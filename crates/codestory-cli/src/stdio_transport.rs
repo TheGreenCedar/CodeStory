@@ -1722,7 +1722,7 @@ fn handle_stdio_request(
             let diagnostics_registry = Arc::clone(&session.diagnostics_v3);
             let (runtime, state) = session.active_project_mut();
             let public_operation = stdio_public_operation_name(name, &request);
-            let observes_complete_core = stdio_tool_observes_complete_core(name);
+            let observes_complete_core = stdio_tool_observes_complete_core(name, &request);
             if stdio_tool_reads_publication(name) {
                 if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
                     let error = serde_json::json!({
@@ -2303,14 +2303,7 @@ fn handle_stdio_search_v3(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let repo_text = match request
-        .pointer("/params/arguments/repo_text")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("on") => SearchRepoTextMode::On,
-        Some("off") => SearchRepoTextMode::Off,
-        _ => SearchRepoTextMode::Auto,
-    };
+    let repo_text = stdio_search_repo_text_mode(request);
     let limit_per_source = request
         .pointer("/params/arguments/limit")
         .and_then(serde_json::Value::as_u64)
@@ -2768,12 +2761,27 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
     name != "status"
 }
 
-fn stdio_tool_observes_complete_core(name: &str) -> bool {
-    name == "affected" || crate::prove_call_path::is_proof_tool_name(name)
+fn stdio_search_repo_text_mode(request: &serde_json::Value) -> SearchRepoTextMode {
+    match request
+        .pointer("/params/arguments/repo_text")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("on") => SearchRepoTextMode::On,
+        Some("off") => SearchRepoTextMode::Off,
+        _ => SearchRepoTextMode::Auto,
+    }
+}
+
+fn stdio_tool_observes_complete_core(name: &str, request: &serde_json::Value) -> bool {
+    name == "affected"
+        || crate::prove_call_path::is_proof_tool_name(name)
+        || (name == "search" && stdio_search_repo_text_mode(request) == SearchRepoTextMode::Off)
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
-    if matches!(
+    if name == "search" {
+        codestory_runtime::search_operation_name(stdio_search_repo_text_mode(request))
+    } else if matches!(
         name,
         "symbol"
             | "trail"
@@ -4790,14 +4798,7 @@ fn handle_stdio_search(
     request: &serde_json::Value,
     query: String,
 ) -> serde_json::Value {
-    let repo_text = match request
-        .pointer("/params/arguments/repo_text")
-        .and_then(|value| value.as_str())
-    {
-        Some("on") => SearchRepoTextMode::On,
-        Some("off") => SearchRepoTextMode::Off,
-        _ => SearchRepoTextMode::Auto,
-    };
+    let repo_text = stdio_search_repo_text_mode(request);
     let limit_per_source = request
         .pointer("/params/arguments/limit")
         .and_then(|value| value.as_u64())
@@ -7734,6 +7735,24 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
         )
         .expect("diagnostic resource response")
+    }
+
+    #[test]
+    fn only_explicit_repo_text_off_search_uses_core_only_stdio_activation() {
+        let exact = json!({
+            "params": {"arguments": {"query": "RenamedAnchor", "repo_text": "off"}}
+        });
+        let ordinary = json!({
+            "params": {"arguments": {"query": "RenamedAnchor", "repo_text": "auto"}}
+        });
+        assert!(stdio_tool_observes_complete_core("search", &exact));
+        assert!(!stdio_tool_observes_complete_core("search", &ordinary));
+        assert!(!stdio_tool_observes_complete_core("search", &json!({})));
+        assert_eq!(
+            stdio_public_operation_name("search", &exact),
+            "exact_search"
+        );
+        assert_eq!(stdio_public_operation_name("search", &ordinary), "search");
     }
 
     #[test]

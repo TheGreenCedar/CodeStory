@@ -6,9 +6,9 @@ use super::{
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDto,
     SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
     SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, clamp_usize_to_u32,
-    compare_search_hits_with_project_root, leading_symbol_segment, looks_like_repo_text_query,
-    normalize_symbol_query, retrieval_file_role_from_path,
+    SearchRequest, SearchResultsDto, SemanticModeDto, Storage, TrailConfigDto, agent,
+    clamp_usize_to_u32, compare_search_hits_with_project_root, leading_symbol_segment,
+    looks_like_repo_text_query, normalize_symbol_query, retrieval_file_role_from_path,
     retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
 };
 use crate::root_rank::{
@@ -33,6 +33,7 @@ use crate::search_terms::{
 };
 use crate::symbol_query::{OrientationEvidence, OrientationHitEvidence, is_non_primary_source_hit};
 use codestory_contracts::api::{GroundingOrientationDto, GroundingOrientationUncertaintyDto};
+use codestory_contracts::api::{RetrievalFallbackReasonDto, RetrievalModeDto};
 use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
 use codestory_store::FileRole;
 use std::cmp::Reverse;
@@ -1785,8 +1786,85 @@ impl AppController {
     /// The returned retrieval state distinguishes full sidecar evidence from degraded or
     /// diagnostic-only paths. Callers should not collapse those states into a generic success.
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        if req.repo_text == SearchRepoTextMode::Off {
+            return self.search_results_core_exact(req);
+        }
         agent::retrieval_primary::with_stable_retrieval_publication(self, "search output", || {
             self.search_results_once(req.clone())
+        })
+    }
+
+    /// Search only the complete core symbol projection.
+    ///
+    /// `repo_text=off` is an explicit request for this narrow lane. It does not
+    /// open a retrieval publication, initialize embeddings, run semantic or
+    /// repository-text retrieval, or imply that those richer lanes are ready.
+    fn search_results_core_exact(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        self.ensure_consistent_read_state("Exact search")?;
+        let original_query = req.query.clone();
+        let intent_query = parse_search_intent_query(&original_query);
+        let query = intent_query.effective_query.clone();
+        let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
+        let mut hits = self.resolve_indexed_symbol_candidates(&query, limit_per_source)?;
+        apply_search_intent_filters(&mut hits, &intent_query.filters);
+        dedupe_inexact_search_hits_by_display_key(&query, &mut hits);
+        hits.truncate(limit_per_source);
+        annotate_search_hit_match_quality(&query, &mut hits);
+
+        let project_root = self.require_project_root()?;
+        let storage = self.open_storage_read_only()?;
+        crate::search_evidence::attach_pinned_exact_search_source(
+            &storage,
+            project_root.as_path(),
+            &mut hits,
+        );
+        crate::search_evidence::attach_pinned_search_evidence(
+            &storage,
+            Some(project_root.as_path()),
+            &mut hits,
+        );
+        let freshness = self.index_freshness().ok();
+        let query_assessment = search_query_assessment(
+            &query,
+            &hits,
+            &[],
+            SearchRepoTextMode::Off,
+            false,
+            None,
+            None,
+        );
+        let retrieval = RetrievalStateDto {
+            mode: RetrievalModeDto::Symbolic,
+            hybrid_configured: false,
+            semantic_ready: false,
+            semantic_mode: SemanticModeDto::DisabledByConfig,
+            semantic_doc_count: 0,
+            embedding_model: None,
+            current_embedding: None,
+            stored_embedding: None,
+            fallback_reason: Some(RetrievalFallbackReasonDto::DisabledByConfig),
+            fallback_message: Some(
+                "Search used the complete core symbol index; semantic and repository-text retrieval were not requested."
+                    .to_string(),
+            ),
+        };
+
+        Ok(SearchResultsDto {
+            query: original_query,
+            retrieval_publication: None,
+            retrieval,
+            retrieval_shadow: None,
+            freshness,
+            limit_per_source: limit_per_source as u32,
+            repo_text_mode: SearchRepoTextMode::Off,
+            repo_text_enabled: false,
+            query_assessment: Some(query_assessment),
+            search_plan: None,
+            repo_text_stats: None,
+            suggestions: Vec::new(),
+            indexed_symbol_hits: hits.clone(),
+            repo_text_hits: Vec::new(),
+            hits,
         })
     }
 

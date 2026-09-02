@@ -433,7 +433,7 @@ pub use services::{
     ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error, set_activation_fail_stop_hook,
+    TrailService, embedding_api_error, search_operation_name, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,

@@ -901,8 +901,9 @@ pub(crate) fn run_sidecar_query(
 
 /// Run every generic packet query through the descriptor-only sidecar path,
 /// rank the combined identities once, and seal packet admission before any
-/// candidate source or graph hydration begins. The later query calls reuse the
-/// sidecar cache and may hydrate only identities admitted here.
+/// candidate source or graph hydration begins. The packet session retains
+/// these exact query results under its retrieval policy and publication pin;
+/// later resolution reuses them and may hydrate only identities admitted here.
 pub(crate) fn preadmit_packet_descriptor_queries(
     controller: &AppController,
     queries: &[String],
@@ -958,7 +959,6 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                 budget_ms: Some(per_query_budget),
             })
             .collect::<Vec<_>>();
-        #[cfg(feature = "benchmark-support")]
         let include_dense_semantic = session.includes_dense_semantic();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
             #[cfg(feature = "benchmark-support")]
@@ -978,7 +978,7 @@ pub(crate) fn preadmit_packet_descriptor_queries(
             )
         })
         .map_err(map_pinned_query_error)?;
-        #[cfg(feature = "benchmark-support")]
+        #[cfg(any(test, feature = "benchmark-support"))]
         for result in &query_results {
             session.record_descriptor_trace(&result.trace);
         }
@@ -1004,6 +1004,19 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                 ));
             }
             pinned.ensure_query_identity(result, "admitting packet descriptors")?;
+        }
+        for result in &query_results {
+            session
+                .retain_descriptor_result(
+                    result,
+                    include_dense_semantic,
+                    pinned.session.publication_identity(),
+                )
+                .map_err(|reason| {
+                    ApiError::internal(format!(
+                        "packet descriptor retention violated its coherent session: {reason}"
+                    ))
+                })?;
         }
         admit_packet_candidate_descriptors(
             &session,
@@ -1075,11 +1088,26 @@ pub(crate) fn run_and_resolve_sidecar_query(
     latency_budget_ms: Option<u32>,
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
-        let query_result = with_detached_sidecar_query_cache(controller, |cache| {
-            if let Some(_session) = crate::agent::packet_candidate::active_packet_proof_session() {
-                #[cfg(feature = "benchmark-support")]
-                if !_session.includes_dense_semantic() {
-                    return pinned
+        let packet_session = crate::agent::packet_candidate::active_packet_proof_session();
+        let include_dense_semantic = packet_session
+            .as_ref()
+            .is_none_or(|session| session.includes_dense_semantic());
+        let retained = packet_session.as_ref().and_then(|session| {
+            session.descriptor_result(
+                query,
+                include_dense_semantic,
+                pinned.session.publication_identity(),
+            )
+        });
+        let _executed_query = retained.is_none();
+        let query_result = if let Some(result) = retained {
+            result
+        } else {
+            with_detached_sidecar_query_cache(controller, |cache| {
+                if packet_session.is_some() {
+                    #[cfg(feature = "benchmark-support")]
+                    if !include_dense_semantic {
+                        return pinned
                         .session
                         .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
                             query,
@@ -1087,25 +1115,26 @@ pub(crate) fn run_and_resolve_sidecar_query(
                             crate::services::active_public_operation_cancellation(),
                             cache,
                         );
+                    }
+                    pinned.session.execute_packet_descriptors_with_cache(
+                        query,
+                        Some(sidecar_budget_ms(latency_budget_ms)),
+                        crate::services::active_public_operation_cancellation(),
+                        cache,
+                    )
+                } else {
+                    pinned.session.execute_with_cache(
+                        query,
+                        Some(sidecar_budget_ms(latency_budget_ms)),
+                        crate::services::active_public_operation_cancellation(),
+                        cache,
+                    )
                 }
-                pinned.session.execute_packet_descriptors_with_cache(
-                    query,
-                    Some(sidecar_budget_ms(latency_budget_ms)),
-                    crate::services::active_public_operation_cancellation(),
-                    cache,
-                )
-            } else {
-                pinned.session.execute_with_cache(
-                    query,
-                    Some(sidecar_budget_ms(latency_budget_ms)),
-                    crate::services::active_public_operation_cancellation(),
-                    cache,
-                )
-            }
-        })
-        .map_err(map_pinned_query_error)?;
-        #[cfg(feature = "benchmark-support")]
-        if let Some(session) = crate::agent::packet_candidate::active_packet_proof_session() {
+            })
+            .map_err(map_pinned_query_error)?
+        };
+        #[cfg(any(test, feature = "benchmark-support"))]
+        if _executed_query && let Some(session) = packet_session {
             session.record_descriptor_trace(&query_result.trace);
         }
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
@@ -1374,39 +1403,85 @@ fn search_sidecar_packet_batch_inner(
         .collect::<Vec<_>>();
     with_pinned_retrieval_read(controller, |pinned| {
         let batch_started_at = Instant::now();
-        let batch_items = batch_queries
+        let packet_session = active_packet_proof_session();
+        let include_dense_semantic = packet_session
+            .as_ref()
+            .is_none_or(|session| session.includes_dense_semantic());
+        let mut query_results = vec![None; batch_queries.len()];
+        let mut missing_indices = Vec::new();
+        for (index, (query, _)) in batch_queries.iter().enumerate() {
+            let retained = packet_session.as_ref().and_then(|session| {
+                session.descriptor_result(
+                    query,
+                    include_dense_semantic,
+                    pinned.session.publication_identity(),
+                )
+            });
+            if let Some(result) = retained {
+                query_results[index] = Some(result);
+            } else {
+                missing_indices.push(index);
+            }
+        }
+        let missing_items = missing_indices
             .iter()
-            .map(|(query, budget_ms)| QueryBatchItem {
-                query,
-                budget_ms: Some(*budget_ms),
+            .map(|index| QueryBatchItem {
+                query: batch_queries[*index].0.as_str(),
+                budget_ms: Some(batch_queries[*index].1),
             })
             .collect::<Vec<_>>();
-        let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+        let executed_results = if missing_items.is_empty() {
+            Vec::new()
+        } else {
+            with_detached_sidecar_query_cache(controller, |cache| {
             #[cfg(feature = "benchmark-support")]
-            if active_packet_proof_session()
-                .is_some_and(|session| !session.includes_dense_semantic())
-            {
+                if packet_session.is_some() && !include_dense_semantic {
                 return pinned
                     .session
                     .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
-                        &batch_items,
+                            &missing_items,
                         crate::services::active_public_operation_cancellation(),
                         cache,
                     );
-            }
-            pinned.session.execute_packet_descriptor_batch_with_cache(
-                &batch_items,
-                crate::services::active_public_operation_cancellation(),
-                cache,
-            )
-        })
-        .map_err(map_pinned_query_error)?;
-        #[cfg(feature = "benchmark-support")]
-        if let Some(session) = active_packet_proof_session() {
-            for result in &query_results {
+                }
+                pinned.session.execute_packet_descriptor_batch_with_cache(
+                    &missing_items,
+                    crate::services::active_public_operation_cancellation(),
+                    cache,
+                )
+            })
+            .map_err(map_pinned_query_error)?
+        };
+        if executed_results.len() != missing_indices.len() {
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "packet descriptor batch returned {} results for {} missing queries",
+                    executed_results.len(),
+                    missing_indices.len()
+                ),
+            ));
+        }
+        #[cfg(any(test, feature = "benchmark-support"))]
+        if let Some(session) = packet_session.as_ref() {
+            for result in &executed_results {
                 session.record_descriptor_trace(&result.trace);
             }
         }
+        for (index, result) in missing_indices.into_iter().zip(executed_results) {
+            query_results[index] = Some(result);
+        }
+        let query_results = query_results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "packet descriptor result {index} was neither retained nor executed"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for result in &query_results {
             pinned.ensure_query_identity(result, "resolving sidecar packet batch")?;
         }
@@ -4055,6 +4130,112 @@ mod tests {
             PacketAdmissionDecision::CountBudgetExceeded,
             "the sealed session must not admit a late lower-scoring query candidate"
         );
+    }
+
+    #[test]
+    fn preadmitted_descriptor_result_is_reused_by_initial_resolution() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = pinned_operation_fixture();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        let query = "renamed lattice transition";
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries(&fixture.controller, &[query.to_string()], None)
+                .expect("preadmit renamed descriptor query");
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                1,
+                "preadmission executes the descriptor query once"
+            );
+
+            let (result, _) = run_and_resolve_sidecar_query(&fixture.controller, query, 4, None)
+                .expect("resolve the preadmitted descriptor result");
+            assert_eq!(result.query, query);
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                1,
+                "initial resolution must reuse the preadmitted result instead of executing retrieval again"
+            );
+
+            let publication = pinned.session.publication_identity().clone();
+            let mut different_publication = publication.clone();
+            different_publication
+                .sidecar_generation
+                .push_str("-different");
+            assert!(
+                session
+                    .descriptor_result("another query", true, &publication)
+                    .is_none()
+            );
+            assert!(
+                session
+                    .descriptor_result(query, false, &publication)
+                    .is_none()
+            );
+            assert!(
+                session
+                    .descriptor_result(query, true, &different_publication)
+                    .is_none()
+            );
+            assert!(
+                PacketProofSession::new()
+                    .descriptor_result(query, true, &publication)
+                    .is_none(),
+                "a retained descriptor result is scoped to one packet session"
+            );
+
+            let mut mismatched_result = result;
+            mismatched_result.publication_identity = Some(different_publication);
+            assert!(
+                PacketProofSession::new()
+                    .retain_descriptor_result(&mismatched_result, true, &publication)
+                    .is_err(),
+                "the retained result must authenticate the packet's exact publication"
+            );
+        });
+    }
+
+    #[test]
+    fn preadmitted_descriptor_result_is_reused_by_planned_query_batch() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = pinned_operation_fixture();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        let query = "renamed lattice continuation";
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries(&fixture.controller, &[query.to_string()], None)
+                .expect("preadmit planned descriptor query");
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                1
+            );
+
+            let outcome = search_sidecar_packet_batch_inner(
+                &fixture.controller,
+                &[(query.to_string(), 4)],
+                None,
+            )
+            .expect("resolve the preadmitted planned query");
+            assert_eq!(outcome.results.len(), 1);
+            assert_eq!(outcome.results[0].0, query);
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                1,
+                "planned query resolution must reuse the preadmitted result"
+            );
+        });
     }
 
     #[test]

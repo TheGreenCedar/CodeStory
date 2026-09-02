@@ -1392,7 +1392,7 @@ fn app_controller_opens_project() {
         None,
     );
     search_dir_snapshot.assert_unchanged("ground symbol");
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "AppController",
@@ -1424,7 +1424,7 @@ fn app_controller_opens_project() {
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("files and affected");
 
-    assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
+    assert_query_search_uses_core_without_full_sidecars(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("query search");
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("packet");
@@ -1642,7 +1642,7 @@ fn ground_symbol_node_id_from_existing_cache(
     string_field(hit, &["id"]).to_string()
 }
 
-fn assert_product_search_fails_closed_without_full_sidecars(
+fn assert_exact_search_uses_core_without_full_sidecars(
     workspace: &Path,
     cache_dir: &Path,
     query: &str,
@@ -1665,10 +1665,38 @@ fn assert_product_search_fails_closed_without_full_sidecars(
         ],
     );
     assert!(
-        !output.status.success(),
-        "product search should fail closed without full retrieval"
+        output.status.success(),
+        "exact search should use the complete core without retrieval sidecars: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_retrieval_failure_output(output);
+    let search: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse exact-search output: {error}; output={output:#?}"));
+    assert_eq!(search["schema_version"], 3, "{search:#}");
+    assert_eq!(search["kind"], "complete", "{search:#}");
+    assert_eq!(search["status"], "available", "{search:#}");
+    assert_eq!(search["retrieval"]["state"], "symbolic", "{search:#}");
+    assert!(
+        search["retrieval"]["generation_id"].is_null()
+            && search["publication"]["retrieval"].is_null(),
+        "exact search must not imply a sidecar publication: {search:#}"
+    );
+    assert!(
+        search["gaps"].as_array().is_some_and(Vec::is_empty),
+        "an intentionally symbolic search must not report retrieval unavailable: {search:#}"
+    );
+    assert!(
+        search["evidence"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["path"]
+                    .as_str()
+                    .is_some_and(|path| !path.starts_with('/'))
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains(query))
+            })
+        }),
+        "exact search must return project-relative source evidence for {query}: {search:#}"
+    );
 }
 
 fn assert_product_search_fails_closed_on_stale_core(
@@ -1704,7 +1732,7 @@ fn assert_product_search_fails_closed_on_stale_core(
         "{failure:#}"
     );
     assert_eq!(
-        failure["error"]["message"], "search requires a fresh complete core publication",
+        failure["error"]["message"], "exact_search requires a fresh complete core publication",
         "{failure:#}"
     );
 }
@@ -2480,7 +2508,7 @@ fn run_git(workspace: &Path, args: &[&str]) {
     );
 }
 
-fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
+fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
     let output = run_cli(
         workspace,
         cache_dir,
@@ -2494,10 +2522,22 @@ fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cach
         ],
     );
     assert!(
-        !output.status.success(),
-        "query search DSL should fail closed without full sidecars"
+        output.status.success(),
+        "query search DSL should use the complete core without sidecars: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_retrieval_failure_output(output);
+    let query: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse query-search output: {error}; output={output:#?}"));
+    assert!(
+        query["items"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["display_name"] == "AppController"
+                    && item["source"] == "search"
+                    && item["file_path"] == "src/lib.rs"
+            })
+        }),
+        "query search DSL should return the exact core symbol: {query:#}"
+    );
 }
 
 fn assert_context_id_fails_closed_without_full_sidecars(
@@ -2703,7 +2743,7 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         &["index", "--refresh", "full", "--format", "json"],
     );
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "normalize_project",
@@ -2890,7 +2930,7 @@ fn context_json_reports_deep_trace_by_default() {
         "index should discover investigation fixture symbols"
     );
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "parse_investigation_event",

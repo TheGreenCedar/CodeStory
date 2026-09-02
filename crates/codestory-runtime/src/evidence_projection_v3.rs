@@ -477,13 +477,20 @@ pub fn project_search_v3(
     results: &SearchResultsDto,
 ) -> Result<SearchProjectionV3Dto, codestory_contracts::api::ApiError> {
     let request_id = format!("search-{}", digest_hex(results.query.as_bytes()));
-    let (identity, publication, retrieval) = projection_envelope(
+    let (identity, publication, mut retrieval) = projection_envelope(
         service,
         caller_id,
         &results.query,
         &request_id,
         results.retrieval_publication.as_ref(),
     )?;
+    let symbolic = results.retrieval.mode == codestory_contracts::api::RetrievalModeDto::Symbolic;
+    if symbolic {
+        retrieval = RetrievalStateDescriptorV3Dto {
+            state: RetrievalStateV3Dto::Symbolic,
+            generation_id: None,
+        };
+    }
     let evidence = results
         .hits
         .iter()
@@ -499,7 +506,7 @@ pub fn project_search_v3(
             Some("Additional search rows were omitted from the bounded public projection."),
         )?);
     }
-    if results.retrieval_publication.is_none() {
+    if results.retrieval_publication.is_none() && !symbolic {
         gaps.push(gap_row(
             "search-retrieval-unavailable",
             GapKindV3Dto::RetrievalUnavailable,

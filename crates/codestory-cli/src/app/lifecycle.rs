@@ -7,7 +7,7 @@ use crate::runtime;
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
 use anyhow::Context;
 use anyhow::Result;
-use codestory_contracts::api::ProjectSummary;
+use codestory_contracts::api::{ProjectSummary, SearchRepoTextMode};
 use std::fmt::Write as _;
 
 pub(super) fn embedding_client_transport_mode(
@@ -97,6 +97,27 @@ pub(super) fn open_agent_surface(
     codestory_runtime::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
         .map_err(map_embedding_preflight_error)
         .with_context(|| format!("initialize retrieval for {surface}"))?;
+    Ok(OpenedAgentSurface {
+        runtime,
+        before,
+        opened,
+    })
+}
+
+pub(super) fn open_search_surface(
+    project: &ProjectArgs,
+    profile: Option<args::CliSidecarProfile>,
+    run_id: Option<&str>,
+    refresh: args::RefreshMode,
+    repo_text: SearchRepoTextMode,
+) -> Result<OpenedAgentSurface> {
+    if repo_text != SearchRepoTextMode::Off {
+        return open_agent_surface(project, profile, run_id, refresh, "search");
+    }
+
+    let runtime = RuntimeContext::new(project)?;
+    let (before, opened) = runtime.ensure_open_with_before(refresh)?;
+    ensure_index_ready(&opened, "search")?;
     Ok(OpenedAgentSurface {
         runtime,
         before,

@@ -3679,7 +3679,7 @@ fn every_production_gap_annotation_producer_is_pinned_to_the_gap_kind() {
     );
 }
 
-/// Repo-text search must not be disabled by a constant on any search path.
+/// Broad search must not disable requested repository text with a constant.
 ///
 /// The sidecar path -- the one the MCP tool surface and the packet both use -- once built
 /// its results with `let repo_text_hits = Vec::new();` and `repo_text_enabled: false`,
@@ -3689,18 +3689,27 @@ fn every_production_gap_annotation_producer_is_pinned_to_the_gap_kind() {
 /// across a 54-row benchmark, agents asked for repo text on 582 of 582 searches and every
 /// one of the 569 that completed reported a zero count.
 ///
-/// A literal `false` here is indistinguishable from "this path does not support repo text",
-/// which is why the regression was invisible. The flag has to follow the requested mode.
+/// The explicit complete-core exact lane intentionally reports repository text
+/// disabled. The sidecar path must still derive the flag from the requested
+/// mode rather than silently turning an `auto` or `on` request into exact-only
+/// search.
 #[test]
 fn search_paths_do_not_hardcode_repo_text_disabled() {
     let source = read("crates/codestory-runtime/src/search_plan.rs");
+    let sidecar_and_following = source
+        .split_once("fn search_results_sidecar_primary")
+        .expect("sidecar search function")
+        .1;
+    let sidecar = sidecar_and_following
+        .split_once("\n    fn ")
+        .map_or(sidecar_and_following, |(body, _)| body);
     assert!(
-        !source.contains("repo_text_enabled: false"),
-        "search_plan.rs disables repo text with a constant; it must follow the requested \
-         SearchRepoTextMode so a caller that asks for literal matches receives them"
+        !sidecar.contains("repo_text_enabled: false"),
+        "the broad sidecar search disables repo text with a constant; it must follow the \
+         requested SearchRepoTextMode so a caller that asks for literal matches receives them"
     );
     assert!(
-        source.contains("let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;"),
+        sidecar.contains("let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;"),
         "the sidecar search path must derive repo_text_enabled from the requested mode"
     );
 }

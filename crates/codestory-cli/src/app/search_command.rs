@@ -1,5 +1,5 @@
 use super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
-use super::lifecycle::{OpenedAgentSurface, open_agent_surface};
+use super::lifecycle::{OpenedAgentSurface, open_search_surface};
 use super::to_api_repo_text_mode;
 use crate::args::SearchCommand;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
@@ -10,27 +10,31 @@ use codestory_contracts::api::SearchRequest;
 pub(super) fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let OpenedAgentSurface { runtime, .. } = open_agent_surface(
+    let repo_text = to_api_repo_text_mode(cmd.repo_text);
+    let OpenedAgentSurface { runtime, .. } = open_search_surface(
         &cmd.project,
         cmd.profile,
         cmd.run_id.as_deref(),
         cmd.refresh,
-        "search",
+        repo_text,
     )?;
-    let operation = runtime.run_public_operation("search", || {
-        let search_results = runtime
-            .browser
-            .search_results(search_request_from_command(&cmd))
+    let operation = runtime.run_public_operation(
+        codestory_runtime::search_operation_name(repo_text),
+        || {
+            let search_results = runtime
+                .browser
+                .search_results(search_request_from_command(&cmd))
+                .map_err(map_api_error)?;
+            let projection = codestory_runtime::project_search_v3(
+                &runtime.public_operation,
+                "codestory-cli",
+                &search_results,
+            )
             .map_err(map_api_error)?;
-        let projection = codestory_runtime::project_search_v3(
-            &runtime.public_operation,
-            "codestory-cli",
-            &search_results,
-        )
-        .map_err(map_api_error)?;
-        let markdown = render_search_projection_markdown(&projection);
-        RenderedPublicOutput::structured(&projection, markdown)
-    })?;
+            let markdown = render_search_projection_markdown(&projection);
+            RenderedPublicOutput::structured(&projection, markdown)
+        },
+    )?;
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 

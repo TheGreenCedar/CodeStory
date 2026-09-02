@@ -209,6 +209,7 @@ pub enum EvidenceAvailabilityV3Dto {
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStateV3Dto {
     Full,
+    Symbolic,
     Degraded,
     Unavailable,
 }
@@ -798,6 +799,7 @@ mod tests {
             ],
             "retrieval_variants": [
                 RetrievalStateV3Dto::Full,
+                RetrievalStateV3Dto::Symbolic,
                 RetrievalStateV3Dto::Degraded,
                 RetrievalStateV3Dto::Unavailable,
             ],

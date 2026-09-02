@@ -276,7 +276,7 @@ fn retrieval_state_schema_v3() -> Value {
     closed_object_schema_v3(vec![
         (
             "state",
-            enum_schema_v3(&["full", "degraded", "unavailable"]),
+            enum_schema_v3(&["full", "symbolic", "degraded", "unavailable"]),
         ),
         ("generation_id", nullable_schema_v3(string_schema_v3())),
     ])

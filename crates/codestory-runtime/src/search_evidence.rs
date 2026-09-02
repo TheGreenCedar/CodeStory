@@ -14,6 +14,7 @@ struct VerifiedFileIndex<'a> {
     project_root: Option<&'a Path>,
     files: Vec<FileInfo>,
     directories: HashMap<PathBuf, Vec<VerifiedSourceFile>>,
+    exact_files: HashMap<PathBuf, Option<VerifiedSourceFile>>,
 }
 
 impl<'a> VerifiedFileIndex<'a> {
@@ -23,6 +24,7 @@ impl<'a> VerifiedFileIndex<'a> {
             project_root,
             files: storage.get_files().ok()?,
             directories: HashMap::new(),
+            exact_files: HashMap::new(),
         })
     }
 
@@ -42,6 +44,22 @@ impl<'a> VerifiedFileIndex<'a> {
                     &directory,
                 )
             })
+    }
+
+    fn verified_hit(&mut self, hit_path: &str) -> Option<&VerifiedSourceFile> {
+        let absolute = self.hit_path(hit_path);
+        if !self.exact_files.contains_key(&absolute) {
+            let verified = self
+                .files
+                .iter()
+                .find(|file| {
+                    let indexed = resolve_path(self.project_root, &file.path);
+                    codestory_workspace::same_workspace_path(&indexed, &absolute)
+                })
+                .and_then(|file| verified_file(self.storage, self.project_root, file));
+            self.exact_files.insert(absolute.clone(), verified);
+        }
+        self.exact_files.get(&absolute).and_then(Option::as_ref)
     }
 }
 
@@ -95,6 +113,50 @@ pub(super) fn attach_pinned_search_evidence(
     }
 }
 
+/// Attach a small source window to exact core-symbol results and expose the
+/// path relative to the selected project. The content hash check binds the
+/// bytes to the pinned core generation; source drift therefore cannot be
+/// mistaken for evidence from that publication.
+pub(super) fn attach_pinned_exact_search_source(
+    storage: &Store,
+    project_root: &Path,
+    hits: &mut [SearchHit],
+) {
+    let Some(mut files) = VerifiedFileIndex::load(storage, Some(project_root)) else {
+        return;
+    };
+    for hit in hits {
+        let Some(hit_path) = hit.file_path.clone() else {
+            continue;
+        };
+        let Ok(codestory_workspace::ProjectRelativePathResolution::Existing { relative, .. }) =
+            codestory_workspace::resolve_project_relative_path(project_root, Path::new(&hit_path))
+        else {
+            hit.file_path = None;
+            hit.source_excerpt = None;
+            continue;
+        };
+        hit.file_path = Some(relative.to_string_lossy().replace('\\', "/"));
+        let Some(source) = files.verified_hit(&hit_path) else {
+            continue;
+        };
+        hit.source_excerpt = hit
+            .line
+            .and_then(|line| bounded_source_window_at_line(&source.content, line));
+    }
+}
+
+fn bounded_source_window_at_line(content: &str, line: u32) -> Option<String> {
+    let line = usize::try_from(line).ok()?.checked_sub(1)?;
+    let lines = content.lines().collect::<Vec<_>>();
+    if line >= lines.len() {
+        return None;
+    }
+    let start = line.saturating_sub(2);
+    let end = (line + 3).min(lines.len());
+    Some(lines[start..end].join("\n"))
+}
+
 fn verified_file(
     storage: &Store,
     project_root: Option<&Path>,
@@ -102,7 +164,11 @@ fn verified_file(
 ) -> Option<VerifiedSourceFile> {
     let expected_hash = storage.get_file_content_hash(file.id).ok().flatten()?;
     let path = resolve_path(project_root, &file.path);
-    let bytes = std::fs::read(&path).ok()?;
+    let read_path = match project_root {
+        Some(root) => contained_existing_read_path(root, &path).ok()?,
+        None => path.clone(),
+    };
+    let bytes = std::fs::read(read_path).ok()?;
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return None;
     }
@@ -110,6 +176,26 @@ fn verified_file(
         path,
         content: String::from_utf8(bytes).ok()?,
     })
+}
+
+fn contained_existing_read_path(project_root: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let resolution = codestory_workspace::resolve_project_relative_path(project_root, path)?;
+    let codestory_workspace::ProjectRelativePathResolution::Existing { absolute, .. } = resolution
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "indexed source path is not an existing file inside the project",
+        ));
+    };
+    let resolved_root = project_root.canonicalize()?;
+    let resolved_file = absolute.canonicalize()?;
+    if codestory_workspace::workspace_relative_path(&resolved_root, &resolved_file).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "indexed source path resolves outside the project",
+        ));
+    }
+    Ok(resolved_file)
 }
 
 fn resolve_path(project_root: Option<&Path>, path: &Path) -> PathBuf {
@@ -213,7 +299,10 @@ fn is_cxx_implementation_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileInfo, Path, PathBuf, SearchHit, Sha256, Store, attach_pinned_search_evidence};
+    use super::{
+        FileInfo, Path, PathBuf, SearchHit, Sha256, Store, attach_pinned_exact_search_source,
+        attach_pinned_search_evidence,
+    };
     use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
     use codestory_store::FileRole;
     use sha2::Digest;
@@ -359,6 +448,91 @@ mod tests {
         assert!(
             hit.verification_targets.is_empty(),
             "independent byte fragments must not infer an interface relationship"
+        );
+    }
+
+    #[test]
+    fn exact_search_source_is_hash_bound_and_project_relative() {
+        let project = tempfile::tempdir().expect("project");
+        let relative = PathBuf::from("src/lib.rs");
+        let source = b"fn before() {}\npub fn exact_anchor() {}\nfn after() {}\n";
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        std::fs::write(project.path().join(&relative), source).expect("source");
+        let storage = Store::new_in_memory().expect("storage");
+        insert_file(&storage, 1, &relative, source);
+        let mut hit = SearchHit {
+            display_name: "exact_anchor".to_string(),
+            file_path: Some(
+                project
+                    .path()
+                    .join(&relative)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            line: Some(2),
+            ..project_hit()
+        };
+
+        attach_pinned_exact_search_source(&storage, project.path(), std::slice::from_mut(&mut hit));
+
+        assert_eq!(hit.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(
+            hit.source_excerpt.as_deref(),
+            Some("fn before() {}\npub fn exact_anchor() {}\nfn after() {}")
+        );
+
+        std::fs::write(project.path().join(&relative), "fn changed() {}\n").expect("mutate source");
+        let mut changed = SearchHit {
+            display_name: "exact_anchor".to_string(),
+            file_path: Some(
+                project
+                    .path()
+                    .join(&relative)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            line: Some(2),
+            ..project_hit()
+        };
+        attach_pinned_exact_search_source(
+            &storage,
+            project.path(),
+            std::slice::from_mut(&mut changed),
+        );
+        assert!(
+            changed.source_excerpt.is_none(),
+            "changed source bytes must not be attached to the pinned result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_search_drops_an_indexed_symlink_that_resolves_outside_the_project() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        let source = b"pub fn external_anchor() {}\n";
+        let outside_source = outside.path().join("external.rs");
+        std::fs::write(&outside_source, source).expect("outside source");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let linked_source = project.path().join("src/external.rs");
+        symlink(&outside_source, &linked_source).expect("outside-project source symlink");
+
+        let storage = Store::new_in_memory().expect("storage");
+        insert_file(&storage, 1, Path::new("src/external.rs"), source);
+        let mut hit = SearchHit {
+            display_name: "external_anchor".to_string(),
+            file_path: Some(linked_source.to_string_lossy().into_owned()),
+            line: Some(1),
+            ..project_hit()
+        };
+
+        attach_pinned_exact_search_source(&storage, project.path(), std::slice::from_mut(&mut hit));
+
+        assert!(
+            hit.file_path.is_none() && hit.source_excerpt.is_none(),
+            "an in-project spelling must not expose source that resolves outside the project"
         );
     }
 

@@ -342,6 +342,67 @@ fn search_json_fails_closed_without_full_sidecars() {
 }
 
 #[test]
+fn exact_search_json_uses_the_core_without_claiming_full_retrieval() {
+    let workspace = tempdir().expect("workspace dir");
+    write_retrieval_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let search = run_cli(
+        workspace.path(),
+        &[
+            "search",
+            "--query",
+            "exact_symbol_anchor",
+            "--repo-text",
+            "off",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        search.status.success(),
+        "exact search command failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&search.stdout).expect("parse exact search json");
+    assert_eq!(json["schema_version"], 3, "{json:#}");
+    assert_eq!(json["kind"], "complete", "{json:#}");
+    assert_eq!(json["status"], "available", "{json:#}");
+    assert_eq!(json["retrieval"]["state"], "symbolic", "{json:#}");
+    assert!(
+        json["retrieval"]["generation_id"].is_null() && json["publication"]["retrieval"].is_null(),
+        "exact search must not imply a sidecar publication: {json:#}"
+    );
+    assert!(
+        json["gaps"].as_array().is_some_and(Vec::is_empty),
+        "an intentionally symbolic search must not report retrieval unavailable: {json:#}"
+    );
+    assert!(
+        json["evidence"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["path"] == "src/lib.rs"
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("exact_symbol_anchor"))
+            })
+        }),
+        "exact search must return its source-backed symbol evidence: {json:#}"
+    );
+}
+
+#[test]
 fn search_json_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
     let workspace = tempdir().expect("workspace dir");
 

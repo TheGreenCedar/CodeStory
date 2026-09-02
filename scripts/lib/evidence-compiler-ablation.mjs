@@ -132,14 +132,13 @@ function hasUnquotedShellComposition(command) {
   return escaped || quote != null;
 }
 
-function shellWords(command) {
-  if (hasUnquotedShellComposition(command)) return null;
+function literalShellWords(command) {
   const text = String(command ?? "");
+  if (/[\0\r\n]/u.test(text)) return null;
   const words = [];
   let word = "";
   let wordStarted = false;
   let quote = null;
-  let escaped = false;
   const finishWord = () => {
     if (!wordStarted) return;
     words.push(word);
@@ -148,20 +147,17 @@ function shellWords(command) {
   };
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];
-    if (escaped) {
-      word += character;
-      wordStarted = true;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && quote !== "'") {
-      escaped = true;
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else word += character;
       wordStarted = true;
       continue;
     }
-    if (quote) {
-      if (character === quote) {
+    if (quote === '"') {
+      if (character === '"') {
         quote = null;
+      } else if (character === "\\" || character === "$" || character === "`") {
+        return null;
       } else {
         word += character;
       }
@@ -177,26 +173,49 @@ function shellWords(command) {
       finishWord();
       continue;
     }
+    if (character === "\\") {
+      if (text[index + 1] !== "'") return null;
+      word += "'";
+      wordStarted = true;
+      index += 1;
+      continue;
+    }
+    if (!/[A-Za-z0-9_./:@%+,=-]/u.test(character)) return null;
+    if (character === "=" && !wordStarted) return null;
     word += character;
     wordStarted = true;
   }
-  if (escaped || quote) return null;
+  if (quote) return null;
   finishWord();
   return words;
 }
 
-function directBenchmarkCliInvocation(command) {
+function directPinnedBenchmarkCliInvocation(command) {
   const text = String(command ?? "");
   const executable = String.raw`(?:"\$(?:CODESTORY_CLI|\{CODESTORY_CLI\})"|\$(?:CODESTORY_CLI|\{CODESTORY_CLI\}))`;
-  if (!new RegExp(`^\\s*${executable}(?=\\s)`, "u").test(text)) return null;
-  const words = shellWords(text);
-  if (!words || words.length < 2) return null;
-  if (!["$CODESTORY_CLI", "${CODESTORY_CLI}"].includes(words[0])) return null;
-  if (!/^[a-z][a-z0-9-]*$/iu.test(words[1])) return null;
+  const executableMatch = text.match(new RegExp(`^\\s*${executable}(?=\\s)`, "u"));
+  if (!executableMatch) return null;
+  const words = literalShellWords(text.slice(executableMatch[0].length));
+  if (!words || words.length < 1) return null;
+  if (!/^[a-z][a-z0-9-]*$/iu.test(words[0])) return null;
   return {
-    operation: normalizeCodeStoryOperation(words[1]),
-    args: words.slice(2),
+    operation: normalizeCodeStoryOperation(words[0]),
+    args: words.slice(1),
   };
+}
+
+function directBenchmarkCliInvocation(command) {
+  const direct = directPinnedBenchmarkCliInvocation(command);
+  if (direct) return direct;
+
+  const outer = literalShellWords(command);
+  if (
+    !outer || outer.length !== 3 || outer[0] !== "/bin/zsh" ||
+    !["-lc", "-c"].includes(outer[1])
+  ) {
+    return null;
+  }
+  return directPinnedBenchmarkCliInvocation(outer[2]);
 }
 
 function codeStoryInvocationsFromCommand(command) {
@@ -1030,6 +1049,7 @@ export {
   codeStoryInvocationsFromCommand,
   codeStoryOperationFromCommand,
   codeStoryOperationFromMcpTool,
+  directBenchmarkCliInvocation,
   evidenceCompilerBuilderAcceptance,
   isBuilderAblationArm,
   isBuilderCodeStoryArm,

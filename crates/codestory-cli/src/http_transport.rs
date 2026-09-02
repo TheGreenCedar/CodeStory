@@ -141,25 +141,28 @@ pub(crate) fn handle_http_request(
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(10)
                 .clamp(1, 100);
-            let operation = match runtime.run_public_operation("search", || {
-                let results = runtime
-                    .browser
-                    .search_results(SearchRequest {
-                        query: query.clone(),
-                        repo_text,
-                        limit_per_source,
-                        expand_search_plan: false,
-                        hybrid_weights: None,
-                        hybrid_limits: None,
-                    })
-                    .map_err(map_api_error)?;
-                codestory_runtime::project_search_v3(
-                    &runtime.public_operation,
-                    "codestory-http",
-                    &results,
-                )
-                .map_err(map_api_error)
-            }) {
+            let operation = match runtime.run_public_operation(
+                codestory_runtime::search_operation_name(repo_text),
+                || {
+                    let results = runtime
+                        .browser
+                        .search_results(SearchRequest {
+                            query: query.clone(),
+                            repo_text,
+                            limit_per_source,
+                            expand_search_plan: false,
+                            hybrid_weights: None,
+                            hybrid_limits: None,
+                        })
+                        .map_err(map_api_error)?;
+                    codestory_runtime::project_search_v3(
+                        &runtime.public_operation,
+                        "codestory-http",
+                        &results,
+                    )
+                    .map_err(map_api_error)
+                },
+            ) {
                 Ok(operation) => operation,
                 Err(error) => {
                     return write_http_typed_error(&mut stream, 400, "search_unavailable", &error);

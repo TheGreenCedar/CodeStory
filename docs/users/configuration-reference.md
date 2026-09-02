@@ -137,8 +137,8 @@ Only the test suites set these. They drive failure shapes that must never occur 
 
 | Variable | Type | Owner | Meaning |
 | --- | --- | --- | --- |
-| `CODESTORY_TEST_EMBED_ALLOW_CPU` | boolean | `crates/codestory-retrieval/src/config.rs` | Test-support builds only: exercises CPU-shaped embedding failures. |
 | `CODESTORY_TEST_CORE_PUBLICATION_ABORT_POINT` | text | `crates/codestory-store/src/core_generation.rs` | Named crash-injection point during immutable core publication (tests only). |
 | `CODESTORY_TEST_CORE_PUBLICATION_ABORT_SENTINEL` | path | `crates/codestory-store/src/core_generation.rs` | Sentinel path written before aborting an immutable core publication (tests only). |
+| `CODESTORY_TEST_EMBED_ALLOW_CPU` | boolean | `crates/codestory-retrieval/src/config.rs` | Test-support builds only: exercises CPU-shaped embedding failures. |
 | `CODESTORY_TEST_PROMOTION_ABORT_SENTINEL` | path | `crates/codestory-store/src/storage_impl/mod.rs` | Sentinel path that aborts a promotion mid-flight to prove crash recovery. |
 

@@ -212,6 +212,18 @@ test("semantic-off packet command uses the hidden stage switch without manifest 
   assert.equal(args.includes("--extra-probe"), false);
 });
 
+test("exact-arm prompt shows the generic query flag without task-shaped vocabulary", () => {
+  const prompt = composeBuilderAblationPrompt(
+    "repo-a",
+    { path: "/tmp/repo", prompt: "fallback" },
+    "exact_identity_source",
+    { prompt: "Describe a renamed subsystem" },
+  );
+  assert.match(prompt, /search --query <identifier-or-terms> --repo-text off/);
+  assert.equal(prompt.includes("HTTP client"), false);
+  assert.equal(prompt.includes("request finalizer"), false);
+});
+
 test("continuation proof paths are opaque and cannot encode experimental identities", () => {
   const proofPath = opaqueBuilderContinuationProofPath(
     "/tmp/codestory-agent-builder-ablation-private",
@@ -265,6 +277,33 @@ test("operation parser and policy fail closed on arm leakage", () => {
       raw: { command: exactSearchCommand },
     }], exactOptions),
     [],
+  );
+  const wrappedExactSearch = `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query "Alpha Beta" --repo-text off'`;
+  const wrappedAnalysis = analyzeTranscript([
+    commandEvent("wrapped-exact", "completed", wrappedExactSearch, "{}"),
+  ], "/tmp/repo");
+  assert.equal(wrappedAnalysis.first_successful_codestory_command?.command, wrappedExactSearch);
+  assert.equal(wrappedAnalysis.codestory_was_first_repository_context_action, true);
+  assert.deepEqual(
+    builderOperationViolations(
+      "exact_identity_source",
+      wrappedAnalysis.codestory_operations,
+      exactOptions,
+    ),
+    [],
+  );
+  const literalDollar = "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query '$fixture ~ =ls * {anchor}' --repo-text off";
+  const literalDollarAnalysis = analyzeTranscript([
+    commandEvent("literal-dollar", "completed", literalDollar, "{}"),
+  ], "/tmp/repo");
+  assert.deepEqual(
+    builderOperationViolations(
+      "exact_identity_source",
+      literalDollarAnalysis.codestory_operations,
+      exactOptions,
+    ),
+    [],
+    "single-quoted literal query text must remain valid",
   );
   assert.deepEqual(
     builderOperationViolations("exact_plus_relations", [{
@@ -388,13 +427,36 @@ test("operation parser and policy fail closed on arm leakage", () => {
     codeStoryInvocationsFromCommand("echo $CODESTORY_CLI")[0].operation,
     null,
   );
+  const directLineContinuation = [
+    "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\",
+    "Beta --repo-text off",
+  ].join("\n");
+  const wrappedLineContinuation = [
+    "/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\",
+    "Beta --repo-text off'",
+  ].join("\n");
   for (const wrapped of [
     `sh -c '\"$CODESTORY_CLI\" search --query Alpha --repo-text off; cat src/lib.rs'`,
     `eval '$CODESTORY_CLI search --query Alpha --repo-text off'`,
     `env FOO=bar $CODESTORY_CLI search --query Alpha --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query \${(z):-"anchor --cache-dir /tmp"} --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query \${(z):-"anchor --cache-dir /tmp"} --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query * --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query {anchor,--cache-dir,/tmp} --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query ~ --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query ~ --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\ Beta --repo-text off`,
+    directLineContinuation,
+    wrappedLineContinuation,
     `$CODESTORY_CLI search --query \"$(cat src/lib.rs)\" --repo-text off`,
     `$CODESTORY_CLI search --query \"\u0060cat src/lib.rs\u0060\" --repo-text off`,
     `sh -c \"$(printenv CODESTORY_CLI) search --query Alpha --repo-text off\"`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha --repo-text off; cat src/lib.rs'`,
+    `/bin/zsh -lc 'CODESTORY_CACHE_ROOT=/tmp/other $CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha --repo-text off'`,
+    `/bin/zsh -lc 'codestory-cli search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha --repo-text off'`,
+    `/bin/zsh -lc '/bin/zsh -lc \"$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha --repo-text off\"'`,
   ]) {
     const wrapperAnalysis = analyzeTranscript([
       commandEvent("wrapped", "completed", wrapped, "source text"),

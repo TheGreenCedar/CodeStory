@@ -193,11 +193,15 @@ impl ReadOnlyBrowserService {
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
-        self.run_public("search", || self.controller.search(req.clone()))
+        self.run_public(crate::search_operation_name(req.repo_text), || {
+            self.controller.search(req.clone())
+        })
     }
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
-        self.run_public("search", || self.controller.search_results(req.clone()))
+        self.run_public(crate::search_operation_name(req.repo_text), || {
+            self.controller.search_results(req.clone())
+        })
     }
 
     pub fn resolve_indexed_symbol_candidates(
