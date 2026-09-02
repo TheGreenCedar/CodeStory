@@ -1054,11 +1054,15 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::fs;
+    use std::sync::{Arc, atomic::AtomicBool};
+
     use codestory_contracts::api::{
-        AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentResponseSectionDto,
-        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto,
-        PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto,
-        PacketDispositionDto, PacketPlanDto, PacketRetrievalTraceSummaryDto,
+        AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
+        AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+        AgentRetrievalTraceDto, IndexMode, PacketBudgetDto, PacketBudgetLimitsDto,
+        PacketBudgetModeDto, PacketBudgetUsageDto, PacketDispositionDto, PacketPlanDto,
+        PacketRetrievalTraceSummaryDto,
     };
 
     pub(in crate::agent) fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
@@ -1153,5 +1157,70 @@ pub(super) mod tests {
             value.get("answer_sufficiency"),
             Some(&serde_json::json!("not_asserted"))
         );
+    }
+
+    #[test]
+    fn hard_budget_minimizer_cannot_destroy_the_v3_request_identity() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(project.path().join("lib.rs"), "pub fn retained() {}\n").expect("source");
+        let controller = crate::AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                project.path().join("codestory.db"),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index project");
+        let service = crate::services::PublicOperationService::new(controller);
+        let request = AgentPacketRequestDto {
+            question: "Locate retained".to_owned(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: None,
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let mut packet = test_packet(&request.question, 16 * 1024);
+
+        assert!(super::minimize_packet_for_hard_budget(&mut packet));
+        assert!(packet.answer.retrieval_trace.request_id.is_empty());
+        assert!(!packet.packet_id.is_empty());
+
+        let product = service
+            .run_observational_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                crate::evidence_projection_v3::project_packet_v3(
+                    &service,
+                    "test",
+                    &request,
+                    &packet,
+                    |candidate| {
+                        serde_json::to_vec(candidate)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    },
+                )
+            })
+            .expect("hard-budget packet should retain an authoritative request identity")
+            .value;
+        let serialized = serde_json::to_vec(&product.projection).expect("serialize projection");
+        assert!(
+            serialized.len()
+                <= crate::agent::packet_projection_v3::PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+        );
+        let identity = match product.projection {
+            codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+                identity,
+                ..
+            }
+            | codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
+                identity,
+                ..
+            } => identity,
+        };
+        assert_eq!(identity.request_id.as_str(), "packet-budget-test");
     }
 }
