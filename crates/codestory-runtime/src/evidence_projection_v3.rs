@@ -119,7 +119,10 @@ pub fn project_packet_v3(
     let retrieval = retrieval_state(packet.answer.retrieval_trace.retrieval_publication.as_ref());
     let input = FinalizedPacketExecutionInputV3::new(
         identity(caller_id, "caller_id")?,
-        identity(&packet.answer.retrieval_trace.request_id, "request_id")?,
+        // `packet_id` is the immutable execution request identity on the
+        // internal packet. The trace copy is optional diagnostics and the hard
+        // public-budget path may remove it before this projection is built.
+        identity(&packet.packet_id, "request_id")?,
         PacketRequestFingerprintV3::from_current_request(request),
         evidence,
         gaps,
