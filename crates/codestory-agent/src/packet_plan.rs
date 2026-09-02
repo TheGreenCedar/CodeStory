@@ -115,11 +115,41 @@ fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeed
 }
 
 fn inline_code_spans(question: &str) -> Vec<&str> {
-    question
-        .split('`')
-        .enumerate()
-        .filter_map(|(index, span)| (index % 2 == 1).then_some(span))
-        .collect()
+    let mut spans = Vec::new();
+    let mut fenced = false;
+    for line in question.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        let mut opening = None;
+        while index < bytes.len() {
+            if bytes[index] != b'`' {
+                index += 1;
+                continue;
+            }
+            let run_start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            if index - run_start != 1 {
+                opening = None;
+                continue;
+            }
+            match opening.take() {
+                Some(start) if start < run_start => spans.push(&line[start..run_start]),
+                Some(_) => {}
+                None => opening = Some(index),
+            }
+        }
+    }
+    spans
 }
 
 fn explicit_canonical_ids(explicit_fragments: &[&str]) -> Vec<String> {
@@ -374,6 +404,31 @@ mod tests {
                 },
                 PacketSeedSelectorV1::CanonicalId {
                     id: "node:7".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fenced_diagnostics_cannot_create_exact_selectors() {
+        let fenced = (0..20)
+            .map(|index| format!("src/generated_{index}.rs net::Generated{index} node:{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let question = format!(
+            "Ignore this diagnostic:\n```text\n{fenced}\n```\nInspect `src/real.rs` and `crate::real` instead."
+        );
+
+        let seed_plan = build_retrieval_seed_plan(&question, &[]);
+
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/real.rs".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "crate::real".into(),
                 },
             ]
         );

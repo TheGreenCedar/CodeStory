@@ -693,8 +693,16 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
     assert!(!orchestrator.contains("append_packet_source_evidence"));
     assert!(!orchestrator.contains("directed_relations_from_graphs(&answer.graphs"));
     let adapter = read("crates/codestory-runtime/src/agent/packet_compiler.rs");
-    assert!(adapter.contains("hydrate_admitted_sources(controller, &admissions"));
+    assert!(adapter.contains("hydrate_admitted_sources(controller, &storage, &admissions"));
     assert!(adapter.contains("get_certain_edge_representatives_between_node_ids(&node_ids)"));
+    assert!(
+        !adapter.contains("controller.node_details("),
+        "packet compiler hydration must not open graph neighborhoods through node_details"
+    );
+    assert!(
+        !adapter.contains("observe_source_coverage("),
+        "packet compiler coverage must stay admission-scoped"
+    );
     let input_build = adapter
         .find("let input = PacketCompilationInputV1")
         .expect("runtime builds typed compiler input");
@@ -702,6 +710,21 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         .find("let product = compile_repository_evidence(&input)")
         .expect("runtime compiles the frozen typed input");
     assert!(input_build < compile);
+    let services = read("crates/codestory-runtime/src/services.rs");
+    let agent_service = source_between(
+        &services,
+        "pub struct AgentService",
+        "pub struct BookmarkService",
+    );
+    assert!(agent_service.contains("public_operation: PublicOperationService"));
+    assert!(agent_service.contains(".run_with_cancel(\"packet\""));
+    let controller_symbols = read("crates/codestory-runtime/src/controller_symbols.rs");
+    let packet_entry = source_between(
+        &controller_symbols,
+        "pub fn agent_packet",
+        "pub fn graph_neighborhood",
+    );
+    assert!(packet_entry.contains("self.with_complete_core_snapshot"));
     let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
     let packet_request = source_between(
         &current_dto,

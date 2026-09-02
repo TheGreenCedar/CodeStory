@@ -6125,6 +6125,30 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    /// Whether one file owns the current structural-text projection row.
+    ///
+    /// Packet coverage uses this bounded identity lookup after admission. It
+    /// must not materialize the repository-wide projection inventory.
+    pub fn has_structural_text_projection_for_file(
+        &self,
+        file_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM structural_text_projection
+                    WHERE file_id = ?1
+                      AND descriptor_version = ?2
+                    LIMIT 1
+                 )",
+                params![file_id, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|found| found != 0)
+            .map_err(StorageError::from)
+    }
+
     /// Whether one file owns a complete dedicated OpenAPI endpoint projection.
     ///
     /// This stays file-scoped and bounded in SQLite rather than loading graph
@@ -8058,8 +8082,8 @@ impl Storage {
         Ok(BoundedRawIncidentEdges { edges, truncated })
     }
 
-    /// Return one certain typed edge representative for every directed pair
-    /// whose effective endpoints are both in `node_ids`.
+    /// Return one certain edge representative for every directed pair and
+    /// relation kind whose effective endpoints are both in `node_ids`.
     ///
     /// This is an induced-edge read: it never opens endpoint nodes or file
     /// records, and dense parallel edges for one pair cannot consume the rows
@@ -8094,9 +8118,10 @@ impl Storage {
                         ROW_NUMBER() OVER (
                             PARTITION BY
                                 COALESCE(e.resolved_source_node_id, e.source_node_id),
-                                COALESCE(e.resolved_target_node_id, e.target_node_id)
-                            ORDER BY e.kind ASC, e.id ASC
-                        ) AS pair_rank
+                                COALESCE(e.resolved_target_node_id, e.target_node_id),
+                                e.kind
+                            ORDER BY e.id ASC
+                        ) AS typed_pair_rank
                  FROM edge e
                  JOIN admitted source_node
                    ON source_node.id = COALESCE(e.resolved_source_node_id, e.source_node_id)
@@ -8108,7 +8133,7 @@ impl Storage {
                     resolved_source_node_id, resolved_target_node_id, confidence,
                     callsite_identity, certainty, candidate_target_node_ids
              FROM ranked
-             WHERE pair_rank = 1
+             WHERE typed_pair_rank = 1
              ORDER BY CASE WHEN effective_source = effective_target THEN 1 ELSE 0 END ASC,
                       effective_source ASC, effective_target ASC, kind ASC, id ASC"
         );
@@ -10238,6 +10263,27 @@ impl Storage {
         &self,
     ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
         read_source_policy_exclusions(&self.conn)
+    }
+
+    /// Check one normalized source-policy path without reading the complete
+    /// exclusion publication into memory.
+    pub fn has_source_policy_exclusion_path(
+        &self,
+        normalized_path: &str,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM source_policy_exclusion
+                    WHERE normalized_path = ?1
+                    LIMIT 1
+                 )",
+                params![normalized_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|found| found != 0)
+            .map_err(StorageError::from)
     }
 
     pub fn get_source_policy_exclusion_manifest(
@@ -13243,6 +13289,31 @@ impl Storage {
         }
     }
 
+    /// Read one file record by its graph/file identity.
+    pub fn get_file_by_id(&self, file_id: i64) -> Result<Option<FileInfo>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, path, language, modification_time, indexed, complete, line_count, file_role
+                 FROM file
+                 WHERE id = ?1",
+                params![file_id],
+                |row| {
+                    Ok(FileInfo {
+                        id: row.get(0)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        language: row.get(2)?,
+                        modification_time: row.get(3)?,
+                        indexed: row.get::<_, i32>(4)? != 0,
+                        complete: row.get::<_, i32>(5)? != 0,
+                        line_count: row.get(6)?,
+                        file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     pub fn get_node_kinds_for_files(
         &self,
         file_ids: &[i64],
@@ -13854,6 +13925,26 @@ impl Storage {
             });
         }
         Ok(errors)
+    }
+
+    /// Read only the coverage reasons attached to one admitted file.
+    pub fn get_file_coverage_reasons(
+        &self,
+        file_id: i64,
+    ) -> Result<Vec<FileCoverageReason>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT coverage_reason
+             FROM error
+             WHERE file_id = ?1
+               AND coverage_reason IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let reason = row?;
+            FileCoverageReason::try_from(reason.as_str()).map_err(StorageError::from)
+        })
+        .collect()
     }
 
     /// Clear all errors

@@ -14,23 +14,27 @@ use codestory_agent::evidence_compiler::{
 };
 use codestory_contracts::api::{
     AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto,
-    EmbeddingVectorPublicationIdentityDto, NodeKind as ApiNodeKind, PACKET_DRILL_MAX_BYTES,
-    PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS, PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto,
-    PacketProbeResolutionDto, PacketProbeResolutionStatusDto, SourceCoverageObservationDto,
-    SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    EmbeddingVectorPublicationIdentityDto, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH,
+    PACKET_DRILL_MAX_HITS, PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto,
+    PacketProbeResolutionDto, PacketProbeResolutionStatusDto, SourceCoverageNotEstablishedCauseDto,
+    SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
+    decode_drill_option_id,
 };
 use codestory_contracts::compilation::{
     INTERIM_SOURCE_ROW_UPPER_BOUND, PACKET_COMPILATION_CONTRACT_VERSION_V1,
     PacketAdmissionGapKindV1, PacketAdmissionGapV1, PacketAdmissionOriginV1,
-    PacketCompilationInputV1, PacketCompilationPublicationV1, PacketContinuationSelectorV1,
-    PacketDirectedRelationV1, PacketHydratedSourceRangeV1, PacketIdentityAmbiguityV1,
-    PacketParserCompletenessV1, PacketRelationCertaintyV1, PacketRelationKindV1,
-    PacketStructuralGapReasonV1,
+    PacketAdmissionReceiptV1, PacketCompilationInputV1, PacketCompilationPublicationV1,
+    PacketContinuationSelectorV1, PacketDirectedRelationV1, PacketHydratedSourceRangeV1,
+    PacketIdentityAmbiguityV1, PacketParserCompletenessV1, PacketRelationCertaintyV1,
+    PacketRelationKindV1, PacketStructuralGapReasonV1,
 };
 use codestory_contracts::graph::{
-    EdgeKind as CoreEdgeKind, FileCoverageReason, NodeId as CoreNodeId, ResolutionCertainty,
+    EdgeKind as CoreEdgeKind, FileCoverageReason, Node as CoreNode, NodeId as CoreNodeId,
+    NodeKind as CoreNodeKind, ResolutionCertainty,
 };
+use codestory_store::{FileInfo, Store};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
 
@@ -52,17 +56,18 @@ pub(crate) fn freeze_packet_compilation(
 ) -> Result<FrozenPacketCompilationV1, codestory_contracts::api::ApiError> {
     let admissions = session.receipts();
     let mut admission_gaps = session.gaps();
-    let mut sources = hydrate_admitted_sources(controller, &admissions, &mut admission_gaps);
+    let storage = controller.open_storage_read_only()?;
+    let (admissions, mut sources) =
+        hydrate_admitted_sources(controller, &storage, &admissions, &mut admission_gaps)?;
     let source_paths = sources
         .iter()
         .map(|source| source.path.clone())
         .collect::<Vec<_>>();
-    let source_coverage =
-        crate::source_coverage::observe_source_coverage(controller, &source_paths);
+    let source_coverage = observe_admitted_source_coverage(controller, &storage, &source_paths);
     for source in &mut sources {
         source.parser_completeness = parser_completeness_for_path(&source.path, &source_coverage);
     }
-    let relations = hydrate_induced_relations(controller, &admissions)?;
+    let relations = hydrate_induced_relations(&storage, &admissions)?;
     let publication = PacketCompilationPublicationV1 {
         project_id: project_id.to_string(),
         core_generation_id: publication
@@ -105,58 +110,113 @@ pub(crate) fn apply_frozen_packet_compilation(
 
 fn hydrate_admitted_sources(
     controller: &AppController,
-    admissions: &[codestory_contracts::compilation::PacketAdmissionReceiptV1],
+    storage: &Store,
+    admissions: &[PacketAdmissionReceiptV1],
     admission_gaps: &mut Vec<PacketAdmissionGapV1>,
-) -> Vec<PacketHydratedSourceRangeV1> {
+) -> Result<
+    (
+        Vec<PacketAdmissionReceiptV1>,
+        Vec<PacketHydratedSourceRangeV1>,
+    ),
+    codestory_contracts::api::ApiError,
+> {
+    let project_root = controller.require_project_root()?;
+    let mut authenticated = Vec::new();
     let mut sources = Vec::new();
     for admission in admissions {
         let result = if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
-            hydrate_admitted_node_source(controller, admission, raw_id)
+            let Some(node) = authenticated_node(storage, raw_id)? else {
+                push_admission_gap(
+                    admission_gaps,
+                    admission,
+                    PacketAdmissionGapKindV1::StableIdentityMissing,
+                    false,
+                );
+                continue;
+            };
+            authenticated.push(admission.clone());
+            hydrate_admitted_node_source(controller, storage, admission, &node)
         } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
-            hydrate_admitted_path_source(controller, admission, path)
+            let Some(file) = find_admitted_file(storage, &project_root, path)? else {
+                push_admission_gap(
+                    admission_gaps,
+                    admission,
+                    PacketAdmissionGapKindV1::StableIdentityMissing,
+                    false,
+                );
+                continue;
+            };
+            authenticated.push(admission.clone());
+            hydrate_admitted_file_source(controller, admission, &file)
         } else {
-            Err(PacketAdmissionGapKindV1::StableIdentityMissing)
+            push_admission_gap(
+                admission_gaps,
+                admission,
+                PacketAdmissionGapKindV1::StableIdentityMissing,
+                false,
+            );
+            continue;
         };
         match result {
             Ok(source) => sources.push(source),
-            Err(kind) => admission_gaps.push(PacketAdmissionGapV1 {
-                kind,
-                stable_identity: Some(admission.stable_identity.clone()),
-                exact_selector_ordinal: (admission.origin
-                    == PacketAdmissionOriginV1::ExactTypedSelector)
-                    .then_some(admission.packet_ordinal),
-            }),
+            Err(kind) => push_admission_gap(admission_gaps, admission, kind, true),
         }
     }
-    sources
+    Ok((authenticated, sources))
+}
+
+fn push_admission_gap(
+    admission_gaps: &mut Vec<PacketAdmissionGapV1>,
+    admission: &PacketAdmissionReceiptV1,
+    kind: PacketAdmissionGapKindV1,
+    expose_authenticated_identity: bool,
+) {
+    admission_gaps.push(PacketAdmissionGapV1 {
+        kind,
+        stable_identity: expose_authenticated_identity.then(|| admission.stable_identity.clone()),
+        exact_selector_ordinal: (admission.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+            .then_some(admission.packet_ordinal),
+    });
+}
+
+fn authenticated_node(
+    storage: &Store,
+    raw_id: &str,
+) -> Result<Option<CoreNode>, codestory_contracts::api::ApiError> {
+    let Ok(node_id) = raw_id.parse::<i64>() else {
+        return Ok(None);
+    };
+    storage.get_node(CoreNodeId(node_id)).map_err(|error| {
+        codestory_contracts::api::ApiError::internal(format!(
+            "Failed to authenticate admitted packet node: {error}"
+        ))
+    })
 }
 
 fn hydrate_admitted_node_source(
     controller: &AppController,
-    admission: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
-    raw_id: &str,
+    storage: &Store,
+    admission: &PacketAdmissionReceiptV1,
+    node: &CoreNode,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
-    let details = controller
-        .node_details(codestory_contracts::api::NodeDetailsRequest {
-            id: codestory_contracts::api::NodeId(raw_id.to_string()),
-        })
-        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    if let Some(path) = file_node_source_path(
-        details.kind,
-        details.file_path.as_deref(),
-        &details.serialized_name,
-    ) {
-        return hydrate_admitted_path_source(controller, admission, path);
+    let file_id = if node.kind == CoreNodeKind::FILE {
+        node.id
+    } else {
+        node.file_node_id
+            .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?
+    };
+    let file = storage
+        .get_file_by_id(file_id.0)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if node.kind == CoreNodeKind::FILE {
+        return hydrate_admitted_file_source(controller, admission, &file);
     }
-    let path = details
-        .file_path
-        .as_deref()
-        .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
-    let (start_line, end_line) = valid_source_bounds(details.start_line, details.end_line)
+    let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
     let (_, bounded) = controller
         .bounded_file_snippet_range(
-            path,
+            &file.path.to_string_lossy(),
             BoundedSnippetRangeOptions {
                 focus_line: start_line,
                 start_line,
@@ -169,41 +229,32 @@ fn hydrate_admitted_node_source(
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
     hydrated_source(
         admission,
-        path,
-        Some(details.display_name),
+        &file.path.to_string_lossy(),
+        Some(
+            node.qualified_name
+                .clone()
+                .unwrap_or_else(|| node.serialized_name.clone()),
+        ),
         &bounded.markdown,
     )
 }
 
-fn file_node_source_path<'a>(
-    kind: ApiNodeKind,
-    file_path: Option<&'a str>,
-    serialized_name: &'a str,
-) -> Option<&'a str> {
-    (kind == ApiNodeKind::FILE)
-        .then(|| {
-            file_path
-                .filter(|path| !path.is_empty())
-                .unwrap_or(serialized_name)
-        })
-        .filter(|path| !path.is_empty())
-}
-
-fn hydrate_admitted_path_source(
+fn hydrate_admitted_file_source(
     controller: &AppController,
-    admission: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
-    path: &str,
+    admission: &PacketAdmissionReceiptV1,
+    file: &FileInfo,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    let path = file.path.to_string_lossy();
     let (_, bounded) = controller
         .bounded_file_snippet(
-            path,
+            &path,
             1,
             8,
             source_byte_cap(admission),
             COMPILER_SOURCE_TRUNCATION_SUFFIX,
         )
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    hydrated_source(admission, path, None, &bounded.markdown)
+    hydrated_source(admission, &path, None, &bounded.markdown)
 }
 
 fn hydrated_source(
@@ -228,10 +279,38 @@ fn hydrated_source(
     })
 }
 
-fn source_byte_cap(
-    admission: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
-) -> usize {
+fn source_byte_cap(admission: &PacketAdmissionReceiptV1) -> usize {
     (admission.reserved_source_bytes as usize).clamp(1, INTERIM_SOURCE_ROW_UPPER_BOUND)
+}
+
+fn find_admitted_file(
+    storage: &Store,
+    project_root: &Path,
+    path: &str,
+) -> Result<Option<FileInfo>, codestory_contracts::api::ApiError> {
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        let file = storage.get_file_by_path(&candidate).map_err(|error| {
+            codestory_contracts::api::ApiError::internal(format!(
+                "Failed to authenticate admitted packet path: {error}"
+            ))
+        })?;
+        if file.is_some() {
+            return Ok(file);
+        }
+    }
+    Ok(None)
+}
+
+fn admitted_file_lookup_paths(project_root: &Path, path: &str) -> Vec<PathBuf> {
+    let candidate = PathBuf::from(path);
+    let mut paths = vec![candidate.clone()];
+    if !candidate.is_absolute() {
+        let joined = project_root.join(candidate);
+        if !paths.contains(&joined) {
+            paths.push(joined);
+        }
+    }
+    paths
 }
 
 fn valid_source_bounds(start_line: Option<u32>, end_line: Option<u32>) -> Option<(u32, u32)> {
@@ -260,6 +339,104 @@ fn source_receipt_line_range(markdown: &str) -> Option<(u32, u32)> {
     start.zip(end)
 }
 
+fn observe_admitted_source_coverage(
+    controller: &AppController,
+    storage: &Store,
+    paths: &[String],
+) -> Vec<SourceCoverageObservationDto> {
+    let Ok(project_root) = controller.require_project_root() else {
+        return paths
+            .iter()
+            .map(|path| source_coverage_not_established(path))
+            .collect();
+    };
+    let mut seen = BTreeSet::new();
+    paths
+        .iter()
+        .filter(|path| seen.insert(packet_display_path(path)))
+        .map(|path| {
+            observe_one_admitted_source_coverage(storage, &project_root, path)
+                .unwrap_or_else(|_| source_coverage_not_established(path))
+        })
+        .collect()
+}
+
+fn observe_one_admitted_source_coverage(
+    storage: &Store,
+    project_root: &Path,
+    path: &str,
+) -> Result<SourceCoverageObservationDto, codestory_store::StorageError> {
+    let mut file = None;
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        if let Some(found) = storage.get_file_by_path(&candidate)? {
+            file = Some(found);
+            break;
+        }
+    }
+    let Some(file) = file else {
+        return Ok(source_coverage_not_established(path));
+    };
+    let relative_path = codestory_workspace::workspace_relative_path(project_root, &file.path)
+        .unwrap_or_else(|| file.path.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
+    if storage.has_source_policy_exclusion_path(&relative_path)? {
+        return Ok(SourceCoverageObservationDto {
+            path: path.to_string(),
+            status: SourceCoverageStatusDto::PolicyExcluded,
+            reason: None,
+            not_established_cause: None,
+            observed_size: None,
+            byte_cap: None,
+        });
+    }
+
+    let verified_source = storage.get_file_content_hash(file.id)?.is_some();
+    let structural_projection = if file.language == "openapi" {
+        storage.has_file_owned_openapi_endpoint_projection(file.id)?
+    } else if codestory_indexer::structural::is_structural_candidate_path(&file.path) {
+        storage.has_structural_text_projection_for_file(file.id)?
+    } else {
+        true
+    };
+    let errors = storage.get_file_coverage_reasons(file.id)?;
+    let reason = if !file.complete || !file.indexed || !verified_source || !structural_projection {
+        errors
+            .first()
+            .copied()
+            .or_else(|| {
+                (file.indexed && verified_source && !file.complete)
+                    .then_some(FileCoverageReason::ParserPartial)
+            })
+            .or(Some(FileCoverageReason::CollectorFailure))
+    } else {
+        None
+    };
+    Ok(SourceCoverageObservationDto {
+        path: path.to_string(),
+        status: if reason.is_some() {
+            SourceCoverageStatusDto::Incomplete
+        } else {
+            SourceCoverageStatusDto::Indexed
+        },
+        reason,
+        not_established_cause: None,
+        observed_size: None,
+        byte_cap: None,
+    })
+}
+
+fn source_coverage_not_established(path: &str) -> SourceCoverageObservationDto {
+    SourceCoverageObservationDto {
+        path: path.to_string(),
+        status: SourceCoverageStatusDto::NotEstablished,
+        reason: None,
+        not_established_cause: Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable),
+        observed_size: None,
+        byte_cap: None,
+    }
+}
+
 fn parser_completeness_for_path(
     path: &str,
     source_coverage: &[SourceCoverageObservationDto],
@@ -278,8 +455,8 @@ fn parser_completeness_for_path(
 }
 
 fn hydrate_induced_relations(
-    controller: &AppController,
-    admissions: &[codestory_contracts::compilation::PacketAdmissionReceiptV1],
+    storage: &Store,
+    admissions: &[PacketAdmissionReceiptV1],
 ) -> Result<Vec<PacketDirectedRelationV1>, codestory_contracts::api::ApiError> {
     let node_ids = admissions
         .iter()
@@ -290,7 +467,6 @@ fn hydrate_induced_relations(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let storage = controller.open_storage_read_only()?;
     storage
         .get_certain_edge_representatives_between_node_ids(&node_ids)
         .map_err(|error| {
@@ -581,20 +757,33 @@ mod tests {
     }
 
     #[test]
-    fn file_nodes_use_their_indexed_path_without_fabricating_symbol_bounds() {
-        assert_eq!(
-            file_node_source_path(ApiNodeKind::FILE, None, "src/lib.rs"),
-            Some("src/lib.rs")
+    fn public_symbol_identity_requires_a_node_in_the_pinned_core() {
+        let mut storage = Store::new_in_memory().expect("store");
+        assert!(
+            authenticated_node(&storage, "not-an-id")
+                .expect("invalid identities are rejected")
+                .is_none()
         );
-        assert_eq!(
-            file_node_source_path(ApiNodeKind::FILE, Some("src/canonical.rs"), "src/stale.rs"),
-            Some("src/canonical.rs")
+        assert!(
+            authenticated_node(&storage, "-42")
+                .expect("missing identities are rejected")
+                .is_none()
         );
+        storage
+            .insert_nodes_batch(&[CoreNode {
+                id: CoreNodeId(-42),
+                kind: CoreNodeKind::FUNCTION,
+                serialized_name: "crate::real".into(),
+                ..Default::default()
+            }])
+            .expect("insert authenticated node");
         assert_eq!(
-            file_node_source_path(ApiNodeKind::FUNCTION, None, "run"),
-            None
+            authenticated_node(&storage, "-42")
+                .expect("lookup")
+                .expect("authenticated node")
+                .id,
+            CoreNodeId(-42)
         );
-        assert_eq!(file_node_source_path(ApiNodeKind::FILE, None, ""), None);
     }
 
     #[test]

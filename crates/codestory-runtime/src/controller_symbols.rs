@@ -381,11 +381,13 @@ impl AppController {
     /// descriptor-only; source and graph evidence may be opened only after the
     /// packet-wide admission session is sealed.
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        agent::retrieval_primary::with_stable_packet_retrieval_publication(
-            self,
-            "packet output",
-            || agent::agent_packet(self, req.clone()),
-        )
+        self.with_complete_core_snapshot(|_| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                || agent::agent_packet(self, req.clone()),
+            )
+        })
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {

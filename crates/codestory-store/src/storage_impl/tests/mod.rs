@@ -8943,6 +8943,71 @@ fn induced_certain_edge_representatives_keep_connectors_after_dense_early_edges(
 }
 
 #[test]
+fn induced_certain_edge_representatives_preserve_distinct_kinds_for_one_pair()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "source".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::MEMBER,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+    ])?;
+
+    let selected =
+        storage.get_certain_edge_representatives_between_node_ids(&[NodeId(1), NodeId(2)])?;
+    assert_eq!(selected.len(), 2);
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .count(),
+        1
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn file_error_replacement_deletes_the_unique_file_set_with_a_batched_predicate()
 -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
