@@ -1,137 +1,235 @@
-//! Finalize the bounded Horizon A packet without answer-planning policy.
+//! Runtime adapter for the pure repository-derived packet compiler.
 //!
-//! Retrieval, typed-probe resolution, descriptor admission, and exact
-//! hydration have already run. This interim boundary retains that evidence and
-//! converts objective admission or ambiguity gaps into stable continuations.
-//! Repository-derived selection belongs to Horizon B (`#2106`).
+//! Runtime owns publication checks and converts pinned repository records into
+//! [`PacketCompilationInputV1`]. Selection itself lives in
+//! `codestory-agent` and cannot see the question.
 
 use crate::agent::packet_candidate::{PacketProofSession, active_packet_proof_session};
 use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_scoring::packet_display_path;
+use codestory_agent::evidence_compiler::compile_repository_evidence;
 use codestory_contracts::api::{
     AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto,
-    PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    GraphArtifactDto, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
     PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto, PacketProbeResolutionStatusDto,
-    SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
+    decode_drill_option_id,
 };
 use codestory_contracts::compilation::{
-    PacketAdmissionGapKindV1, PacketAdmissionReceiptV1, PacketContinuationSelectorV1,
-    PacketStructuralGapReasonV1,
+    PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketAdmissionGapKindV1, PacketAdmissionGapV1,
+    PacketAdmissionOriginV1, PacketCompilationInputV1, PacketCompilationPublicationV1,
+    PacketContinuationSelectorV1, PacketDirectedRelationV1, PacketHydratedSourceRangeV1,
+    PacketIdentityAmbiguityV1, PacketParserCompletenessV1, PacketRelationCertaintyV1,
+    PacketRelationKindV1, PacketStructuralGapReasonV1,
 };
 use codestory_contracts::graph::FileCoverageReason;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
-pub fn finalize_interim_packet_evidence(
+pub fn apply_compiled_evidence_for_project(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
-    _project_id: &str,
+    project_id: &str,
+    relations: Vec<PacketDirectedRelationV1>,
 ) {
     let session = active_packet_proof_session();
-    if let Some(session) = session.as_deref() {
-        order_support_by_admission(&mut packet.support, &session.receipts());
-    }
-    let continuation = interim_continuations(packet, session.as_deref());
-    let publication = packet.answer.retrieval_trace.retrieval_publication.as_ref();
+    let input = packet_compilation_input(packet, project_id, session.as_deref(), relations);
+    let compiled = compile_repository_evidence(&input);
+    packet.support = compiled.support;
     packet.disposition = classify_packet_disposition(
         packet,
         request,
-        &continuation,
-        publication
-            .map(|publication| publication.core_generation_id.clone())
-            .unwrap_or_default(),
-        publication.map(|publication| publication.retrieval_generation.clone()),
+        &compiled.continuation,
+        input.publication.core_generation_id,
+        input.publication.retrieval_generation,
     );
 }
 
-fn order_support_by_admission(
-    support: &mut [SupportUnitDto],
-    admissions: &[PacketAdmissionReceiptV1],
-) {
-    let ordinals = admissions
-        .iter()
-        .map(|admission| (admission.stable_identity.as_str(), admission.packet_ordinal))
-        .collect::<HashMap<_, _>>();
-    support.sort_by_key(|unit| {
-        unit.symbol_id
-            .as_deref()
-            .and_then(|id| ordinals.get(format!("node:{id}").as_str()).copied())
-            .or_else(|| {
-                unit.path.as_deref().and_then(|path| {
-                    let path = packet_display_path(path);
-                    ordinals.get(format!("path:{path}").as_str()).copied()
-                })
-            })
-            .unwrap_or(u32::MAX)
-    });
-}
-
-fn interim_continuations(
+fn packet_compilation_input(
     packet: &AgentPacketDto,
+    project_id: &str,
     session: Option<&PacketProofSession>,
-) -> Vec<PacketContinuationSelectorV1> {
-    let mut continuation = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    if let Some(session) = session {
-        for gap in session.gaps() {
-            let Some(stable_identity) = gap.stable_identity else {
-                continue;
-            };
-            let reason = match gap.kind {
-                PacketAdmissionGapKindV1::CandidateCountExceeded => {
-                    PacketStructuralGapReasonV1::CandidateCountExceeded
-                }
-                PacketAdmissionGapKindV1::SourceBudgetExceeded => {
-                    PacketStructuralGapReasonV1::SourceBudgetExceeded
-                }
-                PacketAdmissionGapKindV1::StableIdentityMissing
-                | PacketAdmissionGapKindV1::SourceBoundMissing
-                | PacketAdmissionGapKindV1::SourceUnavailable => {
-                    PacketStructuralGapReasonV1::SourceUnavailable
-                }
-            };
-            push_continuation(&mut continuation, &mut seen, stable_identity, reason);
+    relations: Vec<PacketDirectedRelationV1>,
+) -> PacketCompilationInputV1 {
+    let publication = packet.answer.retrieval_trace.retrieval_publication.as_ref();
+    let mut admission_gaps = session.map(PacketProofSession::gaps).unwrap_or_default();
+    let admissions = session
+        .map(PacketProofSession::receipts)
+        .unwrap_or_default();
+    let sources = hydrated_sources(&packet.support, &packet.answer.source_coverage, &admissions);
+    let source_identities = sources
+        .iter()
+        .map(|source| source.stable_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    for admission in admissions
+        .iter()
+        .filter(|admission| admission.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+    {
+        if !source_identities.contains(admission.stable_identity.as_str()) {
+            admission_gaps.push(PacketAdmissionGapV1 {
+                kind: PacketAdmissionGapKindV1::SourceUnavailable,
+                stable_identity: Some(admission.stable_identity.clone()),
+                exact_selector_ordinal: Some(admission.packet_ordinal),
+            });
         }
     }
 
-    for resolution in packet
+    PacketCompilationInputV1 {
+        contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+        publication: PacketCompilationPublicationV1 {
+            project_id: project_id.to_string(),
+            core_generation_id: publication
+                .map(|publication| publication.core_generation_id.clone())
+                .unwrap_or_default(),
+            retrieval_generation: publication
+                .map(|publication| publication.retrieval_generation.clone()),
+        },
+        relations,
+        ambiguities: probe_ambiguities(packet),
+        admissions,
+        sources,
+        admission_gaps,
+    }
+}
+
+fn hydrated_sources(
+    support: &[SupportUnitDto],
+    source_coverage: &[SourceCoverageObservationDto],
+    admissions: &[codestory_contracts::compilation::PacketAdmissionReceiptV1],
+) -> Vec<PacketHydratedSourceRangeV1> {
+    support
+        .iter()
+        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
+        .filter_map(|unit| {
+            let path = unit.path.as_deref().map(packet_display_path)?;
+            let source = unit.snippet.clone()?;
+            let stable_identity = support_stable_identity(unit, &path, admissions)?;
+            let parser_completeness = source_coverage
+                .iter()
+                .find(|observation| packet_display_path(&observation.path) == path)
+                .map(|observation| match observation.status {
+                    SourceCoverageStatusDto::Indexed => PacketParserCompletenessV1::Complete,
+                    SourceCoverageStatusDto::Incomplete => PacketParserCompletenessV1::Partial,
+                    SourceCoverageStatusDto::PolicyExcluded
+                    | SourceCoverageStatusDto::NotEstablished => {
+                        PacketParserCompletenessV1::Unknown
+                    }
+                })
+                .unwrap_or(PacketParserCompletenessV1::Unknown);
+            Some(PacketHydratedSourceRangeV1 {
+                stable_identity,
+                path,
+                symbol: (!unit.summary.is_empty()).then_some(unit.summary.clone()),
+                start_line: unit.start_line.unwrap_or(1),
+                end_line: unit.end_line.or(unit.start_line).unwrap_or(1),
+                source,
+                parser_completeness,
+            })
+        })
+        .collect()
+}
+
+fn support_stable_identity(
+    unit: &SupportUnitDto,
+    path: &str,
+    admissions: &[codestory_contracts::compilation::PacketAdmissionReceiptV1],
+) -> Option<String> {
+    if let Some(symbol_id) = unit.symbol_id.as_deref() {
+        for candidate in [symbol_id.to_string(), format!("node:{symbol_id}")] {
+            if admissions
+                .iter()
+                .any(|admission| admission.stable_identity == candidate)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    admissions
+        .iter()
+        .find(|admission| admission.stable_identity == format!("path:{path}"))
+        .map(|admission| admission.stable_identity.clone())
+}
+
+pub(crate) fn directed_relations_from_graphs(
+    graphs: &[GraphArtifactDto],
+    admissions: &[codestory_contracts::compilation::PacketAdmissionReceiptV1],
+) -> Vec<PacketDirectedRelationV1> {
+    let admitted = admissions
+        .iter()
+        .map(|admission| admission.stable_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut relations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for artifact in graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        for edge in &graph.edges {
+            let from_identity = format!("node:{}", edge.source.0);
+            let to_identity = format!("node:{}", edge.target.0);
+            if !admitted.contains(from_identity.as_str())
+                || !admitted.contains(to_identity.as_str())
+            {
+                continue;
+            }
+            if !seen.insert(edge.id.0.clone()) {
+                continue;
+            }
+            relations.push(PacketDirectedRelationV1 {
+                relation_id: edge.id.0.clone(),
+                from_identity,
+                to_identity,
+                relation_kind: packet_relation_kind(edge.kind),
+                certainty: relation_certainty(edge.certainty.as_deref(), edge.confidence),
+            });
+        }
+    }
+    relations
+}
+
+fn packet_relation_kind(kind: codestory_contracts::api::EdgeKind) -> PacketRelationKindV1 {
+    use codestory_contracts::api::EdgeKind;
+    match kind {
+        EdgeKind::MEMBER => PacketRelationKindV1::Member,
+        EdgeKind::TYPE_USAGE => PacketRelationKindV1::TypeUsage,
+        EdgeKind::USAGE => PacketRelationKindV1::Usage,
+        EdgeKind::CALL => PacketRelationKindV1::Call,
+        EdgeKind::INHERITANCE => PacketRelationKindV1::Inheritance,
+        EdgeKind::OVERRIDE => PacketRelationKindV1::Override,
+        EdgeKind::TYPE_ARGUMENT => PacketRelationKindV1::TypeArgument,
+        EdgeKind::TEMPLATE_SPECIALIZATION => PacketRelationKindV1::TemplateSpecialization,
+        EdgeKind::INCLUDE => PacketRelationKindV1::Include,
+        EdgeKind::IMPORT => PacketRelationKindV1::Import,
+        EdgeKind::MACRO_USAGE => PacketRelationKindV1::MacroUsage,
+        EdgeKind::ANNOTATION_USAGE => PacketRelationKindV1::AnnotationUsage,
+        EdgeKind::UNKNOWN => PacketRelationKindV1::Unknown,
+    }
+}
+
+fn relation_certainty(label: Option<&str>, _confidence: Option<f32>) -> PacketRelationCertaintyV1 {
+    match label {
+        Some("certain") => PacketRelationCertaintyV1::Certain,
+        Some("probable") => PacketRelationCertaintyV1::Probable,
+        Some("uncertain") => PacketRelationCertaintyV1::Uncertain,
+        _ => PacketRelationCertaintyV1::Unknown,
+    }
+}
+
+fn probe_ambiguities(packet: &AgentPacketDto) -> Vec<PacketIdentityAmbiguityV1> {
+    packet
         .plan
         .probe_resolutions
         .iter()
         .filter(|resolution| resolution.status == PacketProbeResolutionStatusDto::Ambiguous)
-    {
-        for candidate in &resolution.candidates {
-            push_continuation(
-                &mut continuation,
-                &mut seen,
-                format!("node:{}", candidate.symbol_id),
-                PacketStructuralGapReasonV1::AmbiguousSelector,
-            );
-        }
-    }
-
-    continuation
-}
-
-fn push_continuation(
-    continuation: &mut Vec<PacketContinuationSelectorV1>,
-    seen: &mut BTreeSet<String>,
-    stable_identity: String,
-    reason: PacketStructuralGapReasonV1,
-) {
-    let key = format!("{reason:?}:{stable_identity}");
-    if !seen.insert(key) {
-        return;
-    }
-    let path = stable_identity.strip_prefix("path:").map(str::to_string);
-    let symbol_id = stable_identity.strip_prefix("node:").map(str::to_string);
-    continuation.push(PacketContinuationSelectorV1 {
-        stable_identity,
-        path,
-        symbol_id,
-        reason,
-    });
+        .map(|resolution| PacketIdentityAmbiguityV1 {
+            selector: format!("probe:{}", resolution.input_index),
+            candidate_identities: resolution
+                .candidates
+                .iter()
+                .map(|candidate| format!("node:{}", candidate.symbol_id))
+                .collect(),
+        })
+        .collect()
 }
 
 fn classify_packet_disposition(
@@ -313,6 +411,8 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::{EdgeId, EdgeKind, GraphEdgeDto, GraphResponse, NodeId};
+    use codestory_contracts::compilation::{PacketAdmissionOriginV1, PacketAdmissionReceiptV1};
 
     #[test]
     fn unknown_query_continuations_are_not_decoded() {
@@ -329,20 +429,132 @@ mod tests {
     }
 
     #[test]
-    fn admission_gaps_map_to_typed_structural_reasons() {
-        let mut continuation = Vec::new();
-        let mut seen = BTreeSet::new();
-        push_continuation(
-            &mut continuation,
-            &mut seen,
-            "path:src/lib.rs".into(),
-            PacketStructuralGapReasonV1::SourceBudgetExceeded,
-        );
-        assert_eq!(continuation.len(), 1);
-        assert_eq!(continuation[0].path.as_deref(), Some("src/lib.rs"));
+    fn uncertain_relation_is_not_compiler_evidence() {
         assert_eq!(
-            continuation[0].reason,
-            PacketStructuralGapReasonV1::SourceBudgetExceeded
+            relation_certainty(Some("uncertain"), Some(0.99)),
+            PacketRelationCertaintyV1::Uncertain
+        );
+    }
+
+    #[test]
+    fn numeric_confidence_cannot_upgrade_missing_certainty() {
+        assert_eq!(
+            relation_certainty(None, Some(0.99)),
+            PacketRelationCertaintyV1::Unknown
+        );
+    }
+
+    #[test]
+    fn adapter_forwards_every_admitted_hydrated_source_and_no_unadmitted_source() {
+        let admissions = (0..16)
+            .map(|index| PacketAdmissionReceiptV1 {
+                packet_ordinal: index,
+                stable_identity: format!("node:{index}"),
+                score_version: "retrieval-score/v1".into(),
+                reserved_source_bytes: 32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            })
+            .collect::<Vec<_>>();
+        let mut support = (0..16)
+            .map(|index| SupportUnitDto {
+                id: format!("source-{index}"),
+                kind: SupportUnitKindDto::SourceRange,
+                summary: format!("symbol-{index}"),
+                path: Some(format!("src/{index}.rs")),
+                symbol_id: Some(index.to_string()),
+                start_line: Some(1),
+                end_line: Some(1),
+                snippet: Some(format!("fn symbol_{index}() {{}}")),
+                edge_kind: None,
+                from_symbol: None,
+                to_symbol: None,
+                query: None,
+            })
+            .collect::<Vec<_>>();
+        support.push(SupportUnitDto {
+            id: "source-unadmitted".into(),
+            kind: SupportUnitKindDto::SourceRange,
+            summary: "unadmitted".into(),
+            path: Some("src/unadmitted.rs".into()),
+            symbol_id: Some("unadmitted".into()),
+            start_line: Some(1),
+            end_line: Some(1),
+            snippet: Some("fn unadmitted() {}".into()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        });
+
+        let hydrated = hydrated_sources(&support, &[], &admissions);
+        assert_eq!(hydrated.len(), 16);
+        assert!(
+            hydrated
+                .iter()
+                .all(|source| source.stable_identity.starts_with("node:"))
+        );
+        assert!(
+            hydrated
+                .iter()
+                .all(|source| source.path != "src/unadmitted.rs")
+        );
+    }
+
+    #[test]
+    fn compiler_relation_capture_precedes_presentation_edge_caps() {
+        let admissions = (0..16)
+            .map(|index| PacketAdmissionReceiptV1 {
+                packet_ordinal: index,
+                stable_identity: format!("node:{index}"),
+                score_version: "retrieval-score/v1".into(),
+                reserved_source_bytes: 32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            })
+            .collect::<Vec<_>>();
+        let mut edges = (0..20)
+            .map(|index| GraphEdgeDto {
+                id: EdgeId(format!("a-dense-{index:02}")),
+                source: NodeId("0".into()),
+                target: NodeId("0".into()),
+                kind: EdgeKind::CALL,
+                confidence: Some(1.0),
+                certainty: Some("certain".into()),
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        edges.extend((1..16).map(|index| GraphEdgeDto {
+            id: EdgeId(format!("z-connect-{index:02}")),
+            source: NodeId((index - 1).to_string()),
+            target: NodeId(index.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".into()),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        }));
+        let graphs = vec![GraphArtifactDto::Uml {
+            id: "graph".into(),
+            title: "graph".into(),
+            graph: GraphResponse {
+                center_id: NodeId("0".into()),
+                nodes: Vec::new(),
+                edges,
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+
+        let captured = directed_relations_from_graphs(&graphs, &admissions);
+        assert_eq!(captured.len(), 35);
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|relation| relation.relation_id.starts_with("z-connect-"))
+                .count(),
+            15,
+            "dense early edge IDs must not hide the admitted-seed connecting forest"
         );
     }
 }

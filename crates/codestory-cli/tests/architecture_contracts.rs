@@ -593,8 +593,9 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 17] = [
+const AGENT_PLANNING_MODULES: [&str; 18] = [
     "citation.rs",
+    "evidence_compiler.rs",
     "packet_citations.rs",
     "packet_command.rs",
     "packet_coverage.rs",
@@ -626,29 +627,72 @@ const AGENT_PLANNING_MODULES: [&str; 17] = [
 const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
 
 #[test]
-fn horizon_a_exposes_only_prompt_blind_seed_planning_and_admission() {
+fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
-        !agent_lib.contains("pub mod evidence_compiler;"),
-        "the Horizon B compiler must not enter the Horizon A product graph"
+        agent_lib.contains("pub mod evidence_compiler;"),
+        "the repository-derived evidence compiler must compile in the public product graph"
+    );
+    assert!(
+        AGENT_PLANNING_MODULES.contains(&"evidence_compiler.rs"),
+        "the evidence compiler must count as a production planning module"
     );
     let contracts = read("crates/codestory-contracts/src/compilation.rs");
     for required in [
+        "RetrievalSeedPlanV1",
         "PacketCandidateDescriptorV1",
         "PacketAdmissionReceiptV1",
-        "PacketContinuationSelectorV1",
+        "PacketCompilationInputV1",
     ] {
         assert!(
             contracts.contains(required),
-            "the typed Horizon A admission boundary lost {required}"
+            "the typed compiler boundary lost {required}"
         );
     }
-    for deferred in ["RetrievalSeedPlanV1", "PacketCompilationInputV1"] {
+    let compiler_input = source_between(
+        &contracts,
+        "pub struct PacketCompilationInputV1",
+        "pub enum PacketStructuralGapReasonV1",
+    );
+    for forbidden in [
+        "pub question:",
+        "pub prompt:",
+        "task_class",
+        "obligation",
+        "coverage_role",
+        "carrier",
+        "sufficiency",
+    ] {
         assert!(
-            !contracts.contains(deferred),
-            "Horizon B contract {deferred} entered Horizon A"
+            !compiler_input.contains(forbidden),
+            "PacketCompilationInputV1 regained forbidden prompt policy: {forbidden}"
         );
     }
+    let compiler = read("crates/codestory-agent/src/evidence_compiler.rs");
+    for forbidden in [
+        "RetrievalSeedPlanV1",
+        "AgentPacketRequestDto",
+        "PacketPlanDto",
+    ] {
+        assert!(
+            !compiler.contains(forbidden),
+            "the pure evidence compiler regained request/planning input: {forbidden}"
+        );
+    }
+    let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
+    let source_capture = orchestrator
+        .find("let source_support = append_packet_source_evidence")
+        .expect("runtime captures admitted source for the compiler");
+    let relation_capture = orchestrator
+        .find("directed_relations_from_graphs(&answer.graphs")
+        .expect("runtime captures admitted relations for the compiler");
+    let presentation_cap = orchestrator
+        .find("let budget = apply_packet_budget")
+        .expect("runtime applies the presentation budget");
+    assert!(
+        source_capture < presentation_cap && relation_capture < presentation_cap,
+        "legacy presentation capping must not select compiler source or graph evidence"
+    );
     let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
     let packet_request = source_between(
         &current_dto,

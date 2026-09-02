@@ -136,7 +136,7 @@ plugin package to locate a documented field or excerpt.
   IDs from `publication`. Then answer from the combined evidence and the
   continuation result's remaining gaps. A first-pass continuation-required gap
   is resolved when it is absent from that result; retain other first-pass gaps
-  only when the continuation still reports them. The bounded packet
+  only when the continuation still reports them. The bounded compiler
   continuation is distinct from ordinary exact navigation after the packet.
 - `no_useful_evidence` and `unavailable` describe the packet result, not the
   repository. Preserve that outcome while using exact navigation when it can

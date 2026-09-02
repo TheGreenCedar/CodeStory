@@ -11,7 +11,7 @@ use codestory_contracts::api::{
     PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
     SearchHitOrigin,
 };
-use codestory_contracts::compilation::PacketContinuationSelectorV1;
+use codestory_contracts::compilation::{PacketContinuationSelectorV1, PacketSeedSelectorV1};
 use codestory_workspace::{
     ProjectRelativePathResolution, project_identity_v3, resolve_project_relative_path,
 };
@@ -29,6 +29,25 @@ pub(crate) fn unresolved_packet_probe_queries(probes: &[PacketProbeDto]) -> Vec<
             _ => None,
         })
         .filter(|query| !query.trim().is_empty())
+        .collect()
+}
+
+pub(crate) fn probes_from_seed_selectors(
+    selectors: &[PacketSeedSelectorV1],
+) -> Vec<PacketProbeDto> {
+    selectors
+        .iter()
+        .map(|selector| match selector {
+            PacketSeedSelectorV1::ExactPath { path } => {
+                PacketProbeDto::ExactPath { path: path.clone() }
+            }
+            PacketSeedSelectorV1::CanonicalId { id } => PacketProbeDto::SymbolId {
+                id: id.strip_prefix("node:").unwrap_or(id).to_string(),
+            },
+            PacketSeedSelectorV1::QualifiedSymbol { symbol } => PacketProbeDto::QualifiedSymbol {
+                symbol: symbol.clone(),
+            },
+        })
         .collect()
 }
 
@@ -780,6 +799,33 @@ mod tests {
         assert_eq!(
             unresolved_packet_probe_queries(&probes),
             ["publication recovery"]
+        );
+    }
+
+    #[test]
+    fn seed_selectors_convert_without_textual_reinterpretation() {
+        let selectors = vec![
+            PacketSeedSelectorV1::ExactPath {
+                path: "src/lib.rs".into(),
+            },
+            PacketSeedSelectorV1::CanonicalId {
+                id: "node:7".into(),
+            },
+            PacketSeedSelectorV1::QualifiedSymbol {
+                symbol: "crate::run".into(),
+            },
+        ];
+        assert_eq!(
+            probes_from_seed_selectors(&selectors),
+            vec![
+                PacketProbeDto::ExactPath {
+                    path: "src/lib.rs".into(),
+                },
+                PacketProbeDto::SymbolId { id: "7".into() },
+                PacketProbeDto::QualifiedSymbol {
+                    symbol: "crate::run".into(),
+                },
+            ]
         );
     }
 

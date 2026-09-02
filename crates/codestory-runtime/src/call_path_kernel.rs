@@ -5634,8 +5634,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let root = complete_root(&integration);
-        root
+        complete_root(&integration)
     }
 
     #[test]

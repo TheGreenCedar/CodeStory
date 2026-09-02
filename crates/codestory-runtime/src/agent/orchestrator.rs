@@ -6,13 +6,17 @@ use crate::agent::packet_budget::{
 use crate::agent::packet_candidate::{
     PacketProofSession, PacketSearchHit, install_packet_proof_session,
 };
-use crate::agent::packet_compiler::{drill_options_from_ids, finalize_interim_packet_evidence};
+use crate::agent::packet_compiler::{
+    apply_compiled_evidence_for_project, directed_relations_from_graphs, drill_options_from_ids,
+};
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
-use crate::agent::packet_plan::{build_packet_plan_with_extra, packet_plan_annotation};
+use crate::agent::packet_plan::{
+    build_packet_plan_from_seed_plan, build_retrieval_seed_plan, packet_plan_annotation,
+};
 use crate::agent::packet_probe::{
     exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
-    resolve_packet_probes, unresolved_packet_probe_queries,
+    probes_from_seed_selectors, resolve_packet_probes, unresolved_packet_probe_queries,
 };
 use crate::agent::packet_scoring::{packet_display_path, packet_stage_citation_carry_limit};
 use crate::agent::packet_terms::prompt_search_terms;
@@ -337,6 +341,7 @@ pub(crate) fn agent_packet(
     }
     let is_drill_continuation = req.parent_packet_id.is_some() || !req.option_ids.is_empty();
     let free_queries = unresolved_packet_probe_queries(&req.probes);
+    let seed_plan = build_retrieval_seed_plan(&question, &free_queries);
     let mut probes = normalize_packet_probe_request(&req.probes);
     for option in drill_options_from_ids(&req.option_ids) {
         if let Some(path) = option.path {
@@ -345,11 +350,18 @@ pub(crate) fn agent_packet(
             probes.push(PacketProbeDto::SymbolId { id: symbol_id });
         }
     }
+    for probe in probes_from_seed_selectors(&seed_plan.exact_selectors) {
+        if !probes.contains(&probe) {
+            probes.push(probe);
+        }
+    }
     let probe_resolutions = resolve_packet_probes(controller, probes);
-    let mut plan = build_packet_plan_with_extra(&question, req.budget, &free_queries);
+    let mut plan = build_packet_plan_from_seed_plan(&seed_plan, req.budget);
     plan.probe_resolutions = probe_resolutions;
     let mut descriptor_queries = Vec::new();
-    for query in std::iter::once(question.as_str()).chain(free_queries.iter().map(String::as_str)) {
+    for query in std::iter::once(seed_plan.generic_query.as_str())
+        .chain(seed_plan.free_queries.iter().map(String::as_str))
+    {
         let query = query.trim();
         if !query.is_empty()
             && !descriptor_queries
@@ -455,18 +467,13 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
-    let phase_started = Instant::now();
-    let budget = apply_packet_budget(
-        &project_root,
-        &question,
-        req.budget,
-        limits.clone(),
-        &mut answer,
-    );
-    append_packet_non_trace_phase(&mut answer, "budget", phase_started);
 
-    // Hydrate deterministic bounded source only after identity admission.
-    let source_support = append_packet_source_evidence(controller, &mut answer, &limits);
+    // Capture admitted repository evidence before presentation-only capping.
+    // The pure compiler, rather than legacy graph/citation budgets, decides
+    // which source ranges and directed edges enter the public packet.
+    let source_support = append_packet_source_evidence(controller, &mut answer);
+    let compilation_relations =
+        directed_relations_from_graphs(&answer.graphs, &proof_session.receipts());
 
     // Coverage belongs only to exact selectors and deterministic source reads
     // that survived admission. Prompt-ranked citations have no authority here.
@@ -490,6 +497,16 @@ pub(crate) fn agent_packet(
     answer.source_coverage.retain(|observation| {
         retained_coverage_paths.contains(&packet_display_path(&observation.path))
     });
+
+    let phase_started = Instant::now();
+    let budget = apply_packet_budget(
+        &project_root,
+        &question,
+        req.budget,
+        limits.clone(),
+        &mut answer,
+    );
+    append_packet_non_trace_phase(&mut answer, "budget", phase_started);
 
     let phase_started = Instant::now();
     append_packet_evidence_sections(&mut answer, &limits);
@@ -544,7 +561,12 @@ pub(crate) fn agent_packet(
             .push(RetrievalAnnotationDto::observation(diagnostic));
         enforce_packet_output_budget(&project_root, &mut packet);
     }
-    finalize_interim_packet_evidence(&mut packet, Some(&req), &project_id);
+    apply_compiled_evidence_for_project(
+        &mut packet,
+        Some(&req),
+        &project_id,
+        compilation_relations,
+    );
     enforce_packet_output_budget(&project_root, &mut packet);
 
     Ok(packet)
@@ -757,16 +779,19 @@ fn truncate_packet_source(body: &str, max_bytes: usize) -> &str {
 fn append_packet_source_evidence(
     controller: &AppController,
     answer: &mut AgentAnswerDto,
-    limits: &PacketBudgetLimitsDto,
 ) -> Vec<SupportUnitDto> {
-    if answer.citations.is_empty() || limits.max_snippets == 0 {
+    if answer.citations.is_empty() {
         return Vec::new();
     }
 
     let mut rendered = String::new();
     let mut source_support = Vec::new();
     let mut steps = Vec::new();
-    for citation in answer.citations.iter().take(limits.max_snippets as usize) {
+    for citation in answer
+        .citations
+        .iter()
+        .take(INTERIM_MAX_ADMITTED_CANDIDATES)
+    {
         let started = Instant::now();
         let Some(source) = repository_source_range(controller, citation) else {
             continue;

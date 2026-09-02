@@ -1,11 +1,17 @@
-//! Prompt-blind Horizon A packet seed planning.
+//! Pure packet seed planning.
 //!
-//! Ordinary wording is forwarded unchanged to generic retrieval. Typed
-//! free-query probes may add retrieval queries, but neither source receives
-//! protection, materiality, sufficiency, or structural-traversal authority.
+//! The original wording may reach generic retrieval unchanged. Beyond that,
+//! planning recognizes only identities the caller wrote explicitly: repository
+//! paths, qualified symbols, and typed free-query probes. It does not infer an
+//! answer shape or translate prose into a domain-specific traversal policy.
 
 use crate::planning::dedupe_packet_plan_queries;
+use crate::text::exact_symbol_query_terms;
 use codestory_contracts::api::{PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto};
+use codestory_contracts::compilation::{
+    PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketSeedSelectorV1, RetrievalSeedPlanV1,
+};
+use std::path::{Component, Path};
 
 const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
@@ -20,13 +26,26 @@ pub fn build_packet_plan_with_extra(
     budget: PacketBudgetModeDto,
     free_queries: &[String],
 ) -> PacketPlanDto {
+    let seed_plan = build_retrieval_seed_plan(question, free_queries);
+    build_packet_plan_from_seed_plan(&seed_plan, budget)
+}
+
+pub fn build_packet_plan_from_seed_plan(
+    seed_plan: &RetrievalSeedPlanV1,
+    budget: PacketBudgetModeDto,
+) -> PacketPlanDto {
     let mut queries = Vec::new();
-    push_packet_query(&mut queries, question, GENERIC_RETRIEVAL_PURPOSE);
-    for query in free_queries {
+    push_packet_query(
+        &mut queries,
+        &seed_plan.generic_query,
+        GENERIC_RETRIEVAL_PURPOSE,
+    );
+
+    for query in &seed_plan.free_queries {
         push_packet_query(&mut queries, query, TYPED_FREE_QUERY_PURPOSE);
     }
-    queries.truncate(packet_plan_query_cap(budget));
 
+    queries.truncate(packet_plan_query_cap(budget));
     let mut plan = PacketPlanDto {
         queries,
         probe_resolutions: Vec::new(),
@@ -35,13 +54,81 @@ pub fn build_packet_plan_with_extra(
     dedupe_packet_plan_queries(&mut plan);
     plan.trace
         .push(format!("planned_queries={}", plan.queries.len()));
-    if !free_queries.is_empty() {
+    if !seed_plan.free_queries.is_empty() {
         plan.trace.push(format!(
             "typed_free_queries={} source=request",
-            free_queries.len()
+            seed_plan.free_queries.len()
         ));
     }
     plan
+}
+
+/// Build the only compiler-side value permitted to carry original wording.
+/// Extraction is syntactic: explicit repository paths, canonical `node:` IDs,
+/// and qualified symbols only. Natural-language relations are not inferred.
+pub fn build_retrieval_seed_plan(question: &str, free_queries: &[String]) -> RetrievalSeedPlanV1 {
+    let mut exact_selectors = Vec::new();
+    for path in explicit_source_paths(question) {
+        push_selector(
+            &mut exact_selectors,
+            PacketSeedSelectorV1::ExactPath { path },
+        );
+    }
+    for id in explicit_canonical_ids(question) {
+        push_selector(
+            &mut exact_selectors,
+            PacketSeedSelectorV1::CanonicalId { id },
+        );
+    }
+    for symbol in explicit_qualified_symbols(question) {
+        push_selector(
+            &mut exact_selectors,
+            PacketSeedSelectorV1::QualifiedSymbol { symbol },
+        );
+    }
+    let mut retained_free_queries = Vec::new();
+    for query in free_queries {
+        let query = query.trim();
+        if !query.is_empty()
+            && !retained_free_queries
+                .iter()
+                .any(|existing: &String| existing == query)
+        {
+            retained_free_queries.push(query.to_string());
+        }
+    }
+    RetrievalSeedPlanV1 {
+        contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+        generic_query: question.to_string(),
+        exact_selectors,
+        free_queries: retained_free_queries,
+    }
+}
+
+fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeedSelectorV1) {
+    if !selectors.contains(&selector) {
+        selectors.push(selector);
+    }
+}
+
+fn explicit_canonical_ids(question: &str) -> Vec<String> {
+    question
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '.'
+                )
+            })
+        })
+        .filter(|token| {
+            token
+                .strip_prefix("node:")
+                .is_some_and(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
@@ -72,6 +159,79 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
+fn explicit_qualified_symbols(question: &str) -> Vec<String> {
+    exact_symbol_query_terms(question)
+        .into_iter()
+        .filter(|candidate| {
+            (candidate.contains("::") || candidate.contains('.'))
+                && !candidate.contains("://")
+                && !candidate.contains(['/', '\\'])
+                && codestory_contracts::language_support::language_support_profile_for_path(Some(
+                    source_path_without_location_suffix(candidate),
+                ))
+                .is_none()
+        })
+        .collect()
+}
+
+fn explicit_source_paths(question: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for token in question.split_whitespace() {
+        let mut candidate = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+            )
+        });
+        if candidate.is_empty() || candidate.contains("://") {
+            continue;
+        }
+        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
+            .is_none()
+        {
+            candidate = candidate.trim_end_matches('.');
+        }
+        candidate = source_path_without_location_suffix(candidate);
+        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
+            .is_some()
+            && is_project_relative_source_path(candidate)
+            && !paths.iter().any(|path: &String| path == candidate)
+        {
+            paths.push(candidate.to_string());
+        }
+    }
+    paths
+}
+
+fn is_project_relative_source_path(candidate: &str) -> bool {
+    if candidate.starts_with(['/', '\\'])
+        || candidate
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+    {
+        return false;
+    }
+    let path = Path::new(candidate);
+    !path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+fn source_path_without_location_suffix(candidate: &str) -> &str {
+    if let Some((path, line)) = candidate.rsplit_once(':')
+        && !path.is_empty()
+        && line.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return path;
+    }
+    candidate
+}
+
 fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose: &str) {
     let query = query.trim();
     if query.is_empty()
@@ -92,36 +252,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_question_is_the_only_implicit_query() {
-        let question = "Trace Alpha::beta in src/alpha.rs through Gamma::delta";
-        let plan = build_packet_plan(question, PacketBudgetModeDto::Standard);
-        assert_eq!(plan.queries.len(), 1);
+    fn planning_keeps_only_generic_retrieval_and_explicit_identities() {
+        let question =
+            "Explain the client transport through `src/net/client.rs:42` and `net::Client.send`.";
+        let seed_plan =
+            build_retrieval_seed_plan(question, &["caller supplied concept".to_string()]);
+        let plan = build_packet_plan_from_seed_plan(&seed_plan, PacketBudgetModeDto::Standard);
         assert_eq!(plan.queries[0].query, question);
-        assert_eq!(plan.queries[0].purpose, GENERIC_RETRIEVAL_PURPOSE);
-    }
-
-    #[test]
-    fn typed_free_queries_are_additional_generic_seeds() {
-        let plan = build_packet_plan_with_extra(
-            "ordinary wording",
-            PacketBudgetModeDto::Standard,
-            &["caller supplied concept".into()],
+        assert!(seed_plan.exact_selectors.iter().any(|selector| selector
+            == &PacketSeedSelectorV1::ExactPath {
+                path: "src/net/client.rs".to_string(),
+            }));
+        assert!(seed_plan.exact_selectors.iter().any(|selector| selector
+            == &PacketSeedSelectorV1::QualifiedSymbol {
+                symbol: "net::Client.send".to_string(),
+            }));
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query == "caller supplied concept")
         );
         assert_eq!(plan.queries.len(), 2);
-        assert_eq!(plan.queries[1].purpose, TYPED_FREE_QUERY_PURPOSE);
+        assert!(!plan.queries.iter().any(|query| {
+            query.query == "src/net/client.rs" || query.query == "net::Client.send"
+        }));
     }
 
     #[test]
-    fn domain_vocabulary_does_not_change_plan_shape() {
+    fn ordinary_paraphrase_does_not_create_structural_queries() {
         let first = build_packet_plan(
-            "Explain client cache request finalization",
+            "Explain how the service starts and dispatches requests.",
             PacketBudgetModeDto::Standard,
         );
         let second = build_packet_plan(
-            "Explain alpha beta gamma delta",
+            "Describe where incoming work goes after startup.",
             PacketBudgetModeDto::Standard,
         );
-        assert_eq!(first.queries.len(), second.queries.len());
-        assert_eq!(first.queries[0].purpose, second.queries[0].purpose);
+        assert_eq!(first.queries.len(), 1);
+        assert_eq!(second.queries.len(), 1);
+    }
+
+    #[test]
+    fn prose_extraction_rejects_urls_and_paths_outside_the_project() {
+        let seed_plan = build_retrieval_seed_plan(
+            "Compare https://example.invalid/api with /tmp/secret.rs and ../outside.rs.",
+            &[],
+        );
+        assert!(
+            seed_plan.exact_selectors.is_empty(),
+            "unsafe prose tokens became exact selectors: {:?}",
+            seed_plan.exact_selectors
+        );
+    }
+
+    #[test]
+    fn source_location_is_not_also_treated_as_a_qualified_symbol() {
+        let seed_plan = build_retrieval_seed_plan("Inspect `lib.rs:42` and `crate::run`.", &[]);
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::ExactPath {
+                    path: "lib.rs".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "crate::run".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_identity_survives_sentence_punctuation() {
+        let seed_plan = build_retrieval_seed_plan("Inspect node:42.", &[]);
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![PacketSeedSelectorV1::CanonicalId {
+                id: "node:42".into(),
+            }]
+        );
     }
 }

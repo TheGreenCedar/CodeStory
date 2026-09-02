@@ -39,17 +39,17 @@ pages, runbooks, and workflows own detailed mechanics.
   publication.
 - `codestory-retrieval`: lexical, semantic, and SCIP artifacts; immutable
   sidecar generations; manifests; health; and fail-closed query execution.
-- `codestory-agent`: prompt-blind packet seed planning and pure evidence-policy
-  helpers. Horizon A forwards the unchanged question to generic retrieval and
-  accepts caller-supplied free-query seeds; it does not infer answer shapes or
-  traversal policy. It depends on `codestory-contracts` alone and can never
-  activate, store, execute retrieval, admit or hydrate candidates, retry a
-  publication, or move readiness. Repository-derived compilation is owned by
-  Horizon B (#2106), not the interim product graph.
+- `codestory-agent`: syntactic retrieval-seed planning and pure
+  repository-derived packet compilation over typed admitted evidence. Only the
+  seed plan may retain the unchanged question; the compiler cannot receive
+  prompt terms, task classes, obligations, roles, carriers, or sufficiency
+  policy. It depends on `codestory-contracts` alone and can never activate,
+  store, execute retrieval, admit or hydrate candidates, retry a publication,
+  or move readiness.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
   grounding, search, packet assembly, and retrieval execution belong here.
-  Retrieval, admission, hydration, retry, and interim packet assembly belong
-  here; prompt-blind seed planning belongs in `codestory-agent`.
+  Retrieval, admission, hydration, retry, and packet assembly belong here;
+  pure seed planning and evidence selection belong in `codestory-agent`.
 - `codestory-cli`: command and transport parsing, output rendering, process
   configuration capture, and managed sidecar lifecycle boundaries. Do not move
   product orchestration into adapters.

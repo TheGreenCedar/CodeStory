@@ -452,7 +452,7 @@ pub(crate) fn clone_file_copy_on_write(
     {
         fs::copy(source, destination)
             .map_err(|error| core_path_error("test-only full copy stage", destination, error))?;
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(any(test, feature = "test-support")))]
     Ok(false)

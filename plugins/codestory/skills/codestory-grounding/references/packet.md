@@ -15,9 +15,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 |------|---------|-----------------|
 | Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
 | `available` | Use the returned evidence rows first. Follow an exact identity with `snippet`, `context`, or an explicit graph operation when the task still needs it. | The packet never asserts answer sufficiency. |
-| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded packet continuation; ordinary exact navigation remains available afterward. |
+| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded compiler continuation; ordinary exact navigation remains available afterward. |
 | `no_useful_evidence` / `unavailable` | Preserve the reported gap and use exact search, source, or relations if the task can still be grounded. | Do not turn absence of packet evidence into an absence claim. |
-| Explicit target | `search`, `context`, `trail`, or `snippet` may be used directly when the user or prior evidence identifies the target. | These are the packet substrate and fallback. |
+| Explicit target | `search`, `context`, `trail`, or `snippet` may be used directly when the user or prior evidence identifies the target. | These are the packet compiler's substrate and fallback. |
 | Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
 
 ## Notes
@@ -54,7 +54,7 @@ CLI flags. Every call requires `project` (absolute repository root).
   `source_range` from the same file. That range supports only what its source
   text directly shows; the coverage warning still forbids file-wide absence or
   completeness claims.
-- A packet continuation is bounded to one round. It names stable selectors
+- A compiler continuation is bounded to one round. It names stable selectors
   and a structural gap, never a claim that the current packet is insufficient
   for the answer. After that round, let the task determine whether exact
   navigation is useful rather than manufacturing another packet policy.

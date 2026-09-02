@@ -20,7 +20,8 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
   generation-bound continuations;
 - one descriptor-only admission pass across the unchanged question and all
   typed free queries before candidate source or graph hydration;
-- prompt-blind interim finalization of admitted and hydrated packet evidence;
+- assembly of `PacketCompilationInputV1` and projection of the pure compiler's
+  bounded evidence product;
 - managed retrieval preparation and user-facing gap mapping;
 - generation-coherent candidate resolution and one bounded publication retry.
 
