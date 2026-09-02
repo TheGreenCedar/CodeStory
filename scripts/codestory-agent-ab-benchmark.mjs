@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -30,6 +30,19 @@ import {
   isTrustedPublishableRepoUrl,
   repoProvenanceBlockers,
 } from "./codestory-evidence-provenance.mjs";
+import {
+  BUILDER_ABLATION_ARMS,
+  BUILDER_ABLATION_TASK_IDS,
+  builderOperationViolations,
+  builderPacketRetrievalPolicy,
+  codeStoryInvocationsFromCommand,
+  codeStoryOperationFromCommand,
+  codeStoryOperationFromMcpTool,
+  isBuilderAblationArm,
+  isBuilderCodeStoryArm,
+  isBuilderPacketArm,
+  planBuilderAblationRuns,
+} from "./lib/evidence-compiler-ablation.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const benchmarkHarnessPath = fileURLToPath(import.meta.url);
@@ -222,10 +235,21 @@ const ARMS = {
     CODESTORY_ARM_INSTRUCTION,
   published_0_17_5: CODESTORY_ARM_INSTRUCTION,
   candidate_0_18: CODESTORY_ARM_INSTRUCTION,
+  native_tools: "Use ordinary local repository exploration only.",
+  exact_identity_source: "Use CodeStory exact identity and source operations before ordinary local exploration.",
+  exact_plus_relations: "Use CodeStory exact identity, source, and explicit relation operations before ordinary local exploration.",
+  packet_semantic_off: "Start from the harness packet with dense semantic candidates disabled, then investigate adaptively with ordinary local tools.",
+  packet_semantic_on: "Start from the harness packet with dense semantic candidates enabled, then investigate adaptively with ordinary local tools.",
 };
 
 function isCodeStoryArm(arm) {
-  return arm === "with_codestory" || arm === "published_0_17_5" || arm === "candidate_0_18";
+  return arm === "with_codestory" || arm === "published_0_17_5" || arm === "candidate_0_18" ||
+    isBuilderCodeStoryArm(arm);
+}
+
+function isPacketArm(arm) {
+  return arm === "with_codestory" || arm === "published_0_17_5" || arm === "candidate_0_18" ||
+    isBuilderPacketArm(arm);
 }
 
 function isPacketProjectionV3(packet) {
@@ -244,6 +268,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --self-test
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
+  node scripts/codestory-agent-ab-benchmark.mjs --builder-ablation --codestory-cli <benchmark-enabled-cli> [--materialize-repos] [--out-dir path]
   node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
   node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-source-root <path>
 
@@ -289,6 +314,8 @@ Options:
                   External SHA-256 binding for the comparator source artifact bundle.
   --exact-candidate
                   Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.5, and the frozen 0.18 candidate.
+  --builder-ablation
+                  Run the frozen five-arm, three-repeat builder-visible evidence-compiler ablation. This mode never supplies release evidence.
   --published-archive
                   Published CodeStory 0.17.5 native archive named by the authenticated checksum manifest.
   --published-checksum-manifest
@@ -375,6 +402,7 @@ function parseArgs(argv) {
       "reuse-comparators-ledger-sha256": { type: "string" },
       "reuse-comparators-artifacts-sha256": { type: "string" },
       "exact-candidate": { type: "boolean" },
+      "builder-ablation": { type: "boolean" },
       "published-archive": { type: "string" },
       "published-checksum-manifest": { type: "string" },
       "published-checksum-sha256": { type: "string" },
@@ -423,6 +451,7 @@ function parseArgs(argv) {
     reuseComparatorsLedgerSha256: null,
     reuseComparatorsArtifactsSha256: null,
     exactCandidate: false,
+    builderAblation: false,
     publishedArchive: null,
     publishedChecksumManifest: null,
     publishedChecksumSha256: null,
@@ -492,6 +521,7 @@ function parseArgs(argv) {
   opts.reuseComparatorsLedgerSha256 = values["reuse-comparators-ledger-sha256"] ?? null;
   opts.reuseComparatorsArtifactsSha256 = values["reuse-comparators-artifacts-sha256"] ?? null;
   opts.exactCandidate = values["exact-candidate"] === true;
+  opts.builderAblation = values["builder-ablation"] === true;
   opts.publishedArchive = values["published-archive"] ?? null;
   opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
   opts.publishedChecksumSha256 = values["published-checksum-sha256"] ?? null;
@@ -514,7 +544,10 @@ function parseArgs(argv) {
     throw new Error("--task-suite and --task-manifest are mutually exclusive");
   }
 
-  if (!opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest && !opts.exactCandidate) {
+  if (
+    !opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest &&
+    !opts.exactCandidate && !opts.builderAblation
+  ) {
     opts.repos = opts.quick
       ? ["codestory"]
       : [
@@ -584,6 +617,39 @@ function parseArgs(argv) {
       "--published-checksum-sha256",
     );
   }
+  if (opts.builderAblation) {
+    const builderOptionAllowlist = new Set([
+      "builder-ablation",
+      "materialize-repos",
+      "repo-cache-dir",
+      "out-dir",
+      "codestory-cli",
+    ]);
+    const forbiddenOptions = [...providedOptions].filter((name) => !builderOptionAllowlist.has(name));
+    if (forbiddenOptions.length) {
+      throw new Error(`builder-ablation mode forbids option(s): ${forbiddenOptions.sort().join(", ")}`);
+    }
+    if (opts.exactCandidate || opts.packetRuntime || opts.aggregateShards) {
+      throw new Error("builder-ablation mode is mutually exclusive with exact-candidate, packet-runtime, and aggregation");
+    }
+    if (!opts.codestoryCli) {
+      throw new Error("builder-ablation mode requires --codestory-cli built with benchmark-support");
+    }
+    opts.taskSuite = "language-expansion-holdout";
+    opts.taskIds = [...BUILDER_ABLATION_TASK_IDS];
+    opts.arms = [...BUILDER_ABLATION_ARMS];
+    opts.repeats = 3;
+    opts.model = DEFAULT_BENCHMARK_MODEL;
+    opts.runner = "codex";
+    opts.sandbox = "workspace-write";
+    opts.jobs = 1;
+    opts.prepareCodestoryCache = true;
+    opts.shardCount = 1;
+    opts.shardIndex = 0;
+    opts.publishable = false;
+    opts.allowFailures = false;
+    opts.diagnosticExtraProbesFromManifest = false;
+  }
   opts.arms ??= ["without_codestory", "with_codestory"];
   if (!opts.arms.length) {
     throw new Error("--arms must include at least one arm");
@@ -595,12 +661,15 @@ function parseArgs(argv) {
     if (!opts.exactCandidate && EXACT_CANDIDATE_ARMS.includes(arm) && arm !== "without_codestory") {
       throw new Error(`Arm '${arm}' is available only with --exact-candidate`);
     }
+    if (!opts.builderAblation && isBuilderAblationArm(arm)) {
+      throw new Error(`Arm '${arm}' is available only with --builder-ablation`);
+    }
   }
   if (!opts.repeats) {
     opts.repeats = opts.quick ? 1 : 3;
   }
   if (opts.prepareCodestoryCache == null) {
-    opts.prepareCodestoryCache = opts.packetRuntime || opts.arms.includes("with_codestory");
+    opts.prepareCodestoryCache = opts.packetRuntime || opts.arms.some(isCodeStoryArm);
   }
   if (!Number.isInteger(opts.repeats) || opts.repeats < 1) {
     throw new Error("--repeats must be a positive integer");
@@ -848,6 +917,30 @@ async function initializeExactCandidateState(opts, dependencies = {}) {
   }
 }
 
+async function initializeBuilderAblationState(opts, dependencies = {}) {
+  const createPrivateStateRoot = dependencies.createPrivateStateRoot
+    ?? createExactCandidatePrivateStateRoot;
+  opts.builderAblationStateRoot = await createPrivateStateRoot(
+    "codestory-agent-builder-ablation-",
+  );
+}
+
+function opaqueBuilderContinuationProofPath(stateRoot, entropy = randomBytes) {
+  const nonce = entropy(24);
+  if (!Buffer.isBuffer(nonce) || nonce.length !== 24) {
+    throw new Error("builder continuation proof entropy must return exactly 24 bytes");
+  }
+  return path.join(stateRoot, "continuation-proofs", `${nonce.toString("hex")}.json`);
+}
+
+function opaqueBuilderAgentHome(stateRoot, entropy = randomBytes) {
+  const nonce = entropy(24);
+  if (!Buffer.isBuffer(nonce) || nonce.length !== 24) {
+    throw new Error("builder agent-home entropy must return exactly 24 bytes");
+  }
+  return path.join(stateRoot, "agent-sessions", nonce.toString("hex"), "host");
+}
+
 async function finalizeBenchmarkResources(opts, ledger, preparationLedger, dependencies = {}) {
   const remove = dependencies.remove ?? rm;
   const failures = [...(opts.exactCandidateInitializationCleanupFailures ?? [])];
@@ -870,6 +963,7 @@ async function finalizeBenchmarkResources(opts, ledger, preparationLedger, depen
   for (const [resource, root] of [
     ["exact_candidate_state", opts.exactCandidateStateRoot],
     ["exact_candidate_baseline_state", opts.exactCandidateBaselineContainerRoot],
+    ["builder_ablation_state", opts.builderAblationStateRoot],
   ]) {
     if (!root) continue;
     const failure = await removeOwnedBenchmarkRoot(remove, resource, root);
@@ -878,6 +972,7 @@ async function finalizeBenchmarkResources(opts, ledger, preparationLedger, depen
   delete opts.exactCandidateStateRoot;
   delete opts.exactCandidateBaselineContainerRoot;
   delete opts.exactCandidateBaselineStateRoot;
+  delete opts.builderAblationStateRoot;
   delete opts.exactCandidateInitializationCleanupFailures;
   return failures;
 }
@@ -1040,15 +1135,18 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
     runner_config: PINNED_CODEX_RUNNER_CONFIG,
   };
   let homes = null;
-  if (opts.exactCandidate) {
+  if (opts.exactCandidate || opts.builderAblation) {
     homes = {};
-    for (const arm of EXACT_CANDIDATE_ARMS) {
-      const armRoot = arm === "without_codestory"
-        ? opts.exactCandidateBaselineStateRoot
-        : path.join(opts.exactCandidateStateRoot, arm);
+    const arms = opts.builderAblation ? BUILDER_ABLATION_ARMS : EXACT_CANDIDATE_ARMS;
+    for (const arm of arms) {
+      const armRoot = opts.builderAblation
+        ? path.dirname(opaqueBuilderAgentHome(opts.builderAblationStateRoot))
+        : arm === "without_codestory"
+          ? opts.exactCandidateBaselineStateRoot
+          : path.join(opts.exactCandidateStateRoot, arm);
       const codexHome = path.join(armRoot, "host");
       await mkdir(codexHome, { recursive: true });
-      if (arm === "without_codestory") {
+      if (!opts.builderAblation && arm === "without_codestory") {
         for (const directory of [
           "home", "tmp", "xdg-cache", "xdg-config", "xdg-data",
         ]) {
@@ -1057,6 +1155,7 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
       }
       await copyFile(authPath, path.join(codexHome, "auth.json"));
       homes[arm] = codexHome;
+      if (opts.builderAblation) continue;
       for (const value of Object.values(
         exactCandidateArmEnvironmentGroups(opts, arm).directories,
       )) {
@@ -1071,11 +1170,21 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
         );
       }
     }
-    receipt.contract = "codestory.agent-benchmark-codex-isolation/v3";
-    receipt.with_codestory_config = "arm_specific_checksum_bound_cli";
+    receipt.contract = opts.builderAblation
+      ? "codestory.agent-benchmark-codex-isolation/v4"
+      : "codestory.agent-benchmark-codex-isolation/v3";
+    receipt.with_codestory_config = opts.builderAblation
+      ? "isolated_ephemeral_home_checksum_bound_cli_only"
+      : "arm_specific_checksum_bound_cli";
     receipt.homes = Object.fromEntries(
-      EXACT_CANDIDATE_ARMS.map((arm) => [arm, path.relative(outDir, homes[arm])]),
+      arms.map((arm) => [arm, path.relative(outDir, homes[arm])]),
     );
+    if (opts.builderAblation) {
+      receipt.codestory_surface = "checksum_bound_cli_only";
+      receipt.without_codestory_config = "isolated_ephemeral_home_no_codestory";
+      receipt.host_config_files = "none";
+      return await writeAgentCodexIsolationReceipt(outDir, receipt, homes, opts);
+    }
     receipt.cache_roots = Object.fromEntries(
       EXACT_CANDIDATE_ARMS.map((arm) => [
         arm,
@@ -1107,6 +1216,21 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
   );
   return {
     root: opts.exactCandidate ? opts.exactCandidateStateRoot : null,
+    homes,
+    receipt,
+  };
+}
+
+async function writeAgentCodexIsolationReceipt(outDir, receipt, homes, opts) {
+  await writeFile(
+    path.join(outDir, "codex-agent-isolation.json"),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+    "utf8",
+  );
+  return {
+    root: opts.exactCandidate
+      ? opts.exactCandidateStateRoot
+      : opts.builderAblationStateRoot ?? null,
     homes,
     receipt,
   };
@@ -1675,6 +1799,33 @@ function validateExactCandidateShape(opts, tasks) {
   }
   if (opts.reuseBaselineFrom) {
     throw new Error("baseline reuse is forbidden in exact-candidate mode");
+  }
+}
+
+function validateBuilderAblationShape(opts, tasks) {
+  if (!opts.builderAblation) return;
+  if (
+    tasks.length !== BUILDER_ABLATION_TASK_IDS.length ||
+    tasks.map((task) => task.id).join(",") !== BUILDER_ABLATION_TASK_IDS.join(",")
+  ) {
+    throw new Error("builder-ablation tasks differ from the frozen builder-visible development set");
+  }
+  if (
+    opts.taskSuite !== "language-expansion-holdout" ||
+    opts.repeats !== 3 ||
+    opts.arms.join(",") !== BUILDER_ABLATION_ARMS.join(",")
+  ) {
+    throw new Error("builder-ablation mode requires its frozen suite, five arms, and three repeats");
+  }
+  if (
+    opts.reuseBaselineFrom || opts.resumePrefixFrom || opts.reuseComparatorsFrom ||
+    opts.diagnosticExtraProbesFromManifest || opts.publishable || opts.shardCount !== 1
+  ) {
+    throw new Error("builder-ablation rows must be fresh, unsharded, and free of manifest probe injection");
+  }
+  const cli = path.resolve(opts.codestoryCli);
+  if (!existsSync(cli) || !statSync(cli).isFile()) {
+    throw new Error(`builder-ablation CodeStory CLI does not exist: ${cli}`);
   }
 }
 
@@ -2626,7 +2777,59 @@ async function materializeRepos(tasks, opts) {
   }
 }
 
+function builderAblationPacketBlock(prelude) {
+  if (!prelude?.packet) return "";
+  return `
+The harness ran the initial packet before your turn. Its command and private
+measurement paths are deliberately withheld.
+
+Initial packet JSON:
+\`\`\`json
+${JSON.stringify(packetForAgentPrompt(prelude.packet), null, 2)}
+\`\`\``;
+}
+
+function builderAblationArmInstruction(arm, continuationContract = null) {
+  if (arm === "native_tools") {
+    return "Do not use CodeStory. Investigate with ordinary local search and source reads.";
+  }
+  if (arm === "exact_identity_source") {
+    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use only search with --repo-text off, files, symbol, or snippet. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+  }
+  if (arm === "exact_plus_relations") {
+    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use search with --repo-text off, files, symbol, snippet, context, trail, callers, callees, or trace. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+  }
+  const continuation = continuationContract
+    ? ` The packet offers one optional continuation. If you use it, run this exact command as a separate repository-context action and do not run another CodeStory command:
+\`\`\`${packetFirstCommandFenceLanguage()}
+${continuationContract.command}
+\`\`\``
+    : " The packet offers no continuation. Do not call CodeStory during your turn.";
+  return `Use the initial packet as bounded source-backed evidence, not as an answer or sufficiency verdict. You may investigate adaptively with ordinary local search and source reads.${continuation} Preserve uncertainty and do not claim runtime execution, absence, or a relationship that the cited source does not establish.`;
+}
+
+function composeBuilderAblationPrompt(repoName, repoConfig, armName, task, context = {}) {
+  const packetBlock = isBuilderPacketArm(armName)
+    ? builderAblationPacketBlock(context.codestoryPrelude)
+    : "";
+  return `You are running a builder-visible development ablation for CodeStory.
+
+Repository: ${repoName}
+Project path: ${repoConfig.path}
+Task: ${task?.prompt ?? repoConfig.prompt}
+
+Instruction: ${builderAblationArmInstruction(armName, context.builderContinuationContract)}
+${packetBlock}
+
+Return a concise answer with the files, symbols, and source evidence that support it.
+Do not edit source files. Use read-only inspection commands only; CodeStory may read its already-prepared cache.
+Do not use web search, browser tools, remote URLs, or upstream mirrors. Inspect only this pinned local checkout.`;
+}
+
 function composePrompt(repoName, repoConfig, armName, task = null, context = {}) {
+  if (context.builderAblation) {
+    return composeBuilderAblationPrompt(repoName, repoConfig, armName, task, context);
+  }
   const taskPrompt = task?.prompt ?? repoConfig.prompt;
   const taskHeader = task
     ? `Task id: ${task.id}
@@ -3149,32 +3352,23 @@ function isCommandEvent(event) {
 function commandCategory(command) {
   const text = String(command ?? "");
   const shellText = text.replace(/\\"/g, '"');
-  const codestoryCommands =
-    "\\b(index|ground|doctor|search|symbol|trail|snippet|query|explore|bookmark|context|drill|files|affected|setup|serve|packet)\\b";
+  const codestoryCommands = "\\b[a-z][a-z0-9-]*\\b";
+  const knownCodestoryCommands =
+    "\\b(index|ground|doctor|ready|search|symbol|trail|callers|callees|trace|snippet|query|explore|bookmark|context|drill|files|affected|impact|test-map|setup|serve|packet|verify-indexed-direct-calls|retrieval|cache|agent|report)\\b";
   const codestoryExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+${codestoryCommands}`;
-  if (/^\s*(?:rg|grep|findstr|select-string)\b/i.test(text)) {
-    return "shell_search";
-  }
-  if (/^\s*(?:get-content|cat|type|sed|nl)\b/i.test(text)) {
-    return "direct_file_read";
-  }
   if (
     /^\s*codestory-cli(?:\.exe)?(?:\s|$)/i.test(shellText) ||
     new RegExp(`^\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     /&\s*["']*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
     new RegExp(`(?:^|[;&|]\\s*)["']?\\$CODESTORY_CLI["']?\\s+${codestoryCommands}`, "i").test(shellText) ||
-    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText)
+    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${knownCodestoryCommands}`, "i").test(shellText)
   ) {
     return "codestory_cli";
   }
-  if (/\b(rg|grep|findstr|select-string)\b/i.test(command)) {
-    return "shell_search";
-  }
-  if (/\b(get-content|cat|type|sed|nl)\b/i.test(command)) {
-    return "direct_file_read";
-  }
+  const sourceCategory = sourceProducingCommandCategory(text);
+  if (sourceCategory) return sourceCategory;
   if (/\bgit\b/i.test(command)) {
     return "git";
   }
@@ -3182,6 +3376,49 @@ function commandCategory(command) {
     return "build_test";
   }
   return "other";
+}
+
+function gitSourceProducingCommand(command) {
+  const segments = String(command ?? "").split(/[;&|\r\n]+/u);
+  for (const segment of segments) {
+    const words = segment.trim().split(/\s+/u).filter(Boolean);
+    const gitIndex = words.findIndex((word) =>
+      /^(?:["']?)(?:(?:[^\s"'\\/]+)[\\/])*git(?:\.exe)?["']?$/iu.test(word)
+    );
+    if (gitIndex < 0) continue;
+    let index = gitIndex + 1;
+    while (index < words.length && words[index].startsWith("-")) {
+      const option = words[index].split("=", 1)[0];
+      const consumesValue = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(option) &&
+        !words[index].includes("=");
+      index += consumesValue ? 2 : 1;
+    }
+    const subcommand = String(words[index] ?? "")
+      .replace(/^["']|["']$/gu, "")
+      .toLowerCase();
+    if (["show", "grep", "blame", "diff"].includes(subcommand)) return true;
+    if (subcommand === "log" && words.slice(index + 1).some((word) => word === "-p" || word === "--patch")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sourceProducingCommandCategory(command) {
+  const text = String(command ?? "");
+  if (/\b(?:rg|grep|findstr|select-string)\b/iu.test(text)) {
+    return "shell_search";
+  }
+  if (
+    /\b(?:get-content|cat|type|sed|nl|head|tail|awk|bat|less|dd|strings|jq)\b/iu.test(text) ||
+    /\b(?:read_text|read_to_string|readlines?|readFile(?:Sync)?|readTextFile|createReadStream|File\.read|IO\.read|Pathname\.read|Bun\.file)\b/iu.test(text) ||
+    /\bopen\s*\(|\bPath\s*\([^)]*\)\.read_/iu.test(text) ||
+    /\b(?:perl|ruby)\s+[^;&|]*(?:-[A-Za-z]*[np]|-e)\b/iu.test(text) ||
+    /(?:^|[\s'"=:])[^\s'";&|]+\.(?:rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)(?=$|[\s'";&|])/iu.test(text)
+  ) {
+    return "direct_file_read";
+  }
+  return gitSourceProducingCommand(text) ? "git" : null;
 }
 
 function isCodestoryPacketCommand(command) {
@@ -3231,6 +3468,51 @@ function isSuccessfulContextCommand(command) {
     return true;
   }
   return ["codestory_cli", "shell_search", "direct_file_read", "git", "build_test"].includes(command.category);
+}
+
+const REPOSITORY_CONTEXT_COMMAND_CATEGORIES = new Set([
+  "codestory_cli",
+  "shell_search",
+  "direct_file_read",
+  "git",
+  "build_test",
+]);
+
+function isObservedRepositoryContextCommand(command) {
+  return REPOSITORY_CONTEXT_COMMAND_CATEGORIES.has(command.category) ||
+    String(command.aggregated_output ?? "").trim().length > 0;
+}
+
+function observedRepositoryContextActions(commands, events) {
+  const actions = commands
+    .filter(isObservedRepositoryContextCommand)
+    .map((command) => ({
+      action_key: `command:${command.id}`,
+      kind: "command",
+      id: command.id,
+      category: command.category,
+      codestory: command.category === "codestory_cli",
+      event_index: command.started_event_index ?? command.completed_event_index ?? -1,
+    }));
+
+  events.forEach((event, eventIndex) => {
+    if (!isToolCallStartEvent(event)) return;
+    const category = toolCallCategory(event);
+    if (category === "command_execution") return;
+    const item = itemOf(event);
+    const id = String(item.id ?? event.id ?? `tool_${eventIndex}`);
+    const codestory = isCodeStoryMcpToolCallEvent(event);
+    actions.push({
+      action_key: `${codestory ? "mcp" : "tool"}:${id}`,
+      kind: "tool",
+      id,
+      category,
+      codestory,
+      event_index: eventIndex,
+    });
+  });
+
+  return actions.sort((left, right) => left.event_index - right.event_index);
 }
 
 function normalizePathLike(value) {
@@ -3391,7 +3673,8 @@ function extractCommandExecutions(events) {
 
   for (const command of byId.values()) {
     command.category = command.harness_semantics?.category ?? commandCategory(command.command);
-    command.codestory_operation = command.harness_semantics?.operation ?? null;
+    command.codestory_operation = command.harness_semantics?.operation ??
+      (command.category === "codestory_cli" ? codeStoryOperationFromCommand(command.command) : null);
     command.pattern = commandPattern(command.command);
     commands.push(command);
   }
@@ -3400,6 +3683,77 @@ function extractCommandExecutions(events) {
       (a.started_event_index ?? a.completed_event_index ?? 0) -
       (b.started_event_index ?? b.completed_event_index ?? 0),
   );
+}
+
+function codeStoryMcpToolName(event) {
+  const item = itemOf(event);
+  return item.tool ?? item.name ?? item.tool_name ?? event.tool ?? event.name ?? null;
+}
+
+function orderedCodeStoryOperations(commands, events) {
+  const operations = commands
+    .flatMap((command) => {
+      if (command.harness_semantics) {
+        return [{
+          operation: command.harness_semantics.operation,
+          transport: "cli",
+          source: "harness_packet_prelude",
+          checksum_bound: true,
+          successful: command.exit_code === 0 && String(command.status ?? "completed").toLowerCase() !== "failed",
+          event_index: command.completed_event_index ?? command.started_event_index ?? -1,
+          result_event_index: command.completed_event_index ?? command.started_event_index ?? -1,
+          action_key: `command:${command.id}`,
+          raw: { command: command.command },
+        }];
+      }
+      return codeStoryInvocationsFromCommand(command.command).map((invocation, invocationIndex) => ({
+        operation: invocation.operation,
+        transport: "cli",
+        source: "agent_cli",
+        checksum_bound: invocation.checksum_bound,
+        successful: command.exit_code === 0 && String(command.status ?? "completed").toLowerCase() !== "failed",
+        event_index: (command.completed_event_index ?? command.started_event_index ?? -1) + invocationIndex / 1000,
+        result_event_index: command.completed_event_index ?? command.started_event_index ?? -1,
+        action_key: `command:${command.id}`,
+        raw: { command: command.command },
+      }));
+    });
+  const mcpById = new Map();
+  events.forEach((event, eventIndex) => {
+    if (!isCodeStoryMcpToolCallEvent(event)) return;
+    const item = itemOf(event);
+    const id = String(item.id ?? event.id ?? `mcp_${eventIndex}`);
+    const current = mcpById.get(id) ?? {
+      operation: codeStoryOperationFromMcpTool(codeStoryMcpToolName(event)),
+      transport: "mcp",
+      source: "agent_mcp",
+      successful: false,
+      event_index: eventIndex,
+      result_event_index: null,
+      action_key: `mcp:${id}`,
+      raw: { arguments: item.arguments ?? event.arguments ?? null },
+    };
+    current.operation ??= codeStoryOperationFromMcpTool(codeStoryMcpToolName(event));
+    current.event_index = Math.min(current.event_index, eventIndex);
+    if (isSuccessfulCodeStoryMcpToolCallEvent(event)) {
+      current.successful = true;
+      current.result_event_index = eventIndex;
+    }
+    mcpById.set(id, current);
+  });
+  operations.push(...mcpById.values());
+  return operations.sort((left, right) => left.event_index - right.event_index);
+}
+
+function isOrdinarySourceProducingCommand(command) {
+  return sourceProducingCommandCategory(command.command) != null;
+}
+
+function isRemoteContextCommand(command) {
+  const text = String(command?.command ?? command ?? "");
+  return /(?:^|[;&|]\s*)(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b/i.test(text) ||
+    /(?:^|[;&|]\s*)git\s+(?:clone|fetch|pull|ls-remote)\b/i.test(text) ||
+    /(?:^|[;&|]\s*)gh\s+(?:api|repo|pr|issue|search)\b/i.test(text);
 }
 
 function extractFinalAnswer(events) {
@@ -3656,6 +4010,7 @@ function directSourceReadAuthorization(read, commands, events, projectRoot, cont
 
 function analyzeTranscript(events, projectRoot = null, context = {}) {
   const commands = extractCommandExecutions(events);
+  const codestoryOperations = orderedCodeStoryOperations(commands, events);
   const toolCategories = toolCallCategories(events);
   const codestoryMcpToolCalls = events.filter(isCodeStoryMcpToolCallStartEvent);
   const codestoryMcpCompletedCalls = events.filter(isSuccessfulCodeStoryMcpToolCallEvent);
@@ -3687,16 +4042,20 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
   const firstSuccessfulCodeStory = commands.find(
     (command) => command.category === "codestory_cli" && command.exit_code === 0,
   );
+  const firstSuccessfulCodeStoryOperation = codestoryOperations.find((operation) => operation.successful);
   const firstSuccessfulPacket = commands.find(
     (command) =>
       command.category === "codestory_cli" &&
       command.exit_code === 0 &&
-      (command.codestory_operation === "packet" || isCodestoryPacketCommand(command.command)),
+      (command.harness_semantics?.operation === "packet" ||
+        isCodestoryPacketCommand(command.command)),
   );
   const codestoryIndexCommands = commands.filter(
     (command) => command.category === "codestory_cli" && isCodestoryIndexCommand(command.command),
   );
   const firstSuccessfulContextCommand = commands.find(isSuccessfulContextCommand);
+  const observedContextActions = observedRepositoryContextActions(commands, events);
+  const firstObservedContextAction = observedContextActions[0] ?? null;
   const sourceReads = directFileReads.filter((read) => read.source_like && read.repo_like);
   const authorizedSourceReads = sourceReads.map((read) => ({
     ...read,
@@ -3706,7 +4065,35 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
     first == null
       ? null
       : sourceReads.filter((read) => (read.event_index ?? -1) > (first.completed_event_index ?? first.started_event_index ?? -1)).length;
-
+  const firstCodeStoryEventIndex = firstSuccessfulCodeStoryOperation?.result_event_index ??
+    firstSuccessfulCodeStoryOperation?.event_index ??
+    null;
+  const firstCodeStoryActionPosition = firstSuccessfulCodeStoryOperation == null
+    ? -1
+    : observedContextActions.findIndex(
+      (action) => action.action_key === firstSuccessfulCodeStoryOperation.action_key,
+    );
+  const ordinarySourceActionsAfterFirstCodeStory = firstCodeStoryEventIndex == null
+    ? []
+    : commands.filter((command) =>
+      (command.started_event_index ?? command.completed_event_index ?? -1) > firstCodeStoryEventIndex &&
+      command.category !== "codestory_cli" &&
+      isOrdinarySourceProducingCommand(command)
+    );
+  const exploratoryRepositoryContextActionsAfterFirstCodeStory = firstCodeStoryActionPosition < 0
+    ? []
+    : observedContextActions
+      .slice(firstCodeStoryActionPosition + 1)
+      .filter((action) => action.codestory !== true);
+  const exploratoryRepositoryContextCommandKeys = new Set(
+    exploratoryRepositoryContextActionsAfterFirstCodeStory
+      .filter((action) => action.kind === "command")
+      .map((action) => action.action_key),
+  );
+  const exploratoryRepositoryContextCommandsAfterFirstCodeStory = commands.filter(
+    (command) => exploratoryRepositoryContextCommandKeys.has(`command:${command.id}`),
+  );
+  const remoteContextCommands = commands.filter(isRemoteContextCommand);
   return {
     interaction_turns: interactionTurnTelemetry(events),
     tool_categories: toolCategories,
@@ -3717,6 +4104,7 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
     command_categories: commandCategories,
     command_count: commands.length,
     command_patterns_duplicated: duplicateCounts(commands.map((command) => command.pattern)),
+    codestory_operations: codestoryOperations,
     output_chars_by_category: outputCharsByCategory,
     direct_file_reads_total: directFileReads.length,
     direct_source_reads_total: sourceReads.length,
@@ -3743,22 +4131,49 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
           category: firstSuccessfulContextCommand.category,
         }
       : null,
+    first_observed_repository_context_action: firstObservedContextAction
+      ? {
+          kind: firstObservedContextAction.kind,
+          id: firstObservedContextAction.id,
+          category: firstObservedContextAction.category,
+        }
+      : null,
     packet_was_first_context_command:
       firstSuccessfulPacket != null &&
-      firstSuccessfulContextCommand != null &&
-      firstSuccessfulPacket.id === firstSuccessfulContextCommand.id,
+      firstObservedContextAction != null &&
+      `command:${firstSuccessfulPacket.id}` === firstObservedContextAction.action_key,
     codestory_index_commands_observed: codestoryIndexCommands.length,
     ordinary_source_reads_after_first_codestory: afterIndex(firstSuccessfulCodeStory),
     ordinary_source_reads_after_first_packet: afterIndex(firstSuccessfulPacket),
+    ordinary_source_actions_after_first_codestory: ordinarySourceActionsAfterFirstCodeStory.length,
+    exploratory_source_reads_after_first_codestory: ordinarySourceActionsAfterFirstCodeStory.length,
+    observed_repository_context_actions: observedContextActions.length,
+    exploratory_repository_context_actions_after_first_codestory:
+      exploratoryRepositoryContextActionsAfterFirstCodeStory.length,
+    ordinary_source_output_bytes_after_first_codestory: ordinarySourceActionsAfterFirstCodeStory
+      .reduce((sum, command) => sum + Buffer.byteLength(String(command.aggregated_output ?? ""), "utf8"), 0),
+    observed_repository_context_output_bytes_after_first_codestory:
+      exploratoryRepositoryContextCommandsAfterFirstCodeStory
+        .reduce((sum, command) => sum + Buffer.byteLength(String(command.aggregated_output ?? ""), "utf8"), 0),
+    remote_context_commands: remoteContextCommands.map((command) => command.command),
+    codestory_was_first_context_command:
+      firstSuccessfulCodeStoryOperation != null &&
+      firstObservedContextAction != null &&
+      firstSuccessfulCodeStoryOperation.action_key === firstObservedContextAction.action_key,
+    codestory_was_first_repository_context_action:
+      firstSuccessfulCodeStoryOperation != null &&
+      firstObservedContextAction != null &&
+      firstSuccessfulCodeStoryOperation.action_key === firstObservedContextAction.action_key,
     final_answer_chars: extractFinalAnswer(events).length,
   };
 }
 
 function isCodeStoryMcpToolCallEvent(event) {
   const item = itemOf(event);
+  const server = String(item.server ?? event?.server ?? "").trim().toLowerCase();
   return (
     String(item.type ?? "").toLowerCase() === "mcp_tool_call" &&
-    String(item.server ?? event?.server ?? "").trim().toLowerCase() === "codestory"
+    (server === "codestory" || /(?:^|[-_])codestory$/u.test(server))
   );
 }
 
@@ -4690,7 +5105,10 @@ function retrievalIndexCommandArgs(project) {
   ];
 }
 
-function packetCommandArgs(repoConfig, task, opts = {}) {
+function packetCommandArgs(repoConfig, task, opts = {}, arm = null) {
+  if (opts.builderAblation && opts.diagnosticExtraProbesFromManifest) {
+    throw new Error("builder ablation forbids manifest-derived packet probes");
+  }
   const args = [
     "packet",
     "--project",
@@ -4703,13 +5121,16 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     "--format",
     "json",
   ];
+  if (arm === "packet_semantic_off") {
+    args.push("--benchmark-disable-dense-semantic");
+  }
   for (const probe of packetCommandExtraProbes(task, opts)) {
     args.push("--extra-probe", probe);
   }
   return args;
 }
 
-function drillPacketCommandArgs(repoConfig, task, opts, packet) {
+function drillPacketCommandArgs(repoConfig, task, opts, packet, arm = null) {
   const drill = packet?.disposition?.drill;
   const continuation = isPacketProjectionV3(packet) ? packet.continuation : null;
   const parentPacketId = String(
@@ -4724,7 +5145,10 @@ function drillPacketCommandArgs(repoConfig, task, opts, packet) {
   if (!parentPacketId || optionIds.length === 0) {
     return null;
   }
-  const args = packetCommandArgs(repoConfig, task, opts);
+  const continuationArm = opts.builderAblation && isBuilderPacketArm(arm)
+    ? "packet_semantic_off"
+    : arm;
+  const args = packetCommandArgs(repoConfig, task, opts, continuationArm);
   args.push("--parent-packet-id", parentPacketId);
   for (const optionId of optionIds) {
     args.push("--option-id", optionId);
@@ -4744,6 +5168,54 @@ function drillPacketCommandArgs(repoConfig, task, opts, packet) {
     args.push("--retrieval-generation", retrievalGeneration);
   }
   return args;
+}
+
+function builderContinuationContract(repoConfig, task, opts, packet, arm, proofPath) {
+  if (!proofPath || !isPacketProjectionV3(packet)) return null;
+  const continuation = packet.continuation;
+  const parentPacketId = String(continuation?.continuation_id ?? "").trim();
+  const allowedOptionIds = (Array.isArray(continuation?.gap_ids) ? continuation.gap_ids : [])
+    .map((identity) => String(identity?.gap_id ?? "").trim())
+    .filter(Boolean);
+  const coreGenerationId = String(packet?.publication?.core?.generation_id ?? "").trim();
+  const retrievalGeneration = String(
+    packet?.publication?.retrieval?.retrieval_generation ?? "",
+  ).trim();
+  if (
+    packet.status !== "continuation_available" ||
+    !parentPacketId ||
+    !allowedOptionIds.length ||
+    new Set(allowedOptionIds).size !== allowedOptionIds.length ||
+    !coreGenerationId ||
+    !retrievalGeneration
+  ) {
+    return null;
+  }
+  const args = drillPacketCommandArgs(repoConfig, task, opts, packet, arm);
+  if (!args) return null;
+  args.push("--benchmark-retrieval-proof-out", proofPath);
+  return {
+    parent_packet_id: parentPacketId,
+    allowed_option_ids: allowedOptionIds,
+    core_generation_id: coreGenerationId,
+    retrieval_generation: retrievalGeneration,
+    project: repoConfig.path,
+    question: task?.prompt ?? repoConfig.prompt,
+    question_sha256: sha256Bytes(task?.prompt ?? repoConfig.prompt),
+    proof_path: proofPath,
+    command: ["$CODESTORY_CLI", ...args.map((value) => shellSingleQuoted(value))].join(" "),
+  };
+}
+
+function builderContinuationOfferReceipt(contract) {
+  if (!contract) return null;
+  return {
+    parent_packet_id: contract.parent_packet_id,
+    allowed_option_ids: contract.allowed_option_ids,
+    core_generation_id: contract.core_generation_id,
+    retrieval_generation: contract.retrieval_generation,
+    question_sha256: contract.question_sha256,
+  };
 }
 
 function displayShellArg(value) {
@@ -4799,6 +5271,9 @@ function preludePublicFields(prelude) {
     packet_contract_runtime: prelude.packet_contract_runtime ?? null,
     packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
+    packet_retrieval_policy: prelude.packet_retrieval_policy ?? null,
+    packet_retrieval_proof: prelude.packet_retrieval_proof ?? null,
+    packet_retrieval_proof_path: prelude.packet_retrieval_proof_path ?? null,
     packet_drill_continuation: prelude.packet_drill_continuation === true,
     packet_contract_blockers: prelude.packet_contract_blockers ?? [],
     ...(prelude.packet_command_failure == null
@@ -5982,8 +6457,65 @@ function packetCommandFailureReason(envelope) {
   ].filter(Boolean).join("; ");
 }
 
+function builderPacketRetrievalProofErrors(receipt, arm, expectedRequest = null) {
+  const errors = [];
+  const expectedDense = expectedRequest?.requested_dense_semantic ?? arm === "packet_semantic_on";
+  const expectedPolicy = builderPacketRetrievalPolicy(
+    expectedDense ? "packet_semantic_on" : "packet_semantic_off",
+  );
+  const proof = receipt?.retrieval_proof;
+  const semanticInvocations = proof?.dense_semantic_stage_invocations;
+  const stageInvocations = proof?.descriptor_stage_invocations?.stage1b_semantic ?? 0;
+  if (
+    receipt?.contract !== "codestory.packet-builder-ablation-receipt/v1" ||
+    receipt?.requested_dense_semantic !== expectedDense ||
+    proof?.contract !== "codestory.packet-dense-candidate-ablation-proof/v1" ||
+    proof?.requested_policy !== expectedPolicy ||
+    !Number.isInteger(proof?.descriptor_query_count) || proof.descriptor_query_count < 1 ||
+    !Number.isInteger(semanticInvocations) || semanticInvocations < 0 ||
+    !Number.isInteger(stageInvocations) || stageInvocations !== semanticInvocations ||
+    (!expectedDense && semanticInvocations !== 0)
+  ) {
+    errors.push("packet retrieval proof does not establish the requested dense candidate-stage policy");
+  }
+  for (const field of [
+    "core_generation_id",
+    "core_run_id",
+    "retrieval_generation",
+    "semantic_generation",
+  ]) {
+    if (typeof receipt?.[field] !== "string" || !receipt[field].trim()) {
+      errors.push(`packet retrieval proof is missing ${field}`);
+    }
+  }
+  if (expectedRequest) {
+    const request = receipt?.request;
+    const optionIds = request?.option_ids;
+    const expectedOptions = new Set(expectedRequest.allowed_option_ids ?? []);
+    if (
+      request?.question_sha256 !== expectedRequest.question_sha256 ||
+      request?.parent_packet_id !== (expectedRequest.parent_packet_id ?? null) ||
+      request?.core_generation_id !== (expectedRequest.core_generation_id ?? null) ||
+      request?.retrieval_generation !== (expectedRequest.retrieval_generation ?? null) ||
+      !Array.isArray(optionIds) ||
+      new Set(optionIds).size !== optionIds.length ||
+      optionIds.some((value) => !expectedOptions.has(value)) ||
+      (expectedRequest.parent_packet_id ? optionIds.length === 0 : optionIds.length !== 0)
+    ) {
+      errors.push("packet retrieval proof is not bound to the exact benchmark request");
+    }
+  }
+  return errors;
+}
+
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
-  const args = packetCommandArgs(repoConfig, run.task, opts);
+  const args = packetCommandArgs(repoConfig, run.task, opts, run.arm);
+  const retrievalProofPath = opts.builderAblation
+    ? path.join(outDir, `${runId}.packet-retrieval-proof.json`)
+    : null;
+  if (retrievalProofPath) {
+    args.push("--benchmark-retrieval-proof-out", retrievalProofPath);
+  }
   const extraProbes = packetCommandExtraProbes(run.task, opts);
   let command = displayCommand(codestoryCli, args);
   let activeArgs = args;
@@ -6022,6 +6554,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   let activeStderrPath = stderrPath;
   let drillContinuation = false;
   if (
+    !opts.builderAblation &&
     result.status === "pass" &&
     !parseError &&
     (
@@ -6029,7 +6562,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
       (isPacketProjectionV3(packet) && packet?.status === "continuation_available")
     )
   ) {
-    const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet);
+    const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet, run.arm);
     if (drillArgs) {
       const drillStdoutPath = path.join(outDir, `${runId}.codestory-packet-drill.stdout.json`);
       const drillStderrPath = path.join(outDir, `${runId}.codestory-packet-drill.stderr.txt`);
@@ -6067,8 +6600,26 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   }
 
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  let retrievalProof = null;
+  let retrievalProofError = null;
+  if (retrievalProofPath) {
+    try {
+      retrievalProof = JSON.parse(await readFile(retrievalProofPath, "utf8"));
+      retrievalProofError = builderPacketRetrievalProofErrors(retrievalProof, run.arm, {
+        question_sha256: sha256Bytes(run.task?.prompt ?? repoConfig.prompt),
+        parent_packet_id: null,
+        allowed_option_ids: [],
+        core_generation_id: null,
+        retrieval_generation: null,
+      })[0] ?? null;
+    } catch (error) {
+      retrievalProofError = `packet retrieval proof failed: ${error.message}`;
+    }
+  }
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
-  const contractBlockers = parseError
+  const contractBlockers = retrievalProofError
+    ? [retrievalProofError]
+    : parseError
     ? [`packet JSON parse failed: ${parseError}`]
     : commandFailureReason
       ? [commandFailureReason]
@@ -6126,6 +6677,9 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_contract_runtime: packet?._meta?.codestory_publication?.contract_runtime ?? null,
     packet_extra_probe_count: extraProbes.length,
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
+    packet_retrieval_policy: builderPacketRetrievalPolicy(run.arm),
+    packet_retrieval_proof: retrievalProof,
+    packet_retrieval_proof_path: retrievalProofPath,
     packet_drill_continuation: drillContinuation,
     packet_contract_blockers: contractBlockers,
     packet_command_failure: commandFailure,
@@ -6192,15 +6746,20 @@ async function runOne(opts, run, outDir) {
   const env = agentRunnerEnv(
     selectedBenchmarkChildEnv(opts, run.arm),
     opts.agentCodexHomes?.[run.arm] ?? null,
-    !opts.exactCandidate || isCodeStoryArm(run.arm),
+    opts.builderAblation
+      ? isCodeStoryArm(run.arm)
+      : (!opts.exactCandidate || isCodeStoryArm(run.arm)),
   );
+  if (opts.builderAblation && isCodeStoryArm(run.arm)) {
+    env.CODESTORY_CLI = codestoryPreludeCli;
+  }
   const interactionStarted = performance.now();
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
       : null;
   const codestoryPrelude =
-    isCodeStoryArm(run.arm)
+    isPacketArm(run.arm)
       ? await runCodeStoryPacketPrelude(
           opts,
           run,
@@ -6211,9 +6770,26 @@ async function runOne(opts, run, outDir) {
           env,
         )
       : null;
+  const opaqueContinuationProofPath = opts.builderAblation && isBuilderPacketArm(run.arm)
+    ? opaqueBuilderContinuationProofPath(opts.builderAblationStateRoot)
+    : null;
+  const builderContinuation = builderContinuationContract(
+    repoConfig,
+    run.task,
+    opts,
+    codestoryPrelude?.packet,
+    run.arm,
+    opaqueContinuationProofPath,
+  );
+  const builderContinuationProofPath = builderContinuation?.proof_path ?? null;
+  if (builderContinuationProofPath) {
+    await mkdir(path.dirname(builderContinuationProofPath), { recursive: true, mode: 0o700 });
+  }
   const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task, {
     baselinePrelude,
     codestoryPrelude,
+    builderAblation: opts.builderAblation,
+    builderContinuationContract: builderContinuation,
   });
   const { command, args, stdin, killProcessTree } = runnerCommand(
     opts,
@@ -6300,10 +6876,61 @@ async function runOne(opts, run, outDir) {
     "exact_match",
   ].includes(codestoryBinaryIdentity.status);
   const provenance = await repoProvenance(repoConfig, opts.signal);
-  const packetFirstRequired = isCodeStoryArm(run.arm);
+  const packetFirstRequired = isPacketArm(run.arm);
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(analysisEvents, run.task);
+  const builderOperationErrors = opts.builderAblation
+    ? builderOperationViolations(run.arm, analysis.codestory_operations, {
+        continuationContract: builderContinuation,
+        expectedProject: repoConfig.path,
+      })
+    : [];
+  let builderContinuationRetrievalProof = null;
+  if (builderContinuationProofPath && existsSync(builderContinuationProofPath)) {
+    try {
+      builderContinuationRetrievalProof = JSON.parse(
+        await readFile(builderContinuationProofPath, "utf8"),
+      );
+      const proofErrors = builderPacketRetrievalProofErrors(
+        builderContinuationRetrievalProof,
+        run.arm,
+        { ...builderContinuation, requested_dense_semantic: false },
+      );
+      if (proofErrors.length) builderOperationErrors.push(...proofErrors.map((error) => `continuation ${error}`));
+      const initialIdentity = codestoryPrelude?.public?.packet_retrieval_proof;
+      for (const field of [
+        "core_generation_id",
+        "core_run_id",
+        "retrieval_generation",
+        "semantic_generation",
+      ]) {
+        if (builderContinuationRetrievalProof?.[field] !== initialIdentity?.[field]) {
+          builderOperationErrors.push(`continuation packet changed ${field}`);
+        }
+      }
+    } catch (error) {
+      builderOperationErrors.push(`continuation retrieval proof failed: ${error.message}`);
+    }
+  }
+  const agentPacketContinuations = analysis.codestory_operations.filter(
+    (operation) => operation.source === "agent_cli" && operation.operation === "packet",
+  );
+  if (builderContinuationProofPath && agentPacketContinuations.length > 0 && !builderContinuationRetrievalProof) {
+    builderOperationErrors.push("packet continuation did not produce an execution proof");
+  }
+  if (builderContinuationProofPath && agentPacketContinuations.length === 0 && builderContinuationRetrievalProof) {
+    builderOperationErrors.push("unexpected continuation execution proof without a recorded continuation");
+  }
+  if (opts.builderAblation && analysis.external_context_tool_calls > 0) {
+    builderOperationErrors.push("external context tool use is forbidden");
+  }
+  if (opts.builderAblation && analysis.remote_context_commands.length > 0) {
+    builderOperationErrors.push("remote repository or HTTP command use is forbidden");
+  }
+  const builderFirstCodeStoryRequired = opts.builderAblation && isCodeStoryArm(run.arm);
+  const builderFirstCodeStoryPass = !builderFirstCodeStoryRequired ||
+    analysis.codestory_was_first_context_command === true;
   const cacheProvenance = isCodeStoryArm(run.arm)
     ? await codestoryCacheProvenance(
         opts,
@@ -6387,6 +7014,26 @@ async function runOne(opts, run, outDir) {
     transcript_analysis: analysis,
     packet_first_required: packetFirstRequired,
     packet_first_pass: packetFirstPass,
+    builder_ablation: opts.builderAblation
+      ? {
+          contract: "codestory.evidence-compiler-builder-row/v1",
+          development_only: true,
+          release_authority: false,
+          fresh: true,
+          first_codestory_required: builderFirstCodeStoryRequired,
+          first_codestory_pass: builderFirstCodeStoryPass,
+          packet_retrieval_policy: builderPacketRetrievalPolicy(run.arm),
+          continuation_offer: builderContinuationOfferReceipt(builderContinuation),
+          continuation_retrieval_proof: builderContinuationRetrievalProof,
+          intervention_scope: isBuilderPacketArm(run.arm)
+            ? "dense_candidate_stage_only_model_residency_and_full_publication_health_retained"
+            : null,
+          operation_violations: [
+            ...builderOperationErrors,
+            ...(builderFirstCodeStoryPass ? [] : ["first repository-context action was not CodeStory"]),
+          ],
+        }
+      : null,
     quality,
     event_types: eventTypeCounts(analysisEvents),
     json_events: parsed.length,
@@ -6573,6 +7220,8 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     degraded_reason: output?.degraded_reason ?? null,
     manifest_embedding_backend: output?.manifest?.embedding_backend ?? null,
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
+    sidecar_input_hash: output?.manifest?.sidecar_input_hash ?? null,
+    sidecar_generation: output?.manifest?.sidecar_generation ?? null,
     semantic_generation: output?.manifest?.semantic_generation ?? null,
     embedding_device_policy: output?.embedding_device_policy ?? null,
     embedding_device_state: output?.embedding_device_state ?? null,
@@ -7703,7 +8352,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       },
     }));
   }
-  if (!opts.arms.includes("with_codestory")) {
+  if (!opts.arms.some(isCodeStoryArm)) {
     return [];
   }
   const repoNames = [...new Set(tasks.map((task) => task.repo))];
@@ -10396,6 +11045,12 @@ function resourceAccountingForResult(result) {
     direct_source_reads_total: presentFiniteNumber(analysis.direct_source_reads_total),
     ordinary_source_reads_after_first_codestory:
       presentFiniteNumber(analysis.ordinary_source_reads_after_first_codestory),
+    exploratory_source_reads_after_first_codestory:
+      presentFiniteNumber(analysis.exploratory_source_reads_after_first_codestory),
+    exploratory_repository_context_actions_after_first_codestory:
+      presentFiniteNumber(
+        analysis.exploratory_repository_context_actions_after_first_codestory,
+      ),
     ordinary_source_reads_after_first_packet:
       presentFiniteNumber(analysis.ordinary_source_reads_after_first_packet),
   };
@@ -10485,6 +11140,15 @@ function summarizeArmCostAccounting(rows) {
       ),
       ordinary_source_reads_after_first_codestory: sumFinite(
         rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_codestory),
+      ),
+      exploratory_source_reads_after_first_codestory: sumFinite(
+        rows.map((row) => row.transcript_analysis?.exploratory_source_reads_after_first_codestory),
+      ),
+      exploratory_repository_context_actions_after_first_codestory: sumFinite(
+        rows.map(
+          (row) => row.transcript_analysis
+            ?.exploratory_repository_context_actions_after_first_codestory,
+        ),
       ),
       ordinary_source_reads_after_first_packet: sumFinite(
         rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_packet),
@@ -11669,6 +12333,9 @@ function runSelfTest() {
 }
 
 function planAgentRuns(opts, tasks) {
+  if (opts.builderAblation) {
+    return planBuilderAblationRuns(tasks, opts.repeats);
+  }
   const plannedRuns = [];
   if (opts.exactCandidate) {
     for (const [taskIndex, task] of tasks.entries()) {
@@ -13275,7 +13942,7 @@ async function benchmarkShardAttestation(
     throw new Error("Benchmark shard attestation requires a clean tracked source checkout");
   }
   let cliSha256 = dependencies.cliSha256 ?? null;
-  if (!Object.hasOwn(dependencies, "cliSha256") && opts.arms.includes("with_codestory")) {
+  if (!Object.hasOwn(dependencies, "cliSha256") && opts.arms.some(isCodeStoryArm)) {
     const cli = resolveCodeStoryCli(opts);
     if (path.isAbsolute(cli) && existsSync(cli) && statSync(cli).isFile()) {
       cliSha256 = sha256Bytes(await readFile(cli));
@@ -13305,6 +13972,7 @@ async function benchmarkShardAttestation(
     canary_task_id: opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null,
     diagnostic_extra_probes_from_manifest: Boolean(opts.diagnosticExtraProbesFromManifest),
     collect_all_failures: Boolean(opts.collectAllFailures),
+    builder_ablation: Boolean(opts.builderAblation),
     shard_count: opts.shardCount,
   };
   const rowContractEnvironmentDigests = new Set(
@@ -13819,6 +14487,98 @@ async function runExactCandidatePipeline({
   };
 }
 
+async function runBuilderAblationPipeline({
+  opts,
+  tasks,
+  plannedRuns,
+  executeRun,
+  outDir,
+  materializeGroup,
+  prepareGroup,
+  prepareIsolation,
+  recordResult,
+  recordPreparation,
+  recordPreparationState,
+  recordFirstFailure,
+}) {
+  const cachePreparation = [];
+  opts.cachePreparationByRepo ??= new Map();
+  const groups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({ repo, tasks: repoTasks }));
+  for (const group of groups) {
+    try {
+      await materializeGroup(group, null);
+      await recordPreparationState({ kind: "materialized", repo: group.repo });
+      const rows = await prepareGroup(group, null);
+      if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.repo !== group.repo) {
+        throw new Error(`builder ablation preparation must return exactly one row for ${group.repo}`);
+      }
+      const blockers = cachePreparationCanaryBlockers(
+        rows[0],
+        selectedBenchmarkChildEnv(opts),
+      );
+      if (blockers.length) {
+        throw new Error(`builder ablation preparation is ineligible: ${blockers.join("; ")}`);
+      }
+      await recordPreparation(rows[0]);
+      cachePreparation.push(rows[0]);
+      opts.cachePreparationByRepo.set(group.repo, rows[0]);
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
+    } catch (error) {
+      if (error?.preparation) await recordPreparation(error.preparation);
+      const failure = pipelineStageFailure("preparation", group, error);
+      await recordFirstFailure(failure);
+      return {
+        results: [],
+        firstFailure: failure,
+        comparativeFailure: null,
+        comparativePublishable: false,
+        cachePreparation,
+        agentCodexIsolation: null,
+        aborted: true,
+      };
+    }
+  }
+
+  let agentCodexIsolation;
+  try {
+    agentCodexIsolation = await prepareIsolation();
+  } catch (error) {
+    const failure = pipelineStageFailure("agent_isolation", null, error);
+    await recordFirstFailure(failure);
+    return {
+      results: [],
+      firstFailure: failure,
+      comparativeFailure: null,
+      comparativePublishable: false,
+      cachePreparation,
+      agentCodexIsolation: null,
+      aborted: true,
+    };
+  }
+
+  const outcome = await runPlannedAgentRuns(
+    { ...opts, jobs: 1 },
+    plannedRuns,
+    new Map(),
+    outDir,
+    {
+      runOne: executeRun,
+      failFast: false,
+      onResult: recordResult,
+      onFirstFailure: recordFirstFailure,
+    },
+  );
+  return {
+    results: outcome.results,
+    firstFailure: outcome.firstFailure,
+    comparativeFailure: null,
+    comparativePublishable: outcome.firstFailure == null,
+    cachePreparation,
+    agentCodexIsolation,
+    aborted: false,
+  };
+}
+
 async function runAgentBenchmarkPipeline({
   opts,
   tasks,
@@ -13835,6 +14595,22 @@ async function runAgentBenchmarkPipeline({
   recordFirstFailure = async () => {},
   recordComparativeFailure = async () => {},
 }) {
+  if (opts.builderAblation) {
+    return await runBuilderAblationPipeline({
+      opts,
+      tasks,
+      plannedRuns,
+      executeRun,
+      outDir,
+      materializeGroup,
+      prepareGroup,
+      prepareIsolation,
+      recordResult,
+      recordPreparation,
+      recordPreparationState,
+      recordFirstFailure,
+    });
+  }
   if (opts.exactCandidate) {
     return await runExactCandidatePipeline({
       opts,
@@ -14199,6 +14975,7 @@ async function main() {
   }
   const allTasks = await loadTasks(opts);
   validateExactCandidateShape(opts, allTasks);
+  validateBuilderAblationShape(opts, allTasks);
   opts.exactCandidateCostRates = opts.exactCandidate
     ? exactCandidateCostRates(process.env)
     : null;
@@ -14259,6 +15036,9 @@ async function main() {
   const plannedRuns = planAgentRuns(opts, tasks);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
+  if (opts.builderAblation) {
+    opts.timingExecutionWindowId = `builder-ablation-${timestamp}-${process.pid}`;
+  }
   await mkdir(outDir, { recursive: true });
   const runsPath = path.join(outDir, "runs.jsonl");
   if (existsSync(runsPath)) {
@@ -14301,6 +15081,8 @@ async function main() {
           ...row,
         });
       }
+    } else if (opts.builderAblation) {
+      await initializeBuilderAblationState(opts);
     }
     pipeline = await runAgentBenchmarkPipeline({
       opts,
@@ -14420,6 +15202,19 @@ async function main() {
   );
   const summaryPayload = {
     generated_at: new Date().toISOString(),
+    evidence_status: opts.builderAblation ? "builder_visible_development_only" : null,
+    release_authority: opts.builderAblation ? false : null,
+    builder_ablation: opts.builderAblation
+      ? {
+          contract: "codestory.evidence-compiler-builder-harness/v1",
+          historical_corpus_burned: true,
+          adaptive_local_investigation_allowed: true,
+          packet_continuation_selected_by_agent: true,
+          packet_semantic_off_scope:
+            "dense_candidate_stage_only_model_residency_and_full_publication_health_retained",
+          critical_claim_adjudication: "required_external_blinded_receipt",
+        }
+      : null,
     runner: opts.runner,
     model: opts.model,
     repos: opts.repos ?? [...new Set(tasks.map((task) => task.repo))],
@@ -14455,6 +15250,7 @@ async function main() {
     comparator_reuse: comparatorReuse.provenance,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
+    timing_execution_window_id: opts.timingExecutionWindowId ?? null,
     sandbox: opts.sandbox,
     output_dir: outDir,
     retrieval_env: retrievalEnv(),
@@ -14565,6 +15361,7 @@ export {
   parseJsonLines,
   cachePolicyForRun,
   codeStoryArmInstruction,
+  composeBuilderAblationPrompt,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
   candidateIncrementalRetrievalWorkBlockers,
@@ -14577,6 +15374,9 @@ export {
   finalizeBenchmarkResources,
   finalBenchmarkFailure,
   initializeExactCandidateState,
+  initializeBuilderAblationState,
+  opaqueBuilderAgentHome,
+  opaqueBuilderContinuationProofPath,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
   retrievalIndexWorkEvidence,
@@ -14585,6 +15385,7 @@ export {
   packetComposition,
   packetCommandArgs,
   drillPacketCommandArgs,
+  builderContinuationContract,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -14627,6 +15428,7 @@ export {
   packetV3EvidenceGapAccountingError,
   withExactSourceMutation,
   validateExactCandidateShape,
+  validateBuilderAblationShape,
   validateExactCandidateResumePrefixRows,
   validateExactCandidateComparatorPrefixRows,
   validateExactComparatorLedgerSha256,

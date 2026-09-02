@@ -14,7 +14,11 @@ use codestory_contracts::compilation::{
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "benchmark-support")]
+use std::cell::Cell;
 use std::cell::RefCell;
+#[cfg(feature = "benchmark-support")]
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::rc::Rc;
@@ -35,7 +39,7 @@ pub(crate) enum PacketGraphDirection {
 /// Formula hydration, trail-scan ledgers, and promotion need-sets no longer
 /// live here. The session only bounds how many candidates may hydrate and how
 /// many source bytes they may charge before exact hydration.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PacketProofSession {
     /// Packet-scoped count of candidates selected for source/graph hydration.
     /// Horizon A admits at most [`INTERIM_MAX_ADMITTED_CANDIDATES`] across the
@@ -47,6 +51,34 @@ pub(crate) struct PacketProofSession {
     receipts: RefCell<Vec<PacketAdmissionReceiptV1>>,
     gaps: RefCell<Vec<PacketAdmissionGapV1>>,
     retrieval_admission_sealed: RefCell<bool>,
+    #[cfg(feature = "benchmark-support")]
+    include_dense_semantic: bool,
+    #[cfg(feature = "benchmark-support")]
+    descriptor_query_count: Cell<u32>,
+    #[cfg(feature = "benchmark-support")]
+    descriptor_cache_hit_count: Cell<u32>,
+    #[cfg(feature = "benchmark-support")]
+    descriptor_stage_invocations: RefCell<BTreeMap<String, u32>>,
+    #[cfg(feature = "benchmark-support")]
+    descriptor_stage_candidates: RefCell<BTreeMap<String, u64>>,
+}
+
+impl Default for PacketProofSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "benchmark-support")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct BenchmarkPacketRetrievalProof {
+    pub contract: &'static str,
+    pub requested_policy: &'static str,
+    pub descriptor_query_count: u32,
+    pub descriptor_cache_hit_count: u32,
+    pub descriptor_stage_invocations: BTreeMap<String, u32>,
+    pub descriptor_stage_candidates: BTreeMap<String, u64>,
+    pub dense_semantic_stage_invocations: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +98,72 @@ impl PacketProofSession {
             receipts: RefCell::new(Vec::new()),
             gaps: RefCell::new(Vec::new()),
             retrieval_admission_sealed: RefCell::new(false),
+            #[cfg(feature = "benchmark-support")]
+            include_dense_semantic: true,
+            #[cfg(feature = "benchmark-support")]
+            descriptor_query_count: Cell::new(0),
+            #[cfg(feature = "benchmark-support")]
+            descriptor_cache_hit_count: Cell::new(0),
+            #[cfg(feature = "benchmark-support")]
+            descriptor_stage_invocations: RefCell::new(BTreeMap::new()),
+            #[cfg(feature = "benchmark-support")]
+            descriptor_stage_candidates: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn without_dense_semantic_for_benchmark() -> Self {
+        Self {
+            include_dense_semantic: false,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn includes_dense_semantic(&self) -> bool {
+        self.include_dense_semantic
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn record_descriptor_trace(&self, trace: &codestory_retrieval::QueryTrace) {
+        self.descriptor_query_count
+            .set(self.descriptor_query_count.get().saturating_add(1));
+        if trace.cache_hit {
+            self.descriptor_cache_hit_count
+                .set(self.descriptor_cache_hit_count.get().saturating_add(1));
+        }
+        let mut invocations = self.descriptor_stage_invocations.borrow_mut();
+        let mut candidates = self.descriptor_stage_candidates.borrow_mut();
+        for stage in &trace.stages {
+            if stage.completion_status != codestory_retrieval::StageCompletionStatus::Completed {
+                continue;
+            }
+            let label = stage.stage.label().to_string();
+            let invocation_count = invocations.entry(label.clone()).or_default();
+            *invocation_count = invocation_count.saturating_add(1);
+            let candidate_count = candidates.entry(label).or_default();
+            *candidate_count = candidate_count.saturating_add(stage.candidates_added as u64);
+        }
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn benchmark_retrieval_proof(&self) -> BenchmarkPacketRetrievalProof {
+        let descriptor_stage_invocations = self.descriptor_stage_invocations.borrow().clone();
+        BenchmarkPacketRetrievalProof {
+            contract: "codestory.packet-dense-candidate-ablation-proof/v1",
+            requested_policy: if self.include_dense_semantic {
+                "repository_graph_lexical_dense_candidate_stage_enabled_v1"
+            } else {
+                "repository_graph_lexical_dense_candidate_stage_disabled_v1"
+            },
+            descriptor_query_count: self.descriptor_query_count.get(),
+            descriptor_cache_hit_count: self.descriptor_cache_hit_count.get(),
+            dense_semantic_stage_invocations: descriptor_stage_invocations
+                .get("stage1b_semantic")
+                .copied()
+                .unwrap_or(0),
+            descriptor_stage_invocations,
+            descriptor_stage_candidates: self.descriptor_stage_candidates.borrow().clone(),
         }
     }
 
@@ -551,6 +649,72 @@ mod tests {
         PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
     };
     use codestory_contracts::compilation::{PacketRetrievalLaneV1, VersionedRetrievalScoreV1};
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn benchmark_retrieval_proof_records_executed_descriptor_stages() {
+        assert!(
+            PacketProofSession::default().includes_dense_semantic(),
+            "enabling benchmark support must not change the normal packet default"
+        );
+        let session = PacketProofSession::without_dense_semantic_for_benchmark();
+        session.record_descriptor_trace(&codestory_retrieval::QueryTrace {
+            retrieval_mode: "full".into(),
+            degraded_reason: None,
+            total_budget_ms: 800,
+            elapsed_ms: 4,
+            cancel_reason: None,
+            cache_hit: false,
+            stages: vec![
+                codestory_retrieval::StageTrace {
+                    stage: codestory_retrieval::RetrievalStageKind::Stage1Lexical,
+                    budget_ms: 200,
+                    elapsed_ms: 4,
+                    admission_wait_ms: 0,
+                    queue_wait_ms: Some(0),
+                    execution_ms: Some(4),
+                    candidates_added: 3,
+                    marginal_gain: 1.0,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    degraded: false,
+                    stub_reason: None,
+                    completion_status: codestory_retrieval::StageCompletionStatus::Completed,
+                },
+                codestory_retrieval::StageTrace {
+                    stage: codestory_retrieval::RetrievalStageKind::Stage1bSemantic,
+                    budget_ms: 200,
+                    elapsed_ms: 0,
+                    admission_wait_ms: 0,
+                    queue_wait_ms: None,
+                    execution_ms: None,
+                    candidates_added: 0,
+                    marginal_gain: 0.0,
+                    cancel_reason: Some("unique_exact_definition".into()),
+                    cache_hit: false,
+                    degraded: false,
+                    stub_reason: None,
+                    completion_status: codestory_retrieval::StageCompletionStatus::Skipped,
+                },
+            ],
+        });
+
+        let proof = session.benchmark_retrieval_proof();
+        assert_eq!(proof.descriptor_query_count, 1);
+        assert_eq!(proof.descriptor_cache_hit_count, 0);
+        assert_eq!(proof.dense_semantic_stage_invocations, 0);
+        assert!(
+            !proof
+                .descriptor_stage_invocations
+                .contains_key("stage1b_semantic")
+        );
+        assert_eq!(proof.descriptor_stage_invocations["stage1_lexical"], 1);
+        assert_eq!(proof.descriptor_stage_candidates["stage1_lexical"], 3);
+        assert_eq!(
+            proof.requested_policy,
+            "repository_graph_lexical_dense_candidate_stage_disabled_v1"
+        );
+    }
 
     #[test]
     fn admission_is_packet_wide_identity_deduplicated_and_count_bounded() {

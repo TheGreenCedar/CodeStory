@@ -61,6 +61,8 @@ pub(crate) use codestory_agent::{
     packet_freshness, packet_plan, packet_scoring, packet_terms, planning, profiles,
 };
 
+#[cfg(feature = "benchmark-support")]
+pub(crate) use orchestrator::agent_packet_for_benchmark;
 pub(crate) use orchestrator::{agent_ask, agent_packet};
 pub use packet_budget::enforce_packet_output_budget_for_representation;
 pub use packet_follow_up::bind_packet_follow_up_program;

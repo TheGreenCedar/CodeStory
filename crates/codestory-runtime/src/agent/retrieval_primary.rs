@@ -137,6 +137,13 @@ impl RetrievalPublicationResponse for AgentPacketDto {
     }
 }
 
+#[cfg(feature = "benchmark-support")]
+impl RetrievalPublicationResponse for super::orchestrator::BenchmarkPacketExecution {
+    fn attach_retrieval_publication(&mut self, publication: EmbeddingVectorPublicationIdentityDto) {
+        self.packet.attach_retrieval_publication(publication);
+    }
+}
+
 fn publication_dto(pinned: &PinnedRetrievalRead) -> EmbeddingVectorPublicationIdentityDto {
     let publication = pinned.session.publication_identity();
     EmbeddingVectorPublicationIdentityDto {
@@ -951,7 +958,19 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                 budget_ms: Some(per_query_budget),
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "benchmark-support")]
+        let include_dense_semantic = session.includes_dense_semantic();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+            #[cfg(feature = "benchmark-support")]
+            if !include_dense_semantic {
+                return pinned
+                    .session
+                    .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
+                        &batch_items,
+                        crate::services::active_public_operation_cancellation(),
+                        cache,
+                    );
+            }
             pinned.session.execute_packet_descriptor_batch_with_cache(
                 &batch_items,
                 crate::services::active_public_operation_cancellation(),
@@ -959,6 +978,10 @@ pub(crate) fn preadmit_packet_descriptor_queries(
             )
         })
         .map_err(map_pinned_query_error)?;
+        #[cfg(feature = "benchmark-support")]
+        for result in &query_results {
+            session.record_descriptor_trace(&result.trace);
+        }
         if query_results.len() != queries.len() {
             return Err(sidecar_retrieval_unavailable_error(
                 controller,
@@ -1053,7 +1076,18 @@ pub(crate) fn run_and_resolve_sidecar_query(
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
         let query_result = with_detached_sidecar_query_cache(controller, |cache| {
-            if crate::agent::packet_candidate::active_packet_proof_session().is_some() {
+            if let Some(_session) = crate::agent::packet_candidate::active_packet_proof_session() {
+                #[cfg(feature = "benchmark-support")]
+                if !_session.includes_dense_semantic() {
+                    return pinned
+                        .session
+                        .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
+                            query,
+                            Some(sidecar_budget_ms(latency_budget_ms)),
+                            crate::services::active_public_operation_cancellation(),
+                            cache,
+                        );
+                }
                 pinned.session.execute_packet_descriptors_with_cache(
                     query,
                     Some(sidecar_budget_ms(latency_budget_ms)),
@@ -1070,6 +1104,10 @@ pub(crate) fn run_and_resolve_sidecar_query(
             }
         })
         .map_err(map_pinned_query_error)?;
+        #[cfg(feature = "benchmark-support")]
+        if let Some(session) = crate::agent::packet_candidate::active_packet_proof_session() {
+            session.record_descriptor_trace(&query_result.trace);
+        }
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
         let resolution = resolve_sidecar_candidates_in_read(
             controller,
@@ -1344,6 +1382,18 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Vec<_>>();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+            #[cfg(feature = "benchmark-support")]
+            if active_packet_proof_session()
+                .is_some_and(|session| !session.includes_dense_semantic())
+            {
+                return pinned
+                    .session
+                    .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
+                        &batch_items,
+                        crate::services::active_public_operation_cancellation(),
+                        cache,
+                    );
+            }
             pinned.session.execute_packet_descriptor_batch_with_cache(
                 &batch_items,
                 crate::services::active_public_operation_cancellation(),
@@ -1351,6 +1401,12 @@ fn search_sidecar_packet_batch_inner(
             )
         })
         .map_err(map_pinned_query_error)?;
+        #[cfg(feature = "benchmark-support")]
+        if let Some(session) = active_packet_proof_session() {
+            for result in &query_results {
+                session.record_descriptor_trace(&result.trace);
+            }
+        }
         for result in &query_results {
             pinned.ensure_query_identity(result, "resolving sidecar packet batch")?;
         }

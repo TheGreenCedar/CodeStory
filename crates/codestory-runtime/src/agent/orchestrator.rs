@@ -3,6 +3,8 @@ use crate::agent::packet_batch::{PacketLatencyBudget, run_packet_planned_subquer
 use crate::agent::packet_budget::{
     apply_packet_budget, enforce_packet_output_budget, packet_budget_limits,
 };
+#[cfg(feature = "benchmark-support")]
+use crate::agent::packet_candidate::BenchmarkPacketRetrievalProof;
 use crate::agent::packet_candidate::{
     PacketProofSession, PacketSearchHit, install_packet_proof_session,
 };
@@ -321,6 +323,38 @@ pub(crate) fn agent_packet(
     controller: &AppController,
     req: AgentPacketRequestDto,
 ) -> Result<AgentPacketDto, ApiError> {
+    agent_packet_with_session(controller, req, std::rc::Rc::new(PacketProofSession::new()))
+}
+
+#[cfg(feature = "benchmark-support")]
+pub(crate) struct BenchmarkPacketExecution {
+    pub(crate) packet: AgentPacketDto,
+    pub(crate) retrieval_proof: BenchmarkPacketRetrievalProof,
+}
+
+#[cfg(feature = "benchmark-support")]
+pub(crate) fn agent_packet_for_benchmark(
+    controller: &AppController,
+    req: AgentPacketRequestDto,
+    include_dense_semantic: bool,
+) -> Result<BenchmarkPacketExecution, ApiError> {
+    let proof_session = std::rc::Rc::new(if include_dense_semantic {
+        PacketProofSession::new()
+    } else {
+        PacketProofSession::without_dense_semantic_for_benchmark()
+    });
+    let packet = agent_packet_with_session(controller, req, std::rc::Rc::clone(&proof_session))?;
+    Ok(BenchmarkPacketExecution {
+        packet,
+        retrieval_proof: proof_session.benchmark_retrieval_proof(),
+    })
+}
+
+fn agent_packet_with_session(
+    controller: &AppController,
+    req: AgentPacketRequestDto,
+    proof_session: std::rc::Rc<PacketProofSession>,
+) -> Result<AgentPacketDto, ApiError> {
     let question = req.question.trim().to_string();
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
@@ -330,7 +364,6 @@ pub(crate) fn agent_packet(
     let project_root = controller.require_project_root()?;
     let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
     controller.begin_packet_retrieval();
-    let proof_session = std::rc::Rc::new(PacketProofSession::new());
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
 
     if !req.option_ids.is_empty() && req.parent_packet_id.is_none() {

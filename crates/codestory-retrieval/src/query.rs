@@ -400,6 +400,28 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, true)
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub fn execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, false)
+    }
+
+    fn execute_packet_descriptors_with_cache_policy(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+        include_dense_semantic: bool,
+    ) -> Result<QueryResult> {
         let cancelled = cancelled.unwrap_or_else(cancellation_flag);
         if cancelled.load(Ordering::Acquire) {
             bail!("retrieval query cancelled before preflight");
@@ -413,7 +435,18 @@ impl PinnedQuerySession {
             cancelled,
             mode_override: None,
         };
-        let mut result = executor.execute_packet_descriptors(query, budget_ms)?;
+        let mut result = if include_dense_semantic {
+            executor.execute_packet_descriptors(query, budget_ms)?
+        } else {
+            #[cfg(feature = "benchmark-support")]
+            {
+                executor.execute_packet_descriptors_without_dense_semantic_for_benchmark(
+                    query, budget_ms,
+                )?
+            }
+            #[cfg(not(feature = "benchmark-support"))]
+            unreachable!("dense semantic packet control requires benchmark-support")
+        };
         sanitize_packet_candidate_descriptors(&mut result.hits);
         Ok(result.with_publication_identity(&self.publication_identity))
     }
@@ -469,6 +502,26 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<Vec<QueryResult>> {
+        self.execute_packet_descriptor_batch_with_cache_policy(queries, cancelled, cache, true)
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub fn execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_packet_descriptor_batch_with_cache_policy(queries, cancelled, cache, false)
+    }
+
+    fn execute_packet_descriptor_batch_with_cache_policy(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+        include_dense_semantic: bool,
+    ) -> Result<Vec<QueryResult>> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -499,6 +552,7 @@ impl PinnedQuerySession {
             queries,
             cache,
             strict_batch_worker_limit(queries.len()),
+            include_dense_semantic,
         )?;
         for result in &mut results {
             sanitize_packet_candidate_descriptors(&mut result.hits);
@@ -747,6 +801,7 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         cache,
         worker_limit,
         CandidatePayloadMode::Full,
+        true,
     )
 }
 
@@ -760,6 +815,7 @@ fn execute_strict_retrieval_descriptor_batch_against_sidecars(
     queries: &[QueryBatchItem<'_>],
     cache: &mut RetrievalCache,
     worker_limit: usize,
+    include_dense_semantic: bool,
 ) -> Result<Vec<QueryResult>> {
     execute_strict_retrieval_query_batch_against_sidecars_with_payload(
         sidecars,
@@ -771,6 +827,7 @@ fn execute_strict_retrieval_descriptor_batch_against_sidecars(
         cache,
         worker_limit,
         CandidatePayloadMode::DescriptorOnly,
+        include_dense_semantic,
     )
 }
 
@@ -785,6 +842,7 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
     cache: &mut RetrievalCache,
     worker_limit: usize,
     payload: CandidatePayloadMode,
+    include_dense_semantic: bool,
 ) -> Result<Vec<QueryResult>> {
     if mode != RetrievalDegradedMode::Full {
         bail!(
@@ -846,8 +904,19 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
                         CandidatePayloadMode::Full => {
                             executor.execute(query, Some(remaining_budget_ms))
                         }
+                        CandidatePayloadMode::DescriptorOnly if include_dense_semantic => executor
+                            .execute_packet_descriptors(query, Some(remaining_budget_ms)),
                         CandidatePayloadMode::DescriptorOnly => {
-                            executor.execute_packet_descriptors(query, Some(remaining_budget_ms))
+                            #[cfg(feature = "benchmark-support")]
+                            {
+                                executor
+                                    .execute_packet_descriptors_without_dense_semantic_for_benchmark(
+                                        query,
+                                        Some(remaining_budget_ms),
+                                    )
+                            }
+                            #[cfg(not(feature = "benchmark-support"))]
+                            unreachable!("dense semantic packet control requires benchmark-support")
                         }
                     }
                     .map(|mut result| {
@@ -1637,6 +1706,69 @@ mod tests {
             ]
         );
         assert_eq!(sidecars.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn benchmark_descriptor_batch_executes_no_dense_semantic_stage() {
+        struct DenseSemanticTripwire;
+
+        impl SidecarSearch for DenseSemanticTripwire {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                panic!("dense semantic retrieval must not execute in the descriptor batch control")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let queries = [
+            QueryBatchItem {
+                query: "alpha flow",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "beta flow",
+                budget_ms: Some(500),
+            },
+        ];
+        let results = execute_strict_retrieval_descriptor_batch_against_sidecars(
+            Arc::new(DenseSemanticTripwire),
+            Some(manifest_for("testproj", "descriptor-control", 2)),
+            Arc::new(HashMap::new()),
+            cancellation_flag(),
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut RetrievalCache::new(),
+            2,
+            false,
+        )
+        .expect("descriptor batch control");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            result
+                .trace
+                .stages
+                .iter()
+                .all(|stage| stage.stage != crate::planner::RetrievalStageKind::Stage1bSemantic)
+        }));
     }
 
     #[test]

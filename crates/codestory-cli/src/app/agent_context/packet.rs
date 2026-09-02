@@ -17,12 +17,27 @@ use codestory_contracts::api::{AgentPacketDto, PacketBudgetModeDto, PacketDispos
 use codestory_contracts::packet_projection_v3::{
     EvidenceAvailabilityV3Dto, PacketProjectionV3Dto, RetrievalStateV3Dto,
 };
+#[cfg(feature = "benchmark-support")]
+use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+
+#[cfg(feature = "benchmark-support")]
+fn benchmark_request_receipt(request: &AgentPacketRequestDto) -> serde_json::Value {
+    serde_json::json!({
+        "question_sha256": format!("{:x}", Sha256::digest(request.question.as_bytes())),
+        "parent_packet_id": request.parent_packet_id.as_deref(),
+        "option_ids": &request.option_ids,
+        "core_generation_id": request.core_generation_id.as_deref(),
+        "retrieval_generation": request.retrieval_generation.as_deref(),
+    })
+}
 
 pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     preflight_output_file(cmd.diagnostics_out.as_deref())?;
+    #[cfg(feature = "benchmark-support")]
+    preflight_output_file(cmd.benchmark_retrieval_proof_out.as_deref())?;
     args::validate_packet_probe_arguments(&cmd.probes).map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
         &cmd.project,
@@ -33,7 +48,45 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     )?;
 
     let request = packet_request_from_command(&cmd);
+    #[cfg(feature = "benchmark-support")]
+    let benchmark_disable_dense_semantic = cmd.benchmark_disable_dense_semantic;
+    #[cfg(feature = "benchmark-support")]
+    let benchmark_retrieval_proof_out = cmd.benchmark_retrieval_proof_out.clone();
     let mut operation = runtime.run_public_operation("packet", || {
+        #[cfg(feature = "benchmark-support")]
+        let packet = {
+            let execution = runtime
+                .browser
+                .packet_for_benchmark(request.clone(), !benchmark_disable_dense_semantic)
+                .map_err(map_api_error)?;
+            if let Some(path) = benchmark_retrieval_proof_out.as_deref() {
+                let publication = execution
+                    .packet
+                    .answer
+                    .retrieval_trace
+                    .retrieval_publication
+                    .as_ref();
+                let proof = serde_json::json!({
+                    "contract": "codestory.packet-builder-ablation-receipt/v1",
+                    "requested_dense_semantic": !benchmark_disable_dense_semantic,
+                    "request": benchmark_request_receipt(&request),
+                    "retrieval_proof": execution.retrieval_proof,
+                    "core_generation_id": publication.map(|value| value.core_generation_id.as_str()),
+                    "core_run_id": publication.map(|value| value.core_run_id.as_str()),
+                    "retrieval_generation": publication.map(|value| value.retrieval_generation.as_str()),
+                    "semantic_generation": publication.map(|value| value.semantic_generation.as_str()),
+                });
+                let bytes = serde_json::to_vec_pretty(&proof)?;
+                codestory_workspace::atomic_file::publish_new_private_file_atomic(
+                    path,
+                    "codestory-packet-builder-ablation-proof",
+                    &bytes,
+                )
+                .map_err(anyhow::Error::new)?;
+            }
+            execution.packet
+        };
+        #[cfg(not(feature = "benchmark-support"))]
         let packet = runtime
             .browser
             .packet(request.clone())
@@ -384,6 +437,8 @@ pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'stat
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "benchmark-support")]
+    use super::benchmark_request_receipt;
     use super::packet_request_from_command;
     use crate::args::{Cli, Command};
     use clap::Parser;
@@ -419,5 +474,41 @@ mod tests {
         assert_eq!(request.core_generation_id.as_deref(), Some("core-1"));
         assert_eq!(request.retrieval_generation.as_deref(), Some("retrieval-1"));
         assert_eq!(request.question, "explain indexing");
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn benchmark_receipt_binds_the_exact_packet_request() {
+        let cli = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--parent-packet-id",
+            "packet-1",
+            "--option-id",
+            "gap-1",
+            "--core-generation-id",
+            "core-1",
+            "--retrieval-generation",
+            "retrieval-1",
+        ])
+        .expect("parse packet request");
+        let Command::Packet(cmd) = cli.command else {
+            panic!("expected packet command");
+        };
+        let request = packet_request_from_command(&cmd);
+        assert_eq!(
+            benchmark_request_receipt(&request),
+            serde_json::json!({
+                "question_sha256": "467ace0f0ea2c522ed79a393b5c1258c96c5a10fc8740d736fab1d3aca8dad7c",
+                "parent_packet_id": "packet-1",
+                "option_ids": ["gap-1"],
+                "core_generation_id": "core-1",
+                "retrieval_generation": "retrieval-1",
+            }),
+        );
     }
 }

@@ -18,6 +18,7 @@ name = "codestory-cli-runtime"
 path = "src/runtime_main.rs"
 
 [features]
+benchmark-support = ["codestory-runtime/benchmark-support"]
 proof-qualification-support = ["codestory-runtime/proof-qualification-support"]
 v3-evidence-separation-support = ["codestory-runtime/v3-evidence-separation-support"]
 
