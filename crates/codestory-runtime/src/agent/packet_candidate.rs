@@ -13,11 +13,12 @@ use codestory_contracts::compilation::{
     PacketCandidateDescriptorV1,
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
+use codestory_retrieval::{QueryResult, RetrievalPublicationIdentity};
 use sha2::{Digest, Sha256};
-#[cfg(feature = "benchmark-support")]
+#[cfg(any(test, feature = "benchmark-support"))]
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(feature = "benchmark-support")]
+#[cfg(any(test, feature = "benchmark-support"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -51,16 +52,24 @@ pub(crate) struct PacketProofSession {
     receipts: RefCell<Vec<PacketAdmissionReceiptV1>>,
     gaps: RefCell<Vec<PacketAdmissionGapV1>>,
     retrieval_admission_sealed: RefCell<bool>,
-    #[cfg(feature = "benchmark-support")]
+    descriptor_results: RefCell<Vec<RetainedPacketDescriptorResult>>,
     include_dense_semantic: bool,
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     descriptor_query_count: Cell<u32>,
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     descriptor_cache_hit_count: Cell<u32>,
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     descriptor_stage_invocations: RefCell<BTreeMap<String, u32>>,
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     descriptor_stage_candidates: RefCell<BTreeMap<String, u64>>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedPacketDescriptorResult {
+    query: String,
+    include_dense_semantic: bool,
+    publication: RetrievalPublicationIdentity,
+    result: QueryResult,
 }
 
 impl Default for PacketProofSession {
@@ -69,7 +78,7 @@ impl Default for PacketProofSession {
     }
 }
 
-#[cfg(feature = "benchmark-support")]
+#[cfg(any(test, feature = "benchmark-support"))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct BenchmarkPacketRetrievalProof {
     pub contract: &'static str,
@@ -98,15 +107,15 @@ impl PacketProofSession {
             receipts: RefCell::new(Vec::new()),
             gaps: RefCell::new(Vec::new()),
             retrieval_admission_sealed: RefCell::new(false),
-            #[cfg(feature = "benchmark-support")]
+            descriptor_results: RefCell::new(Vec::new()),
             include_dense_semantic: true,
-            #[cfg(feature = "benchmark-support")]
+            #[cfg(any(test, feature = "benchmark-support"))]
             descriptor_query_count: Cell::new(0),
-            #[cfg(feature = "benchmark-support")]
+            #[cfg(any(test, feature = "benchmark-support"))]
             descriptor_cache_hit_count: Cell::new(0),
-            #[cfg(feature = "benchmark-support")]
+            #[cfg(any(test, feature = "benchmark-support"))]
             descriptor_stage_invocations: RefCell::new(BTreeMap::new()),
-            #[cfg(feature = "benchmark-support")]
+            #[cfg(any(test, feature = "benchmark-support"))]
             descriptor_stage_candidates: RefCell::new(BTreeMap::new()),
         }
     }
@@ -119,12 +128,11 @@ impl PacketProofSession {
         }
     }
 
-    #[cfg(feature = "benchmark-support")]
     pub(crate) fn includes_dense_semantic(&self) -> bool {
         self.include_dense_semantic
     }
 
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     pub(crate) fn record_descriptor_trace(&self, trace: &codestory_retrieval::QueryTrace) {
         self.descriptor_query_count
             .set(self.descriptor_query_count.get().saturating_add(1));
@@ -146,7 +154,7 @@ impl PacketProofSession {
         }
     }
 
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(any(test, feature = "benchmark-support"))]
     pub(crate) fn benchmark_retrieval_proof(&self) -> BenchmarkPacketRetrievalProof {
         let descriptor_stage_invocations = self.descriptor_stage_invocations.borrow().clone();
         BenchmarkPacketRetrievalProof {
@@ -165,6 +173,55 @@ impl PacketProofSession {
             descriptor_stage_invocations,
             descriptor_stage_candidates: self.descriptor_stage_candidates.borrow().clone(),
         }
+    }
+
+    /// Retain the exact descriptor result that authorized packet admission.
+    ///
+    /// The key includes the query, retrieval policy, and full immutable
+    /// publication. A later hydration stage may reuse only an identical key;
+    /// it cannot silently rerun under a shorter budget or cross a packet,
+    /// policy, or publication boundary.
+    pub(crate) fn retain_descriptor_result(
+        &self,
+        result: &QueryResult,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Result<(), &'static str> {
+        if result.publication_identity.as_ref() != Some(publication) {
+            return Err("descriptor result publication does not match the packet pin");
+        }
+        let mut retained = self.descriptor_results.borrow_mut();
+        if retained.iter().any(|entry| {
+            entry.query == result.query
+                && entry.include_dense_semantic == include_dense_semantic
+                && entry.publication == *publication
+        }) {
+            return Err("descriptor result was retained twice for one packet query");
+        }
+        retained.push(RetainedPacketDescriptorResult {
+            query: result.query.clone(),
+            include_dense_semantic,
+            publication: publication.clone(),
+            result: result.clone(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn descriptor_result(
+        &self,
+        query: &str,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Option<QueryResult> {
+        self.descriptor_results
+            .borrow()
+            .iter()
+            .find(|entry| {
+                entry.query == query
+                    && entry.include_dense_semantic == include_dense_semantic
+                    && entry.publication == *publication
+            })
+            .map(|entry| entry.result.clone())
     }
 
     pub(crate) fn remaining_hydration_slots(&self) -> usize {

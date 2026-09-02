@@ -185,7 +185,7 @@ function shellWords(command) {
   return words;
 }
 
-function directBenchmarkCliInvocation(command) {
+function directPinnedBenchmarkCliInvocation(command) {
   const text = String(command ?? "");
   const executable = String.raw`(?:"\$(?:CODESTORY_CLI|\{CODESTORY_CLI\})"|\$(?:CODESTORY_CLI|\{CODESTORY_CLI\}))`;
   if (!new RegExp(`^\\s*${executable}(?=\\s)`, "u").test(text)) return null;
@@ -197,6 +197,20 @@ function directBenchmarkCliInvocation(command) {
     operation: normalizeCodeStoryOperation(words[1]),
     args: words.slice(2),
   };
+}
+
+function directBenchmarkCliInvocation(command) {
+  const direct = directPinnedBenchmarkCliInvocation(command);
+  if (direct) return direct;
+
+  const outer = shellWords(command);
+  if (
+    !outer || outer.length !== 3 || outer[0] !== "/bin/zsh" ||
+    !["-lc", "-c"].includes(outer[1])
+  ) {
+    return null;
+  }
+  return directPinnedBenchmarkCliInvocation(outer[2]);
 }
 
 function codeStoryInvocationsFromCommand(command) {
@@ -1030,6 +1044,7 @@ export {
   codeStoryInvocationsFromCommand,
   codeStoryOperationFromCommand,
   codeStoryOperationFromMcpTool,
+  directBenchmarkCliInvocation,
   evidenceCompilerBuilderAcceptance,
   isBuilderAblationArm,
   isBuilderCodeStoryArm,

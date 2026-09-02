@@ -597,7 +597,8 @@ fn validate_retrieval_state(
         {
             Ok(())
         }
-        (RetrievalStateV3Dto::Degraded, None, None)
+        (RetrievalStateV3Dto::Symbolic, None, None)
+        | (RetrievalStateV3Dto::Degraded, None, None)
         | (RetrievalStateV3Dto::Unavailable, None, None) => Ok(()),
         (RetrievalStateV3Dto::Degraded, Some(publication), Some(generation))
             if generation.as_str() == publication.retrieval_generation.as_str() =>

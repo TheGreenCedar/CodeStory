@@ -239,6 +239,7 @@ fn evidence_status_label(status: &EvidenceAvailabilityV3Dto) -> &'static str {
 fn retrieval_state_label(state: &RetrievalStateV3Dto) -> &'static str {
     match state {
         RetrievalStateV3Dto::Full => "full",
+        RetrievalStateV3Dto::Symbolic => "symbolic",
         RetrievalStateV3Dto::Degraded => "degraded",
         RetrievalStateV3Dto::Unavailable => "unavailable",
     }

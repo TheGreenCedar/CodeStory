@@ -97,6 +97,7 @@ use index_command::validate_index_watch_output_file;
 #[cfg(test)]
 use lifecycle::{
     embedding_client_transport_mode, map_embedding_preflight_error, open_agent_surface,
+    open_search_surface,
 };
 pub(crate) use readiness_commands::{
     attach_complete_publication, local_refresh_output_from_summary,

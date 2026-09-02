@@ -276,8 +276,9 @@ impl AppController {
     ///
     /// This intentionally bypasses mandatory sidecar product search so symbol,
     /// snippet, trail, and graph-query target resolution can work from an
-    /// already-open indexed store. Product search and packet evidence must use
-    /// the sidecar-primary search paths instead.
+    /// already-open indexed store. Explicit `search --repo-text off` composes
+    /// this resolver as its complete-core lane. Ordinary search and packet
+    /// evidence still use the sidecar-primary paths.
     pub fn resolve_indexed_symbol_candidates(
         &self,
         query: &str,

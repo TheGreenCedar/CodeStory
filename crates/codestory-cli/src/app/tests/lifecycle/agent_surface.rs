@@ -1,5 +1,5 @@
 use super::transport::EnvVarSnapshot;
-use crate::app::open_agent_surface;
+use crate::app::{open_agent_surface, open_search_surface};
 use crate::args;
 use crate::args::ProjectArgs;
 use crate::runtime;
@@ -228,6 +228,48 @@ fn agent_surface_embedding_preflight_preserves_cli_error_text() {
             "initialize retrieval for packet: embedding backend unavailable by test marker in {}",
             embedding_cache_root.display()
         )
+    );
+    fs::remove_file(marker).expect("remove embedding unavailable marker");
+}
+
+#[test]
+fn exact_search_opens_the_complete_core_without_embedding_preflight() {
+    let _env_lock = crate::config::config_env_test_lock();
+    let _env_snapshot = EnvVarSnapshot::clear(&[
+        "CODESTORY_RETRIEVAL_PROFILE",
+        "CODESTORY_RETRIEVAL_RUN_ID",
+        "CI",
+        "GITHUB_ACTIONS",
+    ]);
+    let (_temp, project_args, _storage_path, _current_schema) = agent_surface_refresh_fixture();
+    let runtime = RuntimeContext::new_inspect_only(&project_args).expect("create runtime");
+    let embedding_cache_root = runtime.sidecar.as_raw_config_for_test().cache_root.clone();
+    fs::create_dir_all(&embedding_cache_root).expect("create embedding cache root");
+    let marker = embedding_cache_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER);
+    fs::write(&marker, b"unavailable").expect("write embedding unavailable marker");
+
+    open_search_surface(
+        &project_args,
+        None,
+        None,
+        args::RefreshMode::None,
+        codestory_contracts::api::SearchRepoTextMode::Off,
+    )
+    .expect("exact search must not initialize embeddings");
+
+    let error = match open_search_surface(
+        &project_args,
+        None,
+        None,
+        args::RefreshMode::None,
+        codestory_contracts::api::SearchRepoTextMode::Auto,
+    ) {
+        Ok(_) => panic!("ordinary search still requires embeddings"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("embedding backend unavailable by test marker"),
+        "{error:#}"
     );
     fs::remove_file(marker).expect("remove embedding unavailable marker");
 }

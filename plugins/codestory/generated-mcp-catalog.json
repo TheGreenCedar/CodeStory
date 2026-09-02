@@ -12,8 +12,8 @@
     "discoveryContracts": {
       "2024-11-05": "390ee890235e847b1bb8a7fd65a31907744f6e8c0c91f53cb09f2c7bf38674ec",
       "2025-03-26": "2b9db80728bcab16706c27431199efc18cb265fe2e4faa140c91ec7089d9da59",
-      "2025-06-18": "23a5bcdeac9dbdd0335d2d286908e17356b99a59577063d2395a60bb36df5f1a",
-      "2025-11-25": "9347140dca5574571ffd434d09b944349fa71b704fbcd757b98de41b7e8aa2bc"
+      "2025-06-18": "4174c543d4e96f8f460c46403c3aad6c771c281098effde2812a3d3e8ba05712",
+      "2025-11-25": "c71f1497d39fa4dabed10834bfddd51fddb1e4874abb926d1e89818beeaa2f78"
     }
   },
   "revisionProfiles": {
@@ -3250,7 +3250,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "23a5bcdeac9dbdd0335d2d286908e17356b99a59577063d2395a60bb36df5f1a",
+      "discoveryContractSha256": "4174c543d4e96f8f460c46403c3aad6c771c281098effde2812a3d3e8ba05712",
       "tools": [
         {
           "_meta": {
@@ -4135,6 +4135,7 @@
                               "state": {
                                 "enum": [
                                   "full",
+                                  "symbolic",
                                   "degraded",
                                   "unavailable"
                                 ],
@@ -4418,6 +4419,7 @@
                               "state": {
                                 "enum": [
                                   "full",
+                                  "symbolic",
                                   "degraded",
                                   "unavailable"
                                 ],
@@ -4945,6 +4947,7 @@
                           "state": {
                             "enum": [
                               "full",
+                              "symbolic",
                               "degraded",
                               "unavailable"
                             ],
@@ -13633,7 +13636,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "9347140dca5574571ffd434d09b944349fa71b704fbcd757b98de41b7e8aa2bc",
+      "discoveryContractSha256": "c71f1497d39fa4dabed10834bfddd51fddb1e4874abb926d1e89818beeaa2f78",
       "tools": [
         {
           "_meta": {
@@ -14518,6 +14521,7 @@
                               "state": {
                                 "enum": [
                                   "full",
+                                  "symbolic",
                                   "degraded",
                                   "unavailable"
                                 ],
@@ -14801,6 +14805,7 @@
                               "state": {
                                 "enum": [
                                   "full",
+                                  "symbolic",
                                   "degraded",
                                   "unavailable"
                                 ],
@@ -15328,6 +15333,7 @@
                           "state": {
                             "enum": [
                               "full",
+                              "symbolic",
                               "degraded",
                               "unavailable"
                             ],
@@ -24900,6 +24906,7 @@
                           "state": {
                             "enum": [
                               "full",
+                              "symbolic",
                               "degraded",
                               "unavailable"
                             ],
@@ -25183,6 +25190,7 @@
                           "state": {
                             "enum": [
                               "full",
+                              "symbolic",
                               "degraded",
                               "unavailable"
                             ],
@@ -25710,6 +25718,7 @@
                       "state": {
                         "enum": [
                           "full",
+                          "symbolic",
                           "degraded",
                           "unavailable"
                         ],

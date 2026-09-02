@@ -755,34 +755,30 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     let (_server, addr) = spawn_http_server(&fixture);
 
     let search = http_get(&addr, "/search?q=AppController&repo_text=off")
-        .expect("search fail-closed response");
+        .expect("exact core search response");
+    assert_eq!(search.status, 200, "{}", search.body);
+    assert_eq!(search.body["schema_version"], 3, "{}", search.body);
     assert_eq!(
-        search.status, 400,
-        "HTTP /search is product search and should fail closed without full sidecars: {}",
-        search.body
-    );
-    assert_eq!(
-        search.body.pointer("/error/code").and_then(Value::as_str),
-        Some("retrieval_unavailable"),
-        "HTTP /search must preserve the runtime's machine classification: {}",
-        search.body
-    );
-    assert_eq!(
-        search
-            .body
-            .pointer("/error/details/failed_layer")
-            .and_then(Value::as_str),
-        Some("retrieval_engine"),
-        "HTTP /search must preserve the typed repair details: {}",
+        search.body["retrieval"]["state"], "symbolic",
+        "explicit repo_text=off must use the core without implying sidecar readiness: {}",
         search.body
     );
     assert!(
-        search
-            .body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("retrieval")),
-        "HTTP /search should explain the sidecar-primary boundary: {}",
+        search.body["publication"]["retrieval"].is_null()
+            && search.body["retrieval"]["generation_id"].is_null(),
+        "exact HTTP search must not name a retrieval publication: {}",
+        search.body
+    );
+    assert!(
+        search.body["evidence"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["path"] == "src/lib.rs"
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("AppController"))
+            })),
+        "exact HTTP search must return project-relative source evidence: {}",
         search.body
     );
 

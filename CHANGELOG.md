@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Explicit `search --repo-text off` now reads the complete core symbol index
+  without waiting for embeddings. Packet assembly reuses the retrieval result
+  that established admission instead of rerunning it under a shorter deadline.
 - Packet requests no longer accept `task_class`. Ordinary wording reaches
   generic retrieval; the public packet reports `answer_sufficiency: not_asserted`.
 - The serialized public packet is capped at 16 KiB. When exact hydration cannot

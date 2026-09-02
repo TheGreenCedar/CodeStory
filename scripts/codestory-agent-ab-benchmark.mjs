@@ -38,6 +38,7 @@ import {
   codeStoryInvocationsFromCommand,
   codeStoryOperationFromCommand,
   codeStoryOperationFromMcpTool,
+  directBenchmarkCliInvocation,
   isBuilderAblationArm,
   isBuilderCodeStoryArm,
   isBuilderPacketArm,
@@ -2794,10 +2795,10 @@ function builderAblationArmInstruction(arm, continuationContract = null) {
     return "Do not use CodeStory. Investigate with ordinary local search and source reads.";
   }
   if (arm === "exact_identity_source") {
-    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use only search with --repo-text off, files, symbol, or snippet. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use only `search --query <identifier-or-terms> --repo-text off`, files, symbol, or snippet. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
   }
   if (arm === "exact_plus_relations") {
-    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use search with --repo-text off, files, symbol, snippet, context, trail, callers, callees, or trace. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use `search --query <identifier-or-terms> --repo-text off`, files, symbol, snippet, context, trail, callers, callees, or trace. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
   }
   const continuation = continuationContract
     ? ` The packet offers one optional continuation. If you use it, run this exact command as a separate repository-context action and do not run another CodeStory command:
@@ -3351,6 +3352,7 @@ function isCommandEvent(event) {
 
 function commandCategory(command) {
   const text = String(command ?? "");
+  if (directBenchmarkCliInvocation(text)) return "codestory_cli";
   const shellText = text.replace(/\\"/g, '"');
   const codestoryCommands = "\\b[a-z][a-z0-9-]*\\b";
   const knownCodestoryCommands =
@@ -4048,10 +4050,18 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
       command.category === "codestory_cli" &&
       command.exit_code === 0 &&
       (command.harness_semantics?.operation === "packet" ||
-        isCodestoryPacketCommand(command.command)),
+        isCodestoryPacketCommand(command.command) ||
+        (command.codestory_operation === "packet" &&
+          directBenchmarkCliInvocation(command.command)?.args.some(
+            (argument) => argument === "--question" || argument.startsWith("--question="),
+          ))),
   );
   const codestoryIndexCommands = commands.filter(
-    (command) => command.category === "codestory_cli" && isCodestoryIndexCommand(command.command),
+    (command) =>
+      command.category === "codestory_cli" &&
+      (isCodestoryIndexCommand(command.command) ||
+        (command.codestory_operation === "index" &&
+          directBenchmarkCliInvocation(command.command) != null)),
   );
   const firstSuccessfulContextCommand = commands.find(isSuccessfulContextCommand);
   const observedContextActions = observedRepositoryContextActions(commands, events);

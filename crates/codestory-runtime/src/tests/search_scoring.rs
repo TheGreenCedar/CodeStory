@@ -866,8 +866,8 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
         );
     }
 
-    let error = controller
-        .search(SearchRequest {
+    let exact = controller
+        .search_results(SearchRequest {
             query: "AppController".to_string(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: 10,
@@ -875,7 +875,22 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
             hybrid_weights: None,
             hybrid_limits: None,
         })
-        .expect_err("search should require full sidecars");
+        .expect("repo-text off should use the complete core without retrieval sidecars");
+    assert_eq!(exact.retrieval.mode, RetrievalModeDto::Symbolic);
+    assert!(exact.retrieval_publication.is_none());
+    assert!(!exact.indexed_symbol_hits.is_empty());
+    assert!(exact.repo_text_hits.is_empty());
+
+    let error = controller
+        .search(SearchRequest {
+            query: "AppController".to_string(),
+            repo_text: SearchRepoTextMode::Auto,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .expect_err("ordinary search should still require full sidecars");
     assert_mandatory_retrieval_unavailable(&error);
 }
 
@@ -946,7 +961,7 @@ fn search_prefers_full_sidecars_for_tictactoe_queries() {
         let error = controller
             .search(SearchRequest {
                 query: query.to_string(),
-                repo_text: SearchRepoTextMode::Off,
+                repo_text: SearchRepoTextMode::Auto,
                 limit_per_source: 10,
                 expand_search_plan: false,
                 hybrid_weights: None,
@@ -974,7 +989,7 @@ fn repo_explanation_search_requires_full_sidecar_retrieval() {
     let generic_error = controller
         .search_results(SearchRequest {
             query: "Explain how this repo fits together".to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
             expand_search_plan: false,
             hybrid_weights: None,
@@ -986,7 +1001,7 @@ fn repo_explanation_search_requires_full_sidecar_retrieval() {
     let symbol_error = controller
         .search_results(SearchRequest {
             query: "Explain how check_winner fits in this repo".to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
             expand_search_plan: true,
             hybrid_weights: None,
@@ -1039,7 +1054,7 @@ fn search_rejects_natural_language_queries_without_full_sidecars() {
     let error_without_plan = controller
         .search_results(SearchRequest {
             query: broad_query.to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 20,
             expand_search_plan: false,
             hybrid_weights: None,
@@ -1051,7 +1066,7 @@ fn search_rejects_natural_language_queries_without_full_sidecars() {
     let error_with_plan = controller
         .search_results(SearchRequest {
             query: broad_query.to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 20,
             expand_search_plan: true,
             hybrid_weights: None,
@@ -2404,7 +2419,7 @@ fn search_rejects_reads_while_indexing_is_active() {
     let error = controller
         .search_results(SearchRequest {
             query: "check_winner".to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
             expand_search_plan: false,
             hybrid_weights: None,
@@ -2432,7 +2447,7 @@ fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
     let error = controller
         .search(SearchRequest {
             query: "check_winner".to_string(),
-            repo_text: SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
             expand_search_plan: false,
             hybrid_weights: None,

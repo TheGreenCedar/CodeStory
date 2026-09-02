@@ -7,9 +7,10 @@ use codestory_contracts::api::{
     IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
     IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenProjectRequest,
-    ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto, UpdateBookmarkRequest,
+    ProjectSummary, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto,
+    UpdateBookmarkRequest,
 };
 
 use crate::AppController;
@@ -1802,6 +1803,18 @@ impl ActivationService {
     }
 }
 
+/// Public-operation identity for search's two deliberately different lanes.
+///
+/// Explicit `repo_text=off` is the complete-core exact-symbol surface. Every
+/// other search mode keeps the full retrieval publication contract.
+pub fn search_operation_name(repo_text: SearchRepoTextMode) -> &'static str {
+    if repo_text == SearchRepoTextMode::Off {
+        "exact_search"
+    } else {
+        "search"
+    }
+}
+
 fn operation_requires_retrieval(operation: &str) -> bool {
     matches!(
         operation,
@@ -3141,6 +3154,16 @@ mod freshness_gate_tests {
         for operation in ["packet", "search", "context", "drill"] {
             assert!(operation_requires_retrieval(operation));
         }
+        assert_eq!(
+            search_operation_name(SearchRepoTextMode::Off),
+            "exact_search"
+        );
+        assert!(!operation_requires_retrieval(search_operation_name(
+            SearchRepoTextMode::Off
+        )));
+        assert!(operation_requires_retrieval(search_operation_name(
+            SearchRepoTextMode::Auto
+        )));
     }
 
     fn freshness(
