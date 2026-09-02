@@ -292,6 +292,19 @@ test("operation parser and policy fail closed on arm leakage", () => {
     ),
     [],
   );
+  const literalDollar = "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query '$fixture' --repo-text off";
+  const literalDollarAnalysis = analyzeTranscript([
+    commandEvent("literal-dollar", "completed", literalDollar, "{}"),
+  ], "/tmp/repo");
+  assert.deepEqual(
+    builderOperationViolations(
+      "exact_identity_source",
+      literalDollarAnalysis.codestory_operations,
+      exactOptions,
+    ),
+    [],
+    "single-quoted literal query text must remain valid",
+  );
   assert.deepEqual(
     builderOperationViolations("exact_plus_relations", [{
       operation: "callers",
@@ -418,6 +431,10 @@ test("operation parser and policy fail closed on arm leakage", () => {
     `sh -c '\"$CODESTORY_CLI\" search --query Alpha --repo-text off; cat src/lib.rs'`,
     `eval '$CODESTORY_CLI search --query Alpha --repo-text off'`,
     `env FOO=bar $CODESTORY_CLI search --query Alpha --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query \${(z):-"anchor --cache-dir /tmp"} --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query \${(z):-"anchor --cache-dir /tmp"} --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query * --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query {anchor,--cache-dir,/tmp} --repo-text off`,
     `$CODESTORY_CLI search --query \"$(cat src/lib.rs)\" --repo-text off`,
     `$CODESTORY_CLI search --query \"\u0060cat src/lib.rs\u0060\" --repo-text off`,
     `sh -c \"$(printenv CODESTORY_CLI) search --query Alpha --repo-text off\"`,

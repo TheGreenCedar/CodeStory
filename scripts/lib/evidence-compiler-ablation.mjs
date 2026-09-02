@@ -185,10 +185,54 @@ function shellWords(command) {
   return words;
 }
 
+function hasDynamicShellExpansion(command) {
+  const text = String(command ?? "");
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === "$" || character === "`") {
+        return true;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (
+      character === "$" || character === "`" || character === "*" ||
+      character === "?" || character === "[" || character === "]" ||
+      character === "{" || character === "}" || character === "(" ||
+      character === ")"
+    ) {
+      return true;
+    }
+  }
+  return escaped || quote != null;
+}
+
 function directPinnedBenchmarkCliInvocation(command) {
   const text = String(command ?? "");
   const executable = String.raw`(?:"\$(?:CODESTORY_CLI|\{CODESTORY_CLI\})"|\$(?:CODESTORY_CLI|\{CODESTORY_CLI\}))`;
-  if (!new RegExp(`^\\s*${executable}(?=\\s)`, "u").test(text)) return null;
+  const executableMatch = text.match(new RegExp(`^\\s*${executable}(?=\\s)`, "u"));
+  if (!executableMatch) return null;
+  if (hasDynamicShellExpansion(text.slice(executableMatch[0].length))) return null;
   const words = shellWords(text);
   if (!words || words.length < 2) return null;
   if (!["$CODESTORY_CLI", "${CODESTORY_CLI}"].includes(words[0])) return null;
