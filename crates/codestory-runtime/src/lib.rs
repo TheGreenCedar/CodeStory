@@ -77,6 +77,7 @@ pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiErr
 
 mod affected;
 mod agent;
+mod call_path_grammar;
 #[allow(unused_imports)]
 #[cfg(any(
     test,
@@ -128,18 +129,15 @@ pub use agent::{
 };
 pub use evidence_projection_v3::{
     PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
-    finalize_packet_projection_v3_for_representation, project_context_v3, project_packet_v3,
+    finalize_packet_projection_v3_for_representation,
+    packet_budget_exceeded_projection_v3_from_envelope, project_context_v3, project_packet_v3,
     project_search_v3,
 };
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod agent_test_support {
-    use codestory_contracts::api::{AgentAnswerDto, IndexFreshnessDto, PacketClaimDto};
-
-    pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
-        crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
-    }
+    use codestory_contracts::api::IndexFreshnessDto;
 
     pub fn fresh_index_observation() -> IndexFreshnessDto {
         crate::agent::packet_freshness::fresh_index_observation()
@@ -315,8 +313,6 @@ use semantic_projection::{
     sort_pending_dense_anchor_inputs, stream_pending_llm_symbol_docs_from_env,
     truncate_semantic_doc_text_to_token_budget,
 };
-#[cfg(test)]
-pub(crate) use snippets::markdown_snippet;
 pub(crate) use snippets::{
     BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
 };

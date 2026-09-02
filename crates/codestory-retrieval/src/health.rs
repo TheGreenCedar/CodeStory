@@ -555,6 +555,74 @@ pub fn probe_sidecar_health_for_runtime(
     embedding_device: &EmbeddingDeviceReadiness,
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> RetrievalStatusReport {
+    probe_sidecar_health_for_runtime_scope(
+        layout,
+        project_id,
+        manifest,
+        embedding_device,
+        runtime,
+        true,
+    )
+}
+
+/// Validate only the lexical and semantic lanes used to produce packet
+/// descriptors. SCIP is deliberately not opened here: its query view builds a
+/// repository-wide adjacency map, which belongs after packet admission.
+pub(crate) fn probe_descriptor_sidecar_health(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+) -> RetrievalStatusReport {
+    let embedding_device = crate::embeddings::embedding_device_readiness();
+    probe_descriptor_sidecar_health_with_embedding_device(
+        layout,
+        project_id,
+        manifest,
+        &embedding_device,
+    )
+}
+
+pub(crate) fn probe_descriptor_sidecar_health_with_embedding_device(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+) -> RetrievalStatusReport {
+    let runtime = crate::config::SidecarRuntimeConfig::local();
+    probe_descriptor_sidecar_health_for_runtime(
+        layout,
+        project_id,
+        manifest,
+        embedding_device,
+        &runtime,
+    )
+}
+
+pub(crate) fn probe_descriptor_sidecar_health_for_runtime(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> RetrievalStatusReport {
+    probe_sidecar_health_for_runtime_scope(
+        layout,
+        project_id,
+        manifest,
+        embedding_device,
+        runtime,
+        false,
+    )
+}
+
+fn probe_sidecar_health_for_runtime_scope(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &crate::config::SidecarRuntimeConfig,
+    include_scip: bool,
+) -> RetrievalStatusReport {
     if let Some(manifest) = manifest.as_ref() {
         if !manifest_has_current_sidecar_contract(project_id, manifest) {
             return unavailable_status_report_with_embedding_device(
@@ -686,34 +754,48 @@ pub fn probe_sidecar_health_for_runtime(
             },
         }
     };
-    let scip_project_dir = layout.scip_project_dir(sidecar_generation);
-    let scip_probe = ScipClient::health_probe(layout, sidecar_generation);
-    let scip_capabilities = scip_capabilities(
-        &scip_probe.availability,
-        &scip_project_dir,
-        sidecar_generation,
-    );
-    let scip_stub = matches!(&scip_probe.availability, ScipAvailability::Ready { .. })
-        && !scip_capabilities.graph;
-    let (scip_status, scip_degraded) = match &scip_probe.availability {
-        ScipAvailability::Ready { .. } if scip_capabilities.graph => {
-            (ComponentStatus::Healthy, None)
+    let scip = if include_scip {
+        let scip_project_dir = layout.scip_project_dir(sidecar_generation);
+        let scip_probe = ScipClient::health_probe(layout, sidecar_generation);
+        let scip_capabilities = scip_capabilities(
+            &scip_probe.availability,
+            &scip_project_dir,
+            sidecar_generation,
+        );
+        let scip_stub = matches!(&scip_probe.availability, ScipAvailability::Ready { .. })
+            && !scip_capabilities.graph;
+        let (scip_status, scip_degraded) = match &scip_probe.availability {
+            ScipAvailability::Ready { .. } if scip_capabilities.graph => {
+                (ComponentStatus::Healthy, None)
+            }
+            ScipAvailability::Ready { .. } => (ComponentStatus::Degraded, Some("scip_stub".into())),
+            ScipAvailability::Unavailable { reason } => {
+                (ComponentStatus::Unavailable, Some(reason.clone()))
+            }
+        };
+        ComponentHealth {
+            name: "scip".into(),
+            status: scip_status,
+            latency_ms: None,
+            detail: scip_probe.detail,
+            degraded_reason: scip_degraded.or_else(|| scip_stub.then_some("scip_stub".into())),
+            capabilities: scip_capabilities,
         }
-        ScipAvailability::Ready { .. } => (ComponentStatus::Degraded, Some("scip_stub".into())),
-        ScipAvailability::Unavailable { reason } => {
-            (ComponentStatus::Unavailable, Some(reason.clone()))
+    } else {
+        ComponentHealth {
+            name: "scip".into(),
+            status: ComponentStatus::Unavailable,
+            latency_ms: None,
+            detail: "not opened during packet descriptor admission".into(),
+            degraded_reason: Some("scip_not_probed_for_descriptor_admission".into()),
+            capabilities: SidecarCapabilities::NONE,
         }
     };
-    let scip = ComponentHealth {
-        name: "scip".into(),
-        status: scip_status,
-        latency_ms: None,
-        detail: scip_probe.detail,
-        degraded_reason: scip_degraded.or_else(|| scip_stub.then_some("scip_stub".into())),
-        capabilities: scip_capabilities,
+    let (live_mode, degraded_reason) = if include_scip {
+        crate::mode::derive_degraded_mode(&lexical, &semantic, &scip)
+    } else {
+        crate::mode::derive_descriptor_mode(&lexical, &semantic)
     };
-    let (live_mode, degraded_reason) =
-        crate::mode::derive_degraded_mode(&lexical, &semantic, &scip);
     let retrieval_mode = if manifest_classifies_full(&manifest) {
         "full"
     } else {

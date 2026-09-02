@@ -55,15 +55,10 @@ pub(crate) mod trace_export;
 // Planning lives in `codestory-agent`. These aliases keep the runtime's own
 // module paths spelling the same names they always did, so the extraction is a
 // crate move rather than a rename of every call site.
-#[cfg(test)]
-pub(crate) use codestory_agent::eval_probes;
 #[allow(unused_imports)]
 pub(crate) use codestory_agent::{
-    citation, packet_citations, packet_claim_profile_registry, packet_claim_profiles,
-    packet_claims, packet_coverage, packet_degradation, packet_evidence, packet_evidence_carriers,
-    packet_evidence_roles, packet_flow_requirements, packet_freshness, packet_obligations,
-    packet_plan, packet_profile_telemetry, packet_required_probes, packet_scoring, packet_terms,
-    planning, profiles,
+    citation, packet_citations, packet_coverage, packet_degradation, packet_evidence,
+    packet_freshness, packet_plan, packet_scoring, packet_terms, planning, profiles,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};
@@ -81,15 +76,13 @@ pub fn plan_packet(
             "Question cannot be empty.",
         ));
     }
-    codestory_contracts::api::validate_packet_probe_request(&request.probes, &request.extra_probes)
+    codestory_contracts::api::validate_packet_probe_request(&request.probes)
         .map_err(codestory_contracts::api::ApiError::invalid_argument)?;
-    let probes =
-        packet_probe::normalize_packet_probe_request(&request.probes, &request.extra_probes);
-    let extra_probes = packet_probe::unresolved_packet_probe_queries(&probes);
+    let probes = packet_probe::normalize_packet_probe_request(&request.probes);
+    let free_queries = packet_probe::unresolved_packet_probe_queries(&probes);
     Ok(packet_plan::build_packet_plan_with_extra(
         question,
-        None,
         request.budget,
-        &extra_probes,
+        &free_queries,
     ))
 }

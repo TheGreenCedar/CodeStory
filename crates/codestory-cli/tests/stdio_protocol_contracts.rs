@@ -481,11 +481,11 @@ fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
                 "invalid_selector",
             ),
             (
-                "packet-combined-bound",
+                "packet-retired-extra-probes",
                 "packet",
-                json!({"project":project,"question":"why","probes":exact_path_probes,"extra_probes":["overflow"]}),
-                "/arguments",
-                "combined_item_limit",
+                json!({"project":project,"question":"why","probes":exact_path_probes,"extra_probes":["retired"]}),
+                "/arguments/extra_probes",
+                "unknown_property",
             ),
             (
                 "context-selector-required",

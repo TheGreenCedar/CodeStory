@@ -16,7 +16,7 @@ use codestory_contracts::packet_projection_v3::{
 };
 use sha2::{Digest, Sha256};
 
-use super::packet_execution_record_v3::PacketExecutionRecordV3;
+use super::packet_execution_record_v3::{PacketExecutionRecordV3, canonical_json_bytes_v3};
 
 pub(crate) const PACKET_PUBLIC_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
 pub(crate) const DIAGNOSTIC_ARTIFACT_MAX_BYTES_V3: usize = 1024 * 1024;
@@ -241,7 +241,34 @@ pub(crate) fn finalize_packet_projection_v3(
         return Ok(best_bytes);
     }
 
-    let fallback = PacketProjectionV3Dto::BudgetExceeded {
+    let fallback = packet_budget_exceeded_projection_v3(
+        schema_version,
+        identity,
+        publication,
+        retrieval,
+        diagnostics,
+        required_complete_bytes,
+    );
+    let fallback_bytes =
+        measure(&fallback).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+    if fallback_bytes > PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+        return Err(ProjectionBuildErrorV3::FallbackTooLarge {
+            required_bytes: fallback_bytes,
+        });
+    }
+    *projection = fallback;
+    Ok(fallback_bytes)
+}
+
+pub(crate) fn packet_budget_exceeded_projection_v3(
+    schema_version: u16,
+    identity: PacketRequestIdentityV3Dto,
+    publication: PublicationIdentityV3Dto,
+    retrieval: RetrievalStateDescriptorV3Dto,
+    diagnostics: DiagnosticsCapabilityV3Dto,
+    required_complete_bytes: usize,
+) -> PacketProjectionV3Dto {
+    PacketProjectionV3Dto::BudgetExceeded {
         schema_version,
         identity,
         publication,
@@ -252,16 +279,7 @@ pub(crate) fn finalize_packet_projection_v3(
         maximum_bytes: PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64,
         required_complete_bytes: required_complete_bytes as u64,
         answer_sufficiency: Default::default(),
-    };
-    let fallback_bytes =
-        measure(&fallback).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
-    if fallback_bytes > PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Err(ProjectionBuildErrorV3::FallbackTooLarge {
-            required_bytes: fallback_bytes,
-        });
     }
-    *projection = fallback;
-    Ok(fallback_bytes)
 }
 
 fn packet_budget_exceeded_gaps_v3() -> BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3> {
@@ -612,8 +630,8 @@ pub(crate) fn build_diagnostic_artifact_v3(
         rows: BoundedVecV3::<_, DIAGNOSTIC_ROWS_MAX_V3>::new(rows)
             .expect("validated record diagnostic bound"),
     };
-    let bytes = codestory_agent::packet_execution_plan_v3::canonical_json_bytes_v3(&artifact)
-        .map_err(ProjectionBuildErrorV3::CanonicalJson)?;
+    let bytes =
+        canonical_json_bytes_v3(&artifact).map_err(ProjectionBuildErrorV3::CanonicalJson)?;
     if bytes.len() > DIAGNOSTIC_ARTIFACT_MAX_BYTES_V3 {
         return Ok(DiagnosticArtifactBuildV3::TooLarge {
             required_bytes: bytes.len() as u64,
@@ -684,8 +702,7 @@ fn diagnostic_artifact_id_v3(
 ) -> Result<IdentityTextV3, ProjectionBuildErrorV3> {
     let publication = publication_from_record(record);
     let publication_bytes =
-        codestory_agent::packet_execution_plan_v3::canonical_json_bytes_v3(&publication)
-            .map_err(ProjectionBuildErrorV3::CanonicalJson)?;
+        canonical_json_bytes_v3(&publication).map_err(ProjectionBuildErrorV3::CanonicalJson)?;
     let mut hasher = Sha256::new();
     hasher.update(DIAGNOSTIC_ARTIFACT_ID_DOMAIN_V3);
     for field in [
@@ -705,7 +722,7 @@ fn diagnostic_artifact_id_v3(
 mod tests {
     use super::*;
     use crate::agent::packet_execution_record_v3::{
-        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
+        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
         PacketRequestFingerprintV3, build_packet_execution_record_fixture_v3,
     };
     use codestory_contracts::{
@@ -716,9 +733,9 @@ mod tests {
             DiagnosticCategoryV3Dto, DiagnosticCodeTextV3, DiagnosticRowV3Dto,
             DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, EvidenceIdentityV3Dto,
             EvidenceKindV3Dto, GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, MessageTextV3,
-            PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3, ProjectionGapRowV3Dto,
-            PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
-            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
+            PACKET_EVIDENCE_ROWS_MAX_V3, PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3,
+            ProjectionGapRowV3Dto, PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto,
+            RetrievalStateV3Dto, SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
         },
     };
 
@@ -732,7 +749,6 @@ mod tests {
         record_fixture_with(
             question,
             PacketBudgetModeDto::Standard,
-            PacketProfileV3::Auto,
             vec![packet_evidence("evidence-1", Some("dispatches once"))],
             Vec::new(),
             None,
@@ -749,7 +765,6 @@ mod tests {
     fn record_fixture_with(
         question: &str,
         budget: PacketBudgetModeDto,
-        profile: PacketProfileV3,
         evidence: Vec<PacketEvidenceRowV3Dto>,
         gaps: Vec<ProjectionGapRowV3Dto>,
         continuation: Option<ContinuationStateV3Dto>,
@@ -761,7 +776,6 @@ mod tests {
             question: question.to_owned(),
             budget,
             probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -771,7 +785,7 @@ mod tests {
         let input = FinalizedPacketExecutionInputV3::new(
             identity("caller-1"),
             identity("request-1"),
-            PacketRequestFingerprintV3::from_current_request(&request, profile),
+            PacketRequestFingerprintV3::from_current_request(&request),
             evidence,
             gaps,
             continuation,
@@ -854,8 +868,10 @@ mod tests {
     fn diagnostic_cap_record(
         final_code_length: usize,
     ) -> crate::agent::packet_execution_record_v3::PacketExecutionRecordV3 {
-        let evidence_ids = (0..256)
-            .map(|index| fixed_length_identity("evidence", index, 128))
+        let evidence_ids = (0..PACKET_EVIDENCE_ROWS_MAX_V3)
+            .map(|index| {
+                fixed_length_identity("evidence", index, if index < 2 { 228 } else { 229 })
+            })
             .collect::<Vec<_>>();
         let evidence = evidence_ids
             .iter()
@@ -867,7 +883,7 @@ mod tests {
                 evidence_id: identity(id),
             })
             .collect::<Vec<_>>();
-        let mut diagnostics = (0..27)
+        let mut diagnostics = (0..(DIAGNOSTIC_ROWS_MAX_V3 - 1))
             .map(|index| {
                 FinalizedDiagnosticSourceRowV3::new(
                     identity(&fixed_length_identity("diagnostic", index, 32)),
@@ -879,17 +895,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         diagnostics.push(FinalizedDiagnosticSourceRowV3::new(
-            identity(&fixed_length_identity("diagnostic", 27, 32)),
+            identity(&fixed_length_identity(
+                "diagnostic",
+                DIAGNOSTIC_ROWS_MAX_V3 - 1,
+                132,
+            )),
             DiagnosticCategoryV3Dto::Coverage,
             DiagnosticCodeTextV3::new("c".repeat(final_code_length)).unwrap(),
-            all_evidence_references[..193].to_vec(),
+            all_evidence_references,
             Vec::new(),
         ));
 
         record_fixture_with(
             "diagnostic cap fixture",
             PacketBudgetModeDto::Standard,
-            PacketProfileV3::Auto,
             evidence,
             Vec::new(),
             None,
@@ -1007,7 +1026,6 @@ mod tests {
         let record = record_fixture_with(
             "trim only display text",
             PacketBudgetModeDto::Compact,
-            PacketProfileV3::Callflow,
             vec![
                 packet_evidence("evidence-b", Some("second summary")),
                 packet_evidence("evidence-a", Some("first summary")),
@@ -1108,7 +1126,6 @@ mod tests {
         let record = record_fixture_with(
             "retain the relevance-ranked prefix",
             PacketBudgetModeDto::Compact,
-            PacketProfileV3::Callflow,
             evidence,
             Vec::new(),
             None,
@@ -1214,7 +1231,6 @@ mod tests {
         let record = record_fixture_with(
             "explain the complete multi-file request flow",
             PacketBudgetModeDto::Compact,
-            PacketProfileV3::Callflow,
             evidence,
             Vec::new(),
             None,
@@ -1356,81 +1372,71 @@ mod tests {
             PacketBudgetModeDto::Standard,
             PacketBudgetModeDto::Deep,
         ] {
-            for profile in [
-                PacketProfileV3::Auto,
-                PacketProfileV3::Architecture,
-                PacketProfileV3::Callflow,
-                PacketProfileV3::Impact,
-                PacketProfileV3::Inheritance,
-                PacketProfileV3::Investigate,
-            ] {
-                let record = record_fixture_with(
-                    "one cap for every current request mode",
-                    budget,
-                    profile,
-                    vec![packet_evidence("evidence-1", None)],
-                    Vec::new(),
-                    None,
-                    RetrievalStateDescriptorV3Dto {
-                        state: RetrievalStateV3Dto::Full,
-                        generation_id: Some(identity("retrieval-generation-1")),
-                    },
-                    Vec::new(),
-                    true,
-                );
-                let projection = build_packet_projection_v3(
-                    &record,
-                    diagnostics_capability_fixture(),
-                    |candidate| match candidate {
-                        PacketProjectionV3Dto::Complete { .. } => {
-                            Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
-                        }
-                        PacketProjectionV3Dto::BudgetExceeded { .. } => {
-                            Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
-                        }
-                    },
-                )
-                .expect("whole budget fallback fits");
-                let PacketProjectionV3Dto::BudgetExceeded {
-                    status,
-                    diagnostics,
-                    maximum_bytes,
-                    required_complete_bytes,
-                    ..
-                } = projection
-                else {
-                    panic!("cap plus one must discard the complete projection");
-                };
-                assert_eq!(status, EvidenceAvailabilityV3Dto::Unavailable);
-                assert_eq!(diagnostics, diagnostics_capability_fixture());
-                assert_eq!(maximum_bytes, PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64);
-                assert_eq!(
-                    required_complete_bytes,
-                    (PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1) as u64
-                );
-                let serialized = serde_json::to_value(PacketProjectionV3Dto::BudgetExceeded {
-                    schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
-                    identity: packet_identity(&record),
-                    publication: publication(&record),
-                    status,
-                    retrieval: record.retrieval().clone(),
-                    diagnostics,
-                    gaps: packet_budget_exceeded_gaps_v3(),
-                    maximum_bytes,
-                    required_complete_bytes,
-                    answer_sufficiency: Default::default(),
-                })
-                .unwrap();
-                let gaps = serialized["gaps"].as_array().expect("typed budget gap");
-                assert_eq!(gaps.len(), 1, "fallback must carry exactly one gap");
-                assert_eq!(gaps[0]["kind"], "output_budget_exceeded");
-                assert_eq!(
-                    gaps[0]["identity"]["gap_id"],
-                    "packet-output-budget-exceeded"
-                );
-                for absent in ["evidence", "continuation", "summary"] {
-                    assert!(serialized.get(absent).is_none(), "fallback leaked {absent}");
-                }
+            let record = record_fixture_with(
+                "one cap for every current request mode",
+                budget,
+                vec![packet_evidence("evidence-1", None)],
+                Vec::new(),
+                None,
+                RetrievalStateDescriptorV3Dto {
+                    state: RetrievalStateV3Dto::Full,
+                    generation_id: Some(identity("retrieval-generation-1")),
+                },
+                Vec::new(),
+                true,
+            );
+            let projection = build_packet_projection_v3(
+                &record,
+                diagnostics_capability_fixture(),
+                |candidate| match candidate {
+                    PacketProjectionV3Dto::Complete { .. } => {
+                        Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                    }
+                    PacketProjectionV3Dto::BudgetExceeded { .. } => {
+                        Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
+                    }
+                },
+            )
+            .expect("whole budget fallback fits");
+            let PacketProjectionV3Dto::BudgetExceeded {
+                status,
+                diagnostics,
+                maximum_bytes,
+                required_complete_bytes,
+                ..
+            } = projection
+            else {
+                panic!("cap plus one must discard the complete projection");
+            };
+            assert_eq!(status, EvidenceAvailabilityV3Dto::Unavailable);
+            assert_eq!(diagnostics, diagnostics_capability_fixture());
+            assert_eq!(maximum_bytes, PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64);
+            assert_eq!(
+                required_complete_bytes,
+                (PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1) as u64
+            );
+            let serialized = serde_json::to_value(PacketProjectionV3Dto::BudgetExceeded {
+                schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
+                identity: packet_identity(&record),
+                publication: publication(&record),
+                status,
+                retrieval: record.retrieval().clone(),
+                diagnostics,
+                gaps: packet_budget_exceeded_gaps_v3(),
+                maximum_bytes,
+                required_complete_bytes,
+                answer_sufficiency: Default::default(),
+            })
+            .unwrap();
+            let gaps = serialized["gaps"].as_array().expect("typed budget gap");
+            assert_eq!(gaps.len(), 1, "fallback must carry exactly one gap");
+            assert_eq!(gaps[0]["kind"], "output_budget_exceeded");
+            assert_eq!(
+                gaps[0]["identity"]["gap_id"],
+                "packet-output-budget-exceeded"
+            );
+            for absent in ["evidence", "continuation", "summary"] {
+                assert!(serialized.get(absent).is_none(), "fallback leaked {absent}");
             }
         }
     }
@@ -1799,7 +1805,6 @@ mod tests {
         let record = record_fixture_with(
             "canonical diagnostics",
             PacketBudgetModeDto::Standard,
-            PacketProfileV3::Auto,
             vec![
                 packet_evidence("evidence-b", None),
                 packet_evidence("evidence-a", None),
@@ -1889,23 +1894,29 @@ mod tests {
 
     #[test]
     fn packet_projection_v3_diagnostic_artifact_is_whole_at_one_mib_and_absent_at_cap_plus_one() {
-        let exact = diagnostic_cap_record(31);
+        let exact = diagnostic_cap_record(114);
         let DiagnosticArtifactBuildV3::Complete {
             artifact,
             bytes,
             reference,
         } = build_diagnostic_artifact_v3(&exact).expect("exact-cap diagnostic build")
         else {
-            panic!("exactly one MiB must be admitted");
+            let required = match build_diagnostic_artifact_v3(&exact)
+                .expect("repeat exact-cap diagnostic build")
+            {
+                DiagnosticArtifactBuildV3::TooLarge { required_bytes } => required_bytes,
+                DiagnosticArtifactBuildV3::Complete { .. } => unreachable!(),
+            };
+            panic!("exactly one MiB must be admitted; required {required} bytes");
         };
         assert_eq!(bytes.len(), DIAGNOSTIC_ARTIFACT_MAX_BYTES_V3);
         assert_eq!(
             reference.byte_length,
             DIAGNOSTIC_ARTIFACT_MAX_BYTES_V3 as u64
         );
-        assert_eq!(artifact.rows.as_slice().len(), 28);
+        assert_eq!(artifact.rows.as_slice().len(), DIAGNOSTIC_ROWS_MAX_V3);
 
-        let over = diagnostic_cap_record(32);
+        let over = diagnostic_cap_record(115);
         assert_eq!(
             build_diagnostic_artifact_v3(&over).expect("typed over-cap result"),
             DiagnosticArtifactBuildV3::TooLarge {

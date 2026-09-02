@@ -3,44 +3,30 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::packet_candidate::{PacketSearchHit, merge_packet_candidate_graph};
-use super::packet_scoring::{
-    normalize_identifier, packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc,
-};
+use super::packet_scoring::packet_citation_key;
 use super::trace::field;
-use codestory_agent::packet_terms::prompt_search_terms;
-use codestory_agent::planning::PACKET_OWNER_MEMBER_QUERY_PURPOSE;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
     AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     AgentRetrievalSummaryFieldDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto,
     RetrievalAnnotationDto,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub(crate) fn merge_packet_initial_search_hits(
     answer: &mut AgentAnswerDto,
     hits: &[PacketSearchHit],
     include_evidence: bool,
-    rank_terms: &[String],
     stage_carry_limit: usize,
 ) -> usize {
-    merge_packet_search_hits(
-        answer,
-        hits,
-        include_evidence,
-        rank_terms,
-        stage_carry_limit,
-        None,
-    )
+    merge_packet_search_hits(answer, hits, include_evidence, stage_carry_limit)
 }
 
 fn merge_packet_search_hits(
     answer: &mut AgentAnswerDto,
     hits: &[PacketSearchHit],
     include_evidence: bool,
-    rank_terms: &[String],
     stage_carry_limit: usize,
-    exact_query: Option<&str>,
 ) -> usize {
     let mut citation_indices = answer
         .citations
@@ -48,14 +34,11 @@ fn merge_packet_search_hits(
         .enumerate()
         .map(|(index, citation)| (packet_citation_key(citation), index))
         .collect::<HashMap<_, _>>();
-    let mut candidates = hits
+    let candidates = hits
         .iter()
         .map(|hit| (hit.citation(include_evidence), hit))
         .collect::<Vec<_>>();
-    sort_by_cached_rank_desc(&mut candidates, |(citation, _)| {
-        packet_citation_rank(citation, rank_terms, true)
-    });
-    let selected = select_packet_candidate_indices(&candidates, stage_carry_limit, exact_query);
+    let selected = select_packet_candidate_indices(&candidates, stage_carry_limit);
     for candidate_index in &selected {
         let (citation, hit) = &candidates[*candidate_index];
         if include_evidence {
@@ -97,7 +80,6 @@ pub(crate) fn merge_packet_fused_subquery_batch(
     duration_ms: u32,
     diagnostics: &[PacketSidecarQueryDiagnosticDto],
     include_evidence: bool,
-    rank_terms: &[String],
     stage_carry_limit: usize,
 ) {
     for (diagnostic_index, ((plan_index, query), (result_query, hits))) in
@@ -108,20 +90,7 @@ pub(crate) fn merge_packet_fused_subquery_batch(
         let step_duration = packet_query_duration_ms(diagnostic)
             .unwrap_or(duration_ms / pending.len().max(1) as u32);
         let before = answer.citations.len();
-        let query_rank_terms = prompt_search_terms(&query.query);
-        let effective_rank_terms = if query_rank_terms.is_empty() {
-            rank_terms
-        } else {
-            &query_rank_terms
-        };
-        merge_packet_search_hits(
-            answer,
-            hits,
-            include_evidence,
-            effective_rank_terms,
-            stage_carry_limit,
-            (query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE).then_some(query.query.as_str()),
-        );
+        merge_packet_search_hits(answer, hits, include_evidence, stage_carry_limit);
         let added = answer.citations.len().saturating_sub(before);
         let mut output = vec![
             field("hits", hits.len().to_string()),
@@ -168,37 +137,8 @@ pub(crate) fn merge_packet_fused_subquery_batch(
 fn select_packet_candidate_indices(
     candidates: &[(AgentCitationDto, &PacketSearchHit)],
     limit: usize,
-    exact_query: Option<&str>,
 ) -> Vec<usize> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut selected = Vec::new();
-    let mut selected_set = HashSet::new();
-    if let Some(exact_query) = exact_query {
-        let exact_query = normalize_identifier(exact_query);
-        if let Some((index, _)) = candidates.iter().enumerate().find(|(_, (citation, _))| {
-            citation.origin == codestory_contracts::api::SearchHitOrigin::IndexedSymbol
-                && citation.resolvable
-                && normalize_identifier(&citation.display_name) == exact_query
-        }) {
-            selected.push(index);
-            selected_set.insert(index);
-            if selected.len() >= limit {
-                return selected;
-            }
-        }
-    }
-
-    for index in 0..candidates.len() {
-        if selected.len() >= limit {
-            break;
-        }
-        if selected_set.insert(index) {
-            selected.push(index);
-        }
-    }
-    selected
+    (0..candidates.len().min(limit)).collect()
 }
 
 fn merge_packet_citation_provenance(
@@ -225,22 +165,14 @@ fn merge_packet_citation_provenance(
         existing.evidence_tier = candidate.evidence_tier;
         existing.evidence_producer = candidate.evidence_producer.clone();
         existing.resolution_status = candidate.resolution_status;
-        existing.eligible_for_sufficiency = candidate.eligible_for_sufficiency;
     }
+    existing.eligible_for_sufficiency = None;
 }
 
 fn packet_candidate_evidence_lane_is_stronger(
     existing: &AgentCitationDto,
     candidate: &AgentCitationDto,
 ) -> bool {
-    let existing_eligible =
-        codestory_agent::packet_evidence::citation_sufficiency_eligible(existing);
-    let candidate_eligible =
-        codestory_agent::packet_evidence::citation_sufficiency_eligible(candidate);
-    if existing_eligible != candidate_eligible {
-        return candidate_eligible;
-    }
-
     let resolution_rank = |resolution| match resolution {
         Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved) => 4,
         Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly) => 3,
@@ -354,44 +286,10 @@ mod golden_tests {
     use super::*;
     use crate::agent::packet_candidate::{PacketGraphDirection, PacketGraphEdgeProvenance};
     use codestory_contracts::api::{
-        AgentAnswerDto, AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto,
-        GraphResponse, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-        PacketPlanQueryDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, RetrievalScoreBreakdownDto, SearchHit,
+        SearchHitOrigin,
     };
-
-    fn empty_answer(prompt: &str) -> AgentAnswerDto {
-        AgentAnswerDto {
-            answer_id: "packet-trace".into(),
-            prompt: prompt.into(),
-            summary: "summary".into(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: Vec::new(),
-            subgraph_ids: Vec::new(),
-            retrieval_version: "hybrid-v1".into(),
-            graphs: Vec::new(),
-            source_coverage: Vec::new(),
-            retrieval_trace: AgentRetrievalTraceDto {
-                request_id: "request".into(),
-                retrieval_publication: None,
-                resolved_profile: codestory_contracts::api::AgentRetrievalPresetDto::Architecture,
-                policy_mode: codestory_contracts::api::AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 0,
-                sla_target_ms: None,
-                sla_missed: false,
-                semantic_fallback_count: 0,
-                semantic_fallbacks: Vec::new(),
-                semantic_stage_timeout_zero_hits: 0,
-                semantic_abstained_count: 0,
-                annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
-                source_freshness_telemetry: None,
-                steps: Vec::new(),
-                packet_sidecar_diagnostics: Vec::new(),
-                retrieval_shadow: None,
-            },
-        }
-    }
 
     fn call_boundary_hit(
         center_id: &str,
@@ -424,7 +322,6 @@ mod golden_tests {
                 evidence_producer: Some("symbol_doc".into()),
                 resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: Some(true),
                 source_excerpt: None,
                 verification_targets: Vec::new(),
@@ -496,66 +393,8 @@ mod golden_tests {
         }
     }
 
-    fn dense_distractor(id: &str) -> PacketSearchHit {
-        PacketSearchHit::without_graph(SearchHit {
-            node_id: NodeId(id.into()),
-            display_name: format!("metrics_hook_{id}"),
-            kind: NodeKind::FUNCTION,
-            file_path: Some("src/telemetry.js".into()),
-            line: Some(1),
-            score: 0.99,
-            origin: SearchHitOrigin::IndexedSymbol,
-            target: None,
-            resolvable: true,
-            match_quality: None,
-            evidence_tier: Some(PacketEvidenceTierDto::DenseSemantic),
-            evidence_producer: Some("dense_anchor".into()),
-            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
-            loss_reason: None,
-            coverage_role: None,
-            eligible_for_sufficiency: Some(false),
-            source_excerpt: None,
-            verification_targets: Vec::new(),
-            score_breakdown: None,
-        })
-    }
-
     #[test]
-    fn owner_member_probe_carries_its_exact_hit_before_higher_ranked_distractors() {
-        let query = PacketPlanQueryDto {
-            query: "BaseRequest.finalize".to_string(),
-            purpose: PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string(),
-        };
-        let pending = vec![(0usize, &query)];
-        let mut exact = dense_distractor("exact-owner-member");
-        exact.hit.display_name = "BaseRequest.finalize".to_string();
-        exact.hit.file_path = Some("pkgs/http/lib/src/base_request.dart".to_string());
-        exact.hit.score = 0.01;
-        exact.hit.eligible_for_sufficiency = Some(true);
-        exact.hit.evidence_tier = Some(PacketEvidenceTierDto::ResolvedGraph);
-        let results = vec![(
-            query.query.clone(),
-            vec![dense_distractor("higher-ranked"), exact],
-        )];
-        let mut answer = empty_answer("Explain BaseRequest finalization.");
-
-        merge_packet_fused_subquery_batch(
-            &mut answer,
-            &pending,
-            &results,
-            1,
-            &[],
-            false,
-            &["unrelated".to_string()],
-            1,
-        );
-
-        assert_eq!(answer.citations.len(), 1);
-        assert_eq!(answer.citations[0].display_name, "BaseRequest.finalize");
-    }
-
-    #[test]
-    fn duplicate_citation_promotes_the_strongest_admissible_lane_atomically() {
+    fn duplicate_citation_uses_repository_evidence_strength_not_sufficiency_flags() {
         let hit = call_boundary_hit(
             "application-handle",
             "app.handle",
@@ -582,7 +421,10 @@ mod golden_tests {
         existing.evidence_tier = Some(PacketEvidenceTierDto::DenseSemantic);
         existing.evidence_producer = Some("dense_anchor".into());
         existing.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
-        existing.eligible_for_sufficiency = Some(false);
+        existing.eligible_for_sufficiency = Some(true);
+
+        let mut candidate = candidate;
+        candidate.eligible_for_sufficiency = Some(false);
 
         merge_packet_citation_provenance(
             &mut existing,
@@ -607,7 +449,7 @@ mod golden_tests {
             existing.resolution_status,
             Some(PacketEvidenceResolutionDto::Resolved)
         );
-        assert_eq!(existing.eligible_for_sufficiency, Some(true));
+        assert_eq!(existing.eligible_for_sufficiency, None);
         let breakdown = existing
             .retrieval_score_breakdown
             .as_ref()

@@ -57,7 +57,7 @@ pub enum LanguageClaimTier {
     SourceGraphExtraction,
     StructuralSourceProof,
     TypedSemanticEdges,
-    PacketSufficientAnswerQuality,
+    PacketEvidenceProductQuality,
 }
 
 impl LanguageClaimTier {
@@ -68,7 +68,7 @@ impl LanguageClaimTier {
             Self::SourceGraphExtraction => "source_graph_extraction",
             Self::StructuralSourceProof => "structural_source_proof",
             Self::TypedSemanticEdges => "typed_semantic_edges",
-            Self::PacketSufficientAnswerQuality => "packet_sufficient_answer_quality",
+            Self::PacketEvidenceProductQuality => "packet_evidence_product_quality",
         }
     }
 }
@@ -81,7 +81,7 @@ pub enum LanguageProofRole {
     GraphFixture,
     StructuralCollectorFixture,
     SemanticResolverFixture,
-    PacketRuntimeArtifact,
+    InstalledPacketArtifact,
 }
 
 impl LanguageProofRole {
@@ -92,7 +92,7 @@ impl LanguageProofRole {
             Self::GraphFixture => "graph_fixture",
             Self::StructuralCollectorFixture => "structural_collector_fixture",
             Self::SemanticResolverFixture => "semantic_resolver_fixture",
-            Self::PacketRuntimeArtifact => "packet_runtime_artifact",
+            Self::InstalledPacketArtifact => "installed_packet_artifact",
         }
     }
 }
@@ -132,9 +132,9 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
         provenance_expectations: &["targeted resolver regression"],
     },
     LanguageClaimTierContract {
-        tier: LanguageClaimTier::PacketSufficientAnswerQuality,
-        allowed_proof_roles: &[LanguageProofRole::PacketRuntimeArtifact],
-        provenance_expectations: &["publishable packet-runtime artifact"],
+        tier: LanguageClaimTier::PacketEvidenceProductQuality,
+        allowed_proof_roles: &[LanguageProofRole::InstalledPacketArtifact],
+        provenance_expectations: &["fresh installed-agent acceptance artifact"],
     },
 ];
 
@@ -1031,7 +1031,7 @@ mod tests {
                 profile.language_name
             );
             assert!(
-                !tiers.contains(&LanguageClaimTier::PacketSufficientAnswerQuality),
+                !tiers.contains(&LanguageClaimTier::PacketEvidenceProductQuality),
                 "{} runtime profile must not imply packet-quality proof",
                 profile.language_name
             );

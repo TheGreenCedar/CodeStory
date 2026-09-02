@@ -133,6 +133,53 @@ citation.coverage_role = Some("explicit exact probe".to_string());
   assert.ok(kinds.has("magic_coverage_role"), findings);
 });
 
+test("renamed seed tables and answer-shaped phrases fail by behavior", () => {
+  const renamed = `
+fn choose_orientation_atom(candidate: &str) -> bool {
+    matches!(candidate, "main" | "run" | "entrypoint")
+}
+fn special_probe_label() -> &'static str {
+    "client type declaration"
+}
+`;
+  const kinds = kindsFor(renamed, agentFile("packet_plan.rs"));
+  assert.ok(kinds.has("answer_shape_seed_cluster"), [...kinds].join(","));
+  assert.ok(kinds.has("answer_shaped_literal"), [...kinds].join(","));
+});
+
+test("arbitrary coverage roles cannot regain ranking or capping authority", () => {
+  const renamed = `
+fn priority(row: &AgentCitationDto) -> u8 {
+    row.coverage_role.as_deref().map_or(0, |role| if role.is_empty() { 0 } else { 7 })
+}
+`;
+  const kinds = kindsFor(renamed, runtimeAgentFile("packet_capping.rs"));
+  assert.ok(kinds.has("coverage_role_authority"), [...kinds].join(","));
+});
+
+test("basename-only selectors cannot act as packet identity", () => {
+  const renamed = `
+fn selector_matches(query: &str, path: &str) -> bool {
+    let expected = query.rsplit('/').next().unwrap_or(query);
+    let actual = path.rsplit('/').next().unwrap_or(path);
+    normalize_identifier(expected) == normalize_identifier(actual)
+}
+`;
+  const kinds = kindsFor(renamed, agentFile("packet_required_probes.rs"));
+  assert.ok(kinds.has("basename_identity_authority"), [...kinds].join(","));
+});
+
+test("renaming the prompt parameter does not hide a wording classifier", () => {
+  const renamed = `
+fn choose_relation(user_request: &str) -> bool {
+    let lowered = user_request.to_ascii_lowercase();
+    lowered.contains("callback")
+}
+`;
+  const kinds = kindsFor(renamed, agentFile("packet_plan.rs"));
+  assert.ok(kinds.has("prompt_text_branch"), [...kinds].join(","));
+});
+
 test("clean generic seed / projection surface passes", () => {
   const clean = `
 pub fn extract_packet_query_terms(question: &str) -> Vec<String> {

@@ -3,8 +3,8 @@
 
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    AgentRetrievalTraceDto, PacketObligationPlanDto, PacketRetrievalTraceSummaryDto,
-    RetrievalAnnotationDto, RetrievalAnnotationKindDto,
+    AgentRetrievalTraceDto, PacketRetrievalTraceSummaryDto, RetrievalAnnotationDto,
+    RetrievalAnnotationKindDto,
 };
 use serde_json::{Value, json};
 
@@ -536,7 +536,7 @@ fn step_output_u32(step: &AgentRetrievalStepDto, key: &str) -> Option<u32> {
 /// Export packet retrieval timing and sidecar diagnostics as JSON.
 ///
 /// This is an observability surface for scoring and latency triage. It should not be treated as
-/// proof of answer sufficiency without the packet sufficiency fields on the answer itself.
+/// proof of answer correctness or completeness.
 pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
     let data = packet_step_trace_data(answer);
     let rows = data.rows;
@@ -617,18 +617,12 @@ pub(crate) fn packet_retrieval_trace_summary(
     }
 }
 
-/// Env-gated developer step-trace artifact. Obligation proof verdicts ride
-/// here — and NEVER in `retrieval_trace` annotations, which are
-/// budget-visible — so shadow observability of obligation finalize stays
-/// out of the public payload.
-pub(crate) fn write_packet_step_trace_from_env(
-    answer: &AgentAnswerDto,
-    obligations: &PacketObligationPlanDto,
-) -> Option<String> {
+/// Env-gated developer step-trace artifact. Detailed execution diagnostics
+/// stay here rather than in budget-visible public annotations.
+pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Option<String> {
     let trace_path =
         std::env::var(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV).ok()?;
-    let mut trace = packet_step_trace_json(answer);
-    trace["obligation_proof_verdicts"] = obligation_proof_verdicts_json(obligations);
+    let trace = packet_step_trace_json(answer);
     let payload = match serde_json::to_string_pretty(&trace) {
         Ok(payload) => payload,
         Err(error) => {
@@ -645,24 +639,6 @@ pub(crate) fn write_packet_step_trace_from_env(
             trace_path
         )),
     }
-}
-
-/// One row per claim obligation: id, finalize-time proof status, and the
-/// recorded reason.
-fn obligation_proof_verdicts_json(obligations: &PacketObligationPlanDto) -> Value {
-    Value::Array(
-        obligations
-            .claim_obligations
-            .iter()
-            .map(|obligation| {
-                json!({
-                    "id": obligation.id,
-                    "proof_status": format!("{:?}", obligation.proof_status),
-                    "reason": obligation.reason,
-                })
-            })
-            .collect(),
-    )
 }
 
 fn attributable_step_rows(rows: &[PacketStepTraceRow]) -> Vec<&PacketStepTraceRow> {
@@ -788,7 +764,6 @@ mod tests {
                 steps,
                 packet_sidecar_diagnostics: Vec::new(),
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 retrieval_shadow: None,
             },
@@ -1147,9 +1122,8 @@ mod tests {
         }
 
         let answer = sample_answer(Vec::new());
-        let diagnostic =
-            write_packet_step_trace_from_env(&answer, &PacketObligationPlanDto::default())
-                .expect("missing parent should produce a write diagnostic");
+        let diagnostic = write_packet_step_trace_from_env(&answer)
+            .expect("missing parent should produce a write diagnostic");
         assert!(
             diagnostic.starts_with("packet_step_trace_out error=write "),
             "diagnostic should report the write error: {diagnostic}"

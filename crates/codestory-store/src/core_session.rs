@@ -5,7 +5,9 @@
 //! immutable generations. Direct pointer and rehydrate publishers are crate-
 //! private; the only public write path is this transaction.
 
-use crate::core_generation::{CorePublicationLayout, publish_rehydrated_generation};
+use crate::core_generation::{
+    CorePublicationCommitV1, CorePublicationLayout, publish_rehydrated_generation,
+};
 use crate::storage_impl::{Storage as Store, StorageError};
 use codestory_contracts::core_publication::{CoreGenerationIdentityV1, CorePublicationPointerV1};
 use std::path::{Path, PathBuf};
@@ -84,10 +86,7 @@ impl CorePublishTransaction {
         &self.staged_database
     }
 
-    pub fn generation_database_path(
-        &self,
-        generation_id: &str,
-    ) -> Result<PathBuf, StorageError> {
+    pub fn generation_database_path(&self, generation_id: &str) -> Result<PathBuf, StorageError> {
         self.layout.generation_database_path(generation_id)
     }
 
@@ -103,7 +102,7 @@ impl CorePublishTransaction {
     pub fn commit_rehydrate(
         self,
         target_storage_path: &Path,
-    ) -> Result<CorePublicationPointerV1, StorageError> {
+    ) -> Result<CorePublicationCommitV1, StorageError> {
         publish_rehydrated_generation(&self.staged_database, target_storage_path)
     }
 
@@ -115,7 +114,7 @@ impl CorePublishTransaction {
         self,
         active: CoreGenerationIdentityV1,
         rollback: Option<CoreGenerationIdentityV1>,
-    ) -> Result<CorePublicationPointerV1, StorageError> {
+    ) -> Result<CorePublicationCommitV1, StorageError> {
         if self.staged_database.is_file() {
             self.layout
                 .install_staging_generation(&self.staged_database, &active.generation_id)?;
@@ -205,5 +204,38 @@ mod tests {
         assert!(!staging.is_file(), "stage must be consumed by install");
         let session = CoreReadSession::pin(&logical).expect("pin");
         assert_eq!(session.identity().generation_id, identity.generation_id);
+    }
+
+    #[test]
+    fn post_replacement_directory_sync_failure_reports_committed_unconfirmed() {
+        let dir = tempdir().expect("temp");
+        let logical = dir.path().join(CORE_DATABASE_FILE);
+        let layout = CorePublicationLayout::from_storage_path(&logical).expect("layout");
+        let staging = layout.create_staging_database_path().expect("stage path");
+        seed_sqlite(&staging);
+        let identity = CoreGenerationIdentityV1 {
+            generation_id: "gen-unconfirmed".to_string(),
+            run_id: "run-unconfirmed".to_string(),
+            logical_bytes: 1,
+            published_at_epoch_ms: 1,
+        };
+        let tx = CorePublishTransaction::begin_from_stage(&logical, staging).expect("tx");
+        let commit = crate::core_generation::with_core_pointer_sync_failure(
+            layout.publication_path().as_path(),
+            || tx.commit_pointer(identity.clone(), None),
+        )
+        .expect("replacement is a committed result");
+
+        assert_eq!(commit.pointer.active, identity);
+        assert_eq!(
+            commit.durability,
+            crate::CorePublicationDurabilityV1::Unconfirmed(
+                crate::CorePublicationDurabilityReasonV1::PointerDirectorySyncFailed
+            )
+        );
+        assert_eq!(
+            layout.read_pointer().expect("read pointer").unwrap(),
+            commit.pointer
+        );
     }
 }

@@ -397,7 +397,6 @@ impl AppController {
             resolution_status: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(false),
             source_excerpt: None,

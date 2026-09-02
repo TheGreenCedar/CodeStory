@@ -13,8 +13,8 @@ use codestory_contracts::{
     },
     packet_projection_v3::{
         ContinuationStateV3Dto, CorePublicationIdentityV3Dto, DIAGNOSTIC_ROWS_MAX_V3,
-        DiagnosticCategoryV3Dto, DiagnosticCodeTextV3, EVIDENCE_ROWS_MAX_V3, EvidenceIdentityV3Dto,
-        GAP_ROWS_MAX_V3, GapIdentityV3Dto, IdentityTextV3, PacketEvidenceRowV3Dto,
+        DiagnosticCategoryV3Dto, DiagnosticCodeTextV3, EvidenceIdentityV3Dto, GAP_ROWS_MAX_V3,
+        GapIdentityV3Dto, IdentityTextV3, PACKET_EVIDENCE_ROWS_MAX_V3, PacketEvidenceRowV3Dto,
         ProjectionGapRowV3Dto, REFERENCE_ROWS_MAX_V3, RetrievalPublicationIdentityV3Dto,
         RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto, Sha256DigestV3Dto,
     },
@@ -27,16 +27,10 @@ use uuid::{Uuid, Variant};
 use crate::services::PublicOperationService;
 
 const REQUEST_DIGEST_DOMAIN_V3: &[u8] = b"codestory.packet_execution_record_v3.request\0";
+pub(crate) const PACKET_EXECUTION_PLAN_VERSION_V3: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PacketProfileV3 {
-    Auto,
-    Architecture,
-    Callflow,
-    Impact,
-    Inheritance,
-    Investigate,
+pub(crate) fn canonical_json_bytes_v3<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,9 +38,7 @@ pub(crate) enum PacketProfileV3 {
 pub(crate) struct PacketRequestFingerprintV3 {
     question: String,
     budget: PacketBudgetModeDto,
-    profile: PacketProfileV3,
     typed_probes: Vec<PacketProbeDto>,
-    extra_probes: Vec<String>,
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<String>,
     option_ids: Vec<String>,
@@ -55,16 +47,11 @@ pub(crate) struct PacketRequestFingerprintV3 {
 }
 
 impl PacketRequestFingerprintV3 {
-    pub(crate) fn from_current_request(
-        request: &AgentPacketRequestDto,
-        profile: PacketProfileV3,
-    ) -> Self {
+    pub(crate) fn from_current_request(request: &AgentPacketRequestDto) -> Self {
         Self {
             question: request.question.clone(),
             budget: request.budget,
-            profile,
             typed_probes: request.probes.clone(),
-            extra_probes: request.extra_probes.clone(),
             latency_budget_ms: request.latency_budget_ms,
             parent_packet_id: request.parent_packet_id.clone(),
             option_ids: request.option_ids.clone(),
@@ -81,16 +68,8 @@ impl PacketRequestFingerprintV3 {
         self.budget
     }
 
-    pub(crate) fn profile(&self) -> PacketProfileV3 {
-        self.profile
-    }
-
     pub(crate) fn typed_probes(&self) -> &[PacketProbeDto] {
         &self.typed_probes
-    }
-
-    pub(crate) fn extra_probes(&self) -> &[String] {
-        &self.extra_probes
     }
 
     pub(crate) fn latency_budget_ms(&self) -> Option<u32> {
@@ -412,7 +391,7 @@ fn build_record_from_captured_v3(
         .transpose()?;
     validate_retrieval_state(&input.retrieval, retrieval_publication.as_ref())?;
 
-    if input.evidence.len() > EVIDENCE_ROWS_MAX_V3 {
+    if input.evidence.len() > PACKET_EVIDENCE_ROWS_MAX_V3 {
         return Err(RecordValidationErrorV3::TooManyEvidenceRows(
             input.evidence.len(),
         ));
@@ -477,7 +456,7 @@ fn build_record_from_captured_v3(
         request_id: input.request_id.clone(),
         question_sha256: hashes.question_sha256,
         request_sha256: hashes.request_sha256,
-        plan_version: codestory_agent::packet_execution_plan_v3::PACKET_EXECUTION_PLAN_VERSION_V3,
+        plan_version: PACKET_EXECUTION_PLAN_VERSION_V3,
         project: capture.project.clone(),
         core_publication: CorePublicationIdentityV3Dto {
             project_id: identity_from_required("core_project_id", capture.core_project_id.clone())?,
@@ -530,11 +509,8 @@ fn validate_request(request: &PacketRequestFingerprintV3) -> Result<(), RecordVa
     if request.question.trim().is_empty() {
         return Err(RecordValidationErrorV3::EmptyQuestion);
     }
-    codestory_contracts::api::validate_packet_probe_request(
-        &request.typed_probes,
-        &request.extra_probes,
-    )
-    .map_err(RecordValidationErrorV3::InvalidRequest)?;
+    codestory_contracts::api::validate_packet_probe_request(&request.typed_probes)
+        .map_err(RecordValidationErrorV3::InvalidRequest)?;
     for (field, value) in [
         ("parent_packet_id", request.parent_packet_id.as_deref()),
         (
@@ -764,8 +740,8 @@ fn identity_from_required(
 fn fingerprint_request_v3(
     request: &PacketRequestFingerprintV3,
 ) -> Result<RequestHashesV3, RecordValidationErrorV3> {
-    let canonical = codestory_agent::packet_execution_plan_v3::canonical_json_bytes_v3(request)
-        .map_err(RecordValidationErrorV3::CanonicalJson)?;
+    let canonical =
+        canonical_json_bytes_v3(request).map_err(RecordValidationErrorV3::CanonicalJson)?;
     let mut request_bytes = Vec::with_capacity(REQUEST_DIGEST_DOMAIN_V3.len() + canonical.len());
     request_bytes.extend_from_slice(REQUEST_DIGEST_DOMAIN_V3);
     request_bytes.extend_from_slice(&canonical);
@@ -855,9 +831,7 @@ mod tests {
         PacketRequestFingerprintV3 {
             question: "hello".to_owned(),
             budget: PacketBudgetModeDto::Standard,
-            profile: PacketProfileV3::Auto,
             typed_probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -1008,7 +982,7 @@ mod tests {
         );
         assert_eq!(
             hashes.request_sha256.as_str(),
-            "154ea7d1090d6679591d96117cbdebdd160fac2782f8569300fa46ba39507de9"
+            "8b38090c2b3981740e85b500b0025fabef3ac16f8acbfd6a4c1b5f6efceb1b2c"
         );
     }
 
@@ -1025,15 +999,9 @@ mod tests {
         value.budget = PacketBudgetModeDto::Deep;
         mutations.push(value);
         let mut value = base.clone();
-        value.profile = PacketProfileV3::Callflow;
-        mutations.push(value);
-        let mut value = base.clone();
         value.typed_probes = vec![PacketProbeDto::ExactPath {
             path: "src/lib.rs".to_owned(),
         }];
-        mutations.push(value);
-        let mut value = base.clone();
-        value.extra_probes = vec!["Router::run".to_owned()];
         mutations.push(value);
         let mut value = base.clone();
         value.latency_budget_ms = Some(5_000);
@@ -1087,17 +1055,13 @@ mod tests {
             question: "hello".to_owned(),
             budget: PacketBudgetModeDto::Standard,
             probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
             core_generation_id: None,
             retrieval_generation: None,
         };
-        let fingerprint = PacketRequestFingerprintV3::from_current_request(
-            &current_request,
-            PacketProfileV3::Auto,
-        );
+        let fingerprint = PacketRequestFingerprintV3::from_current_request(&current_request);
         assert_eq!(
             fingerprint_request_v3(&fingerprint)
                 .unwrap()
@@ -1121,10 +1085,7 @@ mod tests {
         );
         assert_eq!(record.caller_id().as_str(), "caller-1");
         assert_eq!(record.request_id().as_str(), "request-1");
-        assert_eq!(
-            record.plan_version(),
-            codestory_agent::packet_execution_plan_v3::PACKET_EXECUTION_PLAN_VERSION_V3
-        );
+        assert_eq!(record.plan_version(), PACKET_EXECUTION_PLAN_VERSION_V3);
         assert_eq!(record.project().project_id, "project-1");
         assert_eq!(record.project().workspace_id, "workspace-1");
         assert_eq!(record.project().artifact_scope_id, "artifact-1");
@@ -1279,13 +1240,13 @@ mod tests {
         ));
 
         let mut input = finalized_fixture();
-        input.evidence = (0..=EVIDENCE_ROWS_MAX_V3)
+        input.evidence = (0..=PACKET_EVIDENCE_ROWS_MAX_V3)
             .map(|index| evidence(&format!("evidence-{index:03}")))
             .collect();
         assert_eq!(
             build_record_from_captured_v3(&capture, &input, &mut ids),
             Err(RecordValidationErrorV3::TooManyEvidenceRows(
-                EVIDENCE_ROWS_MAX_V3 + 1
+                PACKET_EVIDENCE_ROWS_MAX_V3 + 1
             ))
         );
 

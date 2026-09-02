@@ -15,8 +15,19 @@ use codestory_contracts::api::{
     NodeOccurrencesRequest, RouteEndpointHandlerDto, RouteEndpointMetadataDto, SearchHit,
     SourceOccurrenceDto, SymbolSummaryDto, TrailConfigDto, TrailFilterOptionsDto,
 };
+use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use codestory_contracts::graph::Node as GraphNode;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// Identity-index result that can be considered before a packet candidate is
+/// hydrated. It deliberately carries no node body, file record, source, or
+/// graph neighborhood.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedSymbolIdentityCandidate {
+    pub(crate) node_id: NodeId,
+    pub(crate) display_name: String,
+}
 
 /// Copy only the cached display names the caller can still read back.
 ///
@@ -35,6 +46,107 @@ where
 }
 
 impl AppController {
+    pub(crate) fn resolve_indexed_symbol_identity_by_id(
+        &self,
+        id: &NodeId,
+    ) -> Result<Option<IndexedSymbolIdentityCandidate>, ApiError> {
+        self.ensure_search_state()?;
+        let Some(core_id) =
+            id.0.parse::<i64>()
+                .ok()
+                .map(codestory_contracts::graph::NodeId)
+        else {
+            return Ok(None);
+        };
+        let state = self.state.lock();
+        Ok(state
+            .node_names
+            .get(&core_id)
+            .map(|display_name| IndexedSymbolIdentityCandidate {
+                node_id: id.clone(),
+                display_name: display_name.clone(),
+            }))
+    }
+
+    pub(crate) fn resolve_exact_indexed_symbol_identities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<IndexedSymbolIdentityCandidate>, ApiError> {
+        self.ensure_search_state()?;
+        let query = query.trim();
+        let mut candidates = {
+            let mut state = self.state.lock();
+            let engine = state.search_engine.as_mut().ok_or_else(|| {
+                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+            })?;
+            let matches = engine.search_symbol_with_scores(query);
+            let names = node_names_for_ids(&state.node_names, matches.iter().map(|(id, _)| *id));
+            matches
+                .into_iter()
+                .filter_map(|(id, _)| {
+                    names
+                        .get(&id)
+                        .filter(|display_name| display_name.as_str() == query)
+                        .map(|display_name| IndexedSymbolIdentityCandidate {
+                            node_id: NodeId::from(id),
+                            display_name: display_name.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+        candidates.dedup_by(|left, right| left.node_id == right.node_id);
+        // One extra identity lets the packet admission gate observe and type
+        // the overflow without opening an unbounded file/detail projection.
+        candidates.truncate(INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1));
+        Ok(candidates)
+    }
+
+    pub(crate) fn resolve_exact_indexed_symbol_identities_in_file(
+        &self,
+        query: &str,
+        project_root: &Path,
+        exact_path: &Path,
+    ) -> Result<Vec<IndexedSymbolIdentityCandidate>, ApiError> {
+        let candidates = self.resolve_exact_indexed_symbol_identities(query)?;
+        let core_ids = candidates
+            .iter()
+            .filter_map(|candidate| candidate.node_id.0.parse::<i64>().ok())
+            .map(codestory_contracts::graph::NodeId)
+            .collect::<Vec<_>>();
+        let details = self
+            .open_storage_read_only()?
+            .get_node_file_identities_by_ids(
+                &core_ids,
+                INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1),
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve bounded file-scoped symbol identities: {error}"
+                ))
+            })?;
+        let matching_ids = details
+            .into_iter()
+            .filter_map(|detail| {
+                let path = detail.file_path?;
+                let path = Path::new(&path);
+                let joined;
+                let candidate_path = if path.is_absolute() {
+                    path
+                } else {
+                    joined = project_root.join(path);
+                    joined.as_path()
+                };
+                codestory_workspace::same_workspace_path(exact_path, candidate_path)
+                    .then_some(detail.node_id.0.to_string())
+            })
+            .collect::<HashSet<_>>();
+        Ok(candidates
+            .into_iter()
+            .filter(|candidate| matching_ids.contains(&candidate.node_id.0))
+            .collect())
+    }
+
     pub(crate) fn cached_labels<I>(
         &self,
         ids: I,
@@ -263,15 +375,17 @@ impl AppController {
         self.state.lock().last_hybrid_instrumentation.take()
     }
 
-    /// Build an evidence packet with sufficiency, diagnostics, and budget metadata.
+    /// Build one bounded, source-backed evidence packet with typed diagnostics.
     ///
-    /// Packet sufficiency is a runtime judgment over resolved evidence. Full-mode sidecar
-    /// candidates that fail symbol resolution remain diagnostics and do not become supported
-    /// claims merely because retrieval returned them.
+    /// The packet reports no answer-sufficiency judgment. Candidate admission is
+    /// descriptor-only; source and graph evidence may be opened only after the
+    /// packet-wide admission session is sealed.
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        agent::retrieval_primary::with_stable_retrieval_publication(self, "packet output", || {
-            agent::agent_packet(self, req.clone())
-        })
+        agent::retrieval_primary::with_stable_packet_retrieval_publication(
+            self,
+            "packet output",
+            || agent::agent_packet(self, req.clone()),
+        )
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {

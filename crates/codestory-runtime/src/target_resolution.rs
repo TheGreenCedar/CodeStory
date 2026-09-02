@@ -922,7 +922,6 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
                 .unwrap_or(PacketEvidenceResolutionDto::Resolved),
         ),
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -1098,7 +1097,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -1259,7 +1257,7 @@ mod tests {
             hit.resolution_status,
             Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
         assert!(hit.resolvable, "the cited source range remains navigable");
         assert!(!is_graph_target_candidate(&hit));
         assert!(!is_resolvable_graph_target("demo", &hit));
@@ -1311,7 +1309,7 @@ mod tests {
             hit.resolution_status,
             Some(PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
         assert!(hit.resolvable, "the cited source range remains navigable");
         assert!(!is_graph_target_candidate(&hit));
         assert!(matches!(

@@ -37,9 +37,10 @@ import {
   isTrustedPublishableRepoUrl,
   isPathInside,
   installedAgentTiming,
+  installedAgentTimingFromMeasuredInteraction,
   installedAgentTimingCohortId,
   installedAgentTimingPhaseWarmMs,
-  exactCandidateTimingFromInstalledPhases,
+  exactCandidateLifecycleTiming,
   timingEligibleExactCandidateRow,
   timingIneligibleComparatorRow,
   interactionTurnTelemetry,
@@ -328,11 +329,9 @@ function exactCandidateRows() {
           exact_candidate_timing: codestory
             ? {
                 cold_ms: arm === "candidate_0_18" ? 100 : 100,
-                warm_ms: arm === "candidate_0_18" ? 50 : 50,
                 incremental_ms: arm === "candidate_0_18" ? 20 : 20,
-                all_in_ms: arm === "candidate_0_18" ? 50 : 50,
               }
-            : { cold_ms: 0, warm_ms: 100, incremental_ms: 0, all_in_ms: 100 },
+            : { cold_ms: 0, incremental_ms: 0 },
           wall_ms: codestory ? 50 : 100,
           installed_agent_timing: {
             timing_cohort_id: createHash("sha256")
@@ -1224,8 +1223,6 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     }, /cost/i],
     ["warm", (rows) => {
       for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
-        row.exact_candidate_timing.warm_ms = 53;
-        row.exact_candidate_timing.all_in_ms = 53;
         row.installed_agent_timing.agent_runner_ms = 43;
         row.installed_agent_timing.time_to_first_packet_ms = 8;
         row.installed_agent_timing.continuation_ms = 2;
@@ -1239,9 +1236,9 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     ["incremental", (rows) => {
       for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.incremental_ms = 22;
     }, /incremental.*5%/i],
-    ["row all-in mismatch", (rows) => {
-      rows.find((entry) => entry.arm === "candidate_0_18").exact_candidate_timing.all_in_ms = 89;
-    }, /row all-in timing/i],
+    ["packet phase mismatch", (rows) => {
+      rows.find((entry) => entry.arm === "candidate_0_18").installed_agent_timing.time_to_final_packet_ms = 89;
+    }, /packet phases do not reconcile/i],
     ["source authorization", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.direct_source_reads[0].authorization = { status: "unauthorized", reason: null };
     }, /unauthorized direct source read/i],
@@ -9148,6 +9145,33 @@ test("installed timing records literal disjoint intervals without manufacturing 
   assert.equal(overhead.time_to_final_packet_ms, 50);
 });
 
+test("whole task timing comes from the installed interaction clock, not phase arithmetic", () => {
+  const timing = installedAgentTimingFromMeasuredInteraction({
+    timing_cohort_id: "e".repeat(64),
+    agent_runner_ms: 1_200,
+    time_to_first_packet_ms: 400,
+    continuation_ms: 100,
+    interaction_started_ms: 10_000,
+    interaction_finished_ms: 11_850,
+  });
+  assert.equal(timing.whole_task_wall_ms, 1_850);
+  assert.equal(
+    timing.agent_runner_ms + timing.time_to_first_packet_ms + timing.continuation_ms,
+    1_700,
+  );
+  assert.throws(
+    () => installedAgentTimingFromMeasuredInteraction({
+      timing_cohort_id: "e".repeat(64),
+      agent_runner_ms: 1,
+      time_to_first_packet_ms: 0,
+      continuation_ms: 0,
+      interaction_started_ms: 20,
+      interaction_finished_ms: 19,
+    }),
+    /interaction clock/i,
+  );
+});
+
 test("installed timing rounds each measured interval independently", () => {
   const timing = installedAgentTiming({
     timing_cohort_id: "d".repeat(64),
@@ -9164,7 +9188,7 @@ test("installed timing rounds each measured interval independently", () => {
     timing.time_to_final_packet_ms,
     timing.time_to_first_packet_ms + timing.continuation_ms,
   );
-  assert.doesNotThrow(() => exactCandidateTimingFromInstalledPhases(timing));
+  assert.doesNotThrow(() => exactCandidateLifecycleTiming(timing));
 });
 
 test("a packet prelude that ran no continuation reports zero, not the rest of its wall", () => {
@@ -9219,7 +9243,7 @@ test("reused comparator rows are always timing-ineligible", () => {
   assert.equal(Object.keys(row.installed_agent_timing).length, 6);
 });
 
-test("exact-candidate warm timing comes from whole_task_wall_ms, not a phase remainder", () => {
+test("exact-candidate lifecycle timing contains no warm or all-in row aliases", () => {
   const timing = installedAgentTiming({
     timing_cohort_id: "c".repeat(64),
     agent_runner_ms: 80,
@@ -9227,18 +9251,17 @@ test("exact-candidate warm timing comes from whole_task_wall_ms, not a phase rem
     continuation_ms: 5,
     whole_task_wall_ms: 100,
   });
-  const exact = exactCandidateTimingFromInstalledPhases(timing, {
+  const exact = exactCandidateLifecycleTiming(timing, {
     cold_ms: 40,
     incremental_ms: 10,
   });
   assert.deepEqual(exact, {
     cold_ms: 40,
-    warm_ms: 100,
     incremental_ms: 10,
-    all_in_ms: 100,
   });
-  assert.equal(exact.warm_ms, timing.whole_task_wall_ms);
-  assert.notEqual(exact.warm_ms, timing.agent_runner_ms);
+  assert.equal(Object.hasOwn(exact, "warm_ms"), false);
+  assert.equal(Object.hasOwn(exact, "all_in_ms"), false);
+  assert.equal(installedAgentTimingPhaseWarmMs(timing), 100);
   assert.equal(
     Object.getOwnPropertyDescriptor(timing, "whole_task_wall_ms") != null,
     true,
@@ -9255,8 +9278,6 @@ test("exact-candidate acceptance excludes reused timing-ineligible rows from war
         source_run_dir: "/tmp/source",
       },
     }));
-    row.exact_candidate_timing.warm_ms = 1;
-    row.exact_candidate_timing.all_in_ms = 1;
     row.installed_agent_timing.agent_runner_ms = 1;
     row.installed_agent_timing.time_to_first_packet_ms = 0;
     row.installed_agent_timing.continuation_ms = 0;
@@ -9272,17 +9293,16 @@ test("exact-candidate acceptance excludes reused timing-ineligible rows from war
   );
 });
 
-test("exact-candidate acceptance rejects warm that aliases raw wall_ms instead of phases", () => {
+test("exact-candidate acceptance rejects per-row warm and all-in aliases", () => {
   const rows = exactCandidateRows();
   const row = rows.find((entry) => entry.arm === "candidate_0_18");
   row.wall_ms = 999;
   row.exact_candidate_timing.warm_ms = 999;
   row.exact_candidate_timing.all_in_ms = 999;
-  // Leave InstalledAgentTimingV1 phases at the fixture warm (50).
   const accepted = benchmarkHarness.exactCandidateAcceptance(rows, exactLifecycle());
   assert.equal(accepted.pass, false);
   assert.match(
     accepted.reasons.join(" | "),
-    /whole-task warm timing does not reconcile to InstalledAgentTimingV1 whole_task_wall_ms/i,
+    /per-row warm_ms\/all_in_ms aliases are forbidden/i,
   );
 });

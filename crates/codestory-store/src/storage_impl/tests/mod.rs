@@ -338,6 +338,35 @@ fn canonical_annotation_anchor_lookup_rejects_zero_bind_limit() -> Result<(), St
 }
 
 #[test]
+fn exact_file_identity_check_does_not_materialize_file_metadata() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let path = PathBuf::from("/repo/src/hostile.rs");
+    storage.insert_file(&FileInfo {
+        id: 1,
+        path: path.clone(),
+        language: "rust".into(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    })?;
+    storage
+        .conn
+        .execute("UPDATE file SET language = X'80' WHERE id = 1", [])?;
+
+    assert!(
+        storage.has_complete_indexed_file_path(std::slice::from_ref(&path))?,
+        "identity-only lookup must not decode unrelated file metadata"
+    );
+    assert!(
+        storage.get_files_by_paths(&[path]).is_err(),
+        "fixture must fail if the full file record is materialized"
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_annotation_anchor_fallback_returns_every_match_in_node_id_order()
 -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
@@ -4158,12 +4187,68 @@ fn canonical_search_symbols_page_node_table_independently_of_projection() -> Res
     assert_eq!(details[0].file_path.as_deref(), Some("src/lib.rs"));
     assert_eq!(details[0].start_line, Some(7));
     assert_eq!(details[0].end_line, Some(11));
+    assert_eq!(
+        storage.get_node_file_identities_by_ids(
+            &[NodeId(30), NodeId(10), NodeId(30), NodeId(999)],
+            17,
+        )?,
+        [
+            NodeFileIdentityProjection {
+                node_id: NodeId(10),
+                file_path: Some("src/lib.rs".to_string()),
+            },
+            NodeFileIdentityProjection {
+                node_id: NodeId(30),
+                file_path: Some("src/lib.rs".to_string()),
+            },
+        ],
+        "bounded identity lookup must return only requested existing ids in stable order"
+    );
 
     storage.clear_search_symbol_projection()?;
     assert_eq!(storage.get_search_symbol_projection_count()?, 0);
     assert_eq!(
         storage.get_canonical_search_symbol_batch_after(None, usize::MAX)?,
         [first_page, second_page].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn node_file_identity_lookup_does_not_decode_symbol_details() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/hostile.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ])?;
+    storage
+        .conn
+        .execute("UPDATE node SET kind = X'80' WHERE id = 10", [])?;
+
+    assert_eq!(
+        storage.get_node_file_identities_by_ids(&[NodeId(10)], 17)?,
+        [NodeFileIdentityProjection {
+            node_id: NodeId(10),
+            file_path: Some("src/hostile.rs".to_string()),
+        }],
+        "pre-admission identity lookup must not decode node kind or source details"
+    );
+    assert!(
+        storage
+            .get_canonical_search_symbol_detail_batch_after(None, 17)
+            .is_err(),
+        "fixture must fail if the full symbol-detail projection is used"
     );
     Ok(())
 }
@@ -8758,6 +8843,46 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn bounded_raw_incident_edges_do_not_open_endpoint_nodes_or_files() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "admitted".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unadmitted".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(1),
+        source: NodeId(1),
+        target: NodeId(2),
+        kind: EdgeKind::CALL,
+        resolved_target: Some(NodeId(2)),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    }])?;
+
+    storage.conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TABLE node;
+         DROP TABLE file;",
+    )?;
+
+    let incident = storage.get_bounded_raw_incident_edges(NodeId(1), 8)?;
+    assert_eq!(incident.edges.len(), 1);
+    assert_eq!(incident.edges[0].id, EdgeId(1));
+    assert!(!incident.truncated);
     Ok(())
 }
 

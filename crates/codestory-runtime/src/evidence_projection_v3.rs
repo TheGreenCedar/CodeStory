@@ -1,15 +1,11 @@
 //! Public evidence-only projection facade for CodeStory schema 3.
 
-use std::{
-    cmp::Reverse,
-    collections::{HashMap, HashSet},
-};
+use std::collections::{HashMap, HashSet};
 
 use codestory_contracts::{
     api::{
-        AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, PacketClaimObligationDto,
-        PacketDispositionKindDto, SearchHit, SearchResultsDto, SupportUnitDto, SupportUnitKindDto,
-        decode_drill_option_id,
+        AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, PacketDispositionKindDto, SearchHit,
+        SearchResultsDto, SupportUnitDto, SupportUnitKindDto,
     },
     packet_projection_v3::{
         BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionV3Dto, ContextTargetV3Dto,
@@ -26,14 +22,14 @@ use sha2::{Digest, Sha256};
 use crate::{
     agent::{
         packet_execution_record_v3::{
-            FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
+            FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
             PacketRequestFingerprintV3, build_packet_execution_record_v3,
         },
         packet_projection_v3::{
             DiagnosticArtifactBuildV3, FinalizedContextProjectionInputV3,
             FinalizedSearchProjectionInputV3, build_context_projection_v3,
             build_diagnostic_artifact_v3, build_packet_projection_v3, build_search_projection_v3,
-            finalize_packet_projection_v3,
+            finalize_packet_projection_v3, packet_budget_exceeded_projection_v3,
         },
     },
     services::PublicOperationService,
@@ -69,6 +65,28 @@ pub fn finalize_packet_projection_v3_for_representation(
         .map_err(|error| projection_error("packet representation budget", error))
 }
 
+/// Build the typed public fallback when an adapter receives an overbound
+/// internal complete projection that cannot be deserialized into the closed
+/// 16-row DTO. Adapters supply only the already-typed envelope; runtime owns
+/// the public gap vocabulary and result shape.
+pub fn packet_budget_exceeded_projection_v3_from_envelope(
+    schema_version: u16,
+    identity: codestory_contracts::packet_projection_v3::PacketRequestIdentityV3Dto,
+    publication: codestory_contracts::packet_projection_v3::PublicationIdentityV3Dto,
+    retrieval: RetrievalStateDescriptorV3Dto,
+    diagnostics: DiagnosticsCapabilityV3Dto,
+    required_complete_bytes: usize,
+) -> PacketProjectionV3Dto {
+    packet_budget_exceeded_projection_v3(
+        schema_version,
+        identity,
+        publication,
+        retrieval,
+        diagnostics,
+        required_complete_bytes,
+    )
+}
+
 /// Convert the runtime's finalized packet execution into the only public v3
 /// packet vocabulary. The legacy disposition is consumed only to retain gaps
 /// and a bounded continuation; it is never serialized or treated as proof.
@@ -82,11 +100,7 @@ pub fn project_packet_v3(
     let PacketEvidenceSelectionV3 {
         rows: evidence,
         was_bounded: evidence_was_bounded,
-    } = packet_evidence_selection(
-        &packet.support,
-        &packet_evidence_ranking_terms(&request.question, &request.option_ids),
-        &packet.plan.obligations.claim_obligations,
-    );
+    } = packet_evidence_selection(&packet.support);
 
     let mut gaps = packet_gaps(packet);
     if evidence_was_bounded {
@@ -106,7 +120,7 @@ pub fn project_packet_v3(
     let input = FinalizedPacketExecutionInputV3::new(
         identity(caller_id, "caller_id")?,
         identity(&packet.answer.retrieval_trace.request_id, "request_id")?,
-        PacketRequestFingerprintV3::from_current_request(request, PacketProfileV3::Auto),
+        PacketRequestFingerprintV3::from_current_request(request),
         evidence,
         gaps,
         continuation,
@@ -164,19 +178,7 @@ struct PacketEvidenceContentKeyV3 {
     summary: Option<String>,
 }
 
-fn packet_evidence_selection(
-    support: &[SupportUnitDto],
-    ranking_terms: &HashSet<String>,
-    claim_obligations: &[PacketClaimObligationDto],
-) -> PacketEvidenceSelectionV3 {
-    let mut planned_stage_terms = ranking_terms.clone();
-    for candidate in claim_obligations
-        .iter()
-        .filter(|obligation| obligation.material)
-        .flat_map(|obligation| &obligation.open_next_candidates)
-    {
-        planned_stage_terms.extend(packet_evidence_terms(candidate));
-    }
+fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelectionV3 {
     let source_symbols = support
         .iter()
         .filter(|unit| {
@@ -189,12 +191,7 @@ fn packet_evidence_selection(
         .filter_map(|unit| Some((unit.path.as_deref()?, unit.symbol_id.as_deref()?)))
         .collect::<HashSet<_>>();
     let mut seen: HashMap<PacketEvidenceContentKeyV3, usize> = HashMap::new();
-    let mut distinct: Vec<(
-        SupportUnitKindDto,
-        PacketEvidenceRowV3Dto,
-        usize,
-        Vec<usize>,
-    )> = Vec::new();
+    let mut distinct: Vec<(SupportUnitKindDto, PacketEvidenceRowV3Dto)> = Vec::new();
     for unit in support
         .iter()
         .filter(|unit| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
@@ -208,19 +205,13 @@ fn packet_evidence_selection(
         {
             continue;
         }
-        let material_carrier_ranks = packet_material_carrier_ranks(unit, claim_obligations);
-        let Some(row) = packet_evidence_row(0, unit, !material_carrier_ranks.is_empty()) else {
+        let Some(row) = packet_evidence_row(0, unit) else {
             continue;
         };
         let content_key = packet_evidence_content_key(&row);
-        if let Some(existing_index) = seen.get(&content_key).copied() {
-            distinct[existing_index].3.extend(material_carrier_ranks);
-            distinct[existing_index].3.sort_unstable();
-            distinct[existing_index].3.dedup();
-        } else {
-            let relevance = packet_evidence_relevance(&row, &planned_stage_terms);
+        if !seen.contains_key(&content_key) {
             seen.insert(content_key, distinct.len());
-            distinct.push((unit.kind, row, relevance, material_carrier_ranks));
+            distinct.push((unit.kind, row));
         }
     }
 
@@ -240,54 +231,22 @@ fn packet_evidence_selection(
 }
 
 fn select_packet_evidence_indices(
-    distinct: &[(
-        SupportUnitKindDto,
-        PacketEvidenceRowV3Dto,
-        usize,
-        Vec<usize>,
-    )],
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
 ) -> Vec<usize> {
-    // Close the mandatory identity envelope before transport compaction. One carrier covers each
-    // material obligation before any repeated carrier can consume the bound. Within the source
-    // envelope, distinct native paths precede same-path repeats. Existing relevance/native order
-    // remains the tie-breaker inside those priorities.
+    // The supplied rows already reflect retrieval and explicit structural traversal order. Public
+    // projection may deduplicate and enforce kind/path diversity, but it must not reinterpret the
+    // question or external policy to rerank repository evidence.
     let mut selected = Vec::with_capacity(distinct.len().min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3));
     let mut selected_indices = HashSet::new();
     let source_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::SourceRange);
     let location_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::SymbolLocation);
     let relation_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::TypedGraphEdge);
 
-    let mandatory_indices = packet_material_carrier_indices(distinct);
-    let mandatory_relation_indices = packet_material_relation_indices(distinct);
-    for index in &source_order {
-        if mandatory_indices.contains(index) && selected_indices.insert(*index) {
-            selected.push(*index);
-        }
-    }
-
-    let mut source_paths = selected
-        .iter()
-        .filter_map(|index| {
-            (distinct[*index].0 == SupportUnitKindDto::SourceRange)
-                .then(|| distinct[*index].1.path.as_ref().map(|path| path.as_str()))
-                .flatten()
-        })
-        .collect::<HashSet<_>>();
-    let mut source_count = selected.len();
+    let mut source_paths = HashSet::new();
+    let mut source_count = 0;
     for index in &source_order {
         if source_count >= PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
             break;
-        }
-        let remaining_mandatory = mandatory_indices
-            .iter()
-            .filter(|required| !selected_indices.contains(required))
-            .count();
-        if selected.len().saturating_add(remaining_mandatory) >= PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3
-        {
-            break;
-        }
-        if selected_indices.contains(index) {
-            continue;
         }
         let row = &distinct[*index].1;
         if row
@@ -305,25 +264,12 @@ fn select_packet_evidence_indices(
         if source_count >= PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
             break;
         }
-        let remaining_mandatory = mandatory_indices
-            .iter()
-            .filter(|required| !selected_indices.contains(required))
-            .count();
-        if selected.len().saturating_add(remaining_mandatory) >= PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3
-        {
-            break;
-        }
         if selected_indices.insert(*index) {
             selected.push(*index);
             source_count += 1;
         }
     }
 
-    for index in &location_order {
-        if mandatory_indices.contains(index) && selected_indices.insert(*index) {
-            selected.push(*index);
-        }
-    }
     let location_target = selected
         .len()
         .saturating_add(PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3)
@@ -339,15 +285,7 @@ fn select_packet_evidence_indices(
         .len()
         .saturating_add(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
-    for index in &relation_order {
-        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
-            break;
-        }
-        if mandatory_relation_indices.contains(index) && selected_indices.insert(*index) {
-            selected.push(*index);
-        }
-    }
-    let relation_target = relation_floor.max(selected.len());
+    let relation_target = relation_floor;
     let mut relation_callers = HashSet::new();
     for index in &selected {
         if distinct[*index].0 != SupportUnitKindDto::TypedGraphEdge {
@@ -384,15 +322,7 @@ fn select_packet_evidence_indices(
     let mut remainder = (0..distinct.len())
         .filter(|index| !selected_indices.contains(index))
         .collect::<Vec<_>>();
-    remainder.sort_by_key(|index| {
-        (
-            distinct[*index].3.is_empty(),
-            distinct[*index].3.first().copied().unwrap_or(usize::MAX),
-            Reverse(distinct[*index].2),
-            packet_evidence_kind_priority(distinct[*index].0),
-            *index,
-        )
-    });
+    remainder.sort_by_key(|index| (packet_evidence_kind_priority(distinct[*index].0), *index));
     for index in remainder {
         if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
             break;
@@ -429,276 +359,14 @@ fn select_packet_evidence_kind(
 }
 
 fn packet_evidence_kind_order(
-    distinct: &[(
-        SupportUnitKindDto,
-        PacketEvidenceRowV3Dto,
-        usize,
-        Vec<usize>,
-    )],
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
     selected_kind: SupportUnitKindDto,
 ) -> Vec<usize> {
-    let mut indices = distinct
+    distinct
         .iter()
         .enumerate()
-        .filter_map(|(index, (kind, _, _, _))| (*kind == selected_kind).then_some(index))
-        .collect::<Vec<_>>();
-    indices.sort_by_key(|index| {
-        (
-            distinct[*index].3.is_empty(),
-            distinct[*index].3.first().copied().unwrap_or(usize::MAX),
-            Reverse(distinct[*index].2),
-            *index,
-        )
-    });
-    indices
-}
-
-fn packet_material_carrier_ranks(
-    unit: &SupportUnitDto,
-    claim_obligations: &[PacketClaimObligationDto],
-) -> Vec<usize> {
-    claim_obligations
-        .iter()
-        .enumerate()
-        .filter(|(_, obligation)| obligation.material)
-        .filter_map(|(index, obligation)| {
-            let matches = match unit.kind {
-                SupportUnitKindDto::SourceRange | SupportUnitKindDto::SymbolLocation => {
-                    unit.symbol_id.as_deref().is_some_and(|symbol_id| {
-                        obligation
-                            .carrier_node_ids
-                            .iter()
-                            .any(|node_id| node_id.0 == symbol_id)
-                    }) || unit.path.as_deref().is_some_and(|path| {
-                        obligation
-                            .carrier_paths
-                            .iter()
-                            .any(|carrier_path| carrier_path == path)
-                    })
-                }
-                SupportUnitKindDto::TypedGraphEdge => {
-                    unit.id.strip_prefix("edge:").is_some_and(|edge_id| {
-                        let primary_edge_carrier = obligation
-                            .carrier_node_ids
-                            .iter()
-                            .find(|node_id| {
-                                obligation
-                                    .carrier_edge_proofs
-                                    .iter()
-                                    .any(|proof| &proof.carrier_node_id == *node_id)
-                            })
-                            .or_else(|| {
-                                obligation
-                                    .carrier_edge_proofs
-                                    .first()
-                                    .map(|proof| &proof.carrier_node_id)
-                            });
-                        primary_edge_carrier.is_some_and(|primary_edge_carrier| {
-                            obligation.carrier_edge_proofs.iter().any(|proof| {
-                                proof.carrier_node_id == *primary_edge_carrier
-                                    && proof.edge_id.0 == edge_id
-                            })
-                        })
-                    })
-                }
-                SupportUnitKindDto::CompleteQueryNegative => false,
-            };
-            matches.then_some(index)
-        })
+        .filter_map(|(index, (kind, _))| (*kind == selected_kind).then_some(index))
         .collect()
-}
-
-fn packet_material_carrier_indices(
-    distinct: &[(
-        SupportUnitKindDto,
-        PacketEvidenceRowV3Dto,
-        usize,
-        Vec<usize>,
-    )],
-) -> HashSet<usize> {
-    let mut obligation_order = Vec::new();
-    let mut best_candidate_by_obligation = HashMap::new();
-    for (index, (kind, _, relevance, obligations)) in distinct.iter().enumerate() {
-        let candidate = (
-            packet_evidence_kind_priority(*kind),
-            Reverse(*relevance),
-            index,
-        );
-        for obligation in obligations {
-            obligation_order.push(*obligation);
-            best_candidate_by_obligation
-                .entry(*obligation)
-                .and_modify(|best| {
-                    if candidate < *best {
-                        *best = candidate;
-                    }
-                })
-                .or_insert(candidate);
-        }
-    }
-    obligation_order.sort_unstable();
-    obligation_order.dedup();
-
-    let mut covered_obligations = HashSet::new();
-    let mut required = HashSet::new();
-    for obligation in obligation_order {
-        if required.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
-            break;
-        }
-        if covered_obligations.contains(&obligation) {
-            continue;
-        }
-        if let Some((_, _, index)) = best_candidate_by_obligation.get(&obligation).copied() {
-            required.insert(index);
-            covered_obligations.extend(distinct[index].3.iter().copied());
-        }
-    }
-    required
-}
-
-/// Keep one exact relation witness for each material obligation before repeated witnesses from an
-/// earlier obligation consume the relation envelope. Source and relation rows are complementary:
-/// the source says what the carrier contains, while the typed edge records the claimed boundary.
-fn packet_material_relation_indices(
-    distinct: &[(
-        SupportUnitKindDto,
-        PacketEvidenceRowV3Dto,
-        usize,
-        Vec<usize>,
-    )],
-) -> HashSet<usize> {
-    let mut obligation_order = Vec::new();
-    let mut best_candidate_by_obligation = HashMap::new();
-    for (index, (kind, _, relevance, obligations)) in distinct.iter().enumerate() {
-        if *kind != SupportUnitKindDto::TypedGraphEdge {
-            continue;
-        }
-        let candidate = (Reverse(*relevance), index);
-        for obligation in obligations {
-            obligation_order.push(*obligation);
-            best_candidate_by_obligation
-                .entry(*obligation)
-                .and_modify(|best| {
-                    if candidate < *best {
-                        *best = candidate;
-                    }
-                })
-                .or_insert(candidate);
-        }
-    }
-    obligation_order.sort_unstable();
-    obligation_order.dedup();
-
-    let mut covered_obligations = HashSet::new();
-    let mut required = HashSet::new();
-    for obligation in obligation_order {
-        if required.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
-            break;
-        }
-        if covered_obligations.contains(&obligation) {
-            continue;
-        }
-        if let Some((_, index)) = best_candidate_by_obligation.get(&obligation).copied() {
-            required.insert(index);
-            covered_obligations.extend(distinct[index].3.iter().copied());
-        }
-    }
-    required
-}
-
-fn packet_evidence_ranking_terms(question: &str, option_ids: &[String]) -> HashSet<String> {
-    let mut terms = packet_evidence_terms(question);
-    for option_id in option_ids {
-        if let Some((_, target)) = decode_drill_option_id(option_id) {
-            terms.extend(packet_evidence_terms(&target));
-        }
-    }
-    terms
-}
-
-fn packet_evidence_relevance(
-    row: &PacketEvidenceRowV3Dto,
-    ranking_terms: &HashSet<String>,
-) -> usize {
-    let mut text = String::new();
-    for value in [
-        row.path.as_ref().map(|value| value.as_str()),
-        row.symbol_id.as_ref().map(|value| value.as_str()),
-        row.summary.as_ref().map(|value| value.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        text.push_str(value);
-        text.push(' ');
-    }
-    let evidence_terms = packet_evidence_terms(&text);
-    ranking_terms
-        .iter()
-        .filter(|expected| {
-            evidence_terms
-                .iter()
-                .any(|observed| packet_evidence_term_matches(expected, observed))
-        })
-        .count()
-}
-
-fn packet_evidence_terms(value: &str) -> HashSet<String> {
-    let mut normalized = String::with_capacity(value.len());
-    let mut previous_was_lower_or_digit = false;
-    for ch in value.chars() {
-        if ch.is_alphanumeric() {
-            if ch.is_uppercase() && previous_was_lower_or_digit {
-                normalized.push(' ');
-            }
-            for lowercase in ch.to_lowercase() {
-                normalized.push(lowercase);
-            }
-            previous_was_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
-        } else {
-            normalized.push(' ');
-            previous_was_lower_or_digit = false;
-        }
-    }
-    normalized
-        .split_whitespace()
-        .filter(|term| term.len() >= 4 && !packet_evidence_stopword(term))
-        .map(str::to_owned)
-        .collect()
-}
-
-fn packet_evidence_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "cite"
-            | "cited"
-            | "cites"
-            | "explain"
-            | "file"
-            | "files"
-            | "from"
-            | "into"
-            | "name"
-            | "named"
-            | "source"
-            | "sources"
-            | "supporting"
-            | "symbol"
-            | "symbols"
-            | "that"
-            | "them"
-            | "then"
-            | "this"
-            | "through"
-            | "with"
-    )
-}
-
-fn packet_evidence_term_matches(expected: &str, observed: &str) -> bool {
-    expected == observed
-        || (expected.chars().count() >= 4
-            && observed.chars().count() >= 4
-            && expected.chars().take(4).eq(observed.chars().take(4)))
 }
 
 fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceContentKeyV3 {
@@ -722,40 +390,21 @@ fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceCo
 
 #[cfg(test)]
 fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dto> {
-    packet_evidence_selection(support, &HashSet::new(), &[]).rows
-}
-
-#[cfg(test)]
-fn packet_evidence_rows_with_obligations(
-    support: &[SupportUnitDto],
-    question: &str,
-    claim_obligations: &[PacketClaimObligationDto],
-) -> Vec<PacketEvidenceRowV3Dto> {
-    packet_evidence_selection(
-        support,
-        &packet_evidence_ranking_terms(question, &[]),
-        claim_obligations,
-    )
-    .rows
+    packet_evidence_selection(support).rows
 }
 
 #[cfg(test)]
 fn packet_evidence_rows_for_request(
     support: &[SupportUnitDto],
-    question: &str,
-    option_ids: &[String],
+    _question: &str,
+    _option_ids: &[String],
 ) -> Vec<PacketEvidenceRowV3Dto> {
-    packet_evidence_selection(
-        support,
-        &packet_evidence_ranking_terms(question, option_ids),
-        &[],
-    )
-    .rows
+    packet_evidence_selection(support).rows
 }
 
 #[cfg(test)]
 fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
-    packet_evidence_selection(support, &HashSet::new(), &[]).was_bounded
+    packet_evidence_selection(support).was_bounded
 }
 
 const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
@@ -885,7 +534,6 @@ fn projection_envelope(
         question: question.to_owned(),
         budget: Default::default(),
         probes: Vec::new(),
-        extra_probes: Vec::new(),
         latency_budget_ms: None,
         parent_packet_id: None,
         option_ids: Vec::new(),
@@ -896,7 +544,7 @@ fn projection_envelope(
     let input = FinalizedPacketExecutionInputV3::new(
         identity(caller_id, "caller_id")?,
         identity(request_id, "request_id")?,
-        PacketRequestFingerprintV3::from_current_request(&request, PacketProfileV3::Auto),
+        PacketRequestFingerprintV3::from_current_request(&request),
         Vec::new(),
         Vec::new(),
         None,
@@ -923,11 +571,7 @@ fn projection_envelope(
     Ok((identity, publication, retrieval))
 }
 
-fn packet_evidence_row(
-    index: usize,
-    unit: &SupportUnitDto,
-    material_carrier: bool,
-) -> Option<PacketEvidenceRowV3Dto> {
+fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvidenceRowV3Dto> {
     if unit.kind == SupportUnitKindDto::CompleteQueryNegative {
         return None;
     }
@@ -947,14 +591,12 @@ fn packet_evidence_row(
         symbol_id: symbol_text(unit.symbol_id.as_deref()),
         start_line: unit.start_line,
         end_line: unit.end_line,
-        summary: packet_evidence_summary(unit, material_carrier),
+        summary: packet_evidence_summary(unit),
     })
 }
 
 const PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3: usize = 512;
-const PACKET_MATERIAL_CARRIER_SUMMARY_MAX_BYTES_V3: usize = 2 * 1024;
-
-fn packet_evidence_summary(unit: &SupportUnitDto, material_carrier: bool) -> Option<SummaryTextV3> {
+fn packet_evidence_summary(unit: &SupportUnitDto) -> Option<SummaryTextV3> {
     let text = match unit.kind {
         SupportUnitKindDto::SourceRange => unit
             .snippet
@@ -975,12 +617,10 @@ fn packet_evidence_summary(unit: &SupportUnitDto, material_carrier: bool) -> Opt
         SupportUnitKindDto::SymbolLocation => packet_symbol_location_summary(unit),
         SupportUnitKindDto::CompleteQueryNegative => return None,
     };
-    let maximum = if material_carrier && unit.kind == SupportUnitKindDto::SourceRange {
-        PACKET_MATERIAL_CARRIER_SUMMARY_MAX_BYTES_V3
-    } else {
-        PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3
-    };
-    Some(summary_text_bounded(&text, maximum))
+    Some(summary_text_bounded(
+        &text,
+        PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3,
+    ))
 }
 
 fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
@@ -1274,10 +914,7 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, atomic::AtomicBool};
 
-    use codestory_contracts::api::{
-        EdgeId, EdgeKind, IndexMode, NodeId, PacketClaimObligationKindDto,
-        PacketObligationCarrierEdgeProofDto, PacketObligationProofStatusDto,
-    };
+    use codestory_contracts::api::IndexMode;
     use serde_json::json;
 
     use super::*;
@@ -1299,25 +936,6 @@ mod tests {
         }
     }
 
-    fn material_obligation(id: &str) -> PacketClaimObligationDto {
-        PacketClaimObligationDto {
-            id: id.to_owned(),
-            kind: PacketClaimObligationKindDto::Dispatch,
-            binding_terms: Vec::new(),
-            probe_binding: None,
-            material: true,
-            allowed_node_kinds: Vec::new(),
-            required_edge_kind: None,
-            requires_complete_discovery: false,
-            proof_status: PacketObligationProofStatusDto::Proven,
-            reason: None,
-            carrier_node_ids: Vec::new(),
-            carrier_paths: Vec::new(),
-            carrier_edge_proofs: Vec::new(),
-            open_next_candidates: Vec::new(),
-        }
-    }
-
     #[test]
     fn complete_query_negative_is_a_gap_not_a_bounded_evidence_row() {
         let support = vec![support_unit(SupportUnitKindDto::CompleteQueryNegative)];
@@ -1335,7 +953,7 @@ mod tests {
         source.summary = "source range".to_owned();
         source.snippet = Some(format!("fn useful() {{}}\n{}", "x".repeat(700)));
         source.path = Some("src/useful.rs".to_owned());
-        let source = packet_evidence_row(7, &source, false).expect("source evidence");
+        let source = packet_evidence_row(7, &source).expect("source evidence");
         assert_eq!(source.identity.evidence_id.as_str(), "packet-evidence-007");
         assert_eq!(source.summary.as_ref().unwrap().as_str().len(), 512);
         assert!(
@@ -1351,7 +969,7 @@ mod tests {
         relation.from_symbol = Some("caller".to_owned());
         relation.edge_kind = Some("CALL".to_owned());
         relation.to_symbol = Some("callee".to_owned());
-        let relation = packet_evidence_row(8, &relation, false).expect("relation evidence");
+        let relation = packet_evidence_row(8, &relation).expect("relation evidence");
         assert_eq!(
             relation.summary.as_ref().unwrap().as_str(),
             "caller -[CALL]-> callee"
@@ -1603,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_reserves_material_node_path_and_edge_carriers_before_relevance_fill() {
+    fn packet_evidence_keeps_repository_order_without_external_reranking() {
         let mut support = (0..10)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -1648,43 +1266,39 @@ mod tests {
         edge_carrier.to_symbol = Some("Router.handle".to_owned());
         support.push(edge_carrier);
 
-        let mut node_obligation = material_obligation("node-obligation");
-        node_obligation.carrier_node_ids = vec![NodeId("Flow.dispatch".to_owned())];
-        let mut path_obligation = material_obligation("path-obligation");
-        path_obligation.carrier_paths = vec!["src/material-path.rs".to_owned()];
-        let mut edge_obligation = material_obligation("edge-obligation");
-        edge_obligation.carrier_edge_proofs = vec![PacketObligationCarrierEdgeProofDto {
-            carrier_node_id: NodeId("Flow.dispatch".to_owned()),
-            edge_id: EdgeId("material-edge".to_owned()),
-            edge_kind: EdgeKind::CALL,
-        }];
-
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Explain the relevant stages.",
-            &[node_obligation, path_obligation, edge_obligation],
-        );
+        let evidence = packet_evidence_rows(&support);
 
         assert_eq!(
             evidence[0].symbol_id.as_ref().unwrap().as_str(),
-            "Flow.dispatch"
+            "relevant-stage-0"
         );
         assert_eq!(
-            evidence[1].path.as_ref().unwrap().as_str(),
-            "src/material-path.rs"
+            evidence[1].symbol_id.as_ref().unwrap().as_str(),
+            "relevant-stage-1"
         );
         assert!(
-            evidence[0]
+            evidence
+                .iter()
+                .find(|row| row
+                    .symbol_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "Flow.dispatch"))
+                .expect("repository-ordered carrier remains available")
                 .summary
                 .as_ref()
                 .unwrap()
                 .as_str()
-                .contains("this.router.handle(request)"),
-            "a material source carrier must retain more than the optional 512-byte prefix"
+                .len()
+                <= PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3,
+            "external policy must not expand a source row's byte authority"
         );
-        assert_eq!(
-            evidence[8].summary.as_ref().unwrap().as_str(),
-            "Flow.dispatch -[CALL]-> Router.handle"
+        assert!(
+            evidence
+                .iter()
+                .all(|row| row.summary.as_ref().is_none_or(|summary| {
+                    summary.as_str() != "Flow.dispatch -[CALL]-> Router.handle"
+                })),
+            "a later edge must not displace earlier repository relations"
         );
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
     }
@@ -1728,25 +1342,7 @@ mod tests {
             ));
         }
 
-        let proof = |carrier: &str, edge: &str| PacketObligationCarrierEdgeProofDto {
-            carrier_node_id: NodeId(carrier.to_owned()),
-            edge_id: EdgeId(edge.to_owned()),
-            edge_kind: EdgeKind::CALL,
-        };
-        let mut loop_obligation = material_obligation("event-loop");
-        loop_obligation.carrier_node_ids = vec![NodeId("Loop.drive".to_owned())];
-        loop_obligation.carrier_edge_proofs = (0..5)
-            .map(|index| proof("Loop.drive", &format!("loop-{index}")))
-            .collect();
-        let mut command_obligation = material_obligation("command-router");
-        command_obligation.carrier_node_ids = vec![NodeId("Command.route".to_owned())];
-        command_obligation.carrier_edge_proofs = vec![proof("Command.route", "command-route")];
-
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Trace the loop and command route.",
-            &[loop_obligation, command_obligation],
-        );
+        let evidence = packet_evidence_rows(&support);
         let summaries = evidence
             .iter()
             .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
@@ -1764,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_binds_a_material_relation_to_the_primary_exact_carrier() {
+    fn packet_evidence_keeps_repository_relations_for_retained_sources() {
         let relation = |id: &str, caller: &str, target: &str| {
             let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
             unit.id = format!("edge:{id}");
@@ -1795,29 +1391,7 @@ mod tests {
             "EventLoop.processEvents",
             "EventLoop.processTimeEvents",
         ));
-        let mut obligation = material_obligation("event-loop");
-        obligation.carrier_node_ids = vec![
-            NodeId("Runtime.main".to_owned()),
-            NodeId("EventLoop.processEvents".to_owned()),
-        ];
-        obligation.carrier_edge_proofs = vec![
-            PacketObligationCarrierEdgeProofDto {
-                carrier_node_id: NodeId("Runtime.main".to_owned()),
-                edge_id: EdgeId("main-loop".to_owned()),
-                edge_kind: EdgeKind::CALL,
-            },
-            PacketObligationCarrierEdgeProofDto {
-                carrier_node_id: NodeId("EventLoop.processEvents".to_owned()),
-                edge_id: EdgeId("iteration".to_owned()),
-                edge_kind: EdgeKind::CALL,
-            },
-        ];
-
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Trace how the process events iteration handles events and time events.",
-            &[obligation],
-        );
+        let evidence = packet_evidence_rows(&support);
         let summaries = evidence
             .iter()
             .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
@@ -1827,9 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_never_overflows_when_material_sources_fill_the_closed_envelope() {
+    fn packet_evidence_keeps_the_closed_structural_mix() {
         let mut support = Vec::new();
-        let mut obligations = Vec::new();
         for index in 0..PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
             let symbol = format!("Flow.stage{index}");
             let edge_id = format!("edge-{index}");
@@ -1846,33 +1419,28 @@ mod tests {
             relation.edge_kind = Some("CALL".to_owned());
             relation.to_symbol = Some(format!("Flow.target{index}"));
             support.push(relation);
-
-            let mut obligation = material_obligation(&format!("stage-{index}"));
-            obligation.carrier_node_ids = vec![NodeId(symbol.clone())];
-            obligation.carrier_edge_proofs = vec![PacketObligationCarrierEdgeProofDto {
-                carrier_node_id: NodeId(symbol),
-                edge_id: EdgeId(edge_id),
-                edge_kind: EdgeKind::CALL,
-            }];
-            obligations.push(obligation);
         }
 
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Trace every material stage.",
-            &obligations,
-        );
+        let evidence = packet_evidence_rows(&support);
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
-        assert!(
+        assert_eq!(
             evidence
                 .iter()
-                .all(|row| row.kind == EvidenceKindV3Dto::ExactSource),
-            "source receipts that fill the closed envelope leave no lawful room for relation rows"
+                .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
+                .count(),
+            12
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
+                .count(),
+            PACKET_PUBLIC_RELATION_ROWS_TARGET_V3
         );
     }
 
     #[test]
-    fn packet_evidence_covers_each_material_obligation_before_repeating_a_carrier() {
+    fn packet_evidence_prefers_distinct_source_paths_before_repeats() {
         let mut support = (0..24)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -1892,16 +1460,7 @@ mod tests {
         unique_stage.snippet = Some("fn run() {}".to_owned());
         support.push(unique_stage);
 
-        let mut repeated_obligation = material_obligation("repeated-flow");
-        repeated_obligation.carrier_paths = vec!["src/repeated-flow.rs".to_owned()];
-        let mut unique_obligation = material_obligation("unique-stage");
-        unique_obligation.carrier_paths = vec!["src/unique-material-stage.rs".to_owned()];
-
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Explain the dispatch route stages.",
-            &[repeated_obligation, unique_obligation],
-        );
+        let evidence = packet_evidence_rows(&support);
 
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
         assert_eq!(
@@ -1911,12 +1470,12 @@ mod tests {
                 .filter_map(|row| row.path.as_ref().map(|path| path.as_str()))
                 .collect::<HashSet<_>>(),
             HashSet::from(["src/repeated-flow.rs", "src/unique-material-stage.rs"]),
-            "a repeated high-relevance carrier must not displace another material obligation's only carrier"
+            "repeated ranges must not displace another path's source"
         );
     }
 
     #[test]
-    fn packet_evidence_chooses_the_best_carrier_for_each_native_obligation_rank() {
+    fn packet_evidence_deduplicates_relations_without_external_reranking() {
         let relation = |id: &str, caller: &str, target: &str| {
             let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
             unit.id = format!("edge:{id}");
@@ -1925,12 +1484,6 @@ mod tests {
             unit.to_symbol = Some(target.to_owned());
             unit
         };
-        let carrier = |edge_id: &str| PacketObligationCarrierEdgeProofDto {
-            carrier_node_id: NodeId("Fixture.caller".to_owned()),
-            edge_id: EdgeId(edge_id.to_owned()),
-            edge_kind: EdgeKind::CALL,
-        };
-
         let mut support = vec![
             relation("a", "zirconium_plutonium", "a_target"),
             relation("shared-o0", "unrelated_shared", "shared_target"),
@@ -1939,14 +1492,6 @@ mod tests {
             relation("shared-o1", "unrelated_shared", "shared_target"),
             relation("c", "zirconium_plutonium_manganese", "c_target"),
         ];
-        let mut obligations = Vec::new();
-        let mut obligation_zero = material_obligation("obligation-zero");
-        obligation_zero.carrier_edge_proofs = vec![carrier("a"), carrier("shared-o0")];
-        obligations.push(obligation_zero);
-        let mut obligation_one = material_obligation("obligation-one");
-        obligation_one.carrier_edge_proofs = vec![carrier("shared-o1"), carrier("c")];
-        obligations.push(obligation_one);
-
         for index in 0..14 {
             let edge_id = format!("mandatory-{index}");
             support.push(relation(
@@ -1954,16 +1499,9 @@ mod tests {
                 &format!("mandatory_caller_{index}"),
                 &format!("mandatory_target_{index}"),
             ));
-            let mut obligation = material_obligation(&format!("mandatory-{index}"));
-            obligation.carrier_edge_proofs = vec![carrier(&edge_id)];
-            obligations.push(obligation);
         }
 
-        let evidence = packet_evidence_rows_with_obligations(
-            &support,
-            "Trace zirconium plutonium manganese.",
-            &obligations,
-        );
+        let evidence = packet_evidence_rows(&support);
         let summaries = evidence
             .iter()
             .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
@@ -1972,10 +1510,7 @@ mod tests {
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
         assert!(summaries.contains("zirconium_plutonium -[CALL]-> a_target"));
         assert!(summaries.contains("zirconium_plutonium_manganese -[CALL]-> c_target"));
-        assert!(
-            !summaries.contains("unrelated_shared -[CALL]-> shared_target"),
-            "the merged shared carrier must not substitute for each obligation's better native-rank candidate"
-        );
+        assert!(summaries.contains("unrelated_shared -[CALL]-> shared_target"));
     }
 
     #[test]
@@ -2020,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_selection_is_deterministic_bounded_and_keeps_unaffected_rank_order() {
+    fn packet_evidence_selection_is_deterministic_bounded_and_ignores_question_wording() {
         let support = (0..20)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -2040,16 +1575,16 @@ mod tests {
         let first =
             packet_evidence_rows_for_request(&support, "Explain the selected route target.", &[]);
         let second =
-            packet_evidence_rows_for_request(&support, "Explain the selected route target.", &[]);
+            packet_evidence_rows_for_request(&support, "Describe unrelated components.", &[]);
 
         assert_eq!(first, second);
         assert_eq!(first.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
-        assert_eq!(first[0].path.as_ref().unwrap().as_str(), "src/source-17.rs");
-        assert_eq!(first[1].path.as_ref().unwrap().as_str(), "src/source-0.rs");
+        assert_eq!(first[0].path.as_ref().unwrap().as_str(), "src/source-0.rs");
+        assert_eq!(first[1].path.as_ref().unwrap().as_str(), "src/source-1.rs");
     }
 
     #[test]
-    fn packet_evidence_prioritizes_question_terms_inside_each_evidence_class() {
+    fn packet_evidence_does_not_prioritize_question_terms_inside_an_evidence_class() {
         let mut support = (0..10)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -2074,7 +1609,11 @@ mod tests {
             &[],
         );
 
-        assert_eq!(evidence[0].path.as_ref().unwrap().as_str(), "src/server.c");
+        assert_eq!(
+            evidence[0].path.as_ref().unwrap().as_str(),
+            "src/unrelated-0.rs",
+            "public capping must preserve the supplied evidence order rather than rerank from prompt words"
+        );
     }
 
     #[test]
@@ -2124,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_ranks_the_planned_upstream_stage_before_downstream_repeats() {
+    fn packet_evidence_does_not_rank_question_text_ahead_of_repository_evidence() {
         let mut support = (0..PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -2142,25 +1681,22 @@ mod tests {
         upstream.snippet = Some("fn register_request() { route.store(); }".to_owned());
         support.push(upstream);
 
-        let mut obligation = material_obligation("public-upstream-stage");
-        obligation.open_next_candidates = vec!["public request registration".to_owned()];
-
-        let evidence = packet_evidence_rows_with_obligations(
+        let evidence = packet_evidence_rows_for_request(
             &support,
-            "Explain the complete lifecycle.",
-            &[obligation],
+            "Explain the complete lifecycle and public request registration.",
+            &[],
         );
 
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
         assert_eq!(
             evidence[0].symbol_id.as_ref().map(|symbol| symbol.as_str()),
-            Some("PublicFacade.registerRequest"),
-            "the public envelope must spend a row on the planner's missing upstream stage before repeating downstream internals"
+            Some("Processor.handle0"),
+            "question text must not rerank the public evidence envelope"
         );
     }
 
     #[test]
-    fn packet_evidence_prioritizes_the_selected_continuation_gap() {
+    fn packet_evidence_does_not_rerank_from_continuation_diagnostic_text() {
         let mut support = (0..10)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -2191,7 +1727,15 @@ mod tests {
 
         assert_eq!(
             evidence[0].path.as_ref().unwrap().as_str(),
-            "source/attention_seekers/bounce.css"
+            "source/base-0.css"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.path.as_ref().is_some_and(|path| {
+                    path.as_str() == "source/attention_seekers/bounce.css"
+                })),
+            "the continuation target remains evidence without gaining ranking authority"
         );
     }
 
@@ -2202,7 +1746,7 @@ mod tests {
         location.path = Some("src/lib.rs".to_owned());
         location.start_line = Some(7);
 
-        let row = packet_evidence_row(0, &location, false).expect("location evidence");
+        let row = packet_evidence_row(0, &location).expect("location evidence");
         assert_eq!(row.summary.as_ref().unwrap().as_str(), "src/lib.rs:7");
     }
 

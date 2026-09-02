@@ -1,7 +1,7 @@
 use crate::config::SidecarLayout;
 use crate::lexical_index::{
-    LexicalHit, search_lexical_index_batch_with_cancel, search_lexical_index_with_cancel,
-    shard_dir_for,
+    LexicalDocumentSource, LexicalHit, search_lexical_index_batch_with_cancel,
+    search_lexical_index_descriptors_with_cancel, search_lexical_index_with_cancel, shard_dir_for,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -51,6 +51,30 @@ impl LexicalClient {
         .collect()
     }
 
+    pub fn search_descriptors_with_cancel<F>(
+        &self,
+        layout: &SidecarLayout,
+        generation: &str,
+        sidecar_input_hash: &str,
+        query: &str,
+        limit: usize,
+        cancelled: F,
+    ) -> Result<Vec<super::CandidateHit>>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        search_lexical_index_descriptors_with_cancel(
+            &shard_dir_for(&layout.lexical_data_dir, generation),
+            sidecar_input_hash,
+            query,
+            limit,
+            cancelled,
+        )?
+        .into_iter()
+        .map(lexical_hit_to_candidate)
+        .collect()
+    }
+
     pub fn search_batch_with_cancel(
         &self,
         layout: &SidecarLayout,
@@ -80,6 +104,10 @@ fn lexical_hit_to_candidate(hit: LexicalHit) -> Result<super::CandidateHit> {
         CandidateSource::Lexical,
     );
     candidate.node_id = hit.node_id;
+    if candidate.node_id.is_some() || hit.source == LexicalDocumentSource::LexicalSource {
+        candidate.source_bytes_upper_bound =
+            Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+    }
     candidate.start_line = hit.start_line;
     candidate.target = hit.target;
     candidate.source_excerpt = hit.source_excerpt;

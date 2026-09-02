@@ -16,8 +16,11 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - grounding, trails, symbol workflows, target context, search, and packet
   assembly;
 - one packet-probe normalization and resolution path for exact paths, stable
-  symbol IDs, file-scoped symbols, free queries, and generation-bound
-  continuations;
+  symbol IDs, qualified symbols, file-scoped symbols, free queries, and
+  generation-bound continuations;
+- one descriptor-only admission pass across the unchanged question and all
+  typed free queries before candidate source or graph hydration;
+- prompt-blind interim finalization of admitted and hydrated packet evidence;
 - managed retrieval preparation and user-facing gap mapping;
 - generation-coherent candidate resolution and one bounded publication retry.
 
@@ -92,8 +95,9 @@ retrieval index command publishes a matching generation.
 - keep command parsing/rendering in CLI and persistence in store;
 - extend packet/search through the existing retrieval-primary path rather than
   creating a second scoring or readiness system.
-- keep probe resolution metadata diagnostic: a requested probe may add evidence
-  work but cannot promote sufficiency or invent route order.
+- keep probe resolution metadata diagnostic: a requested probe may constrain
+  exact identity resolution but cannot promote rank, materiality, sufficiency,
+  or an answer-stage order.
 
 ## Failure signatures
 

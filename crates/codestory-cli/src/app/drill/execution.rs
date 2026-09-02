@@ -20,7 +20,7 @@ use crate::{display, drill_targeting, retrieval};
 use anyhow::{Context, Result};
 use codestory_contracts::api::{
     AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, ApiError, IndexingPhaseTimings,
-    NodeKind, PacketBudgetModeDto, SearchMatchQualityDto, StorageStatsDto,
+    NodeKind, PacketBudgetModeDto, PacketProbeDto, SearchMatchQualityDto, StorageStatsDto,
 };
 use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
 use std::collections::HashSet;
@@ -99,8 +99,11 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
         packet_request: AgentPacketRequestDto {
             question,
             budget: PacketBudgetModeDto::Standard,
-            probes: Vec::new(),
-            extra_probes: anchors.clone(),
+            probes: anchors
+                .iter()
+                .cloned()
+                .map(|query| PacketProbeDto::FreeQuery { query })
+                .collect(),
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -337,7 +340,7 @@ pub(in crate::app) fn drill_search_hit_from_packet_citation(
         duplicate_of: None,
         excerpt: None,
         primary_occurrence_kind: None,
-        symbol_role: citation.coverage_role.clone(),
+        symbol_role: None,
         paired_refs: Vec::new(),
         verification_targets,
         resolution_hints: Vec::new(),
@@ -357,10 +360,7 @@ pub(super) fn drill_packet_verification_target(
         return None;
     }
     Some(VerificationTargetOutput {
-        role: citation
-            .coverage_role
-            .clone()
-            .unwrap_or_else(|| "packet citation".to_string()),
+        role: "packet citation".to_string(),
         path: display::relative_path(project_root, citation.file_path.as_deref()?),
         line: citation.line?,
         node_ref: None,

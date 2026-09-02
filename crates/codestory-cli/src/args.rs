@@ -246,16 +246,8 @@ fn parse_packet_probe(value: &str) -> Result<PacketProbeDto, String> {
     Ok(probe)
 }
 
-fn parse_legacy_packet_probe(value: &str) -> Result<String, String> {
-    codestory_contracts::api::validate_packet_probe_request(&[], &[value.to_string()])
-        .map(|()| value.to_string())
-}
-
-pub(crate) fn validate_packet_probe_arguments(
-    probes: &[PacketProbeDto],
-    legacy_probes: &[String],
-) -> Result<(), String> {
-    codestory_contracts::api::validate_packet_probe_request(probes, legacy_probes)
+pub(crate) fn validate_packet_probe_arguments(probes: &[PacketProbeDto]) -> Result<(), String> {
+    codestory_contracts::api::validate_packet_probe_request(probes)
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -533,16 +525,9 @@ pub(crate) struct PacketCommand {
         long = "probe",
         value_name = "TAGGED_JSON",
         value_parser = parse_packet_probe,
-        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, file_symbol, free_query, continuation. Repeatable."
+        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, qualified_symbol, file_symbol, free_query, continuation. Repeatable."
     )]
     pub(crate) probes: Vec<PacketProbeDto>,
-    #[arg(
-        long = "extra-probe",
-        value_name = "QUERY",
-        value_parser = parse_legacy_packet_probe,
-        help = "Add a legacy string probe. It is normalized through the same typed resolver as --probe."
-    )]
-    pub(crate) extra_probes: Vec<String>,
     #[arg(
         long,
         value_enum,
@@ -637,13 +622,6 @@ pub(crate) struct TaskBriefCommand {
         help = "Add a typed packet probe as tagged JSON. Repeatable."
     )]
     pub(crate) probes: Vec<PacketProbeDto>,
-    #[arg(
-        long = "extra-probe",
-        value_name = "QUERY",
-        value_parser = parse_legacy_packet_probe,
-        help = "Add a legacy string probe normalized through the typed packet resolver."
-    )]
-    pub(crate) extra_probes: Vec<String>,
     #[arg(
         long,
         value_enum,
@@ -2806,7 +2784,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_cli_parses_tagged_and_legacy_probes() {
+    fn packet_cli_parses_tagged_probes() {
         let parsed = Cli::try_parse_from([
             "codestory-cli",
             "packet",
@@ -2814,8 +2792,6 @@ mod tests {
             "Explain the target",
             "--probe",
             r#"{"kind":"exact_path","path":"assets/desk.svg"}"#,
-            "--extra-probe",
-            "WorkspaceIndexer",
         ])
         .expect("packet probes should parse");
         let Command::Packet(packet) = parsed.command else {
@@ -2827,7 +2803,6 @@ mod tests {
                 path: "assets/desk.svg".into()
             }]
         );
-        assert_eq!(packet.extra_probes, ["WorkspaceIndexer"]);
     }
 
     #[test]
@@ -2856,7 +2831,7 @@ mod tests {
                 "packet",
                 "--question",
                 "Explain the target",
-                "--extra-probe",
+                "--probe",
                 &"x".repeat(codestory_contracts::api::PACKET_PROBE_MAX_TEXT_LENGTH + 1),
             ])
             .is_err()
@@ -2865,7 +2840,12 @@ mod tests {
             PacketProbeDto::FreeQuery { query: "x".into() };
             codestory_contracts::api::PACKET_PROBE_MAX_COUNT
         ];
-        assert!(validate_packet_probe_arguments(&typed, &["overflow".into()]).is_err());
+        assert!(validate_packet_probe_arguments(&typed).is_ok());
+        let overflow = vec![
+            PacketProbeDto::FreeQuery { query: "x".into() };
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT + 1
+        ];
+        assert!(validate_packet_probe_arguments(&overflow).is_err());
     }
 
     #[test]

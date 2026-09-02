@@ -854,7 +854,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
                     == Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource)
                     && hit.resolution_status
                         == Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved)
-                    && hit.eligible_for_sufficiency == Some(true)
+                    && hit.eligible_for_sufficiency.is_none()
                     && hit.score_breakdown.as_ref().is_some_and(|breakdown| {
                         breakdown.lexical > 0.0
                             && breakdown.semantic == 0.0
@@ -862,7 +862,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
                             && breakdown.provenance == ["lexical_source"]
                     })
             }),
-            "{lane} lexical lane must bind provenance before classification: {hits:#?}"
+            "{lane} lexical lane must bind provenance without asserting answer sufficiency: {hits:#?}"
         );
     }
 
@@ -896,7 +896,6 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -917,7 +916,6 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -2045,7 +2043,6 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2066,7 +2063,6 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2091,7 +2087,6 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2131,7 +2126,6 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2152,7 +2146,6 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2173,7 +2166,6 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2216,7 +2208,6 @@ fn exact_search_results_keep_repeated_display_keys() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2237,7 +2228,6 @@ fn exact_search_results_keep_repeated_display_keys() {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),

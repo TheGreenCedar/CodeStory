@@ -3864,7 +3864,6 @@ pub(crate) mod activation_tests {
             question: "how does the ready lease source anchor work".to_string(),
             budget: codestory_contracts::api::PacketBudgetModeDto::default(),
             probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: Some(30_000),
             parent_packet_id: None,
             option_ids: Vec::new(),

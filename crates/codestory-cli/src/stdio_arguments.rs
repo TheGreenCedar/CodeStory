@@ -1217,7 +1217,6 @@ mod tests {
                     "question": "how does routing work",
                     "budget": "compact",
                     "probes": [{"kind": "free_query", "query": "router"}],
-                    "extra_probes": ["router"],
                     "latency_budget_ms": 5000,
                     "parent_packet_id": "packet-1",
                     "option_ids": ["bounded_source_read:src%2Funread.rs"],
@@ -1404,7 +1403,7 @@ mod tests {
             ),
             vec!["/arguments/probes/1".to_string()]
         );
-        let probes = (0..codestory_contracts::api::PACKET_PROBE_MAX_COUNT - 1)
+        let probes = (0..=codestory_contracts::api::PACKET_PROBE_MAX_COUNT)
             .map(|index| json!({"kind": "free_query", "query": format!("probe-{index}")}))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1413,11 +1412,10 @@ mod tests {
                 json!({
                     "project": "/repo",
                     "question": "why",
-                    "probes": probes,
-                    "extra_probes": ["one", "two"]
+                    "probes": probes
                 })
             ),
-            vec!["combined_item_limit"]
+            vec!["above_max_items"]
         );
     }
 

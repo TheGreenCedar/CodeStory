@@ -1,22 +1,12 @@
-//! Verdict-visible retrieval degradation (EV-8).
+//! Typed retrieval degradation counters.
 //!
-//! Retrieval already records, per stage, whether it finished, was cut off, or declined to run.
-//! Until now none of that reached the packet verdict: a query whose dense lane ran out of budget
-//! produced a shorter ranked list and nothing else, so the packet reported the same `sufficient`
-//! it would have reported on a complete run. Losing evidence and having no evidence to find are
-//! not the same fact, and a caller acting on the answer needs them separated.
-//!
-//! This module reads the stage record and answers three questions with types:
+//! This module reads the stage record and reports three distinct conditions:
 //!
 //! * did the primary retrieval lose candidates it had planned to collect (`primary_truncated`)?
 //! * did a query's semantic stage time out and contribute nothing (`timed_out_zero_hits`)?
 //! * did a query's semantic stage decline to run at all (`abstained`)?
 //!
-//! The first caps the packet verdict at `partial`. The second demotes the *specific* query
-//! obligation that lost its lane, so the demotion lands on the evidence that is actually missing
-//! rather than on the packet as a whole. The third is counted, not blocking: an abstention on a
-//! repository with no dense anchors is correct behavior, and its rate is the reconsideration
-//! trigger recorded against the retrieval backend non-claim.
+//! These counters describe retrieval execution only. They do not assert answer sufficiency.
 
 #[cfg(test)]
 use codestory_contracts::wire::{
@@ -295,8 +285,7 @@ mod tests {
         }
     }
 
-    /// The same three states on the semantic stage, with nothing merged, are the zero-hit timeout
-    /// that demotes the owning query obligation.
+    /// The same three states on the semantic stage, with nothing merged, are a zero-hit timeout.
     #[test]
     fn every_declared_deadline_loss_state_with_no_candidates_is_a_semantic_timeout() {
         for completion_status in [
@@ -361,7 +350,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,

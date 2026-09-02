@@ -504,24 +504,6 @@ impl SchemaProperty {
         self
     }
 
-    const fn with_item_max_length(mut self, max_length: u64) -> Self {
-        self.items = match self.items {
-            Some(SchemaItems::Type {
-                schema_type,
-                min_length,
-                enum_values,
-                ..
-            }) => Some(SchemaItems::Type {
-                schema_type,
-                min_length,
-                max_length: Some(max_length),
-                enum_values,
-            }),
-            items => items,
-        };
-        self
-    }
-
     const fn with_item_enum(mut self, enum_values: &'static [&'static str]) -> Self {
         self.items = match self.items {
             Some(SchemaItems::Type {
@@ -693,16 +675,6 @@ impl SchemaObject {
         self
     }
 
-    const fn with_combined_item_limit(
-        mut self,
-        left: &'static str,
-        right: &'static str,
-        limit: u64,
-    ) -> Self {
-        self.combined_item_limit = Some((left, right, limit));
-        self
-    }
-
     fn to_json(self) -> Value {
         let properties = self
             .properties
@@ -802,9 +774,17 @@ const GROUNDING_ORIENTATION_UNCERTAINTY: &[&str] = &[
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
 const PACKET_PROBE_EXACT_PATH_KIND: &[&str] = &["exact_path"];
 const PACKET_PROBE_SYMBOL_ID_KIND: &[&str] = &["symbol_id"];
+const PACKET_PROBE_QUALIFIED_SYMBOL_KIND: &[&str] = &["qualified_symbol"];
 const PACKET_PROBE_FILE_SYMBOL_KIND: &[&str] = &["file_symbol"];
 const PACKET_PROBE_FREE_QUERY_KIND: &[&str] = &["free_query"];
 const PACKET_PROBE_CONTINUATION_KIND: &[&str] = &["continuation"];
+const PACKET_STRUCTURAL_GAP_REASONS: &[&str] = &[
+    "candidate_count_exceeded",
+    "source_budget_exceeded",
+    "source_unavailable",
+    "ambiguous_selector",
+    "disconnected_seed",
+];
 const AFFECTED_CHANGE_KINDS: &[&str] = &[
     "added",
     "modified",
@@ -2191,6 +2171,18 @@ static PACKET_SYMBOL_ID_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     &["kind", "id"],
 );
 
+static PACKET_QUALIFIED_SYMBOL_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Exact qualified-symbol probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_QUALIFIED_SYMBOL_KIND),
+        SchemaProperty::string_required("symbol", "Qualified symbol name.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "symbol"],
+);
+
 static PACKET_FILE_SYMBOL_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Exact file-scoped symbol probe.",
     &[
@@ -2218,6 +2210,24 @@ static PACKET_FREE_QUERY_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     &["kind", "query"],
 );
 
+static PACKET_CONTINUATION_SELECTOR_SCHEMA: SchemaObject = SchemaObject::object(
+    "Stable path or symbol selector plus the exact structural reason it remains uncovered.",
+    &[
+        SchemaProperty::string_required("stable_identity", "Stable packet identity.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string("path", "Optional exact project-relative path.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string("symbol_id", "Optional exact stable symbol id.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string_required("reason", "Typed uncovered structural reason.")
+            .with_enum(PACKET_STRUCTURAL_GAP_REASONS),
+    ],
+    &["stable_identity", "reason"],
+);
+
 static PACKET_CONTINUATION_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Project- and generation-bound continuation probe.",
     &[
@@ -2241,26 +2251,22 @@ static PACKET_CONTINUATION_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
         .with_min_length(1)
         .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
         .nullable(),
-        SchemaProperty::string("symbol_id", "Optional exact continuation symbol id.")
-            .with_min_length(1)
-            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
-            .nullable(),
-        SchemaProperty::string_required("query", "Continuation display query.")
-            .with_min_length(1)
-            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::object("selector", "Stable typed continuation selector.")
+            .with_object_schema(&PACKET_CONTINUATION_SELECTOR_SCHEMA),
     ],
     &[
         "kind",
         "contract_version",
         "project_id",
         "core_generation_id",
-        "query",
+        "selector",
     ],
 );
 
 static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
     &PACKET_EXACT_PATH_PROBE_SCHEMA,
     &PACKET_SYMBOL_ID_PROBE_SCHEMA,
+    &PACKET_QUALIFIED_SYMBOL_PROBE_SCHEMA,
     &PACKET_FILE_SYMBOL_PROBE_SCHEMA,
     &PACKET_FREE_QUERY_PROBE_SCHEMA,
     &PACKET_CONTINUATION_PROBE_SCHEMA,
@@ -2279,17 +2285,10 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_default(ValueLiteral::String("standard")),
         SchemaProperty::tagged_union_array(
             "probes",
-            "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
             PACKET_PROBE_SCHEMAS,
         )
         .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64),
-        SchemaProperty::string_array(
-            "extra_probes",
-            "Legacy string probes normalized through the same typed runtime resolver.",
-        )
-        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64)
-        .with_item_min_length(1)
-        .with_item_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
         SchemaProperty::integer(
             "latency_budget_ms",
             "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2316,8 +2315,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         ),
     ],
     &["question"],
-)
-.with_combined_item_limit("probes", "extra_probes", PACKET_PROBE_MAX_COUNT as u64);
+);
 
 static STATUS_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
@@ -2739,10 +2737,11 @@ mod tests {
     #[test]
     fn packet_probe_schema_is_a_strict_bounded_tagged_union() {
         let schema = packet_probe_schema();
-        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(5));
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(6));
         for valid in [
             json!({"kind": "exact_path", "path": "assets/desk.svg"}),
             json!({"kind": "symbol_id", "id": "42"}),
+            json!({"kind": "qualified_symbol", "symbol": "crate::runtime::run"}),
             json!({"kind": "file_symbol", "path": "src/lib.rs", "symbol": "run"}),
             json!({"kind": "free_query", "query": "runtime path"}),
             json!({
@@ -2750,7 +2749,11 @@ mod tests {
                 "contract_version": 1,
                 "project_id": "project",
                 "core_generation_id": "core",
-                "query": "run"
+                "selector": {
+                    "stable_identity": "node:42",
+                    "symbol_id": "42",
+                    "reason": "disconnected_seed"
+                }
             }),
         ] {
             assert!(tagged_union_accepts(&schema, &valid), "{valid}");
@@ -2776,8 +2779,8 @@ mod tests {
             .find(|tool| tool["name"] == "packet")
             .expect("packet tool");
         assert_eq!(
-            packet["inputSchema"]["allOf"].as_array().map(Vec::len),
-            Some(PACKET_PROBE_MAX_COUNT)
+            packet["inputSchema"]["properties"]["probes"]["maxItems"].as_u64(),
+            Some(PACKET_PROBE_MAX_COUNT as u64)
         );
     }
 

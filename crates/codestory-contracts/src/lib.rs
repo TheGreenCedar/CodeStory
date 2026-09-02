@@ -13,6 +13,7 @@
 pub mod api;
 pub mod bounded_locks;
 pub mod call_path;
+pub mod call_path_public;
 pub mod compilation;
 pub mod config_registry;
 pub mod core_publication;

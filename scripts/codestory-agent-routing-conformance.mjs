@@ -3062,21 +3062,23 @@ async function readJson(path, label) {
 function validateRoutingGuidance(text, label) {
   const requirements = [
     [/discovery leads?.*`search`/isu, "search discovery authority"],
-    [/successful search.*stop.*(?:do not|never).*source/isu, "successful-search stop boundary"],
-    [/successful search.*stop.*unless.*exact selection/isu, "preselected-target search exception"],
+    [/discovery leads?.*select.*unambiguous.*identity.*(?:`context`|`snippet`).*relation/isu, "identity-bound adaptive search follow-up"],
+    [/preserve ambiguity.*instead of guessing/isu, "ambiguous-search boundary"],
     [/symbol_id.*context.*(?:`id`|\.id)/isu, "stable context identity mapping"],
     [/selected target.*`context`/isu, "selected-target context authority"],
     [/supplied symbol name.*search\.query.*unchanged/isu, "exact search query preservation"],
-    [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
+    [/broad.*`packet`.*continuation.*once.*exact navigation/isu, "bounded packet and exact-navigation routing"],
     [/host-supplied.*`verify_indexed_direct_calls`/isu, "host-supplied proof routing"],
     [/semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu, "semantic proof error boundary"],
     [/exact proof from English.*no complete\s+`call-path\/v1` document.*stop.*do not\s+call a\s+repository tool/isu, "free-English proof refusal"],
     [/`unknown`.*not absence/isu, "unknown boundary"],
     [/runtime execution/iu, "runtime-execution boundary"],
-    [/typed `Unavailable`.*terminal/isu, "typed-unavailable terminal boundary"],
+    [/`unavailable`.*not negative proof/isu, "unavailable proof boundary"],
     [/diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu, "diagnostics availability boundary"],
     [/transport.*tool absence.*source/isu, "transport-unavailable source fallback"],
-    [/requested material stage.*direct subject-verb claim.*before.*gap/isu, "supported material-stage claim boundary"],
+    [/claims? no broader than.*source or typed relation/isu, "source-and-relation claim boundary"],
+    [/gap.*does\s+not erase supported evidence.*missing edge.*does\s+not prove absence/isu, "positive-evidence and missing-edge boundary"],
+    [/follow-up.*returned stable identity or exact path.*stop.*cannot change/isu, "bounded adaptive investigation"],
   ];
   for (const [pattern, requirement] of requirements) {
     if (!pattern.test(text)) fail(`${label} is missing ${requirement}`);
@@ -3159,8 +3161,8 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     fail("canonical context guidance is missing the returned-identity disambiguation contract");
   }
   if (!/continuation\.gap_ids.*map.*gap_id/isu.test(packetReferenceText)
-      || !/fallback-only.*initial.*probe/isu.test(packetReferenceText)) {
-    fail("canonical packet guidance is missing exact continuation and fallback-only argument rules");
+      || !/exact probe only.*user.*repository evidence/isu.test(packetReferenceText)) {
+    fail("canonical packet guidance is missing exact continuation and evidence-bound probe rules");
   }
   if (!/read and follow the loaded codestory-grounding skill/isu.test(openAiMetadataText)
       || !/sole source of truth/isu.test(openAiMetadataText)

@@ -262,12 +262,12 @@ pub(super) fn ensure_incremental_refresh_compatible(
     Ok(())
 }
 
-/// Whole-database copies one incremental publication performs.
+/// Foreground whole-database copies one immutable-generation publication avoids.
 ///
-/// `SnapshotStore::clone_live_to_staged` copies the published core into the
-/// staged image, promotion copies the previous live image into the rollback
-/// backup, and promotion restores the staged image over live. Skipping the
-/// staged pipeline avoids all three.
+/// The staged image is a copy-on-write clone, the previous immutable generation
+/// already is the rollback image, and publication installs the candidate by
+/// rename before replacing the pointer. There is no foreground backup or
+/// staged-to-live whole-file copy to count.
 pub(super) const INCREMENTAL_PUBLICATION_DATABASE_COPIES: u32 = 0;
 
 /// Read-only verdict on whether an incremental refresh has any work to do.
@@ -989,16 +989,28 @@ fn prepare_incremental_refresh(
                 "Failed to read staged publication identity: {error}"
             ))
         })?;
-    let rebuild_complete_dense_anchor_set = preparation
-        .staged_mut()
-        .store_mut()
-        .get_dense_anchor_publication_manifest()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to read staged dense anchor publication identity: {error}"
-            ))
-        })?
-        .is_none();
+    // A manifest row by itself does not make the inherited semantic projection
+    // reusable. A non-empty source plan returns from the read-only probe before
+    // its derived-state checks, so adjudicate the staged copy against the same
+    // complete contract here. Any missing, stale, mixed-policy, or unreadable
+    // projection is rebuilt as one set instead of carrying invalid rows into a
+    // newly published generation.
+    let rebuild_complete_dense_anchor_set = {
+        let staged_store = preparation.staged_mut().store_mut();
+        let dense_projection_stale = previous_publication.as_ref().is_none_or(|previous| {
+            staged_store
+                .validate_dense_anchor_publication(previous)
+                .map(|manifest| manifest.policy_version != SEMANTIC_POLICY_VERSION)
+                .unwrap_or(true)
+        });
+        let symbol_projection_stale = staged_store
+            .has_symbol_search_doc_contract_mismatch(
+                LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                SEMANTIC_POLICY_VERSION,
+            )
+            .unwrap_or(true);
+        dense_projection_stale || symbol_projection_stale
+    };
     let publication = next_index_publication(
         previous_publication.as_ref(),
         IndexPublicationMode::Incremental,

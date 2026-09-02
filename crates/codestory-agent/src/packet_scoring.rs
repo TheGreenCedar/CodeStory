@@ -116,19 +116,6 @@ pub fn packet_citation_rank(
     if packet_display_name_is_import_literal(&display) {
         score -= 30.0;
     }
-    let concrete_module_file =
-        packet_concrete_module_file_citation(citation.kind, &normalized_display, &path);
-    let facade_module_file =
-        packet_facade_module_citation(citation.kind, &normalized_display, &path);
-    if concrete_module_file {
-        score += 2.0;
-    }
-    if facade_module_file {
-        score -= 3.0;
-    }
-    if citation.kind == NodeKind::MODULE && !concrete_module_file && !facade_module_file {
-        score -= 12.0;
-    }
     if path.contains("/sandbox/")
         || path.starts_with("sandbox/")
         || path.contains("/examples/")
@@ -228,36 +215,6 @@ fn packet_source_set_segment_kind(segment: &str) -> Option<PacketSourceSetKind> 
         return Some(PacketSourceSetKind::Platform);
     }
     None
-}
-
-fn packet_facade_module_citation(kind: NodeKind, normalized_display: &str, path: &str) -> bool {
-    if kind != NodeKind::MODULE {
-        return false;
-    }
-    let file_name = path.rsplit('/').next().unwrap_or(path);
-    if file_name != "lib.rs" && file_name != "mod.rs" {
-        return false;
-    }
-    !matches!(normalized_display, "" | "lib" | "mod" | "main")
-}
-
-fn packet_concrete_module_file_citation(
-    kind: NodeKind,
-    normalized_display: &str,
-    path: &str,
-) -> bool {
-    if kind != NodeKind::MODULE || normalized_display.is_empty() {
-        return false;
-    }
-    let file_name = path.rsplit('/').next().unwrap_or(path);
-    if matches!(file_name, "lib.rs" | "mod.rs" | "main.rs") {
-        return false;
-    }
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name);
-    normalize_identifier(stem) == normalized_display
 }
 
 /// Rank citations for role-backed claim carry: prefer primary-source flow evidence over tests.
@@ -462,36 +419,15 @@ pub fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
         .any(|term| term.eq_ignore_ascii_case(needle) || normalize_identifier(term) == needle)
 }
 
-pub fn packet_file_stem_matches_query(query: &str, path: Option<&str>) -> bool {
+pub fn packet_path_matches_query(query: &str, path: Option<&str>) -> bool {
     let Some(path) = path else {
         return false;
     };
-    // Basename-stem identity is deleted. Only an explicit path-shaped query may
-    // match a file name; a bare symbol must not match `router.rs`.
-    if !query.contains(['/', '\\']) {
+    let query_path = packet_display_path(query.trim().trim_start_matches("./"));
+    if query_path.is_empty() {
         return false;
     }
-    let query_path = query.replace('\\', "/");
-    let query_file_name = query_path.rsplit('/').next().unwrap_or(query).trim();
-    let query_stem = query_file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(query_file_name);
-    let normalized_query = normalize_identifier(query_stem);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    let normalized_path = path.replace('\\', "/");
-    let file_name = normalized_path
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim();
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name);
-    normalize_identifier(stem) == normalized_query
+    packet_display_path(path) == query_path
 }
 
 pub fn packet_display_path(path: &str) -> String {

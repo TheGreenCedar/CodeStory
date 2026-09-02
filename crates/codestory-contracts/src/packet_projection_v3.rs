@@ -17,6 +17,7 @@ pub const SUMMARY_MAX_BYTES_V3: usize = 8_192;
 pub const MESSAGE_MAX_BYTES_V3: usize = 4_096;
 pub const EXCERPT_MAX_BYTES_V3: usize = 8_192;
 pub const DIAGNOSTIC_CODE_MAX_BYTES_V3: usize = 128;
+pub const PACKET_EVIDENCE_ROWS_MAX_V3: usize = 16;
 pub const EVIDENCE_ROWS_MAX_V3: usize = 256;
 pub const GAP_ROWS_MAX_V3: usize = 256;
 pub const REFERENCE_ROWS_MAX_V3: usize = 256;
@@ -348,7 +349,7 @@ pub enum PacketProjectionV3Dto {
         publication: PublicationIdentityV3Dto,
         status: EvidenceAvailabilityV3Dto,
         retrieval: RetrievalStateDescriptorV3Dto,
-        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, EVIDENCE_ROWS_MAX_V3>,
+        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, PACKET_EVIDENCE_ROWS_MAX_V3>,
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         continuation: Option<ContinuationStateV3Dto>,
         diagnostics: DiagnosticsCapabilityV3Dto,

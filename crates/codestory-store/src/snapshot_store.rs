@@ -495,7 +495,8 @@ mod tests {
 
     fn named_promotion_ms(stats: &CorePromotionStats) -> u32 {
         stats
-            .lock_recovery_ms
+            .lock_wait_ms
+            .saturating_add(stats.lock_recovery_ms)
             .saturating_add(stats.candidate_validation_ms)
             .saturating_add(stats.previous_validation_ms)
             .saturating_add(stats.rollback_backup_copy_ms.unwrap_or_default())

@@ -33,6 +33,35 @@ thread_local! {
     static CORE_CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static CORE_POINTER_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_core_pointer_sync_failure<T>(
+    destination: &Path,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORE_POINTER_SYNC_FAILURE.with(|value| {
+                value.replace(self.0.take());
+            });
+        }
+    }
+
+    CORE_POINTER_SYNC_FAILURE.with(|value| {
+        let restore = Restore(value.replace(Some(destination.to_path_buf())));
+        let result = action();
+        drop(restore);
+        result
+    })
+}
+
 /// Force core CoW clones to report unavailable for the duration of `action`.
 ///
 /// Production stays fail-closed without CoW. Tests normally get a test-only
@@ -70,6 +99,31 @@ pub fn is_core_copy_on_write_unavailable(error: &StorageError) -> bool {
 
 const MAX_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_GENERATION_ID_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorePublicationDurabilityV1 {
+    Confirmed,
+    Unconfirmed(CorePublicationDurabilityReasonV1),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorePublicationDurabilityReasonV1 {
+    PointerDirectorySyncFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorePublicationCommitV1 {
+    pub pointer: CorePublicationPointerV1,
+    pub durability: CorePublicationDurabilityV1,
+}
+
+impl std::ops::Deref for CorePublicationCommitV1 {
+    type Target = CorePublicationPointerV1;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pointer
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorePublicationLayout {
@@ -187,7 +241,7 @@ impl CorePublicationLayout {
         &self,
         active: CoreGenerationIdentityV1,
         rollback: Option<CoreGenerationIdentityV1>,
-    ) -> Result<CorePublicationPointerV1, StorageError> {
+    ) -> Result<CorePublicationCommitV1, StorageError> {
         validate_generation_identity(&active)?;
         if let Some(rollback) = rollback.as_ref() {
             validate_generation_identity(rollback)?;
@@ -210,8 +264,11 @@ impl CorePublicationLayout {
             receipt_digest: String::new(),
         };
         pointer.receipt_digest = pointer_receipt_digest(&pointer)?;
-        write_pointer_atomic(&self.publication_path(), &pointer)?;
-        Ok(pointer)
+        let durability = write_pointer_atomic(&self.publication_path(), &pointer)?;
+        Ok(CorePublicationCommitV1 {
+            pointer,
+            durability,
+        })
     }
 
     pub(crate) fn install_staging_generation(
@@ -323,7 +380,7 @@ pub fn core_database_exists(storage_path: &Path) -> Result<bool, StorageError> {
 pub(crate) fn publish_rehydrated_generation(
     candidate_database: &Path,
     target_storage_path: &Path,
-) -> Result<CorePublicationPointerV1, StorageError> {
+) -> Result<CorePublicationCommitV1, StorageError> {
     let layout = CorePublicationLayout::from_storage_path(target_storage_path)?;
     if layout.read_pointer()?.is_some() {
         return Err(core_publication_error(format!(
@@ -697,7 +754,7 @@ fn require_regular_generation_file(path: &Path) -> Result<(), StorageError> {
 fn write_pointer_atomic(
     destination: &Path,
     pointer: &CorePublicationPointerV1,
-) -> Result<(), StorageError> {
+) -> Result<CorePublicationDurabilityV1, StorageError> {
     let parent = destination.parent().ok_or_else(|| {
         core_publication_error(format!(
             "Core publication pointer has no parent: {}",
@@ -718,7 +775,7 @@ fn write_pointer_atomic(
         .write(true)
         .open(&temporary)
         .map_err(|error| core_path_error("create pointer candidate", &temporary, error))?;
-    let result = (|| {
+    let before_replacement = (|| {
         file.write_all(&bytes)
             .map_err(|error| core_path_error("write pointer candidate", &temporary, error))?;
         file.sync_all()
@@ -726,15 +783,28 @@ fn write_pointer_atomic(
         drop(file);
         #[cfg(test)]
         abort_after_publication_point("pointer_write")?;
-        replace_file_atomic(&temporary, destination)?;
-        #[cfg(test)]
-        abort_after_publication_point("pointer_replacement")?;
-        sync_parent(destination)
+        replace_file_atomic(&temporary, destination)
     })();
-    if result.is_err() {
+    if let Err(error) = before_replacement {
         let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
-    result
+    #[cfg(test)]
+    abort_after_publication_point("pointer_replacement")?;
+
+    #[cfg(test)]
+    if CORE_POINTER_SYNC_FAILURE.with(|value| value.borrow().as_deref() == Some(destination)) {
+        return Ok(CorePublicationDurabilityV1::Unconfirmed(
+            CorePublicationDurabilityReasonV1::PointerDirectorySyncFailed,
+        ));
+    }
+
+    match sync_parent(destination) {
+        Ok(()) => Ok(CorePublicationDurabilityV1::Confirmed),
+        Err(_) => Ok(CorePublicationDurabilityV1::Unconfirmed(
+            CorePublicationDurabilityReasonV1::PointerDirectorySyncFailed,
+        )),
+    }
 }
 
 pub(crate) fn sync_staging_database(path: &Path) -> Result<(), StorageError> {
@@ -888,7 +958,7 @@ mod tests {
             .publish_pointer(second.clone(), Some(first.clone()))
             .expect("publish pointer");
 
-        assert_eq!(layout.read_pointer().expect("read"), Some(pointer));
+        assert_eq!(layout.read_pointer().expect("read"), Some(pointer.pointer));
         assert_eq!(
             layout.resolve_active_database().expect("resolve"),
             Some(

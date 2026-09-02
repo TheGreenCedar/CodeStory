@@ -75,9 +75,8 @@ function focusedAbbaTiming(rawRow, dimensions) {
   if (!raw) throw new Error("focused ABBA row has no installed agent timing");
   const timingCohortId = installedAgentTimingCohortId(dimensions);
   const prelude = rawRow.codestory_harness_prelude;
-  const baselineMs = rawRow.baseline_harness_prelude?.wall_ms ?? 0;
   const agentRunnerMs = Number.isFinite(rawRow.agent_runner_wall_ms)
-    ? rawRow.agent_runner_wall_ms + baselineMs
+    ? rawRow.agent_runner_wall_ms
     : raw.agent_runner_ms;
   const timeToFirstPacketMs = Number.isFinite(prelude?.time_to_first_packet_ms)
     ? prelude.time_to_first_packet_ms

@@ -10,7 +10,8 @@ use codestory_contracts::validation_receipts::{
 use codestory_store::FileRole;
 use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -574,6 +575,12 @@ pub struct LexicalHit {
     pub target: Option<SearchTargetDto>,
     pub source_excerpt: Option<String>,
     pub score: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalHitPayload {
+    Full,
+    DescriptorOnly,
 }
 
 pub(crate) struct LexicalSourceInput {
@@ -1662,9 +1669,35 @@ where
         query,
         limit,
         Arc::clone(&cancelled),
+        LexicalHitPayload::Full,
     );
     if result.is_err() && cancelled() {
         bail!("lexical search cancelled");
+    }
+    result
+}
+
+pub(crate) fn search_lexical_index_descriptors_with_cancel<F>(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    query: &str,
+    limit: usize,
+    cancelled: F,
+) -> Result<Vec<LexicalHit>>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(cancelled);
+    let result = search_lexical_index_with_cancel_inner(
+        shard_dir,
+        expected_sidecar_input_hash,
+        query,
+        limit,
+        Arc::clone(&cancelled),
+        LexicalHitPayload::DescriptorOnly,
+    );
+    if result.is_err() && cancelled() {
+        bail!("lexical descriptor search cancelled");
     }
     result
 }
@@ -1675,6 +1708,7 @@ fn search_lexical_index_with_cancel_inner(
     query: &str,
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1690,7 +1724,14 @@ fn search_lexical_index_with_cancel_inner(
         Some(project_id),
         Some(expected_sidecar_input_hash),
     )? {
-        return search_lexical_component_set(shard_dir, &component_set, query, limit, cancelled);
+        return search_lexical_component_set(
+            shard_dir,
+            &component_set,
+            query,
+            limit,
+            cancelled,
+            payload,
+        );
     }
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
     let connection = open_read_only(&index_path)?;
@@ -1716,6 +1757,7 @@ fn search_lexical_index_with_cancel_inner(
         document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
+        payload,
     )
 }
 
@@ -1748,6 +1790,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                     query,
                     *limit,
                     Arc::clone(&cancelled),
+                    LexicalHitPayload::Full,
                 )
             })
             .collect();
@@ -1780,6 +1823,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                 document_count,
                 &mut token_frequencies,
                 cancelled.as_ref(),
+                LexicalHitPayload::Full,
             )
         })
         .collect()
@@ -1791,6 +1835,7 @@ fn search_lexical_component_set(
     query: &str,
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1815,6 +1860,7 @@ fn search_lexical_component_set(
         component_limit,
         logical_count,
         Arc::clone(&cancelled),
+        payload,
     )?;
     let mut hits = Vec::new();
     for hit in base_hits {
@@ -1831,6 +1877,7 @@ fn search_lexical_component_set(
             component_limit,
             logical_count,
             Arc::clone(&cancelled),
+            payload,
         )?;
         for hit in delta_hits {
             let key = lexical_hit_document_key(&hit)?;
@@ -1864,6 +1911,7 @@ fn search_lexical_component(
     limit: usize,
     logical_document_count: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     validate_component_descriptor_at(shard_dir, descriptor)?;
     let path = shard_dir.join(&descriptor.file_name);
@@ -1881,6 +1929,7 @@ fn search_lexical_component(
         logical_document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
+        payload,
     )
 }
 
@@ -1919,6 +1968,7 @@ fn search_lexical_index_on_connection(
     document_count: usize,
     frequency_cache: &mut HashMap<String, usize>,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1969,24 +2019,27 @@ fn search_lexical_index_on_connection(
     // the documented two-of-three or forty-percent admission contracts.
     let required_match_count = required_lexical_match_count(tokens.len());
 
-    let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
+    let exact_candidates = query_exact_candidates(connection, query, candidate_limit, payload)?;
     let path_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
+        payload,
     )?;
     let content_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Content,
+        payload,
     )?;
     let mut symbol_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::SymbolDocument,
+        payload,
     )?;
     rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
 
@@ -2012,16 +2065,17 @@ fn search_lexical_index_on_connection(
         content_candidates,
         symbol_candidates,
     ]));
+    if payload == LexicalHitPayload::DescriptorOnly {
+        populate_descriptor_token_matches(connection, &mut candidates, &tokens)?;
+    }
 
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
-    for (index, (document, normalized_path, normalized_content)) in
-        candidates.into_iter().enumerate()
-    {
+    for (index, candidate) in candidates.into_iter().enumerate() {
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        let identity = lexical_candidate_identity(&document);
+        let identity = lexical_candidate_identity(&candidate.document);
         let sublane_ranks = best_sublane_ranks
             .get(&identity)
             .copied()
@@ -2036,30 +2090,36 @@ fn search_lexical_index_on_connection(
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
-            &normalized_path,
-            &normalized_content,
+            &candidate.normalized_path,
+            &candidate.normalized_content,
         );
         if token_match.matched_count >= required_match_count
-            && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
+            && mandatory_tokens_match(
+                &mandatory_tokens,
+                &candidate.normalized_path,
+                &candidate.normalized_content,
+            )
         {
-            let (target, matched_line, source_excerpt) =
-                if document.source == LexicalDocumentSource::LexicalSource {
-                    lexical_source_target(
-                        &document.path,
-                        &document.content,
-                        &tokens,
-                        token_match.content_weight > 0.0,
-                    )
-                } else {
-                    (None, None, None)
-                };
+            let (target, matched_line, source_excerpt) = if candidate.document.source
+                == LexicalDocumentSource::LexicalSource
+                && payload == LexicalHitPayload::Full
+            {
+                lexical_source_target(
+                    &candidate.document.path,
+                    &candidate.document.content,
+                    &tokens,
+                    token_match.content_weight > 0.0,
+                )
+            } else {
+                (None, None, None)
+            };
             hits.push(LexicalHit {
                 score: lexical_sublane_score(sublane_ranks, query_shape),
-                path: document.path,
-                source: document.source,
-                node_id: document.node_id,
-                symbol_name: document.symbol_name,
-                start_line: document.start_line.or(matched_line),
+                path: candidate.document.path,
+                source: candidate.document.source,
+                node_id: candidate.document.node_id,
+                symbol_name: candidate.document.symbol_name,
+                start_line: candidate.document.start_line.or(matched_line),
                 target,
                 source_excerpt,
             });
@@ -2098,13 +2158,20 @@ enum LexicalCandidateOrder {
     SymbolDocument,
 }
 
-type LexicalCandidate = (LexicalDocument, String, String);
+#[derive(Debug, Clone)]
+struct LexicalCandidate {
+    row_id: i64,
+    document: LexicalDocument,
+    normalized_path: String,
+    normalized_content: String,
+}
 
 fn query_fts_candidates(
     connection: &Connection,
     fts_query: &str,
     candidate_limit: usize,
     order: LexicalCandidateOrder,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalCandidate>> {
     let scoped_query = match order {
         LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
@@ -2112,9 +2179,9 @@ fn query_fts_candidates(
             format!("content : ({fts_query})")
         }
     };
-    let sql = match order {
-        LexicalCandidateOrder::Path => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+    let sql = match (order, payload) {
+        (LexicalCandidateOrder::Path, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2122,8 +2189,8 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
         }
-        LexicalCandidateOrder::Content => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+        (LexicalCandidateOrder::Content, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2131,8 +2198,35 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
         }
-        LexicalCandidateOrder::SymbolDocument => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+        (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::Path, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::Content, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2144,20 +2238,25 @@ fn query_fts_candidates(
     let mut statement = connection.prepare_cached(sql)?;
     let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
-            path: row.get(0)?,
-            content: row.get(1)?,
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
+            path: row.get(1)?,
+            content: row.get(2)?,
+            source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    4,
+                    5,
                     rusqlite::types::Type::Text,
                     error.into(),
                 )
             })?,
-            node_id: row.get(5)?,
-            symbol_name: row.get(6)?,
-            start_line: row.get(7)?,
+            node_id: row.get(6)?,
+            symbol_name: row.get(7)?,
+            start_line: row.get(8)?,
         };
-        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        Ok(LexicalCandidate {
+            row_id: row.get(0)?,
+            document,
+            normalized_path: row.get(3)?,
+            normalized_content: row.get(4)?,
+        })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -2167,6 +2266,7 @@ fn query_exact_candidates(
     connection: &Connection,
     query: &str,
     candidate_limit: usize,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalCandidate>> {
     let mut needles = quoted_query_tokens(query);
     let intent = crate::query_features::classify_query(query).intent;
@@ -2181,8 +2281,9 @@ fn query_exact_candidates(
     needles.dedup();
 
     let mut candidates = Vec::new();
-    let mut statement = connection.prepare_cached(
-        "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+    let sql = match payload {
+        LexicalHitPayload::Full => {
+            "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
@@ -2191,27 +2292,46 @@ fn query_exact_candidates(
             OR lower(d.symbol_name) LIKE '%::' || ?1
             OR lower(d.symbol_name) LIKE '%.' || ?1
          ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+        }
+        LexicalHitPayload::DescriptorOnly => {
+            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
+                d.source, d.node_id, d.symbol_name, d.start_line
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare_cached(sql)?;
     for needle in needles {
         let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
             let document = LexicalDocument {
-                path: row.get(0)?,
-                content: row.get(1)?,
-                source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(
+                path: row.get(1)?,
+                content: row.get(2)?,
+                source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(
                     |error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            4,
+                            5,
                             rusqlite::types::Type::Text,
                             error.into(),
                         )
                     },
                 )?,
-                node_id: row.get(5)?,
-                symbol_name: row.get(6)?,
-                start_line: row.get(7)?,
+                node_id: row.get(6)?,
+                symbol_name: row.get(7)?,
+                start_line: row.get(8)?,
             };
-            Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            Ok(LexicalCandidate {
+                row_id: row.get(0)?,
+                document,
+                normalized_path: row.get(3)?,
+                normalized_content: row.get(4)?,
+            })
         })?;
         candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
         if candidates.len() >= candidate_limit {
@@ -2220,6 +2340,53 @@ fn query_exact_candidates(
     }
     candidates.truncate(candidate_limit);
     Ok(candidates)
+}
+
+/// Derive descriptor coverage from FTS row membership only. The packet path
+/// must rank candidates before admission without selecting either stored copy
+/// of the source body (`lexical_documents.content` or `lexical_fts.content`).
+fn populate_descriptor_token_matches(
+    connection: &Connection,
+    candidates: &mut [LexicalCandidate],
+    tokens: &[String],
+) -> Result<()> {
+    const ROW_ID_CHUNK: usize = 500;
+
+    let mut row_ids = candidates
+        .iter()
+        .map(|candidate| candidate.row_id)
+        .collect::<Vec<_>>();
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    let mut matches = HashMap::<i64, Vec<&str>>::new();
+    for token in tokens {
+        let token_query = format!("\"{}\"*", token.replace('"', "\"\""));
+        for chunk in row_ids.chunks(ROW_ID_CHUNK) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT rowid FROM lexical_fts
+                 WHERE lexical_fts MATCH ?1 AND rowid IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(SqlValue::Text(token_query.clone()));
+            values.extend(chunk.iter().copied().map(SqlValue::Integer));
+            let mut statement = connection.prepare_cached(&sql)?;
+            let rows = statement.query_map(params_from_iter(values), |row| row.get::<_, i64>(0))?;
+            for row_id in rows {
+                matches.entry(row_id?).or_default().push(token);
+            }
+        }
+    }
+    for candidate in candidates {
+        candidate.normalized_content = matches
+            .remove(&candidate.row_id)
+            .unwrap_or_default()
+            .join(" ");
+    }
+    Ok(())
 }
 
 fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
@@ -2275,10 +2442,10 @@ fn record_lexical_sublane_ranks(
     candidates: &[LexicalCandidate],
     lane: LexicalSublane,
 ) {
-    for (index, (document, _, _)) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate() {
         let candidate_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
         ranks
-            .entry(lexical_candidate_identity(document))
+            .entry(lexical_candidate_identity(&candidate.document))
             .or_default()
             .record(lane, candidate_rank);
     }
@@ -2292,15 +2459,19 @@ fn rank_symbol_candidates_by_identifier_overlap(
     let original_order = candidates
         .iter()
         .enumerate()
-        .map(|(index, (document, _, _))| (lexical_candidate_identity(document), index))
+        .map(|(index, candidate)| (lexical_candidate_identity(&candidate.document), index))
         .collect::<HashMap<_, _>>();
     candidates.sort_by(|left, right| {
-        symbol_identifier_overlap(&right.0, tokens, token_weights)
-            .partial_cmp(&symbol_identifier_overlap(&left.0, tokens, token_weights))
+        symbol_identifier_overlap(&right.document, tokens, token_weights)
+            .partial_cmp(&symbol_identifier_overlap(
+                &left.document,
+                tokens,
+                token_weights,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                original_order[&lexical_candidate_identity(&left.0)]
-                    .cmp(&original_order[&lexical_candidate_identity(&right.0)])
+                original_order[&lexical_candidate_identity(&left.document)]
+                    .cmp(&original_order[&lexical_candidate_identity(&right.document)])
             })
     });
 }
@@ -4550,12 +4721,71 @@ mod tests {
                 end_byte: 7,
             })
         );
+        let descriptor_hits =
+            search_lexical_index_descriptors_with_cancel(&shard_a, "input-a", "handler", 1, || {
+                false
+            })
+            .expect("descriptor search");
+        assert_eq!(descriptor_hits[0].path, "src/z_strong_handler.rs");
+        assert_eq!(descriptor_hits[0].source_excerpt, None);
+        assert_eq!(descriptor_hits[0].target, None);
         assert!(
             search_lexical_index(&shard_a, "input-a", "project_b_handler", 8)
                 .expect("isolated search")
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn descriptor_search_never_materializes_the_stored_source_body() {
+        let connection = Connection::open_in_memory().expect("in-memory lexical database");
+        connection
+            .execute_batch(
+                "CREATE TABLE lexical_documents (
+                     id INTEGER PRIMARY KEY,
+                     path TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     node_id TEXT,
+                     symbol_name TEXT,
+                     start_line INTEGER
+                 );
+                 CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);
+                 INSERT INTO lexical_documents
+                     (id, path, content, source, node_id, symbol_name, start_line)
+                 VALUES (1, 'src/needle.rs', X'80', 'lexical_source', '7', 'needle', 1);
+                 INSERT INTO lexical_fts(rowid, path, content)
+                 VALUES (1, 'src/needle.rs', 'needle implementation');",
+            )
+            .expect("descriptor fixture");
+
+        let descriptors = search_lexical_index_on_connection(
+            &connection,
+            "needle",
+            1,
+            1,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::DescriptorOnly,
+        )
+        .expect("descriptor path reads FTS membership and metadata only");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].node_id.as_deref(), Some("7"));
+        assert!(descriptors[0].source_excerpt.is_none());
+        assert!(
+            search_lexical_index_on_connection(
+                &connection,
+                "needle",
+                1,
+                1,
+                &mut HashMap::new(),
+                &|| false,
+                LexicalHitPayload::Full,
+            )
+            .is_err(),
+            "the hostile stored body must fail if a query tries to materialize it"
+        );
     }
 
     #[test]

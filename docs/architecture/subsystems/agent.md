@@ -1,8 +1,11 @@
 # Agent Subsystem
 
-`codestory-agent` owns packet planning. It decides what evidence a task needs:
-prompt terms, claim-profile coverage labels, evidence roles and carriers, citation
-scoring, and the deduplicated query plan. It does not run that plan.
+`codestory-agent` owns Horizon A's prompt-blind packet seed planning and pure
+evidence-policy helpers. It passes the unchanged question to generic retrieval
+and records typed free-query probes as additional generic queries. It does not
+infer paths, symbols, relations, answer stages, material roles, or sufficiency
+from prompt wording. Repository-derived evidence selection lands separately
+under #2106.
 
 The crate depends on `codestory-contracts` alone. It cannot activate a
 project, open or write storage, execute retrieval, retry a publication, or
@@ -11,32 +14,33 @@ pinned, through the `PinnedReader` trait implemented by runtime.
 
 ## Ownership
 
-- packet terms, claims, obligations, and coverage labels;
-- evidence roles, carriers, and citation scoring;
-- probe and required-probe planning;
-- the query plan handed to runtime for execution;
+- the unchanged-question generic retrieval plan;
+- deterministic query deduplication without English or domain taxonomies;
 - `PinnedReader`, the only allowed view of pinned runtime state.
 
 ## Entry points
 
 - `src/lib.rs`: crate contract and module map
-- `src/planning.rs` and `src/packet_plan.rs`: plan construction
-- `src/packet_terms.rs`, `src/packet_flow_requirements.rs`, `src/packet_obligations.rs`: prompt terms, coverage labels, and exact-probe obligations
-- `src/packet_evidence_roles.rs` and `src/packet_evidence_carriers.rs`: how a citation can count
-- `src/packet_scoring.rs` and `src/citation.rs`: ranking inside the plan
+- `src/packet_plan.rs` and `src/planning.rs`: unchanged-question retrieval
+  planning and literal query deduplication
+- `src/citation.rs` and `src/packet_evidence.rs`: compatibility metadata for
+  non-compiler search/citation surfaces; these fields have no admission,
+  ranking, protection, or sufficiency authority in packet compilation
 - `src/pinned_reader.rs`: the pin trait runtime implements
 
 ## What stays in runtime
 
-Runtime still owns execution residuals that need `AppController`, store,
-retrieval, or filesystem writes: `orchestrator`, `retrieval_primary`,
-`packet_batch`, `packet_probe`, `packet_search`, traces, and budget/capping
-that fold live step results. Those modules live under
-`crates/codestory-runtime/src/agent/` on purpose. They are not planning.
+Runtime owns generic retrieval, packet-wide descriptor admission, exact-probe
+resolution, hydration, publication retry, interim packet finalization, public
+projection, and budgets. Those modules live under
+`crates/codestory-runtime/src/agent/` because they need `AppController`, store,
+retrieval, or filesystem access.
 
 ## Extension rules
 
-- add planning policy here; add execution, publication retry, and assembly in
+- keep question handling to unchanged generic retrieval and caller-supplied
+  typed probes;
+- add retrieval, admission, hydration, publication retry, and assembly in
   runtime;
 - never import `codestory-runtime`, `codestory-store`, `codestory-retrieval`,
   or `codestory-workspace` from this crate;
@@ -44,10 +48,11 @@ that fold live step results. Those modules live under
 
 ## Failure signatures
 
-- packet planning modules reappear under `codestory-runtime`;
+- prompt tokens, task classes, obligations, roles, carriers, or answer stages
+  steer planning, admission, hydration, finalization, or capping;
 - this crate starts retrieval, indexing, or a publication retry;
 - a planner reads ambient process state instead of a pin;
-- sufficiency *policy* is rewritten in retrieval while planning stays here.
+- packet output asserts answer sufficiency.
 
 See [runtime](runtime.md) for assembly and retry, and
 [retrieval](retrieval.md) for fail-closed query execution.

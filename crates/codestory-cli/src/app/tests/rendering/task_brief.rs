@@ -112,7 +112,9 @@ fn task_brief_exposes_only_the_typed_drill_once_continuation() {
                 kind: DrillGapKindDto::BoundedSourceRead,
                 path: Some("src/lib.rs".to_string()),
                 symbol_id: None,
-                query: None,
+                structural_reason: Some(
+                    codestory_contracts::compilation::PacketStructuralGapReasonV1::SourceUnavailable,
+                ),
             }],
             max_bytes: 32 * 1024,
             max_hits: 8,

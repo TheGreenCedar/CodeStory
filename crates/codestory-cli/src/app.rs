@@ -89,8 +89,8 @@ mod source_commands;
 
 #[cfg(test)]
 use agent_context::{
-    build_task_brief_output, packet_budget_mode_label, packet_task_class_label,
-    render_packet_markdown, render_task_brief_markdown,
+    build_task_brief_output, packet_budget_mode_label, render_packet_markdown,
+    render_task_brief_markdown,
 };
 #[cfg(test)]
 use index_command::validate_index_watch_output_file;

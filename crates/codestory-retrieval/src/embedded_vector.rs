@@ -2547,6 +2547,8 @@ fn scored_hits_to_candidates(scored: Vec<ScoredHit>) -> Vec<CandidateHit> {
                     CandidateSource::Semantic,
                 );
                 hit.node_id = Some(node_id);
+                hit.source_bytes_upper_bound =
+                    Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
                 hit.file_role = file_role
                     .as_deref()
                     .map(codestory_store::FileRole::from_db_value);

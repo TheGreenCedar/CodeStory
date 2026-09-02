@@ -8,7 +8,6 @@
 mod app;
 mod args;
 mod cache_reset;
-mod call_path_grammar;
 mod config;
 mod diagnostics;
 mod display;

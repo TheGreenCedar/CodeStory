@@ -43,12 +43,12 @@ use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_indexer::current_proof_resolution_adapter_roster;
-use codestory_store::{
-    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store, resolve_core_database_path,
-    seal_call_resolution_fact,
-};
 #[cfg(test)]
 use codestory_store::make_file_owner_writable;
+use codestory_store::{
+    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store,
+    resolve_core_database_path, seal_call_resolution_fact,
+};
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
     resolve_project_relative_path, workspace_path_identity_token, workspace_relative_path,
@@ -196,8 +196,8 @@ fn observe_proof_publication_identity(
 }
 
 fn storage_native_identity(storage_path: &Path) -> Result<String, ApiError> {
-    let observed = resolve_core_database_path(storage_path)
-        .unwrap_or_else(|_| storage_path.to_path_buf());
+    let observed =
+        resolve_core_database_path(storage_path).unwrap_or_else(|_| storage_path.to_path_buf());
     workspace_path_identity_token(&observed)
         .map_err(|error| {
             ApiError::new(
@@ -2275,11 +2275,7 @@ mod tests {
         validated_contract(start, targets).0
     }
 
-    fn mutate_published_core(
-        storage_path: &Path,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) {
+    fn mutate_published_core(storage_path: &Path, sql: &str, params: impl rusqlite::Params) {
         let generation = resolve_core_database_path(storage_path).expect("published generation");
         make_file_owner_writable(&generation).expect("writable generation");
         let scratch = generation.with_extension("mutation.sqlite");

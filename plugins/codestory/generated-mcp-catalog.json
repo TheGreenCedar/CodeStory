@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "99ae2ef4ee139d1ea070d408596993a669300fa535e3232221a481c6d6ee1a44",
-      "2025-03-26": "df52d18ab523ead3365fa1f12e0920ed6cc66e1c2ed817cbec1ea8c0e70a7169",
-      "2025-06-18": "d6336477a226cd6c4b5083d86cbf7f4ae317f8ee7f9d8ccf5bdc804d29820e02",
-      "2025-11-25": "b3fafc4cc4f9fbcff175b79180a901ef48ef7b7e08e227a71060dc5b352c38b7"
+      "2024-11-05": "390ee890235e847b1bb8a7fd65a31907744f6e8c0c91f53cb09f2c7bf38674ec",
+      "2025-03-26": "2b9db80728bcab16706c27431199efc18cb265fe2e4faa140c91ec7089d9da59",
+      "2025-06-18": "23a5bcdeac9dbdd0335d2d286908e17356b99a59577063d2395a60bb36df5f1a",
+      "2025-11-25": "9347140dca5574571ffd434d09b944349fa71b704fbcd757b98de41b7e8aa2bc"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "99ae2ef4ee139d1ea070d408596993a669300fa535e3232221a481c6d6ee1a44",
+      "discoveryContractSha256": "390ee890235e847b1bb8a7fd65a31907744f6e8c0c91f53cb09f2c7bf38674ec",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -43,264 +43,6 @@
           "description": "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically. CodeStory effect: may activate project-local managed cache, indexing, or network-backed retrieval state.",
           "inputSchema": {
             "additionalProperties": false,
-            "allOf": [
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 16
-                    },
-                    "probes": {
-                      "minItems": 1
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 15
-                    },
-                    "probes": {
-                      "minItems": 2
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 14
-                    },
-                    "probes": {
-                      "minItems": 3
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 13
-                    },
-                    "probes": {
-                      "minItems": 4
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 12
-                    },
-                    "probes": {
-                      "minItems": 5
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 11
-                    },
-                    "probes": {
-                      "minItems": 6
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 10
-                    },
-                    "probes": {
-                      "minItems": 7
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 9
-                    },
-                    "probes": {
-                      "minItems": 8
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 8
-                    },
-                    "probes": {
-                      "minItems": 9
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 7
-                    },
-                    "probes": {
-                      "minItems": 10
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 6
-                    },
-                    "probes": {
-                      "minItems": 11
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 5
-                    },
-                    "probes": {
-                      "minItems": 12
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 4
-                    },
-                    "probes": {
-                      "minItems": 13
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 3
-                    },
-                    "probes": {
-                      "minItems": 14
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 2
-                    },
-                    "probes": {
-                      "minItems": 15
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 1
-                    },
-                    "probes": {
-                      "minItems": 16
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              }
-            ],
             "description": "Build a broad evidence packet with typed availability and one bounded continuation.",
             "properties": {
               "budget": {
@@ -317,17 +59,6 @@
               "core_generation_id": {
                 "description": "Pinned core publication generation for a continuation.",
                 "type": "string"
-              },
-              "extra_probes": {
-                "description": "Legacy string probes normalized through the same typed runtime resolver.",
-                "items": {
-                  "maxLength": 240,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "maxItems": 16,
-                "minItems": 1,
-                "type": "array"
               },
               "latency_budget_ms": {
                 "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -353,7 +84,7 @@
                 "type": "string"
               },
               "probes": {
-                "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+                "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
                 "items": {
                   "oneOf": [
                     {
@@ -401,6 +132,30 @@
                       "required": [
                         "kind",
                         "id"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "description": "Exact qualified-symbol probe.",
+                      "properties": {
+                        "kind": {
+                          "description": "Probe kind.",
+                          "enum": [
+                            "qualified_symbol"
+                          ],
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Qualified symbol name.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "symbol"
                       ],
                       "type": "object"
                     },
@@ -488,12 +243,6 @@
                           "minLength": 1,
                           "type": "string"
                         },
-                        "query": {
-                          "description": "Continuation display query.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": "string"
-                        },
                         "retrieval_generation": {
                           "description": "Optional continuation retrieval generation.",
                           "maxLength": 240,
@@ -503,14 +252,45 @@
                             "null"
                           ]
                         },
-                        "symbol_id": {
-                          "description": "Optional exact continuation symbol id.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                        "selector": {
+                          "additionalProperties": false,
+                          "description": "Stable typed continuation selector.",
+                          "properties": {
+                            "path": {
+                              "description": "Optional exact project-relative path.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "reason": {
+                              "description": "Typed uncovered structural reason.",
+                              "enum": [
+                                "candidate_count_exceeded",
+                                "source_budget_exceeded",
+                                "source_unavailable",
+                                "ambiguous_selector",
+                                "disconnected_seed"
+                              ],
+                              "type": "string"
+                            },
+                            "stable_identity": {
+                              "description": "Stable packet identity.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "symbol_id": {
+                              "description": "Optional exact stable symbol id.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "stable_identity",
+                            "reason"
+                          ],
+                          "type": "object"
                         }
                       },
                       "required": [
@@ -518,7 +298,7 @@
                         "contract_version",
                         "project_id",
                         "core_generation_id",
-                        "query"
+                        "selector"
                       ],
                       "type": "object"
                     }
@@ -1791,7 +1571,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "df52d18ab523ead3365fa1f12e0920ed6cc66e1c2ed817cbec1ea8c0e70a7169",
+      "discoveryContractSha256": "2b9db80728bcab16706c27431199efc18cb265fe2e4faa140c91ec7089d9da59",
       "tools": [
         {
           "annotations": {
@@ -1828,264 +1608,6 @@
           "description": "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically. CodeStory effect: may activate project-local managed cache, indexing, or network-backed retrieval state.",
           "inputSchema": {
             "additionalProperties": false,
-            "allOf": [
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 16
-                    },
-                    "probes": {
-                      "minItems": 1
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 15
-                    },
-                    "probes": {
-                      "minItems": 2
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 14
-                    },
-                    "probes": {
-                      "minItems": 3
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 13
-                    },
-                    "probes": {
-                      "minItems": 4
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 12
-                    },
-                    "probes": {
-                      "minItems": 5
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 11
-                    },
-                    "probes": {
-                      "minItems": 6
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 10
-                    },
-                    "probes": {
-                      "minItems": 7
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 9
-                    },
-                    "probes": {
-                      "minItems": 8
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 8
-                    },
-                    "probes": {
-                      "minItems": 9
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 7
-                    },
-                    "probes": {
-                      "minItems": 10
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 6
-                    },
-                    "probes": {
-                      "minItems": 11
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 5
-                    },
-                    "probes": {
-                      "minItems": 12
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 4
-                    },
-                    "probes": {
-                      "minItems": 13
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 3
-                    },
-                    "probes": {
-                      "minItems": 14
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 2
-                    },
-                    "probes": {
-                      "minItems": 15
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 1
-                    },
-                    "probes": {
-                      "minItems": 16
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              }
-            ],
             "description": "Build a broad evidence packet with typed availability and one bounded continuation.",
             "properties": {
               "budget": {
@@ -2102,17 +1624,6 @@
               "core_generation_id": {
                 "description": "Pinned core publication generation for a continuation.",
                 "type": "string"
-              },
-              "extra_probes": {
-                "description": "Legacy string probes normalized through the same typed runtime resolver.",
-                "items": {
-                  "maxLength": 240,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "maxItems": 16,
-                "minItems": 1,
-                "type": "array"
               },
               "latency_budget_ms": {
                 "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2138,7 +1649,7 @@
                 "type": "string"
               },
               "probes": {
-                "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+                "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
                 "items": {
                   "oneOf": [
                     {
@@ -2186,6 +1697,30 @@
                       "required": [
                         "kind",
                         "id"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "description": "Exact qualified-symbol probe.",
+                      "properties": {
+                        "kind": {
+                          "description": "Probe kind.",
+                          "enum": [
+                            "qualified_symbol"
+                          ],
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Qualified symbol name.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "symbol"
                       ],
                       "type": "object"
                     },
@@ -2273,12 +1808,6 @@
                           "minLength": 1,
                           "type": "string"
                         },
-                        "query": {
-                          "description": "Continuation display query.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": "string"
-                        },
                         "retrieval_generation": {
                           "description": "Optional continuation retrieval generation.",
                           "maxLength": 240,
@@ -2288,14 +1817,45 @@
                             "null"
                           ]
                         },
-                        "symbol_id": {
-                          "description": "Optional exact continuation symbol id.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                        "selector": {
+                          "additionalProperties": false,
+                          "description": "Stable typed continuation selector.",
+                          "properties": {
+                            "path": {
+                              "description": "Optional exact project-relative path.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "reason": {
+                              "description": "Typed uncovered structural reason.",
+                              "enum": [
+                                "candidate_count_exceeded",
+                                "source_budget_exceeded",
+                                "source_unavailable",
+                                "ambiguous_selector",
+                                "disconnected_seed"
+                              ],
+                              "type": "string"
+                            },
+                            "stable_identity": {
+                              "description": "Stable packet identity.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "symbol_id": {
+                              "description": "Optional exact stable symbol id.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "stable_identity",
+                            "reason"
+                          ],
+                          "type": "object"
                         }
                       },
                       "required": [
@@ -2303,7 +1863,7 @@
                         "contract_version",
                         "project_id",
                         "core_generation_id",
-                        "query"
+                        "selector"
                       ],
                       "type": "object"
                     }
@@ -3690,7 +3250,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "d6336477a226cd6c4b5083d86cbf7f4ae317f8ee7f9d8ccf5bdc804d29820e02",
+      "discoveryContractSha256": "23a5bcdeac9dbdd0335d2d286908e17356b99a59577063d2395a60bb36df5f1a",
       "tools": [
         {
           "_meta": {
@@ -3913,264 +3473,6 @@
           "description": "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
           "inputSchema": {
             "additionalProperties": false,
-            "allOf": [
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 16
-                    },
-                    "probes": {
-                      "minItems": 1
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 15
-                    },
-                    "probes": {
-                      "minItems": 2
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 14
-                    },
-                    "probes": {
-                      "minItems": 3
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 13
-                    },
-                    "probes": {
-                      "minItems": 4
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 12
-                    },
-                    "probes": {
-                      "minItems": 5
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 11
-                    },
-                    "probes": {
-                      "minItems": 6
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 10
-                    },
-                    "probes": {
-                      "minItems": 7
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 9
-                    },
-                    "probes": {
-                      "minItems": 8
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 8
-                    },
-                    "probes": {
-                      "minItems": 9
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 7
-                    },
-                    "probes": {
-                      "minItems": 10
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 6
-                    },
-                    "probes": {
-                      "minItems": 11
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 5
-                    },
-                    "probes": {
-                      "minItems": 12
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 4
-                    },
-                    "probes": {
-                      "minItems": 13
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 3
-                    },
-                    "probes": {
-                      "minItems": 14
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 2
-                    },
-                    "probes": {
-                      "minItems": 15
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 1
-                    },
-                    "probes": {
-                      "minItems": 16
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              }
-            ],
             "description": "Build a broad evidence packet with typed availability and one bounded continuation.",
             "properties": {
               "budget": {
@@ -4187,17 +3489,6 @@
               "core_generation_id": {
                 "description": "Pinned core publication generation for a continuation.",
                 "type": "string"
-              },
-              "extra_probes": {
-                "description": "Legacy string probes normalized through the same typed runtime resolver.",
-                "items": {
-                  "maxLength": 240,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "maxItems": 16,
-                "minItems": 1,
-                "type": "array"
               },
               "latency_budget_ms": {
                 "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -4223,7 +3514,7 @@
                 "type": "string"
               },
               "probes": {
-                "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+                "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
                 "items": {
                   "oneOf": [
                     {
@@ -4271,6 +3562,30 @@
                       "required": [
                         "kind",
                         "id"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "description": "Exact qualified-symbol probe.",
+                      "properties": {
+                        "kind": {
+                          "description": "Probe kind.",
+                          "enum": [
+                            "qualified_symbol"
+                          ],
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Qualified symbol name.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "symbol"
                       ],
                       "type": "object"
                     },
@@ -4358,12 +3673,6 @@
                           "minLength": 1,
                           "type": "string"
                         },
-                        "query": {
-                          "description": "Continuation display query.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": "string"
-                        },
                         "retrieval_generation": {
                           "description": "Optional continuation retrieval generation.",
                           "maxLength": 240,
@@ -4373,14 +3682,45 @@
                             "null"
                           ]
                         },
-                        "symbol_id": {
-                          "description": "Optional exact continuation symbol id.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                        "selector": {
+                          "additionalProperties": false,
+                          "description": "Stable typed continuation selector.",
+                          "properties": {
+                            "path": {
+                              "description": "Optional exact project-relative path.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "reason": {
+                              "description": "Typed uncovered structural reason.",
+                              "enum": [
+                                "candidate_count_exceeded",
+                                "source_budget_exceeded",
+                                "source_unavailable",
+                                "ambiguous_selector",
+                                "disconnected_seed"
+                              ],
+                              "type": "string"
+                            },
+                            "stable_identity": {
+                              "description": "Stable packet identity.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "symbol_id": {
+                              "description": "Optional exact stable symbol id.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "stable_identity",
+                            "reason"
+                          ],
+                          "type": "object"
                         }
                       },
                       "required": [
@@ -4388,7 +3728,7 @@
                         "contract_version",
                         "project_id",
                         "core_generation_id",
-                        "query"
+                        "selector"
                       ],
                       "type": "object"
                     }
@@ -4429,6 +3769,12 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "answer_sufficiency": {
+                            "enum": [
+                              "not_asserted"
+                            ],
+                            "type": "string"
+                          },
                           "continuation": {
                             "anyOf": [
                               {
@@ -4628,7 +3974,7 @@
                               ],
                               "type": "object"
                             },
-                            "maxItems": 256,
+                            "maxItems": 16,
                             "type": "array"
                           },
                           "gaps": {
@@ -4827,13 +4173,20 @@
                           "evidence",
                           "gaps",
                           "continuation",
-                          "diagnostics"
+                          "diagnostics",
+                          "answer_sufficiency"
                         ],
                         "type": "object"
                       },
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "answer_sufficiency": {
+                            "enum": [
+                              "not_asserted"
+                            ],
+                            "type": "string"
+                          },
                           "diagnostics": {
                             "oneOf": [
                               {
@@ -5100,7 +4453,8 @@
                           "diagnostics",
                           "gaps",
                           "maximum_bytes",
-                          "required_complete_bytes"
+                          "required_complete_bytes",
+                          "answer_sufficiency"
                         ],
                         "type": "object"
                       }
@@ -12342,7 +11696,7 @@
                                     ],
                                     "type": "object"
                                   },
-                                  "maxItems": 537,
+                                  "maxItems": 57,
                                   "type": "array"
                                 },
                                 "non_material_kind": {
@@ -12869,7 +12223,7 @@
                                             "type": "string"
                                           },
                                           "prohibition_index": {
-                                            "maximum": 255,
+                                            "maximum": 15,
                                             "minimum": 0,
                                             "type": "integer"
                                           },
@@ -13468,7 +12822,7 @@
                                   ],
                                   "type": "object"
                                 },
-                                "maxItems": 256,
+                                "maxItems": 16,
                                 "type": "array"
                               },
                               "prohibit_traversal_through": {
@@ -13561,7 +12915,7 @@
                                   ],
                                   "type": "object"
                                 },
-                                "maxItems": 256,
+                                "maxItems": 16,
                                 "type": "array"
                               },
                               "start": {
@@ -14279,7 +13633,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "b3fafc4cc4f9fbcff175b79180a901ef48ef7b7e08e227a71060dc5b352c38b7",
+      "discoveryContractSha256": "9347140dca5574571ffd434d09b944349fa71b704fbcd757b98de41b7e8aa2bc",
       "tools": [
         {
           "_meta": {
@@ -14502,264 +13856,6 @@
           "description": "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
           "inputSchema": {
             "additionalProperties": false,
-            "allOf": [
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 16
-                    },
-                    "probes": {
-                      "minItems": 1
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 15
-                    },
-                    "probes": {
-                      "minItems": 2
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 14
-                    },
-                    "probes": {
-                      "minItems": 3
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 13
-                    },
-                    "probes": {
-                      "minItems": 4
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 12
-                    },
-                    "probes": {
-                      "minItems": 5
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 11
-                    },
-                    "probes": {
-                      "minItems": 6
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 10
-                    },
-                    "probes": {
-                      "minItems": 7
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 9
-                    },
-                    "probes": {
-                      "minItems": 8
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 8
-                    },
-                    "probes": {
-                      "minItems": 9
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 7
-                    },
-                    "probes": {
-                      "minItems": 10
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 6
-                    },
-                    "probes": {
-                      "minItems": 11
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 5
-                    },
-                    "probes": {
-                      "minItems": 12
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 4
-                    },
-                    "probes": {
-                      "minItems": 13
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 3
-                    },
-                    "probes": {
-                      "minItems": 14
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 2
-                    },
-                    "probes": {
-                      "minItems": 15
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "extra_probes": {
-                      "minItems": 1
-                    },
-                    "probes": {
-                      "minItems": 16
-                    }
-                  },
-                  "required": [
-                    "probes",
-                    "extra_probes"
-                  ]
-                }
-              }
-            ],
             "description": "Build a broad evidence packet with typed availability and one bounded continuation.",
             "properties": {
               "budget": {
@@ -14776,17 +13872,6 @@
               "core_generation_id": {
                 "description": "Pinned core publication generation for a continuation.",
                 "type": "string"
-              },
-              "extra_probes": {
-                "description": "Legacy string probes normalized through the same typed runtime resolver.",
-                "items": {
-                  "maxLength": 240,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "maxItems": 16,
-                "minItems": 1,
-                "type": "array"
               },
               "latency_budget_ms": {
                 "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -14812,7 +13897,7 @@
                 "type": "string"
               },
               "probes": {
-                "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+                "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
                 "items": {
                   "oneOf": [
                     {
@@ -14860,6 +13945,30 @@
                       "required": [
                         "kind",
                         "id"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "description": "Exact qualified-symbol probe.",
+                      "properties": {
+                        "kind": {
+                          "description": "Probe kind.",
+                          "enum": [
+                            "qualified_symbol"
+                          ],
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Qualified symbol name.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "symbol"
                       ],
                       "type": "object"
                     },
@@ -14947,12 +14056,6 @@
                           "minLength": 1,
                           "type": "string"
                         },
-                        "query": {
-                          "description": "Continuation display query.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": "string"
-                        },
                         "retrieval_generation": {
                           "description": "Optional continuation retrieval generation.",
                           "maxLength": 240,
@@ -14962,14 +14065,45 @@
                             "null"
                           ]
                         },
-                        "symbol_id": {
-                          "description": "Optional exact continuation symbol id.",
-                          "maxLength": 240,
-                          "minLength": 1,
-                          "type": [
-                            "string",
-                            "null"
-                          ]
+                        "selector": {
+                          "additionalProperties": false,
+                          "description": "Stable typed continuation selector.",
+                          "properties": {
+                            "path": {
+                              "description": "Optional exact project-relative path.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "reason": {
+                              "description": "Typed uncovered structural reason.",
+                              "enum": [
+                                "candidate_count_exceeded",
+                                "source_budget_exceeded",
+                                "source_unavailable",
+                                "ambiguous_selector",
+                                "disconnected_seed"
+                              ],
+                              "type": "string"
+                            },
+                            "stable_identity": {
+                              "description": "Stable packet identity.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "symbol_id": {
+                              "description": "Optional exact stable symbol id.",
+                              "maxLength": 240,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "stable_identity",
+                            "reason"
+                          ],
+                          "type": "object"
                         }
                       },
                       "required": [
@@ -14977,7 +14111,7 @@
                         "contract_version",
                         "project_id",
                         "core_generation_id",
-                        "query"
+                        "selector"
                       ],
                       "type": "object"
                     }
@@ -15018,6 +14152,12 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "answer_sufficiency": {
+                            "enum": [
+                              "not_asserted"
+                            ],
+                            "type": "string"
+                          },
                           "continuation": {
                             "anyOf": [
                               {
@@ -15217,7 +14357,7 @@
                               ],
                               "type": "object"
                             },
-                            "maxItems": 256,
+                            "maxItems": 16,
                             "type": "array"
                           },
                           "gaps": {
@@ -15416,13 +14556,20 @@
                           "evidence",
                           "gaps",
                           "continuation",
-                          "diagnostics"
+                          "diagnostics",
+                          "answer_sufficiency"
                         ],
                         "type": "object"
                       },
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "answer_sufficiency": {
+                            "enum": [
+                              "not_asserted"
+                            ],
+                            "type": "string"
+                          },
                           "diagnostics": {
                             "oneOf": [
                               {
@@ -15689,7 +14836,8 @@
                           "diagnostics",
                           "gaps",
                           "maximum_bytes",
-                          "required_complete_bytes"
+                          "required_complete_bytes",
+                          "answer_sufficiency"
                         ],
                         "type": "object"
                       }
@@ -22931,7 +22079,7 @@
                                     ],
                                     "type": "object"
                                   },
-                                  "maxItems": 537,
+                                  "maxItems": 57,
                                   "type": "array"
                                 },
                                 "non_material_kind": {
@@ -23458,7 +22606,7 @@
                                             "type": "string"
                                           },
                                           "prohibition_index": {
-                                            "maximum": 255,
+                                            "maximum": 15,
                                             "minimum": 0,
                                             "type": "integer"
                                           },
@@ -24057,7 +23205,7 @@
                                   ],
                                   "type": "object"
                                 },
-                                "maxItems": 256,
+                                "maxItems": 16,
                                 "type": "array"
                               },
                               "prohibit_traversal_through": {
@@ -24150,7 +23298,7 @@
                                   ],
                                   "type": "object"
                                 },
-                                "maxItems": 256,
+                                "maxItems": 16,
                                 "type": "array"
                               },
                               "start": {
@@ -25090,264 +24238,6 @@
       "description": "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
         "additionalProperties": false,
-        "allOf": [
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 16
-                },
-                "probes": {
-                  "minItems": 1
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 15
-                },
-                "probes": {
-                  "minItems": 2
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 14
-                },
-                "probes": {
-                  "minItems": 3
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 13
-                },
-                "probes": {
-                  "minItems": 4
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 12
-                },
-                "probes": {
-                  "minItems": 5
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 11
-                },
-                "probes": {
-                  "minItems": 6
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 10
-                },
-                "probes": {
-                  "minItems": 7
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 9
-                },
-                "probes": {
-                  "minItems": 8
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 8
-                },
-                "probes": {
-                  "minItems": 9
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 7
-                },
-                "probes": {
-                  "minItems": 10
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 6
-                },
-                "probes": {
-                  "minItems": 11
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 5
-                },
-                "probes": {
-                  "minItems": 12
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 4
-                },
-                "probes": {
-                  "minItems": 13
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 3
-                },
-                "probes": {
-                  "minItems": 14
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 2
-                },
-                "probes": {
-                  "minItems": 15
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          },
-          {
-            "not": {
-              "properties": {
-                "extra_probes": {
-                  "minItems": 1
-                },
-                "probes": {
-                  "minItems": 16
-                }
-              },
-              "required": [
-                "probes",
-                "extra_probes"
-              ]
-            }
-          }
-        ],
         "description": "Build a broad evidence packet with typed availability and one bounded continuation.",
         "properties": {
           "budget": {
@@ -25364,17 +24254,6 @@
           "core_generation_id": {
             "description": "Pinned core publication generation for a continuation.",
             "type": "string"
-          },
-          "extra_probes": {
-            "description": "Legacy string probes normalized through the same typed runtime resolver.",
-            "items": {
-              "maxLength": 240,
-              "minLength": 1,
-              "type": "string"
-            },
-            "maxItems": 16,
-            "minItems": 1,
-            "type": "array"
           },
           "latency_budget_ms": {
             "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -25400,7 +24279,7 @@
             "type": "string"
           },
           "probes": {
-            "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
             "items": {
               "oneOf": [
                 {
@@ -25448,6 +24327,30 @@
                   "required": [
                     "kind",
                     "id"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Exact qualified-symbol probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "qualified_symbol"
+                      ],
+                      "type": "string"
+                    },
+                    "symbol": {
+                      "description": "Qualified symbol name.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "symbol"
                   ],
                   "type": "object"
                 },
@@ -25535,12 +24438,6 @@
                       "minLength": 1,
                       "type": "string"
                     },
-                    "query": {
-                      "description": "Continuation display query.",
-                      "maxLength": 240,
-                      "minLength": 1,
-                      "type": "string"
-                    },
                     "retrieval_generation": {
                       "description": "Optional continuation retrieval generation.",
                       "maxLength": 240,
@@ -25550,14 +24447,45 @@
                         "null"
                       ]
                     },
-                    "symbol_id": {
-                      "description": "Optional exact continuation symbol id.",
-                      "maxLength": 240,
-                      "minLength": 1,
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                    "selector": {
+                      "additionalProperties": false,
+                      "description": "Stable typed continuation selector.",
+                      "properties": {
+                        "path": {
+                          "description": "Optional exact project-relative path.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "Typed uncovered structural reason.",
+                          "enum": [
+                            "candidate_count_exceeded",
+                            "source_budget_exceeded",
+                            "source_unavailable",
+                            "ambiguous_selector",
+                            "disconnected_seed"
+                          ],
+                          "type": "string"
+                        },
+                        "stable_identity": {
+                          "description": "Stable packet identity.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "symbol_id": {
+                          "description": "Optional exact stable symbol id.",
+                          "maxLength": 240,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "stable_identity",
+                        "reason"
+                      ],
+                      "type": "object"
                     }
                   },
                   "required": [
@@ -25565,7 +24493,7 @@
                     "contract_version",
                     "project_id",
                     "core_generation_id",
-                    "query"
+                    "selector"
                   ],
                   "type": "object"
                 }
@@ -25606,6 +24534,12 @@
                   {
                     "additionalProperties": false,
                     "properties": {
+                      "answer_sufficiency": {
+                        "enum": [
+                          "not_asserted"
+                        ],
+                        "type": "string"
+                      },
                       "continuation": {
                         "anyOf": [
                           {
@@ -25805,7 +24739,7 @@
                           ],
                           "type": "object"
                         },
-                        "maxItems": 256,
+                        "maxItems": 16,
                         "type": "array"
                       },
                       "gaps": {
@@ -26004,13 +24938,20 @@
                       "evidence",
                       "gaps",
                       "continuation",
-                      "diagnostics"
+                      "diagnostics",
+                      "answer_sufficiency"
                     ],
                     "type": "object"
                   },
                   {
                     "additionalProperties": false,
                     "properties": {
+                      "answer_sufficiency": {
+                        "enum": [
+                          "not_asserted"
+                        ],
+                        "type": "string"
+                      },
                       "diagnostics": {
                         "oneOf": [
                           {
@@ -26277,7 +25218,8 @@
                       "diagnostics",
                       "gaps",
                       "maximum_bytes",
-                      "required_complete_bytes"
+                      "required_complete_bytes",
+                      "answer_sufficiency"
                     ],
                     "type": "object"
                   }
@@ -33519,7 +32461,7 @@
                                 ],
                                 "type": "object"
                               },
-                              "maxItems": 537,
+                              "maxItems": 57,
                               "type": "array"
                             },
                             "non_material_kind": {
@@ -34046,7 +32988,7 @@
                                         "type": "string"
                                       },
                                       "prohibition_index": {
-                                        "maximum": 255,
+                                        "maximum": 15,
                                         "minimum": 0,
                                         "type": "integer"
                                       },
@@ -34645,7 +33587,7 @@
                               ],
                               "type": "object"
                             },
-                            "maxItems": 256,
+                            "maxItems": 16,
                             "type": "array"
                           },
                           "prohibit_traversal_through": {
@@ -34738,7 +33680,7 @@
                               ],
                               "type": "object"
                             },
-                            "maxItems": 256,
+                            "maxItems": 16,
                             "type": "array"
                           },
                           "start": {

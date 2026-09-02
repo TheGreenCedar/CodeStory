@@ -208,7 +208,6 @@ fn cli_search_and_resolution_keep_structural_metadata_while_drill_omits_truth_au
         evidence_producer: workflow.evidence_producer.clone(),
         resolution_status: workflow.resolution_status,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: workflow.eligible_for_sufficiency,
         source_excerpt: None,
     };

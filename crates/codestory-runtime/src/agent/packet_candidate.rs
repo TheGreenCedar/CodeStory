@@ -5,9 +5,14 @@ use codestory_contracts::api::EdgeKind;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, EdgeId, GraphArtifactDto, GraphResponse, SearchHit,
 };
+#[cfg(test)]
+use codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1;
 use codestory_contracts::compilation::{
-    INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES,
+    INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES, PacketAdmissionGapKindV1,
+    PacketAdmissionGapV1, PacketAdmissionOriginV1, PacketAdmissionReceiptV1,
+    PacketCandidateDescriptorV1,
 };
+use codestory_contracts::graph::NodeId as CoreNodeId;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +43,18 @@ pub(crate) struct PacketProofSession {
     pub(crate) hydrated_admissions: RefCell<usize>,
     /// Conservative source bytes charged before exact hydration.
     pub(crate) admitted_source_bytes: RefCell<usize>,
+    admitted_identities: RefCell<HashMap<String, usize>>,
+    receipts: RefCell<Vec<PacketAdmissionReceiptV1>>,
+    gaps: RefCell<Vec<PacketAdmissionGapV1>>,
+    retrieval_admission_sealed: RefCell<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketAdmissionDecision {
+    Admitted,
+    AlreadyAdmitted,
+    CountBudgetExceeded,
+    SourceBudgetExceeded,
 }
 
 impl PacketProofSession {
@@ -45,6 +62,10 @@ impl PacketProofSession {
         Self {
             hydrated_admissions: RefCell::new(0),
             admitted_source_bytes: RefCell::new(0),
+            admitted_identities: RefCell::new(HashMap::new()),
+            receipts: RefCell::new(Vec::new()),
+            gaps: RefCell::new(Vec::new()),
+            retrieval_admission_sealed: RefCell::new(false),
         }
     }
 
@@ -52,22 +73,211 @@ impl PacketProofSession {
         INTERIM_MAX_ADMITTED_CANDIDATES.saturating_sub(*self.hydrated_admissions.borrow())
     }
 
-    pub(crate) fn consume_hydration_slots(&self, count: usize) {
-        let mut admitted = self.hydrated_admissions.borrow_mut();
-        *admitted = admitted
-            .saturating_add(count)
-            .min(INTERIM_MAX_ADMITTED_CANDIDATES);
-    }
-
     pub(crate) fn remaining_source_bytes(&self) -> usize {
         INTERIM_MAX_ADMITTED_SOURCE_BYTES.saturating_sub(*self.admitted_source_bytes.borrow())
     }
 
-    pub(crate) fn consume_source_bytes(&self, bytes: usize) {
-        let mut admitted = self.admitted_source_bytes.borrow_mut();
-        *admitted = admitted
-            .saturating_add(bytes)
-            .min(INTERIM_MAX_ADMITTED_SOURCE_BYTES);
+    #[cfg(test)]
+    pub(crate) fn admit(
+        &self,
+        stable_identity: &str,
+        source_bytes: usize,
+    ) -> PacketAdmissionDecision {
+        self.admit_with_receipt(
+            stable_identity,
+            source_bytes,
+            PacketAdmissionOriginV1::Retrieval,
+            PACKET_RETRIEVAL_SCORE_VERSION_V1,
+            None,
+        )
+    }
+
+    pub(crate) fn admit_exact_selector(
+        &self,
+        stable_identity: &str,
+        source_bytes: usize,
+        selector_ordinal: u32,
+    ) -> PacketAdmissionDecision {
+        self.admit_with_receipt(
+            stable_identity,
+            source_bytes,
+            PacketAdmissionOriginV1::ExactTypedSelector,
+            "exact-selector/v1",
+            Some(selector_ordinal),
+        )
+    }
+
+    pub(crate) fn admit_descriptor(
+        &self,
+        descriptor: &PacketCandidateDescriptorV1,
+    ) -> PacketAdmissionDecision {
+        if self
+            .admitted_identities
+            .borrow()
+            .contains_key(&descriptor.stable_identity)
+        {
+            return PacketAdmissionDecision::AlreadyAdmitted;
+        }
+        if *self.retrieval_admission_sealed.borrow() {
+            self.record_gap(
+                PacketAdmissionGapKindV1::CandidateCountExceeded,
+                Some(descriptor.stable_identity.clone()),
+                descriptor.exact_selector_ordinal,
+            );
+            return PacketAdmissionDecision::CountBudgetExceeded;
+        }
+        let Some(source_bytes) = descriptor.source_bytes_upper_bound else {
+            self.record_gap(
+                PacketAdmissionGapKindV1::SourceBoundMissing,
+                Some(descriptor.stable_identity.clone()),
+                descriptor.exact_selector_ordinal,
+            );
+            return PacketAdmissionDecision::SourceBudgetExceeded;
+        };
+        self.admit_with_receipt(
+            &descriptor.stable_identity,
+            source_bytes as usize,
+            if descriptor.exact_selector_ordinal.is_some() {
+                PacketAdmissionOriginV1::ExactTypedSelector
+            } else {
+                PacketAdmissionOriginV1::Retrieval
+            },
+            &descriptor.retrieval_score.version,
+            descriptor.exact_selector_ordinal,
+        )
+    }
+
+    pub(crate) fn seal_retrieval_admission(&self) {
+        *self.retrieval_admission_sealed.borrow_mut() = true;
+    }
+
+    fn admit_with_receipt(
+        &self,
+        stable_identity: &str,
+        source_bytes: usize,
+        origin: PacketAdmissionOriginV1,
+        score_version: &str,
+        exact_selector_ordinal: Option<u32>,
+    ) -> PacketAdmissionDecision {
+        if self
+            .admitted_identities
+            .borrow()
+            .contains_key(stable_identity)
+        {
+            return PacketAdmissionDecision::AlreadyAdmitted;
+        }
+        if self.remaining_hydration_slots() == 0 {
+            self.record_gap(
+                PacketAdmissionGapKindV1::CandidateCountExceeded,
+                Some(stable_identity.to_string()),
+                exact_selector_ordinal,
+            );
+            return PacketAdmissionDecision::CountBudgetExceeded;
+        }
+        if source_bytes > self.remaining_source_bytes() {
+            self.record_gap(
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                Some(stable_identity.to_string()),
+                exact_selector_ordinal,
+            );
+            return PacketAdmissionDecision::SourceBudgetExceeded;
+        }
+
+        self.admitted_identities
+            .borrow_mut()
+            .insert(stable_identity.to_owned(), source_bytes);
+        *self.hydrated_admissions.borrow_mut() += 1;
+        *self.admitted_source_bytes.borrow_mut() += source_bytes;
+        let packet_ordinal = self.receipts.borrow().len() as u32;
+        self.receipts.borrow_mut().push(PacketAdmissionReceiptV1 {
+            packet_ordinal,
+            stable_identity: stable_identity.to_string(),
+            score_version: score_version.to_string(),
+            reserved_source_bytes: u32::try_from(source_bytes).unwrap_or(u32::MAX),
+            origin,
+        });
+        PacketAdmissionDecision::Admitted
+    }
+
+    pub(crate) fn record_ineligible_candidate(
+        &self,
+        kind: PacketAdmissionGapKindV1,
+        stable_identity: Option<String>,
+    ) {
+        self.record_gap(kind, stable_identity, None);
+    }
+
+    fn record_gap(
+        &self,
+        kind: PacketAdmissionGapKindV1,
+        stable_identity: Option<String>,
+        exact_selector_ordinal: Option<u32>,
+    ) {
+        self.gaps.borrow_mut().push(PacketAdmissionGapV1 {
+            kind,
+            stable_identity,
+            exact_selector_ordinal,
+        });
+    }
+
+    pub(crate) fn receipts(&self) -> Vec<PacketAdmissionReceiptV1> {
+        self.receipts.borrow().clone()
+    }
+
+    pub(crate) fn gaps(&self) -> Vec<PacketAdmissionGapV1> {
+        self.gaps.borrow().clone()
+    }
+
+    pub(crate) fn is_admitted_identity(&self, stable_identity: &str) -> bool {
+        self.admitted_identities
+            .borrow()
+            .contains_key(stable_identity)
+    }
+
+    pub(crate) fn is_admitted_node(&self, node_id: CoreNodeId) -> bool {
+        self.is_admitted_identity(&format!("node:{}", node_id.0))
+    }
+
+    /// Keep a failed selector's reservation charged while hiding its synthetic
+    /// pre-resolution identity from compiler input. Repository reads are never
+    /// refunded into later hydration capacity.
+    pub(crate) fn consume_unresolved_reservation(&self, identity: &str) {
+        self.receipts
+            .borrow_mut()
+            .retain(|receipt| receipt.stable_identity != identity);
+    }
+
+    pub(crate) fn canonicalize_identity(&self, reserved: &str, stable: &str) {
+        if reserved == stable {
+            return;
+        }
+        let Some(source_bytes) = self.admitted_identities.borrow_mut().remove(reserved) else {
+            return;
+        };
+        if self.admitted_identities.borrow().contains_key(stable) {
+            let admitted_count = self.hydrated_admissions.borrow().saturating_sub(1);
+            let admitted_bytes = self
+                .admitted_source_bytes
+                .borrow()
+                .saturating_sub(source_bytes);
+            *self.hydrated_admissions.borrow_mut() = admitted_count;
+            *self.admitted_source_bytes.borrow_mut() = admitted_bytes;
+            self.receipts
+                .borrow_mut()
+                .retain(|receipt| receipt.stable_identity != reserved);
+        } else {
+            self.admitted_identities
+                .borrow_mut()
+                .insert(stable.to_owned(), source_bytes);
+            if let Some(receipt) = self
+                .receipts
+                .borrow_mut()
+                .iter_mut()
+                .find(|receipt| receipt.stable_identity == reserved)
+            {
+                receipt.stable_identity = stable.to_owned();
+            }
+        }
     }
 }
 
@@ -136,6 +346,10 @@ impl PacketSearchHit {
             None,
             include_evidence,
         );
+        // Search DTOs retain this legacy field for non-packet callers. The
+        // packet compiler must never receive answer-sufficiency authority from
+        // retrieval metadata.
+        citation.eligible_for_sufficiency = None;
         if include_evidence && self.hit.resolvable {
             // Empty-requirement path: proof_edge_ids is empty, so the dense-only
             // upgrade never fires. Citation edges are every provenance edge
@@ -328,6 +542,113 @@ mod tests {
         AgentRetrievalTraceDto, GraphEdgeDto, GraphNodeDto, NodeId, NodeKind,
         PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
     };
+    use codestory_contracts::compilation::{PacketRetrievalLaneV1, VersionedRetrievalScoreV1};
+
+    #[test]
+    fn admission_is_packet_wide_identity_deduplicated_and_count_bounded() {
+        let session = PacketProofSession::new();
+        for index in 0..INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                session.admit(&format!("node:{index}"), 1),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        assert_eq!(
+            session.admit("node:0", 1),
+            PacketAdmissionDecision::AlreadyAdmitted
+        );
+        assert_eq!(
+            session.admit("node:17", 1),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 16);
+    }
+
+    #[test]
+    fn exact_selectors_and_retrieval_share_one_sixteen_identity_session() {
+        let session = PacketProofSession::new();
+        for index in 0..8 {
+            assert_eq!(
+                session.admit_exact_selector(&format!("node:exact-{index}"), 1, index),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        for index in 0..8 {
+            let descriptor = PacketCandidateDescriptorV1 {
+                stable_identity: format!("node:retrieved-{index}"),
+                path: format!("src/retrieved-{index}.rs"),
+                symbol: Some(format!("retrieved_{index}")),
+                retrieval_lane: PacketRetrievalLaneV1::Lexical,
+                retrieval_score: VersionedRetrievalScoreV1 {
+                    version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                    value: 1.0 - index as f32 / 100.0,
+                },
+                source_bytes_upper_bound: Some(1),
+                exact_selector_ordinal: None,
+            };
+            assert_eq!(
+                session.admit_descriptor(&descriptor),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+
+        let rejected = PacketCandidateDescriptorV1 {
+            stable_identity: "node:seventeenth".into(),
+            path: "src/seventeenth.rs".into(),
+            symbol: Some("seventeenth".into()),
+            retrieval_lane: PacketRetrievalLaneV1::Semantic,
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                value: 0.5,
+            },
+            source_bytes_upper_bound: Some(1),
+            exact_selector_ordinal: None,
+        };
+        assert_eq!(
+            session.admit_descriptor(&rejected),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(session.gaps().len(), 1);
+        assert_eq!(
+            session.gaps()[0].kind,
+            PacketAdmissionGapKindV1::CandidateCountExceeded
+        );
+    }
+
+    #[test]
+    fn admission_rejects_source_overflow_before_mutating_the_session() {
+        let session = PacketProofSession::new();
+        assert_eq!(
+            session.admit("node:oversized", INTERIM_MAX_ADMITTED_SOURCE_BYTES + 1),
+            PacketAdmissionDecision::SourceBudgetExceeded
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 0);
+        assert_eq!(*session.admitted_source_bytes.borrow(), 0);
+    }
+
+    #[test]
+    fn sealed_retrieval_admission_rejects_late_descriptors() {
+        let session = PacketProofSession::new();
+        session.seal_retrieval_admission();
+        let descriptor = PacketCandidateDescriptorV1 {
+            stable_identity: "node:late".into(),
+            path: "src/late.rs".into(),
+            symbol: Some("late".into()),
+            retrieval_lane: PacketRetrievalLaneV1::Lexical,
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                value: 1.0,
+            },
+            source_bytes_upper_bound: Some(1),
+            exact_selector_ordinal: None,
+        };
+        assert_eq!(
+            session.admit_descriptor(&descriptor),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
+        assert!(session.receipts().is_empty());
+    }
 
     fn answer() -> AgentAnswerDto {
         AgentAnswerDto {
@@ -354,7 +675,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
@@ -381,7 +701,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
                 verification_targets: Vec::new(),
@@ -470,7 +789,6 @@ mod tests {
                 evidence_producer: Some("core_incident_call".into()),
                 resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: Some(true),
                 source_excerpt: None,
                 verification_targets: Vec::new(),
@@ -521,6 +839,10 @@ mod tests {
         let hit = packet_hit("edge-1");
         let citation = hit.citation(true);
         assert_eq!(citation.evidence_edge_ids, [EdgeId("edge-1".into())]);
+        assert_eq!(
+            citation.eligible_for_sufficiency, None,
+            "packet citations carry retrieval provenance, never answer-sufficiency authority"
+        );
         assert!(hit.has_proof_call_provenance());
 
         let mut answer = answer();

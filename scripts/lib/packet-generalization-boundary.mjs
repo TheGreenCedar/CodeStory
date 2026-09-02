@@ -361,6 +361,27 @@ const DOMAIN_VOCABULARY_SHAPES = Object.freeze([
     ]),
   }),
   Object.freeze({
+    // Renaming `task_class_seed_queries` does not make a fixed table of
+    // expected explanation anchors repository-derived.
+    kind: "answer_shape_seed_cluster",
+    minimum: 3,
+    vocabulary: Object.freeze([
+      "main",
+      "run",
+      "start",
+      "entrypoint",
+      "bootstrap",
+      "server",
+      "router",
+      "handler",
+      "dispatch",
+      "pipeline",
+      "transport",
+      "finalizer",
+      "finalization",
+    ]),
+  }),
+  Object.freeze({
     kind: "corpus_entity_noun_cluster",
     minimum: 3,
     vocabulary: Object.freeze([
@@ -394,8 +415,16 @@ const DOMAIN_VOCABULARY_SHAPES = Object.freeze([
 const PROMPT_TEXT_BINDINGS = Object.freeze([
   "question",
   "prompt",
+  "query",
   "query_text",
   "task_phrasing",
+]);
+
+const PROMPT_PARAMETER_NAME = /(?:question|prompt|query|request|task)/i;
+
+const ANSWER_SHAPED_LITERAL_PATTERNS = Object.freeze([
+  /\b(?:type|class|trait|interface|client|request|response|transport|handler|router|cache|store)\s+(?:declaration|implementation|finalization|facade|entrypoint|dispatch|stage)\b/i,
+  /\b(?:public|top[- ]level|base)\s+(?:client|helper|facade|entrypoint|surface)\b/i,
 ]);
 
 /** String-content tests that turn prompt text into a branch. */
@@ -684,7 +713,13 @@ export function splitRustFunctions(source) {
       j += 1;
     }
     if (bodyStart < 0) continue;
-    functions.push({ name: match[1], start: match.index, end: j, body: source.slice(bodyStart, j) });
+    functions.push({
+      name: match[1],
+      start: match.index,
+      end: j,
+      signature: source.slice(match.index, bodyStart),
+      body: source.slice(bodyStart, j),
+    });
     signature.lastIndex = j;
   }
   return functions;
@@ -720,6 +755,13 @@ function findDomainVocabularyClusters(source, relative) {
     for (const literal of literals) {
       const compacted = normalizeIdentifier(literal);
       if (compacted) tokens.add(compacted);
+      if (ANSWER_SHAPED_LITERAL_PATTERNS.some((pattern) => pattern.test(literal))) {
+        findings.push({
+          kind: "answer_shaped_literal",
+          file: relative,
+          detail: `${fn.name} contains answer-shaped phrase "${literal}"`,
+        });
+      }
     }
     for (const shape of DOMAIN_VOCABULARY_SHAPES) {
       const matched = shape.vocabulary.filter((word) => tokens.has(word));
@@ -748,12 +790,19 @@ function findPromptTextBranches(source, relative) {
   const predicates = PROMPT_TEXT_PREDICATES.join("|");
   for (const fn of splitRustFunctions(source)) {
     const carriers = new Set(PROMPT_TEXT_BINDINGS);
-    const binding = new RegExp(
-      `\\blet\\s+(?:mut\\s+)?([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*[^;]*\\b(?:${[...carriers].join("|")})\\b`,
-      "g",
-    );
+    const parameter = /\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&(?:'[_A-Za-z0-9]+\s+)?str\b/g;
+    let parameterMatch;
+    while ((parameterMatch = parameter.exec(fn.signature)) != null) {
+      if (PROMPT_PARAMETER_NAME.test(parameterMatch[1])) {
+        carriers.add(parameterMatch[1]);
+      }
+    }
     // Two passes so a binding chain (question -> lowered -> trimmed) is followed.
     for (let pass = 0; pass < 2; pass += 1) {
+      const binding = new RegExp(
+        `\\blet\\s+(?:mut\\s+)?([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*[^;]*\\b(?:${[...carriers].join("|")})\\b`,
+        "g",
+      );
       binding.lastIndex = 0;
       let bound;
       while ((bound = binding.exec(fn.body)) != null) {
@@ -777,6 +826,48 @@ function findPromptTextBranches(source, relative) {
       });
       break;
     }
+  }
+  return findings;
+}
+
+function findCoverageRoleAuthority(source, relative) {
+  const code = blankNonCode(source);
+  if (!/\.\s*coverage_role\b/.test(code) && !/\bcoverage_role\s*:\s*Some\s*\(/.test(code)) {
+    return [];
+  }
+  return [{
+    kind: "coverage_role_authority",
+    file: relative,
+    detail: "coverage_role appears in production packet behavior",
+  }];
+}
+
+function findBasenameIdentityAuthority(source, relative) {
+  if (
+    !relative.startsWith("crates/codestory-agent/src/")
+    && !relative.startsWith("crates/codestory-runtime/src/agent/")
+  ) {
+    return [];
+  }
+  const findings = [];
+  for (const fn of splitRustFunctions(source)) {
+    if (!/(?:packet|probe|selector)/i.test(fn.name)) continue;
+    const hasBasenameExtraction = /\.file_name\s*\(/.test(fn.body)
+      || /\.r?split(?:_once)?\s*\([^)]*[\/\\]/.test(fn.body)
+      || /\.split\s*\([^)]*[\/\\][^)]*\)\s*\.\s*last\s*\(/.test(fn.body);
+    if (!hasBasenameExtraction) continue;
+    const identityContext = `${fn.name} ${fn.signature} ${blankNonCode(fn.body)}`;
+    if (!/\b(?:query|probe|selector|identity|matches?|required)\b/i.test(identityContext)) {
+      continue;
+    }
+    if (!/(?:==|\.eq\s*\()/.test(fn.body)) {
+      continue;
+    }
+    findings.push({
+      kind: "basename_identity_authority",
+      file: relative,
+      detail: `${fn.name} compares selector identity after basename extraction`,
+    });
   }
   return findings;
 }
@@ -988,6 +1079,8 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
 
     findings.push(...findDomainVocabularyClusters(productionView, relative));
     findings.push(...findPromptTextBranches(productionView, relative));
+    findings.push(...findCoverageRoleAuthority(productionView, relative));
+    findings.push(...findBasenameIdentityAuthority(productionView, relative));
   }
 
   return findings;

@@ -1483,9 +1483,9 @@ fn snippet_exact_id_navigates_openapi_diagnostic_evidence_but_query_stays_typed(
         snippet["resolution"]["resolved"]["resolution_status"],
         "source_range_only"
     );
-    assert_eq!(
-        snippet["resolution"]["resolved"]["eligible_for_sufficiency"],
-        false
+    assert!(
+        snippet["resolution"]["resolved"]["eligible_for_sufficiency"].is_null(),
+        "source navigation must not expose answer-sufficiency authority: {snippet:#}"
     );
     assert!(
         snippet["snippet"]["snippet"]

@@ -423,7 +423,10 @@ fn symbol_to_hit(
         start_line: Some(symbol.start_line),
         target: None,
         source_excerpt: None,
-        source_bytes_upper_bound: None,
+        source_bytes_upper_bound: symbol
+            .node_id
+            .as_ref()
+            .map(|_| codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32),
         score,
         lane_scores: Default::default(),
         source: CandidateSource::Scip,

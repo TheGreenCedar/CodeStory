@@ -2,7 +2,8 @@
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_candidate::{
-    PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
+    PacketAdmissionDecision, PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
+    active_packet_proof_session,
 };
 use crate::agent::packet_degradation::semantic_stage_degradation;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
@@ -18,6 +19,7 @@ use codestory_contracts::api::{
     RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
     RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
+use codestory_contracts::compilation::PacketAdmissionGapKindV1;
 use codestory_contracts::graph::{
     EdgeKind, NodeId as CoreNodeId, NodeKind, TrailCallerScope, TrailConfig, TrailDirection,
 };
@@ -28,7 +30,7 @@ use codestory_retrieval::{
     QueryRequest, QueryResult, QueryTrace, SidecarProfile,
     execute_retrieval_query_with_cache_for_runtime, is_phantom_sidecar_hit,
     is_retrieval_publication_changed, sidecar_project_id_for_root,
-    strict_sidecar_status_for_runtime,
+    strict_descriptor_sidecar_status_for_runtime, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
 use std::cell::RefCell;
@@ -55,7 +57,14 @@ const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
 struct PinnedRetrievalRead {
     session: PinnedQuerySession,
     project_root: PathBuf,
-    node_names: Arc<HashMap<CoreNodeId, String>>,
+    storage_path: PathBuf,
+    node_names: RefCell<Option<Arc<HashMap<CoreNodeId, String>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedRetrievalScope {
+    Full,
+    PacketDescriptor,
 }
 
 thread_local! {
@@ -260,17 +269,49 @@ fn canonical_symbol_names_for_session(
 
 impl PinnedRetrievalRead {
     fn begin(controller: &AppController) -> Result<Self, ApiError> {
+        Self::begin_with_scope(controller, PinnedRetrievalScope::Full)
+    }
+
+    fn begin_packet_descriptor(controller: &AppController) -> Result<Self, ApiError> {
+        Self::begin_with_scope(controller, PinnedRetrievalScope::PacketDescriptor)
+    }
+
+    fn begin_with_scope(
+        controller: &AppController,
+        scope: PinnedRetrievalScope,
+    ) -> Result<Self, ApiError> {
         let project_root = controller.require_project_root()?;
         let storage_path = controller.require_storage_path()?;
-        let session =
-            PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
-                .map_err(map_pinned_query_error)?;
-        let node_names = canonical_symbol_names_for_session(controller, &storage_path, &session)?;
+        let session = match scope {
+            PinnedRetrievalScope::Full => {
+                PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
+            }
+            PinnedRetrievalScope::PacketDescriptor => PinnedQuerySession::begin_packet_descriptor(
+                &project_root,
+                &storage_path,
+                &controller.runtime_config,
+            ),
+        }
+        .map_err(map_pinned_query_error)?;
         Ok(Self {
             session,
             project_root,
-            node_names,
+            storage_path,
+            node_names: RefCell::new(None),
         })
+    }
+
+    fn canonical_node_names(
+        &self,
+        controller: &AppController,
+    ) -> Result<Arc<HashMap<CoreNodeId, String>>, ApiError> {
+        if let Some(node_names) = self.node_names.borrow().as_ref() {
+            return Ok(Arc::clone(node_names));
+        }
+        let node_names =
+            canonical_symbol_names_for_session(controller, &self.storage_path, &self.session)?;
+        self.node_names.replace(Some(Arc::clone(&node_names)));
+        Ok(node_names)
     }
 
     fn ensure_query_identity(&self, query: &QueryResult, operation: &str) -> Result<(), ApiError> {
@@ -320,7 +361,38 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
     if !sidecar_retrieval_primary_enabled(controller) {
         return build();
     }
-    with_stable_retrieval_publication_inner(controller, operation, build, |_| Ok(()))
+    with_stable_retrieval_publication_inner(
+        controller,
+        operation,
+        PinnedRetrievalScope::Full,
+        build,
+        |_| Ok(()),
+    )
+}
+
+/// Pin the retrieval publication for a packet without opening the graph lane
+/// before descriptor admission. Packet compilation performs the ordinary full
+/// readiness check later, after the packet-wide admission session is sealed.
+pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationResponse>(
+    controller: &AppController,
+    operation: &str,
+    mut build: impl FnMut() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        let mut response = build()?;
+        response.attach_retrieval_publication(publication_dto(&pinned));
+        return Ok(response);
+    }
+    if !sidecar_descriptor_retrieval_enabled(controller) {
+        return build();
+    }
+    with_stable_retrieval_publication_inner(
+        controller,
+        operation,
+        PinnedRetrievalScope::PacketDescriptor,
+        build,
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn with_pinned_retrieval_publication_value<T>(
@@ -358,11 +430,17 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
 fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
     controller: &AppController,
     operation: &str,
+    scope: PinnedRetrievalScope,
     mut build: impl FnMut() -> Result<T, ApiError>,
     mut after_retry: impl FnMut(usize) -> Result<(), ApiError>,
 ) -> Result<T, ApiError> {
     for attempt in 0..RETRIEVAL_PUBLICATION_ATTEMPTS {
-        let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
+        let pinned = Rc::new(match scope {
+            PinnedRetrievalScope::Full => PinnedRetrievalRead::begin(controller)?,
+            PinnedRetrievalScope::PacketDescriptor => {
+                PinnedRetrievalRead::begin_packet_descriptor(controller)?
+            }
+        });
         let publication = publication_dto(&pinned);
         let result = with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
             build().and_then(|mut response| {
@@ -448,6 +526,33 @@ pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> b
             auto_on
         }
     }
+}
+
+fn sidecar_descriptor_retrieval_enabled(controller: &AppController) -> bool {
+    if retrieval_env_override() == Some(false) {
+        return false;
+    }
+    // The outer packet boundary admitted and pinned this exact publication
+    // using descriptor-scoped readiness. Re-running project-wide status while
+    // the pin is active cannot strengthen that identity; the descriptor batch
+    // performs its own component health check against the pinned manifest.
+    if active_pinned_retrieval_read(controller).is_some() {
+        return true;
+    }
+    if !sidecar_retrieval_eligible(controller) {
+        return false;
+    }
+    let Ok(project_root) = controller.require_project_root() else {
+        return false;
+    };
+    let Ok(storage_path) = controller.require_storage_path() else {
+        return false;
+    };
+    sidecar_status_can_serve_primary(&sidecar_descriptor_mode_status_for_runtime(
+        &project_root,
+        &storage_path,
+        &controller.runtime_config,
+    ))
 }
 
 pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -> Option<String> {
@@ -664,6 +769,29 @@ fn sidecar_mode_status_for_runtime(
     }
 }
 
+fn sidecar_descriptor_mode_status_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> SidecarModeStatus {
+    match strict_descriptor_sidecar_status_for_runtime(
+        project_root,
+        Some(storage_path),
+        runtime.clone(),
+    ) {
+        Ok(report) => SidecarModeStatus {
+            profile: Some(runtime.profile.as_str().to_string()),
+            mode: report.retrieval_mode,
+            degraded_reason: report.degraded_reason,
+        },
+        Err(error) => SidecarModeStatus {
+            profile: None,
+            mode: "unavailable".into(),
+            degraded_reason: Some(format!("retrieval_status_error: {error}")),
+        },
+    }
+}
+
 pub(crate) fn sidecar_result_rejection_reason(
     query_result: &QueryResult,
     resolved_hits: &[SearchHit],
@@ -751,6 +879,161 @@ pub(crate) fn run_sidecar_query(
     })
 }
 
+/// Run every generic packet query through the descriptor-only sidecar path,
+/// rank the combined identities once, and seal packet admission before any
+/// candidate source or graph hydration begins. The later query calls reuse the
+/// sidecar cache and may hydrate only identities admitted here.
+pub(crate) fn preadmit_packet_descriptor_queries(
+    controller: &AppController,
+    queries: &[String],
+    latency_budget_ms: Option<u32>,
+) -> Result<(), ApiError> {
+    let session = active_packet_proof_session().ok_or_else(|| {
+        ApiError::internal("packet descriptor admission requires an active packet session")
+    })?;
+    if queries.is_empty() || session.remaining_hydration_slots() == 0 {
+        session.seal_retrieval_admission();
+        if let Some(pinned) = active_pinned_retrieval_read(controller) {
+            pinned
+                .session
+                .validate_full_readiness()
+                .map_err(map_pinned_query_error)?;
+        }
+        return Ok(());
+    }
+    if !sidecar_descriptor_retrieval_enabled(controller) {
+        let reason = if retrieval_env_override() == Some(false) {
+            "CODESTORY_RETRIEVAL=0 is unsupported; packet descriptor retrieval is mandatory"
+                .to_string()
+        } else if let (Ok(project_root), Ok(storage_path)) = (
+            controller.require_project_root(),
+            controller.require_storage_path(),
+        ) {
+            let status = sidecar_descriptor_mode_status_for_runtime(
+                &project_root,
+                &storage_path,
+                &controller.runtime_config,
+            );
+            format!(
+                "packet descriptor retrieval is unavailable (profile={} mode={} reason={})",
+                status.profile.as_deref().unwrap_or("unknown"),
+                status.mode,
+                status.degraded_reason.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            "packet descriptor retrieval requires an open indexed project".to_string()
+        };
+        return Err(sidecar_retrieval_unavailable_error(controller, reason));
+    }
+
+    with_pinned_retrieval_read(controller, |pinned| {
+        let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
+            .checked_div(queries.len().max(1) as u64)
+            .unwrap_or(100)
+            .max(100);
+        let batch_items = queries
+            .iter()
+            .map(|query| QueryBatchItem {
+                query,
+                budget_ms: Some(per_query_budget),
+            })
+            .collect::<Vec<_>>();
+        let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+            pinned.session.execute_packet_descriptor_batch_with_cache(
+                &batch_items,
+                crate::services::active_public_operation_cancellation(),
+                cache,
+            )
+        })
+        .map_err(map_pinned_query_error)?;
+        if query_results.len() != queries.len() {
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "packet descriptor batch returned {} results for {} queries",
+                    query_results.len(),
+                    queries.len()
+                ),
+            ));
+        }
+
+        for (expected_query, result) in queries.iter().zip(&query_results) {
+            if result.query != *expected_query {
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!(
+                        "packet descriptor batch query mismatch expected `{expected_query}` got `{}`",
+                        result.query
+                    ),
+                ));
+            }
+            pinned.ensure_query_identity(result, "admitting packet descriptors")?;
+        }
+        admit_packet_candidate_descriptors(
+            &session,
+            query_results.iter().flat_map(|result| result.hits.iter()),
+        );
+        // The repository-wide freshness and core/vector attestation checks are
+        // intentionally deferred until the one packet admission session is
+        // sealed. They may inspect repository records, so running them before
+        // this point would violate the descriptor-first boundary.
+        pinned
+            .session
+            .validate_full_readiness()
+            .map_err(map_pinned_query_error)?;
+        Ok(())
+    })
+}
+
+fn admit_packet_candidate_descriptors<'a>(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    candidates: impl IntoIterator<Item = &'a CandidateHit>,
+) {
+    let mut descriptors = Vec::new();
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| !is_phantom_sidecar_hit(candidate))
+    {
+        if let Some(descriptor) = candidate.packet_descriptor() {
+            descriptors.push(descriptor);
+        } else {
+            let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
+                PacketAdmissionGapKindV1::StableIdentityMissing
+            } else {
+                PacketAdmissionGapKindV1::SourceBoundMissing
+            };
+            session.record_ineligible_candidate(
+                kind,
+                candidate.node_id.as_deref().map(|id| format!("node:{id}")),
+            );
+        }
+    }
+    descriptors.sort_by(|left, right| {
+        right
+            .retrieval_score
+            .value
+            .total_cmp(&left.retrieval_score.value)
+            .then_with(|| left.stable_identity.cmp(&right.stable_identity))
+    });
+    let mut seen = HashSet::new();
+    for descriptor in descriptors {
+        if !seen.insert(descriptor.stable_identity.clone()) {
+            continue;
+        }
+        match session.admit_descriptor(&descriptor) {
+            PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
+            PacketAdmissionDecision::CountBudgetExceeded
+                if session.remaining_hydration_slots() == 0 =>
+            {
+                break;
+            }
+            PacketAdmissionDecision::CountBudgetExceeded
+            | PacketAdmissionDecision::SourceBudgetExceeded => {}
+        }
+    }
+    session.seal_retrieval_admission();
+}
+
 pub(crate) fn run_and_resolve_sidecar_query(
     controller: &AppController,
     query: &str,
@@ -759,17 +1042,30 @@ pub(crate) fn run_and_resolve_sidecar_query(
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
         let query_result = with_detached_sidecar_query_cache(controller, |cache| {
-            pinned.session.execute_with_cache(
-                query,
-                Some(sidecar_budget_ms(latency_budget_ms)),
-                crate::services::active_public_operation_cancellation(),
-                cache,
-            )
+            if crate::agent::packet_candidate::active_packet_proof_session().is_some() {
+                pinned.session.execute_packet_descriptors_with_cache(
+                    query,
+                    Some(sidecar_budget_ms(latency_budget_ms)),
+                    crate::services::active_public_operation_cancellation(),
+                    cache,
+                )
+            } else {
+                pinned.session.execute_with_cache(
+                    query,
+                    Some(sidecar_budget_ms(latency_budget_ms)),
+                    crate::services::active_public_operation_cancellation(),
+                    cache,
+                )
+            }
         })
         .map_err(map_pinned_query_error)?;
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
-        let resolution =
-            resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)?;
+        let resolution = resolve_sidecar_candidates_in_read(
+            controller,
+            pinned,
+            &query_result.hits,
+            max_results,
+        )?;
         Ok((query_result, resolution))
     })
 }
@@ -971,8 +1267,7 @@ fn packet_sidecar_query_diagnostic(
     let semantic = semantic_stage_degradation(&stage_timings);
     // EV-8: a required query whose dense lane went dark and then resolved nothing produced no
     // evidence, but the sidecar itself reports no blocking cancel — the stage budget, not the
-    // query, ran out. Left as `Completed` it would satisfy its query obligation on an empty
-    // result. Naming the cancel here is what lets the obligation ledger demote it.
+    // query, ran out. Left as `Completed` it would misreport an empty result as complete.
     let semantic_timeout_without_hits =
         semantic.timed_out_zero_hits && resolution.resolved_hits.is_empty();
     let cancel_reason = sidecar_blocking_cancel_reason(query_result)
@@ -1038,7 +1333,7 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Vec<_>>();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
-            pinned.session.execute_batch_with_cache(
+            pinned.session.execute_packet_descriptor_batch_with_cache(
                 &batch_items,
                 crate::services::active_public_operation_cancellation(),
                 cache,
@@ -1054,7 +1349,12 @@ fn search_sidecar_packet_batch_inner(
             query_results,
             clamp_elapsed_ms(batch_started_at),
             |query_result, max_results| {
-                resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)
+                resolve_sidecar_candidates_in_read(
+                    controller,
+                    pinned,
+                    &query_result.hits,
+                    max_results,
+                )
             },
         )
     })
@@ -2031,13 +2331,27 @@ fn resolve_candidate_node_id(
 }
 
 fn resolve_sidecar_candidates_in_read(
+    controller: &AppController,
     pinned: &PinnedRetrievalRead,
     candidates: &[CandidateHit],
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
+    if active_packet_proof_session().is_some() {
+        // Packet descriptors carry stable node identities. Canonical-name
+        // streaming is repository-wide core hydration and therefore cannot
+        // happen before or on behalf of a rejected packet candidate.
+        return resolve_sidecar_candidates_in_storage(
+            pinned.session.storage(),
+            &HashMap::new(),
+            &pinned.project_root,
+            candidates,
+            max_results,
+        );
+    }
+    let node_names = pinned.canonical_node_names(controller)?;
     resolve_sidecar_candidates_in_storage(
         pinned.session.storage(),
-        &pinned.node_names,
+        &node_names,
         &pinned.project_root,
         candidates,
         max_results,
@@ -2049,6 +2363,7 @@ fn resolve_sidecar_candidates_in_read(
 type PacketCandidateGraphHydration = (Vec<PacketGraphEdgeProvenance>, Option<GraphResponse>);
 
 const PACKET_CANDIDATE_DIRECTION_NODE_LIMIT: usize = 65;
+const PACKET_CANDIDATE_RAW_EDGE_LIMIT: usize = PACKET_CANDIDATE_DIRECTION_NODE_LIMIT * 6;
 
 fn packet_graph_for_resolved_candidate(
     storage: &Store,
@@ -2091,39 +2406,71 @@ fn packet_graph_for_resolved_candidate(
     {
         edge_filter.push(edge_kind);
     }
-    let bounded_trail = |direction| {
-        storage.get_trail(&TrailConfig {
-            root_id: node_id,
-            depth: 1,
-            direction,
-            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-            edge_filter: edge_filter.clone(),
-            show_utility_calls: true,
-            max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
-            ..TrailConfig::default()
-        })
-    };
-    let incoming = bounded_trail(TrailDirection::Incoming).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to resolve bounded incoming packet candidate graph provenance: {error}"
-        ))
-    })?;
-    let outgoing = bounded_trail(TrailDirection::Outgoing).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to resolve bounded outgoing packet candidate graph provenance: {error}"
-        ))
-    })?;
-    let scan_truncated = incoming.truncated || outgoing.truncated;
-    let scan_omitted_edge_count = incoming
-        .omitted_edge_count
-        .saturating_add(outgoing.omitted_edge_count);
-    let mut seen_incident_edge_ids = HashSet::new();
-    let mut collected = Vec::new();
-    for edge in incoming.edges.into_iter().chain(outgoing.edges) {
-        if seen_incident_edge_ids.insert(edge.id) {
-            collected.push(edge);
-        }
-    }
+    let identity_scope = active_packet_proof_session();
+    let (collected, scan_truncated, scan_omitted_edge_count) =
+        if let Some(identity_scope) = identity_scope.as_ref() {
+            // Trail traversal materializes every endpoint node before it returns
+            // the incident edges. A packet may inspect only identities admitted
+            // by the packet-wide descriptor gate, so use the edge-only view and
+            // discard unadmitted endpoints before any node or file hydration.
+            let incident = storage
+                .get_bounded_raw_incident_edges(node_id, PACKET_CANDIDATE_RAW_EDGE_LIMIT)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve bounded packet candidate edge provenance: {error}"
+                    ))
+                })?;
+            let mut omitted = u32::from(incident.truncated);
+            let mut collected = Vec::new();
+            for edge in incident.edges {
+                let (source, target) = edge.effective_endpoints();
+                if !edge_filter.contains(&edge.kind)
+                    || (source != node_id && target != node_id)
+                    || !identity_scope.is_admitted_node(source)
+                    || !identity_scope.is_admitted_node(target)
+                {
+                    omitted = omitted.saturating_add(1);
+                    continue;
+                }
+                collected.push(edge);
+            }
+            (collected, incident.truncated, omitted)
+        } else {
+            let bounded_trail = |direction| {
+                storage.get_trail(&TrailConfig {
+                    root_id: node_id,
+                    depth: 1,
+                    direction,
+                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+                    edge_filter: edge_filter.clone(),
+                    show_utility_calls: true,
+                    max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
+                    ..TrailConfig::default()
+                })
+            };
+            let incoming = bounded_trail(TrailDirection::Incoming).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve bounded incoming packet candidate graph provenance: {error}"
+                ))
+            })?;
+            let outgoing = bounded_trail(TrailDirection::Outgoing).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve bounded outgoing packet candidate graph provenance: {error}"
+                ))
+            })?;
+            let scan_truncated = incoming.truncated || outgoing.truncated;
+            let scan_omitted_edge_count = incoming
+                .omitted_edge_count
+                .saturating_add(outgoing.omitted_edge_count);
+            let mut seen_incident_edge_ids = HashSet::new();
+            let mut collected = Vec::new();
+            for edge in incoming.edges.into_iter().chain(outgoing.edges) {
+                if seen_incident_edge_ids.insert(edge.id) {
+                    collected.push(edge);
+                }
+            }
+            (collected, scan_truncated, scan_omitted_edge_count)
+        };
 
     let mut edges = Vec::new();
     for edge in collected {
@@ -2148,12 +2495,17 @@ fn packet_graph_for_resolved_candidate(
             edges.push((edge, direction, hop, hydrated));
         }
     }
-    edges.sort_by(|(left, _, _, left_hydrated), (right, _, _, right_hydrated)| {
-        left_hydrated.cmp(right_hydrated).then_with(|| {
-            packet_graph_certainty_priority(left.certainty)
-                .cmp(&packet_graph_certainty_priority(right.certainty))
-        }).then_with(|| left.id.0.cmp(&right.id.0))
-    });
+    edges.sort_by(
+        |(left, _, _, left_hydrated), (right, _, _, right_hydrated)| {
+            left_hydrated
+                .cmp(right_hydrated)
+                .then_with(|| {
+                    packet_graph_certainty_priority(left.certainty)
+                        .cmp(&packet_graph_certainty_priority(right.certainty))
+                })
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        },
+    );
     if edges.is_empty() {
         return Ok((Vec::new(), None));
     }
@@ -2161,9 +2513,7 @@ fn packet_graph_for_resolved_candidate(
     let graph_flags = app_graph_flags();
     let edge_dtos = edges
         .iter()
-        .map(|(edge, _, _, _)| {
-            graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags)
-        })
+        .map(|(edge, _, _, _)| graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags))
         .collect::<Vec<_>>();
     let nodes = packet_graph_endpoint_nodes(storage, node_names, node_id, &edge_dtos)?;
 
@@ -2278,26 +2628,116 @@ fn resolve_sidecar_candidates_in_storage(
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashSet::new();
-    let mut pending = ordered_sidecar_candidates(candidates, |candidate| {
-        candidate_path_resolvable(project_root, &candidate.file_path)
-    });
-
-    let identity_scope = crate::agent::packet_candidate::active_packet_proof_session()
-        .unwrap_or_else(|| Rc::new(crate::agent::packet_candidate::PacketProofSession::new()));
-    let max_results = max_results
-        .min(codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES)
-        .min(identity_scope.remaining_hydration_slots());
+    let identity_scope = crate::agent::packet_candidate::active_packet_proof_session();
+    let mut pending = if identity_scope.is_some() {
+        // Packet admission consumes the sidecar's versioned order and descriptor
+        // metadata only. Even a filesystem stat would inspect an unadmitted
+        // candidate, so path validation waits until after admission.
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
+            .map(|(index, candidate)| (index, candidate, false))
+            .collect::<Vec<_>>()
+    } else {
+        ordered_sidecar_candidates(candidates, |candidate| {
+            candidate_path_resolvable(project_root, &candidate.file_path)
+        })
+    };
+    if identity_scope.is_some() {
+        pending.sort_by(|left, right| {
+            let left_candidate = left.1;
+            let right_candidate = right.1;
+            right_candidate
+                .score
+                .total_cmp(&left_candidate.score)
+                .then_with(|| left_candidate.node_id.cmp(&right_candidate.node_id))
+                .then_with(|| left_candidate.file_path.cmp(&right_candidate.file_path))
+        });
+    }
+    let max_results =
+        max_results.min(codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES);
     let mut admitted: Vec<(CoreNodeId, &CandidateHit)> = Vec::new();
 
     while admitted.len() < max_results && !pending.is_empty() {
         let (candidate_index, candidate, path_resolvable) = pending.remove(0);
         attempted_candidate_indices.insert(candidate_index);
         let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
-        let Some(node_id) =
+        let descriptor = if let Some(identity_scope) = identity_scope.as_ref() {
+            match candidate.packet_descriptor() {
+                Some(descriptor) => Some(descriptor),
+                None => {
+                    let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
+                        PacketAdmissionGapKindV1::StableIdentityMissing
+                    } else {
+                        PacketAdmissionGapKindV1::SourceBoundMissing
+                    };
+                    identity_scope.record_ineligible_candidate(
+                        kind,
+                        candidate.node_id.as_deref().map(|id| format!("node:{id}")),
+                    );
+                    unresolved_candidates.push((
+                        candidate,
+                        if matches!(kind, PacketAdmissionGapKindV1::StableIdentityMissing) {
+                            "stable_identity_missing"
+                        } else {
+                            "source_bound_missing"
+                        },
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(identity_scope), Some(descriptor)) =
+            (identity_scope.as_ref(), descriptor.as_ref())
+        {
+            // The descriptor batch sealed the packet-wide session before this
+            // hydration path began. A candidate missing from that admitted set
+            // is rejected before even a path lookup or node read.
+            match identity_scope.admit_descriptor(descriptor) {
+                PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
+                PacketAdmissionDecision::CountBudgetExceeded => {
+                    unresolved_candidates.push((candidate, "candidate_count_exceeded"));
+                    continue;
+                }
+                PacketAdmissionDecision::SourceBudgetExceeded => {
+                    unresolved_candidates.push((candidate, "source_budget_exceeded"));
+                    continue;
+                }
+            }
+        }
+        let node_id = if let Some(descriptor) = descriptor.as_ref() {
+            descriptor
+                .stable_identity
+                .strip_prefix("node:")
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .map(CoreNodeId)
+                .or_else(|| {
+                    descriptor
+                        .stable_identity
+                        .strip_prefix("path:")
+                        .and_then(|_| {
+                            resolve_candidate_node_id(
+                                storage,
+                                node_names,
+                                project_root,
+                                &rel_path,
+                                candidate,
+                            )
+                        })
+                })
+        } else {
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
-        else {
+        };
+        let Some(node_id) = node_id else {
             let label = if path_resolvable {
-                "node_unresolved"
+                if identity_scope.is_some() {
+                    "stable_identity_missing"
+                } else {
+                    "node_unresolved"
+                }
             } else {
                 "path_unresolvable"
             };
@@ -2308,15 +2748,8 @@ fn resolve_sidecar_candidates_in_storage(
         if !seen.insert(dedupe_key) {
             continue;
         }
-        let source_cost = candidate.conservative_source_bytes();
-        if source_cost > identity_scope.remaining_source_bytes() {
-            unresolved_candidates.push((candidate, "source_budget_exceeded"));
-            continue;
-        }
-        identity_scope.consume_source_bytes(source_cost);
         admitted.push((node_id, candidate));
     }
-    identity_scope.consume_hydration_slots(admitted.len());
 
     for (node_id, candidate) in admitted {
         let Some(hit) =
@@ -2465,8 +2898,8 @@ mod tests {
         NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
     };
     use codestory_retrieval::{
-        CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
-        classify_query, project_id_for_root, rank_candidates,
+        CandidateHit, CandidateSource, QueryTrace, RetrievalCacheKey, RetrievalStageKind,
+        StageTrace, classify_query, project_id_for_root, rank_candidates,
         test_support::{publish_zero_dense_pinned_query_fixture, retrieval_manifest_fixture},
     };
 
@@ -2568,7 +3001,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -2615,6 +3047,7 @@ mod tests {
         let response = with_stable_retrieval_publication_inner(
             &fixture.controller,
             "test response",
+            PinnedRetrievalScope::Full,
             || {
                 build_calls += 1;
                 assert!(
@@ -2681,7 +3114,14 @@ mod tests {
         let fixture = pinned_operation_fixture();
 
         let first = PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
-        let first_names = Arc::clone(&first.node_names);
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            0,
+            "pinning alone must not stream repository node records"
+        );
+        let first_names = first
+            .canonical_node_names(&fixture.controller)
+            .expect("load first canonical map");
         drop(first);
         assert_eq!(canonical_stream_count(&fixture.controller), 1);
 
@@ -2689,15 +3129,60 @@ mod tests {
         assert_eq!(
             canonical_stream_count(&fixture.controller),
             1,
+            "pinning alone must not restream the canonical table"
+        );
+        let second_names = second
+            .canonical_node_names(&fixture.controller)
+            .expect("reuse canonical map");
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            1,
             "a pin on an unchanged publication must not restream the canonical table"
         );
         assert_eq!(
-            *second.node_names, *first_names,
+            *second_names, *first_names,
             "the reused map must be the map the stream produced"
         );
         assert!(
-            Arc::ptr_eq(&second.node_names, &first_names),
+            Arc::ptr_eq(&second_names, &first_names),
             "the reused map must be the cached allocation, not a fresh clone"
+        );
+    }
+
+    #[test]
+    fn rejected_packet_candidate_does_not_stream_repository_identity_records() {
+        use crate::agent::packet_candidate::{
+            PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
+        };
+
+        let fixture = pinned_operation_fixture();
+        let pinned = PinnedRetrievalRead::begin(&fixture.controller).expect("packet pin");
+        let admission = Rc::new(PacketProofSession::new());
+        for index in 0..codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                admission.admit(&format!("node:{index}"), 1),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let _guard = install_packet_proof_session(Rc::clone(&admission));
+        let mut rejected = CandidateHit::with_source(
+            "src/never-opened.rs",
+            Some("NeverOpened".into()),
+            1.0,
+            CandidateSource::Lexical,
+        );
+        rejected.node_id = Some("17".into());
+        rejected.source_bytes_upper_bound = Some(1);
+
+        let result =
+            resolve_sidecar_candidates_in_read(&fixture.controller, &pinned, &[rejected], 1)
+                .expect("budget rejection is diagnostic");
+
+        assert!(result.resolved_hits.is_empty());
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            0,
+            "the seventeenth identity must not trigger canonical node hydration"
         );
     }
 
@@ -2708,7 +3193,10 @@ mod tests {
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
         let fixture = pinned_operation_fixture();
-        PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
+        PinnedRetrievalRead::begin(&fixture.controller)
+            .expect("first pin")
+            .canonical_node_names(&fixture.controller)
+            .expect("load first canonical map");
         assert_eq!(canonical_stream_count(&fixture.controller), 1);
 
         let mut writer = Store::open(&fixture.storage_path).expect("open publication writer");
@@ -2740,7 +3228,10 @@ mod tests {
         )
         .expect("republish the retrieval fixture for the new core generation");
 
-        PinnedRetrievalRead::begin(&fixture.controller).expect("pin the new publication");
+        PinnedRetrievalRead::begin(&fixture.controller)
+            .expect("pin the new publication")
+            .canonical_node_names(&fixture.controller)
+            .expect("load replacement canonical map");
         assert_eq!(
             canonical_stream_count(&fixture.controller),
             2,
@@ -2894,6 +3385,7 @@ mod tests {
         let error = with_stable_retrieval_publication_inner(
             &fixture.controller,
             "cancelled response",
+            PinnedRetrievalScope::Full,
             || Err::<TestPublicationResponse, _>(ApiError::new("cancelled", "request cancelled")),
             |_| Ok(()),
         )
@@ -3311,7 +3803,7 @@ mod tests {
             &storage,
             &HashMap::new(),
             Path::new("."),
-            &[candidate],
+            &[candidate.clone()],
             1,
         )
         .expect("resolve typed lexical candidate");
@@ -3338,7 +3830,143 @@ mod tests {
     }
 
     #[test]
-    fn packet_candidate_keeps_exact_scip_edge_provenance_without_public_hit_fields() {
+    fn seventeenth_packet_identity_is_rejected_before_core_hydration() {
+        use crate::agent::packet_candidate::{
+            PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
+        };
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let storage_path = storage_root.path().join("codestory.db");
+        let storage = Store::open(&storage_path).expect("storage");
+        let poison = rusqlite::Connection::open(&storage_path).expect("poison connection");
+        poison
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE edge;
+                 DROP TABLE node;
+                 DROP TABLE file;",
+            )
+            .expect("remove every core hydration table");
+        drop(poison);
+        let session = Rc::new(PacketProofSession::new());
+        for index in 0..codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                session.admit(
+                    &format!("node:{index}"),
+                    codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
+                ),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let mut seventeenth = CandidateHit::with_source(
+            "src/never-opened.rs",
+            Some("NeverOpened".to_string()),
+            1.0,
+            CandidateSource::Lexical,
+        );
+        seventeenth.node_id = Some("17".to_string());
+        seventeenth.source_bytes_upper_bound =
+            Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[seventeenth],
+            1,
+        )
+        .expect("count rejection is diagnostic, not a storage failure");
+
+        assert!(outcome.resolved_hits.is_empty());
+        assert!(outcome.packet_hits.is_empty());
+        assert_eq!(outcome.unresolved_candidate_count, 1);
+        assert_eq!(*session.hydrated_admissions.borrow(), 16);
+    }
+
+    #[test]
+    fn packet_admission_consumes_versioned_retrieval_score_order() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let storage = Store::new_in_memory().expect("storage");
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let mut low = CandidateHit::with_source(
+            "src/low.rs",
+            Some("Low".to_string()),
+            0.1,
+            CandidateSource::Lexical,
+        );
+        low.node_id = Some("1".to_string());
+        low.source_bytes_upper_bound = Some(64);
+        let mut high = CandidateHit::with_source(
+            "src/high.rs",
+            Some("High".to_string()),
+            0.9,
+            CandidateSource::Lexical,
+        );
+        high.node_id = Some("2".to_string());
+        high.source_bytes_upper_bound = Some(64);
+
+        let _ = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[low, high],
+            1,
+        )
+        .expect("missing core rows are diagnostic after descriptor admission");
+
+        assert_eq!(session.receipts().len(), 1);
+        assert_eq!(session.receipts()[0].stable_identity, "node:2");
+        assert_eq!(
+            session.receipts()[0].score_version,
+            codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1
+        );
+    }
+
+    #[test]
+    fn descriptor_admission_ranks_candidates_across_query_batches_before_sealing() {
+        use crate::agent::packet_candidate::{PacketAdmissionDecision, PacketProofSession};
+
+        let session = PacketProofSession::new();
+        for index in 0..15 {
+            assert_eq!(
+                session.admit_exact_selector(&format!("node:exact-{index}"), 1, index),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let mut low = CandidateHit::with_source(
+            "src/low.rs",
+            Some("Low".to_string()),
+            0.1,
+            CandidateSource::Lexical,
+        );
+        low.node_id = Some("1".to_string());
+        low.source_bytes_upper_bound = Some(64);
+        let mut high = CandidateHit::with_source(
+            "src/high.rs",
+            Some("High".to_string()),
+            0.9,
+            CandidateSource::Semantic,
+        );
+        high.node_id = Some("2".to_string());
+        high.source_bytes_upper_bound = Some(64);
+
+        admit_packet_candidate_descriptors(&session, [&low, &high]);
+
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(session.receipts()[15].stable_identity, "node:2");
+        assert_eq!(
+            session.admit_descriptor(&low.packet_descriptor().expect("complete low descriptor")),
+            PacketAdmissionDecision::CountBudgetExceeded,
+            "the sealed session must not admit a late lower-scoring query candidate"
+        );
+    }
+
+    #[test]
+    fn packet_graph_never_hydrates_or_projects_an_unadmitted_endpoint() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
         use codestory_retrieval::CandidateGraphEvidence;
         use codestory_store::{FileInfo, FileRole};
 
@@ -3411,17 +4039,48 @@ mod tests {
             edge_weight: 1.0,
             direction_weight: 1.0,
         });
+        candidate.source_bytes_upper_bound = Some(512);
+
+        let session = Rc::new(PacketProofSession::new());
+        let guard = install_packet_proof_session(Rc::clone(&session));
 
         let outcome = resolve_sidecar_candidates_in_storage(
             &storage,
             &HashMap::new(),
             Path::new("."),
-            &[candidate],
+            &[candidate.clone()],
             1,
         )
         .expect("resolve packet candidate");
         assert_eq!(outcome.resolved_hits.len(), 1);
         let packet_hit = outcome.packet_hits.first().expect("packet hit");
+        assert!(packet_hit.graph_provenance.is_empty());
+        assert!(packet_hit.graph.is_none());
+        drop(guard);
+
+        let mut admitted_peer = CandidateHit::with_source(
+            "requests/sessions.py",
+            Some("Session.request".into()),
+            0.7,
+            CandidateSource::Scip,
+        );
+        admitted_peer.node_id = Some("2".into());
+        admitted_peer.source_bytes_upper_bound = Some(512);
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(session);
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[candidate, admitted_peer],
+            2,
+        )
+        .expect("resolve both admitted packet candidates");
+        let packet_hit = outcome
+            .packet_hits
+            .iter()
+            .find(|hit| hit.hit.node_id.0 == "3")
+            .expect("target packet hit");
         assert_eq!(
             packet_hit
                 .graph_provenance
@@ -3729,7 +4388,7 @@ mod tests {
 
     /// EV-8. The sidecar reports no blocking cancel when only a *stage* runs out of budget, so a
     /// query whose dense lane went dark and then resolved nothing used to arrive as `Completed`
-    /// and satisfy its query obligation on an empty result.
+    /// and report an empty result as complete.
     #[test]
     fn a_semantic_stage_timeout_with_no_resolved_hits_cancels_the_query() {
         let result = query_result_with_stages(vec![semantic_stage_trace(
@@ -3948,7 +4607,7 @@ mod tests {
         assert!(breakdown.semantic > 0.0);
         assert_eq!(breakdown.graph, 0.0);
         assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::DenseSemantic));
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
     }
 
     #[test]
@@ -4014,7 +4673,7 @@ mod tests {
             structural.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
         );
-        assert_eq!(structural.eligible_for_sufficiency, Some(false));
+        assert_eq!(structural.eligible_for_sufficiency, None);
 
         let mut exact = undecorated_search_hit_for_candidate(&lexical);
         exact.evidence_tier = Some(PacketEvidenceTier::ExactSource);
@@ -4027,7 +4686,7 @@ mod tests {
             exact.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
         );
-        assert_eq!(exact.eligible_for_sufficiency, Some(false));
+        assert_eq!(exact.eligible_for_sufficiency, None);
 
         let mut affinity = CandidateHit::with_source(
             "src/service.rs",
@@ -4810,7 +5469,7 @@ mod tests {
             CandidateSource::Scip,
         );
         candidate.node_id = Some("2".into());
-        let resolution = resolve_sidecar_candidates_in_read(&pinned, &[candidate], 1)
+        let resolution = resolve_sidecar_candidates_in_read(&controller, &pinned, &[candidate], 1)
             .expect("resolve against pinned snapshot");
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.resolved_hits[0].display_name, "original");

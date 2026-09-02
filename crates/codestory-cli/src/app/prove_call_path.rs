@@ -4,12 +4,8 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand, VerifyOutputMode};
-use crate::call_path_grammar::parse_call_path_document;
 use crate::output::emit;
-use crate::prove_call_path::{
-    internal_projection_root, project_public_verification_result, projection_root,
-    read_bounded_call_path, validate_request,
-};
+use crate::prove_call_path::read_bounded_call_path;
 use crate::runtime::{RuntimeContext, map_api_error};
 
 pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsCommand) -> Result<()> {
@@ -20,8 +16,13 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
     }
     let document = read_bounded_call_path(&cmd.spec)?;
     let contract =
-        parse_call_path_document(&document).map_err(|error| anyhow::Error::msg(error.message))?;
-    let validation = validate_request(contract).map_err(anyhow::Error::msg)?;
+        codestory_runtime::proof_qualification_support::parse_public_call_path_document(&document)
+            .map_err(anyhow::Error::msg)?;
+    let validation =
+        codestory_runtime::proof_qualification_support::validate_public_call_path_contract(
+            contract,
+        )
+        .map_err(anyhow::Error::msg)?;
     let project = ProjectArgs {
         project: cmd.project,
         cache_dir: None,
@@ -35,7 +36,7 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
             Arc::new(AtomicBool::new(false)),
         )
         .map_err(map_api_error)?;
-    let root = match validation {
+    let public = match validation {
         codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
             contract,
             hashes,
@@ -50,7 +51,10 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            projection_root(&operation).map_err(anyhow::Error::msg)?
+            codestory_runtime::proof_qualification_support::project_observed_public_operation(
+                &operation,
+            )
+            .map_err(anyhow::Error::msg)?
         }
         codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
             spec,
@@ -68,9 +72,11 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            internal_projection_root(&operation.value)
+            codestory_runtime::proof_qualification_support::project_internal_projection(
+                &operation.value,
+            )
+            .map_err(anyhow::Error::msg)?
         }
     };
-    let public = project_public_verification_result(root).map_err(anyhow::Error::msg)?;
     emit(OutputFormat::Json, &public, String::new(), None)
 }

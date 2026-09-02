@@ -85,26 +85,14 @@ fn jsonrpc_error_v3(id: Value, code: i64, message: &str) -> Value {
 
 pub(crate) fn build_proof_tool_result_v3(
     revision: McpRevisionV3,
-    internal_root: &Value,
+    public_result: &codestory_contracts::call_path_public::PublicCallPathResultDto,
 ) -> Result<Value, StdioV3InternalError> {
     let tool_name = crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME;
-    codestory_runtime::proof_qualification_support::validate_compact_projection(internal_root)
-        .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
-    let public_root =
-        crate::prove_call_path::project_public_verification_result(internal_root.clone())
-            .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
-    if crate::stdio_arguments::validate_structured_content(
-        &super::catalog::proof_output_schema_v3(),
-        &public_root,
-    )
-    .is_err()
-    {
-        return Err(StdioV3InternalError::OutputSchemaViolation);
-    }
+    let public_root = public_result.as_value();
     let result = build_tool_result_for_surface_v3(
         revision,
         tool_name,
-        &public_root,
+        public_root,
         V3SurfaceSet::WithProof,
     )?;
     let bytes = crate::stdio_transport::v3_serialize_call_tool_result(&result)
@@ -113,22 +101,16 @@ pub(crate) fn build_proof_tool_result_v3(
         return Ok(result);
     }
 
-    let fallback_internal = proof_budget_fallback_v3(internal_root, bytes.len())?;
     let fallback_public =
-        crate::prove_call_path::project_public_verification_result(fallback_internal)
-            .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
-    if crate::stdio_arguments::validate_structured_content(
-        &super::catalog::proof_output_schema_v3(),
-        &fallback_public,
-    )
-    .is_err()
-    {
-        return Err(StdioV3InternalError::OutputSchemaViolation);
-    }
+        codestory_runtime::proof_qualification_support::project_public_transport_budget_result(
+            public_result,
+            bytes.len(),
+        )
+        .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(
         revision,
         tool_name,
-        &fallback_public,
+        fallback_public.as_value(),
         V3SurfaceSet::WithProof,
     )?;
     let fallback_bytes = crate::stdio_transport::v3_serialize_call_tool_result(&fallback_result)
@@ -184,6 +166,16 @@ fn revision_native_tool_result_with_schema_v3(
         let _ = violations;
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
+    revision_native_tool_result_unchecked_v3(revision, root)
+}
+
+/// Build the revision-native envelope without validating a product schema.
+/// This is used only to measure an already-detected overbound internal packet
+/// before replacing it with the runtime-owned typed budget fallback.
+pub(crate) fn revision_native_tool_result_unchecked_v3(
+    revision: McpRevisionV3,
+    root: &Value,
+) -> Result<Value, StdioV3InternalError> {
     let text = serde_json::to_string(root)
         .map_err(|error| StdioV3InternalError::Serialization(error.to_string()))?;
     if revision.profile().structured_content {
@@ -205,42 +197,6 @@ fn revision_native_tool_result_with_schema_v3(
             "isError": false
         }))
     }
-}
-
-fn proof_budget_fallback_v3(
-    complete: &Value,
-    required_complete_size: usize,
-) -> Result<Value, StdioV3InternalError> {
-    if complete.get("kind") != Some(&json!("complete")) {
-        return Err(StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: PROOF_TOOL_RESULT_MAX_BYTES_V3,
-            actual_bytes: required_complete_size,
-        });
-    }
-    let required = |name: &str| {
-        complete
-            .get(name)
-            .cloned()
-            .ok_or_else(|| StdioV3InternalError::InvalidProjection(name.to_string()))
-    };
-    let contract_digest = required("contract_digest")?;
-    Ok(json!({
-        "kind": "budget_exceeded",
-        "schema_version": required("schema_version")?,
-        "domain": required("domain")?,
-        "contract_interpretation": required("contract_interpretation")?,
-        "guard_version": required("guard_version")?,
-        "source_text_sha256": required("source_text_sha256")?,
-        "contract_digest": contract_digest,
-        "core_publication": required("core_publication")?,
-        "disposition": {
-            "kind": "unknown",
-            "contract_digest": contract_digest,
-            "gaps": [{"kind":"output_budget_exceeded"}]
-        },
-        "cap_bytes": PROOF_TOOL_RESULT_MAX_BYTES_V3,
-        "required_complete_size": required_complete_size
-    }))
 }
 
 pub(crate) fn semantic_tool_error_v3(message: &str) -> Value {
@@ -278,6 +234,13 @@ mod tests {
         ReceiptRef, ResolvedNodeIdentity, VerifiedDirectCallFact, VerifiedProofFact,
     };
     use sha2::{Digest, Sha256};
+
+    fn public_result(
+        root: Value,
+    ) -> codestory_contracts::call_path_public::PublicCallPathResultDto {
+        codestory_runtime::proof_qualification_support::project_public_verification_result(root)
+            .expect("project public verification result")
+    }
 
     fn resolution_fact_id(evidence_sha256: &str) -> String {
         let mut hasher = Sha256::new();
@@ -450,18 +413,17 @@ mod tests {
     #[test]
     fn actual_projected_root_round_trips_through_all_revision_profiles() {
         let internal = actual_projected_root("A calls B();\n".to_owned());
-        let public = crate::prove_call_path::project_public_verification_result(internal.clone())
-            .expect("project public verification result");
+        let public = public_result(internal);
         for revision in McpRevisionV3::all() {
-            let result = build_proof_tool_result_v3(*revision, &internal)
+            let result = build_proof_tool_result_v3(*revision, &public)
                 .unwrap_or_else(|error| panic!("{revision:?}: {error:?}"));
             assert_eq!(
                 serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
                     .unwrap(),
-                public
+                *public.as_value()
             );
             if revision.profile().structured_content {
-                assert_eq!(result["structuredContent"], public);
+                assert_eq!(result["structuredContent"], *public.as_value());
             }
         }
     }
@@ -474,122 +436,73 @@ mod tests {
     }
 
     #[cfg(feature = "proof-qualification-support")]
-    fn actual_projected_root_at_revision_bytes(revision: McpRevisionV3, target: usize) -> Value {
-        let root = actual_projected_root("A calls B();\n".to_owned());
-        let size = |root: &Value| {
-            let public = crate::prove_call_path::project_public_verification_result(root.clone())
-                .expect("project public verification result for size probe");
-            let result = build_tool_result_for_surface_v3(
-                revision,
-                crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
-                &public,
-                V3SurfaceSet::WithProof,
-            )
-            .expect("unbounded revision-native result");
-            crate::stdio_transport::v3_serialize_call_tool_result(&result)
-                .expect("unbounded revision-native bytes")
-                .len()
-        };
-        let baseline = size(&root);
-        assert!(baseline < target);
-        for quote_count in 0..=16 {
-            let mut candidate = root.clone();
-            set_receipt_line_text(&mut candidate, "\"".repeat(quote_count));
-            let candidate_size = size(&candidate);
-            let mut one_more = candidate.clone();
-            set_receipt_line_text(&mut one_more, format!("{}x", "\"".repeat(quote_count)));
-            let byte_step = size(&one_more) - candidate_size;
-            let remaining = target.saturating_sub(candidate_size);
-            if byte_step > 0 && remaining % byte_step == 0 {
-                let mut count = remaining / byte_step;
-                for _ in 0..4 {
-                    set_receipt_line_text(
-                        &mut candidate,
-                        format!("{}{}", "\"".repeat(quote_count), "x".repeat(count)),
-                    );
-                    let actual = size(&candidate);
-                    if actual == target {
-                        return candidate;
-                    }
-                    let delta = isize::try_from(target).unwrap() - isize::try_from(actual).unwrap();
-                    let adjustment = delta / isize::try_from(byte_step).unwrap();
-                    let Some(next) = count.checked_add_signed(adjustment) else {
-                        break;
-                    };
-                    if next == count {
-                        break;
-                    }
-                    count = next;
-                }
+    fn near_compact_limit_public_result()
+    -> codestory_contracts::call_path_public::PublicCallPathResultDto {
+        let mut last_complete = public_result(actual_projected_root("x".to_owned()));
+        for quote_count in 1..=4_096 {
+            let mut candidate = actual_projected_root("A calls B();\n".to_owned());
+            set_receipt_line_text(
+                &mut candidate,
+                format!("A calls B();\n{}", "\"".repeat(quote_count)),
+            );
+            let projected = public_result(candidate);
+            if projected.as_value()["kind"] == "budget_exceeded" {
+                break;
             }
+            last_complete = projected;
         }
-        panic!("revision {revision:?} cannot reach target {target}");
+        last_complete
     }
 
     #[cfg(feature = "proof-qualification-support")]
     #[test]
-    fn revision_transport_owns_actual_projected_root_budgeting_and_internal_errors() {
+    fn runtime_projection_and_revision_transport_own_their_distinct_budgets() {
+        let complete = near_compact_limit_public_result();
+        let mut saw_transport_fallback = false;
         for revision in McpRevisionV3::all() {
-            let fitting_size = if revision.profile().structured_content {
-                PROOF_TOOL_RESULT_MAX_BYTES_V3 - 1
-            } else {
-                PROOF_TOOL_RESULT_MAX_BYTES_V3
-            };
-            let complete = actual_projected_root_at_revision_bytes(*revision, fitting_size);
-            let complete_result = build_proof_tool_result_v3(*revision, &complete).unwrap();
-            assert_eq!(
-                crate::stdio_transport::v3_serialize_call_tool_result(&complete_result)
-                    .unwrap()
-                    .len(),
-                fitting_size
-            );
-
-            let oversized = actual_projected_root_at_revision_bytes(
+            let unbounded = build_tool_result_for_surface_v3(
                 *revision,
-                PROOF_TOOL_RESULT_MAX_BYTES_V3 + 1,
-            );
-            let oversized_public =
-                crate::prove_call_path::project_public_verification_result(oversized.clone())
-                    .expect("project oversized public verification result");
-            let expected_size = crate::stdio_transport::v3_serialize_call_tool_result(
-                &build_tool_result_for_surface_v3(
-                    *revision,
-                    crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
-                    &oversized_public,
-                    V3SurfaceSet::WithProof,
-                )
-                .unwrap(),
+                crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
+                complete.as_value(),
+                V3SurfaceSet::WithProof,
             )
-            .unwrap()
-            .len();
-            let fallback = build_proof_tool_result_v3(*revision, &oversized).unwrap();
-            let fallback_bytes =
-                crate::stdio_transport::v3_serialize_call_tool_result(&fallback).unwrap();
-            assert!(fallback_bytes.len() <= PROOF_TOOL_RESULT_MAX_BYTES_V3);
-            let fallback_root =
-                serde_json::from_str::<Value>(fallback["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+            let unbounded_size = crate::stdio_transport::v3_serialize_call_tool_result(&unbounded)
+                .unwrap()
+                .len();
+            let bounded = build_proof_tool_result_v3(*revision, &complete).unwrap();
+            let bounded_bytes =
+                crate::stdio_transport::v3_serialize_call_tool_result(&bounded).unwrap();
+            assert!(bounded_bytes.len() <= PROOF_TOOL_RESULT_MAX_BYTES_V3);
+            let bounded_root =
+                serde_json::from_str::<Value>(bounded["content"][0]["text"].as_str().unwrap())
                     .unwrap();
-            assert_eq!(fallback_root["kind"], "budget_exceeded");
-            assert_eq!(fallback_root["required_complete_size"], expected_size);
-            assert_eq!(fallback_root["domain"], "call-path/v1");
-            assert_eq!(fallback_root["runtime_execution_proven"], false);
+            if unbounded_size > PROOF_TOOL_RESULT_MAX_BYTES_V3 {
+                saw_transport_fallback = true;
+                assert_eq!(bounded_root["kind"], "budget_exceeded");
+                assert_eq!(bounded_root["required_complete_size"], unbounded_size);
+            } else {
+                assert_eq!(bounded_root["kind"], "complete");
+            }
+            assert_eq!(bounded_root["domain"], "call-path/v1");
+            assert_eq!(bounded_root["runtime_execution_proven"], false);
             if revision.profile().structured_content {
-                assert_eq!(fallback["structuredContent"], fallback_root);
+                assert_eq!(bounded["structuredContent"], bounded_root);
             }
         }
+        assert!(
+            saw_transport_fallback,
+            "at least one structured-content revision must exercise the outer envelope budget"
+        );
 
         let mut fallback_too_large = actual_projected_root("A calls B();\n".to_owned());
         fallback_too_large["core_publication"]["project_id"] = json!("p".repeat(70_000));
-        let error = build_proof_tool_result_v3(McpRevisionV3::November2024, &fallback_too_large)
-            .expect_err("oversized fallback must fail internally");
-        assert!(matches!(
-            error,
-            StdioV3InternalError::ResultExceedsBudget { .. }
-        ));
-        assert_eq!(
-            jsonrpc_internal_error_v3(json!(99), &error).pointer("/error/code"),
-            Some(&json!(-32603))
-        );
+        let error =
+            codestory_runtime::proof_qualification_support::project_public_verification_result(
+                fallback_too_large,
+            )
+            .expect_err("oversized runtime fallback must fail internally");
+        assert!(error.contains("even after budget projection"), "{error}");
     }
 
     fn proof_root(disposition_kind: &str) -> Value {
@@ -731,20 +644,23 @@ mod tests {
     fn result_profiles_are_revision_native_and_keep_typed_uncertainty_successful() {
         for disposition in ["unknown", "unavailable"] {
             let root = proof_root(disposition);
-            let public = crate::prove_call_path::project_public_verification_result(root.clone())
-                .expect("project public verification result");
+            let public = public_result(root);
             for revision in McpRevisionV3::all() {
-                let result = build_proof_tool_result_v3(*revision, &root).unwrap_or_else(|error| {
-                    panic!("{disposition} {revision:?} tool result: {error:?}")
-                });
+                let result =
+                    build_proof_tool_result_v3(*revision, &public).unwrap_or_else(|error| {
+                        panic!("{disposition} {revision:?} tool result: {error:?}")
+                    });
                 assert_eq!(result["isError"], false);
                 let text = result
                     .pointer("/content/0/text")
                     .and_then(Value::as_str)
                     .unwrap();
-                assert_eq!(serde_json::from_str::<Value>(text).unwrap(), public);
+                assert_eq!(
+                    serde_json::from_str::<Value>(text).unwrap(),
+                    *public.as_value()
+                );
                 if revision.profile().structured_content {
-                    assert_eq!(result["structuredContent"], public);
+                    assert_eq!(result["structuredContent"], *public.as_value());
                     assert_eq!(
                         result.pointer("/_meta/com.thegreencedar.codestory~1protocolRevision"),
                         Some(&json!(revision.as_str()))
@@ -762,24 +678,21 @@ mod tests {
     fn post_budget_validation_suppresses_invalid_payload_and_whole_result_falls_back() {
         let mut invalid = proof_root("unknown");
         invalid["undeclared"] = json!(true);
-        let error = build_proof_tool_result_v3(McpRevisionV3::June2025, &invalid)
+        let error =
+            codestory_runtime::proof_qualification_support::project_public_verification_result(
+                invalid,
+            )
             .expect_err("undeclared output must fail closed");
         assert!(
-            matches!(
-                error,
-                StdioV3InternalError::OutputSchemaViolation
-                    | StdioV3InternalError::InvalidProjection(_)
-            ),
+            error.contains("invalid internal call-path projection"),
             "undeclared proof fields must fail closed: {error:?}"
         );
-        let response = jsonrpc_internal_error_v3(json!(7), &error);
-        assert_eq!(response.pointer("/error/code"), Some(&json!(-32603)));
-        assert!(response.pointer("/error/data/structuredContent").is_none());
 
         let mut oversized = proof_root("proven");
         set_receipt_line_text(&mut oversized, "\\\"é".repeat(24_000));
-        let result = build_proof_tool_result_v3(McpRevisionV3::June2025, &oversized)
-            .expect("fallback result");
+        let public = public_result(oversized);
+        let result =
+            build_proof_tool_result_v3(McpRevisionV3::June2025, &public).expect("fallback result");
         assert_eq!(
             result.pointer("/structuredContent/kind"),
             Some(&json!("budget_exceeded"))
@@ -930,6 +843,7 @@ mod tests {
             "evidence":[],
             "gaps":[],
             "continuation":null,
+            "answer_sufficiency":"not_asserted",
             "diagnostics": {
                 "availability": "available",
                 "reference": {
@@ -994,9 +908,10 @@ mod tests {
         let root = proof_root("proven");
         let measured = super::super::measure_revision_native_proof_result_v3(&root)
             .expect("revision-native measurements");
+        let public = public_result(root);
         assert_eq!(measured.len(), 4);
         for measurement in measured {
-            let direct = build_proof_tool_result_v3(measurement.revision, &root).unwrap();
+            let direct = build_proof_tool_result_v3(measurement.revision, &public).unwrap();
             let direct_bytes = crate::stdio_transport::v3_serialize_call_tool_result(&direct)
                 .expect("exact tool result bytes");
             assert_eq!(measurement.call_tool_result_bytes, direct_bytes);

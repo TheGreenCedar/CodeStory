@@ -11,7 +11,7 @@ use crate::args::{
 };
 use codestory_contracts::api::{
     AgentPacketRequestDto, EdgeId, NodeKind, PacketBudgetModeDto, PacketDispositionDto,
-    PacketPlanQueryDto,
+    PacketPlanQueryDto, PacketProbeDto,
 };
 use codestory_contracts::packet_projection_v3::{
     BoundedVecV3, CorePublicationIdentityV3Dto, DiagnosticsCapabilityV3Dto,
@@ -230,8 +230,9 @@ fn drill_executes_one_packet_with_explicit_anchor_probes() {
     let request = AgentPacketRequestDto {
         question: packet.question.clone(),
         budget: PacketBudgetModeDto::Standard,
-        probes: Vec::new(),
-        extra_probes: vec!["WorkspaceIndexer".to_string()],
+        probes: vec![PacketProbeDto::FreeQuery {
+            query: "WorkspaceIndexer".to_string(),
+        }],
         latency_budget_ms: None,
         parent_packet_id: None,
         option_ids: Vec::new(),
@@ -241,7 +242,12 @@ fn drill_executes_one_packet_with_explicit_anchor_probes() {
 
     let result = execute_drill_packet(request, |request| {
         calls.set(calls.get() + 1);
-        assert_eq!(request.extra_probes, ["WorkspaceIndexer"]);
+        assert_eq!(
+            request.probes,
+            [PacketProbeDto::FreeQuery {
+                query: "WorkspaceIndexer".to_string(),
+            }]
+        );
         Ok(packet.clone())
     })
     .expect("execute packet");

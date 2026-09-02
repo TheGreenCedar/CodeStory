@@ -5,8 +5,8 @@ use crate::generation::{
     manifest_unavailable_reason_for_runtime,
 };
 use crate::health::{
-    RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health_for_runtime,
-    unavailable_status_report_with_embedding_device,
+    RetrievalStatusReport, attach_manifest_contract, probe_descriptor_sidecar_health_for_runtime,
+    probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_runtime};
 use anyhow::{Context, Result};
@@ -54,6 +54,7 @@ pub fn sidecar_status(
         storage_path,
         false,
         SidecarRuntimeConfig::for_project_auto(project_root),
+        SidecarHealthScope::Full,
     )
 }
 
@@ -67,6 +68,7 @@ pub fn strict_sidecar_status(
         storage_path,
         true,
         SidecarRuntimeConfig::for_project_auto(project_root),
+        SidecarHealthScope::Full,
     )
 }
 
@@ -87,7 +89,31 @@ pub fn strict_sidecar_status_for_runtime(
     storage_path: Option<&Path>,
     runtime: SidecarRuntimeConfig,
 ) -> Result<RetrievalStatusReport> {
-    status_with_runtime(project_root, storage_path, true, runtime)
+    status_with_runtime(
+        project_root,
+        storage_path,
+        true,
+        runtime,
+        SidecarHealthScope::Full,
+    )
+}
+
+/// Strict readiness for the lexical/semantic descriptor lanes only. This
+/// validates the pinned manifest and descriptor artifacts without computing a
+/// repository freshness plan or opening dense-anchor rows. Packet compilation
+/// performs those full checks only after packet-wide admission is sealed.
+pub fn strict_descriptor_sidecar_status_for_runtime(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    runtime: SidecarRuntimeConfig,
+) -> Result<RetrievalStatusReport> {
+    status_with_runtime(
+        project_root,
+        storage_path,
+        true,
+        runtime,
+        SidecarHealthScope::Descriptor,
+    )
 }
 
 /// Observe the current retrieval publication, producer, and live engine
@@ -175,11 +201,18 @@ pub fn observe_ready_retrieval_identity_for_project_id(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarHealthScope {
+    Full,
+    Descriptor,
+}
+
 fn status_with_runtime(
     project_root: &Path,
     storage_path: Option<&Path>,
     strict: bool,
     runtime: SidecarRuntimeConfig,
+    health_scope: SidecarHealthScope,
 ) -> Result<RetrievalStatusReport> {
     let layout = runtime.layout.clone();
     let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(&runtime);
@@ -223,6 +256,7 @@ fn status_with_runtime(
             ));
         }
         if strict
+            && health_scope == SidecarHealthScope::Full
             && let Some(manifest) = manifest.as_ref()
             && let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
                 project_root,
@@ -261,7 +295,9 @@ fn status_with_runtime(
                 &runtime,
             ));
         }
-        if let Some(manifest) = manifest.as_ref() {
+        if health_scope == SidecarHealthScope::Full
+            && let Some(manifest) = manifest.as_ref()
+        {
             let evidence = storage
                 .get_complete_index_publication()
                 .context("load core publication for retrieval evidence status")?
@@ -292,31 +328,48 @@ fn status_with_runtime(
                 ));
             }
         }
-        return Ok(enrich_stored_status(
-            probe_sidecar_health_for_runtime(
+        let report = match health_scope {
+            SidecarHealthScope::Full => probe_sidecar_health_for_runtime(
                 &layout,
                 &project_id,
                 manifest,
                 &embedding_device,
                 &runtime,
             ),
+            SidecarHealthScope::Descriptor => probe_descriptor_sidecar_health_for_runtime(
+                &layout,
+                &project_id,
+                manifest,
+                &embedding_device,
+                &runtime,
+            ),
+        };
+        return Ok(enrich_stored_status(
+            report,
             project_root,
             &storage,
             &runtime,
         ));
     }
 
-    Ok(enrich_status(
-        attach_manifest_contract(
-            probe_sidecar_health_for_runtime(
-                &layout,
-                &project_id,
-                None,
-                &embedding_device,
-                &runtime,
-            ),
-            project_root,
+    let report = match health_scope {
+        SidecarHealthScope::Full => probe_sidecar_health_for_runtime(
+            &layout,
+            &project_id,
+            None,
+            &embedding_device,
+            &runtime,
         ),
+        SidecarHealthScope::Descriptor => probe_descriptor_sidecar_health_for_runtime(
+            &layout,
+            &project_id,
+            None,
+            &embedding_device,
+            &runtime,
+        ),
+    };
+    Ok(enrich_status(
+        attach_manifest_contract(report, project_root),
         &runtime,
     ))
 }

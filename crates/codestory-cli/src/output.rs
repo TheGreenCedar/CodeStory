@@ -11,18 +11,15 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ArtifactCacheAccessTimings, ArtifactCachePolicyDto,
     GraphArtifactDto, GroundingOrientationConfidenceDto, GroundingOrientationUncertaintyDto,
-    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketClaimProfileTelemetryDto,
-    PacketClaimSourceDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
-    RetrievalAnnotationKindDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SearchHitOrigin, SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto,
-    SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto, SearchPlanChannelDto,
-    SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto,
-    TrailContextDto, TrailStoryDto,
+    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, RepoTextScanStatsDto, RetrievalAnnotationKindDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
-#[cfg(test)]
-use codestory_contracts::api::{PacketClaimProfileFireRateDto, PacketClaimSourceCountDto};
 use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
 use serde_json::Value;
@@ -2022,9 +2019,6 @@ fn append_agent_evidence_packet(
         answer.retrieval_trace.total_latency_ms,
         answer.retrieval_trace.steps.len()
     );
-    if let Some(telemetry) = &answer.retrieval_trace.packet_claim_profile_telemetry {
-        let _ = writeln!(markdown, "- {}", claim_profile_telemetry_summary(telemetry));
-    }
     let checked_stages = answer
         .retrieval_trace
         .steps
@@ -2445,48 +2439,6 @@ fn citation_needs_untrusted_repo_label(citation: &AgentCitationDto) -> bool {
                     | PacketEvidenceResolutionDto::DiagnosticOnly
             )
         )
-}
-
-/// Render claim-profile fire rates for the `what_was_checked` block.
-///
-/// This telemetry is always present on a packet, so it is reported as an observation about the
-/// retrieval run rather than as a trace annotation. Annotations are the evidence channel:
-/// `Gap`-kind entries downgrade confidence, so always-on telemetry never belongs there even as
-/// an `Observation`.
-fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -> String {
-    let source_claims = telemetry
-        .claim_sources
-        .iter()
-        .find(|entry| entry.source == PacketClaimSourceDto::SourceProfile)
-        .map(|entry| entry.claims)
-        .unwrap_or(0);
-    let mut summary = format!(
-        "claim profiles: contract_version={} fired={}/{} skipped_invalid={} pending={}/{} citations_considered={} source_profile_claims={}",
-        telemetry.contract_version,
-        telemetry.profiles_fired,
-        telemetry.registered_profiles,
-        telemetry.profiles_skipped_invalid,
-        telemetry.pending_profiles,
-        telemetry.pending_ratchet,
-        telemetry.citations_considered,
-        source_claims,
-    );
-    // The registry loads from checked-in data and fails closed, so a refusal answers from a
-    // smaller registry than the one this build ships. Reported only when it happened: a
-    // `rejected=0` on every packet is noise, and a silent refusal is the failure this exists for.
-    if telemetry.rejected_profiles > 0 {
-        summary.push_str(&format!(" rejected={}", telemetry.rejected_profiles));
-        if !telemetry.rejected_reasons.is_empty() {
-            summary.push_str(&format!(
-                " rejected_reasons={}",
-                telemetry.rejected_reasons.join(",")
-            ));
-        }
-    }
-    if let Some(error) = telemetry.registry_error.as_deref() {
-        summary.push_str(&format!(" registry_error={error}"));
-    }
-    summary
 }
 
 fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'static str {
@@ -4374,7 +4326,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -5005,7 +4956,6 @@ mod tests {
             evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
             resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: Some(false),
             source_excerpt: None,
         };
@@ -5057,7 +5007,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -5079,7 +5028,6 @@ mod tests {
                 annotations: vec![RetrievalAnnotationDto::observation(
                     "semantic retrieval ready",
                 )],
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -5127,52 +5075,6 @@ mod tests {
         );
     }
 
-    fn claim_profile_telemetry_fixture() -> PacketClaimProfileTelemetryDto {
-        PacketClaimProfileTelemetryDto {
-            contract_version: 2,
-            registered_profiles: 20,
-            contracted_profiles: 7,
-            pending_profiles: 13,
-            pending_ratchet: 13,
-            rejected_profiles: 0,
-            rejected_reasons: Vec::new(),
-            registry_error: None,
-            citations_considered: 3,
-            profiles_fired: 2,
-            // A healthy packet routinely reports skips: a profile whose runtime contract does
-            // not hold for a citation is skipped rather than fired.
-            profiles_skipped_invalid: 1,
-            profiles: vec![
-                PacketClaimProfileFireRateDto {
-                    profile_id: "shell-install-dispatch".to_string(),
-                    evaluated: 3,
-                    fired: 2,
-                    claims: 4,
-                    skipped_invalid: 0,
-                    skip_reason: None,
-                },
-                PacketClaimProfileFireRateDto {
-                    profile_id: "session-request-dispatch".to_string(),
-                    evaluated: 3,
-                    fired: 0,
-                    claims: 0,
-                    skipped_invalid: 1,
-                    skip_reason: Some("no_allowed_proof_roles".to_string()),
-                },
-            ],
-            claim_sources: vec![
-                PacketClaimSourceCountDto {
-                    source: PacketClaimSourceDto::SourceProfile,
-                    claims: 4,
-                },
-                PacketClaimSourceCountDto {
-                    source: PacketClaimSourceDto::RoleTemplate,
-                    claims: 1,
-                },
-            ],
-        }
-    }
-
     fn well_grounded_packet_answer() -> AgentAnswerDto {
         AgentAnswerDto {
             source_coverage: Vec::new(),
@@ -5210,7 +5112,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -5230,7 +5131,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -5244,63 +5144,6 @@ mod tests {
                 retrieval_shadow: None,
             },
         }
-    }
-
-    #[test]
-    fn claim_profile_telemetry_keeps_a_clean_packet_at_high_ready_confidence() {
-        // Regression: the always-on claim-profile counters were published as free-text
-        // `retrieval_trace.annotations`, which is the evidence-gap channel, so
-        // every packet reported the telemetry as an evidence gap and `agent_confidence` fell
-        // from high to medium (operator status ready -> review) universally. Telemetry now
-        // rides its own typed field and must not touch the gap channel.
-        let baseline = well_grounded_packet_answer();
-        let (baseline_confidence, _) = agent_confidence(&baseline);
-        assert_eq!(
-            baseline_confidence, "high",
-            "fixture must start from a clean high-confidence packet"
-        );
-
-        let mut answer = well_grounded_packet_answer();
-        answer.retrieval_trace.packet_claim_profile_telemetry =
-            Some(claim_profile_telemetry_fixture());
-
-        let (confidence, reasons) = agent_confidence(&answer);
-        assert_eq!(
-            confidence, "high",
-            "profile telemetry must not downgrade packet confidence: {reasons:?}"
-        );
-        assert_eq!(operator_status_from_confidence(confidence), "ready");
-        assert!(
-            agent_gap_notes(&answer).is_empty(),
-            "profile telemetry must not be reported as an evidence gap: {:?}",
-            agent_gap_notes(&answer)
-        );
-
-        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
-        assert!(
-            markdown.contains("status: ready"),
-            "telemetry-carrying packet must stay ready:\n{markdown}"
-        );
-        // Fire rates stay observable, but as an observation about the run rather than a gap.
-        assert!(
-            markdown.contains("claim profiles: contract_version=2 fired=2/20 skipped_invalid=1"),
-            "claim-profile fire rates must be reported under what_was_checked:\n{markdown}"
-        );
-        assert!(
-            !markdown.contains("rejected=") && !markdown.contains("registry_error="),
-            "a registry that loaded whole must not report a loader refusal:\n{markdown}"
-        );
-        assert_order(&markdown, "what_was_checked:", "gaps_uncertainty:");
-        let gaps_block = markdown
-            .split("gaps_uncertainty:")
-            .nth(1)
-            .expect("gaps block");
-        assert!(
-            !gaps_block.contains("claim profiles:")
-                && !gaps_block.contains("skipped_invalid")
-                && !gaps_block.contains("profiles_fired"),
-            "claim-profile telemetry must never appear as an evidence gap:\n{gaps_block}"
-        );
     }
 
     /// Every word the retired `is_gap_annotation` substring heuristic matched on.
@@ -5413,38 +5256,6 @@ mod tests {
             agent_gap_notes(&answer),
             vec![format!("trace annotation: {text}")],
             "a gap-kind annotation must be reported verbatim as an evidence gap"
-        );
-    }
-
-    #[test]
-    fn a_refused_claim_profile_registry_is_visible_to_the_operator() {
-        // The registry loads from checked-in data and fails closed. A refusal answers from a
-        // smaller registry than this build ships, which is indistinguishable from "the profiles
-        // ran and stayed quiet" unless the refusal itself is printed.
-        let mut answer = well_grounded_packet_answer();
-        let mut telemetry = claim_profile_telemetry_fixture();
-        telemetry.rejected_profiles = 2;
-        telemetry.rejected_reasons = vec![
-            "unknown_profile_id".to_string(),
-            "missing_contract".to_string(),
-        ];
-        telemetry.registry_error = Some("schema_version_mismatch".to_string());
-        answer.retrieval_trace.packet_claim_profile_telemetry = Some(telemetry);
-
-        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
-        assert!(
-            markdown.contains(
-                "rejected=2 rejected_reasons=unknown_profile_id,missing_contract \
-                 registry_error=schema_version_mismatch"
-            ),
-            "a refused registry must be reported under what_was_checked:\n{markdown}"
-        );
-        // It is an observation about the run, not an evidence gap: routing it through the gap
-        // channel would downgrade confidence by substring match, which EV-6 established as wrong.
-        assert!(
-            agent_gap_notes(&answer).is_empty(),
-            "a loader refusal must not be published as an evidence annotation: {:?}",
-            agent_gap_notes(&answer)
         );
     }
 
@@ -6003,7 +5814,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -6023,7 +5833,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: vec![RetrievalAnnotationDto::gap("weak hits after fallback")],
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![
                     AgentRetrievalStepDto {

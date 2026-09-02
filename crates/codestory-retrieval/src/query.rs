@@ -8,12 +8,15 @@ use crate::embeddings::{
     acquire_product_embedding_residency_for_runtime, embedding_device_readiness_for_runtime,
 };
 use crate::executor::{
-    QueryExecutor, QueryResult, RetrievalPublicationIdentity, cancellation_flag,
+    CandidatePayloadMode, QueryExecutor, QueryResult, RetrievalPublicationIdentity,
+    cancellation_flag,
 };
 use crate::generation::manifest_unavailable_reason_for_runtime;
-use crate::health::probe_sidecar_health_for_runtime;
+use crate::health::{
+    probe_descriptor_sidecar_health_for_runtime, probe_sidecar_health_for_runtime,
+};
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
-use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
+use crate::mode::{RetrievalDegradedMode, derive_degraded_mode, derive_descriptor_mode};
 use crate::query_features::{QueryLookupMode, classify_query};
 use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
@@ -22,9 +25,10 @@ use crate::sidecar_search::{LiveSidecarSearch, SearchExecutionContext, SidecarSe
 use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::NodeId;
 use codestory_store::{
-    BoundRetrievalIndexManifest, FileRole, RetrievalIndexManifest, Store, core_database_exists,
-    resolve_core_generation_database_path,
+    BoundRetrievalIndexManifest, CorePublicationLayout, FileRole, RetrievalIndexManifest, Store,
+    core_database_exists, resolve_core_generation_database_path,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -133,16 +137,18 @@ pub struct QueryBatchRequest<'a> {
 pub struct PinnedQuerySession {
     storage: Store,
     storage_path: PathBuf,
+    core_database_path: PathBuf,
     project_root: PathBuf,
     project_id: String,
     runtime: SidecarRuntimeConfig,
     manifest: RetrievalIndexManifest,
-    file_roles: Arc<HashMap<String, FileRole>>,
+    file_roles: RefCell<Option<Arc<HashMap<String, FileRole>>>>,
     embedding_device: EmbeddingDeviceReadiness,
     publication_identity: RetrievalPublicationIdentity,
     sidecars: Arc<dyn SidecarSearch>,
     _generation_lease: GenerationRetentionLease,
     _embedding_residency: ProductEmbeddingResidencyLease,
+    full_readiness_validated: Cell<bool>,
     transaction_active: bool,
 }
 
@@ -151,6 +157,27 @@ impl PinnedQuerySession {
         project_root: &Path,
         storage_path: &Path,
         runtime: &SidecarRuntimeConfig,
+    ) -> Result<Self> {
+        Self::begin_with_scope(project_root, storage_path, runtime, true)
+    }
+
+    /// Pin the exact core/retrieval publication needed to query descriptor
+    /// sidecars without loading repository file records, nodes, source, graph
+    /// neighborhoods, or dense-anchor rows. Packet admission must be sealed
+    /// before [`Self::validate_full_readiness`] is called.
+    pub fn begin_packet_descriptor(
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: &SidecarRuntimeConfig,
+    ) -> Result<Self> {
+        Self::begin_with_scope(project_root, storage_path, runtime, false)
+    }
+
+    fn begin_with_scope(
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: &SidecarRuntimeConfig,
+        validate_full_readiness: bool,
     ) -> Result<Self> {
         if !core_database_exists(storage_path).context("resolve core publication for query")? {
             let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
@@ -171,12 +198,27 @@ impl PinnedQuerySession {
                     "retrieval sidecar manifest is missing; run retrieval index for project {project_id}"
                 )
             })?;
+        let core_layout = CorePublicationLayout::from_storage_path(storage_path)
+            .context("resolve retrieval query core layout")?;
+        let has_immutable_publication = core_layout
+            .read_pointer()
+            .context("read retrieval query core publication pointer")?
+            .is_some();
         let core_path =
             resolve_core_generation_database_path(storage_path, &bound_manifest.core.generation_id)
                 .context("resolve retrieval publication core generation")?;
         drop(publication_storage);
-        let storage = Store::open_immutable_generation(&core_path)
-            .context("open exact core generation for retrieval query")?;
+        let storage = if has_immutable_publication {
+            Store::open_immutable_generation(&core_path)
+                .context("open exact immutable core generation for retrieval query")?
+        } else {
+            // Legacy stores have no immutable generation directory. They must
+            // use a normal read-only SQLite snapshot; `immutable=1` would
+            // ignore concurrent WAL changes and can surface a newer row under
+            // an older retrieval identity.
+            Store::open_read_only(&core_path)
+                .context("open legacy core snapshot for retrieval query")?
+        };
         storage
             .get_connection()
             .execute_batch("BEGIN DEFERRED TRANSACTION")
@@ -211,38 +253,7 @@ impl PinnedQuerySession {
                 u32::try_from(crate::embeddings::semantic_vector_dim())
                     .context("embedding dimension exceeds evidence contract")?,
             )?;
-        if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
-            project_root,
-            storage_path,
-            &storage,
-            runtime,
-            &producer_compatibility_identity,
-        ) {
-            bail!(
-                "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
-            );
-        }
-        let file_roles = storage
-            .get_files()
-            .map(|files| {
-                files
-                    .into_iter()
-                    .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
-                    .collect()
-            })
-            .unwrap_or_default();
         let publication_identity = retrieval_publication_identity_from_bound(&bound_manifest)?;
-        crate::embedded_vector::validate_generation_evidence_for_publication(
-            &runtime.layout,
-            &storage,
-            Some(&core_path),
-            &manifest,
-            &core_publication,
-            runtime,
-            &embedding_device,
-            embedding_residency.identity(),
-        )
-        .context("validate attested vector generation")?;
         let sidecars = Arc::new(
             LiveSidecarSearch::new_for_runtime_with_embedding_device(
                 runtime,
@@ -254,21 +265,80 @@ impl PinnedQuerySession {
             .with_core_candidate_context(project_root, storage_path),
         );
 
-        Ok(Self {
+        let session = Self {
             storage,
             storage_path: storage_path.to_path_buf(),
+            core_database_path: core_path,
             project_root: project_root.to_path_buf(),
             project_id,
             runtime: runtime.clone(),
             manifest,
-            file_roles: Arc::new(file_roles),
+            file_roles: RefCell::new(None),
             embedding_device,
             publication_identity,
             sidecars,
             _generation_lease: generation_lease,
             _embedding_residency: embedding_residency,
+            full_readiness_validated: Cell::new(false),
             transaction_active: true,
-        })
+        };
+        if validate_full_readiness {
+            session.validate_full_readiness_with_identity(&producer_compatibility_identity)?;
+        }
+        Ok(session)
+    }
+
+    /// Complete the repository/core consistency checks after packet-wide
+    /// descriptor admission has been sealed and before any admitted identity
+    /// is hydrated. Ordinary query sessions perform this during `begin`.
+    pub fn validate_full_readiness(&self) -> Result<()> {
+        let producer_compatibility_identity =
+            crate::embedded_vector::vector_producer_compatibility_identity(
+                &self.embedding_device,
+                self._embedding_residency.identity(),
+                u32::try_from(crate::embeddings::semantic_vector_dim())
+                    .context("embedding dimension exceeds evidence contract")?,
+            )?;
+        self.validate_full_readiness_with_identity(&producer_compatibility_identity)
+    }
+
+    fn validate_full_readiness_with_identity(
+        &self,
+        producer_compatibility_identity: &str,
+    ) -> Result<()> {
+        if self.full_readiness_validated.get() {
+            return Ok(());
+        }
+        if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
+            &self.project_root,
+            &self.storage_path,
+            &self.storage,
+            &self.runtime,
+            producer_compatibility_identity,
+        ) {
+            bail!(
+                "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {}",
+                self.project_id
+            );
+        }
+        let core_publication = self
+            .storage
+            .get_complete_index_publication()
+            .context("load pinned core publication for vector validation")?
+            .context("pinned retrieval query requires a complete core publication")?;
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &self.runtime.layout,
+            &self.storage,
+            Some(&self.core_database_path),
+            &self.manifest,
+            &core_publication,
+            &self.runtime,
+            &self.embedding_device,
+            self._embedding_residency.identity(),
+        )
+        .context("validate attested vector generation")?;
+        self.full_readiness_validated.set(true);
+        Ok(())
     }
 
     pub fn storage(&self) -> &Store {
@@ -307,13 +377,44 @@ impl PinnedQuerySession {
             sidecars: Arc::clone(&self.sidecars),
             cache,
             manifest: Some(self.manifest.clone()),
-            file_roles: Arc::clone(&self.file_roles),
+            file_roles: self.file_roles()?,
             cancelled,
             mode_override: None,
         };
         let mut result = executor.execute(query, budget_ms)?;
         self.enrich_and_rerank_candidates(&mut result)?;
         refresh_cached_query_result(cache, &self.manifest, &result);
+        Ok(result.with_publication_identity(&self.publication_identity))
+    }
+
+    /// Execute the sidecars and return only pre-hydration packet descriptors.
+    ///
+    /// This path deliberately skips core enrichment. Packet admission must
+    /// choose stable identities before any core node, file, source, or graph
+    /// record is opened. The ordinary search path above keeps its richer
+    /// post-query enrichment.
+    pub fn execute_packet_descriptors_with_cache(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let mut executor = QueryExecutor {
+            sidecars: Arc::clone(&self.sidecars),
+            cache,
+            manifest: Some(self.manifest.clone()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled,
+            mode_override: None,
+        };
+        let mut result = executor.execute_packet_descriptors(query, budget_ms)?;
+        sanitize_packet_candidate_descriptors(&mut result.hits);
         Ok(result.with_publication_identity(&self.publication_identity))
     }
 
@@ -347,7 +448,7 @@ impl PinnedQuerySession {
         let mut results = execute_strict_retrieval_query_batch_against_sidecars(
             Arc::clone(&self.sidecars),
             Some(self.manifest.clone()),
-            Arc::clone(&self.file_roles),
+            self.file_roles()?,
             cancelled,
             mode,
             queries,
@@ -362,10 +463,78 @@ impl PinnedQuerySession {
         Ok(results)
     }
 
+    pub fn execute_packet_descriptor_batch_with_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<Vec<QueryResult>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let (mode, degraded_reason) = resolve_descriptor_batch_mode(
+            self.sidecars.as_ref(),
+            Some(&self.manifest),
+            &self.embedding_device,
+            &self.runtime,
+        );
+        if mode != RetrievalDegradedMode::Full {
+            bail!(
+                "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+                mode.as_str(),
+                degraded_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        let mut results = execute_strict_retrieval_descriptor_batch_against_sidecars(
+            Arc::clone(&self.sidecars),
+            Some(self.manifest.clone()),
+            Arc::new(HashMap::new()),
+            cancelled,
+            mode,
+            queries,
+            cache,
+            strict_batch_worker_limit(queries.len()),
+        )?;
+        for result in &mut results {
+            sanitize_packet_candidate_descriptors(&mut result.hits);
+            result.publication_identity = Some(self.publication_identity.clone());
+        }
+        Ok(results)
+    }
+
     fn enrich_and_rerank_candidates(&self, result: &mut QueryResult) -> Result<()> {
         enrich_candidates_from_core(&self.storage, &self.project_root, &mut result.hits)?;
         result.hits = rank_candidates(&result.features, std::mem::take(&mut result.hits));
         Ok(())
+    }
+
+    /// Load repository-wide file roles only for the ordinary enriched search
+    /// path. Packet descriptor queries must reach their global admission gate
+    /// without opening any candidate file records.
+    fn file_roles(&self) -> Result<Arc<HashMap<String, FileRole>>> {
+        if let Some(file_roles) = self.file_roles.borrow().as_ref() {
+            return Ok(Arc::clone(file_roles));
+        }
+        let file_roles = Arc::new(
+            self.storage
+                .get_files()
+                .context("load file roles for enriched retrieval query")?
+                .into_iter()
+                .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
+                .collect(),
+        );
+        self.file_roles.replace(Some(Arc::clone(&file_roles)));
+        Ok(file_roles)
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    fn file_roles_loaded(&self) -> bool {
+        self.file_roles.borrow().is_some()
     }
 
     pub fn ensure_result_identity(
@@ -407,6 +576,14 @@ impl PinnedQuerySession {
             .into());
         }
         Ok(())
+    }
+}
+
+fn sanitize_packet_candidate_descriptors(candidates: &mut [CandidateHit]) {
+    for candidate in candidates {
+        candidate.source_excerpt = None;
+        candidate.structural_kind = None;
+        candidate.rank_features = None;
     }
 }
 
@@ -560,6 +737,55 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
     cache: &mut RetrievalCache,
     worker_limit: usize,
 ) -> Result<Vec<QueryResult>> {
+    execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+        sidecars,
+        manifest,
+        file_roles,
+        cancelled,
+        mode,
+        queries,
+        cache,
+        worker_limit,
+        CandidatePayloadMode::Full,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strict_retrieval_descriptor_batch_against_sidecars(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: Arc<HashMap<String, FileRole>>,
+    cancelled: Arc<AtomicBool>,
+    mode: RetrievalDegradedMode,
+    queries: &[QueryBatchItem<'_>],
+    cache: &mut RetrievalCache,
+    worker_limit: usize,
+) -> Result<Vec<QueryResult>> {
+    execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+        sidecars,
+        manifest,
+        file_roles,
+        cancelled,
+        mode,
+        queries,
+        cache,
+        worker_limit,
+        CandidatePayloadMode::DescriptorOnly,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: Arc<HashMap<String, FileRole>>,
+    cancelled: Arc<AtomicBool>,
+    mode: RetrievalDegradedMode,
+    queries: &[QueryBatchItem<'_>],
+    cache: &mut RetrievalCache,
+    worker_limit: usize,
+    payload: CandidatePayloadMode,
+) -> Result<Vec<QueryResult>> {
     if mode != RetrievalDegradedMode::Full {
         bail!(
             "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason=unknown)",
@@ -576,8 +802,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         if cancelled.load(Ordering::Acquire) {
             bail!("retrieval query batch cancelled during cache lookup");
         }
-        if let Some(result) =
-            cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
+        if payload == CandidatePayloadMode::Full
+            && let Some(result) =
+                cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
         {
             results[index] = Some(result);
         } else {
@@ -585,8 +812,11 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         }
     }
 
-    let (sidecars, prefetch_elapsed) =
-        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled);
+    let (sidecars, prefetch_elapsed) = if payload == CandidatePayloadMode::Full {
+        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled)
+    } else {
+        (sidecars, Duration::ZERO)
+    };
     let prefetch_elapsed_ms = duration_millis_ceil(prefetch_elapsed);
 
     for wave in misses.chunks(worker_limit.max(1)) {
@@ -612,15 +842,20 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
                         cancelled,
                         mode_override: Some(mode),
                     };
-                    let result =
-                        executor
-                            .execute(query, Some(remaining_budget_ms))
-                            .map(|mut result| {
-                                result.trace.total_budget_ms = total_budget_ms;
-                                result.trace.elapsed_ms =
-                                    result.trace.elapsed_ms.saturating_add(prefetch_elapsed_ms);
-                                result
-                            });
+                    let result = match payload {
+                        CandidatePayloadMode::Full => {
+                            executor.execute(query, Some(remaining_budget_ms))
+                        }
+                        CandidatePayloadMode::DescriptorOnly => {
+                            executor.execute_packet_descriptors(query, Some(remaining_budget_ms))
+                        }
+                    }
+                    .map(|mut result| {
+                        result.trace.total_budget_ms = total_budget_ms;
+                        result.trace.elapsed_ms =
+                            result.trace.elapsed_ms.saturating_add(prefetch_elapsed_ms);
+                        result
+                    });
                     (*index, result)
                 }));
             }
@@ -639,7 +874,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
             if cancelled.load(Ordering::Acquire) {
                 bail!("retrieval query batch cancelled after worker wave");
             }
-            cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
+            if payload == CandidatePayloadMode::Full {
+                cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
+            }
             results[index] = Some(result);
         }
     }
@@ -1001,6 +1238,34 @@ fn resolve_batch_mode(
     )
 }
 
+fn resolve_descriptor_batch_mode(
+    sidecars: &dyn SidecarSearch,
+    manifest: Option<&RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &SidecarRuntimeConfig,
+) -> (RetrievalDegradedMode, Option<String>) {
+    if let Some(manifest) = manifest {
+        let Some(layout) = sidecars.layout() else {
+            return (
+                RetrievalDegradedMode::Unavailable,
+                Some("sidecar_layout_missing".into()),
+            );
+        };
+        let report = probe_descriptor_sidecar_health_for_runtime(
+            layout,
+            &manifest.project_id,
+            Some(manifest.clone()),
+            embedding_device,
+            runtime,
+        );
+        return derive_descriptor_mode(&report.lexical, &report.semantic);
+    }
+    (
+        RetrievalDegradedMode::LexicalOnly,
+        Some("manifest_missing".into()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1381,10 @@ mod tests {
                 .expect("publish first strict generation");
         let first_session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
             .expect("first strict query admission");
+        assert!(
+            !first_session.file_roles_loaded(),
+            "pinning a retrieval publication must not hydrate repository file records"
+        );
         assert_eq!(
             first_session.publication_identity().core_generation_id,
             first_core.generation_id
@@ -1161,6 +1430,77 @@ mod tests {
         assert_eq!(
             second_session.publication_identity().core_run_id,
             second_core.run_id
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn packet_descriptor_pin_defers_file_inventory_until_after_admission() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+
+        let writer = Store::open(&storage_path).expect("open hostile writer");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = X'FF' WHERE id = 1", [])
+            .expect("poison full file projection");
+        drop(writer);
+
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("descriptor pin must not decode repository file rows");
+        assert!(!session.file_roles_loaded());
+        let error = session
+            .validate_full_readiness()
+            .expect_err("post-admission full readiness must still fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("retrieval sidecar manifest is unavailable"),
+            "unexpected error: {error:#}"
         );
     }
 

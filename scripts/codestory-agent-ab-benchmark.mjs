@@ -3047,6 +3047,27 @@ function installedAgentTiming(values) {
   };
 }
 
+function installedAgentTimingFromMeasuredInteraction(values) {
+  const started = values?.interaction_started_ms;
+  const finished = values?.interaction_finished_ms;
+  if (
+    typeof started !== "number"
+    || !Number.isFinite(started)
+    || typeof finished !== "number"
+    || !Number.isFinite(finished)
+    || finished < started
+  ) {
+    throw new Error("installed interaction clock must be finite and monotonic");
+  }
+  return installedAgentTiming({
+    timing_cohort_id: values.timing_cohort_id,
+    agent_runner_ms: values.agent_runner_ms,
+    time_to_first_packet_ms: values.time_to_first_packet_ms,
+    continuation_ms: values.continuation_ms,
+    whole_task_wall_ms: finished - started,
+  });
+}
+
 function installedAgentTimingPhaseWarmMs(timing) {
   if (!timing) return null;
   return timing.agent_runner_ms
@@ -3054,19 +3075,17 @@ function installedAgentTimingPhaseWarmMs(timing) {
     + timing.continuation_ms;
 }
 
-function exactCandidateTimingFromInstalledPhases(installedTiming, { cold_ms = 0, incremental_ms = 0 } = {}) {
+function exactCandidateLifecycleTiming(installedTiming, { cold_ms = 0, incremental_ms = 0 } = {}) {
   if (
     !installedTiming
     || !Number.isFinite(installedTiming.whole_task_wall_ms)
     || installedTiming.whole_task_wall_ms < 0
   ) {
-    throw new Error("exact-candidate warm timing requires InstalledAgentTimingV1 whole_task_wall_ms");
+    throw new Error("exact-candidate lifecycle timing requires InstalledAgentTimingV1 whole_task_wall_ms");
   }
   return {
     cold_ms,
-    warm_ms: installedTiming.whole_task_wall_ms,
     incremental_ms,
-    all_in_ms: installedTiming.whole_task_wall_ms,
   };
 }
 
@@ -6175,6 +6194,7 @@ async function runOne(opts, run, outDir) {
     opts.agentCodexHomes?.[run.arm] ?? null,
     !opts.exactCandidate || isCodeStoryArm(run.arm),
   );
+  const interactionStarted = performance.now();
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
@@ -6228,8 +6248,8 @@ async function runOne(opts, run, outDir) {
       };
 
   const runnerWallMs = shouldRunAgent ? Math.round((performance.now() - started) * 1000) / 1000 : 0;
-  const preludeWallMs = (codestoryPrelude?.public.wall_ms ?? 0) + (baselinePrelude?.public.wall_ms ?? 0);
-  const wallMs = Math.round((runnerWallMs + preludeWallMs) * 1000) / 1000;
+  const interactionFinished = performance.now();
+  const wallMs = Math.round((interactionFinished - interactionStarted) * 1000) / 1000;
   const timingCohortId = installedAgentTimingCohortId({
     execution_window_id: opts.timingExecutionWindowId ?? opts.executionWindowId ?? "local-dev-window",
     host: benchmarkHostClass([]),
@@ -6249,12 +6269,13 @@ async function runOne(opts, run, outDir) {
   }
   const timeToFirstPacketMs = codestoryPrelude?.public.time_to_first_packet_ms ?? 0;
   const continuationMs = codestoryPrelude?.public.continuation_ms ?? 0;
-  const installedTiming = installedAgentTiming({
+  const installedTiming = installedAgentTimingFromMeasuredInteraction({
     timing_cohort_id: timingCohortId,
     agent_runner_ms: runnerWallMs,
     time_to_first_packet_ms: timeToFirstPacketMs,
     continuation_ms: continuationMs,
-    whole_task_wall_ms: wallMs,
+    interaction_started_ms: interactionStarted,
+    interaction_finished_ms: interactionFinished,
   });
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
@@ -6351,7 +6372,7 @@ async function runOne(opts, run, outDir) {
     installed_agent_timing_ineligibility_reason:
       run.comparative_wall_time_eligible === false ? "preparation_overlap" : null,
     exact_candidate_timing: opts.exactCandidate
-      ? exactCandidateTimingFromInstalledPhases(installedTiming, {
+      ? exactCandidateLifecycleTiming(installedTiming, {
           cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
           incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
         })
@@ -11824,7 +11845,16 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   }
   const timingTotals = {};
   for (const arm of EXACT_CANDIDATE_ARMS) {
-    const warm = sum(arm, (row) => row.exact_candidate_timing?.warm_ms, { timingEligibleOnly: true });
+    const warmComponent = sum(
+      arm,
+      (row) => installedAgentTimingPhaseWarmMs(row.installed_agent_timing),
+      { timingEligibleOnly: true },
+    );
+    const wholeTaskWall = sum(
+      arm,
+      (row) => row.installed_agent_timing?.whole_task_wall_ms,
+      { timingEligibleOnly: true },
+    );
     const measuredCold = arm === "without_codestory" ? 0 : uniqueRepoTiming(arm, "cold_ms");
     const oneTimeModel = arm === "without_codestory" ? 0 : modelInitializationMs(arm);
     const cold = Math.max(0, measuredCold - oneTimeModel);
@@ -11832,15 +11862,17 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     timingTotals[arm] = {
       package_authentication_ms: arm === "without_codestory" ? 0 : lifecycleMs(arm),
       model_initialization_ms: oneTimeModel,
-      warm_ms: warm,
+      warm_component_ms: warmComponent,
+      whole_task_wall_ms: wholeTaskWall,
       cold_ms: cold,
       incremental_ms: incremental,
-      all_in_ms: warm + cold + incremental + oneTimeModel +
+      all_in_ms: warmComponent + cold + incremental + oneTimeModel +
         (arm === "without_codestory" ? 0 : lifecycleMs(arm)),
     };
   }
   for (const [label, field, factor, display] of [
-    ["warm", "warm_ms", 1.05, "105%"],
+    ["warm component", "warm_component_ms", 1.05, "105%"],
+    ["whole-task", "whole_task_wall_ms", 1.05, "105%"],
     ["cold", "cold_ms", 1.05, "5%"],
     ["incremental", "incremental_ms", 1.05, "5%"],
     ["all-in", "all_in_ms", 1.10, "110%"],
@@ -11871,22 +11903,34 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     if (!finiteNonnegativeInteger(row.tool_calls_observed) || !finiteNonnegative(row.estimated_cost_usd)) {
       reasons.push(`missing tool call or cost accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
-    for (const field of ["cold_ms", "warm_ms", "incremental_ms", "all_in_ms"]) {
+    for (const field of ["cold_ms", "incremental_ms"]) {
       if (!finiteNonnegative(row.exact_candidate_timing?.[field])) {
         reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
       }
     }
-    const wholeTaskWallMs = row.installed_agent_timing?.whole_task_wall_ms;
     if (
-      !finiteNonnegative(wholeTaskWallMs)
-      || row.exact_candidate_timing?.warm_ms !== wholeTaskWallMs
+      Object.hasOwn(row.exact_candidate_timing ?? {}, "warm_ms")
+      || Object.hasOwn(row.exact_candidate_timing ?? {}, "all_in_ms")
     ) {
-      reasons.push(
-        `whole-task warm timing does not reconcile to InstalledAgentTimingV1 whole_task_wall_ms for ${row.task_id}/${row.arm}/${row.repeat}`,
-      );
+      reasons.push(`per-row warm_ms/all_in_ms aliases are forbidden for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
-    if (row.exact_candidate_timing?.all_in_ms !== row.exact_candidate_timing?.warm_ms) {
-      reasons.push(`row all-in timing must equal whole-task warm timing for ${row.task_id}/${row.arm}/${row.repeat}`);
+    const installedTiming = row.installed_agent_timing;
+    for (const field of [
+      "agent_runner_ms",
+      "time_to_first_packet_ms",
+      "continuation_ms",
+      "time_to_final_packet_ms",
+      "whole_task_wall_ms",
+    ]) {
+      if (!finiteNonnegative(installedTiming?.[field])) {
+        reasons.push(`missing InstalledAgentTimingV1 ${field} for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
+    }
+    if (
+      installedTiming?.time_to_final_packet_ms !==
+      installedTiming?.time_to_first_packet_ms + installedTiming?.continuation_ms
+    ) {
+      reasons.push(`InstalledAgentTimingV1 packet phases do not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
     if (
       !row.quality?.material_factual_errors ||
@@ -14485,9 +14529,10 @@ export {
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
   installedAgentTiming,
+  installedAgentTimingFromMeasuredInteraction,
   installedAgentTimingCohortId,
   installedAgentTimingPhaseWarmMs,
-  exactCandidateTimingFromInstalledPhases,
+  exactCandidateLifecycleTiming,
   timingEligibleExactCandidateRow,
   timingIneligibleComparatorRow,
   benchmarkContractEnvironmentSha256,

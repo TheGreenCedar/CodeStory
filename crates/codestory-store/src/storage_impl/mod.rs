@@ -119,6 +119,14 @@ pub struct BoundedRawCallEdges {
     pub truncated: bool,
 }
 
+/// A bounded edge-only neighborhood. Unlike trail traversal, this projection
+/// never joins or materializes endpoint nodes or file records.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRawIncidentEdges {
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactCallEdgeProjection {
     pub edge_id: EdgeId,
@@ -4201,6 +4209,17 @@ pub struct SearchSymbolProjectionDetail {
     pub end_line: Option<u32>,
 }
 
+/// Identity-only link from one symbol node to its owning indexed file.
+///
+/// Packet admission may use this projection to constrain an explicit symbol
+/// selector by path. It deliberately excludes symbol text, kind, ranges, and
+/// every source-bearing field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeFileIdentityProjection {
+    pub node_id: NodeId,
+    pub file_path: Option<String>,
+}
+
 /// Stored generated symbol document and embedding payload.
 ///
 /// The document records graph-derived text and embedding metadata. Dense
@@ -4794,6 +4813,20 @@ pub struct SymbolSummaryRecord {
     pub summary: String,
     pub model: String,
     pub updated_at_epoch_ms: i64,
+}
+
+/// Resolve one logical core path to the exact database image SQLite must
+/// attach for copy-forward reads. Immutable publication keeps the logical
+/// `codestory.db` path separate from `core/generations/<id>/codestory.db`; an
+/// attach of the logical path would otherwise read an empty legacy shell.
+fn resolved_copy_source_database_path(
+    logical_path: &Path,
+) -> Result<Option<PathBuf>, StorageError> {
+    if !crate::core_database_exists(logical_path)? {
+        return Ok(None);
+    }
+    drop(Storage::open_read_only(logical_path)?);
+    crate::resolve_core_database_path(logical_path).map(Some)
 }
 
 /// Open the active core without materializing SQLite lock sidecars beside an
@@ -5480,10 +5513,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -5543,11 +5576,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn.execute(
             "ATTACH DATABASE ?1 AS structural_cache_source",
             params![source],
@@ -6980,10 +7012,8 @@ impl Storage {
         // immutable generation.
         require_standalone_core_candidate(staged_path)?;
         remove_closed_core_sidecars(staged_path)?;
-        let publication = crate::CorePublishTransaction::begin_from_stage(
-            live_path,
-            staged_path.to_path_buf(),
-        )?;
+        let publication =
+            crate::CorePublishTransaction::begin_from_stage(live_path, staged_path.to_path_buf())?;
         let final_database = publication.generation_database_path(&candidate.generation_id)?;
         if final_database.is_file() {
             let installed = require_complete_promotion_database_identity(
@@ -7059,7 +7089,15 @@ impl Storage {
                 },
             )?;
         }
-        publication.commit_pointer(candidate_identity, previous_identity.clone())?;
+        let commit = publication.commit_pointer(candidate_identity, previous_identity.clone())?;
+        if let crate::CorePublicationDurabilityV1::Unconfirmed(reason) = commit.durability {
+            tracing::warn!(
+                live_path = %live_path.display(),
+                reason = ?reason,
+                generation_id = %commit.pointer.active.generation_id,
+                "core pointer was committed but directory durability could not be confirmed"
+            );
+        }
         durations.pointer_publication = pointer_started.elapsed();
 
         let cleanup_started = Instant::now();
@@ -7639,11 +7677,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -7984,6 +8021,41 @@ impl Storage {
         let truncated = edges.len() > maximum as usize;
         edges.truncate(maximum as usize);
         Ok(BoundedRawCallEdges { edges, truncated })
+    }
+
+    /// Reads a bounded incident edge neighborhood without opening endpoint
+    /// nodes or file records. Packet admission uses this after admitting the
+    /// center identity, then discards edges whose other endpoint was not
+    /// admitted before any endpoint hydration occurs.
+    pub fn get_bounded_raw_incident_edges(
+        &self,
+        node_id: NodeId,
+        maximum: usize,
+    ) -> Result<BoundedRawIncidentEdges, StorageError> {
+        let query_limit = maximum.saturating_add(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line,
+                    e.resolved_source_node_id, e.resolved_target_node_id, e.confidence,
+                    e.callsite_identity, e.certainty, e.candidate_target_node_ids
+             FROM edge e
+             WHERE e.source_node_id = ?1
+                OR e.target_node_id = ?1
+                OR e.resolved_source_node_id = ?1
+                OR e.resolved_target_node_id = ?1
+             ORDER BY e.id ASC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            node_id.0,
+            i64::try_from(query_limit).unwrap_or(i64::MAX)
+        ])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        let truncated = edges.len() > maximum;
+        edges.truncate(maximum);
+        Ok(BoundedRawIncidentEdges { edges, truncated })
     }
 
     pub fn get_edges_for_node_ids(
@@ -9324,6 +9396,49 @@ impl Storage {
         Ok(symbols)
     }
 
+    /// Read only the file identity attached to an explicit bounded node set.
+    ///
+    /// `limit` bounds both the input identities consulted and the rows
+    /// returned. This is an identity-index operation for pre-hydration packet
+    /// admission, not a source or node-detail projection.
+    pub fn get_node_file_identities_by_ids(
+        &self,
+        node_ids: &[NodeId],
+        limit: usize,
+    ) -> Result<Vec<NodeFileIdentityProjection>, StorageError> {
+        canonical_search_symbol_batch_limit("get_node_file_identities_by_ids", limit)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut identities = BTreeMap::new();
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable_by_key(|id| id.0);
+        unique.dedup();
+        unique.truncate(limit);
+        for chunk in unique.chunks(500) {
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT
+                    node.id,
+                    file.serialized_name
+                 FROM node
+                 LEFT JOIN node file ON file.id = node.file_node_id
+                 WHERE node.id IN ({placeholders})
+                 ORDER BY node.id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let identity = NodeFileIdentityProjection {
+                    node_id: NodeId(row.get(0)?),
+                    file_path: row.get(1)?,
+                };
+                identities.insert(identity.node_id, identity);
+            }
+        }
+        Ok(identities.into_values().collect())
+    }
+
     /// Counts lexical-search symbols in the canonical node table.
     pub fn get_canonical_search_symbol_count(&self) -> Result<u32, StorageError> {
         let count = self
@@ -10587,11 +10702,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
         let copy_result = self.conn.execute(
@@ -10910,11 +11024,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -11628,11 +11741,10 @@ impl Storage {
     }
 
     pub fn copy_llm_symbol_docs_from(&mut self, source_path: &Path) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -12212,6 +12324,37 @@ impl Storage {
             }
         }
         Ok(files)
+    }
+
+    /// Check exact path membership through the file identity index without
+    /// materializing a file record. Packet admission uses this before source,
+    /// node bodies, or other file metadata may be opened.
+    pub fn has_complete_indexed_file_path(&self, paths: &[PathBuf]) -> Result<bool, StorageError> {
+        for chunk in paths.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM file
+                    WHERE path IN ({placeholders})
+                      AND indexed = 1
+                      AND complete = 1
+                    LIMIT 1
+                )"
+            );
+            let found = self.conn.query_row(
+                &sql,
+                params_from_iter(chunk.iter().map(|path| path.to_string_lossy().to_string())),
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn get_file_roles_by_paths(

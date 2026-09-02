@@ -808,13 +808,6 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         "Builds the symbol full-text index (default on).",
     ),
     setting(
-        TEST_EMBED_ALLOW_CPU_ENV,
-        RETRIEVAL_CONFIG,
-        SettingKind::Boolean,
-        SettingAudience::Testing,
-        "Test-support builds only: exercises CPU-shaped embedding failures.",
-    ),
-    setting(
         TEST_CORE_PUBLICATION_ABORT_POINT_ENV,
         STORE_CORE_GENERATION,
         SettingKind::Text,
@@ -827,6 +820,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Path,
         SettingAudience::Testing,
         "Sentinel path written before aborting an immutable core publication (tests only).",
+    ),
+    setting(
+        TEST_EMBED_ALLOW_CPU_ENV,
+        RETRIEVAL_CONFIG,
+        SettingKind::Boolean,
+        SettingAudience::Testing,
+        "Test-support builds only: exercises CPU-shaped embedding failures.",
     ),
     setting(
         TEST_PROMOTION_ABORT_SENTINEL_ENV,

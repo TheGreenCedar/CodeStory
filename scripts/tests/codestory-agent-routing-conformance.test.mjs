@@ -361,6 +361,7 @@ function v3Packet({
     gaps,
     continuation,
     diagnostics: { availability: "unavailable" },
+    answer_sufficiency: "not_asserted",
   };
 }
 
@@ -2764,29 +2765,26 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
     "utf8",
   );
   assert.match(skill, /discovery leads?.*`search`/isu);
-  assert.match(skill, /successful search.*stop.*(?:do not|never).*source/isu);
-  assert.match(skill, /successful search.*stop.*unless.*exact selection/isu);
+  assert.match(skill, /discovery leads?.*select.*unambiguous.*identity.*(?:`context`|`snippet`).*relation/isu);
+  assert.match(skill, /preserve ambiguity.*instead of guessing/isu);
   assert.match(skill, /symbol_id.*context.*(?:`id`|\.id)/isu);
   assert.match(skill, /selected target.*`context`/isu);
   assert.match(skill, /supplied symbol name.*search\.query.*unchanged/isu);
-  assert.match(skill, /broad.*`packet`.*continuation.*once/isu);
+  assert.match(skill, /broad.*`packet`.*continuation.*once.*exact navigation/isu);
   assert.match(skill, /host-supplied.*`verify_indexed_direct_calls`/isu);
   assert.match(skill, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu);
   assert.match(skill, /exact proof from English.*no complete\s+`call-path\/v1` document.*stop.*do not\s+call a\s+repository tool/isu);
   assert.match(skill, /`unknown`.*not absence/isu);
   assert.match(skill, /runtime execution/iu);
-  assert.match(skill, /typed `Unavailable`.*terminal/isu);
+  assert.match(skill, /`unavailable`.*not negative proof/isu);
   assert.match(skill, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu);
   assert.match(skill, /transport.*tool absence.*source/isu);
   assert.match(skill, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu);
-  assert.match(skill, /requested material stage.*direct subject-verb claim.*before.*gap/isu);
-  assert.match(skill, /heading.*symbol\s+(?:inventory|list).*partial observation/isu);
-  assert.match(skill, /gap.*(?:does not|never).*erase.*supported.*(?:does not|never).*authorize.*read/isu);
-  assert.match(skill, /higher-level action.*mechanism.*same evidence rows/isu);
-  assert.match(skill, /participates.*calls/isu);
+  assert.match(skill, /claims? no broader than.*source or typed relation/isu);
+  assert.match(skill, /gap.*does\s+not erase supported evidence.*missing edge.*does\s+not prove absence/isu);
+  assert.match(skill, /follow-up.*returned stable identity or exact path.*stop.*cannot change/isu);
   assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
   assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|verify_indexed_direct_calls|Inspect source after a packet/u);
-  assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);
   assert.match(openAiMetadata, /read and follow the loaded codestory-grounding skill/isu);
   assert.match(openAiMetadata, /sole source of truth/isu);
   assert.match(openAiMetadata, /adds no parallel instructions/isu);
@@ -2799,7 +2797,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
   assert.match(contextReference, /bare\s+symbol.*exact\s+path.*evidence\[\]\.symbol_id.*context\.id/isu);
   assert.match(contextReference, /do not combine.*name.*path.*free-text\s+`query`/isu);
   assert.match(packetReference, /continuation\.gap_ids.*map.*gap_id/isu);
-  assert.match(packetReference, /fallback-only.*initial.*probe/isu);
+  assert.match(packetReference, /exact probe only.*user.*repository evidence/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {

@@ -19,7 +19,6 @@ fn citation(display_name: &str, file_path: &str) -> AgentCitationDto {
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
     }

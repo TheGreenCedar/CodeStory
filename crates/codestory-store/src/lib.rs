@@ -28,9 +28,10 @@ pub use annotations::{
 pub use core_generation::with_core_clone_disabled;
 pub use core_generation::{
     CORE_COPY_ON_WRITE_UNAVAILABLE, CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY,
-    CORE_PUBLICATION_FILE, CORE_STAGING_DIRECTORY, CorePublicationLayout, core_database_exists,
-    is_core_copy_on_write_unavailable, make_file_owner_writable, remove_staging_database,
-    resolve_core_database_path, resolve_core_generation_database_path,
+    CORE_PUBLICATION_FILE, CORE_STAGING_DIRECTORY, CorePublicationCommitV1,
+    CorePublicationDurabilityReasonV1, CorePublicationDurabilityV1, CorePublicationLayout,
+    core_database_exists, is_core_copy_on_write_unavailable, make_file_owner_writable,
+    remove_staging_database, resolve_core_database_path, resolve_core_generation_database_path,
 };
 pub use core_session::{CorePublishTransaction, CoreReadSession};
 pub use file_store::FileStore;
@@ -51,8 +52,8 @@ pub use sqlite_observation::{
 };
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
-    BoundedRawCallEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary,
-    CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    BoundedRawCallEdges, BoundedRawIncidentEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION,
+    CallerProjectionRemovalSummary, CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorContentIdentity,
     DenseAnchorInput, DenseAnchorInputReuseMetadata, DenseAnchorInputStats,
     DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, DenseReasonCounts,
@@ -61,12 +62,13 @@ pub use storage_impl::{
     GroundingSnapshotMetadata, GroundingSnapshotState, IndexArtifactCacheEntry,
     IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,
-    PromotedValidation, ProofResolutionPublication, RehydratedCacheRebaseStats,
-    RetrievalCoreGenerationBinding, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
-    SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
-    STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
-    SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
+    NodeFileIdentityProjection, ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats,
+    ProjectionPersistenceStats, PromotedValidation, ProofResolutionPublication,
+    RehydratedCacheRebaseStats, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
+    RetrievalIndexRollbackRecord, SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+    STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION, STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE,
+    STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION, SearchSymbolProjection,
+    SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
     SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
     StorageError, StorageOpenMode, StorageStats, StoredVectorEncoding,
     StructuralTextArtifactCacheWrite, StructuralTextProjection,

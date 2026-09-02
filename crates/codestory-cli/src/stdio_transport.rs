@@ -18,6 +18,7 @@ use codestory_contracts::api::{
     SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope, TrailDirection,
     TrailMode,
 };
+use codestory_contracts::compilation::{PacketContinuationSelectorV1, PacketStructuralGapReasonV1};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1877,7 +1878,9 @@ fn handle_stdio_request(
                     return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                 };
                 let validation =
-                    match crate::prove_call_path::validate_request(proof_request.clone()) {
+                    match codestory_runtime::proof_qualification_support::
+                        validate_public_call_path_contract(proof_request.clone())
+                    {
                         Ok(validation) => validation,
                         Err(message) => {
                             return Some(stdio_jsonrpc_success(
@@ -1886,7 +1889,7 @@ fn handle_stdio_request(
                             ));
                         }
                     };
-                let root = match validation {
+                let public = match validation {
                     codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
                         contract,
                         hashes,
@@ -1908,8 +1911,10 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        match crate::prove_call_path::projection_root(&operation) {
-                            Ok(root) => root,
+                        match codestory_runtime::proof_qualification_support::
+                            project_observed_public_operation(&operation)
+                        {
+                            Ok(public) => public,
                             Err(_) => {
                                 return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                             }
@@ -1938,11 +1943,18 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        crate::prove_call_path::internal_projection_root(&operation.value)
+                        match codestory_runtime::proof_qualification_support::
+                            project_internal_projection(&operation.value)
+                        {
+                            Ok(public) => public,
+                            Err(_) => {
+                                return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                            }
+                        }
                     }
                 };
                 return Some(
-                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &root) {
+                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &public) {
                         Ok(result) => stdio_jsonrpc_success(id, result),
                         Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
                     },
@@ -2190,8 +2202,6 @@ fn project_stdio_tool_execution_v3(
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 probes: stdio_packet_probes(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                extra_probes: stdio_packet_extra_probes(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 latency_budget_ms: stdio_packet_latency_budget(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 parent_packet_id: request
@@ -2371,6 +2381,26 @@ fn build_served_tool_result_v3(
     Ok(result)
 }
 
+fn build_unchecked_served_tool_result_v3(
+    revision: crate::stdio_v3::McpRevisionV3,
+    root: &serde_json::Value,
+    publication_meta: Option<&serde_json::Value>,
+) -> std::result::Result<serde_json::Value, crate::stdio_v3::StdioV3InternalError> {
+    let mut result = crate::stdio_v3::revision_native_tool_result_unchecked_v3(revision, root)?;
+    if revision.profile().structured_content
+        && let Some(publication_meta) = publication_meta
+        && let Some(meta) = result
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.insert(
+            "codestory_publication".to_string(),
+            publication_meta.clone(),
+        );
+    }
+    Ok(result)
+}
+
 fn finalize_packet_projection_for_stdio_v3(
     root: &mut serde_json::Value,
     revision: crate::stdio_v3::McpRevisionV3,
@@ -2384,10 +2414,85 @@ fn finalize_packet_projection_for_stdio_v3(
     {
         reference.remove("uri");
     }
-    let mut projection = serde_json::from_value::<
+    let projection_result = serde_json::from_value::<
         codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
-    >(typed_root)
-    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.to_string()))?;
+    >(typed_root.clone());
+    let mut projection = match projection_result {
+        Ok(projection) => projection,
+        Err(error)
+            if typed_root
+                .get("evidence")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|rows| {
+                    rows.len()
+                        > codestory_contracts::packet_projection_v3::PACKET_EVIDENCE_ROWS_MAX_V3
+                }) =>
+        {
+            let complete_result =
+                build_unchecked_served_tool_result_v3(revision, root, publication_meta)?;
+            let required_complete_bytes = v3_serialize_call_tool_result(&complete_result)
+                .map_err(|serialize_error| {
+                    crate::stdio_v3::StdioV3InternalError::Serialization(
+                        serialize_error.to_string(),
+                    )
+                })?
+                .len();
+            let schema_version = typed_root
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(
+                        "packet schema_version is missing or invalid".to_string(),
+                    )
+                })?;
+            let parse_envelope = |field: &str| {
+                typed_root.get(field).cloned().ok_or_else(|| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet {field} is missing"
+                    ))
+                })
+            };
+            let identity =
+                serde_json::from_value(parse_envelope("identity")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet identity is invalid: {field_error}"
+                    ))
+                })?;
+            let publication =
+                serde_json::from_value(parse_envelope("publication")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet publication is invalid: {field_error}"
+                    ))
+                })?;
+            let retrieval =
+                serde_json::from_value(parse_envelope("retrieval")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet retrieval is invalid: {field_error}"
+                    ))
+                })?;
+            let diagnostics =
+                serde_json::from_value(parse_envelope("diagnostics")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet diagnostics are invalid: {field_error}"
+                    ))
+                })?;
+            let _ = error;
+            codestory_runtime::packet_budget_exceeded_projection_v3_from_envelope(
+                schema_version,
+                identity,
+                publication,
+                retrieval,
+                diagnostics,
+                required_complete_bytes,
+            )
+        }
+        Err(error) => {
+            return Err(crate::stdio_v3::StdioV3InternalError::InvalidProjection(
+                error.to_string(),
+            ));
+        }
+    };
     let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
         &mut projection,
         |candidate| {
@@ -4306,13 +4411,7 @@ fn handle_stdio_packet(
         Ok(probes) => probes,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let extra_probes = match stdio_packet_extra_probes(request) {
-        Ok(extra_probes) => extra_probes,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
-    if let Err(error) =
-        codestory_contracts::api::validate_packet_probe_request(&probes, &extra_probes)
-    {
+    if let Err(error) = codestory_contracts::api::validate_packet_probe_request(&probes) {
         return serde_json::json!({"error": error});
     }
     let parent_packet_id = request
@@ -4341,7 +4440,6 @@ fn handle_stdio_packet(
             question,
             budget,
             probes: &probes,
-            extra_probes: &extra_probes,
             latency_budget_ms,
             parent_packet_id: parent_packet_id.as_deref(),
             option_ids: &option_ids,
@@ -4362,7 +4460,6 @@ fn handle_stdio_packet(
             question: question.to_string(),
             budget,
             probes,
-            extra_probes,
             latency_budget_ms,
             parent_packet_id,
             option_ids,
@@ -4466,7 +4563,6 @@ struct StdioPacketCacheKey {
     question: String,
     budget: &'static str,
     probes: Vec<PacketProbeDto>,
-    extra_probes: Vec<String>,
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<String>,
     option_ids: Vec<String>,
@@ -4540,7 +4636,6 @@ struct StdioPacketCacheKeyInput<'a> {
     question: &'a str,
     budget: PacketBudgetModeDto,
     probes: &'a [PacketProbeDto],
-    extra_probes: &'a [String],
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<&'a str>,
     option_ids: &'a [String],
@@ -4554,7 +4649,6 @@ fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCac
         question: input.question.to_string(),
         budget: stdio_packet_budget_label(input.budget),
         probes: input.probes.to_vec(),
-        extra_probes: input.extra_probes.to_vec(),
         latency_budget_ms: input.latency_budget_ms,
         parent_packet_id: input.parent_packet_id.map(str::to_string),
         option_ids: input.option_ids.to_vec(),
@@ -4688,25 +4782,6 @@ fn stdio_packet_probes(request: &serde_json::Value) -> Result<Vec<PacketProbeDto
             Ok(probe)
         })
         .collect()
-}
-
-fn stdio_packet_extra_probes(request: &serde_json::Value) -> Result<Vec<String>> {
-    let Some(value) = request.pointer("/params/arguments/extra_probes") else {
-        return Ok(Vec::new());
-    };
-    let Some(values) = value.as_array() else {
-        bail!("packet.extra_probes must be an array of strings");
-    };
-    let mut probes = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(probe) = value.as_str() else {
-            bail!("packet.extra_probes must be an array of strings");
-        };
-        codestory_contracts::api::validate_packet_probe_request(&[], &[probe.to_string()])
-            .map_err(anyhow::Error::msg)?;
-        probes.push(probe.to_string());
-    }
-    Ok(probes)
 }
 
 fn handle_stdio_search(
@@ -7512,21 +7587,22 @@ fn stdio_continuation_binding(runtime: &RuntimeContext) -> Option<StdioContinuat
 
 fn stdio_node_links(
     node_id: &str,
-    query: Option<&str>,
+    _query: Option<&str>,
     continuation: Option<&StdioContinuationBinding>,
     project_root: &Path,
 ) -> serde_json::Value {
-    let continuation_probe =
-        query
-            .zip(continuation)
-            .map(|(query, continuation)| PacketProbeDto::Continuation {
-                contract_version: PACKET_PROBE_CONTRACT_VERSION,
-                project_id: continuation.project_id.clone(),
-                core_generation_id: continuation.core_generation_id.clone(),
-                retrieval_generation: continuation.retrieval_generation.clone(),
-                symbol_id: Some(node_id.to_string()),
-                query: query.to_string(),
-            });
+    let continuation_probe = continuation.map(|continuation| PacketProbeDto::Continuation {
+        contract_version: PACKET_PROBE_CONTRACT_VERSION,
+        project_id: continuation.project_id.clone(),
+        core_generation_id: continuation.core_generation_id.clone(),
+        retrieval_generation: continuation.retrieval_generation.clone(),
+        selector: PacketContinuationSelectorV1 {
+            stable_identity: format!("node:{node_id}"),
+            path: None,
+            symbol_id: Some(node_id.to_string()),
+            reason: PacketStructuralGapReasonV1::DisconnectedSeed,
+        },
+    });
     let mut links = serde_json::json!([
         {
             "rel": "symbol",
@@ -7998,6 +8074,7 @@ mod tests {
                     "retrieval":null
                 },
                 "status":"available",
+                "answer_sufficiency":"not_asserted",
                 "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
                 "evidence":evidence,
                 "gaps":[],
@@ -8591,7 +8668,6 @@ mod tests {
             question,
             budget: PacketBudgetModeDto::Compact,
             probes: &[],
-            extra_probes: &[],
             latency_budget_ms: Some(15_000),
             parent_packet_id: None,
             option_ids: &[],
@@ -9930,8 +10006,10 @@ version = "0.11.20"
         assert_eq!(probe["project_id"], "project-v3");
         assert_eq!(probe["core_generation_id"], "core-generation");
         assert_eq!(probe["retrieval_generation"], "retrieval-generation");
-        assert_eq!(probe["symbol_id"], "42");
-        assert_eq!(probe["query"], "AppController");
+        assert_eq!(probe["selector"]["stable_identity"], "node:42");
+        assert_eq!(probe["selector"]["symbol_id"], "42");
+        assert_eq!(probe["selector"]["reason"], "disconnected_seed");
+        assert!(probe.get("query").is_none());
 
         let definition_links =
             stdio_definition_links("42", "AppController", Some(&binding), Path::new("/repo"));
@@ -9957,7 +10035,6 @@ version = "0.11.20"
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
             ),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: Some(false),
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -10612,14 +10689,6 @@ version = "0.11.20"
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
         );
-        let extra_probes = ["src/lib.rs run".to_string()];
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                extra_probes: &extra_probes,
-                ..base_packet_cache_key_input("Explain packet caching.")
-            })
-        );
         let probes = [PacketProbeDto::ExactPath {
             path: "src/lib.rs".into(),
         }];
@@ -10669,6 +10738,7 @@ version = "0.11.20"
                     "probes": [
                         {"kind": "exact_path", "path": "assets/desk.svg"},
                         {"kind": "symbol_id", "id": "42"},
+                        {"kind": "qualified_symbol", "symbol": "crate::runtime::run"},
                         {"kind": "file_symbol", "path": "src/lib.rs", "symbol": "run"},
                         {"kind": "free_query", "query": "runtime path"},
                         {
@@ -10677,8 +10747,11 @@ version = "0.11.20"
                             "project_id": "project",
                             "core_generation_id": "core",
                             "retrieval_generation": "retrieval",
-                            "symbol_id": "42",
-                            "query": "run"
+                            "selector": {
+                                "stable_identity": "node:42",
+                                "symbol_id": "42",
+                                "reason": "disconnected_seed"
+                            }
                         }
                     ]
                 }
@@ -10686,7 +10759,7 @@ version = "0.11.20"
         });
         assert_eq!(
             stdio_packet_probes(&request).expect("tagged probes").len(),
-            5
+            6
         );
 
         let malformed = serde_json::json!({
@@ -10702,19 +10775,11 @@ version = "0.11.20"
         });
         assert!(stdio_packet_probes(&too_long).is_err());
 
-        let empty_legacy = serde_json::json!({
-            "params": {"arguments": {"extra_probes": ["   "]}}
-        });
-        assert!(stdio_packet_extra_probes(&empty_legacy).is_err());
-
         let probes = vec![
             PacketProbeDto::FreeQuery { query: "x".into() };
-            codestory_contracts::api::PACKET_PROBE_MAX_COUNT
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT + 1
         ];
-        assert!(
-            codestory_contracts::api::validate_packet_probe_request(&probes, &["overflow".into()])
-                .is_err()
-        );
+        assert!(codestory_contracts::api::validate_packet_probe_request(&probes).is_err());
     }
 
     #[test]
