@@ -427,6 +427,14 @@ test("operation parser and policy fail closed on arm leakage", () => {
     codeStoryInvocationsFromCommand("echo $CODESTORY_CLI")[0].operation,
     null,
   );
+  const directLineContinuation = [
+    "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\",
+    "Beta --repo-text off",
+  ].join("\n");
+  const wrappedLineContinuation = [
+    "/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\",
+    "Beta --repo-text off'",
+  ].join("\n");
   for (const wrapped of [
     `sh -c '\"$CODESTORY_CLI\" search --query Alpha --repo-text off; cat src/lib.rs'`,
     `eval '$CODESTORY_CLI search --query Alpha --repo-text off'`,
@@ -439,6 +447,9 @@ test("operation parser and policy fail closed on arm leakage", () => {
     `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query ~ --repo-text off'`,
     `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off`,
     `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query Alpha\\ Beta --repo-text off`,
+    directLineContinuation,
+    wrappedLineContinuation,
     `$CODESTORY_CLI search --query \"$(cat src/lib.rs)\" --repo-text off`,
     `$CODESTORY_CLI search --query \"\u0060cat src/lib.rs\u0060\" --repo-text off`,
     `sh -c \"$(printenv CODESTORY_CLI) search --query Alpha --repo-text off\"`,

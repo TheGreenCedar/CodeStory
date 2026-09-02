@@ -132,14 +132,13 @@ function hasUnquotedShellComposition(command) {
   return escaped || quote != null;
 }
 
-function shellWords(command) {
-  if (hasUnquotedShellComposition(command)) return null;
+function literalShellWords(command) {
   const text = String(command ?? "");
+  if (/[\0\r\n]/u.test(text)) return null;
   const words = [];
   let word = "";
   let wordStarted = false;
   let quote = null;
-  let escaped = false;
   const finishWord = () => {
     if (!wordStarted) return;
     words.push(word);
@@ -148,20 +147,17 @@ function shellWords(command) {
   };
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];
-    if (escaped) {
-      word += character;
-      wordStarted = true;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && quote !== "'") {
-      escaped = true;
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else word += character;
       wordStarted = true;
       continue;
     }
-    if (quote) {
-      if (character === quote) {
+    if (quote === '"') {
+      if (character === '"') {
         quote = null;
+      } else if (character === "\\" || character === "$" || character === "`") {
+        return null;
       } else {
         word += character;
       }
@@ -177,66 +173,21 @@ function shellWords(command) {
       finishWord();
       continue;
     }
+    if (character === "\\") {
+      if (text[index + 1] !== "'") return null;
+      word += "'";
+      wordStarted = true;
+      index += 1;
+      continue;
+    }
+    if (!/[A-Za-z0-9_./:@%+,=-]/u.test(character)) return null;
+    if (character === "=" && !wordStarted) return null;
     word += character;
     wordStarted = true;
   }
-  if (escaped || quote) return null;
+  if (quote) return null;
   finishWord();
   return words;
-}
-
-function hasDynamicShellExpansion(command) {
-  const text = String(command ?? "");
-  let quote = null;
-  let escaped = false;
-  let wordStarted = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (escaped) {
-      escaped = false;
-      wordStarted = true;
-      continue;
-    }
-    if (character === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote === "'") {
-      if (character === "'") quote = null;
-      wordStarted = true;
-      continue;
-    }
-    if (quote === '"') {
-      if (character === '"') {
-        quote = null;
-      } else if (character === "$" || character === "`") {
-        return true;
-      }
-      wordStarted = true;
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      quote = character;
-      wordStarted = true;
-      continue;
-    }
-    if (/\s/u.test(character)) {
-      wordStarted = false;
-      continue;
-    }
-    if (
-      character === "$" || character === "`" || character === "*" ||
-      character === "?" || character === "[" || character === "]" ||
-      character === "{" || character === "}" || character === "(" ||
-      character === ")" || character === "~" || character === "^" ||
-      character === "#" || character === "!" ||
-      (character === "=" && !wordStarted)
-    ) {
-      return true;
-    }
-    wordStarted = true;
-  }
-  return escaped || quote != null;
 }
 
 function directPinnedBenchmarkCliInvocation(command) {
@@ -244,14 +195,12 @@ function directPinnedBenchmarkCliInvocation(command) {
   const executable = String.raw`(?:"\$(?:CODESTORY_CLI|\{CODESTORY_CLI\})"|\$(?:CODESTORY_CLI|\{CODESTORY_CLI\}))`;
   const executableMatch = text.match(new RegExp(`^\\s*${executable}(?=\\s)`, "u"));
   if (!executableMatch) return null;
-  if (hasDynamicShellExpansion(text.slice(executableMatch[0].length))) return null;
-  const words = shellWords(text);
-  if (!words || words.length < 2) return null;
-  if (!["$CODESTORY_CLI", "${CODESTORY_CLI}"].includes(words[0])) return null;
-  if (!/^[a-z][a-z0-9-]*$/iu.test(words[1])) return null;
+  const words = literalShellWords(text.slice(executableMatch[0].length));
+  if (!words || words.length < 1) return null;
+  if (!/^[a-z][a-z0-9-]*$/iu.test(words[0])) return null;
   return {
-    operation: normalizeCodeStoryOperation(words[1]),
-    args: words.slice(2),
+    operation: normalizeCodeStoryOperation(words[0]),
+    args: words.slice(1),
   };
 }
 
@@ -259,7 +208,7 @@ function directBenchmarkCliInvocation(command) {
   const direct = directPinnedBenchmarkCliInvocation(command);
   if (direct) return direct;
 
-  const outer = shellWords(command);
+  const outer = literalShellWords(command);
   if (
     !outer || outer.length !== 3 || outer[0] !== "/bin/zsh" ||
     !["-lc", "-c"].includes(outer[1])
