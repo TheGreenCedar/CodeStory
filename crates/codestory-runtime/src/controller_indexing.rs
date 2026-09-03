@@ -44,7 +44,9 @@ use codestory_contracts::api::{
     StartIndexingRequest, StorageStatsDto, SummaryGenerationDto,
 };
 use codestory_indexer::CancellationToken;
-use codestory_store::{CURRENT_SCHEMA_VERSION, IndexPublicationRecord, Store, SymbolSummaryRecord};
+use codestory_store::{
+    CURRENT_SCHEMA_VERSION, CoreReadSession, IndexPublicationRecord, Store, SymbolSummaryRecord,
+};
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -57,7 +59,7 @@ pub(crate) struct ActivationIndexingEvidence {
 }
 
 impl AppController {
-    pub(crate) fn project_summary_from_storage(
+    fn core_project_summary_from_storage(
         &self,
         root: &Path,
         storage_path: &Path,
@@ -98,14 +100,88 @@ impl AppController {
             root: root.to_string_lossy().to_string(),
             stats: dto_stats,
             members,
-            retrieval: Some(retrieval_state_from_storage_for_runtime(
-                storage,
-                root,
-                &self.runtime_config,
-            )?),
+            retrieval: None,
             freshness: Some(freshness),
             publication,
         })
+    }
+
+    pub(crate) fn project_summary_from_storage(
+        &self,
+        root: &Path,
+        storage_path: &Path,
+        storage: &Storage,
+    ) -> Result<ProjectSummary, ApiError> {
+        let mut summary = self.core_project_summary_from_storage(root, storage_path, storage)?;
+        summary.retrieval = Some(retrieval_state_from_storage_for_runtime(
+            storage,
+            root,
+            &self.runtime_config,
+        )?);
+        Ok(summary)
+    }
+
+    /// Attach an existing immutable core without touching retrieval-owned
+    /// state or creating a cache path.
+    pub fn open_core_read_only_with_storage_path(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        if !root.exists() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(ApiError::invalid_argument(format!(
+                "Project path is not a directory: {}",
+                root.display()
+            )));
+        }
+        let session = CoreReadSession::pin(&storage_path).map_err(|error| {
+            ApiError::new(
+                "project_unavailable",
+                format!("no complete core publication is available: {error}"),
+            )
+        })?;
+        let summary =
+            self.core_project_summary_from_storage(&root, &storage_path, session.storage())?;
+        if summary.publication.is_none() {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "no complete core publication is available",
+            ));
+        }
+
+        let changed = {
+            let mut state = self.state.lock();
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                }) || state.observed_core_publication.as_ref() != summary.publication.as_ref();
+            state.project_root = Some(root);
+            state.storage_path = Some(storage_path);
+            state.observed_core_publication = summary.publication.clone();
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+            }
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
+            self.clear_proof_publication_validation_cache();
+        }
+        Ok(summary)
     }
 
     pub fn complete_index_publication_at(

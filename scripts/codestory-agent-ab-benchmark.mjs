@@ -44,6 +44,7 @@ import {
   isBuilderPacketArm,
   planBuilderAblationRuns,
 } from "./lib/evidence-compiler-ablation.mjs";
+import { canaryBlockers, runBuilderOperationCanary, sandboxCommand } from "./lib/builder-operation-canary.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const benchmarkHarnessPath = fileURLToPath(import.meta.url);
@@ -2795,10 +2796,10 @@ function builderAblationArmInstruction(arm, continuationContract = null) {
     return "Do not use CodeStory. Investigate with ordinary local search and source reads.";
   }
   if (arm === "exact_identity_source") {
-    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use only `search --query <identifier-or-terms> --repo-text off`, files, symbol, or snippet. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+    return "Your first repository-context action must be a successful CodeStory search. With $CODESTORY_CLI, use only `search --query <identifier-or-terms> --repo-text off --refresh none`, files, symbol, or snippet. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, mutating refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
   }
   if (arm === "exact_plus_relations") {
-    return "Your first repository-context action must be a successful CodeStory exact operation. With $CODESTORY_CLI, use `search --query <identifier-or-terms> --repo-text off`, files, symbol, snippet, context, trail, callers, callees, or trace. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
+    return "Your first repository-context action must be a successful CodeStory search. With $CODESTORY_CLI, use `search --query <identifier-or-terms> --repo-text off --refresh none`, files, symbol, snippet, context, trail, callers, callees, or trace. Include at least one successful explicit relation operation. Every CodeStory command must include the exact --project path shown above; search must also include --profile agent --run-id shared-agent. Do not pass cache, mutating refresh, or output-file overrides. After the first CodeStory output, investigate adaptively with ordinary local search and source reads. Any other CodeStory operation invalidates the row.";
   }
   const continuation = continuationContract
     ? ` The packet offers one optional continuation. If you use it, run this exact command as a separate repository-context action and do not run another CodeStory command:
@@ -6532,7 +6533,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const stdoutPath = path.join(outDir, `${runId}.codestory-packet.stdout.json`);
   const stderrPath = path.join(outDir, `${runId}.codestory-packet.stderr.txt`);
   const started = performance.now();
-  let result = await runProcess(codestoryCli, args, {
+  const invocation = opts.builderAblation
+    ? sandboxCommand(opts.sandbox, repoConfig.path, codestoryCli, args)
+    : { command: codestoryCli, args };
+  let result = await runProcess(invocation.command, invocation.args, {
     cwd: repoConfig.path,
     env,
     signal: opts.signal,
@@ -14513,6 +14517,7 @@ async function runBuilderAblationPipeline({
   recordPreparation,
   recordPreparationState,
   recordFirstFailure,
+  runOperationCanary,
 }) {
   const cachePreparation = [];
   opts.cachePreparationByRepo ??= new Map();
@@ -14569,6 +14574,22 @@ async function runBuilderAblationPipeline({
     };
   }
 
+  let operationCanary;
+  try {
+    operationCanary = await runOperationCanary({ opts, outDir });
+    const blockers = canaryBlockers(operationCanary);
+    if (blockers.length) throw new Error(blockers.join("; "));
+    opts.operationCanary = operationCanary;
+  } catch (error) {
+    const failure = pipelineStageFailure("operation_canary", null, error);
+    await recordFirstFailure(failure);
+    return {
+      results: [], firstFailure: failure, comparativeFailure: null,
+      comparativePublishable: false, cachePreparation, agentCodexIsolation,
+      operationCanary, experiment_status: "invalid", packet_decision: "not_evaluated", aborted: true,
+    };
+  }
+
   const outcome = await runPlannedAgentRuns(
     { ...opts, jobs: 1 },
     plannedRuns,
@@ -14588,8 +14609,42 @@ async function runBuilderAblationPipeline({
     comparativePublishable: outcome.firstFailure == null,
     cachePreparation,
     agentCodexIsolation,
+    operationCanary,
     aborted: false,
   };
+}
+
+async function runTimedAgentOperationCanary({ opts, outDir }) {
+  if (opts.runner !== "codex") throw new Error("operation canary requires the pinned Codex runner");
+  const cli = resolveCodeStoryCli(opts);
+  const question = "What does seed call?";
+  const proofPath = (arm, continuation = false) => path.join(outDir, `canary-${arm}-${continuation ? "continuation" : "packet"}-proof.json`);
+  return await runBuilderOperationCanary({
+    root: opts.builderAblationStateRoot, outDir, cli, sandbox: opts.sandbox,
+    envForArm: (arm) => {
+      const env = agentRunnerEnv(selectedBenchmarkChildEnv(opts), opts.agentCodexHomes?.[arm], isCodeStoryArm(arm));
+      if (isCodeStoryArm(arm)) env.CODESTORY_CLI = cli;
+      return env;
+    },
+    runProcess,
+    scopeArgs: benchmarkAgentScopeArgs,
+    retrievalArgs: retrievalIndexCommandArgs,
+    packetArgs: (project, arm) => [
+      ...packetCommandArgs({ path: project }, { prompt: question }, opts, arm),
+      "--benchmark-retrieval-proof-out", proofPath(arm),
+    ],
+    continuationArgs: (project, arm, packet) => {
+      const args = drillPacketCommandArgs({ path: project }, { prompt: question }, opts, packet, arm);
+      return args ? [...args, "--benchmark-retrieval-proof-out", proofPath(arm, true)] : null;
+    },
+    validatePacket: async (packet, arm, previous) => {
+      const proof = JSON.parse(await readFile(proofPath(arm, Boolean(previous)), "utf8"));
+      return builderPacketRetrievalProofErrors(proof, previous ? "packet_semantic_off" : arm).length === 0 &&
+        packetV3ContractBlockers(packet).length === 0 &&
+        packet.evidence?.some((row) => row.path === "src/lib.rs" && row.start_line > 0 && row.summary?.includes("leaf")) &&
+        (!previous || JSON.stringify(packet.publication) === JSON.stringify(previous.publication));
+    },
+  });
 }
 
 async function runAgentBenchmarkPipeline({
@@ -14607,6 +14662,7 @@ async function runAgentBenchmarkPipeline({
   recordPreparationState = async () => {},
   recordFirstFailure = async () => {},
   recordComparativeFailure = async () => {},
+  runOperationCanary = runTimedAgentOperationCanary,
 }) {
   if (opts.builderAblation) {
     return await runBuilderAblationPipeline({
@@ -14622,6 +14678,7 @@ async function runAgentBenchmarkPipeline({
       recordPreparation,
       recordPreparationState,
       recordFirstFailure,
+      runOperationCanary,
     });
   }
   if (opts.exactCandidate) {
@@ -15226,6 +15283,8 @@ async function main() {
           packet_semantic_off_scope:
             "dense_candidate_stage_only_model_residency_and_full_publication_health_retained",
           critical_claim_adjudication: "required_external_blinded_receipt",
+          operation_canary: pipeline.operationCanary ?? null,
+          experiment_status: pipeline.experiment_status ?? (firstFailure ? "invalid" : "pending_evaluation"),
         }
       : null,
     runner: opts.runner,

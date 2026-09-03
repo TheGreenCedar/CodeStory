@@ -3597,6 +3597,27 @@ test("benchmark pipeline fences a failed canary and counts a passing canary once
   assert.equal(nonOwnerResult.results.some((row) => row.canary), false);
 });
 
+test("builder operation canary aborts all model launches on failure or missing telemetry", async () => {
+  for (const canary of [null, { status: "fail" }, { status: "pass", operations: [] }]) {
+    const fixture = pipelineFixture({ repos: ["canary"] });
+    fixture.opts.builderAblation = true;
+    const launches = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      ...fixture,
+      prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+      runOperationCanary: async () => canary,
+      executeRun: async (_opts, run) => {
+        launches.push(run);
+        return pipelineResult(run);
+      },
+    });
+    assert.deepEqual(launches, []);
+    assert.equal(outcome.experiment_status, "invalid");
+    assert.equal(outcome.packet_decision, "not_evaluated");
+    assert.equal(outcome.aborted, true);
+  }
+});
+
 test("benchmark pipeline rejects missing or wrong-repository canary preparation before agents", async () => {
   for (const prepared of [[], [pipelinePreparation("wrong-repo")]]) {
     const launched = [];

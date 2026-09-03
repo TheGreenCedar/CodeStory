@@ -3,6 +3,7 @@ use crate::route_coverage::{
     RouteHandlerCandidate, compare_route_handler_candidates,
     route_endpoint_metadata_from_canonical, route_endpoint_metadata_from_openapi_label,
 };
+use crate::search::engine::search_core_symbol_names_with_scores;
 #[cfg(test)]
 use crate::search_scoring::HybridSearchInstrumentation;
 use crate::support::node_display_name;
@@ -299,6 +300,54 @@ impl AppController {
         let mut hits = matches
             .into_iter()
             .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
+            .collect::<Vec<_>>();
+        let project_root = self.require_project_root().ok();
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
+        });
+        hits.truncate(max_results.clamp(1, 50));
+        Ok(hits)
+    }
+
+    /// Resolve symbols from the immutable core projection only.
+    ///
+    /// This deliberately avoids `ensure_search_state`: that path attaches the
+    /// persisted search generation and therefore acquires its catalog lock.
+    /// An explicit `repo_text=off` query owns no retrieval or search-generation
+    /// dependency, so it streams canonical identities from the already-pinned
+    /// core and applies the same in-memory fuzzy matcher directly.
+    pub(crate) fn resolve_core_symbol_candidates(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        let storage = self.open_storage_read_only()?;
+        let mut symbols = Vec::new();
+        let (node_names, _) = crate::load_canonical_search_symbols(
+            &storage,
+            crate::semantic_projection::SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+            None,
+            |batch| {
+                symbols.extend(
+                    batch
+                        .into_iter()
+                        .map(|entry| (entry.node_id, entry.display_name)),
+                );
+                Ok(())
+            },
+        )?;
+        let matches = search_core_symbol_names_with_scores(&symbols, query);
+        let names = node_names_for_ids(&node_names, matches.iter().map(|(id, _)| *id));
+        let mut hits = matches
+            .into_iter()
+            .map(|(id, score)| Self::build_search_hit(&storage, &names, id, score))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()

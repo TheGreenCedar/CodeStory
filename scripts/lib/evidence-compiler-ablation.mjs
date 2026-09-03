@@ -262,7 +262,7 @@ const EXACT_OPERATION_ARGUMENTS = Object.freeze({
   search: {
     values: new Set([
       "--project", "--query", "--limit", "--repo-text", "--profile", "--run-id",
-      "--format",
+      "--format", "--refresh",
     ]),
     booleans: new Set(["--why", "--plan-details"]),
   },
@@ -343,6 +343,9 @@ function exactOperationArgumentViolations(operation, command, expectedProject) {
     }
     if (seen.get("--profile") !== "agent" || seen.get("--run-id") !== "shared-agent") {
       violations.push("CLI search must bind the prepared agent profile and run id");
+    }
+    if (seen.has("--refresh") && seen.get("--refresh") !== "none") {
+      violations.push("CLI exact search permits only observational --refresh none");
     }
   }
   return violations;
@@ -454,6 +457,9 @@ function builderOperationViolations(arm, operations, options = {}) {
     return ["CodeStory arm executed no successful CodeStory operation"];
   }
   for (const entry of attempted) {
+    if (entry.successful !== true) {
+      violations.push(`CodeStory operation ${entry.operation ?? "unknown"} did not succeed`);
+    }
     if (entry.source !== "harness_packet_prelude" && entry.transport !== "cli") {
       violations.push("builder ablation permits only the checksum-bound CodeStory CLI");
     }
@@ -771,7 +777,7 @@ function denseStageProofInvocations(receipt, arm) {
   return invocations;
 }
 
-function evidenceCompilerBuilderAcceptance(rows, adjudication, options = {}) {
+function evidenceCompilerExperimentValidity(rows, options = {}) {
   const reasons = [];
   const expectedTaskIds = options.taskIds ?? BUILDER_ABLATION_TASK_IDS;
   const expectedRepeats = options.repeats ?? 3;
@@ -794,6 +800,19 @@ function evidenceCompilerBuilderAcceptance(rows, adjudication, options = {}) {
     const violations = row.builder_ablation?.operation_violations;
     if (!Array.isArray(violations) || violations.length) {
       reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} has missing or forbidden operation telemetry`);
+    }
+    const operations = row.transcript_analysis?.codestory_operations;
+    if (!Array.isArray(operations) || operations.some((operation) => operation.successful !== true)) {
+      reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} has missing or failed required-operation telemetry`);
+    } else if (row.arm.startsWith("exact_")) {
+      if (operations[0]?.operation !== "search") {
+        reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} did not start with exact search`);
+      }
+      if (row.arm === "exact_plus_relations" && !operations.some((operation) =>
+        EXPLICIT_RELATION_OPERATIONS.has(operation.operation) && !EXACT_IDENTITY_SOURCE_OPERATIONS.has(operation.operation)
+      )) {
+        reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} executed no explicit relation operation`);
+      }
     }
     if (row.comparator_reuse_provenance || row.resume_provenance || row.reused_from) {
       reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} is not fresh`);
@@ -904,6 +923,20 @@ function evidenceCompilerBuilderAcceptance(rows, adjudication, options = {}) {
   if (denseSemanticOnInvocations < 1) {
     reasons.push("semantic-on packet rows contain no executed dense candidate stage");
   }
+
+  const pairs = pairedRows(rows, "packet_semantic_off", "exact_plus_relations");
+  if (pairs.length !== expectedTaskIds.length * expectedRepeats || pairs.some((pair) => !timingPairIsEligible(pair))) {
+    reasons.push("packet and primitive timing rows do not share complete eligible cohort identities");
+  }
+  return { valid: reasons.length === 0, reasons: [...new Set(reasons)], expected_rows: expectedRows };
+}
+
+function evidenceCompilerBuilderAcceptance(rows, adjudication, options = {}) {
+  const validity = evidenceCompilerExperimentValidity(rows, options);
+  const reasons = [...validity.reasons];
+  const expectedTaskIds = options.taskIds ?? BUILDER_ABLATION_TASK_IDS;
+  const expectedRepeats = options.repeats ?? 3;
+  const expectedRows = validity.expected_rows;
 
   const packetArm = "packet_semantic_off";
   const controlArm = "exact_plus_relations";
@@ -1051,6 +1084,7 @@ export {
   codeStoryOperationFromMcpTool,
   directBenchmarkCliInvocation,
   evidenceCompilerBuilderAcceptance,
+  evidenceCompilerExperimentValidity,
   isBuilderAblationArm,
   isBuilderCodeStoryArm,
   isBuilderPacketArm,

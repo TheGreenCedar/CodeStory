@@ -1,11 +1,15 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn write_tiny_rust_workspace(root: &Path) {
     fs::write(
@@ -676,6 +680,59 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         return generations.pop().expect("published search generation");
     }
     parent.join(format!("{stem}.search"))
+}
+
+fn search_catalog_lock_for_storage(storage_path: &Path) -> PathBuf {
+    let parent = storage_path.parent().expect("storage parent");
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("storage file stem");
+    parent.join(format!("{stem}.search-generations.lock"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CacheFileSnapshot {
+    relative_path: PathBuf,
+    byte_len: u64,
+    sha256: String,
+    modified: SystemTime,
+}
+
+fn cache_file_snapshots(root: &Path) -> Vec<CacheFileSnapshot> {
+    fn visit(root: &Path, current: &Path, snapshots: &mut Vec<CacheFileSnapshot>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read cache directory")
+            .map(|entry| entry.expect("read cache entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = entry.metadata().expect("read cache entry metadata");
+            if metadata.is_dir() {
+                visit(root, &path, snapshots);
+            } else if metadata.is_file() {
+                snapshots.push(CacheFileSnapshot {
+                    relative_path: path
+                        .strip_prefix(root)
+                        .expect("cache entry below root")
+                        .to_path_buf(),
+                    byte_len: metadata.len(),
+                    sha256: format!(
+                        "{:x}",
+                        Sha256::digest(fs::read(&path).expect("read cache file"))
+                    ),
+                    modified: metadata.modified().expect("read cache file mtime"),
+                });
+            }
+        }
+    }
+
+    let mut snapshots = Vec::new();
+    if root.is_dir() {
+        visit(root, root, &mut snapshots);
+    }
+    snapshots
 }
 
 fn find_index_freshness(value: &Value) -> Option<&Value> {
@@ -1696,6 +1753,118 @@ fn assert_exact_search_uses_core_without_full_sidecars(
             })
         }),
         "exact search must return project-relative source evidence for {query}: {search:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    let index = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let storage_path = PathBuf::from(string_field(&index, &["storage_path"]));
+    let catalog_lock = search_catalog_lock_for_storage(&storage_path);
+    assert!(
+        catalog_lock.is_file(),
+        "index should publish a catalog lock"
+    );
+    fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o400))
+        .expect("make search catalog lock read-only");
+    let before = cache_file_snapshots(cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o600))
+        .expect("restore search catalog lock permissions");
+    assert!(
+        output.status.success(),
+        "core-only exact search must not open the search-generation catalog: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let search: Value = serde_json::from_slice(&output.stdout).expect("parse exact search JSON");
+    assert!(
+        search["evidence"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["excerpt"]
+                    .as_str()
+                    .is_some_and(|excerpt| excerpt.contains("AppController"))
+            })),
+        "core-only exact search should return source evidence: {search:#}"
+    );
+    assert_eq!(
+        cache_file_snapshots(cache_dir.path()),
+        before,
+        "core-only exact search must not mutate cache bytes or mtimes"
+    );
+}
+
+#[test]
+fn cold_exact_search_returns_project_unavailable_without_creating_cache_files() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    let before = cache_file_snapshots(cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "cold exact search must fail closed"
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse cold exact-search failure: {error}; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        failure["error"]["code"], "project_unavailable",
+        "{failure:#}"
+    );
+    assert_eq!(
+        cache_file_snapshots(cache_dir.path()),
+        before,
+        "cold exact search must not create cache files"
     );
 }
 

@@ -30,6 +30,7 @@ import {
   evaluate,
   packetNextAction,
 } from "../codestory-evidence-compiler-ablation-evaluate.mjs";
+import { CONTRACT as CANARY_CONTRACT, REQUIRED as CANARY_REQUIRED } from "../lib/builder-operation-canary.mjs";
 import {
   JUDGMENTS_CONTRACT,
   finalizeAdjudication,
@@ -633,6 +634,9 @@ function passingRows() {
       },
       installed_agent_timing_eligible: true,
       transcript_analysis: {
+        codestory_operations: arm === "native_tools" ? [] : arm.startsWith("packet_")
+          ? [{ operation: "packet", successful: true, source: "harness_packet_prelude" }]
+          : [{ operation: "search", successful: true }, ...(arm === "exact_plus_relations" ? [{ operation: "callees", successful: true }] : [])],
         codestory_was_first_repository_context_action: arm !== "native_tools",
         exploratory_repository_context_actions_after_first_codestory:
           arm === "packet_semantic_off" ? 4 : 5,
@@ -714,6 +718,17 @@ function zeroAdjudication(rows) {
         unsupported_relation_finding_ids: [],
       })),
   };
+}
+
+async function writePassingCanary(root) {
+  const operationCanary = {
+    contract: CANARY_CONTRACT, status: "pass", cli_sha256: "a".repeat(64),
+    operations: Object.entries(CANARY_REQUIRED).flatMap(([arm, operations]) => operations.map((operation) => ({
+      arm, operation, exit_code: 0, shape_valid: true, sandboxed: true,
+      wall_ms: 1, stdout_sha256: "b".repeat(64), stderr_sha256: "c".repeat(64),
+    }))),
+  };
+  await writeFile(path.join(root, "summary.json"), JSON.stringify({ builder_ablation: { operation_canary: operationCanary } }));
 }
 
 test("frozen packet acceptance passes only with complete independent adjudication", () => {
@@ -913,6 +928,7 @@ test("evaluator binds independent adjudication to the exact run ledger", async (
       source_runs_sha256: createHash("sha256").update(runBytes).digest("hex"),
     };
     await writeFile(path.join(root, "runs.jsonl"), runBytes);
+    await writePassingCanary(root);
     const adjudicationPath = path.join(root, "adjudication.json");
     await writeFile(adjudicationPath, `${JSON.stringify(adjudication)}\n`);
 
@@ -943,6 +959,27 @@ test("evaluator binds independent adjudication to the exact run ledger", async (
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid interventions never produce a quality aggregate or consume a revision", async () => {
+  for (const fault of ["no_canary", "missing_telemetry", "failed_search", "no_relation"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codestory-invalid-intervention-"));
+    const rows = passingRows();
+    const control = rows.find((row) => row.arm === "exact_plus_relations");
+    if (fault === "missing_telemetry") delete control.transcript_analysis.codestory_operations;
+    if (fault === "failed_search") control.transcript_analysis.codestory_operations[0].successful = false;
+    if (fault === "no_relation") control.transcript_analysis.codestory_operations.pop();
+    const runBytes = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+    await writeFile(path.join(root, "runs.jsonl"), runBytes);
+    if (fault !== "no_canary") await writePassingCanary(root);
+    const adjudicationPath = path.join(root, "adjudication.json");
+    await writeFile(adjudicationPath, JSON.stringify({ ...zeroAdjudication(rows), source_runs_sha256: createHash("sha256").update(runBytes).digest("hex") }));
+    const receipt = await evaluate({ runDir: root, adjudication: adjudicationPath, attempt: "general_revision", causalClassification: "equivalent" });
+    assert.equal(receipt.experiment_status, "invalid");
+    assert.equal(receipt.packet_decision, "not_evaluated");
+    assert.equal(receipt.packet_acceptance, null);
+    assert.deepEqual(receipt.marginal_value, { graph_relations: null, dense_semantic_candidates: null });
   }
 });
 
@@ -1135,36 +1172,22 @@ test("evaluator writes the bounded revision or stop decision for a failed packet
       ...zeroAdjudication(rows),
       source_runs_sha256: createHash("sha256").update(runBytes).digest("hex"),
     };
-    await writeFile(path.join(root, "runs.jsonl"), runBytes);
     const adjudicationPath = path.join(root, "adjudication.json");
     await writeFile(adjudicationPath, `${JSON.stringify(adjudication)}\n`);
-
-    const unclassified = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-    });
-    assert.equal(unclassified.packet_decision, "failed_needs_causal_classification");
-    const revision = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-      causalClassification: "new",
-    });
-    assert.equal(revision.packet_decision, "revise_once");
-    const equivalent = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-      causalClassification: "equivalent",
-    });
-    assert.equal(equivalent.packet_decision, "stop");
-    const exhausted = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "general_revision",
-    });
-    assert.equal(exhausted.packet_decision, "stop");
+    for (const [attempt, causalClassification, expected] of [
+      ["initial", null, "failed_needs_causal_classification"],
+      ["initial", "new", "revise_once"],
+      ["initial", "equivalent", "stop"],
+      ["general_revision", null, "stop"],
+    ]) {
+      const runDir = await mkdtemp(path.join(root, "decision-"));
+      await writeFile(path.join(runDir, "runs.jsonl"), runBytes);
+      await writePassingCanary(runDir);
+      const opts = { runDir, adjudication: adjudicationPath, attempt, causalClassification };
+      const receipt = await evaluate(opts);
+      assert.equal(receipt.packet_decision, expected);
+      await assert.rejects(() => evaluate(opts), /refusing to replace/);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
