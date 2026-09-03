@@ -339,6 +339,8 @@ pub use path_resolution::resolve_project_file_path_from_root;
 mod process_config;
 pub use process_config::RuntimeProcessConfig;
 mod activation_retrieval;
+#[cfg(feature = "benchmark-support")]
+mod addressed_hydration;
 mod query_language;
 mod repository_identity;
 mod retrieval_boundary;
@@ -346,6 +348,9 @@ mod search;
 mod search_runtime;
 #[cfg(feature = "benchmark-support")]
 pub mod benchmark_support {
+    pub use crate::addressed_hydration::{
+        AddressedHydrationGap, HydratedAddressedRange, hydrate_addressed_range,
+    };
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
 }
 
