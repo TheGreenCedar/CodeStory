@@ -83,6 +83,29 @@ It authenticates the run ledger against the original receipt and reads only
 preserved transcript copies. The checksummed erratum withdraws affected
 comparisons without replacing the original receipt or its decision.
 
+The hidden source-address experiment uses these focused checks, run serially:
+
+```sh
+cargo test --locked -p codestory-contracts --test evidence_address
+cargo test --locked -p codestory-runtime --features benchmark-support --test addressed_hydration --test witness_seam
+cargo test --locked -p codestory-bench --bin codestory-witness-seam
+node --test scripts/tests/witness-seam-evidence.test.mjs
+```
+
+`codestory-witness-seam` is a benchmark binary, not a public CLI or MCP route.
+Its `prepare`, `capture`, and `replay` commands preserve the existing lexical
+order and compare two hydration addresses under one core pin. Replay requires
+a clean-source binary and an authenticated frozen manifest. It keeps sixteen
+candidates, 512-byte source charges, and the unchanged pure compiler. Missing
+source addresses are never replaced by headers. Lexical coverage omissions are
+recorded; preparation does not certify full installed-product readiness.
+
+Keep questions, independent annotations, descriptors, and receipts outside the
+repository. `scripts/codestory-witness-seam-evaluate.mjs` authenticates those
+inputs and requires every case and phrasing before producing an aggregate.
+Passing synthetic contracts does not pass the evidence-quality gate. Pool,
+graph, semantic, public-routing, and release changes remain gated separately.
+
 Run the relevant focused commands while implementing. A typical Rust lane is:
 
 ```sh

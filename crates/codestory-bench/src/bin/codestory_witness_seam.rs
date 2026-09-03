@@ -82,6 +82,7 @@ struct Prepared {
     storage_path: PathBuf,
     lexical_root: PathBuf,
     lexical_input_hash: String,
+    lexical_coverage: codestory_retrieval::benchmark_support::LexicalCoverage,
     publication: PacketCompilationPublicationV1,
     core_pointer: codestory_contracts::core_publication::CorePublicationPointerV1,
 }
@@ -199,17 +200,19 @@ fn prepare(project: &Path, output: &Path) -> Result<()> {
     drop(runtime);
     let pin = CoreReadSession::pin(&storage_path)?;
     let lexical_root = output.join("lexical");
-    let lexical_input_hash = codestory_retrieval::benchmark_support::prepare_witness_lexical_shard(
-        &project,
-        &pin,
-        &lexical_root,
-    )?;
+    let (lexical_input_hash, lexical_coverage) =
+        codestory_retrieval::benchmark_support::prepare_witness_lexical_shard(
+            &project,
+            &pin,
+            &lexical_root,
+        )?;
     let prepared = Prepared {
         contract: "codestory.witness-preparation/v1".into(),
         project_root: project.clone(),
         storage_path,
         lexical_root,
         lexical_input_hash,
+        lexical_coverage,
         publication: PacketCompilationPublicationV1 {
             project_id: codestory_workspace::project_identity_v3(&project).project_id,
             core_generation_id: pin.identity().generation_id.clone(),
@@ -274,6 +277,7 @@ fn capture(
             "question_sha256": format!("{:x}", Sha256::digest(question.as_bytes())),
             "query_ordinal": 0, "prepared_sha256": expected,
             "lexical_input_hash": prepared.lexical_input_hash,
+            "lexical_coverage": prepared.lexical_coverage,
             "raw_hits_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&hits)?)),
             "candidate_count": hits.len(), "candidate_limit": 16,
             "semantic": false, "graph": false,
@@ -381,8 +385,12 @@ mod tests {
             .unwrap();
         }
         let output = temp.path().join("prepared");
+        std::fs::write(project.join("image.png"), [0xff, 0xfe, 0xfd]).unwrap();
         prepare(&project, &output).unwrap();
         let preparation = output.join("prepared.json");
+        let prepared: Prepared =
+            serde_json::from_slice(&std::fs::read(&preparation).unwrap()).unwrap();
+        assert_eq!(prepared.lexical_coverage.unreadable_files, 1);
         let captured = temp.path().join("capture.json");
         capture(
             &preparation,

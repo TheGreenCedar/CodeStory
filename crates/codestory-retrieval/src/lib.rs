@@ -63,6 +63,7 @@ pub mod benchmark_support {
         AttestedSemanticPoint, AttestedVectorPublication, EmbeddedVectorIndex,
         ExpectedVectorAnchor, SemanticPoint, VectorEvidenceContract,
     };
+    pub use crate::lexical_index::LexicalCoverage;
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
@@ -72,7 +73,7 @@ pub mod benchmark_support {
         project_root: &Path,
         core: &codestory_store::CoreReadSession,
         lexical_root: &Path,
-    ) -> Result<String> {
+    ) -> Result<(String, LexicalCoverage)> {
         let source =
             crate::lexical_index::lexical_source_input(project_root, core.generation_path())?;
         let expected = crate::lexical_index::prepare_lexical_input_for_store(
@@ -80,11 +81,8 @@ pub mod benchmark_support {
             project_root,
             core.storage(),
         )?;
-        anyhow::ensure!(
-            expected.fingerprint.coverage.complete(),
-            "incomplete lexical source discovery"
-        );
         let input_hash = expected.fingerprint.hash.clone();
+        let coverage = expected.fingerprint.coverage.clone();
         crate::lexical_index::build_prepared_lexical_shard(
             lexical_root,
             &core.identity().generation_id,
@@ -93,7 +91,9 @@ pub mod benchmark_support {
             None,
             || expected.revalidate_source_seals(project_root, core.generation_path()),
         )?;
-        Ok(input_hash)
+        // The witness experiment preserves the existing candidate universe and
+        // its omissions. This does not attest to installed-product readiness.
+        Ok((input_hash, coverage))
     }
 
     /// One vector the bake-off publishes and later scores against.
