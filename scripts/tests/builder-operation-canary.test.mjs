@@ -26,6 +26,12 @@ test("operation canary executes required surfaces in the timed-agent sandbox and
       runProcess: async (command, args, options) => {
         calls.push({ command, args, options });
         if (command !== "codex") return { exitCode: 0, stdout: "{}", stderr: "" };
+        const requestOrdinal = expectedContext.canary_requests.length - 1;
+        const request = JSON.parse(await readFile(path.join(root, `canary-request-${requestOrdinal}.json`), "utf8"));
+        assert.deepEqual(request, expectedContext.canary_requests[requestOrdinal]);
+        assert.equal(request.command, command);
+        assert.deepEqual(request.arguments, args);
+        assert.equal(request.cwd, options.cwd);
         assert.deepEqual(args.slice(0, 3), ["sandbox", "--permission-profile", ":workspace"]);
         const operation = args[7] === "--project" ? args[6] : args[7];
         const source = "pub fn seed() -> usize { leaf() }\npub fn leaf() -> usize { 7 }\n";

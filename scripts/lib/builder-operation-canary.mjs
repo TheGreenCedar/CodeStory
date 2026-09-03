@@ -44,12 +44,19 @@ function canaryExecutionContext({ cli, cliSha256, sandbox, envForArm, timeoutMs 
     sandbox, permission_profile: ":workspace", runner: "codex", platform: "darwin",
     process: { shell: false, stdin: "ignore", timeout_ms: timeoutMs },
     arms: Object.fromEntries(BUILDER_ABLATION_ARMS.map((arm) => [arm, environmentIdentity(envForArm(arm))])),
+    canary_requests: [],
   };
+}
+
+function requestBinding(row) {
+  return Object.fromEntries(["arm", "operation", "command", "arguments", "cwd", "codex_home", "environment", "process"]
+    .map((key) => [key, row?.[key]]));
 }
 
 function canaryBlockers(receipt, expectedContext) {
   const reasons = [];
   const operations = Array.isArray(receipt?.operations) ? receipt.operations : [];
+  const requests = Array.isArray(expectedContext?.canary_requests) ? expectedContext.canary_requests : [];
   if (receipt?.contract !== CONTRACT || receipt?.status !== "pass") {
     reasons.push("operation canary did not pass");
   }
@@ -70,6 +77,9 @@ function canaryBlockers(receipt, expectedContext) {
   if (!path.isAbsolute(receipt?.project ?? "")) {
     reasons.push("operation canary project is missing");
   }
+  if (requests.length === 0 || requests.length !== operations.length) {
+    reasons.push("operation canary lacks its complete pre-dispatch request record");
+  }
   for (const arm of BUILDER_ABLATION_ARMS) {
     for (const operation of REQUIRED[arm]) {
       const rows = operations.filter((row) => row?.arm === arm && row?.operation === operation);
@@ -81,24 +91,17 @@ function canaryBlockers(receipt, expectedContext) {
       }
     }
   }
-  for (const row of operations) {
+  for (const [ordinal, row] of operations.entries()) {
     if (!row || typeof row.operation !== "string") {
       reasons.push("malformed operation canary telemetry");
       continue;
     }
     if (row.exit_code !== 0 || row.shape_valid !== true) reasons.push(`${row.arm}/${row.operation} failed`);
-    const prefix = ["sandbox", "--permission-profile", ":workspace", "--cd", receipt.project, "--"];
-    const args = Array.isArray(row.arguments) ? row.arguments : [];
-    const command = args?.[6];
-    const operationArgs = args?.slice(7) ?? [];
-    const expectedCommand = row.operation === "native_search" ? "rg" : row.operation === "native_source" ? "sed" : expectedContext?.cli_path;
-    const expectedOperation = row.operation === "continuation" ? "packet" : row.operation;
-    const projectFlag = operationArgs.indexOf("--project");
-    if (row.command !== "codex" || !Array.isArray(args) ||
-        prefix.some((value, index) => args[index] !== value) || command !== expectedCommand ||
-        (!row.operation.startsWith("native_") && (operationArgs[0] !== expectedOperation ||
-          projectFlag < 0 || operationArgs[projectFlag + 1] !== receipt.project)) ||
-        operationArgs.includes("--cache-dir") ||
+    // The operation owner records the complete request before execution. Do not
+    // reconstruct expected arguments from results or accept a subset of flags.
+    const request = requests[ordinal];
+    if (!request || JSON.stringify(requestBinding(row)) !== JSON.stringify(requestBinding(request)) ||
+        row.command !== "codex" || !Array.isArray(row.arguments) || row.cwd !== receipt.project ||
         JSON.stringify(row.environment) !== JSON.stringify(expectedContext?.arms?.[row.arm]) ||
         JSON.stringify(row.process) !== JSON.stringify(expectedContext?.process) ||
         row.codex_home !== expectedContext?.arms?.[row.arm]?.codex_home ||
@@ -126,14 +129,17 @@ async function runBuilderOperationCanary({
     source_sha256: sha256(SOURCE),
     cli_sha256: sha256(await readFile(cli)),
     sandbox,
-    context_sha256: digestObject(expectedContext),
     operations: [],
   };
   const persist = async () => {
+    receipt.context_sha256 = digestObject(expectedContext);
     await writeFile(path.join(outDir, "operation-canary.json"), JSON.stringify(receipt, null, 2) + "\n");
     return receipt;
   };
   try {
+    if (!Array.isArray(expectedContext?.canary_requests) || expectedContext.canary_requests.length !== 0) {
+      throw new Error("canary requires a fresh pre-dispatch request record");
+    }
     // Preparation is outside the agent sandbox, exactly as task preparation is.
     receipt.preparation = [];
     for (const args of [["index", "--project", project, "--format", "json"], retrievalArgs(project)]) {
@@ -156,9 +162,19 @@ async function runBuilderOperationCanary({
       if (JSON.stringify(environmentIdentity(env)) !== JSON.stringify(expectedContext?.arms?.[arm])) {
         throw new Error(`${arm} environment changed after context freeze`);
       }
+      const dispatch = {
+        arm, operation, command: wrapped.command, arguments: [...wrapped.args], cwd: project,
+        codex_home: env.CODEX_HOME, environment: environmentIdentity(env), process: { ...expectedContext.process },
+      };
+      const request = structuredClone(dispatch);
+      const ordinal = expectedContext.canary_requests.length;
+      // Persist separately, before invoking the process. Results cannot mint or
+      // overwrite the request against which dispatch and evaluation are checked.
+      await writeFile(path.join(outDir, `canary-request-${ordinal}.json`), JSON.stringify(request, null, 2) + "\n", { flag: "wx" });
+      expectedContext.canary_requests.push(request);
       const started = performance.now();
-      const result = await runProcess(wrapped.command, wrapped.args, {
-        cwd: project, env, timeoutMs: expectedContext.process.timeout_ms,
+      const result = await runProcess(dispatch.command, [...dispatch.arguments], {
+        cwd: dispatch.cwd, env: { ...env }, timeoutMs: dispatch.process.timeout_ms,
       });
       let shapeValid = false;
       let output = null;
@@ -169,9 +185,7 @@ async function runBuilderOperationCanary({
         } catch { /* Wrong JSON shape is an invalid intervention, never a quality failure. */ }
       }
       receipt.operations.push({
-        arm, operation, command: wrapped.command, arguments: wrapped.args,
-        sandboxed: true, codex_home: env.CODEX_HOME,
-        environment: environmentIdentity(env), process: expectedContext.process,
+        ...dispatch, sandboxed: true,
         exit_code: result.exitCode, wall_ms: performance.now() - started,
         stdout_sha256: sha256(result.stdout), stderr_sha256: sha256(result.stderr),
         shape_valid: shapeValid,
