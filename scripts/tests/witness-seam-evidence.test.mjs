@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { authenticateRange, phase1AGate, scoreWitnessArm, sha256, verifyPairedInputs } from "../lib/witness-seam-evidence.mjs";
 
 function fixture() {
@@ -74,4 +78,23 @@ test("the paired-input contract binds cardinality, charge, order, and publicatio
     (copy) => copy.addressed.input.publication.core_generation_id = "other",
     (copy) => copy.addressed.input.sources[0].source = "x".repeat(513),
   ]) { const copy = structuredClone(receipt); mutate(copy); assert.throws(() => verifyPairedInputs(copy, manifest)); }
+});
+
+test("invalid artifacts cannot create a quality aggregate or overwrite a decision", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "witness-evaluation-"));
+  const output = path.join(root, "evaluation.json");
+  const script = new URL("../codestory-witness-seam-evaluate.mjs", import.meta.url);
+  const argv = [script.pathname, "--output", output];
+  for (const kind of ["questions", "annotations", "runs"])
+    argv.push(`--${kind}`, path.join(root, `${kind}.json`), `--${kind}-sha256`, "0".repeat(64));
+  const failed = spawnSync(process.execPath, argv, { encoding: "utf8" });
+  assert.equal(failed.status, 1);
+  const bytes = await readFile(output, "utf8");
+  const report = JSON.parse(bytes);
+  assert.equal(report.experiment_status, "invalid");
+  assert.equal(report.phase1a, "blocked");
+  assert.equal(report.packet_decision, "not_evaluated");
+  assert.equal(report.mean_addressed_recall, undefined);
+  assert.equal(spawnSync(process.execPath, argv).status, 1);
+  assert.equal(await readFile(output, "utf8"), bytes);
 });
