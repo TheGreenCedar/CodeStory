@@ -347,11 +347,14 @@ mod retrieval_boundary;
 mod search;
 mod search_runtime;
 #[cfg(feature = "benchmark-support")]
+mod witness_seam;
+#[cfg(feature = "benchmark-support")]
 pub mod benchmark_support {
     pub use crate::addressed_hydration::{
         AddressedHydrationGap, HydratedAddressedRange, hydrate_addressed_range,
     };
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
+    pub use crate::witness_seam::{WitnessSeamDescriptor, WitnessSeamPair, run_witness_seam};
 }
 
 mod activation_status;
