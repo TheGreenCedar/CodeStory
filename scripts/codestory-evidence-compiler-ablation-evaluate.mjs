@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs as parseNodeArgs } from "node:util";
@@ -10,8 +10,10 @@ import {
   BUILDER_ABLATION_ARMS,
   BUILDER_ABLATION_TASK_IDS,
   evidenceCompilerBuilderAcceptance,
+  evidenceCompilerExperimentValidity,
   marginalValue,
 } from "./lib/evidence-compiler-ablation.mjs";
+import { canaryBlockers, digestObject } from "./lib/builder-operation-canary.mjs";
 
 function parseArgs(argv) {
   const { values } = parseNodeArgs({
@@ -66,6 +68,9 @@ function formatRatio(value) {
 }
 
 function markdownReceipt(receipt) {
+  if (receipt.experiment_status === "invalid") {
+    return `# Evidence compiler experiment invalid\n\nPacket decision: **not_evaluated**\n\n${receipt.experiment_validity.reasons.map((reason) => `- ${reason}`).join("\n")}\n\nNo quality aggregate or layer decision was computed. Earlier receipts and their stop decisions are unchanged.\n`;
+  }
   const acceptance = receipt.packet_acceptance;
   const graph = receipt.default_layer_decisions.graph_relations;
   const semantic = receipt.default_layer_decisions.dense_semantic_candidates;
@@ -114,28 +119,42 @@ async function evaluate(opts) {
   if (adjudication.source_runs_sha256 !== runsSha256) {
     throw new Error("adjudication source_runs_sha256 does not match runs.jsonl");
   }
-  const packetAcceptance = evidenceCompilerBuilderAcceptance(rows, adjudication);
-  const graphRelations = marginalValue(
-    rows,
-    "exact_plus_relations",
-    "exact_identity_source",
-    adjudication,
-  );
-  const denseSemanticCandidates = marginalValue(
-    rows,
-    "packet_semantic_on",
-    "packet_semantic_off",
-    adjudication,
-  );
-  const packetDecision = packetNextAction(
-    packetAcceptance.pass,
-    attempt,
-    causalClassification,
-  );
+  if (existsSync(path.join(opts.runDir, "builder-ablation.json"))) {
+    throw new Error("refusing to replace an existing builder receipt; preserve its decision");
+  }
   const summaryPath = path.join(opts.runDir, "summary.json");
   const summary = existsSync(summaryPath)
     ? JSON.parse(await readFile(summaryPath, "utf8"))
     : null;
+  const validity = evidenceCompilerExperimentValidity(rows);
+  validity.reasons.push(...canaryBlockers(
+    summary?.builder_ablation?.operation_canary,
+    summary?.builder_ablation?.operation_canary_context,
+  ));
+  const context = summary?.builder_ablation?.operation_canary_context;
+  if (rows.some((row) => row.builder_ablation?.execution_context_sha256 !== digestObject(context) ||
+      (row.arm !== "native_tools" && row.codestory_prelude_cli_sha256 !== context?.cli_sha256))) {
+    validity.reasons.push("model rows do not bind the canary's exact execution context and CLI");
+  }
+  validity.valid = validity.reasons.length === 0;
+  const packetAcceptance = validity.valid ? evidenceCompilerBuilderAcceptance(rows, adjudication) : null;
+  const graphRelations = validity.valid ? marginalValue(
+    rows,
+    "exact_plus_relations",
+    "exact_identity_source",
+    adjudication,
+  ) : null;
+  const denseSemanticCandidates = validity.valid ? marginalValue(
+    rows,
+    "packet_semantic_on",
+    "packet_semantic_off",
+    adjudication,
+  ) : null;
+  const packetDecision = validity.valid ? packetNextAction(
+    packetAcceptance.pass,
+    attempt,
+    causalClassification,
+  ) : "not_evaluated";
   const receipt = {
     generated_at: new Date().toISOString(),
     evidence_status: "builder_visible_development_only",
@@ -144,6 +163,8 @@ async function evaluate(opts) {
     experiment_attempt: attempt,
     causal_classification: causalClassification,
     packet_decision: packetDecision,
+    experiment_status: validity.valid ? "valid" : "invalid",
+    experiment_validity: validity,
     source_runs_sha256: runsSha256,
     adjudication_sha256: sha256(await readFile(opts.adjudication)),
     source_commit: summary?.source_commit ?? summary?.shard?.attestation?.source_commit ?? null,
@@ -156,21 +177,28 @@ async function evaluate(opts) {
       dense_semantic_candidates: denseSemanticCandidates,
     },
     default_layer_decisions: {
-      graph_relations: graphRelations.positive ? "keep_default" : "disable_default",
-      dense_semantic_candidates: denseSemanticCandidates.positive
+      graph_relations: !validity.valid ? "not_evaluated" : graphRelations.positive ? "keep_default" : "disable_default",
+      dense_semantic_candidates: !validity.valid ? "not_evaluated" : denseSemanticCandidates.positive
         ? "keep_default"
         : "disable_default",
     },
   };
+  // Exclusive reservation serializes the JSON/Markdown pair. Keep the marker
+  // after failure as well: recovery must never replace a possibly published decision.
+  const reservation = await open(path.join(opts.runDir, ".builder-ablation-reservation"), "wx").catch((error) => {
+    if (error.code === "EEXIST") throw new Error("refusing to replace a reserved builder receipt");
+    throw error;
+  });
+  await reservation.close();
   await writeFile(
     path.join(opts.runDir, "builder-ablation.json"),
     `${JSON.stringify(receipt, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
   await writeFile(
     path.join(opts.runDir, "builder-ablation.md"),
     markdownReceipt(receipt),
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
   console.log(`wrote ${path.join(opts.runDir, "builder-ablation.json")}`);
   return receipt;

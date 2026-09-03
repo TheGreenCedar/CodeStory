@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Exact `search --repo-text off --refresh none` works from the existing core
+  publication even when retrieval catalogs are unwritable. A project without
+  a published core returns `project_unavailable` without creating a cache.
 - Explicit `search --repo-text off` now reads the complete core symbol index
   without waiting for embeddings. Packet assembly reuses the retrieval result
   that established admission instead of rerunning it under a shorter deadline.

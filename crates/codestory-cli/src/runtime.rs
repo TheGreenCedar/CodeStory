@@ -472,6 +472,24 @@ impl RuntimeContext {
             .map_err(|error| map_api_error_for_project(error, &self.project_root))
     }
 
+    /// Attach the existing immutable core for an exact read without creating
+    /// cache state or consulting retrieval-owned catalogs.
+    pub(crate) fn open_core_read_only(&self) -> Result<OpenedProject> {
+        let summary = self
+            .project
+            .open_core_read_only_with_storage_path(
+                self.project_root.clone(),
+                self.storage_path.clone(),
+            )
+            .map_err(|error| map_api_error_for_project(error, &self.project_root))?;
+        Ok(OpenedProject {
+            summary,
+            refresh_mode: None,
+            refresh_reason: None,
+            phase_timings: None,
+        })
+    }
+
     pub(crate) fn inspect_project_summary(&self) -> Result<Option<ProjectSummary>> {
         self.project
             .inspect_project_summary_with_storage_path(

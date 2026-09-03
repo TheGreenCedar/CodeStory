@@ -116,6 +116,15 @@ pub(super) fn open_search_surface(
     }
 
     let runtime = RuntimeContext::new(project)?;
+    if refresh == args::RefreshMode::None {
+        let opened = runtime.open_core_read_only()?;
+        ensure_index_ready(&opened, "search")?;
+        return Ok(OpenedAgentSurface {
+            before: Some(opened.summary.clone()),
+            runtime,
+            opened,
+        });
+    }
     let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, "search")?;
     Ok(OpenedAgentSurface {

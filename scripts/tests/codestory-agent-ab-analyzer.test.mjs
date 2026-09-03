@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
+import { contextMutations, passingCanaryFixture } from "./helpers/builder-canary-fixture.mjs";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -3595,6 +3596,50 @@ test("benchmark pipeline fences a failed canary and counts a passing canary once
     executeRun: async (_opts, run) => pipelineResult(run),
   });
   assert.equal(nonOwnerResult.results.some((row) => row.canary), false);
+});
+
+test("builder operation canary aborts all model launches on failure or missing telemetry", async () => {
+  for (const canary of [null, { status: "fail" }, { status: "pass", operations: [] }]) {
+    const fixture = pipelineFixture({ repos: ["canary"] });
+    fixture.opts.builderAblation = true;
+    const launches = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      ...fixture,
+      prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+      prepareOperationCanaryContext: async () => passingCanaryFixture().context,
+      runOperationCanary: async () => canary,
+      executeRun: async (_opts, run) => {
+        launches.push(run);
+        return pipelineResult(run);
+      },
+    });
+    assert.deepEqual(launches, []);
+    assert.equal(outcome.experiment_status, "invalid");
+    assert.equal(outcome.packet_decision, "not_evaluated");
+    assert.equal(outcome.aborted, true);
+  }
+});
+
+test("builder operation canary binds permissions, commands and environment before dispatch", async () => {
+  for (const mutate of [null, ...contextMutations]) {
+    const fixture = pipelineFixture({ repos: ["canary"] });
+    fixture.opts.builderAblation = true;
+    const { context, receipt } = passingCanaryFixture();
+    if (mutate) mutate(receipt);
+    const launches = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      ...fixture,
+      prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+      prepareOperationCanaryContext: async () => context,
+      runOperationCanary: async () => receipt,
+      executeRun: async (_opts, run) => { launches.push(run); return pipelineResult(run); },
+    });
+    assert.equal(launches.length, mutate ? 0 : fixture.plannedRuns.length);
+    if (mutate) {
+      assert.equal(outcome.experiment_status, "invalid");
+      assert.equal(outcome.packet_decision, "not_evaluated");
+    }
+  }
 });
 
 test("benchmark pipeline rejects missing or wrong-repository canary preparation before agents", async () => {

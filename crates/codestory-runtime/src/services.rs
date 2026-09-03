@@ -2664,6 +2664,17 @@ impl ProjectService {
             .open_project_summary_with_storage_path(root, storage_path)
     }
 
+    /// Attach one existing immutable core without opening retrieval catalogs
+    /// or creating cache state.
+    pub fn open_core_read_only_with_storage_path(
+        &self,
+        root: std::path::PathBuf,
+        storage_path: std::path::PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        self.controller
+            .open_core_read_only_with_storage_path(root, storage_path)
+    }
+
     /// Observe an existing project store without creating directories,
     /// initializing a database, migrating schema, or binding controller state.
     pub fn inspect_project_summary_with_storage_path(
