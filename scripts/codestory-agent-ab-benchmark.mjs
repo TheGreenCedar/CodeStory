@@ -44,7 +44,7 @@ import {
   isBuilderPacketArm,
   planBuilderAblationRuns,
 } from "./lib/evidence-compiler-ablation.mjs";
-import { canaryBlockers, runBuilderOperationCanary, sandboxCommand } from "./lib/builder-operation-canary.mjs";
+import { canaryBlockers, canaryExecutionContext, digestObject, environmentIdentity, runBuilderOperationCanary, sandboxCommand } from "./lib/builder-operation-canary.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const benchmarkHarnessPath = fileURLToPath(import.meta.url);
@@ -5226,6 +5226,7 @@ function builderContinuationOfferReceipt(contract) {
     core_generation_id: contract.core_generation_id,
     retrieval_generation: contract.retrieval_generation,
     question_sha256: contract.question_sha256,
+    proof_path: contract.proof_path,
   };
 }
 
@@ -6767,6 +6768,10 @@ async function runOne(opts, run, outDir) {
   if (opts.builderAblation && isCodeStoryArm(run.arm)) {
     env.CODESTORY_CLI = codestoryPreludeCli;
   }
+  if (opts.builderAblation && (JSON.stringify(environmentIdentity(env)) !== JSON.stringify(opts.operationCanaryContext?.arms?.[run.arm]) ||
+      (isCodeStoryArm(run.arm) && codestoryPreludeCliSha256 !== opts.operationCanaryContext?.cli_sha256))) {
+    throw new Error("timed-agent environment or CLI changed after its operation canary");
+  }
   const interactionStarted = performance.now();
   const baselinePrelude =
     run.arm === "without_codestory"
@@ -7031,6 +7036,7 @@ async function runOne(opts, run, outDir) {
     builder_ablation: opts.builderAblation
       ? {
           contract: "codestory.evidence-compiler-builder-row/v1",
+          execution_context_sha256: digestObject(opts.operationCanaryContext),
           development_only: true,
           release_authority: false,
           fresh: true,
@@ -14518,6 +14524,7 @@ async function runBuilderAblationPipeline({
   recordPreparationState,
   recordFirstFailure,
   runOperationCanary,
+  prepareOperationCanaryContext,
 }) {
   const cachePreparation = [];
   opts.cachePreparationByRepo ??= new Map();
@@ -14575,18 +14582,21 @@ async function runBuilderAblationPipeline({
   }
 
   let operationCanary;
+  let operationCanaryContext;
   try {
-    operationCanary = await runOperationCanary({ opts, outDir });
-    const blockers = canaryBlockers(operationCanary);
+    operationCanaryContext = await prepareOperationCanaryContext(opts);
+    operationCanary = await runOperationCanary({ opts, outDir, expectedContext: operationCanaryContext });
+    const blockers = canaryBlockers(operationCanary, operationCanaryContext);
     if (blockers.length) throw new Error(blockers.join("; "));
     opts.operationCanary = operationCanary;
+    opts.operationCanaryContext = operationCanaryContext;
   } catch (error) {
     const failure = pipelineStageFailure("operation_canary", null, error);
     await recordFirstFailure(failure);
     return {
       results: [], firstFailure: failure, comparativeFailure: null,
       comparativePublishable: false, cachePreparation, agentCodexIsolation,
-      operationCanary, experiment_status: "invalid", packet_decision: "not_evaluated", aborted: true,
+      operationCanary, operationCanaryContext, experiment_status: "invalid", packet_decision: "not_evaluated", aborted: true,
     };
   }
 
@@ -14610,22 +14620,33 @@ async function runBuilderAblationPipeline({
     cachePreparation,
     agentCodexIsolation,
     operationCanary,
+    operationCanaryContext,
     aborted: false,
   };
 }
 
-async function runTimedAgentOperationCanary({ opts, outDir }) {
+function builderCanaryEnvironment(opts, arm) {
+  const env = agentRunnerEnv(selectedBenchmarkChildEnv(opts, arm), opts.agentCodexHomes?.[arm], isCodeStoryArm(arm));
+  if (isCodeStoryArm(arm)) env.CODESTORY_CLI = path.resolve(resolveCodeStoryCli(opts));
+  return env;
+}
+
+async function prepareTimedAgentCanaryContext(opts) {
+  const cli = path.resolve(resolveCodeStoryCli(opts));
+  return canaryExecutionContext({
+    cli, cliSha256: sha256Bytes(await readFile(cli)), sandbox: opts.sandbox,
+    timeoutMs: opts.timeoutMs, envForArm: (arm) => builderCanaryEnvironment(opts, arm),
+  });
+}
+
+async function runTimedAgentOperationCanary({ opts, outDir, expectedContext }) {
   if (opts.runner !== "codex") throw new Error("operation canary requires the pinned Codex runner");
   const cli = resolveCodeStoryCli(opts);
   const question = "What does seed call?";
   const proofPath = (arm, continuation = false) => path.join(outDir, `canary-${arm}-${continuation ? "continuation" : "packet"}-proof.json`);
   return await runBuilderOperationCanary({
-    root: opts.builderAblationStateRoot, outDir, cli, sandbox: opts.sandbox,
-    envForArm: (arm) => {
-      const env = agentRunnerEnv(selectedBenchmarkChildEnv(opts), opts.agentCodexHomes?.[arm], isCodeStoryArm(arm));
-      if (isCodeStoryArm(arm)) env.CODESTORY_CLI = cli;
-      return env;
-    },
+    root: opts.builderAblationStateRoot, outDir, cli, sandbox: opts.sandbox, expectedContext,
+    envForArm: (arm) => builderCanaryEnvironment(opts, arm),
     runProcess,
     scopeArgs: benchmarkAgentScopeArgs,
     retrievalArgs: retrievalIndexCommandArgs,
@@ -14663,6 +14684,7 @@ async function runAgentBenchmarkPipeline({
   recordFirstFailure = async () => {},
   recordComparativeFailure = async () => {},
   runOperationCanary = runTimedAgentOperationCanary,
+  prepareOperationCanaryContext = prepareTimedAgentCanaryContext,
 }) {
   if (opts.builderAblation) {
     return await runBuilderAblationPipeline({
@@ -14679,6 +14701,7 @@ async function runAgentBenchmarkPipeline({
       recordPreparationState,
       recordFirstFailure,
       runOperationCanary,
+      prepareOperationCanaryContext,
     });
   }
   if (opts.exactCandidate) {
@@ -15284,6 +15307,7 @@ async function main() {
             "dense_candidate_stage_only_model_residency_and_full_publication_health_retained",
           critical_claim_adjudication: "required_external_blinded_receipt",
           operation_canary: pipeline.operationCanary ?? null,
+          operation_canary_context: pipeline.operationCanaryContext ?? null,
           experiment_status: pipeline.experiment_status ?? (firstFailure ? "invalid" : "pending_evaluation"),
         }
       : null,

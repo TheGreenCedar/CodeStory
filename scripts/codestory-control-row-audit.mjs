@@ -158,16 +158,22 @@ function commandReceipt(command) {
   };
 }
 
-function sourceReadIndex(row, commands) {
+function sourceReadIndex(row, commands, events) {
   const reads = row.transcript_analysis?.direct_source_reads;
   if (!Array.isArray(reads) || row.transcript_analysis?.direct_source_reads_total !== reads.length) {
     throw new Error(`${row.benchmark_run_id}: source-read telemetry is missing or inconsistent`);
   }
-  const commandIds = new Set(commands.map((command) => command.id));
   const byCommand = new Map();
   for (const read of reads) {
     const id = read?.command_id;
-    if (typeof id !== "string" || !commandIds.has(id)) {
+    const matches = commands.filter((command) => command.id === id);
+    const event = events[read.event_index];
+    const starts = events.filter((entry) => entry.type === "item.started" && entry.item?.id === id);
+    if (typeof id !== "string" || matches.length !== 1 ||
+        starts.length > 1 || !["item.started", "item.completed"].includes(event?.type) ||
+        event.item?.type !== "command_execution" || event.item.id !== id ||
+        event.item.command !== matches[0].command || read.event_index > matches[0].event_index ||
+        typeof read.path !== "string" || !read.path.trim()) {
       throw new Error(`${row.benchmark_run_id}: source-read telemetry cannot join command ${id}`);
     }
     const current = byCommand.get(id) ?? [];
@@ -197,6 +203,15 @@ function requiredOperationValidity(arm, commands) {
   const reasons = [];
   if (!firstSearchValid) reasons.push("first required exact search did not succeed");
   if (!relationValid) reasons.push("no required explicit relation operation succeeded");
+  for (const command of commands) {
+    if (command.exit_status !== 0) reasons.push(`CodeStory ${command.operation} did not succeed`);
+    if (!command.checksum_bound || !Array.isArray(command.arguments)) {
+      reasons.push(`CodeStory ${command.operation} lacks a direct checksum-bound command`);
+    }
+    const allowed = new Set(["search", "files", "symbol", "symbols", "get_node", "definition", "snippet",
+      ...(arm === "exact_plus_relations" ? ["context", ...RELATION_OPERATIONS] : [])]);
+    if (!allowed.has(command.operation)) reasons.push(`CodeStory ${command.operation} is forbidden in ${arm}`);
+  }
   return {
     valid: reasons.length === 0,
     reasons,
@@ -239,7 +254,7 @@ async function auditControlRow({
   const transcript = parseJsonlWithRawLines(stdout.bytes, stdout.preserved_name)
     .map((entry) => entry.value);
   const commands = commandEvents(transcript);
-  const sourceReads = sourceReadIndex(row, commands);
+  const sourceReads = sourceReadIndex(row, commands, transcript);
   const codeStoryByEvent = new Map();
   for (const command of commands) {
     const receipt = commandReceipt(command);

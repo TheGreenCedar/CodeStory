@@ -115,11 +115,45 @@ test("missing or unjoinable source-read telemetry is never reported as zero meas
   for (const mutate of [
     (row) => { delete row.transcript_analysis.direct_source_reads; },
     (row) => { row.transcript_analysis.direct_source_reads[0].command_id = "absent"; },
+    (row) => { row.transcript_analysis.direct_source_reads[0].event_index = 0; },
+    (row) => { delete row.transcript_analysis.direct_source_reads[0].path; },
   ]) {
     const setup = await fixture();
     mutate(setup.row);
     await assert.rejects(() => auditControlRow(setup.params), /source.read telemetry/i);
   }
+});
+
+test("duplicate completed command identities cannot multiply measured exposure", async () => {
+  const setup = await fixture();
+  setup.events.push(setup.events[1]);
+  await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+  await assert.rejects(() => auditControlRow(setup.params), /source.read telemetry/);
+});
+
+test("source telemetry may bind the unique start event paired with its completion", async () => {
+  const setup = await fixture();
+  setup.events.splice(1, 0, { type: "item.started", item: { ...setup.events[1].item, exit_code: null } });
+  await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+  const audit = await auditControlRow(setup.params);
+  assert.equal(audit.native_fallback.source_read_count, 2);
+});
+
+test("a failed CodeStory operation remains invalid after successful native fallback", async () => {
+  const setup = await fixture();
+  setup.events[0].item.exit_code = 0;
+  setup.events[0].item.aggregated_output = "source";
+  setup.events.push({ type: "item.completed", item: {
+    id: "snippet", type: "command_execution", command: "$CODESTORY_CLI snippet --project /repo --id node",
+    exit_code: 1, aggregated_output: "failed",
+  } });
+  setup.row.builder_ablation.first_codestory_pass = true;
+  setup.row.builder_ablation.operation_violations = [];
+  setup.row.transcript_analysis.codestory_was_first_repository_context_action = true;
+  await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+  const audit = await auditControlRow(setup.params);
+  assert.equal(audit.intervention_valid, false);
+  assert.match(audit.required_operation.reasons.join(" "), /snippet did not succeed/);
 });
 
 test("erratum withdraws the whole aggregate for one invalid repeat and preserves the old stop", () => {

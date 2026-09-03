@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { canaryBlockers, runBuilderOperationCanary, sandboxCommand } from "../lib/builder-operation-canary.mjs";
+import { canaryBlockers, canaryExecutionContext, runBuilderOperationCanary, sandboxCommand } from "../lib/builder-operation-canary.mjs";
+import { contextMutations, passingCanaryFixture } from "./helpers/builder-canary-fixture.mjs";
 
 test("operation canary executes required surfaces in the timed-agent sandbox and fails closed", { skip: process.platform !== "darwin" }, async () => {
   for (const fault of [null, "exit", "shape", "missing_exit"]) {
     const root = await mkdtemp(path.join(os.tmpdir(), "codestory-canary-test-"));
     const calls = [];
+    const envForArm = (arm) => ({ CODEX_HOME: `/isolated/${arm}`, CODESTORY_CACHE_ROOT: "/prepared/cache" });
+    const expectedContext = canaryExecutionContext({
+      cli: process.execPath, cliSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"),
+      sandbox: "workspace-write", envForArm, timeoutMs: 60_000,
+    });
     const receipt = await runBuilderOperationCanary({
-      root, outDir: root, cli: process.execPath, sandbox: "workspace-write",
-      envForArm: (arm) => ({ CODEX_HOME: `/isolated/${arm}`, CODESTORY_CACHE_ROOT: "/prepared/cache" }),
+      root, outDir: root, cli: process.execPath, sandbox: "workspace-write", expectedContext, envForArm,
       scopeArgs: () => ["--profile", "agent", "--run-id", "shared-agent"],
       retrievalArgs: (project) => ["retrieval", "index", "--project", project],
       packetArgs: (project) => ["packet", "--project", project],
@@ -39,13 +45,23 @@ test("operation canary executes required surfaces in the timed-agent sandbox and
       assert.ok(canaryBlockers(receipt).length > 0);
     } else {
       assert.equal(receipt.status, "pass", receipt.error);
-      assert.deepEqual(canaryBlockers(receipt, receipt.cli_sha256), []);
+      assert.deepEqual(canaryBlockers(receipt, expectedContext), []);
       assert.equal(receipt.operations.length, 9);
-      assert.ok(canaryBlockers(receipt, "0".repeat(64)).length > 0);
+      assert.ok(canaryBlockers(receipt, { ...expectedContext, cli_sha256: "0".repeat(64) }).length > 0);
       assert.ok(calls.filter((call) => call.command === "codex").every((call) => call.options.env.CODESTORY_CACHE_ROOT === "/prepared/cache"));
     }
     assert.deepEqual(JSON.parse(await readFile(path.join(root, "operation-canary.json"), "utf8")), receipt);
     assert.equal(calls.some((call) => call.args[0] === "exec"), false, "canary never starts a model");
+  }
+});
+
+test("canary rejects missing and contradictory execution context", () => {
+  const passing = passingCanaryFixture();
+  assert.deepEqual(canaryBlockers(passing.receipt, passing.context), []);
+  for (const mutate of contextMutations) {
+    const { receipt, context } = passingCanaryFixture();
+    mutate(receipt);
+    assert.ok(canaryBlockers(receipt, context).length > 0);
   }
 });
 

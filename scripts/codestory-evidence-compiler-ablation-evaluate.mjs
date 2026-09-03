@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs as parseNodeArgs } from "node:util";
@@ -13,7 +13,7 @@ import {
   evidenceCompilerExperimentValidity,
   marginalValue,
 } from "./lib/evidence-compiler-ablation.mjs";
-import { canaryBlockers } from "./lib/builder-operation-canary.mjs";
+import { canaryBlockers, digestObject } from "./lib/builder-operation-canary.mjs";
 
 function parseArgs(argv) {
   const { values } = parseNodeArgs({
@@ -129,8 +129,13 @@ async function evaluate(opts) {
   const validity = evidenceCompilerExperimentValidity(rows);
   validity.reasons.push(...canaryBlockers(
     summary?.builder_ablation?.operation_canary,
-    rows.find((row) => row.codestory_prelude_cli_sha256)?.codestory_prelude_cli_sha256,
+    summary?.builder_ablation?.operation_canary_context,
   ));
+  const context = summary?.builder_ablation?.operation_canary_context;
+  if (rows.some((row) => row.builder_ablation?.execution_context_sha256 !== digestObject(context) ||
+      (row.arm !== "native_tools" && row.codestory_prelude_cli_sha256 !== context?.cli_sha256))) {
+    validity.reasons.push("model rows do not bind the canary's exact execution context and CLI");
+  }
   validity.valid = validity.reasons.length === 0;
   const packetAcceptance = validity.valid ? evidenceCompilerBuilderAcceptance(rows, adjudication) : null;
   const graphRelations = validity.valid ? marginalValue(
@@ -178,15 +183,22 @@ async function evaluate(opts) {
         : "disable_default",
     },
   };
+  // Exclusive reservation serializes the JSON/Markdown pair. Keep the marker
+  // after failure as well: recovery must never replace a possibly published decision.
+  const reservation = await open(path.join(opts.runDir, ".builder-ablation-reservation"), "wx").catch((error) => {
+    if (error.code === "EEXIST") throw new Error("refusing to replace a reserved builder receipt");
+    throw error;
+  });
+  await reservation.close();
   await writeFile(
     path.join(opts.runDir, "builder-ablation.json"),
     `${JSON.stringify(receipt, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
   await writeFile(
     path.join(opts.runDir, "builder-ablation.md"),
     markdownReceipt(receipt),
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
   console.log(`wrote ${path.join(opts.runDir, "builder-ablation.json")}`);
   return receipt;

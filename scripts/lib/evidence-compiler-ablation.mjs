@@ -814,6 +814,15 @@ function evidenceCompilerExperimentValidity(rows, options = {}) {
         reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} executed no explicit relation operation`);
       }
     }
+    if (Array.isArray(operations)) {
+      const offer = row.builder_ablation?.continuation_offer;
+      reasons.push(...builderOperationViolations(row.arm, operations, {
+        expectedProject: row.repo_path,
+        continuationContract: offer ? {
+          ...offer, project: row.repo_path, question: row.task_manifest_snapshot?.prompt,
+        } : null,
+      }).map((reason) => `row ${row.task_id}/${row.arm}/${row.repeat}: ${reason}`));
+    }
     if (row.comparator_reuse_provenance || row.resume_provenance || row.reused_from) {
       reasons.push(`row ${row.task_id}/${row.arm}/${row.repeat} is not fresh`);
     }

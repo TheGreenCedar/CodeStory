@@ -7,6 +7,8 @@ import { BUILDER_ABLATION_ARMS } from "./evidence-compiler-ablation.mjs";
 const CONTRACT = "codestory.builder-operation-canary/v1";
 const SOURCE = "pub fn seed() -> usize { leaf() }\npub fn leaf() -> usize { 7 }\n";
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+const digestObject = (value) => sha256(JSON.stringify(value ?? null));
+const isDigest = (value) => /^[a-f0-9]{64}$/u.test(value ?? "");
 const REQUIRED = Object.freeze({
   native_tools: ["native_search", "native_source"],
   exact_identity_source: ["search", "snippet"],
@@ -27,17 +29,50 @@ function sandboxCommand(sandbox, project, command, args) {
   };
 }
 
-function canaryBlockers(receipt, cliSha256 = null) {
+function environmentIdentity(env) {
+  return {
+    codex_home: env.CODEX_HOME ?? null,
+    environment_sha256: digestObject(Object.entries(env).sort(([left], [right]) => left.localeCompare(right))),
+    cache_configuration_sha256: digestObject(Object.entries(env).filter(([key]) => /CODESTORY|HOME|XDG/u.test(key)).sort(([left], [right]) => left.localeCompare(right))),
+  };
+}
+
+function canaryExecutionContext({ cli, cliSha256, sandbox, envForArm, timeoutMs }) {
+  return {
+    contract: "codestory.builder-execution-context/v1",
+    cli_path: path.resolve(cli), cli_sha256: cliSha256,
+    sandbox, permission_profile: ":workspace", runner: "codex", platform: "darwin",
+    process: { shell: false, stdin: "ignore", timeout_ms: timeoutMs },
+    arms: Object.fromEntries(BUILDER_ABLATION_ARMS.map((arm) => [arm, environmentIdentity(envForArm(arm))])),
+  };
+}
+
+function canaryBlockers(receipt, expectedContext) {
   const reasons = [];
+  const operations = Array.isArray(receipt?.operations) ? receipt.operations : [];
   if (receipt?.contract !== CONTRACT || receipt?.status !== "pass") {
     reasons.push("operation canary did not pass");
   }
-  if (cliSha256 && receipt?.cli_sha256 !== cliSha256) {
-    reasons.push("operation canary binary differs from the model-row binary");
+  if (expectedContext?.contract !== "codestory.builder-execution-context/v1" ||
+      expectedContext?.sandbox !== "workspace-write" || expectedContext?.permission_profile !== ":workspace" ||
+      expectedContext?.platform !== "darwin" || expectedContext?.runner !== "codex" ||
+      !path.isAbsolute(expectedContext?.cli_path ?? "") || !isDigest(expectedContext?.cli_sha256) ||
+      expectedContext?.process?.shell !== false || expectedContext?.process?.stdin !== "ignore" ||
+      !(expectedContext?.process?.timeout_ms > 0) ||
+      BUILDER_ABLATION_ARMS.some((arm) => !path.isAbsolute(expectedContext?.arms?.[arm]?.codex_home ?? "") ||
+        !isDigest(expectedContext?.arms?.[arm]?.environment_sha256) || !isDigest(expectedContext?.arms?.[arm]?.cache_configuration_sha256))) {
+    reasons.push("expected timed-agent execution context is missing or invalid");
+  }
+  if (receipt?.context_sha256 !== digestObject(expectedContext) ||
+      receipt?.cli_sha256 !== expectedContext?.cli_sha256 || receipt?.sandbox !== expectedContext?.sandbox) {
+    reasons.push("operation canary differs from the timed-agent execution context");
+  }
+  if (!path.isAbsolute(receipt?.project ?? "")) {
+    reasons.push("operation canary project is missing");
   }
   for (const arm of BUILDER_ABLATION_ARMS) {
     for (const operation of REQUIRED[arm]) {
-      const rows = receipt?.operations?.filter((row) => row.arm === arm && row.operation === operation) ?? [];
+      const rows = operations.filter((row) => row?.arm === arm && row?.operation === operation);
       if (rows.length !== 1 || rows[0].exit_code !== 0 || rows[0].shape_valid !== true ||
           !/^[a-f0-9]{64}$/u.test(rows[0].stdout_sha256 ?? "") ||
           !/^[a-f0-9]{64}$/u.test(rows[0].stderr_sha256 ?? "") ||
@@ -46,14 +81,37 @@ function canaryBlockers(receipt, cliSha256 = null) {
       }
     }
   }
-  for (const row of receipt?.operations ?? []) {
+  for (const row of operations) {
+    if (!row || typeof row.operation !== "string") {
+      reasons.push("malformed operation canary telemetry");
+      continue;
+    }
     if (row.exit_code !== 0 || row.shape_valid !== true) reasons.push(`${row.arm}/${row.operation} failed`);
+    const prefix = ["sandbox", "--permission-profile", ":workspace", "--cd", receipt.project, "--"];
+    const args = Array.isArray(row.arguments) ? row.arguments : [];
+    const command = args?.[6];
+    const operationArgs = args?.slice(7) ?? [];
+    const expectedCommand = row.operation === "native_search" ? "rg" : row.operation === "native_source" ? "sed" : expectedContext?.cli_path;
+    const expectedOperation = row.operation === "continuation" ? "packet" : row.operation;
+    const projectFlag = operationArgs.indexOf("--project");
+    if (row.command !== "codex" || !Array.isArray(args) ||
+        prefix.some((value, index) => args[index] !== value) || command !== expectedCommand ||
+        (!row.operation.startsWith("native_") && (operationArgs[0] !== expectedOperation ||
+          projectFlag < 0 || operationArgs[projectFlag + 1] !== receipt.project)) ||
+        operationArgs.includes("--cache-dir") ||
+        JSON.stringify(row.environment) !== JSON.stringify(expectedContext?.arms?.[row.arm]) ||
+        JSON.stringify(row.process) !== JSON.stringify(expectedContext?.process) ||
+        row.codex_home !== expectedContext?.arms?.[row.arm]?.codex_home ||
+        !BUILDER_ABLATION_ARMS.includes(row.arm) ||
+        !(REQUIRED[row.arm]?.includes(row.operation) || (row.arm.startsWith("packet_") && row.operation === "continuation"))) {
+      reasons.push(`${row.arm}/${row.operation} has missing or mismatched command/environment/process binding`);
+    }
   }
   return reasons;
 }
 
 async function runBuilderOperationCanary({
-  root, outDir, cli, sandbox, envForArm, runProcess,
+  root, outDir, cli, sandbox, envForArm, runProcess, expectedContext,
   scopeArgs, retrievalArgs, packetArgs, continuationArgs, validatePacket,
 }) {
   await mkdir(root, { recursive: true });
@@ -68,6 +126,7 @@ async function runBuilderOperationCanary({
     source_sha256: sha256(SOURCE),
     cli_sha256: sha256(await readFile(cli)),
     sandbox,
+    context_sha256: digestObject(expectedContext),
     operations: [],
   };
   const persist = async () => {
@@ -94,9 +153,12 @@ async function runBuilderOperationCanary({
       const wrapped = sandboxCommand(sandbox, project, command, args);
       const env = envForArm(arm);
       if (!env.CODEX_HOME) throw new Error(`${arm} lacks the isolated timed-agent home`);
+      if (JSON.stringify(environmentIdentity(env)) !== JSON.stringify(expectedContext?.arms?.[arm])) {
+        throw new Error(`${arm} environment changed after context freeze`);
+      }
       const started = performance.now();
       const result = await runProcess(wrapped.command, wrapped.args, {
-        cwd: project, env, timeoutMs: 60_000,
+        cwd: project, env, timeoutMs: expectedContext.process.timeout_ms,
       });
       let shapeValid = false;
       let output = null;
@@ -109,6 +171,7 @@ async function runBuilderOperationCanary({
       receipt.operations.push({
         arm, operation, command: wrapped.command, arguments: wrapped.args,
         sandboxed: true, codex_home: env.CODEX_HOME,
+        environment: environmentIdentity(env), process: expectedContext.process,
         exit_code: result.exitCode, wall_ms: performance.now() - started,
         stdout_sha256: sha256(result.stdout), stderr_sha256: sha256(result.stderr),
         shape_valid: shapeValid,
@@ -148,4 +211,4 @@ async function runBuilderOperationCanary({
   return await persist();
 }
 
-export { CONTRACT, REQUIRED, canaryBlockers, runBuilderOperationCanary, sandboxCommand };
+export { CONTRACT, REQUIRED, canaryBlockers, canaryExecutionContext, digestObject, environmentIdentity, runBuilderOperationCanary, sandboxCommand };
