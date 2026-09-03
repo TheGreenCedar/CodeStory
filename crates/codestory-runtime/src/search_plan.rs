@@ -1805,7 +1805,7 @@ impl AppController {
         let intent_query = parse_search_intent_query(&original_query);
         let query = intent_query.effective_query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
-        let mut hits = self.resolve_indexed_symbol_candidates(&query, limit_per_source)?;
+        let mut hits = self.resolve_core_symbol_candidates(&query, limit_per_source)?;
         apply_search_intent_filters(&mut hits, &intent_query.filters);
         dedupe_inexact_search_hits_by_display_key(&query, &mut hits);
         hits.truncate(limit_per_source);

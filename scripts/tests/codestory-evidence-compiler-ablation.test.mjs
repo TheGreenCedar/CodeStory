@@ -30,6 +30,8 @@ import {
   evaluate,
   packetNextAction,
 } from "../codestory-evidence-compiler-ablation-evaluate.mjs";
+import { digestObject } from "../lib/builder-operation-canary.mjs";
+import { contextMutations, passingCanaryFixture } from "./helpers/builder-canary-fixture.mjs";
 import {
   JUDGMENTS_CONTRACT,
   finalizeAdjudication,
@@ -624,6 +626,7 @@ function passingRows() {
       task_id: taskId,
       arm,
       repeat,
+      repo_path: "/tmp/repo",
       status: "pass",
       quality: { pass: true },
       usage: { input_tokens: arm === "packet_semantic_off" ? 100 : 100 },
@@ -633,6 +636,10 @@ function passingRows() {
       },
       installed_agent_timing_eligible: true,
       transcript_analysis: {
+        codestory_operations: arm === "native_tools" ? [] : arm.startsWith("packet_")
+          ? [{ operation: "packet", successful: true, source: "harness_packet_prelude" }]
+          : [{ operation: "search", successful: true, transport: "cli", source: "agent_cli", raw: { command: exactSearchCommand } },
+            ...(arm === "exact_plus_relations" ? [{ operation: "callees", successful: true, transport: "cli", source: "agent_cli", raw: { command: "$CODESTORY_CLI callees --project /tmp/repo --id node" } }] : [])],
         codestory_was_first_repository_context_action: arm !== "native_tools",
         exploratory_repository_context_actions_after_first_codestory:
           arm === "packet_semantic_off" ? 4 : 5,
@@ -640,6 +647,7 @@ function passingRows() {
           arm === "packet_semantic_off" ? 8 : 10,
       },
       builder_ablation: {
+        execution_context_sha256: digestObject(passingCanaryFixture().context),
         operation_violations: [],
         continuation_offer: null,
         first_codestory_required: arm !== "native_tools",
@@ -716,6 +724,11 @@ function zeroAdjudication(rows) {
   };
 }
 
+async function writePassingCanary(root) {
+  const { context, receipt } = passingCanaryFixture();
+  await writeFile(path.join(root, "summary.json"), JSON.stringify({ builder_ablation: { operation_canary: receipt, operation_canary_context: context } }));
+}
+
 test("frozen packet acceptance passes only with complete independent adjudication", () => {
   const rows = passingRows();
   const accepted = evidenceCompilerBuilderAcceptance(rows, zeroAdjudication(rows));
@@ -782,10 +795,13 @@ test("packet continuations require a same-publication dense-stage execution proo
     core_generation_id: `core-${row.task_id}`,
     retrieval_generation: `retrieval-${row.task_id}`,
     question_sha256: questionSha256,
+    proof_path: "/private/proof.json",
   };
   row.transcript_analysis.codestory_operations = [
     { operation: "packet", source: "harness_packet_prelude", successful: true },
-    { operation: "packet", source: "agent_cli", successful: true },
+    { operation: "packet", source: "agent_cli", transport: "cli", successful: true, raw: {
+      command: `$CODESTORY_CLI packet --project /tmp/repo --profile agent --run-id shared-agent --question '${row.task_manifest_snapshot.prompt}' --budget standard --format json --parent-packet-id packet-1 --option-id gap-1 --core-generation-id core-${row.task_id} --retrieval-generation retrieval-${row.task_id} --benchmark-retrieval-proof-out /private/proof.json --benchmark-disable-dense-semantic`,
+    } },
   ];
   row.builder_ablation.continuation_retrieval_proof = structuredClone(
     row.codestory_harness_prelude.packet_retrieval_proof,
@@ -913,6 +929,7 @@ test("evaluator binds independent adjudication to the exact run ledger", async (
       source_runs_sha256: createHash("sha256").update(runBytes).digest("hex"),
     };
     await writeFile(path.join(root, "runs.jsonl"), runBytes);
+    await writePassingCanary(root);
     const adjudicationPath = path.join(root, "adjudication.json");
     await writeFile(adjudicationPath, `${JSON.stringify(adjudication)}\n`);
 
@@ -943,6 +960,61 @@ test("evaluator binds independent adjudication to the exact run ledger", async (
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid interventions never produce a quality aggregate or consume a revision", async () => {
+  for (const fault of ["no_canary", "missing_telemetry", "failed_search", "no_relation", "empty_packet", "substituted_packet", "forbidden_native", "wrong_command"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codestory-invalid-intervention-"));
+    const rows = passingRows();
+    const control = rows.find((row) => row.arm === "exact_plus_relations");
+    if (fault === "missing_telemetry") delete control.transcript_analysis.codestory_operations;
+    if (fault === "failed_search") control.transcript_analysis.codestory_operations[0].successful = false;
+    if (fault === "no_relation") control.transcript_analysis.codestory_operations.pop();
+    const packet = rows.find((row) => row.arm === "packet_semantic_off");
+    if (fault === "empty_packet") packet.transcript_analysis.codestory_operations = [];
+    if (fault === "substituted_packet") packet.transcript_analysis.codestory_operations = [control.transcript_analysis.codestory_operations[0]];
+    if (fault === "forbidden_native") rows.find((row) => row.arm === "native_tools").transcript_analysis.codestory_operations.push(control.transcript_analysis.codestory_operations[0]);
+    if (fault === "wrong_command") control.transcript_analysis.codestory_operations[0].raw.command = "/bin/true";
+    const runBytes = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+    await writeFile(path.join(root, "runs.jsonl"), runBytes);
+    if (fault !== "no_canary") await writePassingCanary(root);
+    const adjudicationPath = path.join(root, "adjudication.json");
+    await writeFile(adjudicationPath, JSON.stringify({ ...zeroAdjudication(rows), source_runs_sha256: createHash("sha256").update(runBytes).digest("hex") }));
+    const receipt = await evaluate({ runDir: root, adjudication: adjudicationPath, attempt: "general_revision", causalClassification: "equivalent" });
+    assert.equal(receipt.experiment_status, "invalid");
+    assert.equal(receipt.packet_decision, "not_evaluated");
+    assert.equal(receipt.packet_acceptance, null);
+    assert.deepEqual(receipt.marginal_value, { graph_relations: null, dense_semantic_candidates: null });
+  }
+});
+
+test("evaluator rejects context drift and publishes one concurrent decision without replacement", async () => {
+  for (const mutate of [null, ...contextMutations]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codestory-context-receipt-"));
+    const rows = passingRows();
+    for (const row of rows.filter((row) => row.arm === "packet_semantic_off")) row.quality.pass = false;
+    const bytes = rows.map(JSON.stringify).join("\n") + "\n";
+    await writeFile(path.join(root, "runs.jsonl"), bytes);
+    const { context, receipt } = passingCanaryFixture();
+    if (mutate) mutate(receipt);
+    await writeFile(path.join(root, "summary.json"), JSON.stringify({ builder_ablation: { operation_canary: receipt, operation_canary_context: context } }));
+    const adjudication = path.join(root, "adjudication.json");
+    await writeFile(adjudication, JSON.stringify({ ...zeroAdjudication(rows), source_runs_sha256: createHash("sha256").update(bytes).digest("hex") }));
+    const opts = { runDir: root, adjudication, attempt: "initial", causalClassification: "new" };
+    if (mutate) {
+      const result = await evaluate(opts);
+      assert.equal(result.packet_decision, "not_evaluated");
+      assert.equal(result.packet_acceptance, null);
+    } else {
+      const results = await Promise.allSettled([evaluate(opts), evaluate({ ...opts, attempt: "general_revision", causalClassification: "equivalent" })]);
+      assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+      assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+      const winner = results.find((result) => result.status === "fulfilled").value;
+      const persisted = JSON.parse(await readFile(path.join(root, "builder-ablation.json"), "utf8"));
+      assert.deepEqual(persisted, winner);
+      assert.ok((await readFile(path.join(root, "builder-ablation.md"), "utf8")).includes(winner.packet_decision));
+    }
   }
 });
 
@@ -1135,36 +1207,22 @@ test("evaluator writes the bounded revision or stop decision for a failed packet
       ...zeroAdjudication(rows),
       source_runs_sha256: createHash("sha256").update(runBytes).digest("hex"),
     };
-    await writeFile(path.join(root, "runs.jsonl"), runBytes);
     const adjudicationPath = path.join(root, "adjudication.json");
     await writeFile(adjudicationPath, `${JSON.stringify(adjudication)}\n`);
-
-    const unclassified = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-    });
-    assert.equal(unclassified.packet_decision, "failed_needs_causal_classification");
-    const revision = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-      causalClassification: "new",
-    });
-    assert.equal(revision.packet_decision, "revise_once");
-    const equivalent = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "initial",
-      causalClassification: "equivalent",
-    });
-    assert.equal(equivalent.packet_decision, "stop");
-    const exhausted = await evaluate({
-      runDir: root,
-      adjudication: adjudicationPath,
-      attempt: "general_revision",
-    });
-    assert.equal(exhausted.packet_decision, "stop");
+    for (const [attempt, causalClassification, expected] of [
+      ["initial", null, "failed_needs_causal_classification"],
+      ["initial", "new", "revise_once"],
+      ["initial", "equivalent", "stop"],
+      ["general_revision", null, "stop"],
+    ]) {
+      const runDir = await mkdtemp(path.join(root, "decision-"));
+      await writeFile(path.join(runDir, "runs.jsonl"), runBytes);
+      await writePassingCanary(runDir);
+      const opts = { runDir, adjudication: adjudicationPath, attempt, causalClassification };
+      const receipt = await evaluate(opts);
+      assert.equal(receipt.packet_decision, expected);
+      await assert.rejects(() => evaluate(opts), /refusing to replace/);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

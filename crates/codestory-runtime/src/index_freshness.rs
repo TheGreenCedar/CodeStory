@@ -1054,7 +1054,10 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
             ));
         }
     };
-    let schema = Storage::database_schema_version(&resolved).map_err(|error| {
+    // Inspect through the logical path so immutable-generation context is
+    // preserved. Opening the resolved generation as a legacy database lets
+    // SQLite materialize WAL/SHM files beside a sealed read target.
+    let schema = Storage::database_schema_version(path).map_err(|error| {
         ApiError::internal(format!("Failed to inspect storage schema: {error}"))
     })?;
     if schema != CURRENT_SCHEMA_VERSION {
