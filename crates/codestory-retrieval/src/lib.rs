@@ -66,6 +66,36 @@ pub mod benchmark_support {
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
+    /// Prepare the existing lexical implementation without semantic or graph
+    /// work. Only the frozen witness experiment consumes this isolated shard.
+    pub fn prepare_witness_lexical_shard(
+        project_root: &Path,
+        core: &codestory_store::CoreReadSession,
+        lexical_root: &Path,
+    ) -> Result<String> {
+        let source =
+            crate::lexical_index::lexical_source_input(project_root, core.generation_path())?;
+        let expected = crate::lexical_index::prepare_lexical_input_for_store(
+            source,
+            project_root,
+            core.storage(),
+        )?;
+        anyhow::ensure!(
+            expected.fingerprint.coverage.complete(),
+            "incomplete lexical source discovery"
+        );
+        let input_hash = expected.fingerprint.hash.clone();
+        crate::lexical_index::build_prepared_lexical_shard(
+            lexical_root,
+            &core.identity().generation_id,
+            &expected,
+            &input_hash,
+            None,
+            || expected.revalidate_source_seals(project_root, core.generation_path()),
+        )?;
+        Ok(input_hash)
+    }
+
     /// One vector the bake-off publishes and later scores against.
     #[derive(Debug, Clone, PartialEq)]
     pub struct BenchmarkVector {

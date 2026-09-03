@@ -354,7 +354,9 @@ pub mod benchmark_support {
         AddressedHydrationGap, HydratedAddressedRange, hydrate_addressed_range,
     };
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
-    pub use crate::witness_seam::{WitnessSeamDescriptor, WitnessSeamPair, run_witness_seam};
+    pub use crate::witness_seam::{
+        WitnessSeamDescriptor, WitnessSeamPair, freeze_witness_descriptors, run_witness_seam,
+    };
 }
 
 mod activation_status;

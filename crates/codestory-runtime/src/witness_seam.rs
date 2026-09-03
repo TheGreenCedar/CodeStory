@@ -11,11 +11,12 @@ use codestory_agent::evidence_compiler::{
     RepositoryDerivedCompilationV1, compile_repository_evidence,
 };
 use codestory_contracts::compilation::{
-    PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketAdmissionReceiptV1, PacketCompilationInputV1,
+    PACKET_COMPILATION_CONTRACT_VERSION_V1, PACKET_RETRIEVAL_SCORE_VERSION_V1,
+    PacketAdmissionOriginV1, PacketAdmissionReceiptV1, PacketCompilationInputV1,
     PacketCompilationPublicationV1,
 };
 use codestory_contracts::evidence_address::{
-    ByteRangeV1, EvidenceAnchorV1, LineRangeV1, ProjectRelativePath, SourceRangeV1,
+    ByteRangeV1, EvidenceAnchorV1, LineRangeV1, ProjectRelativePath, SourceRangeV1, StableNodeId,
 };
 use codestory_contracts::graph::{NodeId, NodeKind};
 use codestory_contracts::packet_projection_v3::Sha256DigestV3Dto;
@@ -43,6 +44,152 @@ pub struct WitnessSeamPair {
     pub addressed_input: PacketCompilationInputV1,
     pub control: RepositoryDerivedCompilationV1,
     pub addressed: RepositoryDerivedCompilationV1,
+}
+
+/// Freeze existing lexical results without reranking, padding, or dropping an
+/// inconvenient unaddressed hit. Capture is independent of either hydration arm.
+pub fn freeze_witness_descriptors(
+    pin: &CoreReadSession,
+    project_root: &Path,
+    hits: &[codestory_retrieval::CandidateHit],
+) -> Result<Vec<WitnessSeamDescriptor>> {
+    use codestory_contracts::api::SearchTargetDto;
+    ensure!(
+        hits.len() <= 16,
+        "Phase 1A candidate universe exceeds sixteen"
+    );
+    let root = project_root.canonicalize()?;
+    let mut descriptors = Vec::new();
+    for (ordinal, hit) in hits.iter().enumerate() {
+        ensure!(
+            hit.source == codestory_retrieval::CandidateSource::Lexical,
+            "Phase 1A permits only lexical retrieval"
+        );
+        let hit_path = Path::new(&hit.file_path);
+        let relative = if hit_path.is_absolute() {
+            hit_path.strip_prefix(&root)?
+        } else {
+            hit_path
+        };
+        let path = ProjectRelativePath::new(relative.to_str().context("non-UTF-8 path")?)?;
+        let file = pin
+            .storage()
+            .get_file_by_path(&root.join(relative))?
+            .or(pin.storage().get_file_by_path(relative)?)
+            .context("retrieved file is absent from the core pin")?;
+        let digest = Sha256DigestV3Dto::new(
+            pin.storage()
+                .get_file_content_hash(file.id)?
+                .context("retrieved file has no indexed content digest")?,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid indexed content digest"))?;
+        let mut descriptor = WitnessSeamDescriptor {
+            admission: PacketAdmissionReceiptV1 {
+                packet_ordinal: ordinal as u32,
+                stable_identity: hit
+                    .packet_stable_identity()
+                    .context("hit lacks stable identity")?,
+                score_version: PACKET_RETRIEVAL_SCORE_VERSION_V1.into(),
+                reserved_source_bytes: 512,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            },
+            path: path.clone(),
+            symbol: hit
+                .qualified_name
+                .clone()
+                .or_else(|| hit.symbol_name.clone()),
+            anchor: EvidenceAnchorV1::PathOnly { path: path.clone() },
+            content_digest: digest,
+        };
+        // Path spellings are normalized once, with no basename authority.
+        if hit.node_id.is_none() {
+            descriptor.admission.stable_identity = format!("path:{}", path.as_str());
+        }
+        let full_path = root.join(relative).canonicalize()?;
+        ensure!(
+            full_path.starts_with(&root),
+            "retrieved source escapes the project"
+        );
+        let source = std::fs::read_to_string(&full_path)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&source)) == descriptor.content_digest.as_str(),
+            "retrieved source changed since core publication"
+        );
+        if let Some(id) = &hit.node_id {
+            let node = pin
+                .storage()
+                .get_node(NodeId(id.parse()?))?
+                .context("retrieved node missing")?;
+            if node.kind == NodeKind::FILE {
+                ensure!(
+                    node.id == NodeId(file.id),
+                    "retrieved file-node identity mismatch"
+                );
+                // A file node identifies the file, not a source match or syntax body.
+            } else if node.file_node_id.is_some() {
+                ensure!(
+                    node.file_node_id == Some(NodeId(file.id)),
+                    "retrieved node/file mismatch: node={} kind={:?} owner={:?} candidate_file={} path={}",
+                    node.id,
+                    node.kind,
+                    node.file_node_id,
+                    file.id,
+                    path.as_str()
+                );
+                if let (Some(start), Some(end)) = (node.start_line, node.end_line) {
+                    if let Some(source_range) = full_line_range(&source, &descriptor, start, end) {
+                        descriptor.anchor = EvidenceAnchorV1::IndexedNode {
+                            node_id: StableNodeId::new(
+                                descriptor.admission.stable_identity.clone(),
+                            )?,
+                            source_range,
+                        };
+                    }
+                }
+                // Namespace/component documents can carry a display path while
+                // their core node has no source owner. They remain PathOnly.
+            }
+        } else if let Some(SearchTargetDto::FileRange {
+            file_path,
+            start_byte,
+            end_byte,
+        }) = &hit.target
+        {
+            ensure!(
+                file_path == &hit.file_path,
+                "lexical match path differs from its candidate"
+            );
+            let start = *start_byte as usize;
+            let end = *end_byte as usize;
+            ensure!(
+                start < end
+                    && end <= source.len()
+                    && source.is_char_boundary(start)
+                    && source.is_char_boundary(end),
+                "invalid lexical match offsets"
+            );
+            let first = source.as_bytes()[..start]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as u32
+                + 1;
+            let last = source.as_bytes()[..end - 1]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as u32
+                + 1;
+            ensure!(
+                hit.start_line == Some(first),
+                "lexical matched line differs from its offsets"
+            );
+            descriptor.anchor = EvidenceAnchorV1::Match {
+                byte_range: ByteRangeV1::new(*start_byte as u64, *end_byte as u64)?,
+                line_range: LineRangeV1::new(first, last)?,
+            };
+        }
+        descriptors.push(descriptor);
+    }
+    Ok(descriptors)
 }
 
 pub fn run_witness_seam(
