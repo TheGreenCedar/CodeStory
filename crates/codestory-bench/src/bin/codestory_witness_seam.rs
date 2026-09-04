@@ -70,6 +70,18 @@ enum Command {
         #[arg(long)]
         receipt_sha256: String,
     },
+    /// Post-failure diagnostic only: compare the native unquoted term cutoff.
+    /// This cannot mint a canonical witness capture or a qualification result.
+    CoverageDiagnostic {
+        #[arg(long)]
+        prepared: PathBuf,
+        #[arg(long)]
+        prepared_sha256: String,
+        #[arg(long)]
+        question: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -190,7 +202,84 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::CoverageDiagnostic {
+            prepared,
+            prepared_sha256,
+            question,
+            output,
+        } => coverage_diagnostic(&prepared, &prepared_sha256, &question, &output),
     }
+}
+
+fn coverage_diagnostic(
+    prepared_path: &Path,
+    expected: &str,
+    question: &str,
+    output: &Path,
+) -> Result<()> {
+    ensure!(!question.trim().is_empty(), "question is required");
+    let bytes = std::fs::read(prepared_path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == expected,
+        "preparation digest mismatch"
+    );
+    let prepared: Prepared = serde_json::from_slice(&bytes)?;
+    ensure!(
+        prepared.contract == "codestory.witness-preparation/v1",
+        "unexpected preparation contract"
+    );
+    let pin = CoreReadSession::pin(&prepared.storage_path)?;
+    ensure!(
+        pin.pointer() == &prepared.core_pointer,
+        "prepared core publication changed"
+    );
+    let (control, candidate) =
+        codestory_retrieval::benchmark_support::witness_lexical_coverage_diagnostic(
+            &prepared.lexical_root,
+            &pin.identity().generation_id,
+            &prepared.lexical_input_hash,
+            question,
+        )?;
+    let compile = |hits: &[codestory_retrieval::CandidateHit]| -> Result<serde_json::Value> {
+        let lexical = pin_witness_lexical_sources(
+            &prepared.lexical_root,
+            &pin.identity().generation_id,
+            &prepared.lexical_input_hash,
+            &hits
+                .iter()
+                .map(|hit| hit.file_path.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let descriptors = freeze_witness_descriptors(&pin, &lexical, &prepared.project_root, hits)?;
+        let pair = run_witness_seam(
+            &pin,
+            Some(&lexical),
+            &prepared.project_root,
+            &prepared.publication,
+            &descriptors,
+        )?;
+        Ok(json!({
+            "hits": hits, "descriptors": descriptors,
+            "input": pair.addressed_input, "output": pair.addressed,
+        }))
+    };
+    let receipt = json!({
+        "contract": "codestory.lexical-coverage-diagnostic/v1",
+        "authority": "post_failure_diagnostic_only",
+        "packet_decision": "not_evaluated",
+        "cannot_replace_phase1a": true,
+        "question_sha256": format!("{:x}", Sha256::digest(question.as_bytes())),
+        "prepared_sha256": expected,
+        "prepared_path": prepared_path,
+        // A historical, immutable preparation is an input to this diagnostic.
+        // It is not relabelled as a preparation by the executing source build.
+        "preparation_build": prepared.build,
+        "execution_build": build_identity()?,
+        "control": compile(&control)?, "without_count_cutoff": compile(&candidate)?,
+    });
+    write_receipt(output, &serde_json::to_vec_pretty(&receipt)?)?;
+    println!("{}  {}", file_digest(output)?, output.display());
+    Ok(())
 }
 
 fn prepare(project: &Path, output: &Path) -> Result<()> {
@@ -566,6 +655,41 @@ mod tests {
                 .all(|source| source.source.contains("needle"))
         );
         assert!(!output.join("runtime/models").exists());
+        let diagnostic_path = temp.path().join("coverage-diagnostic.json");
+        coverage_diagnostic(
+            &preparation,
+            &file_digest(&preparation).unwrap(),
+            "needle alpha beta gamma delta epsilon zeta eta theta",
+            &diagnostic_path,
+        )
+        .unwrap();
+        let diagnostic_bytes = std::fs::read(&diagnostic_path).unwrap();
+        let diagnostic: serde_json::Value = serde_json::from_slice(&diagnostic_bytes).unwrap();
+        assert_eq!(diagnostic["authority"], "post_failure_diagnostic_only");
+        assert_eq!(diagnostic["packet_decision"], "not_evaluated");
+        assert_eq!(diagnostic["cannot_replace_phase1a"], true);
+        assert_eq!(diagnostic["control"]["descriptors"], json!([]));
+        assert_eq!(
+            diagnostic["without_count_cutoff"]["descriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(read_manifest(&diagnostic_path, &file_digest(&diagnostic_path).unwrap()).is_err());
+        assert!(
+            coverage_diagnostic(
+                &preparation,
+                &file_digest(&preparation).unwrap(),
+                "needle",
+                &diagnostic_path,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&diagnostic_path).unwrap(), diagnostic_bytes);
+        let refused = temp.path().join("refused-diagnostic.json");
+        assert!(coverage_diagnostic(&preparation, &"0".repeat(64), "needle", &refused).is_err());
+        assert!(!refused.exists());
         let manifest_digest = file_digest(&captured).unwrap();
         let receipt = temp.path().join("receipt.json");
         replay(&captured, &manifest_digest, &receipt).unwrap();

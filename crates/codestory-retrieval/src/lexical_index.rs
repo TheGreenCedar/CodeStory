@@ -1711,7 +1711,7 @@ where
         query,
         limit,
         Arc::clone(&cancelled),
-        LexicalHitPayload::Full,
+        LexicalHitPayload::Full.into(),
     );
     if result.is_err() && cancelled() {
         bail!("lexical search cancelled");
@@ -1736,7 +1736,7 @@ where
         query,
         limit,
         Arc::clone(&cancelled),
-        LexicalHitPayload::DescriptorOnly,
+        LexicalHitPayload::DescriptorOnly.into(),
     );
     if result.is_err() && cancelled() {
         bail!("lexical descriptor search cancelled");
@@ -1750,7 +1750,7 @@ fn search_lexical_index_with_cancel_inner(
     query: &str,
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    payload: LexicalHitPayload,
+    options: LexicalSearchOptions,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1772,7 +1772,7 @@ fn search_lexical_index_with_cancel_inner(
             query,
             limit,
             cancelled,
-            payload,
+            options,
         );
     }
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
@@ -1799,7 +1799,7 @@ fn search_lexical_index_with_cancel_inner(
         document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
-        payload,
+        options,
     )
 }
 
@@ -1832,7 +1832,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                     query,
                     *limit,
                     Arc::clone(&cancelled),
-                    LexicalHitPayload::Full,
+                    LexicalHitPayload::Full.into(),
                 )
             })
             .collect();
@@ -1865,7 +1865,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                 document_count,
                 &mut token_frequencies,
                 cancelled.as_ref(),
-                LexicalHitPayload::Full,
+                LexicalHitPayload::Full.into(),
             )
         })
         .collect()
@@ -1877,7 +1877,7 @@ fn search_lexical_component_set(
     query: &str,
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    payload: LexicalHitPayload,
+    options: LexicalSearchOptions,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1902,7 +1902,7 @@ fn search_lexical_component_set(
         component_limit,
         logical_count,
         Arc::clone(&cancelled),
-        payload,
+        options,
     )?;
     let mut hits = Vec::new();
     for hit in base_hits {
@@ -1919,7 +1919,7 @@ fn search_lexical_component_set(
             component_limit,
             logical_count,
             Arc::clone(&cancelled),
-            payload,
+            options,
         )?;
         for hit in delta_hits {
             let key = lexical_hit_document_key(&hit)?;
@@ -1953,7 +1953,7 @@ fn search_lexical_component(
     limit: usize,
     logical_document_count: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    payload: LexicalHitPayload,
+    options: LexicalSearchOptions,
 ) -> Result<Vec<LexicalHit>> {
     validate_component_descriptor_at(shard_dir, descriptor)?;
     let path = shard_dir.join(&descriptor.file_name);
@@ -1971,7 +1971,7 @@ fn search_lexical_component(
         logical_document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
-        payload,
+        options,
     )
 }
 
@@ -2003,6 +2003,60 @@ fn lexical_hit_identity(hit: &LexicalHit) -> LexicalCandidateIdentity {
     )
 }
 
+/// Compare the incumbent and no-count-cutoff intervention through the same
+/// component-aware reader. This is unavailable to product callers.
+#[cfg(feature = "benchmark-support")]
+pub(crate) fn witness_coverage_diagnostic(
+    lexical_root: &Path,
+    generation: &str,
+    input_hash: &str,
+    query: &str,
+) -> Result<(Vec<LexicalHit>, Vec<LexicalHit>)> {
+    let shard = shard_dir_for(lexical_root, generation);
+    let control = search_lexical_index_with_cancel_inner(
+        &shard,
+        input_hash,
+        query,
+        16,
+        Arc::new(|| false),
+        LexicalHitPayload::Full.into(),
+    )?;
+    let candidate = search_lexical_index_with_cancel_inner(
+        &shard,
+        input_hash,
+        query,
+        16,
+        Arc::new(|| false),
+        LexicalSearchOptions {
+            payload: LexicalHitPayload::Full,
+            admission: LexicalAdmission::AnyMatchingTerm,
+        },
+    )?;
+    Ok((control, candidate))
+}
+
+#[derive(Clone, Copy)]
+struct LexicalSearchOptions {
+    payload: LexicalHitPayload,
+    admission: LexicalAdmission,
+}
+
+impl From<LexicalHitPayload> for LexicalSearchOptions {
+    fn from(payload: LexicalHitPayload) -> Self {
+        Self {
+            payload,
+            admission: LexicalAdmission::CurrentCoverage,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LexicalAdmission {
+    CurrentCoverage,
+    #[cfg(any(test, feature = "benchmark-support"))]
+    AnyMatchingTerm,
+}
+
 fn search_lexical_index_on_connection(
     connection: &Connection,
     query: &str,
@@ -2010,8 +2064,9 @@ fn search_lexical_index_on_connection(
     document_count: usize,
     frequency_cache: &mut HashMap<String, usize>,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
-    payload: LexicalHitPayload,
+    options: LexicalSearchOptions,
 ) -> Result<Vec<LexicalHit>> {
+    let LexicalSearchOptions { payload, admission } = options;
     if cancelled() {
         bail!("lexical search cancelled");
     }
@@ -2059,7 +2114,11 @@ fn search_lexical_index_on_connection(
     // Coverage is a count of distinct query terms. Rarity weights order
     // candidates within lexical lanes; an unmatched rare term must not veto
     // the documented two-of-three or forty-percent admission contracts.
-    let required_match_count = required_lexical_match_count(tokens.len());
+    let required_match_count = match admission {
+        LexicalAdmission::CurrentCoverage => required_lexical_match_count(tokens.len()),
+        #[cfg(any(test, feature = "benchmark-support"))]
+        LexicalAdmission::AnyMatchingTerm => 1,
+    };
 
     let exact_candidates = query_exact_candidates(connection, query, candidate_limit, payload)?;
     let path_candidates = query_fts_candidates(
@@ -4809,7 +4868,7 @@ mod tests {
             1,
             &mut HashMap::new(),
             &|| false,
-            LexicalHitPayload::DescriptorOnly,
+            LexicalHitPayload::DescriptorOnly.into(),
         )
         .expect("descriptor path reads FTS membership and metadata only");
         assert_eq!(descriptors.len(), 1);
@@ -4823,7 +4882,7 @@ mod tests {
                 1,
                 &mut HashMap::new(),
                 &|| false,
-                LexicalHitPayload::Full,
+                LexicalHitPayload::Full.into(),
             )
             .is_err(),
             "the hostile stored body must fail if a query tries to materialize it"
@@ -5079,6 +5138,69 @@ mod tests {
         assert_eq!(required_lexical_match_count(3), 2);
         assert_eq!(required_lexical_match_count(4), 2);
         assert_eq!(required_lexical_match_count(12), 5);
+    }
+
+    #[test]
+    fn coverage_diagnostic_changes_only_the_unquoted_term_cutoff() {
+        for identifier in ["frindle", "widget", "client", "cache"] {
+            let project = TempDir::new().expect("project");
+            std::fs::write(
+                project.path().join("unit.rs"),
+                format!("fn {identifier}() {{}}\n"),
+            )
+            .expect("literal source");
+            let data = TempDir::new().expect("data");
+            let shard = build(project.path(), data.path(), "cutoff-probe", "input");
+            let connection = open_read_only(&shard.join(LEXICAL_INDEX_FILE)).expect("read pin");
+            let query = format!("{identifier} alpha beta gamma delta epsilon zeta eta theta");
+            let search = |query: &str, admission, limit, cancelled: bool| {
+                search_lexical_index_on_connection(
+                    &connection,
+                    query,
+                    limit,
+                    1,
+                    &mut HashMap::new(),
+                    &move || cancelled,
+                    LexicalSearchOptions {
+                        payload: LexicalHitPayload::Full,
+                        admission,
+                    },
+                )
+            };
+            assert!(
+                search(&query, LexicalAdmission::CurrentCoverage, 16, false)
+                    .expect("current search")
+                    .is_empty()
+            );
+            let diagnostic = search(&query, LexicalAdmission::AnyMatchingTerm, 16, false)
+                .expect("diagnostic search");
+            assert_eq!(
+                diagnostic.len(),
+                1,
+                "a literal match survives the diagnostic cutoff"
+            );
+            let exact = search(identifier, LexicalAdmission::CurrentCoverage, 16, false)
+                .expect("exact current search");
+            assert_eq!(diagnostic[0].target, exact[0].target);
+            assert_eq!(diagnostic[0].start_line, exact[0].start_line);
+            assert_eq!(diagnostic[0].source_excerpt, exact[0].source_excerpt);
+            assert!(
+                search(
+                    &format!("{query} `absent`"),
+                    LexicalAdmission::AnyMatchingTerm,
+                    16,
+                    false
+                )
+                .expect("quoted selector remains mandatory")
+                .is_empty()
+            );
+            assert!(
+                search(&query, LexicalAdmission::AnyMatchingTerm, 0, false)
+                    .expect("zero limit")
+                    .is_empty()
+            );
+            assert!(search(&query, LexicalAdmission::AnyMatchingTerm, 16, true).is_err());
+        }
     }
 
     #[test]

@@ -103,6 +103,33 @@ pub mod benchmark_support {
         })
     }
 
+    /// Isolated post-failure intervention, never a product search policy.
+    /// Both arms use the same native ranking and differ only in the unquoted
+    /// term-count cutoff. Mandatory quoted terms retain their existing meaning.
+    pub fn witness_lexical_coverage_diagnostic(
+        lexical_root: &Path,
+        generation: &str,
+        input_hash: &str,
+        query: &str,
+    ) -> Result<(Vec<crate::CandidateHit>, Vec<crate::CandidateHit>)> {
+        let (control, candidate) = crate::lexical_index::witness_coverage_diagnostic(
+            lexical_root,
+            generation,
+            input_hash,
+            query,
+        )?;
+        Ok((
+            control
+                .into_iter()
+                .map(crate::lexical_client::lexical_hit_to_candidate)
+                .collect::<Result<_>>()?,
+            candidate
+                .into_iter()
+                .map(crate::lexical_client::lexical_hit_to_candidate)
+                .collect::<Result<_>>()?,
+        ))
+    }
+
     /// Prepare the existing lexical implementation without semantic or graph
     /// work. Only the frozen witness experiment consumes this isolated shard.
     pub fn prepare_witness_lexical_shard(

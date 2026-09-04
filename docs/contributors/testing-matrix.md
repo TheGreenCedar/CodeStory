@@ -118,6 +118,17 @@ public payload.
 Passing synthetic contracts does not pass the evidence-quality gate. Pool,
 graph, semantic, public-routing, and release changes remain gated separately.
 
+After a failed witness experiment, the hidden `coverage-diagnostic` command can
+compare the existing lexical cutoff with admitting any matching query term.
+Both arms retain the native ranker, mandatory quoted terms, sixteen candidates,
+512-byte hydration, and pure compiler. It reads a checksummed historical
+preparation, records preparation and execution builds separately, and produces
+only `codestory.lexical-coverage-diagnostic/v1` output. It cannot mint a canonical
+capture, change the original decision, or authorize product routing. The
+intervention exists only with `benchmark-support`; ordinary searches retain
+their current cutoff. Run the lexical-index tests with that feature and the
+witness binary tests when changing this diagnostic.
+
 Run the relevant focused commands while implementing. A typical Rust lane is:
 
 ```sh
