@@ -303,6 +303,7 @@ impl PreparedCoreCommit {
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)?;
         ensure_indexing_active(cancel_token)?;
+        crate::index_coverage::revalidate_malformed_sources(self.staged_mut().store_mut())?;
         let staged_path = self.staged_mut().path().to_path_buf();
         let staged = self
             .staged

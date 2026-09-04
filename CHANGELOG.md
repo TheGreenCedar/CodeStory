@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Malformed text configuration files no longer block the entire repository
+  index. Their source remains visible with an explicit coverage gap; stale
+  symbols and structural claims from an earlier valid version are removed.
+
 - Exact `search --repo-text off --refresh none` works from the existing core
   publication even when retrieval catalogs are unwritable. A project without
   a published core returns `project_unavailable` without creating a cache.

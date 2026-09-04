@@ -8041,21 +8041,20 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
         "{\"missing_value\":",
     )
     .expect("write malformed JSON");
-    let error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("malformed structural input must fail closed");
-    assert_eq!(error.code, "source_malformed");
-    assert!(error.details.as_ref().is_some_and(|details| {
-        details
-            .coverage_gaps
+        .expect("verified malformed source publishes without a projection");
+    let structural_before_failure = structural_live_identity(&storage_path);
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
             .iter()
-            .any(|gap| gap.reason == FileCoverageReason::Malformed)
-    }));
-    assert_eq!(
-        structural_live_identity(&storage_path),
-        structural_before_failure,
-        "malformed input changed the prior structural manifest or cache identity"
+            .any(|gap| gap.reason == FileCoverageReason::Malformed
+                && gap.verified_source
+                && !gap.projection_available)
     );
+    drop(storage);
     assert_no_staged_publication_artifacts(&storage_path);
 
     fs::remove_file(workspace.path().join("malformed.json"))
@@ -8085,7 +8084,7 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
 }
 
 #[test]
-fn full_refresh_excludes_controlled_negative_fixture_but_rejects_production_malformed_source() {
+fn full_refresh_retains_malformed_source_separately_from_controlled_exclusions() {
     let workspace = tempdir().expect("workspace dir");
     let fixture = workspace
         .path()
@@ -8114,16 +8113,19 @@ fn full_refresh_excludes_controlled_negative_fixture_but_rejects_production_malf
         "{\"missing_value\":",
     )
     .expect("write malformed production source");
-    let error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("malformed production source must still fail closed");
-    assert_eq!(error.code, "source_malformed");
-    assert!(error.details.as_ref().is_some_and(|details| {
-        details
-            .coverage_gaps
+        .expect("verified malformed production source remains in the inventory");
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
             .iter()
-            .any(|gap| gap.reason == FileCoverageReason::Malformed)
-    }));
+            .any(|gap| gap.path == "production-malformed.json"
+                && gap.reason == FileCoverageReason::Malformed
+                && gap.verified_source
+                && !gap.projection_available)
+    );
 }
 
 #[test]
@@ -8532,15 +8534,19 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
     assert!(!controller.state.lock().is_indexing);
     assert_no_staged_publication_artifacts(&storage_path);
 
-    let full_error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("explicit full refresh must reach malformed source verification");
-    assert_eq!(full_error.code, "source_malformed");
+        .expect("explicit full refresh repairs the manifest and retains malformed source");
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    storage
+        .validate_structural_text_unit_publication(&publication)
+        .unwrap();
     assert!(
-        full_error
-            .message
-            .contains("Effective refresh mode `full` could not verify"),
-        "unexpected full-refresh error: {full_error:?}"
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
+            .iter()
+            .any(|gap| gap.reason == FileCoverageReason::Malformed && gap.verified_source)
     );
 }
 

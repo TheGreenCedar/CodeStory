@@ -382,7 +382,7 @@ fn evaluate_incremental_plan_probe(
     };
     if stored_coverage
         .iter()
-        .any(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .any(crate::index_coverage::coverage_gap_blocks_publication)
     {
         return IncrementalPlanProbeOutcomeDto::StoredCoverageGap;
     }
@@ -747,7 +747,7 @@ fn validate_incremental_refresh_coverage(
 ) -> Result<(), ApiError> {
     let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
         .into_iter()
-        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .filter(crate::index_coverage::coverage_gap_blocks_publication)
         .collect::<Vec<_>>();
     if blocking_gaps.is_empty() {
         return Ok(());
