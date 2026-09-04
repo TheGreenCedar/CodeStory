@@ -129,6 +129,17 @@ intervention exists only with `benchmark-support`; ordinary searches retain
 their current cutoff. Run the lexical-index tests with that feature and the
 witness binary tests when changing this diagnostic.
 
+The Cargo example `codestory_embedding_diagnostic` measures the existing native
+encoder on checksummed external inputs. It is not a shipped command and emits
+no packet or qualification decision. It requires a clean build with the pinned
+embedded model, a private state root containing `cache/` and `ipc/`, and matching
+cache and qualification-namespace environment settings. It retains the product
+query prefix, document encoder, accelerator policy, and token limit. Any rejected
+input aborts the result; it never truncates text or substitutes CPU execution.
+Run `cargo test --locked -p codestory-bench --example codestory_embedding_diagnostic`
+and an isolated native canary before using it for post-failure retrieval research.
+Keep its vectors, inputs, and research conclusions outside the repository.
+
 Run the relevant focused commands while implementing. A typical Rust lane is:
 
 ```sh
