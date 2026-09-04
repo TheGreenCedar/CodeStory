@@ -67,6 +67,121 @@ pub mod benchmark_support {
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Etr1LexicalMatch {
+        pub rowid: usize,
+        pub score: f64,
+    }
+
+    /// Frozen-fragment FTS5 surface for benchmark-only causal experiments.
+    /// It deliberately reuses the product's lexical normalization and stopword
+    /// policy while keeping the fragment representation outside production.
+    pub struct Etr1LexicalIndex {
+        connection: rusqlite::Connection,
+    }
+
+    impl Etr1LexicalIndex {
+        pub fn new<'a>(documents: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+            use rusqlite::params;
+
+            let connection = rusqlite::Connection::open_in_memory()?;
+            connection.execute_batch(
+                "CREATE VIRTUAL TABLE passages USING fts5(content); BEGIN IMMEDIATE;",
+            )?;
+            {
+                let mut insert =
+                    connection.prepare("INSERT INTO passages(rowid, content) VALUES (?1, ?2)")?;
+                for (ordinal, document) in documents.into_iter().enumerate() {
+                    let rowid = i64::try_from(ordinal.saturating_add(1))?;
+                    insert.execute(params![rowid, etr1_lexical_document(document)])?;
+                }
+            }
+            connection.execute_batch("COMMIT;")?;
+            Ok(Self { connection })
+        }
+
+        pub fn search(&self, query: &str) -> Result<(Vec<String>, Vec<Etr1LexicalMatch>)> {
+            let terms = etr1_lexical_query_terms(query);
+            if terms.is_empty() {
+                return Ok((terms, Vec::new()));
+            }
+            let expression = terms
+                .iter()
+                .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut statement = self.connection.prepare(
+                "SELECT rowid, bm25(passages) AS score \
+                 FROM passages WHERE passages MATCH ?1 ORDER BY score, rowid",
+            )?;
+            let rows = statement.query_map([expression], |row| {
+                Ok(Etr1LexicalMatch {
+                    rowid: usize::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    score: row.get(1)?,
+                })
+            })?;
+            Ok((terms, rows.collect::<rusqlite::Result<Vec<_>>>()?))
+        }
+    }
+
+    pub fn etr1_lexical_document(value: &str) -> String {
+        etr1_normalize_lexical_text(value)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn etr1_lexical_query_terms(query: &str) -> Vec<String> {
+        const LEXICAL_STOP_WORDS: &[&str] = &[
+            "about", "after", "and", "are", "cite", "does", "explain", "file", "files", "flow",
+            "flows", "for", "from", "how", "into", "level", "path", "source", "sources", "support",
+            "that", "the", "through", "top", "what", "where", "which", "with",
+        ];
+
+        let mut tokens = Vec::new();
+        let normalized = etr1_normalize_lexical_text(query);
+        for token in normalized
+            .split_whitespace()
+            .filter(|token| token.len() >= 2)
+            .filter(|token| !LEXICAL_STOP_WORDS.contains(token))
+        {
+            if !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_string());
+            }
+        }
+        tokens
+    }
+
+    fn etr1_normalize_lexical_text(value: &str) -> String {
+        let mut normalized = String::with_capacity(value.len() + value.len() / 8);
+        let mut characters = value.chars().peekable();
+        let mut previous: Option<char> = None;
+        while let Some(character) = characters.next() {
+            let next = characters.peek().copied();
+            if character.is_uppercase()
+                && previous.is_some_and(|value: char| value.is_lowercase() || value.is_numeric())
+                || character.is_uppercase()
+                    && previous.is_some_and(|value: char| value.is_uppercase())
+                    && next.is_some_and(|value| value.is_lowercase())
+            {
+                normalized.push(' ');
+            }
+            if character.is_alphanumeric() {
+                normalized.extend(character.to_lowercase());
+            } else {
+                normalized.push(' ');
+            }
+            previous = Some(character);
+        }
+        normalized
+    }
+
     pub struct WitnessLexicalPin {
         generation: String,
         input_hash: String,
