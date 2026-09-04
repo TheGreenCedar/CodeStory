@@ -778,6 +778,35 @@ mod tests {
     }
 
     #[test]
+    fn parser_cache_key_invalidates_changed_callable_extraction_rules() {
+        for extension in ["c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let key = |config: &crate::LanguageConfig| {
+                build_index_artifact_cache_key(
+                    Path::new("project"),
+                    Path::new("source"),
+                    b"unchanged source",
+                    config,
+                    None,
+                    false,
+                    true,
+                )
+                .expect("portable cache key")
+            };
+            let current = key(&config);
+            let old_config = crate::LanguageConfig {
+                graph_query: "(older_callable_rule)",
+                ..config
+            };
+            assert_ne!(
+                current,
+                key(&old_config),
+                "{extension} must not reuse the old projection"
+            );
+        }
+    }
+
+    #[test]
     fn test_artifact_cache_key_skips_unportable_compile_paths() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("root");

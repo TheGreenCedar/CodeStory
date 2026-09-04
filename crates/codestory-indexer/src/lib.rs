@@ -87,6 +87,7 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+mod native_declarators;
 mod proof_resolution;
 
 /// SRC-C2 fence classification: lives in its own file because
@@ -5050,7 +5051,7 @@ struct ManualPreciseCallSpec {
     line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GraphNodeSpan {
     start_line: u32,
     start_col: u32,
@@ -15793,6 +15794,8 @@ fn index_file_with_resolution_inputs(
     let mut tag_definitions = extract_tag_definitions(compiled_rules, &tree, source)?;
     let declaration_span_overrides =
         collect_declaration_span_overrides(language_config.language_name, &tree, source);
+    let native_callable_names =
+        native_declarators::callable_names(language_config.language_name, &tree, source);
 
     let mut variables = Variables::new();
     if let Some(info) = &compilation_info {
@@ -15948,6 +15951,21 @@ fn index_file_with_resolution_inputs(
             let mut start_col_1 = start_col.map(|v| v + 1).unwrap_or(1);
             let mut end_line_1 = end_row.map(|v| v + 1).unwrap_or(start_line);
             let mut end_col_1 = end_col.map(|v| v + 1).unwrap_or(start_col_1);
+            if matches!(language_config.language_name, "c" | "cpp") && kind == NodeKind::FUNCTION {
+                let span = GraphNodeSpan {
+                    start_line,
+                    start_col: start_col_1,
+                    end_line: end_line_1,
+                    end_col: end_col_1,
+                };
+                if let Some(name) = native_callable_names.get(&span) {
+                    // A missing name on a definition is unknown. Other
+                    // function-shaped captures (prototypes, lambdas) retain
+                    // their own syntax-specific extraction.
+                    let Some(name) = name else { continue };
+                    name_str.clone_from(name);
+                }
+            }
             if let Some((
                 normalized_name,
                 normalized_start_line,
