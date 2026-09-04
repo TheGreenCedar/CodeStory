@@ -8,7 +8,8 @@ import { authenticateFragment, encodedCandidateInput, evaluateArm, exactPublicBy
 import { validateArm, validateDocumentVectorRecord, validateEngine,
   validatePreAnnotationBoundary, parseEvents } from "../codestory-etr1-validate.mjs";
 import { decision, evaluateEtr1, gateOne, gateTwo } from "../codestory-etr1-evaluate.mjs";
-import { fileBinding, readExecutionBinding, validateExecution } from "../lib/etr1-execution.mjs";
+import { fileBinding, readExecutionBinding, validateExecution, executionEnvironment,
+  validateCanaryGate } from "../lib/etr1-execution.mjs";
 
 function unit(index) {
   const vector = Array(LIMITS.vectorDimension).fill(0);
@@ -133,6 +134,9 @@ test("vector, model, and pre-annotation boundaries refuse substitutions", () => 
     policy: "accelerated", accelerator_execution_verified: true, worker_alive: true,
     embedded_model: true, load_error: null };
   validateEngine(engine);
+  const omittedError = { ...engine }; delete omittedError.load_error;
+  validateEngine(omittedError);
+  assert.throws(() => validateEngine({ ...engine, load_error: "failed" }));
   assert.throws(() => validateEngine({ ...engine, model_digest: "f".repeat(64) }));
   const run = { annotation_access: "not_accessed", graph_invocations: 0, bge_invocations: 0,
     symbol_document_invocations: 0, host_query_invocations: 0, production_packet_invocations: 0 };
@@ -142,6 +146,26 @@ test("vector, model, and pre-annotation boundaries refuse substitutions", () => 
     const changed = structuredClone(run); mutate(changed);
     assert.throws(() => validatePreAnnotationBoundary(changed, { annotation_access: "not_accessed" }));
   }
+});
+
+test("execution uses only its recorded secret-free process environment", () => {
+  const env = executionEnvironment({ PATH: "/bin", HOME: "/users/test", OMP_NUM_THREADS: "4",
+    CODESTORY_CACHE_ROOT: "/cache", API_TOKEN: "private", NODE_OPTIONS: "--require bad.cjs",
+    UNRELATED: "hidden" });
+  assert.deepEqual(env, { CODESTORY_CACHE_ROOT: "/cache", HOME: "/users/test",
+    OMP_NUM_THREADS: "4", PATH: "/bin" });
+});
+
+test("corpus launch requires a completed identity-matched canary before model access", async () => {
+  await assert.rejects(() => validateCanaryGate(undefined, {}), /passing canary receipt required/u);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "etr1-canary-gate-"));
+  const file = path.join(directory, "receipt.json");
+  await writeFile(file, JSON.stringify({ contract: "codestory.etr1-synthetic-canary/v2",
+    authority: "synthetic_canary_only", experiment_status: "invalid" }));
+  const binding = await fileBinding(file);
+  await assert.rejects(() => validateCanaryGate(binding, {}), /canary did not pass/u);
+  await writeFile(file, "{}");
+  await assert.rejects(() => validateCanaryGate(binding, {}), /execution artifact/u);
 });
 
 test("exact optimizer selects successors without compulsory discovery seeds", () => {

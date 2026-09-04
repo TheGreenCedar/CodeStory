@@ -5,7 +5,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { executeRecorded, fileBinding } from "./lib/etr1-execution.mjs";
+import { executeRecorded, fileBinding, analysisIdentity } from "./lib/etr1-execution.mjs";
 import { validateEtr1 } from "./codestory-etr1-validate.mjs";
 import { evaluateEtr1 } from "./codestory-etr1-evaluate.mjs";
 
@@ -42,7 +42,7 @@ async function main() {
         CODESTORY_EMBED_QUALIFICATION_DIR: ipc, CODESTORY_EMBED_QUALIFICATION_NONCE: nonce } };
   };
   const documentState = await makeState("documents"), vectorPath = path.join(documentState.state, "vectors.json");
-  const documents = await executeRecorded({ role: "documents", executable: values.diagnostic,
+  const documents = await executeRecorded({ role: "documents", authority: "synthetic_canary_only", executable: values.diagnostic,
     args: ["--input", preparation.embedding_input.path, "--input-sha256", preparation.embedding_input.sha256,
       "--state-root", documentState.state, "--output", vectorPath],
     inputs: [preparation.embedding_input.path], outputPaths: [vectorPath], eventsPath: documentState.events,
@@ -51,7 +51,7 @@ async function main() {
   const vectors = await fileBinding(vectorPath), queryState = await makeState("queries");
   const runDirectory = path.join(root, "run"), runPath = path.join(runDirectory, "run.json");
   const cancelFile = path.join(root, "cancel");
-  const execution = await executeRecorded({ role: "paired_run", executable: values.runner,
+  const execution = await executeRecorded({ role: "paired_run", authority: "synthetic_canary_only", executable: values.runner,
     args: ["run", "--prepared", preparationPath, "--prepared-sha256", preparationBinding.sha256,
       "--fragment-vectors", vectorPath, "--fragment-vectors-sha256", vectors.sha256,
       "--document-execution", documents.binding.path, "--document-execution-sha256", documents.binding.sha256,
@@ -82,7 +82,7 @@ async function main() {
   await writeFile(receiptPath, JSON.stringify({ contract: "codestory.etr1-synthetic-canary/v2",
     authority: "synthetic_canary_only", experiment_status: "valid", packet_decision: "not_evaluated",
     preparation: preparationBinding, documents: documents.binding, execution: execution.binding,
-    validation, evaluated }), { flag: "wx", mode: 0o600 });
+    vectors, analysis: await analysisIdentity(sourceRoot), validation, evaluated }), { flag: "wx", mode: 0o600 });
   console.log(JSON.stringify(await fileBinding(receiptPath)));
 }
 

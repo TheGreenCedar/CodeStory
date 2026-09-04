@@ -57,7 +57,7 @@ export function validateEngine(engine) {
   assert.equal(engine.accelerator_execution_verified, true, "accelerator execution unverified");
   assert.equal(engine.worker_alive, true, "embedding worker is not alive");
   assert.equal(engine.embedded_model, true, "embedding model was not embedded");
-  assert.equal(engine.load_error, null, "embedding engine recorded a load error");
+  assert.equal(engine.load_error ?? null, null, "embedding engine recorded a load error");
 }
 
 export function validatePreAnnotationBoundary(run, preparation) {
@@ -246,10 +246,10 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot, executionB
   assert.equal(sha256(await readFile(run.build.binary_path)), run.build.binary_sha256, "run binary changed");
   const preparation = await boundJson(run.preparation);
   const { request: runnerRequest, receipt: runnerExecution } = await validateExecution(executionBinding,
-    { role: "paired_run", input: run.preparation, output: runBinding, sourceRoot });
+    { role: "paired_run", input: run.preparation, output: runBinding, sourceRoot, authority: run.authority });
   assert.equal(runnerRequest.executable.sha256, run.build.binary_sha256, "run producer changed");
   const { request: documentRequest } = await validateExecution(run.document_execution,
-    { role: "documents", input: preparation.embedding_input, output: run.fragment_vectors, sourceRoot });
+    { role: "documents", input: preparation.embedding_input, output: run.fragment_vectors, sourceRoot, authority: run.authority });
   assert.equal(preparation.contract, "codestory.etr1-preparation/v1");
   assert.equal(preparation.authority, run.authority);
   validatePreAnnotationBoundary(run, preparation);
