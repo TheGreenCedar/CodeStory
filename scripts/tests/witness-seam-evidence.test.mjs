@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { authenticateRange, phase1AGate, scoreWitnessArm, sha256, verifyPairedInputs } from "../lib/witness-seam-evidence.mjs";
+import { verifyRequiredOperation } from "../codestory-witness-seam-evaluate.mjs";
 
 function fixture() {
   const bytes = Buffer.from("// preamble\nfn café() { work(); }\nfn alternate() {}\n");
@@ -47,6 +48,38 @@ test("source authentication rejects fabricated, stale, aliased, and partial addr
   assert.equal(control.recall, 0, "a partial line never covers an entire atom");
   assert.equal(control.exposed_source_bytes, Buffer.byteLength("fn café() {"));
   assert.throws(() => scoreWitnessArm({ support: [{ kind: "typed_graph_edge" }] }, f.annotation, f.sources));
+  assert.throws(() => scoreWitnessArm({ support: [f.row], continuation: ["x".repeat(17000)] }, f.annotation, f.sources));
+  assert.throws(() => scoreWitnessArm({ support: [f.row], continuation: [], gap: "serialized_public_budget" }, f.annotation, f.sources));
+});
+
+test("required operation validity binds success, invocation, streams, and artifact", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "witness-operation-"));
+  const artifact = path.join(root, "receipt.json"), bytes = "{}", digest = sha256(bytes);
+  const stdout = `${digest}  ${artifact}\n`;
+  const operation = { command: ["/trusted/witness", "replay"], exit_code: 0, error: null, wall_ms: 3,
+    stdout_path: path.join(root, "stdout"), stderr_path: path.join(root, "stderr"),
+    stdout_sha256: sha256(stdout), stderr_sha256: sha256("") };
+  await writeFile(artifact, bytes);
+  await writeFile(operation.stdout_path, stdout);
+  await writeFile(operation.stderr_path, "");
+  const check = (value) => verifyRequiredOperation(value, operation.command, artifact, digest);
+  await check(operation);
+  for (const mutate of [
+    () => null,
+    (copy) => ({ ...copy, exit_code: 1 }),
+    (copy) => ({ ...copy, error: "timed out" }),
+    (copy) => ({ ...copy, error: undefined }),
+    (copy) => ({ ...copy, command: ["/other/witness", "replay"] }),
+    (copy) => ({ ...copy, wall_ms: undefined }),
+    (copy) => ({ ...copy, stdout_sha256: "0".repeat(64) }),
+    (copy) => ({ ...copy, stderr_sha256: "0".repeat(64) }),
+    (copy) => ({ ...copy, stdout_path: undefined }),
+  ]) await assert.rejects(check(mutate(structuredClone(operation))));
+  await writeFile(operation.stdout_path, "wrong result shape");
+  await assert.rejects(check({ ...operation, stdout_sha256: sha256("wrong result shape") }));
+  await writeFile(operation.stdout_path, stdout);
+  await writeFile(artifact, "changed");
+  await assert.rejects(check(operation));
 });
 
 test("Phase 1A aggregates phrasings inside cases and rejects selective subsets", () => {
@@ -110,7 +143,7 @@ test("invalid artifacts cannot create a quality aggregate or overwrite a decisio
   const root = await mkdtemp(path.join(tmpdir(), "witness-evaluation-"));
   const output = path.join(root, "evaluation.json");
   const script = new URL("../codestory-witness-seam-evaluate.mjs", import.meta.url);
-  const argv = [script.pathname, "--output", output];
+  const argv = [script.pathname, "--output", output, "--binary", process.execPath];
   for (const kind of ["questions", "annotations", "runs"])
     argv.push(`--${kind}`, path.join(root, `${kind}.json`), `--${kind}-sha256`, "0".repeat(64));
   const failed = spawnSync(process.execPath, argv, { encoding: "utf8" });

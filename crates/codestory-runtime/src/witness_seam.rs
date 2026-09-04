@@ -11,11 +11,12 @@ use anyhow::{Context, Result, bail, ensure};
 use codestory_agent::evidence_compiler::{
     RepositoryDerivedCompilationV1, compile_repository_evidence,
 };
+use codestory_contracts::api::SupportUnitDto;
 use codestory_contracts::compilation::{
-    PACKET_COMPILATION_CONTRACT_VERSION_V1, PACKET_RETRIEVAL_SCORE_VERSION_V1,
-    PacketAdmissionGapKindV1, PacketAdmissionGapV1, PacketAdmissionOriginV1,
-    PacketAdmissionReceiptV1, PacketCompilationInputV1, PacketCompilationPublicationV1,
-    PacketParserCompletenessV1,
+    AnswerSufficiencyV1, PACKET_COMPILATION_CONTRACT_VERSION_V1, PACKET_RETRIEVAL_SCORE_VERSION_V1,
+    PUBLIC_PACKET_SERIALIZED_MAX_BYTES, PacketAdmissionGapKindV1, PacketAdmissionGapV1,
+    PacketAdmissionOriginV1, PacketAdmissionReceiptV1, PacketCompilationInputV1,
+    PacketCompilationPublicationV1, PacketContinuationSelectorV1, PacketParserCompletenessV1,
 };
 use codestory_contracts::evidence_address::{
     ByteRangeV1, EvidenceAnchorV1, LineRangeV1, ProjectRelativePath, SourceRangeV1, StableNodeId,
@@ -44,8 +45,46 @@ pub struct WitnessSeamPair {
     pub descriptors_sha256: String,
     pub control_input: PacketCompilationInputV1,
     pub addressed_input: PacketCompilationInputV1,
-    pub control: RepositoryDerivedCompilationV1,
-    pub addressed: RepositoryDerivedCompilationV1,
+    pub control: WitnessSeamOutput,
+    pub addressed: WitnessSeamOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WitnessSeamOutput {
+    pub publication: PacketCompilationPublicationV1,
+    pub answer_sufficiency: AnswerSufficiencyV1,
+    pub support: Vec<SupportUnitDto>,
+    pub continuation: Vec<PacketContinuationSelectorV1>,
+    pub gap: Option<WitnessOutputGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WitnessOutputGap {
+    SerializedPublicBudget,
+}
+
+fn bounded_output(
+    compiled: RepositoryDerivedCompilationV1,
+    publication: &PacketCompilationPublicationV1,
+) -> Result<WitnessSeamOutput> {
+    let mut output = WitnessSeamOutput {
+        publication: publication.clone(),
+        answer_sufficiency: AnswerSufficiencyV1::NotAsserted,
+        support: compiled.support,
+        continuation: compiled.continuation,
+        gap: None,
+    };
+    if serde_json::to_vec(&output)?.len() > PUBLIC_PACKET_SERIALIZED_MAX_BYTES {
+        output.support.clear();
+        output.continuation.clear();
+        output.gap = Some(WitnessOutputGap::SerializedPublicBudget);
+    }
+    ensure!(
+        serde_json::to_vec(&output)?.len() <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES,
+        "publication metadata exceeds the public packet budget"
+    );
+    Ok(output)
 }
 
 /// Preserve the existing lexical identities and order, including candidates
@@ -206,8 +245,8 @@ pub fn run_witness_seam(
         "frozen descriptor publication differs from the core/lexical pin"
     );
     ensure!(
-        !publication.project_id.is_empty(),
-        "missing logical project identity"
+        publication.project_id == codestory_workspace::project_identity_v3(project_root).project_id,
+        "publication belongs to another logical project"
     );
     ensure!(
         descriptors.len() <= 16,
@@ -404,8 +443,8 @@ pub fn run_witness_seam(
     }
     Ok(WitnessSeamPair {
         descriptors_sha256,
-        control: compile_repository_evidence(&control_input),
-        addressed: compile_repository_evidence(&addressed_input),
+        control: bounded_output(compile_repository_evidence(&control_input), publication)?,
+        addressed: bounded_output(compile_repository_evidence(&addressed_input), publication)?,
         control_input,
         addressed_input,
     })

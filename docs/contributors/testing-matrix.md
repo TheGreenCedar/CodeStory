@@ -107,6 +107,14 @@ preparation does not certify full installed-product readiness.
 Keep questions, independent annotations, descriptors, and receipts outside the
 repository. `scripts/codestory-witness-seam-evaluate.mjs` authenticates those
 inputs and requires every case and phrasing before producing an aggregate.
+Supply its explicit `--binary` with the frozen replay binary. Capture and replay
+must each have a successful, exact invocation and authenticated stdout, stderr,
+and output artifact. The native `validate-receipt` operation recomputes hydration
+and compilation against the prepared core/lexical and build identities; matching
+JSON hashes alone do not authenticate evidence. The complete public output,
+including publication and continuation metadata, fits 16 KiB or returns a typed
+`serialized_public_budget` gap. Detailed compiler inputs remain outside that
+public payload.
 Passing synthetic contracts does not pass the evidence-quality gate. Pool,
 graph, semantic, public-routing, and release changes remain gated separately.
 

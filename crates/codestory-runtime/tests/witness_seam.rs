@@ -114,7 +114,7 @@ fn witness_seam_changes_only_hydration_under_one_core_pin() {
         .unwrap();
     let pin = CoreReadSession::pin(&logical).unwrap();
     let publication = PacketCompilationPublicationV1 {
-        project_id: "fixture-project".into(),
+        project_id: codestory_workspace::project_identity_v3(root).project_id,
         core_generation_id: pin.identity().generation_id.clone(),
         retrieval_generation: None,
     };
@@ -182,6 +182,9 @@ fn witness_seam_changes_only_hydration_under_one_core_pin() {
         );
     }
     let mut wrong_publication = publication.clone();
+    wrong_publication.project_id = "another-project".into();
+    assert!(run_witness_seam(&pin, None, root, &wrong_publication, &descriptors).is_err());
+    wrong_publication = publication.clone();
     wrong_publication.core_generation_id.push_str("-other");
     assert!(run_witness_seam(&pin, None, root, &wrong_publication, &descriptors).is_err());
     let mut changed_charge = descriptors.clone();
@@ -209,6 +212,43 @@ fn witness_seam_changes_only_hydration_under_one_core_pin() {
         missing.addressed_input.admission_gaps
     );
     assert_eq!(missing.addressed_input.admissions.len(), 16);
+    let mut oversized = descriptors.clone();
+    for descriptor in &mut oversized {
+        descriptor
+            .admission
+            .stable_identity
+            .push_str(&"/long-path".repeat(200));
+        descriptor.path = None;
+        descriptor.anchor = None;
+        descriptor.content_digest = None;
+    }
+    let bounded = run_witness_seam(&pin, None, root, &publication, &oversized).unwrap();
+    for output in [bounded.control, bounded.addressed] {
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(value["gap"], "serialized_public_budget");
+        assert!(output.support.is_empty());
+        assert!(output.continuation.is_empty());
+        assert!(serde_json::to_vec(&output).unwrap().len() <= 16 * 1024);
+    }
+    let mut missing_node = descriptors.clone();
+    missing_node[0].admission.stable_identity = "node:999999".into();
+    let EvidenceAnchorV1::Match {
+        byte_range,
+        line_range,
+    } = missing_node[0].anchor.clone().unwrap()
+    else {
+        panic!("expected lexical anchor")
+    };
+    missing_node[0].anchor = Some(EvidenceAnchorV1::IndexedNode {
+        node_id: codestory_contracts::evidence_address::StableNodeId::new("node:999999").unwrap(),
+        source_range: codestory_contracts::evidence_address::SourceRangeV1 {
+            path: missing_node[0].path.clone().unwrap(),
+            byte_range,
+            line_range,
+            content_digest: missing_node[0].content_digest.clone().unwrap(),
+        },
+    });
+    assert!(run_witness_seam(&pin, None, root, &publication, &missing_node).is_err());
     std::fs::write(root.join("src/unit_0.rs"), "changed\n").unwrap();
     assert!(
         run_witness_seam(&pin, None, root, &publication, &descriptors).is_err(),

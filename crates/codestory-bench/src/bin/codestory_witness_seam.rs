@@ -1,5 +1,5 @@
-//! Deterministic replay of the frozen sixteen-candidate witness experiment.
-//! This binary never retrieves candidates, launches models, or decides a gate.
+//! Capture, replay and authenticate the frozen witness experiment. This hidden
+//! binary never launches models or decides an evidence-quality gate.
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -59,6 +59,17 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Recompute the deterministic receipt against the live pinned authorities.
+    ValidateReceipt {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        manifest_sha256: String,
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        receipt_sha256: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +99,7 @@ struct Prepared {
     lexical_coverage: codestory_retrieval::benchmark_support::LexicalCoverage,
     publication: PacketCompilationPublicationV1,
     core_pointer: codestory_contracts::core_publication::CorePublicationPointerV1,
+    build: serde_json::Value,
 }
 
 fn read_manifest(path: &Path, expected: &str) -> Result<Manifest> {
@@ -163,6 +175,21 @@ fn main() -> Result<()> {
             manifest_sha256,
             output,
         } => replay(&manifest, &manifest_sha256, &output),
+        Command::ValidateReceipt {
+            manifest,
+            manifest_sha256,
+            receipt,
+            receipt_sha256,
+        } => {
+            validate_receipt(&manifest, &manifest_sha256, &receipt, &receipt_sha256)?;
+            println!(
+                "{}",
+                json!({"contract": "codestory.witness-receipt-validation/v1",
+                "manifest_sha256": manifest_sha256, "receipt_sha256": receipt_sha256,
+                "build": build_identity()?})
+            );
+            Ok(())
+        }
     }
 }
 
@@ -222,6 +249,7 @@ fn prepare(project: &Path, output: &Path) -> Result<()> {
             retrieval_generation: Some(lexical_input_hash),
         },
         core_pointer: pin.pointer().clone(),
+        build: build_identity()?,
     };
     let path = output.join("prepared.json");
     write_receipt(&path, &serde_json::to_vec_pretty(&prepared)?)?;
@@ -248,6 +276,10 @@ fn capture(
     ensure!(
         prepared.contract == "codestory.witness-preparation/v1",
         "unexpected preparation contract"
+    );
+    ensure!(
+        prepared.build == build_identity()?,
+        "preparation belongs to another build"
     );
     let pin = CoreReadSession::pin(&prepared.storage_path)?;
     ensure!(
@@ -290,6 +322,7 @@ fn capture(
         capture: Some(json!({
             "question_sha256": format!("{:x}", Sha256::digest(question.as_bytes())),
             "query_ordinal": 0, "prepared_sha256": expected,
+            "prepared_path": prepared_path,
             "lexical_input_hash": prepared.lexical_input_hash,
             "lexical_coverage": prepared.lexical_coverage,
             "raw_hits_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&hits)?)),
@@ -307,8 +340,64 @@ fn capture(
 
 fn replay(manifest_path: &Path, expected: &str, output: &Path) -> Result<()> {
     ensure!(!output.exists(), "receipt already exists");
+    let receipt = compute_receipt(manifest_path, expected)?;
+    write_receipt(output, &serde_json::to_vec_pretty(&receipt)?)?;
+    println!("{}  {}", file_digest(output)?, output.display());
+    Ok(())
+}
+
+fn build_identity() -> Result<serde_json::Value> {
+    Ok(json!({
+        "source_commit": build_provenance::SOURCE_COMMIT.trim(),
+        "source_tree": build_provenance::SOURCE_TREE.trim(),
+        "profile": build_provenance::BUILD_PROFILE.trim(),
+        "rustc": build_provenance::RUSTC_VV.trim(),
+        "binary_sha256": file_digest(&std::env::current_exe()?)?,
+    }))
+}
+
+fn compute_receipt(manifest_path: &Path, expected: &str) -> Result<serde_json::Value> {
     let manifest = read_manifest(manifest_path, expected)?;
+    let capture = manifest
+        .capture
+        .as_ref()
+        .context("capture authority missing")?;
+    let preparation = Path::new(
+        capture["prepared_path"]
+            .as_str()
+            .context("preparation path missing")?,
+    );
+    let prepared_bytes = std::fs::read(preparation)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&prepared_bytes))
+            == capture["prepared_sha256"]
+                .as_str()
+                .context("preparation digest missing")?,
+        "preparation digest changed"
+    );
+    let prepared: Prepared = serde_json::from_slice(&prepared_bytes)?;
+    let build = build_identity()?;
+    ensure!(
+        prepared.contract == "codestory.witness-preparation/v1"
+            && prepared.build == build
+            && capture["build_commit"] == build["source_commit"]
+            && capture["binary_sha256"] == build["binary_sha256"],
+        "preparation, capture, and replay build identities differ"
+    );
+    ensure!(
+        manifest.project_root == prepared.project_root
+            && manifest.storage_path == prepared.storage_path
+            && manifest.lexical_root == prepared.lexical_root
+            && manifest.lexical_input_hash == prepared.lexical_input_hash
+            && manifest.publication == prepared.publication
+            && capture["lexical_input_hash"] == prepared.lexical_input_hash,
+        "manifest differs from its preparation authority"
+    );
     let pin = CoreReadSession::pin(&manifest.storage_path)?;
+    ensure!(
+        pin.pointer() == &prepared.core_pointer,
+        "prepared core pointer changed"
+    );
     let lexical = manifest_lexical_pin(&manifest)?;
     let pair = run_witness_seam(
         &pin,
@@ -317,35 +406,42 @@ fn replay(manifest_path: &Path, expected: &str, output: &Path) -> Result<()> {
         &manifest.publication,
         &manifest.descriptors,
     )?;
-    let receipt = json!({
+    Ok(json!({
         "contract": "codestory.witness-seam-receipt/v1",
         "case_id": manifest.case_id,
         "phrasing_id": manifest.phrasing_id,
         "manifest_sha256": expected,
         "descriptors_sha256": pair.descriptors_sha256,
         "core_pointer": pin.pointer(),
-        "build": {
-            "source_commit": build_provenance::SOURCE_COMMIT.trim(),
-            "source_tree": build_provenance::SOURCE_TREE.trim(),
-            "profile": build_provenance::BUILD_PROFILE.trim(),
-            "rustc": build_provenance::RUSTC_VV.trim(),
-            "binary_sha256": file_digest(&std::env::current_exe()?)?,
-        },
+        "build": build,
         "control": {
             "input": pair.control_input,
-            "support": pair.control.support,
-            "continuation": pair.control.continuation,
+            "output": pair.control,
         },
         "addressed": {
             "input": pair.addressed_input,
-            "support": pair.addressed.support,
-            "continuation": pair.addressed.continuation,
+            "output": pair.addressed,
         },
         "packet_decision": "not_evaluated",
-    });
-    let bytes = serde_json::to_vec_pretty(&receipt)?;
-    write_receipt(output, &bytes)?;
-    println!("{}  {}", file_digest(output)?, output.display());
+    }))
+}
+
+fn validate_receipt(
+    manifest: &Path,
+    manifest_sha256: &str,
+    receipt: &Path,
+    receipt_sha256: &str,
+) -> Result<()> {
+    let bytes = std::fs::read(receipt)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == receipt_sha256,
+        "receipt digest mismatch"
+    );
+    let observed: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        observed == compute_receipt(manifest, manifest_sha256)?,
+        "receipt differs from deterministic hydration and compilation"
+    );
     Ok(())
 }
 
@@ -470,6 +566,82 @@ mod tests {
                 .all(|source| source.source.contains("needle"))
         );
         assert!(!output.join("runtime/models").exists());
+        let manifest_digest = file_digest(&captured).unwrap();
+        let receipt = temp.path().join("receipt.json");
+        replay(&captured, &manifest_digest, &receipt).unwrap();
+        validate_receipt(
+            &captured,
+            &manifest_digest,
+            &receipt,
+            &file_digest(&receipt).unwrap(),
+        )
+        .unwrap();
+        let original = compute_receipt(&captured, &manifest_digest).unwrap();
+        // Rehashing altered evidence must not authenticate a different operation.
+        let mut mutations = Vec::new();
+        let mut changed = original.clone();
+        changed["addressed"]["output"]["support"] = json!([]);
+        mutations.push(changed);
+        let mut changed = original.clone();
+        changed["addressed"]["input"]["sources"][0]["source"] =
+            json!("unexposed fabricated source");
+        changed["addressed"]["output"]["support"] = json!([]);
+        mutations.push(changed);
+        let mut changed = original.clone();
+        changed["addressed"]["input"]["sources"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        changed["addressed"]["input"]["admission_gaps"] = json!([{
+            "kind": "source_budget_exceeded", "stable_identity": original["addressed"]["input"]["admissions"][0]["stable_identity"],
+            "exact_selector_ordinal": null,
+        }]);
+        mutations.push(changed);
+        let mut changed = original.clone();
+        changed["addressed"]["output"]["support"] = json!([{
+            "kind": "symbol_location", "path": "absent.rs", "symbol": "invented",
+        }]);
+        mutations.push(changed);
+        let mut changed = original.clone();
+        changed["addressed"]["output"]["continuation"] = json!(["x".repeat(17000)]);
+        mutations.push(changed);
+        for (index, changed) in mutations.into_iter().enumerate() {
+            let path = temp.path().join(format!("altered-{index}.json"));
+            write_receipt(&path, &serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                validate_receipt(
+                    &captured,
+                    &manifest_digest,
+                    &path,
+                    &file_digest(&path).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let input: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&captured).unwrap()).unwrap();
+        for (index, pointer) in [
+            "/publication/project_id",
+            "/publication/core_generation_id",
+            "/publication/retrieval_generation",
+            "/lexical_input_hash",
+            "/capture/lexical_input_hash",
+            "/capture/build_commit",
+            "/capture/binary_sha256",
+            "/capture/prepared_sha256",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut changed = input.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("wrong-authority");
+            let path = temp.path().join(format!("authority-{index}.json"));
+            write_receipt(&path, &serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                compute_receipt(&path, &file_digest(&path).unwrap()).is_err(),
+                "accepted {pointer}"
+            );
+        }
         for count in [0, 1, 15] {
             let pair = run_witness_seam(
                 &pin,
@@ -563,6 +735,44 @@ mod tests {
             pair.addressed_input.sources[0]
                 .source
                 .contains("needle_document")
+        );
+        let manifest_digest = file_digest(&captured).unwrap();
+        let mut false_completeness = compute_receipt(&captured, &manifest_digest).unwrap();
+        let mut false_header = false_completeness.clone();
+        false_header["addressed"] = false_header["control"].clone();
+        assert_ne!(
+            false_header, false_completeness,
+            "the lexical control must expose a different window"
+        );
+        let header_receipt = temp.path().join("false-header.json");
+        write_receipt(&header_receipt, &serde_json::to_vec(&false_header).unwrap()).unwrap();
+        assert!(
+            validate_receipt(
+                &captured,
+                &manifest_digest,
+                &header_receipt,
+                &file_digest(&header_receipt).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            false_completeness["addressed"]["input"]["sources"][0]["parser_completeness"],
+            "unknown"
+        );
+        for arm in ["control", "addressed"] {
+            false_completeness[arm]["input"]["sources"][0]["parser_completeness"] =
+                json!("complete");
+        }
+        let altered = temp.path().join("false-completeness.json");
+        write_receipt(&altered, &serde_json::to_vec(&false_completeness).unwrap()).unwrap();
+        assert!(
+            validate_receipt(
+                &captured,
+                &manifest_digest,
+                &altered,
+                &file_digest(&altered).unwrap()
+            )
+            .is_err()
         );
         let mut wrong = read_manifest(&captured, &file_digest(&captured).unwrap()).unwrap();
         wrong.lexical_input_hash = "0".repeat(64);

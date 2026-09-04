@@ -84,7 +84,12 @@ export function scoreWitnessArm(arm, annotation, sources, { headerControl = fals
   const witnesses = new Map();
   let exposed = 0, relevant = 0;
   assert.ok(arm.support.length <= 16, "public row limit exceeded");
-  assert.ok(Buffer.byteLength(JSON.stringify(arm.support)) <= 16 * 1024, "public support budget exceeded");
+  assert.ok(Buffer.byteLength(JSON.stringify(arm)) <= 16 * 1024, "serialized public budget exceeded");
+  if (arm.gap != null) {
+    assert.equal(arm.gap, "serialized_public_budget", "unknown public gap");
+    assert.deepEqual(arm.support, []);
+    assert.deepEqual(arm.continuation, []);
+  }
   for (const row of arm.support) {
     assert.ok(["source_range", "symbol_location"].includes(row.kind), "Phase 1A cannot emit relation or claim rows");
     if (row.kind !== "source_range") continue;
