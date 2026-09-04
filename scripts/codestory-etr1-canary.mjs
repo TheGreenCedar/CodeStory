@@ -1,83 +1,90 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, readFile, writeFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
-import { maximizeCoveredAtoms, scoreOrder, selectSuccessors, sha256,
-  validateVector } from "./lib/etr1-evidence.mjs";
+import { randomUUID } from "node:crypto";
+import { executeRecorded, fileBinding } from "./lib/etr1-execution.mjs";
+import { validateEtr1 } from "./codestory-etr1-validate.mjs";
+import { evaluateEtr1 } from "./codestory-etr1-evaluate.mjs";
 
 async function main() {
   const { values } = parseArgs({ options: { diagnostic: { type: "string" },
-    "state-root": { type: "string" }, "output-dir": { type: "string" } } });
-  for (const name of ["diagnostic", "state-root", "output-dir"])
+    runner: { type: "string" }, "output-dir": { type: "string" } } });
+  for (const name of ["diagnostic", "runner", "output-dir"])
     assert.ok(values[name] && path.isAbsolute(values[name]), `missing absolute --${name}`);
   await mkdir(values["output-dir"], { mode: 0o700 });
-  const documents = [
-    { id: "seed", text: "pub fn process() { dispatch(); }\n" },
-    { id: "target", text: "fn dispatch() { persist(); }\n" },
-    { id: "noise-a", text: "fn render_banner() { paint(); }\n" },
-    { id: "noise-b", text: "fn parse_flags() { validate(); }\n" },
-  ];
-  const question = "How does process reach persistence?";
-  const input = { contract: "codestory.embedding-diagnostic-input/v1", records: [
-    ...documents.map(({ id, text }) => ({ id, purpose: "document", text })),
-    { id: "control", purpose: "query", text: question },
-    { id: "candidate", purpose: "query", text: `${question}\n\n${documents[0].text}` },
-  ] };
-  const inputBytes = Buffer.from(JSON.stringify(input)), inputPath = path.join(values["output-dir"], "input.json");
-  await writeFile(inputPath, inputBytes, { flag: "wx", mode: 0o600 });
-  const vectorPath = path.join(values["state-root"], "canary-vectors.json");
-  const execution = spawnSync(values.diagnostic, ["--input", inputPath, "--input-sha256", sha256(inputBytes),
-    "--state-root", values["state-root"], "--output", vectorPath],
-  { encoding: "utf8", timeout: 180_000, maxBuffer: 4 * 1024 * 1024, env: process.env });
-  assert.equal(execution.error, undefined, `embedding diagnostic failed to launch: ${execution.error}`);
-  assert.equal(execution.status, 0, `embedding diagnostic failed: ${execution.stderr}`);
-  const vectorBytes = await readFile(vectorPath), artifact = JSON.parse(vectorBytes);
-  assert.equal(artifact.contract, "codestory.embedding-diagnostic-output/v1");
-  assert.equal(artifact.input_sha256, sha256(inputBytes));
-  assert.equal(artifact.records.length, input.records.length);
-  const vectors = new Map(artifact.records.map((record, index) => {
-    assert.equal(record.id, input.records[index].id);
-    assert.equal(record.text_sha256, sha256(input.records[index].text));
-    validateVector(record.vector, `canary vector ${record.id}`);
-    return [record.id, record.vector];
-  }));
-  const dot = (left, right) => left.reduce((sum, value, index) =>
-    Math.fround(sum + Math.fround(Math.fround(value) * Math.fround(right[index]))), 0);
-  const frontiers = {};
-  for (const arm of ["control", "candidate"]) {
-    const scores = documents.map(({ id }) => dot(vectors.get(arm), vectors.get(id)));
-    const successors = selectSuccessors(scoreOrder(documents.map(({ id }) => id), scores),
-      new Set(["seed"]), new Set());
-    frontiers[arm] = { scores, successors, legal_pool: ["seed", ...successors] };
-  }
-  const frontierBytes = Buffer.from(JSON.stringify(frontiers));
-  await writeFile(path.join(values["output-dir"], "frontiers.json"), frontierBytes,
-    { flag: "wx", mode: 0o600 });
-  // Synthetic truth is constructed only after both frontier outputs are frozen.
-  const costs = new Map(documents.map(({ id, text }) => [id, Buffer.byteLength(text) + 128]));
-  const evaluated = Object.fromEntries(Object.entries(frontiers).map(([arm, frontier]) => {
-    const requirement = frontier.legal_pool.includes("target") ? [["target"]] : [null];
-    return [arm, maximizeCoveredAtoms(requirement, costs, 256)];
-  }));
-  const events = await readFile(path.join(values["state-root"], "ipc",
-    `${process.env.CODESTORY_EMBED_QUALIFICATION_NONCE}.events.jsonl`));
-  const completed = events.toString("utf8").trimEnd().split("\n").map(JSON.parse)
-    .filter((event) => event.action === "completed_tokens");
-  assert.ok(completed.length >= 2 && completed.every((event) => Number(event.details.completed_tokens) > 0),
-    "canary token completion evidence missing");
-  const receipt = { contract: "codestory.etr1-synthetic-canary/v1", experiment_status: "valid",
-    packet_decision: "not_evaluated", input_sha256: sha256(inputBytes),
-    vectors_sha256: sha256(vectorBytes), frontiers_sha256: sha256(frontierBytes),
-    diagnostic_binary_sha256: sha256(await readFile(values.diagnostic)),
-    qualification_events_sha256: sha256(events), completed_token_events: completed.length,
-    vector_artifact_bytes: (await stat(vectorPath)).size, evaluated };
-  const receiptBytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
-  const output = path.join(values["output-dir"], "receipt.json");
-  await writeFile(output, receiptBytes, { flag: "wx", mode: 0o600 });
-  console.log(`${sha256(receiptBytes)}  ${output}`);
+  const root = await realpath(values["output-dir"]);
+  const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const project = path.join(root, "repository"), prepared = path.join(root, "prepared");
+  await mkdir(project, { mode: 0o700 });
+  const source = Array.from({ length: 32 }, (_, i) =>
+    `fn commonneedle_${i}() { commonneedle(); ${i === 0 ? "raremarker();" : ""} }\n`).join("");
+  await writeFile(path.join(project, "canary.rs"), source, { flag: "wx", mode: 0o600 });
+  const git = (...args) => execFileSync("git", ["-C", project, "-c", "core.hooksPath=/dev/null", ...args],
+    { encoding: "utf8", stdio: "pipe" });
+  git("init", "--quiet"); git("add", "canary.rs");
+  git("-c", "user.name=ETR canary", "-c", "user.email=canary@invalid.local", "-c", "commit.gpgsign=false",
+    "commit", "--quiet", "-m", "freeze synthetic source");
+  execFileSync(values.runner, ["prepare-canary", "--project-root", project, "--output-dir", prepared],
+    { encoding: "utf8", stdio: "pipe", timeout: 60_000 });
+  const preparationPath = path.join(prepared, "preparation.json");
+  const preparation = JSON.parse(await readFile(preparationPath, "utf8"));
+  const preparationBinding = await fileBinding(preparationPath);
+  const makeState = async (name) => {
+    const state = path.join(root, name), ipc = path.join(state, "ipc"), cache = path.join(state, "cache");
+    await mkdir(state, { mode: 0o700 });
+    await mkdir(ipc, { mode: 0o700 }); await mkdir(cache, { mode: 0o700 });
+    const nonce = `etr1-canary-${randomUUID()}`;
+    return { state, events: path.join(ipc, `${nonce}.events.jsonl`),
+      env: { ...process.env, CODESTORY_CACHE_ROOT: cache, CODESTORY_EMBED_ALLOW_CPU: "false",
+        CODESTORY_EMBED_QUALIFICATION_DIR: ipc, CODESTORY_EMBED_QUALIFICATION_NONCE: nonce } };
+  };
+  const documentState = await makeState("documents"), vectorPath = path.join(documentState.state, "vectors.json");
+  const documents = await executeRecorded({ role: "documents", executable: values.diagnostic,
+    args: ["--input", preparation.embedding_input.path, "--input-sha256", preparation.embedding_input.sha256,
+      "--state-root", documentState.state, "--output", vectorPath],
+    inputs: [preparation.embedding_input.path], outputPaths: [vectorPath], eventsPath: documentState.events,
+    directory: path.join(root, "document-execution"), sourceRoot, env: documentState.env });
+  assert.equal(documents.receipt.experiment_status, "completed", "canary document execution failed");
+  const vectors = await fileBinding(vectorPath), queryState = await makeState("queries");
+  const runDirectory = path.join(root, "run"), runPath = path.join(runDirectory, "run.json");
+  const cancelFile = path.join(root, "cancel");
+  const execution = await executeRecorded({ role: "paired_run", executable: values.runner,
+    args: ["run", "--prepared", preparationPath, "--prepared-sha256", preparationBinding.sha256,
+      "--fragment-vectors", vectorPath, "--fragment-vectors-sha256", vectors.sha256,
+      "--document-execution", documents.binding.path, "--document-execution-sha256", documents.binding.sha256,
+      "--state-root", queryState.state, "--output-dir", runDirectory, "--cancel-file", cancelFile],
+    inputs: [preparationPath, vectorPath, documents.binding.path], outputPaths: [runPath],
+    eventsPath: queryState.events, directory: path.join(root, "run-execution"), sourceRoot,
+    env: queryState.env, cancelFile });
+  assert.equal(execution.receipt.experiment_status, "completed", "canary paired execution failed");
+  const runBinding = await fileBinding(runPath);
+  const validated = await validateEtr1({ runBinding, sourceRoot, executionBinding: execution.binding, allowCanary: true });
+  const validationPath = path.join(root, "validation.json");
+  await writeFile(validationPath, JSON.stringify({ contract: "codestory.etr1-validation/v1",
+    authority: "synthetic_canary_only", experiment_status: "valid", decision: "not_evaluated",
+    annotation_access: "not_accessed", run: runBinding, execution: execution.binding,
+    binary_sha256: validated.run.build.binary_sha256 }), { flag: "wx", mode: 0o600 });
+  // Synthetic truth enters only after the real paired run and validator finish.
+  const first = preparation.fragments[0];
+  const annotationsPath = path.join(root, "annotations.json");
+  const annotations = { authority: "synthetic_canary_only", cases: preparation.wordings.map((row) => ({
+    case_id: row.case_id, acceptable_sets: [{ set_id: "first-fragment", required_relation_atoms: [],
+      required_source_atoms: [{ atom_id: "first", source_range: { path: first.path,
+        content_digest: first.content_digest, byte_range: first.byte_range, line_range: first.line_range } }] }] })) };
+  await writeFile(annotationsPath, JSON.stringify(annotations), { flag: "wx", mode: 0o600 });
+  const validation = await fileBinding(validationPath), annotationBinding = await fileBinding(annotationsPath);
+  const evaluated = await evaluateEtr1({ validationPath, validationSha256: validation.sha256,
+    annotationsPath, annotationsSha256: annotationBinding.sha256, sourceRoot, allowCanary: true });
+  const receiptPath = path.join(root, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify({ contract: "codestory.etr1-synthetic-canary/v2",
+    authority: "synthetic_canary_only", experiment_status: "valid", packet_decision: "not_evaluated",
+    preparation: preparationBinding, documents: documents.binding, execution: execution.binding,
+    validation, evaluated }), { flag: "wx", mode: 0o600 });
+  console.log(JSON.stringify(await fileBinding(receiptPath)));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
-  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+  main().catch((error) => { console.error(error.stack); process.exitCode = 1; });

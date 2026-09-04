@@ -181,7 +181,9 @@ pub struct BatchReceiptV1 {
     pub input_sha256: Vec<String>,
     pub wall_ns: u64,
     pub completed_tokens: u64,
-    pub qualification_event_sequence: u64,
+    pub qualification_native_completion_sequence: u64,
+    pub qualification_server_event_sequence: u64,
+    pub qualification_request_id_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -203,6 +205,7 @@ pub struct ArmTimingV1 {
     pub descriptor_mapping_ns: u64,
     pub remaining_source_authentication_ns: u64,
     pub prepared_state_ns: u64,
+    pub unaccounted_ns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +249,7 @@ pub struct Etr1RunManifestV1 {
     pub build: BuildIdentity,
     pub preparation: FileBinding,
     pub fragment_vectors: FileBinding,
+    pub document_execution: FileBinding,
     pub method_sha256: String,
     pub annotation_access: String,
     pub vector_artifact_loaded_before_timing: bool,

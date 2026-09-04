@@ -201,7 +201,7 @@ fn render_snippet(source: &str, start_line: u32) -> String {
 }
 
 fn authenticate_units(
-    repository: &SelectedRepository,
+    project_root: &Path,
     project_id: &str,
     units: &[LineUnit],
 ) -> Result<Vec<FrozenFragmentV1>> {
@@ -210,7 +210,7 @@ fn authenticate_units(
     for unit in units {
         ensure!(unit.available, "frozen_fragment_unavailable");
         if !sources.contains_key(&unit.path) {
-            let path = confined_source_path(&repository.project_root, &unit.path)?;
+            let path = confined_source_path(project_root, &unit.path)?;
             let bytes = std::fs::read(path)?;
             ensure!(
                 sha256(&bytes) == unit.content_digest,
@@ -327,6 +327,10 @@ fn method_freeze() -> Value {
         "query": {"control":"raw question", "candidate":"raw question + newline delimiter + seed source", "truncation":"none; complete trailing seed lines may be removed only after a typed model-limit rejection"},
         "graph": false, "bge": false, "symbol_documents": false, "host_queries": false,
         "packet_decision": "not_evaluated"
+        ,"execution": {"paired_deadline_seconds":1800,"canary":"same_rust_runner_and_authoritative_validator",
+            "timing":"enclosing_request_wall_and_exclusive_phases_with_explicit_unaccounted_time",
+            "provenance":"independent_pre_dispatch_request_and_post_execution_result_bindings",
+            "native_completion_identity":"native_completion_sequence,server_event_sequence,request_id"}
     })
 }
 
@@ -431,7 +435,8 @@ pub fn execute(evidence_root: &Path, corpus_root: &Path, output: &Path) -> Resul
             .to_string();
         let units_binding = external_binding(&selected_repository.units.line)?;
         let units: Vec<LineUnit> = read_bound_json(&units_binding)?;
-        let repo_fragments = authenticate_units(selected_repository, &project_id, &units)?;
+        let repo_fragments =
+            authenticate_units(&selected_repository.project_root, &project_id, &units)?;
         let score_order_sha256 = sha256(serde_json::to_vec(
             &repo_fragments
                 .iter()
@@ -547,6 +552,32 @@ pub fn execute(evidence_root: &Path, corpus_root: &Path, output: &Path) -> Resul
         fixed_inputs.insert(name.to_string(), binding);
     }
 
+    finish_preparation(
+        output,
+        build,
+        fixed_inputs,
+        DeclaredBinding {
+            path: corpus_root.join("reconciled.json"),
+            sha256: ANNOTATIONS_SHA256.into(),
+        },
+        repositories,
+        fragments,
+        wordings,
+        "visible_development_frontier_only",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_preparation(
+    output: &Path,
+    build: BuildIdentity,
+    fixed_inputs: BTreeMap<String, FileBinding>,
+    annotations: DeclaredBinding,
+    repositories: Vec<PreparedRepositoryV1>,
+    fragments: Vec<FrozenFragmentV1>,
+    wordings: Vec<PreparedWordingV1>,
+    authority: &str,
+) -> Result<()> {
     let method_bytes = serialize_pretty(&method_freeze())?;
     let embedding_input = EmbeddingDiagnosticInput {
         contract: "codestory.embedding-diagnostic-input/v1".into(),
@@ -574,16 +605,13 @@ pub fn execute(evidence_root: &Path, corpus_root: &Path, output: &Path) -> Resul
     };
     let preparation = Etr1PreparationV1 {
         contract: "codestory.etr1-preparation/v1".into(),
-        authority: "visible_development_frontier_only".into(),
+        authority: authority.into(),
         packet_decision: "not_evaluated".into(),
         parent_head: PARENT_HEAD.into(),
         build,
         method,
         fixed_inputs,
-        annotations: DeclaredBinding {
-            path: corpus_root.join("reconciled.json"),
-            sha256: ANNOTATIONS_SHA256.into(),
-        },
+        annotations,
         model_sha256: MODEL_SHA256.into(),
         tokenizer_sha256: TOKENIZER_SHA256.into(),
         embedding_input: embedding_binding,
@@ -612,6 +640,113 @@ pub fn execute(evidence_root: &Path, corpus_root: &Path, output: &Path) -> Resul
         preparation.embedding_input.path.display()
     );
     Ok(())
+}
+
+/// Only fixture construction differs from corpus preparation. Fragment
+/// authentication, BM25, publication, encoding, and the paired runner are shared.
+pub fn execute_canary(project_root: &Path, output: &Path) -> Result<()> {
+    ensure!(
+        project_root.is_absolute() && output.is_absolute(),
+        "canary_paths_must_be_absolute"
+    );
+    let source = std::fs::read_to_string(project_root.join("canary.rs"))?;
+    let digest = sha256(source.as_bytes());
+    let mut offset = 0;
+    let units = source
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let start = offset;
+            offset += line.len();
+            LineUnit {
+                start_line: index as u32 + 1,
+                end_line: index as u32 + 1,
+                byte_range: ByteRangeV1 {
+                    start: start as u64,
+                    end: offset as u64,
+                },
+                content: line.into(),
+                available: true,
+                snippet: render_snippet(line, index as u32 + 1),
+                path: "canary.rs".into(),
+                content_digest: digest.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        units.len() == 32 && units.iter().all(|unit| unit.content.len() <= 512),
+        "canary_fixture_shape_changed"
+    );
+    let fragments = authenticate_units(project_root, "etr1-synthetic-canary", &units)?;
+    let fragment_ids = fragments
+        .iter()
+        .map(|fragment| fragment.fragment_id.clone())
+        .collect::<Vec<_>>();
+    let publication =
+        json!({"project_id":"etr1-synthetic-canary", "source_commit":git_head(project_root)?});
+    let empty = json!({"publication":publication,"answer_sufficiency":"not_asserted","support":[],"continuation":[]});
+    let repository = PreparedRepositoryV1 {
+        repository_id: "canary".into(),
+        project_id: "etr1-synthetic-canary".into(),
+        commit: git_head(project_root)?,
+        local_root: project_root.into(),
+        publication,
+        score_order_sha256: sha256(serde_json::to_vec(&fragment_ids)?),
+        fragment_ids,
+        base_serialized_bytes: serde_json::to_vec(&empty)?.len() as u32,
+    };
+    let source_binding = bind_file(&project_root.join("canary.rs"), Some(&digest))?;
+    let lexical = Etr1LexicalIndex::new(fragments.iter().map(|fragment| fragment.source.as_str()))?;
+    let mut wordings = Vec::new();
+    for (index, query) in ["commonneedle", "raremarker", "absentmarker"]
+        .iter()
+        .enumerate()
+    {
+        let (terms, matches) = lexical.search(query)?;
+        let expected_seeds = [16, 1, 0][index];
+        let seeds = natural_seed_prefix(&matches)
+            .iter()
+            .map(|item| repository.fragment_ids[item.rowid - 1].clone())
+            .collect::<Vec<_>>();
+        ensure!(
+            seeds.len() == expected_seeds,
+            "canary_bm25_membership_changed"
+        );
+        wordings.push(PreparedWordingV1 {
+            case_id: format!("canary-{index}"),
+            phrasing_id: "original".into(),
+            repository_id: "canary".into(),
+            group: "synthetic".into(),
+            question: (*query).into(),
+            question_sha256: sha256(query.as_bytes()),
+            membership: source_binding.clone(),
+            terms,
+            bm25_match_count: matches.len() as u32,
+            bm25_matches_sha256: sha256(serde_json::to_vec(
+                &matches
+                    .iter()
+                    .map(|item| MembershipMatch {
+                        rowid: item.rowid,
+                        score: item.score,
+                    })
+                    .collect::<Vec<_>>(),
+            )?),
+            seed_fragment_ids: seeds,
+        });
+    }
+    finish_preparation(
+        output,
+        build_identity()?,
+        BTreeMap::from([("synthetic_source".into(), source_binding)]),
+        DeclaredBinding {
+            path: output.join("synthetic-annotations-unopened.json"),
+            sha256: "0".repeat(64),
+        },
+        vec![repository],
+        fragments,
+        wordings,
+        "synthetic_canary_only",
+    )
 }
 
 #[cfg(test)]

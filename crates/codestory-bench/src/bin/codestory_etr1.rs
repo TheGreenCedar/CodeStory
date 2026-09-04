@@ -8,6 +8,8 @@ use std::path::PathBuf;
 mod build_provenance;
 #[path = "codestory_etr1/contract.rs"]
 mod contract;
+#[path = "codestory_etr1/control.rs"]
+mod control;
 #[path = "codestory_etr1/prepare.rs"]
 mod prepare;
 #[path = "codestory_etr1/run.rs"]
@@ -22,6 +24,13 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare the fixed synthetic canary, never a corpus experiment.
+    PrepareCanary {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     /// Authenticate the frozen corpus, rebuild BM25 memberships, and emit exact
     /// fragment documents for the existing embedding diagnostic.
     Prepare {
@@ -35,6 +44,12 @@ enum Command {
     /// Build paired unconditioned and source-conditioned frontiers from a
     /// previously authenticated preparation and exact fragment vectors.
     Run {
+        #[arg(long)]
+        document_execution: PathBuf,
+        #[arg(long)]
+        document_execution_sha256: String,
+        #[arg(long)]
+        cancel_file: PathBuf,
         #[arg(long)]
         prepared: PathBuf,
         #[arg(long)]
@@ -60,12 +75,19 @@ fn main() -> Result<()> {
     }
     let args = Args::parse();
     match args.command {
+        Command::PrepareCanary {
+            project_root,
+            output_dir,
+        } => prepare::execute_canary(&project_root, &output_dir),
         Command::Prepare {
             evidence_root,
             corpus_root,
             output_dir,
         } => prepare::execute(&evidence_root, &corpus_root, &output_dir),
         Command::Run {
+            document_execution,
+            document_execution_sha256,
+            cancel_file,
             prepared,
             prepared_sha256,
             fragment_vectors,
@@ -79,6 +101,9 @@ fn main() -> Result<()> {
             &fragment_vectors_sha256,
             &state_root,
             &output_dir,
+            &cancel_file,
+            &document_execution,
+            &document_execution_sha256,
         ),
     }
 }

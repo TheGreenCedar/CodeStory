@@ -115,50 +115,46 @@ export function gateTwo(cases, control, candidate, candidateGateOne) {
 
 export function decision(controlGate, candidateGate, conditioningGate) {
   if (!controlGate && !candidateGate) return { frontier: null,
-    decision: "stop_automatic_packet_compilation", reason: "neither_arm_sufficient" };
+    decision: "no_frontier_selected", reason: "neither_arm_sufficient" };
   if (controlGate && !conditioningGate) return { frontier: "control",
-    decision: "freeze_unconditioned_frontier_for_selector_experiment",
+    decision: "unconditioned_frontier_selected",
     reason: candidateGate ? "conditioning_lacks_material_value" : "control_alone_sufficient" };
   if (candidateGate && conditioningGate) return { frontier: "candidate",
-    decision: "freeze_conditioned_frontier_for_selector_experiment",
+    decision: "conditioned_frontier_selected",
     reason: controlGate ? "conditioning_materially_better" : "conditioning_only_adequate_frontier" };
-  return { frontier: null, decision: "stop_automatic_packet_compilation",
+  return { frontier: null, decision: "no_frontier_selected",
     reason: "only_conditioned_arm_sufficient_without_material_conditioning_value" };
 }
 
 export async function evaluateEtr1({ validationPath, validationSha256, annotationsPath,
-  annotationsSha256, oraclePath, oracleSha256, sourceRoot }) {
+  annotationsSha256, oraclePath, oracleSha256, sourceRoot, allowCanary = false }) {
   const { value: validation } = await readBound(validationPath, validationSha256);
   assert.equal(validation.contract, "codestory.etr1-validation/v1");
   assert.equal(validation.experiment_status, "valid", "validator did not authorize annotation access");
   assert.equal(validation.decision, "not_evaluated");
   assert.equal(validation.annotation_access, "not_accessed");
   const validated = await validateEtr1({ runBinding: validation.run,
-    runPath: validation.run.path, sourceRoot });
+    runPath: validation.run.path, sourceRoot, executionBinding: validation.execution, allowCanary });
   assert.equal(validated.run.build.binary_sha256, validation.binary_sha256,
     "validation receipt no longer binds the run binary");
   // This is the first annotation read in the authoritative path.
   const { value: annotations } = await readBound(annotationsPath, annotationsSha256);
+  const canary = validated.run.authority === "synthetic_canary_only";
+  if (canary) {
+    assert.equal(annotations.authority, "synthetic_canary_only");
+    const rows = scoreRows(validated, annotations);
+    assert.deepEqual(rows.map((row) => [row.control.recall, row.candidate.recall]), [[1, 1], [1, 1], [0, 0]],
+      "synthetic oracle output changed");
+    return { contract: "codestory.etr1-evaluation/v1", authority: "synthetic_canary_only",
+      experiment_status: "valid", decision: "not_evaluated", packet_decision: "not_evaluated", rows };
+  }
   assert.equal(annotations.authority, "visible_development_only");
   assert.equal(annotations.questions_sha256,
     validated.preparation.fixed_inputs.questions.sha256, "annotation question binding changed");
   const { value: oracle } = await readBound(oraclePath, oracleSha256);
   const oracle_reproduction = await reproduceOracleFixtures({ oracle,
     preparation: validated.preparation, annotations });
-  const annotationByCase = new Map(annotations.cases.map((value) => [value.case_id, value]));
-  const repositoryById = new Map(validated.preparation.repositories
-    .map((value) => [value.repository_id, value]));
-  const fragmentById = new Map(validated.preparation.fragments.map((value) => [value.fragment_id, value]));
-  const scoredRows = validated.rows.map((row) => {
-    const annotation = annotationByCase.get(row.case_id), repository = repositoryById.get(row.repository_id);
-    assert.ok(annotation && repository, "evaluation binding missing");
-    const repositoryFragments = repository.fragment_ids.map((id) => fragmentById.get(id));
-    const score = (name) => ({ ...evaluateArm(annotation, repositoryFragments,
-      row[name].legally_selectable_pool, repository.base_serialized_bytes),
-    prepared_state_ns: row[name].timing.prepared_state_ns });
-    return { case_id: row.case_id, phrasing_id: row.phrasing_id, group: row.group,
-      control: score("control"), candidate: score("candidate") };
-  });
+  const scoredRows = scoreRows(validated, annotations);
   const cases = buildCases(scoredRows), control = aggregateArm(cases, "control"),
     candidate = aggregateArm(cases, "candidate"), controlGate = gateOne(control),
     candidateGate = gateOne(candidate), conditioning = gateTwo(cases, control, candidate, candidateGate.pass);
@@ -181,6 +177,22 @@ export async function evaluateEtr1({ validationPath, validationSha256, annotatio
     gates: { control_frontier_sufficiency: controlGate,
       candidate_frontier_sufficiency: candidateGate, conditioning_value: conditioning,
       frontier_construction_latency: latency }, selected, cases, rows: scoredRows };
+}
+
+function scoreRows(validated, annotations) {
+  const annotationByCase = new Map(annotations.cases.map((value) => [value.case_id, value]));
+  const repositoryById = new Map(validated.preparation.repositories.map((value) => [value.repository_id, value]));
+  const fragmentById = new Map(validated.preparation.fragments.map((value) => [value.fragment_id, value]));
+  return validated.rows.map((row) => {
+    const annotation = annotationByCase.get(row.case_id), repository = repositoryById.get(row.repository_id);
+    assert.ok(annotation && repository, "evaluation binding missing");
+    const fragments = repository.fragment_ids.map((id) => fragmentById.get(id));
+    const score = (name) => ({ ...evaluateArm(annotation, fragments,
+      row[name].legally_selectable_pool, repository.base_serialized_bytes),
+      prepared_state_ns: row[name].timing.prepared_state_ns });
+    return { case_id: row.case_id, phrasing_id: row.phrasing_id, group: row.group,
+      control: score("control"), candidate: score("candidate") };
+  });
 }
 
 async function main() {

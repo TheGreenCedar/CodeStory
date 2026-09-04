@@ -1,4 +1,5 @@
 use super::contract::*;
+use super::control::RunControl;
 use anyhow::{Context, Result, ensure};
 use codestory_retrieval::benchmark_support::Etr1LexicalIndex;
 use codestory_retrieval::{
@@ -9,7 +10,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const RUN_CONTRACT: &str = "codestory.etr1-run/v1";
 const ROW_CONTRACT: &str = "codestory.etr1-wording/v1";
@@ -346,59 +347,103 @@ fn read_completed_events(path: &Path) -> Result<Vec<QualificationEvent>> {
         "qualification_event_log_unterminated"
     );
     let mut events = Vec::new();
-    let mut previous = None;
+    let mut previous_native: Option<u64> = None;
+    let mut previous_server: Option<u64> = None;
+    let mut request_ids = HashSet::new();
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let event: QualificationEvent = serde_json::from_slice(line)?;
         ensure!(
-            event.schema_version == 1 && previous.is_none_or(|previous| event.sequence > previous),
-            "qualification_event_sequence_invalid"
+            event.schema_version == 1
+                && event.sequence == 0
+                && event.action == "completed_tokens"
+                && event.status == "completed"
+                && event.server_event_sequence > 0
+                && previous_server.is_none_or(|previous| event.server_event_sequence > previous)
+                && event.clock.is_object()
+                && event.snapshot.is_none(),
+            "qualification_token_event_invalid"
         );
-        previous = Some(event.sequence);
-        if event.action == "completed_tokens" {
-            ensure!(
-                event.status == "completed"
-                    && event.server_event_sequence > 0
-                    && event.clock.is_object()
-                    && event.snapshot.is_none(),
-                "qualification_token_event_invalid"
-            );
-            events.push(event);
-        }
+        let details = event
+            .details
+            .as_ref()
+            .context("qualification_token_details_missing")?;
+        let request_id = details
+            .get("request_id")
+            .filter(|value| !value.is_empty())
+            .context("qualification_token_request_id_missing")?;
+        let native_sequence = details
+            .get("native_completion_sequence")
+            .context("qualification_native_completion_sequence_missing")?
+            .parse::<u64>()?;
+        ensure!(
+            native_sequence > 0
+                && previous_native
+                    .is_none_or(|previous| { previous.checked_add(1) == Some(native_sequence) })
+                && request_ids.insert(request_id.clone()),
+            "qualification_native_completion_identity_invalid"
+        );
+        ensure!(
+            details
+                .get("completed_tokens")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0),
+            "qualification_completed_tokens_invalid"
+        );
+        previous_native = Some(native_sequence);
+        previous_server = Some(event.server_event_sequence);
+        events.push(event);
     }
+    ensure!(
+        !events.is_empty(),
+        "qualification_completed_event_log_empty"
+    );
     Ok(events)
 }
 
-fn consume_completed_event(path: &Path, cursor: &mut EventCursor) -> Result<(u64, u64)> {
+fn completed_event_identity(event: &QualificationEvent) -> Result<(u64, u64, u64, String)> {
+    let details = event
+        .details
+        .as_ref()
+        .context("qualification_token_details_missing")?;
+    let request_id = details
+        .get("request_id")
+        .filter(|value| !value.is_empty())
+        .context("qualification_token_request_id_missing")?;
+    let native_sequence = details
+        .get("native_completion_sequence")
+        .context("qualification_native_completion_sequence_missing")?
+        .parse::<u64>()?;
+    let tokens = details
+        .get("completed_tokens")
+        .context("qualification_completed_tokens_missing")?
+        .parse::<u64>()?;
+    ensure!(
+        tokens > 0 && native_sequence > 0 && event.server_event_sequence > 0,
+        "qualification_completed_event_identity_invalid"
+    );
+    Ok((
+        tokens,
+        native_sequence,
+        event.server_event_sequence,
+        sha256(request_id.as_bytes()),
+    ))
+}
+
+fn consume_completed_event(
+    path: &Path,
+    cursor: &mut EventCursor,
+) -> Result<(u64, u64, u64, String)> {
     let events = read_completed_events(path)?;
     ensure!(
         events.len() == cursor.completed_events + 1,
         "qualification_completed_event_count_invalid"
     );
-    let event = &events[cursor.completed_events];
+    let identity = completed_event_identity(&events[cursor.completed_events])?;
     cursor.completed_events += 1;
-    let details = event
-        .details
-        .as_ref()
-        .context("qualification_token_details_missing")?;
-    ensure!(
-        details
-            .get("request_id")
-            .is_some_and(|value| !value.is_empty())
-            && details
-                .get("native_completion_sequence")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|value| value > 0),
-        "qualification_token_identity_missing"
-    );
-    let tokens = details
-        .get("completed_tokens")
-        .context("qualification_completed_tokens_missing")?
-        .parse::<u64>()?;
-    ensure!(tokens > 0, "qualification_completed_tokens_zero");
-    Ok((tokens, event.sequence))
+    Ok(identity)
 }
 
 fn input_too_long(error: &anyhow::Error) -> bool {
@@ -425,6 +470,7 @@ fn shorten_single_query(spec: &mut QuerySpec, question: &str, source: &str) -> R
 
 #[allow(clippy::too_many_arguments)]
 fn encode_partition(
+    control: &RunControl,
     client: &ProductEmbeddingClient,
     specs: &mut [QuerySpec],
     questions: &[String],
@@ -445,14 +491,16 @@ fn encode_partition(
         .map(|spec| spec.encoded_input.clone())
         .collect::<Vec<_>>();
     let started = Instant::now();
-    match client.embed_queries_with_control(&inputs, Some(Duration::from_secs(60)), &|| false) {
+    match client.embed_queries_with_control(&inputs, Some(control.batch_timeout()?), &|| {
+        control.cancelled()
+    }) {
         Ok(vectors) => {
             let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             ensure!(vectors.len() == specs.len(), "query_vector_count_mismatch");
             for vector in &vectors {
                 validate_vector(vector)?;
             }
-            let (completed_tokens, sequence) =
+            let (completed_tokens, native_sequence, server_sequence, request_id_sha256) =
                 consume_completed_event(qualification_events, cursor)?;
             let ordinal = *next_batch_ordinal;
             *next_batch_ordinal = (*next_batch_ordinal).saturating_add(1);
@@ -466,7 +514,9 @@ fn encode_partition(
                     .collect(),
                 wall_ns,
                 completed_tokens,
-                qualification_event_sequence: sequence,
+                qualification_native_completion_sequence: native_sequence,
+                qualification_server_event_sequence: server_sequence,
+                qualification_request_id_sha256: request_id_sha256,
             });
             for (spec, vector) in specs.iter().cloned().zip(vectors) {
                 results.push(EncodedQuery {
@@ -486,6 +536,7 @@ fn encode_partition(
                 let middle = specs.len() / 2;
                 let (left, right) = specs.split_at_mut(middle);
                 encode_partition(
+                    control,
                     client,
                     left,
                     questions,
@@ -498,6 +549,7 @@ fn encode_partition(
                     arm,
                 )?;
                 encode_partition(
+                    control,
                     client,
                     right,
                     questions,
@@ -513,6 +565,7 @@ fn encode_partition(
                 let index = specs[0].ordinal;
                 shorten_single_query(&mut specs[0], &questions[index], &seed_sources[index])?;
                 encode_partition(
+                    control,
                     client,
                     specs,
                     questions,
@@ -532,6 +585,7 @@ fn encode_partition(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_queries(
+    control: &RunControl,
     client: &ProductEmbeddingClient,
     arm: &str,
     specs: &mut [QuerySpec],
@@ -550,6 +604,7 @@ fn encode_queries(
     for start in (0..specs.len()).step_by(QUERY_BATCH_MAX) {
         let end = (start + QUERY_BATCH_MAX).min(specs.len());
         encode_partition(
+            control,
             client,
             &mut specs[start..end],
             questions,
@@ -631,6 +686,7 @@ fn exact_legally_selectable_pool(
 
 #[allow(clippy::too_many_arguments)]
 fn run_arm(
+    control: &RunControl,
     name: &str,
     wording: &PreparedWordingV1,
     repository: &PreparedRepositoryV1,
@@ -642,6 +698,8 @@ fn run_arm(
     cursor: &mut EventCursor,
     next_batch_ordinal: &mut u32,
 ) -> Result<ArmFrontierV1> {
+    let request_started = Instant::now();
+    control.check()?;
     let bm25_started = Instant::now();
     let (_, matches) = lexical.search(&wording.question)?;
     let observed_seeds = natural_seed_prefix(&matches)
@@ -704,6 +762,7 @@ fn run_arm(
         .collect::<Vec<_>>();
     let encoding_started = Instant::now();
     let (encoded, batch_receipts) = encode_queries(
+        control,
         client,
         name,
         &mut specs,
@@ -719,6 +778,7 @@ fn run_arm(
     let vector_started = Instant::now();
     let mut scored = Vec::with_capacity(encoded.len());
     for query in &encoded {
+        control.check()?;
         scored.push(score_fragments(
             &query.vector,
             &repository.fragment_ids,
@@ -732,7 +792,7 @@ fn run_arm(
     let mut successors = Vec::new();
     let mut query_receipts = Vec::with_capacity(encoded.len());
     for (query, (scores, ranked)) in encoded.into_iter().zip(scored) {
-        let excluded_before = seeds.iter().chain(prior.iter()).cloned().collect();
+        let excluded_before = seeds.union(&prior).cloned().collect();
         let selected = select_successors(&ranked, &seeds, &prior, SUCCESSORS_PER_QUERY);
         ensure!(
             selected.len() <= SUCCESSORS_PER_QUERY,
@@ -772,6 +832,7 @@ fn run_arm(
 
     let remaining_auth_started = Instant::now();
     for fragment_id in &successors {
+        control.check()?;
         authenticator.authenticate(fragment_id)?;
     }
     let remaining_source_authentication_ns =
@@ -783,6 +844,14 @@ fn run_arm(
     );
     let legally_selectable_pool =
         exact_legally_selectable_pool(&hydrated_pool, repository, fragments)?;
+    let prepared_state_ns = u64::try_from(request_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let accounted_ns = round_zero_bm25_ns
+        .saturating_add(seed_source_authentication_ns)
+        .saturating_add(query_encoding_ns)
+        .saturating_add(vector_search_ns)
+        .saturating_add(descriptor_mapping_ns)
+        .saturating_add(remaining_source_authentication_ns);
+    ensure!(accounted_ns <= prepared_state_ns, "request_timing_overlaps");
     let timing = ArmTimingV1 {
         round_zero_bm25_ns,
         seed_source_authentication_ns,
@@ -790,12 +859,8 @@ fn run_arm(
         vector_search_ns,
         descriptor_mapping_ns,
         remaining_source_authentication_ns,
-        prepared_state_ns: round_zero_bm25_ns
-            .saturating_add(seed_source_authentication_ns)
-            .saturating_add(query_encoding_ns)
-            .saturating_add(vector_search_ns)
-            .saturating_add(descriptor_mapping_ns)
-            .saturating_add(remaining_source_authentication_ns),
+        prepared_state_ns,
+        unaccounted_ns: prepared_state_ns - accounted_ns,
     };
     Ok(ArmFrontierV1 {
         name: name.to_string(),
@@ -828,7 +893,11 @@ pub fn execute(
     fragment_vectors_sha256: &str,
     state_root: &Path,
     output: &Path,
+    cancel_file: &Path,
+    document_execution: &Path,
+    document_execution_sha256: &str,
 ) -> Result<()> {
+    let run_control = RunControl::new(cancel_file)?;
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -840,18 +909,19 @@ pub fn execute(
     let preparation_binding = bind_file(prepared, Some(prepared_sha256))?;
     let preparation: Etr1PreparationV1 = read_bound_json(&preparation_binding)?;
     let build = build_identity()?;
+    let canary = preparation.authority == "synthetic_canary_only";
     ensure!(
         !build.source_dirty
             && preparation.contract == "codestory.etr1-preparation/v1"
-            && preparation.authority == "visible_development_frontier_only"
+            && (preparation.authority == "visible_development_frontier_only" || canary)
             && preparation.packet_decision == "not_evaluated"
             && preparation.parent_head == PARENT_HEAD
             && preparation.annotation_access == "not_accessed"
-            && preparation.annotations.sha256 == ANNOTATIONS_SHA256
+            && (preparation.annotations.sha256 == ANNOTATIONS_SHA256 || canary)
             && preparation.model_sha256 == MODEL_SHA256
             && preparation.tokenizer_sha256 == TOKENIZER_SHA256
-            && preparation.fragments.len() == FRAGMENT_COUNT
-            && preparation.wordings.len() == WORDING_COUNT
+            && preparation.fragments.len() == if canary { 32 } else { FRAGMENT_COUNT }
+            && preparation.wordings.len() == if canary { 3 } else { WORDING_COUNT }
             && preparation.build.source_commit == build.source_commit
             && preparation.build.source_tree == build.source_tree,
         "etr1_preparation_identity_mismatch"
@@ -872,6 +942,40 @@ pub fn execute(
     // request timing begins. It is never rebuilt or paged during ETR-1.
     let (vector_binding, vector_artifact, vectors) =
         load_vector_artifact(fragment_vectors, fragment_vectors_sha256, &preparation)?;
+    let document_execution = bind_file(document_execution, Some(document_execution_sha256))?;
+    let execution: Value = read_bound_json(&document_execution)?;
+    ensure!(
+        execution["contract"] == "codestory.etr1-execution/v1"
+            && execution["role"] == "documents"
+            && execution["experiment_status"] == "completed"
+            && execution["exit_code"] == 0
+            && execution["signal"].is_null()
+            && execution["annotation_access"] == "not_accessed",
+        "document_execution_invalid"
+    );
+    let request_binding: FileBinding = serde_json::from_value(execution["request"].clone())?;
+    let request: Value = read_bound_json(&request_binding)?;
+    let producer: FileBinding = serde_json::from_value(request["executable"].clone())?;
+    ensure!(
+        bind_file(&producer.path, Some(&producer.sha256))? == producer
+            && producer.sha256 == vector_artifact.binary_sha256,
+        "document_producer_changed"
+    );
+    let inputs: Vec<FileBinding> = serde_json::from_value(request["inputs"].clone())?;
+    let outputs: Vec<FileBinding> = serde_json::from_value(execution["outputs"].clone())?;
+    ensure!(
+        inputs.contains(&preparation.embedding_input) && outputs.contains(&vector_binding),
+        "document_execution_artifact_not_bound"
+    );
+    let document_events: FileBinding = serde_json::from_value(execution["events"].clone())?;
+    ensure!(
+        bind_file(&document_events.path, Some(&document_events.sha256))? == document_events,
+        "document_native_events_changed"
+    );
+    ensure!(
+        !read_completed_events(&document_events.path)?.is_empty(),
+        "document_native_events_missing"
+    );
     let runtime = SidecarRuntimeConfig::local();
     let qualification_events = validate_isolated_state(state_root, &runtime)?;
     codestory_cli::install_native_embedding_client_transport()?;
@@ -885,7 +989,7 @@ pub fn execute(
         .map(|fragment| (fragment.fragment_id.clone(), fragment))
         .collect::<HashMap<_, _>>();
     ensure!(
-        fragment_map.len() == FRAGMENT_COUNT,
+        fragment_map.len() == preparation.fragments.len(),
         "fragment_map_identity_collision"
     );
     let repository_map = preparation
@@ -923,6 +1027,7 @@ pub fn execute(
             .get(&wording.repository_id)
             .context("wording_lexical_index_missing")?;
         let control = finalize_arm(run_arm(
+            &run_control,
             "control",
             wording,
             repository,
@@ -935,6 +1040,7 @@ pub fn execute(
             &mut next_batch_ordinal,
         )?);
         let candidate = finalize_arm(run_arm(
+            &run_control,
             "candidate",
             wording,
             repository,
@@ -965,7 +1071,10 @@ pub fn execute(
             candidate,
         });
     }
-    ensure!(rows.len() == WORDING_COUNT, "etr1_row_count_mismatch");
+    ensure!(
+        rows.len() == preparation.wordings.len(),
+        "etr1_row_count_mismatch"
+    );
     let final_engine = engine_receipt(&residency.revalidate()?)?;
     for key in [
         "server_instance_id",
@@ -997,6 +1106,7 @@ pub fn execute(
         .sum::<u64>();
 
     let stage = stage_output_directory(output)?;
+    run_control.check()?;
     let rows_directory = stage.path().join("rows");
     fs::create_dir(&rows_directory)?;
     let mut row_bindings = Vec::with_capacity(rows.len());
@@ -1021,13 +1131,14 @@ pub fn execute(
     };
     let manifest = Etr1RunManifestV1 {
         contract: RUN_CONTRACT.into(),
-        authority: "visible_development_frontier_only".into(),
+        authority: preparation.authority.clone(),
         experiment_status: "awaiting_validation".into(),
         decision: "not_evaluated".into(),
         parent_head: PARENT_HEAD.into(),
         build,
         preparation: preparation_binding,
         fragment_vectors: vector_binding,
+        document_execution,
         method_sha256: preparation.method.sha256,
         annotation_access: "not_accessed".into(),
         vector_artifact_loaded_before_timing: true,
@@ -1102,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_events_accept_the_native_zero_based_sequence() {
+    fn qualification_events_use_native_completion_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         fs::write(
@@ -1112,7 +1223,7 @@ mod tests {
                 "\"status\":\"completed\",\"server_event_sequence\":10,\"clock\":{},",
                 "\"details\":{\"completed_tokens\":\"5\",\"native_completion_sequence\":\"1\",",
                 "\"request_id\":\"first\"}}\n",
-                "{\"schema_version\":1,\"sequence\":1,\"action\":\"completed_tokens\",",
+                "{\"schema_version\":1,\"sequence\":0,\"action\":\"completed_tokens\",",
                 "\"status\":\"completed\",\"server_event_sequence\":11,\"clock\":{},",
                 "\"details\":{\"completed_tokens\":\"7\",\"native_completion_sequence\":\"2\",",
                 "\"request_id\":\"second\"}}\n",
@@ -1123,10 +1234,17 @@ mod tests {
         let events = read_completed_events(&path).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].sequence, 1);
+        assert_eq!(events[1].sequence, 0);
 
         let bytes = fs::read_to_string(&path).unwrap();
-        fs::write(&path, bytes.replace("\"sequence\":1", "\"sequence\":0")).unwrap();
+        fs::write(
+            &path,
+            bytes.replace(
+                "\"native_completion_sequence\":\"2\"",
+                "\"native_completion_sequence\":\"1\"",
+            ),
+        )
+        .unwrap();
         assert!(read_completed_events(&path).is_err());
     }
 

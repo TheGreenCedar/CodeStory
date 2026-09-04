@@ -8,6 +8,7 @@ import { authenticateFragment, encodedCandidateInput, evaluateArm, exactPublicBy
 import { validateArm, validateDocumentVectorRecord, validateEngine,
   validatePreAnnotationBoundary, parseEvents } from "../codestory-etr1-validate.mjs";
 import { decision, evaluateEtr1, gateOne, gateTwo } from "../codestory-etr1-evaluate.mjs";
+import { fileBinding, readExecutionBinding, validateExecution } from "../lib/etr1-execution.mjs";
 
 function unit(index) {
   const vector = Array(LIMITS.vectorDimension).fill(0);
@@ -32,7 +33,8 @@ function fixture(expectedName = "control") {
   const input = expectedName === "control" ? question : `${question}\n\n${seed.source}`;
   const batch = { global_batch_ordinal: 0, arm: expectedName, query_ordinals: [0],
     input_sha256: [sha256(input)], wall_ns: 1, completed_tokens: 2,
-    qualification_event_sequence: 1 };
+    qualification_native_completion_sequence: 1, qualification_server_event_sequence: 10,
+    qualification_request_id_sha256: sha256("request-1") };
   const arm = { name: expectedName, search_count: 1,
     query_receipts: [{ query_ordinal: 0, seed_fragment_id: seed.fragment_id,
       original_input_sha256: sha256(input), encoded_input_sha256: sha256(input), encoded_input: input,
@@ -48,7 +50,7 @@ function fixture(expectedName = "control") {
       file_digests: { "src/lib.rs": digest } }, token_total: 2,
     timing: { round_zero_bm25_ns: 1, seed_source_authentication_ns: 1, query_encoding_ns: 1,
       vector_search_ns: 1, descriptor_mapping_ns: 1, remaining_source_authentication_ns: 1,
-      prepared_state_ns: 6 } };
+      prepared_state_ns: 6, unaccounted_ns: 0 } };
   return { arm, expectedName, wording, repository,
     fragments: new Map([[seed.fragment_id, seed], [successor.fragment_id, successor]]),
     documentVectors: new Map([[seed.fragment_id, unit(1)], [successor.fragment_id, unit(0)]]),
@@ -84,14 +86,14 @@ test("candidate input shortening preserves UTF-8 and complete trailing lines", (
   assert.throws(() => encodedCandidateInput("question", source, 3));
 });
 
-test("validator accepts the native zero-based qualification sequence", () => {
-  const event = (sequence) => JSON.stringify({ schema_version: 1, sequence,
-    action: "completed_tokens", status: "completed", server_event_sequence: 10 + sequence,
-    clock: {}, details: { completed_tokens: "5", native_completion_sequence: String(sequence + 1),
-      request_id: `request-${sequence}` } });
-  const events = parseEvents(Buffer.from(`${event(0)}\n${event(1)}\n`));
-  assert.deepEqual(events.map(({ sequence }) => sequence), [0, 1]);
-  assert.throws(() => parseEvents(Buffer.from(`${event(0)}\n${event(0)}\n`)));
+test("validator uses native completion identity for automatic token events", () => {
+  const event = (nativeSequence) => JSON.stringify({ schema_version: 1, sequence: 0,
+    action: "completed_tokens", status: "completed", server_event_sequence: 3 + nativeSequence,
+    clock: {}, details: { completed_tokens: "5", native_completion_sequence: String(nativeSequence),
+      request_id: `request-${nativeSequence}` } });
+  const events = parseEvents(Buffer.from(`${event(1)}\n${event(2)}\n`));
+  assert.deepEqual(events.map(({ sequence }) => sequence), [0, 0]);
+  assert.throws(() => parseEvents(Buffer.from(`${event(1)}\n${event(1)}\n`)));
 });
 
 test("validator reconstructs both arm query contracts and refuses hostile mutations", () => {
@@ -109,6 +111,15 @@ test("validator reconstructs both arm query contracts and refuses hostile mutati
     mutate(value);
     assert.throws(() => validateArm(value));
   }
+});
+
+test("request wall timing includes unaccounted work and rejects impossible phase totals", () => {
+  const value = fixture();
+  value.arm.timing.prepared_state_ns = 10;
+  value.arm.timing.unaccounted_ns = 4;
+  validateArm(value);
+  value.arm.timing.unaccounted_ns = 0;
+  assert.throws(() => validateArm(value), /timing/u);
 });
 
 test("vector, model, and pre-annotation boundaries refuse substitutions", () => {
@@ -194,11 +205,12 @@ test("the frozen decision table never authorizes production integration", () => 
     groups: { a: { mean_recall: 0.5 }, b: { mean_recall: 0.5 } } };
   assert.equal(gateOne(sufficient).pass, true);
   assert.equal(gateOne(weak).pass, false);
-  assert.equal(decision(false, false, false).decision, "stop_automatic_packet_compilation");
+  assert.equal(decision(false, false, false).decision, "no_frontier_selected");
+  assert.equal(decision(false, true, false).decision, "no_frontier_selected");
   assert.equal(decision(true, true, false).decision,
-    "freeze_unconditioned_frontier_for_selector_experiment");
+    "unconditioned_frontier_selected");
   assert.equal(decision(false, true, true).decision,
-    "freeze_conditioned_frontier_for_selector_experiment");
+    "conditioned_frontier_selected");
   const cases = [{ control_incomplete_for_gain: true, candidate_gained_atom: true }];
   assert.equal(gateTwo(cases, weak, sufficient, true).pass, true);
 });
@@ -214,4 +226,18 @@ test("annotations cannot be opened before a valid validator receipt", async () =
     validationSha256: sha256(bytes), annotationsPath: path.join(directory, "must-not-open.json"),
     annotationsSha256: "0".repeat(64), oraclePath: path.join(directory, "oracle.json"),
     oracleSha256: "0".repeat(64), sourceRoot: directory }), /validator did not authorize/u);
+});
+
+test("independently frozen execution bindings reject rehashed substitute outputs", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "etr1-execution-"));
+  const output = path.join(directory, "vectors.json");
+  await writeFile(output, JSON.stringify({ vector: unit(0) }));
+  const frozen = await fileBinding(output);
+  await readExecutionBinding(frozen);
+  await writeFile(output, JSON.stringify({ vector: unit(1) }));
+  const substitute = await fileBinding(output);
+  assert.notEqual(substitute.sha256, frozen.sha256);
+  await assert.rejects(() => readExecutionBinding(frozen), /execution artifact digest changed/u);
+  await assert.rejects(() => validateExecution(undefined, { role: "documents" }),
+    /independent execution receipt required/u);
 });

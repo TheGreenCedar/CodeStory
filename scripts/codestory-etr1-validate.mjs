@@ -4,6 +4,7 @@ import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
+import { validateExecution } from "./lib/etr1-execution.mjs";
 import { authenticateFragment, encodedCandidateInput, f32Dot, fragmentId, LIMITS,
   scoreOrder, selectSuccessors, sha256, validateVector } from "./lib/etr1-evidence.mjs";
 
@@ -155,7 +156,12 @@ export function validateArm({ arm, expectedName, wording, repository, fragments,
   }
   assert.deepEqual(arm.successors, [...prior], "successor pool equation changed");
   assert.ok(arm.batch_receipts.every((batch) => batch.query_ordinals.length >= 1
-    && batch.query_ordinals.length <= 8 && batch.wall_ns > 0 && batch.completed_tokens > 0),
+    && batch.query_ordinals.length <= 8 && batch.wall_ns > 0 && batch.completed_tokens > 0
+    && Number.isSafeInteger(batch.qualification_native_completion_sequence)
+    && batch.qualification_native_completion_sequence > 0
+    && Number.isSafeInteger(batch.qualification_server_event_sequence)
+    && batch.qualification_server_event_sequence > 0
+    && /^[0-9a-f]{64}$/u.test(batch.qualification_request_id_sha256)),
   "batch contract invalid");
   const batchOrdinals = arm.batch_receipts.flatMap((batch) => batch.query_ordinals).toSorted((a, b) => a - b);
   assert.deepEqual(batchOrdinals, Array.from({ length: seeds.length }, (_, index) => index),
@@ -167,18 +173,42 @@ export function validateArm({ arm, expectedName, wording, repository, fragments,
   timingKeys.forEach((key) => assert.ok(Number.isSafeInteger(arm.timing[key]) && arm.timing[key] >= 0,
     `invalid timing ${key}`));
   assert.equal(arm.timing.prepared_state_ns,
-    timingKeys.reduce((sum, key) => sum + arm.timing[key], 0), "prepared timing does not reconcile");
+    timingKeys.reduce((sum, key) => sum + arm.timing[key], 0) + arm.timing.unaccounted_ns,
+    "prepared timing does not reconcile");
+  assert.ok(Number.isSafeInteger(arm.timing.unaccounted_ns) && arm.timing.unaccounted_ns >= 0,
+    "invalid unaccounted timing");
   validateSourceAuthentication(arm, fragments, repository, sourceFiles);
 }
 
 export function parseEvents(bytes) {
   assert.equal(bytes.at(-1), 10, "qualification event log is unterminated");
-  let previous = null;
-  return bytes.toString("utf8").trimEnd().split("\n").map(JSON.parse).filter((event) => {
+  let previousNative = null, previousServer = null;
+  const requestIds = new Set();
+  return bytes.toString("utf8").trimEnd().split("\n").map(JSON.parse).map((event) => {
     assert.equal(event.schema_version, 1, "qualification event schema changed");
-    assert.ok(previous === null || event.sequence > previous, "qualification event sequence changed");
-    previous = event.sequence;
-    return event.action === "completed_tokens";
+    assert.equal(event.sequence, 0, "automatic token event command sequence changed");
+    assert.equal(event.action, "completed_tokens", "unexpected qualification action");
+    assert.equal(event.status, "completed", "qualification token event failed");
+    assert.ok(event.clock && typeof event.clock === "object" && event.snapshot === undefined,
+      "qualification token event shape changed");
+    const nativeSequence = Number(event.details?.native_completion_sequence);
+    const serverSequence = Number(event.server_event_sequence);
+    const completedTokens = Number(event.details?.completed_tokens);
+    const requestId = event.details?.request_id;
+    assert.ok(Number.isSafeInteger(nativeSequence) && nativeSequence > 0
+      && (previousNative === null || nativeSequence === previousNative + 1),
+    "qualification native completion sequence changed");
+    assert.ok(Number.isSafeInteger(serverSequence) && serverSequence > 0
+      && (previousServer === null || serverSequence > previousServer),
+    "qualification server event sequence changed");
+    assert.ok(Number.isSafeInteger(completedTokens) && completedTokens > 0,
+      "qualification completed token count changed");
+    assert.ok(typeof requestId === "string" && requestId && !requestIds.has(requestId),
+      "qualification request identity changed");
+    requestIds.add(requestId);
+    previousNative = nativeSequence;
+    previousServer = serverSequence;
+    return event;
   });
 }
 
@@ -195,10 +225,12 @@ async function loadSourceFiles(repository, repositoryFragments) {
   return result;
 }
 
-export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
+export async function validateEtr1({ runBinding, runPath, sourceRoot, executionBinding, allowCanary = false }) {
   const run = await boundJson(runBinding, runPath);
   assert.equal(run.contract, "codestory.etr1-run/v1");
-  assert.equal(run.authority, "visible_development_frontier_only");
+  const canary = run.authority === "synthetic_canary_only";
+  assert.ok(canary ? allowCanary : run.authority === "visible_development_frontier_only",
+    "synthetic canary cannot authorize corpus evaluation");
   assert.equal(run.experiment_status, "awaiting_validation");
   assert.equal(run.decision, "not_evaluated");
   assert.equal(run.parent_head, FIXED.parent);
@@ -213,22 +245,29 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
   assert.equal(run.build.source_dirty, false, "run binary was built dirty");
   assert.equal(sha256(await readFile(run.build.binary_path)), run.build.binary_sha256, "run binary changed");
   const preparation = await boundJson(run.preparation);
+  const { request: runnerRequest, receipt: runnerExecution } = await validateExecution(executionBinding,
+    { role: "paired_run", input: run.preparation, output: runBinding, sourceRoot });
+  assert.equal(runnerRequest.executable.sha256, run.build.binary_sha256, "run producer changed");
+  const { request: documentRequest } = await validateExecution(run.document_execution,
+    { role: "documents", input: preparation.embedding_input, output: run.fragment_vectors, sourceRoot });
   assert.equal(preparation.contract, "codestory.etr1-preparation/v1");
+  assert.equal(preparation.authority, run.authority);
   validatePreAnnotationBoundary(run, preparation);
-  assert.equal(preparation.annotations.sha256, FIXED.annotations);
+  assert.equal(preparation.annotations.sha256, canary ? "0".repeat(64) : FIXED.annotations);
   assert.equal(preparation.model_sha256, FIXED.model);
   assert.equal(preparation.tokenizer_sha256, FIXED.tokenizer);
   assert.equal(preparation.build.source_commit, sourceCommit);
   assert.equal(preparation.build.source_tree, sourceTree);
   assert.equal(run.method_sha256, preparation.method.sha256);
-  for (const name of ["fragment_diagnostic", "fragment_build", "lexical_membership_freeze",
+  for (const name of canary ? [] : ["fragment_diagnostic", "fragment_build", "lexical_membership_freeze",
     "questions", "model_contract", "lexical_policy_source"])
     assert.equal(preparation.fixed_inputs[name].sha256, FIXED[name], `fixed input changed: ${name}`);
   await boundBytes(preparation.method);
   await boundBytes(preparation.embedding_input);
   for (const binding of Object.values(preparation.fixed_inputs)) await boundBytes(binding);
-  assert.equal(preparation.fragments.length, 10_369, "fragment count changed");
-  assert.equal(preparation.wordings.length, 72, "wording count changed");
+  assert.equal(preparation.fragments.length, canary ? 32 : 10_369, "fragment count changed");
+  assert.equal(preparation.wordings.length, canary ? 3 : 72, "wording count changed");
+  if (canary) assert.deepEqual(preparation.wordings.map((row) => row.seed_fragment_ids.length), [16, 1, 0]);
   const fragments = new Map(), fragmentsByRepository = new Map();
   for (const fragment of preparation.fragments) {
     assert.equal(fragment.fragment_id, fragmentId(fragment), "prepared fragment identity changed");
@@ -251,6 +290,7 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
   assert.equal(vectorArtifact.input_sha256, preparation.embedding_input.sha256);
   assert.equal(vectorArtifact.source_commit, sourceCommit);
   assert.equal(vectorArtifact.source_tree, sourceTree);
+  assert.equal(vectorArtifact.binary_sha256, documentRequest.executable.sha256, "document producer changed");
   validateEngine(vectorArtifact.initial_engine);
   validateEngine(vectorArtifact.final_engine);
   assert.equal(vectorArtifact.initial_engine.server_instance_id, vectorArtifact.final_engine.server_instance_id);
@@ -267,6 +307,7 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
   assert.equal(run.initial_engine.server_instance_id, run.final_engine.server_instance_id,
     "query engine changed during ETR-1");
   const eventBytes = await boundBytes(run.qualification_events), events = parseEvents(eventBytes);
+  assert.equal(run.qualification_events.sha256, runnerExecution.events.sha256, "runner native events changed");
   const batches = new Map(), rows = [];
   assert.equal(run.rows.length, preparation.wordings.length, "run row count changed");
   for (let rowIndex = 0; rowIndex < run.rows.length; rowIndex++) {
@@ -295,10 +336,13 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
   assert.equal(events.length, batches.size, "qualification event count differs from successful batches");
   for (const [ordinal, batch] of [...batches].sort((left, right) => left[0] - right[0])) {
     const event = events[ordinal];
-    assert.equal(event.sequence, batch.qualification_event_sequence, "batch event sequence changed");
+    assert.equal(Number(event.details.native_completion_sequence),
+      batch.qualification_native_completion_sequence, "batch native completion sequence changed");
+    assert.equal(event.server_event_sequence, batch.qualification_server_event_sequence,
+      "batch server event sequence changed");
+    assert.equal(sha256(event.details.request_id), batch.qualification_request_id_sha256,
+      "batch request identity changed");
     assert.equal(Number(event.details.completed_tokens), batch.completed_tokens, "batch token count changed");
-    assert.ok(event.details.request_id, "batch request identity missing");
-    assert.ok(Number(event.details.native_completion_sequence) > 0, "native completion identity missing");
   }
   assert.equal(run.qualification_completed_token_total,
     [...batches.values()].reduce((sum, batch) => sum + batch.completed_tokens, 0),
@@ -311,16 +355,23 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot }) {
 async function main() {
   const { values } = parseArgs({ options: {
     run: { type: "string" }, "run-sha256": { type: "string" }, output: { type: "string" },
+    execution: { type: "string" }, "execution-sha256": { type: "string" },
+    "synthetic-canary": { type: "boolean", default: false },
   } });
-  for (const name of ["run", "run-sha256", "output"]) assert.ok(values[name], `missing --${name}`);
+  for (const name of ["run", "run-sha256", "output", "execution", "execution-sha256"])
+    assert.ok(values[name], `missing --${name}`);
   assert.ok(path.isAbsolute(values.run) && path.isAbsolute(values.output), "paths must be absolute");
   const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   let receipt;
   try {
-    const validated = await validateEtr1({ runBinding: { path: values.run,
+    const executionBinding = { path: values.execution, sha256: values["execution-sha256"],
+      bytes: (await stat(values.execution)).size };
+    const validated = await validateEtr1({ executionBinding, allowCanary: values["synthetic-canary"], runBinding: { path: values.run,
       sha256: values["run-sha256"], bytes: (await stat(values.run)).size }, runPath: values.run, sourceRoot });
     receipt = { contract: "codestory.etr1-validation/v1", experiment_status: "valid",
       decision: "not_evaluated", annotation_access: "not_accessed",
+      execution: executionBinding,
+      authority: validated.run.authority,
       run: { path: values.run, sha256: values["run-sha256"], bytes: (await stat(values.run)).size },
       source_commit: validated.source_commit, source_tree: validated.source_tree,
       binary_sha256: validated.run.build.binary_sha256,
