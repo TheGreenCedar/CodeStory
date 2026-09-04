@@ -6,7 +6,8 @@ import path from "node:path";
 import { authenticateFragment, encodedCandidateInput, evaluateArm, exactPublicBytes, fragmentId,
   LIMITS, maximizeCoveredAtoms, scoreOrder, selectSuccessors, sha256 } from "../lib/etr1-evidence.mjs";
 import { validateArm, validateDocumentVectorRecord, validateEngine,
-  validatePreAnnotationBoundary, parseEvents, validateDocumentCompletions } from "../codestory-etr1-validate.mjs";
+  validatePreAnnotationBoundary, parseEvents, validateDocumentCompletions,
+  renderSnippet } from "../codestory-etr1-validate.mjs";
 import { decision, evaluateEtr1, gateOne, gateTwo } from "../codestory-etr1-evaluate.mjs";
 import { fileBinding, readExecutionBinding, validateExecution, executionEnvironment,
   validateCanaryGate } from "../lib/etr1-execution.mjs";
@@ -16,6 +17,14 @@ function unit(index) {
   vector[index] = 1;
   return vector;
 }
+
+test("source rendering splits only at LF and preserves all source inside a line", () => {
+  assert.equal(renderSnippet({ source: "first\r\nsecond\nthird\u2028inside\u2029line\rlast",
+    line_range: { start: 9 } }),
+  "```text\n     9 | first\n    10 | second\n    11 | third\u2028inside\u2029line\rlast\n```");
+  assert.equal(renderSnippet({ source: "\n\r\n", line_range: { start: 1 } }),
+    "```text\n     1 | \n     2 | \n```");
+});
 
 function fixture(expectedName = "control") {
   const bytes = Buffer.from("seed\nsuccessor\n"), digest = sha256(bytes), project_id = "project";

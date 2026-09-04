@@ -34,9 +34,9 @@ async function boundJson(binding, expectedPath) {
   return JSON.parse(await boundBytes(binding, expectedPath));
 }
 
-function renderSnippet(fragment) {
+export function renderSnippet(fragment) {
   let result = "```text\n";
-  const lines = fragment.source.match(/.*(?:\n|$)/gu).filter(Boolean);
+  const lines = fragment.source.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
   lines.forEach((line, offset) => {
     result += ` ${String(fragment.line_range.start + offset).padStart(5)} | ${line.replace(/[\r\n]+$/u, "")}\n`;
   });

@@ -20,7 +20,7 @@ async function main() {
   const project = path.join(root, "repository"), prepared = path.join(root, "prepared");
   await mkdir(project, { mode: 0o700 });
   const source = Array.from({ length: 32 }, (_, i) =>
-    `fn commonneedle_${i}() { commonneedle(); ${i === 0 ? "raremarker();" : ""} }\n`).join("");
+    `fn commonneedle_${i}() { commonneedle(); ${i === 0 ? "raremarker();" : ""} }${i === 1 ? " /* a\u2028b\u2029c */" : ""}${i % 3 === 0 ? "\r\n" : "\n"}`).join("");
   await writeFile(path.join(project, "canary.rs"), source, { flag: "wx", mode: 0o600 });
   const git = (...args) => execFileSync("git", ["-C", project, "-c", "core.hooksPath=/dev/null", ...args],
     { encoding: "utf8", stdio: "pipe" });
