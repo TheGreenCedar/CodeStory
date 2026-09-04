@@ -26,7 +26,6 @@ use crate::{
 };
 use codestory_contracts::api::{ApiError, AppEventPayload};
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::FileCoverageReason;
 use codestory_indexer::{
     ArtifactCachePolicies, ArtifactCachePolicy, CancellationToken, IncrementalIndexingStats,
     WorkspaceIndexer as V2WorkspaceIndexer,
@@ -176,7 +175,7 @@ fn validate_full_refresh_coverage(
 ) -> Result<(), ApiError> {
     let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
         .into_iter()
-        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .filter(crate::index_coverage::coverage_gap_blocks_publication)
         .collect::<Vec<_>>();
     if blocking_gaps.is_empty() {
         return Ok(());

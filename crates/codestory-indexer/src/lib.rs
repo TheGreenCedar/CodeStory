@@ -1422,6 +1422,14 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
+        // A verified malformed snapshot replaces the old projection with source
+        // identity only. An operational failure cannot authorize that removal.
+        let verified_malformed = !local_storage.file_content_hashes.is_empty()
+            && !local_storage.errors.is_empty()
+            && local_storage
+                .errors
+                .iter()
+                .all(|error| error.coverage_reason == Some(FileCoverageReason::Malformed));
         let mut source_identity_only = false;
         if let Some((file_id, file_complete, file_path)) = local_storage
             .files
@@ -1440,12 +1448,12 @@ impl<'a> ProjectionWriter<'a> {
                 .storage
                 .get_callable_projection_states_for_file(file_id)
                 .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-            let replace_file_owned_projection =
-                !local_storage.structural_text_projections.is_empty()
-                    || local_storage
-                        .files
-                        .first()
-                        .is_some_and(|file| file.language == "openapi");
+            let replace_file_owned_projection = verified_malformed
+                || !local_storage.structural_text_projections.is_empty()
+                || local_storage
+                    .files
+                    .first()
+                    .is_some_and(|file| file.language == "openapi");
             let update_mode = if replace_file_owned_projection {
                 ProjectionUpdateMode::FullReplace
             } else {
@@ -1480,7 +1488,7 @@ impl<'a> ProjectionWriter<'a> {
                 local_storage.impl_anchor_node_ids.clear();
                 self.stats.source_identity_only_files =
                     self.stats.source_identity_only_files.saturating_add(1);
-            } else if !file_complete {
+            } else if !file_complete && !verified_malformed {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
@@ -4006,24 +4014,46 @@ impl WorkspaceIndexer {
                         FileCoverageReason::Oversized
                     }
                 };
-                return PreparedIndexJobResult {
-                    local_storage: incomplete_file_storage(
+                let mut local_storage = incomplete_file_storage(
+                    &prepared_input.full_path,
+                    Some(&prepared_input.source),
+                    language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Failed to index structural file {:?}: {}",
+                            prepared_input.full_path, error
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        coverage_reason: Some(reason),
+                    },
+                );
+                if reason == FileCoverageReason::Malformed {
+                    match verify_source_snapshot(
                         &prepared_input.full_path,
-                        Some(&prepared_input.source),
-                        language,
-                        codestory_contracts::graph::ErrorInfo {
-                            message: format!(
-                                "Failed to index structural file {:?}: {}",
-                                prepared_input.full_path, error
-                            ),
-                            file_id: None,
-                            line: None,
-                            column: None,
-                            is_fatal: false,
-                            index_step: codestory_contracts::graph::IndexStep::Indexing,
-                            coverage_reason: Some(reason),
-                        },
-                    ),
+                        &prepared_input.content_hash,
+                    ) {
+                        Ok(modification_time) => {
+                            let file = &mut local_storage.files[0];
+                            file.modification_time = modification_time;
+                            local_storage.file_content_hashes.push(
+                                codestory_store::FileContentHash {
+                                    file_id: file.id,
+                                    content_hash: prepared_input.content_hash.clone(),
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            local_storage =
+                                changed_source_storage(&prepared_input.full_path, language, error);
+                        }
+                    }
+                }
+                return PreparedIndexJobResult {
+                    local_storage,
                     cache_write: None,
                     policy_exclusion: None,
                 };
