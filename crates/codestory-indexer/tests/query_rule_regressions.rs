@@ -118,6 +118,80 @@ fn script_private_callable_names_cannot_resolve_to_enclosing_definitions() -> an
     Ok(())
 }
 
+#[test]
+fn script_private_call_scope_belongs_to_each_occurrence() -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for private in ["quartz", "opaque_731"] {
+            for callable in ["function", "async function", "function*", "async function*"] {
+                for outside_first in [false, true] {
+                    for nested in [false, true] {
+                        let calls = format!("return {private}(x-1) + {private}(x-2);");
+                        let body = if nested {
+                            format!("function child() {{ {calls} }} return child();")
+                        } else {
+                            calls
+                        };
+                        let binding =
+                            format!("const bound = {callable} {private}(x) {{ {body} }};");
+                        let ordinary = format!("{private}(77);");
+                        let line = if outside_first {
+                            format!(
+                                "/* λ */ function driver() {{ {ordinary} {binding} return bound; }}"
+                            )
+                        } else {
+                            format!(
+                                "/* λ */ function driver() {{ {binding} {ordinary} return bound; }}"
+                            )
+                        };
+                        let source = format!("function {private}(x) {{ return 99; }}\n{line}\n");
+                        let (nodes, edges) =
+                            index_project(&[(&format!("nested/fixture.{extension}"), &source)])?;
+                        let outer = nodes
+                            .iter()
+                            .find(|node| {
+                                node.kind == NodeKind::FUNCTION
+                                    && node.serialized_name == private
+                                    && node.start_line == Some(1)
+                            })
+                            .expect("outer definition");
+                        let calls = edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.kind == EdgeKind::CALL
+                                    && edge.line == Some(2)
+                                    && nodes.iter().any(|node| {
+                                        node.id == edge.target && node.serialized_name == private
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        let unresolved = calls
+                            .iter()
+                            .filter(|edge| {
+                                edge.resolved_target.is_none() && edge.candidate_targets.is_empty()
+                            })
+                            .count();
+                        let resolved = calls
+                            .iter()
+                            .filter(|edge| edge.resolved_target == Some(outer.id))
+                            .count();
+                        if calls.len() != 3 || unresolved != 2 || resolved != 1 {
+                            failures.push(format!("{extension}/{callable}/{private}/outside_first={outside_first}/nested={nested}: {calls:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} occurrence failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
 fn matches_name(actual: &str, wanted: &str) -> bool {
     actual == wanted
         || actual.ends_with(&format!(".{wanted}"))

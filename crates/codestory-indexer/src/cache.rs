@@ -485,7 +485,7 @@ pub(crate) fn build_index_artifact_cache_key(
         language_config.language_name,
         "c" | "cpp" | "javascript" | "typescript"
     ) {
-        mix_str(&mut state, "callable-identity-and-scope-v2");
+        mix_str(&mut state, "callable-identity-and-scope-v3");
     }
     mix_bool(&mut state, legacy_edge_identity);
     mix_bool(&mut state, lazy_graph_execution);
