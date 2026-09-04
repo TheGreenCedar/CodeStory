@@ -89,22 +89,7 @@
 }
 
 (function_definition
-  declarator: (function_declarator
-    declarator: (_) @name)) @def
-{
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @def)
-  attr (@name.node) start_col = (start-column @def)
-  attr (@name.node) end_row = (end-row @def)
-  attr (@name.node) end_col = (end-column @def)
-}
-
-(function_definition
-  declarator: (pointer_declarator
-    declarator: (function_declarator
-      declarator: (_) @name))) @def
+  declarator: (_) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"
@@ -168,8 +153,7 @@
   name: (_) @ns_name
   body: (declaration_list
     (function_definition
-      declarator: (function_declarator
-        declarator: (_) @member_name))))
+      declarator: (_) @member_name)))
 {
   edge @ns_name.node -> @member_name.node
   attr (@ns_name.node -> @member_name.node) kind = "MEMBER"
@@ -189,8 +173,7 @@
   name: (_) @class_name
   body: (field_declaration_list
     (function_definition
-      declarator: (function_declarator
-        declarator: (_) @method_name))))
+      declarator: (_) @method_name)))
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
@@ -243,8 +226,7 @@
   name: (_) @class_name
   body: (field_declaration_list
     (function_definition
-      declarator: (function_declarator
-        declarator: (_) @method_name))))
+      declarator: (_) @method_name)))
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
@@ -306,8 +288,7 @@
     name: (_) @class_name
     body: (field_declaration_list
       (function_definition
-        declarator: (function_declarator
-          declarator: (_) @method_name)))))
+        declarator: (_) @method_name))))
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"

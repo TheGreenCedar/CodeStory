@@ -8880,6 +8880,42 @@ function loneLoopWriteExternal(body) {
 }
 
 #[test]
+fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -> anyhow::Result<()>
+{
+    for extension in ["js", "ts", "tsx"] {
+        for imported_first in [false, true] {
+            let imported = "function outside() { dispatch(2); }";
+            let shadowed = "function shadow() { const dispatch = (value) => value; dispatch(1); }";
+            let source = if imported_first {
+                format!("const dispatch = require('opaque-module'); {imported} {shadowed}\n")
+            } else {
+                format!("const dispatch = require('opaque-module'); {shadowed} {imported}\n")
+            };
+            let (nodes, edges) = index_single_file(&format!("neutral.{extension}"), &source)?;
+            let marked = edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge.callsite_identity.as_deref().is_some_and(|identity| {
+                            identity
+                                .split('|')
+                                .any(|part| part == "syntax:js-runtime-import-call")
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                marked.len(),
+                1,
+                "{extension}/imported_first={imported_first}: {:?}",
+                describe_call_edges(&edges, &nodes)
+            );
+            assert!(marked[0].resolved_target.is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_typescript_family_member_calls_never_inherit_runtime_import_markers() -> anyhow::Result<()>
 {
     for (filename, source) in [

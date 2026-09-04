@@ -87,6 +87,7 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+mod native_declarators;
 mod proof_resolution;
 
 /// SRC-C2 fence classification: lives in its own file because
@@ -5050,7 +5051,7 @@ struct ManualPreciseCallSpec {
     line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GraphNodeSpan {
     start_line: u32,
     start_col: u32,
@@ -10601,45 +10602,6 @@ fn append_runtime_import_edges(
     }
 }
 
-fn annotate_exact_runtime_import_bare_calls(
-    specs: &[RuntimeImportSpec],
-    unique_nodes: &HashMap<NodeId, Node>,
-    edges: &mut [Edge],
-    edge_keys: &mut HashSet<EdgeDedupKey>,
-    flags: IndexFeatureFlags,
-) {
-    let exact_target_spans = specs
-        .iter()
-        .flat_map(|spec| spec.exact_bare_call_target_spans.iter())
-        .map(|span| (span.start_line, span.start_col, span.end_line, span.end_col))
-        .collect::<HashSet<_>>();
-    if exact_target_spans.is_empty() {
-        return;
-    }
-
-    for edge in edges {
-        if edge.kind != EdgeKind::CALL
-            || !unique_nodes
-                .get(&edge.target)
-                .and_then(|target| {
-                    Some((
-                        target.start_line?,
-                        target.start_col?,
-                        target.end_line?,
-                        target.end_col?,
-                    ))
-                })
-                .is_some_and(|span| exact_target_spans.contains(&span))
-        {
-            continue;
-        }
-        edge_keys.remove(&edge_dedup_key(edge, flags));
-        append_callsite_marker(edge, languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER);
-        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
-        edge_keys.insert(edge_dedup_key(edge, flags));
-    }
-}
-
 fn collect_c_enum_member_pairs(tree: &Tree, source: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
@@ -15793,6 +15755,8 @@ fn index_file_with_resolution_inputs(
     let mut tag_definitions = extract_tag_definitions(compiled_rules, &tree, source)?;
     let declaration_span_overrides =
         collect_declaration_span_overrides(language_config.language_name, &tree, source);
+    let native_callable_names =
+        native_declarators::callable_names(language_config.language_name, &tree, source);
 
     let mut variables = Variables::new();
     if let Some(info) = &compilation_info {
@@ -15853,6 +15817,9 @@ fn index_file_with_resolution_inputs(
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
+    // A canonical reference node can represent multiple same-line calls.
+    // Keep each graph capture's address until its individual edge is built.
+    let mut graph_capture_spans = HashMap::new();
     let line_offsets = LineOffsets::new(source);
     let mut unique_nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut component_access_by_node_id: HashMap<NodeId, AccessKind> = HashMap::new();
@@ -15892,6 +15859,19 @@ fn index_file_with_resolution_inputs(
                 "rust_impl_expr" => rust_impl_expr = true,
                 _ => {}
             }
+        }
+        if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) =
+            (start_row, start_col, end_row, end_col)
+        {
+            graph_capture_spans.insert(
+                node_id,
+                GraphNodeSpan {
+                    start_line: start_row + 1,
+                    start_col: start_col + 1,
+                    end_line: end_row + 1,
+                    end_col: end_col + 1,
+                },
+            );
         }
         if canonical_role == CanonicalNodeRole::Unspecified {
             canonical_role = if reference_graph_nodes.contains(&node_id) {
@@ -15948,6 +15928,21 @@ fn index_file_with_resolution_inputs(
             let mut start_col_1 = start_col.map(|v| v + 1).unwrap_or(1);
             let mut end_line_1 = end_row.map(|v| v + 1).unwrap_or(start_line);
             let mut end_col_1 = end_col.map(|v| v + 1).unwrap_or(start_col_1);
+            if matches!(language_config.language_name, "c" | "cpp") && kind == NodeKind::FUNCTION {
+                let span = GraphNodeSpan {
+                    start_line,
+                    start_col: start_col_1,
+                    end_line: end_line_1,
+                    end_col: end_col_1,
+                };
+                if let Some(name) = native_callable_names.get(&span) {
+                    // A missing name on a definition is unknown. Other
+                    // function-shaped captures (prototypes, lambdas) retain
+                    // their own syntax-specific extraction.
+                    let Some(name) = name else { continue };
+                    name_str.clone_from(name);
+                }
+            }
             if let Some((
                 normalized_name,
                 normalized_start_line,
@@ -16130,6 +16125,16 @@ fn index_file_with_resolution_inputs(
         &mut unique_nodes,
         symbol_table.as_ref(),
     );
+    let runtime_import_call_spans = runtime_import_specs
+        .iter()
+        .flat_map(|spec| spec.exact_bare_call_target_spans.iter().copied())
+        .collect::<HashSet<_>>();
+    let private_call_spans = if matches!(language_config.language_name, "javascript" | "typescript")
+    {
+        languages::javascript::private_name_call_spans(&tree, source)
+    } else {
+        HashSet::new()
+    };
 
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
@@ -16220,6 +16225,24 @@ fn index_file_with_resolution_inputs(
             }
             if let Some(marker) = callsite_marker {
                 append_callsite_marker(&mut edge, marker);
+            }
+            if edge.kind == EdgeKind::CALL
+                && let Some(span) = graph_capture_spans.get(&sink_ref)
+            {
+                for (spans, marker) in [
+                    (
+                        &runtime_import_call_spans,
+                        languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER,
+                    ),
+                    (
+                        &private_call_spans,
+                        languages::javascript::PRIVATE_NAME_CALLSITE_MARKER,
+                    ),
+                ] {
+                    if spans.contains(span) {
+                        append_callsite_marker(&mut edge, marker);
+                    }
+                }
             }
             if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
                 continue;
@@ -16322,13 +16345,6 @@ fn index_file_with_resolution_inputs(
         &runtime_import_specs,
         &unique_nodes,
         file_id,
-        &mut result_edges,
-        &mut edge_keys,
-        flags,
-    );
-    annotate_exact_runtime_import_bare_calls(
-        &runtime_import_specs,
-        &unique_nodes,
         &mut result_edges,
         &mut edge_keys,
         flags,

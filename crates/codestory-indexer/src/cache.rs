@@ -478,6 +478,15 @@ pub(crate) fn build_index_artifact_cache_key(
     mix_str(&mut state, language_config.language_name);
     mix_str(&mut state, language_config.graph_query);
     mix_optional_str(&mut state, language_config.tags_query);
+    // Rust-side callable identity/scope extraction changed independently of the
+    // graph rules. Invalidate affected languages without discarding unrelated
+    // parser artifacts or changing the shared cache serialization schema.
+    if matches!(
+        language_config.language_name,
+        "c" | "cpp" | "javascript" | "typescript"
+    ) {
+        mix_str(&mut state, "callable-identity-and-scope-v3");
+    }
     mix_bool(&mut state, legacy_edge_identity);
     mix_bool(&mut state, lazy_graph_execution);
     mix_compilation_info(&mut state, root, compilation_info)?;
@@ -775,6 +784,68 @@ mod tests {
             String::from_utf8_lossy(b"/* \x81 */")
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn parser_cache_key_invalidates_changed_callable_extraction_rules() {
+        for extension in ["c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let key = |config: &crate::LanguageConfig| {
+                build_index_artifact_cache_key(
+                    Path::new("project"),
+                    Path::new("source"),
+                    b"unchanged source",
+                    config,
+                    None,
+                    false,
+                    true,
+                )
+                .expect("portable cache key")
+            };
+            let current = key(&config);
+            let old_config = crate::LanguageConfig {
+                graph_query: "(older_callable_rule)",
+                ..config
+            };
+            assert_ne!(
+                current,
+                key(&old_config),
+                "{extension} must not reuse the old projection"
+            );
+        }
+    }
+
+    #[test]
+    fn callable_scope_cache_revision_is_limited_to_affected_languages() {
+        for extension in ["c", "cpp", "js", "ts", "tsx", "rs", "py"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let cache_path = Path::new("source");
+            let source = b"unchanged source";
+            // Reconstruct the previously shipped key, with identical grammar
+            // and source bytes, to test Rust-side extraction invalidation.
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, cache_path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current = build_index_artifact_cache_key(
+                root, cache_path, source, &config, None, false, true,
+            )
+            .expect("cache key");
+            assert_eq!(
+                current == previous,
+                matches!(extension, "rs" | "py"),
+                "{extension}"
+            );
+        }
     }
 
     #[test]
