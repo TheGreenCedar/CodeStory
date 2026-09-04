@@ -11,9 +11,11 @@ export const ANALYSIS_FILES = ["scripts/codestory-etr1-validate.mjs",
 
 // This is the complete child environment, not a filtered description of a
 // larger inherited environment. Unlisted settings cannot affect the child.
+const platformEnvironment = process.platform === "darwin"
+  ? { __CF_USER_TEXT_ENCODING: process.env.__CF_USER_TEXT_ENCODING } : {};
 export function executionEnvironment(env) {
-  return Object.fromEntries(Object.entries(env).filter(([key, value]) => typeof value === "string"
-    && /^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z_]+|DEVELOPER_DIR|SDKROOT|OMP_NUM_THREADS|VECLIB_MAXIMUM_THREADS|CODESTORY_[A-Z_]+|XDG_CACHE_HOME|DYLD_LIBRARY_PATH)$/u.test(key)
+  return Object.fromEntries(Object.entries({ ...platformEnvironment, ...env }).filter(([key, value]) => typeof value === "string"
+    && /^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z_]+|DEVELOPER_DIR|SDKROOT|OMP_NUM_THREADS|VECLIB_MAXIMUM_THREADS|CODESTORY_[A-Z_]+|XDG_CACHE_HOME|DYLD_LIBRARY_PATH|__CF_USER_TEXT_ENCODING)$/u.test(key)
     && !/TOKEN|SECRET|PASSWORD|CREDENTIAL/u.test(key)).sort(([a], [b]) => a.localeCompare(b)));
 }
 

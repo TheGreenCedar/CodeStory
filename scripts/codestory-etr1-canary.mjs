@@ -66,6 +66,7 @@ async function main() {
   await writeFile(validationPath, JSON.stringify({ contract: "codestory.etr1-validation/v1",
     authority: "synthetic_canary_only", experiment_status: "valid", decision: "not_evaluated",
     annotation_access: "not_accessed", run: runBinding, execution: execution.binding,
+    document_completion: validated.document_completion,
     binary_sha256: validated.run.build.binary_sha256 }), { flag: "wx", mode: 0o600 });
   // Synthetic truth enters only after the real paired run and validator finish.
   const first = preparation.fragments[0];

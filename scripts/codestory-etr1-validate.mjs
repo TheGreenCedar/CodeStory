@@ -212,6 +212,24 @@ export function parseEvents(bytes) {
   });
 }
 
+// The pinned diagnostic encodes consecutive document batches of sixteen.
+// Reconcile its independently captured progress with every native completion;
+// a digest alone cannot establish that a log contains the required events.
+export function validateDocumentCompletions({ eventsBytes, stderrBytes, recordCount }) {
+  assert.ok(Number.isSafeInteger(recordCount) && recordCount > 0);
+  const events = parseEvents(eventsBytes);
+  const progress = [...stderrBytes.toString("utf8").matchAll(/^encoded (\d+)\/(\d+) records; batch_ms=(\d+)$/gmu)];
+  const expectedBatches = Math.ceil(recordCount / 16);
+  assert.equal(events.length, expectedBatches, "document native completion count changed");
+  assert.equal(progress.length, expectedBatches, "document batch progress count changed");
+  progress.forEach((entry, index) => {
+    assert.equal(Number(entry[1]), Math.min((index + 1) * 16, recordCount), "document batch partition changed");
+    assert.equal(Number(entry[2]), recordCount, "document record total changed");
+  });
+  return { batches: events.length, records: recordCount,
+    completed_tokens: events.reduce((sum, event) => sum + Number(event.details.completed_tokens), 0) };
+}
+
 async function loadSourceFiles(repository, repositoryFragments) {
   const root = await realpath(repository.local_root), result = new Map();
   for (const relative of new Set(repositoryFragments.map((fragment) => fragment.path))) {
@@ -248,7 +266,7 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot, executionB
   const { request: runnerRequest, receipt: runnerExecution } = await validateExecution(executionBinding,
     { role: "paired_run", input: run.preparation, output: runBinding, sourceRoot, authority: run.authority });
   assert.equal(runnerRequest.executable.sha256, run.build.binary_sha256, "run producer changed");
-  const { request: documentRequest } = await validateExecution(run.document_execution,
+  const { request: documentRequest, receipt: documentExecution } = await validateExecution(run.document_execution,
     { role: "documents", input: preparation.embedding_input, output: run.fragment_vectors, sourceRoot, authority: run.authority });
   assert.equal(preparation.contract, "codestory.etr1-preparation/v1");
   assert.equal(preparation.authority, run.authority);
@@ -295,6 +313,9 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot, executionB
   validateEngine(vectorArtifact.final_engine);
   assert.equal(vectorArtifact.initial_engine.server_instance_id, vectorArtifact.final_engine.server_instance_id);
   assert.equal(vectorArtifact.records.length, preparation.fragments.length, "document vector count changed");
+  const document_completion = validateDocumentCompletions({
+    eventsBytes: await boundBytes(documentExecution.events),
+    stderrBytes: await boundBytes(documentExecution.stderr), recordCount: preparation.fragments.length });
   const documentVectors = new Map();
   vectorArtifact.records.forEach((record, index) => {
     const fragment = preparation.fragments[index];
@@ -348,7 +369,7 @@ export async function validateEtr1({ runBinding, runPath, sourceRoot, executionB
     [...batches.values()].reduce((sum, batch) => sum + batch.completed_tokens, 0),
   "qualification token total changed");
   return { run, preparation, rows, source_commit: sourceCommit, source_tree: sourceTree,
-    batch_count: batches.size, query_count: rows.reduce((sum, row) =>
+    document_completion, batch_count: batches.size, query_count: rows.reduce((sum, row) =>
       sum + row.control.search_count + row.candidate.search_count, 0) };
 }
 
@@ -377,6 +398,7 @@ async function main() {
       binary_sha256: validated.run.build.binary_sha256,
       preparation_sha256: validated.run.preparation.sha256,
       fragment_vectors_sha256: validated.run.fragment_vectors.sha256,
+      document_completion: validated.document_completion,
       row_count: validated.rows.length, batch_count: validated.batch_count,
       query_count: validated.query_count, source_address_validity: 1 };
   } catch (error) {

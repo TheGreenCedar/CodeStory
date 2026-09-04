@@ -6,7 +6,7 @@ import path from "node:path";
 import { authenticateFragment, encodedCandidateInput, evaluateArm, exactPublicBytes, fragmentId,
   LIMITS, maximizeCoveredAtoms, scoreOrder, selectSuccessors, sha256 } from "../lib/etr1-evidence.mjs";
 import { validateArm, validateDocumentVectorRecord, validateEngine,
-  validatePreAnnotationBoundary, parseEvents } from "../codestory-etr1-validate.mjs";
+  validatePreAnnotationBoundary, parseEvents, validateDocumentCompletions } from "../codestory-etr1-validate.mjs";
 import { decision, evaluateEtr1, gateOne, gateTwo } from "../codestory-etr1-evaluate.mjs";
 import { fileBinding, readExecutionBinding, validateExecution, executionEnvironment,
   validateCanaryGate } from "../lib/etr1-execution.mjs";
@@ -152,8 +152,25 @@ test("execution uses only its recorded secret-free process environment", () => {
   const env = executionEnvironment({ PATH: "/bin", HOME: "/users/test", OMP_NUM_THREADS: "4",
     CODESTORY_CACHE_ROOT: "/cache", API_TOKEN: "private", NODE_OPTIONS: "--require bad.cjs",
     UNRELATED: "hidden" });
-  assert.deepEqual(env, { CODESTORY_CACHE_ROOT: "/cache", HOME: "/users/test",
+  assert.deepEqual(env, { ...executionEnvironment({}), CODESTORY_CACHE_ROOT: "/cache", HOME: "/users/test",
     OMP_NUM_THREADS: "4", PATH: "/bin" });
+});
+
+test("document completions reconcile every fixed diagnostic batch before annotations", () => {
+  const event = (i) => JSON.stringify({ schema_version: 1, sequence: 0,
+    action: "completed_tokens", status: "completed", server_event_sequence: i + 10, clock: {},
+    details: { native_completion_sequence: String(i), completed_tokens: "25", request_id: `doc-${i}` } });
+  const eventsBytes = Buffer.from(`${event(1)}\n${event(2)}\n`);
+  const stderrBytes = Buffer.from("encoded 16/17 records; batch_ms=1\nencoded 17/17 records; batch_ms=2\n");
+  const input = { eventsBytes, stderrBytes, recordCount: 17 };
+  assert.deepEqual(validateDocumentCompletions(input), { batches: 2, records: 17, completed_tokens: 50 });
+  for (const changed of [
+    { eventsBytes: Buffer.from(`${event(1)}\n`) },
+    { eventsBytes: Buffer.alloc(0) },
+    { stderrBytes: Buffer.from("encoded 16/17 records; batch_ms=1\n") },
+    { stderrBytes: Buffer.from("encoded 15/17 records; batch_ms=1\nencoded 17/17 records; batch_ms=2\n") },
+    { recordCount: 18 },
+  ]) assert.throws(() => validateDocumentCompletions({ ...input, ...changed }));
 });
 
 test("corpus launch requires a completed identity-matched canary before model access", async () => {
