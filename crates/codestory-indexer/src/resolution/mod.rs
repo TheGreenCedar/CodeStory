@@ -1291,6 +1291,7 @@ fn semantic_lookup_from_row<'a>(
 
 fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResolutionRequestKey> {
     if semantic_language_bucket(lookup.file_path).is_none()
+        || is_js_private_name_call(lookup.edge_kind, lookup.callsite_identity)
         || is_python_dotted_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_cpp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_js_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
@@ -1316,6 +1317,15 @@ fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResol
         file_path: lookup.file_path.map(str::to_string),
         target_name: semantic_request_target_name(lookup),
     })
+}
+
+fn is_js_private_name_call(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    edge_kind == EdgeKind::CALL
+        && callsite_identity.is_some_and(|identity| {
+            identity
+                .split('|')
+                .any(|part| part == crate::languages::javascript::PRIVATE_NAME_CALLSITE_MARKER)
+        })
 }
 
 fn semantic_request_target_name(lookup: &SemanticEdgeLookup<'_>) -> String {
