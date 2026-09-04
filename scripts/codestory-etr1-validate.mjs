@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { validateExecution } from "./lib/etr1-execution.mjs";
 import { authenticateFragment, encodedCandidateInput, f32Dot, fragmentId, LIMITS,
-  scoreOrder, selectSuccessors, sha256, validateVector } from "./lib/etr1-evidence.mjs";
+  scoreOrder, selectSuccessors, sha256, validateVector, sourceLines } from "./lib/etr1-evidence.mjs";
 
 const FIXED = Object.freeze({ parent: "c9c935d87129a79f326b650bbf23d73191df8b4f",
   fragment_diagnostic: "ca185ed13c635bbb4b64cc6760c5025799700359ebcc4dd3bcc53e34f8cf9194",
@@ -36,7 +36,7 @@ async function boundJson(binding, expectedPath) {
 
 export function renderSnippet(fragment) {
   let result = "```text\n";
-  const lines = fragment.source.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+  const lines = sourceLines(fragment.source);
   lines.forEach((line, offset) => {
     result += ` ${String(fragment.line_range.start + offset).padStart(5)} | ${line.replace(/[\r\n]+$/u, "")}\n`;
   });

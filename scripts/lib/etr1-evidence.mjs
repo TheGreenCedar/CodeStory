@@ -6,6 +6,10 @@ export const LIMITS = Object.freeze({ rows: 16, bytes: 16 * 1024, seeds: 16,
 
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
+// Match Rust split_inclusive('\n'): CR and Unicode separators remain source,
+// never additional boundaries or reasons to discard text.
+export const sourceLines = (source) => source.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+
 export function fragmentId(fragment) {
   const framed = [];
   for (const value of [fragment.project_id, fragment.path, fragment.content_digest]) {
@@ -56,7 +60,7 @@ export function selectSuccessors(order, seeds, prior, limit = LIMITS.successorsP
 export function encodedCandidateInput(question, source, removedTrailingLines) {
   assert.ok(Number.isSafeInteger(removedTrailingLines) && removedTrailingLines >= 0,
     "invalid removed-line count");
-  const lines = source.match(/.*(?:\n|$)/gu).filter(Boolean);
+  const lines = sourceLines(source);
   assert.ok(lines.length > removedTrailingLines, "all seed lines were removed");
   const retained = lines.slice(0, lines.length - removedTrailingLines).join("");
   assert.ok(retained.trim(), "retained seed source is empty");

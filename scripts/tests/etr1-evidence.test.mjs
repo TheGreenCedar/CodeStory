@@ -94,6 +94,10 @@ test("candidate input shortening preserves UTF-8 and complete trailing lines", (
   const source = "first α\nsecond β\nthird γ\n";
   assert.equal(encodedCandidateInput("question", source, 1), "question\n\nfirst α\nsecond β\n");
   assert.throws(() => encodedCandidateInput("question", source, 3));
+  const mixed = "first α\r\nsecond\u2028β\u2029line\nlast\rinside";
+  assert.equal(encodedCandidateInput("question", mixed, 0), `question\n\n${mixed}`);
+  assert.equal(encodedCandidateInput("question", mixed, 1), "question\n\nfirst α\r\nsecond\u2028β\u2029line\n");
+  assert.equal(encodedCandidateInput("question", mixed, 2), "question\n\nfirst α\r\n");
 });
 
 test("validator uses native completion identity for automatic token events", () => {
