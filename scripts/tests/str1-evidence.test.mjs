@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { structuralFrontier, validateStructuralGraph } from "../lib/str1-evidence.mjs";
+import { STR_FIXED, assertStrInputs, assertStrRequest } from "../lib/str1-execution.mjs";
+import { sha256 } from "../lib/etr1-evidence.mjs";
 
 const fixture = () => ({
   nodes: [
@@ -52,4 +54,26 @@ test("empty and naturally underfilled frontiers are retained; IDs alone break sc
   assert.deepEqual(structuralFrontier(graph, ["seed"], scores).successors, ["f01", "f00"]);
   assert.deepEqual(structuralFrontier(graph, ["seed"], new Map([["seed", 0], ["f00", 1], ["f01", 1]])).successors,
     ["f00", "f01"]);
+});
+
+test("frozen experiment inputs cannot be replaced by self-declared method or core identities", () => {
+  const job={method:{sha256:STR_FIXED.method},preparation:{sha256:STR_FIXED.preparation},vectors:{sha256:STR_FIXED.vectors},
+    control_run:{sha256:STR_FIXED.control},graph_inputs:{sha256:STR_FIXED.graph_inputs}};
+  const preparation={authority:"visible_development_frontier_only"};
+  assertStrInputs(job,preparation,{sha256:STR_FIXED.validation});
+  for(const field of Object.keys(job)) {const changed=structuredClone(job);changed[field].sha256="f".repeat(64);
+    assert.throws(()=>assertStrInputs(changed,preparation,{sha256:STR_FIXED.validation}));}
+  assert.throws(()=>assertStrInputs(job,preparation,{sha256:"f".repeat(64)}));
+});
+
+test("request contract, argv, context and independently frozen request binding are required", () => {
+  const job={path:"/external/job.json",sha256:"1".repeat(64),bytes:12},binding={path:"/external/request.json",sha256:"2".repeat(64),bytes:99};
+  const request={contract:"codestory.str1-execution-request/v1",job,cwd:"/source",environment:{LANG:"C"},args:["--job",job.path]};
+  request.context_sha256=sha256(JSON.stringify({cwd:request.cwd,environment:request.environment}));
+  assertStrRequest(request,binding,binding);
+  for(const mutate of [r=>{r.contract="fake";},r=>{r.environment.LANG="changed";},r=>{r.args=["--job","/other"]; }]) {
+    const changed=structuredClone(request);mutate(changed);assert.throws(()=>assertStrRequest(changed,binding,binding));
+  }
+  assert.throws(()=>assertStrRequest(request,{...binding,sha256:"3".repeat(64)},binding));
+  assert.throws(()=>assertStrRequest(request,binding,undefined));
 });

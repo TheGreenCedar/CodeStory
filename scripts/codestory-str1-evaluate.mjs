@@ -29,7 +29,7 @@ export function aggregateStrRows(rows) {
 
 export async function evaluateStr1({validation,annotations,oracle,sourceRoot}) {
   const prior=await readExecutionBinding(validation);assert.equal(prior.experiment_status,"valid");assert.equal(prior.annotation_access,"not_accessed");
-  const checked=await validateStr1({execution:prior.execution,graphExecution:prior.graph_execution,controlValidation:prior.control_validation,
+  const checked=await validateStr1({execution:prior.execution,executionRequest:prior.execution_request,graphExecution:prior.graph_execution,graphRequest:prior.graph_request,controlValidation:prior.control_validation,
     controlSourceRoot:prior.control_source_root,reconstructionRoot:prior.reconstruction_root,sourceRoot});
   assert.deepEqual(checked.validation,prior,"validation receipt changed");
   // First annotations read, after full native/control reconstruction.

@@ -48,16 +48,21 @@ async function main() {
   const runJob=await writeJob("run",{operation:"run",preparation,method,graphs:graphExecution.receipt.output,vectors,control_run:controlRun,state_root:query.state,cancel_file:cancelFile,output:runDir});
   const execution=await executeStr({binary,jobPath:runJob,directory:path.join(root,"run-execution"),sourceRoot,env:query.env});
   assert.equal(execution.receipt.experiment_status,"completed");
-  const validated=await validateStr1({execution:execution.binding,graphExecution:graphExecution.binding,sourceRoot,controlValidation,controlSourceRoot:sourceRoot,reconstructionRoot:root});
+  const validated=await validateStr1({execution:execution.binding,executionRequest:execution.request,graphExecution:graphExecution.binding,graphRequest:graphExecution.request,sourceRoot,controlValidation,controlSourceRoot:sourceRoot,reconstructionRoot:root});
   assert.ok(validated.run.rows.some(row=>row.candidate.steps.some(step=>step.eligible.length>8)),"canary did not exercise overflow");
   assert.deepEqual(validated.run.rows.map(r=>r.seed_fragment_ids.length),[16,1,0]);
   const validationPath=path.join(root,"validation.json");await writeFile(validationPath,JSON.stringify(validated.validation),{flag:"wx",mode:0o600});
   const validation=await fileBinding(validationPath);
   const first=p.fragments[0],truth={authority:"synthetic_canary_only",cases:p.wordings.map(row=>({case_id:row.case_id,acceptable_sets:[{set_id:"first",required_relation_atoms:[],required_source_atoms:[{atom_id:"first",source_range:{path:first.path,content_digest:first.content_digest,byte_range:first.byte_range,line_range:first.line_range}}]}]}))};
   const truthPath=path.join(root,"annotations.json");await writeFile(truthPath,JSON.stringify(truth),{flag:"wx",mode:0o600});
-  const evaluated=await evaluateStr1({validation,annotations:await fileBinding(truthPath),sourceRoot});
+  const annotations=await fileBinding(truthPath);
+  const evaluated=await evaluateStr1({validation,annotations,sourceRoot});
   assert.deepEqual(evaluated.rows.map(row=>row.candidate.recall),[1,1,0]);
-  const receiptPath=path.join(root,"receipt.json");await writeFile(receiptPath,JSON.stringify({contract:"codestory.str1-canary/v1",authority:"synthetic_canary_only",experiment_status:"valid",binary:await fileBinding(binary),analysis:await strIdentity(sourceRoot),validation,evaluated}),{flag:"wx",mode:0o600});
+  const args=["--test","scripts/tests/str1-evidence.test.mjs"];
+  const stdout=execFileSync(process.execPath,args,{cwd:sourceRoot,encoding:"utf8",timeout:60_000});
+  const hostileOutput=path.join(root,"hostile-output.json");await writeFile(hostileOutput,JSON.stringify({stdout}),{flag:"wx",mode:0o600});
+  const hostilePath=path.join(root,"hostile.json");await writeFile(hostilePath,JSON.stringify({exit_code:0,args,node:await fileBinding(process.execPath),test_source:await fileBinding(path.join(sourceRoot,"scripts/tests/str1-evidence.test.mjs")),output:await fileBinding(hostileOutput)}),{flag:"wx",mode:0o600});
+  const receiptPath=path.join(root,"receipt.json");await writeFile(receiptPath,JSON.stringify({contract:"codestory.str1-canary/v1",authority:"synthetic_canary_only",experiment_status:"valid",binary:await fileBinding(binary),analysis:await strIdentity(sourceRoot),validation,annotations,evaluated,hostile:await fileBinding(hostilePath)}),{flag:"wx",mode:0o600});
   console.log(JSON.stringify(await fileBinding(receiptPath)));
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{console.error(e.stack);process.exitCode=1;});

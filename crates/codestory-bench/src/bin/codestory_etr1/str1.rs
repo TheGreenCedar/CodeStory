@@ -55,6 +55,8 @@ struct Job {
     preparation: FileBinding,
     method: FileBinding,
     #[serde(default)]
+    graph_inputs: Option<FileBinding>,
+    #[serde(default)]
     graph_preparations: BTreeMap<String, FileBinding>,
     #[serde(default)]
     graphs: Option<FileBinding>,
@@ -66,6 +68,117 @@ struct Job {
     state_root: Option<PathBuf>,
     cancel_file: PathBuf,
     output: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphInput {
+    repository_id: String,
+    preparation: FileBinding,
+    core: FileBinding,
+    pointer: FileBinding,
+}
+#[derive(Debug, Deserialize)]
+struct GraphInputs {
+    repositories: Vec<GraphInput>,
+}
+
+fn fixed_inputs(job: &Job, preparation: &Etr1PreparationV1) -> Result<Vec<GraphInput>> {
+    ensure!(
+        job.method.sha256 == "0902f8f8f6771fce5c6addf09bbdef061fd3706be0da050c32baead80fb171fc",
+        "unregistered_structural_method"
+    );
+    read_bound_json::<Value>(&job.method)?;
+    if preparation.authority == "synthetic_canary_only" {
+        ensure!(
+            preparation.repositories.len() == 1
+                && preparation.fragments.len() == 32
+                && preparation.wordings.len() == 3,
+            "invalid_canary_shape"
+        );
+        return Ok(Vec::new());
+    }
+    ensure!(
+        preparation.authority == "visible_development_frontier_only",
+        "invalid_structural_authority"
+    );
+    ensure!(
+        job.preparation.sha256
+            == "30b84d4d848f96bd4fe799f2e0f28b9114971da0e47bf98ebe54fe36242199fd",
+        "unregistered_preparation"
+    );
+    let binding = job
+        .graph_inputs
+        .as_ref()
+        .context("graph_input_freeze_missing")?;
+    ensure!(
+        binding.sha256 == "668c990ee29b25a4bab0cb03e048d70eebd8ffe3dd62317d69b2e58b912a2c9f",
+        "unregistered_graph_inputs"
+    );
+    let inputs: GraphInputs = read_bound_json(binding)?;
+    let expected = preparation
+        .repositories
+        .iter()
+        .map(|r| r.repository_id.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        inputs.repositories.len() == expected.len()
+            && inputs
+                .repositories
+                .iter()
+                .map(|r| r.repository_id.as_str())
+                .collect::<BTreeSet<_>>()
+                == expected,
+        "graph_repository_set_changed"
+    );
+    for input in &inputs.repositories {
+        for file in [&input.preparation, &input.core, &input.pointer] {
+            ensure!(
+                bind_file(&file.path, Some(&file.sha256))? == *file,
+                "graph_input_changed"
+            );
+        }
+        let wal = PathBuf::from(format!("{}-wal", input.core.path.display()));
+        ensure!(
+            !wal.exists() || fs::metadata(wal)?.len() == 0,
+            "unbound_graph_wal"
+        );
+        if job.operation == "export_graphs" {
+            ensure!(
+                job.graph_preparations.get(&input.repository_id) == Some(&input.preparation),
+                "unregistered_graph_preparation"
+            );
+        }
+    }
+    if let Some(vectors) = &job.vectors {
+        ensure!(
+            vectors.sha256 == "7f604b30b823066bd5b0ed71106d10577c28495abd270444bc8ad5b7a63cb70a",
+            "unregistered_vectors"
+        );
+    }
+    if let Some(control) = &job.control_run {
+        ensure!(
+            control.sha256 == "c14da697d03707c0096f5f2fd7a97bff2ab5b4a6f9326c4a9a03da2066d545f2",
+            "unregistered_control"
+        );
+    }
+    Ok(inputs.repositories)
+}
+
+fn authenticate_graph_input(graph: &Graph, inputs: &[GraphInput]) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let input = inputs
+        .iter()
+        .find(|i| i.repository_id == graph.repository_id)
+        .context("unregistered_graph")?;
+    ensure!(
+        graph.core == input.core
+            && graph.preparation == input.preparation
+            && graph.core_pointer == read_bound_json::<Value>(&input.pointer)?,
+        "graph_authority_changed"
+    );
+    Ok(())
 }
 
 fn overlaps(fragment: &FrozenFragmentV1, path: &str, start: u32, end: u32) -> bool {
@@ -345,6 +458,7 @@ pub fn execute(job_path: &Path) -> Result<()> {
     let job: Job = read_bound_json(&job_binding)?;
     let control = RunControl::new(&job.cancel_file)?;
     let preparation: Etr1PreparationV1 = read_bound_json(&job.preparation)?;
+    let graph_inputs = fixed_inputs(&job, &preparation)?;
     let build = build_identity()?;
     ensure!(!build.source_dirty, "dirty_structural_binary");
     bind_file(&job.method.path, Some(&job.method.sha256))?;
@@ -402,13 +516,15 @@ pub fn execute(job_path: &Path) -> Result<()> {
         let mut graphs = Vec::new();
         for repository in &preparation.repositories {
             control.check()?;
-            graphs.push(graph_for(
+            let graph = graph_for(
                 repository,
                 &preparation.fragments,
                 job.graph_preparations
                     .get(&repository.repository_id)
                     .context("graph_preparation_missing")?,
-            )?);
+            )?;
+            authenticate_graph_input(&graph, &graph_inputs)?;
+            graphs.push(graph);
         }
         write_exclusive(
             &stage.path().join("graphs.json"),
@@ -429,6 +545,7 @@ pub fn execute(job_path: &Path) -> Result<()> {
     let graphs: Vec<Graph> = serde_json::from_value(graph_value["graphs"].clone())?;
     let mut core_pins = Vec::new();
     for graph in &graphs {
+        authenticate_graph_input(graph, &graph_inputs)?;
         let prepared: Value = read_bound_json(&graph.preparation)?;
         let pin = CoreReadSession::pin(Path::new(
             prepared["storage_path"]
@@ -447,7 +564,7 @@ pub fn execute(job_path: &Path) -> Result<()> {
         }
     }
     let vector_binding = job.vectors.as_ref().context("vectors_missing")?;
-    let (_, _, vectors) =
+    let (_, vector_artifact, vectors) =
         load_vector_artifact(&vector_binding.path, &vector_binding.sha256, &preparation)?;
     let control_binding = job.control_run.as_ref().context("control_run_missing")?;
     let frozen: Etr1RunManifestV1 = read_bound_json(control_binding)?;
@@ -458,7 +575,7 @@ pub fn execute(job_path: &Path) -> Result<()> {
     let frozen_rows = frozen
         .rows
         .iter()
-        .map(read_bound_json::<Etr1WordingResultV1>)
+        .map(read_bound_json::<Value>)
         .collect::<Result<Vec<_>>>()?;
     let runtime = SidecarRuntimeConfig::local();
     let events_path =
@@ -466,6 +583,13 @@ pub fn execute(job_path: &Path) -> Result<()> {
     codestory_cli::install_native_embedding_client_transport()?;
     let mut residency = PerUserEmbeddingClient::for_runtime(&runtime)?.acquire_residency_lease()?;
     let initial_engine = engine_receipt(residency.identity())?;
+    for key in ["model_digest", "ggml_build_identity"] {
+        ensure!(
+            initial_engine[key] == frozen.initial_engine[key]
+                && initial_engine[key] == vector_artifact.initial_engine[key],
+            "structural_cross_engine_mismatch:{key}"
+        );
+    }
     let client = ProductEmbeddingClient::new(&runtime);
     let fragments = preparation
         .fragments
@@ -573,11 +697,16 @@ pub fn execute(job_path: &Path) -> Result<()> {
         let wall = started.elapsed().as_nanos() as u64;
         let old = frozen_rows
             .iter()
-            .find(|r| r.case_id == wording.case_id && r.phrasing_id == wording.phrasing_id)
+            .position(|r| {
+                r["case_id"] == wording.case_id && r["phrasing_id"] == wording.phrasing_id
+            })
             .context("frozen_control_row_missing")?;
-        ensure!(old.seed_fragment_ids == seeds, "control_seed_mismatch");
+        ensure!(
+            frozen_rows[old]["seed_fragment_ids"] == serde_json::to_value(&seeds)?,
+            "control_seed_mismatch"
+        );
         rows.push(json!({"case_id":wording.case_id,"phrasing_id":wording.phrasing_id,"group":wording.group,"repository_id":wording.repository_id,
-            "question_sha256":wording.question_sha256,"seed_fragment_ids":seeds,"control":old.control,
+            "question_sha256":wording.question_sha256,"seed_fragment_ids":seeds,"control_row":frozen.rows[old],
             "candidate":{"legally_selectable_pool":legal,"descriptor_pool":pool,"hydrated_pool":pool,"successors":successors,
             "steps":steps,"query_input":wording.question,"query_vector":query_vector,"scores":scores,"batch_receipts":batches,
             "source_authentication":authenticator.receipt,"timing":{"round_zero_bm25_ns":bm25,"seed_source_authentication_ns":seed_auth,

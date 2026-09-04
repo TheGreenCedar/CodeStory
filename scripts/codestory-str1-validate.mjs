@@ -3,14 +3,14 @@ import { execFileSync } from "node:child_process";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateStrExecution, readExecutionBinding, fileBinding, strIdentity } from "./lib/str1-execution.mjs";
+import { validateStrExecution, readExecutionBinding, fileBinding, strIdentity, assertStrInputs } from "./lib/str1-execution.mjs";
 import { structuralFrontier, validateStructuralGraph } from "./lib/str1-evidence.mjs";
 import { authenticateFragment, f32Dot, sha256, validateVector } from "./lib/etr1-evidence.mjs";
 import { parseEvents, validateEngine, validateEtr1 } from "./codestory-etr1-validate.mjs";
 
-export async function validateStr1({execution,graphExecution,sourceRoot,controlValidation,controlSourceRoot,reconstructionRoot}) {
-  const external=await validateStrExecution(execution,sourceRoot);
-  const exported=await validateStrExecution(graphExecution,sourceRoot);
+export async function validateStr1({execution,executionRequest,graphExecution,graphRequest,sourceRoot,controlValidation,controlSourceRoot,reconstructionRoot}) {
+  const external=await validateStrExecution(execution,sourceRoot,executionRequest);
+  const exported=await validateStrExecution(graphExecution,sourceRoot,graphRequest);
   const run=await readExecutionBinding(external.receipt.output),graphOutput=await readExecutionBinding(exported.receipt.output);
   assert.equal(run.contract,"codestory.str1-run/v1");assert.equal(graphOutput.contract,"codestory.str1-graphs/v1");
   assert.equal(run.annotation_access,"not_accessed");assert.equal(graphOutput.annotation_access,"not_accessed");
@@ -30,6 +30,7 @@ export async function validateStr1({execution,graphExecution,sourceRoot,controlV
     allowCanary:old.authority==="synthetic_canary_only"});
   assert.deepEqual(run.control_run,old.run);assert.deepEqual(run.preparation,controls.run.preparation);
   assert.deepEqual(run.vectors,controls.run.fragment_vectors);
+  assertStrInputs(external.job,controls.preparation,controlValidation);
   // Re-export through the pinned read-session path; don't trust graph JSON
   // merely because someone also updated its digest.
   const reconstruction=await mkdtemp(path.join(reconstructionRoot,"str1-graph-reconstruction-"));
@@ -47,12 +48,19 @@ export async function validateStr1({execution,graphExecution,sourceRoot,controlV
   validateEngine(run.initial_engine);validateEngine(run.final_engine);
   for(const key of ["server_instance_id","load_generation","model_digest","ggml_build_identity"])
     assert.deepEqual(run.initial_engine[key],run.final_engine[key]);
+  for(const key of ["model_digest","ggml_build_identity"]) {
+    assert.deepEqual(run.initial_engine[key],controls.run.initial_engine[key]);
+    assert.deepEqual(run.initial_engine[key],vectors.initial_engine[key]);
+  }
   assert.equal(run.rows.length,preparation.wordings.length);
   for(let index=0;index<run.rows.length;index++) {
     const row=run.rows[index],wording=preparation.wordings[index],controlRow=controls.rows[index];
     for(const key of ["case_id","phrasing_id","repository_id","group","question_sha256"])
       assert.deepEqual(row[key],wording[key]);
-    assert.deepEqual(row.control,controlRow.control,"frozen control changed");
+    assert.deepEqual(row.control_row,controls.run.rows[index],"frozen control binding changed");
+    assert.equal(Object.hasOwn(row,"control"),false,"control must remain an immutable reference");
+    // Join only after authenticating the original row. Never republish its floats.
+    row.control=controlRow.control;
     assert.deepEqual(row.seed_fragment_ids,wording.seed_fragment_ids);
     const candidate=row.candidate,repository=preparation.repositories.find(r=>r.repository_id===row.repository_id);
     const graph=graphOutput.graphs.find(g=>g.repository_id===row.repository_id);
@@ -100,7 +108,7 @@ export async function validateStr1({execution,graphExecution,sourceRoot,controlV
   assert.equal(eventOrdinal,events.length);assert.ok(totalWall<=external.receipt.wall_ns,"request wall exceeds process wall");
   return {run,preparation,graphs:graphOutput.graphs,validation:{contract:"codestory.str1-validation/v1",
     experiment_status:"valid",decision:"not_evaluated",annotation_access:"not_accessed",authority:preparation.authority,
-    execution,graph_execution:graphExecution,control_validation:controlValidation,control_source_root:controlSourceRoot,
+    execution,execution_request:executionRequest,graph_execution:graphExecution,graph_request:graphRequest,control_validation:controlValidation,control_source_root:controlSourceRoot,
     reconstruction_root:reconstructionRoot,run:external.receipt.output,analysis:await strIdentity(sourceRoot),
     prepared_state_ns:totalWall,execution_wall_ns:external.receipt.wall_ns,outer_remainder_ns:external.receipt.wall_ns-totalWall}};
 }
