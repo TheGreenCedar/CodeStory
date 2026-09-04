@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use codestory_contracts::compilation::PacketCompilationPublicationV1;
+use codestory_retrieval::benchmark_support::{WitnessLexicalPin, pin_witness_lexical_sources};
 use codestory_runtime::benchmark_support::{
     WitnessSeamDescriptor, freeze_witness_descriptors, run_witness_seam,
 };
@@ -68,6 +69,8 @@ struct Manifest {
     phrasing_id: String,
     project_root: PathBuf,
     storage_path: PathBuf,
+    lexical_root: PathBuf,
+    lexical_input_hash: String,
     publication: PacketCompilationPublicationV1,
     descriptors: Vec<WitnessSeamDescriptor>,
     #[serde(default)]
@@ -211,12 +214,12 @@ fn prepare(project: &Path, output: &Path) -> Result<()> {
         project_root: project.clone(),
         storage_path,
         lexical_root,
-        lexical_input_hash,
+        lexical_input_hash: lexical_input_hash.clone(),
         lexical_coverage,
         publication: PacketCompilationPublicationV1 {
             project_id: codestory_workspace::project_identity_v3(&project).project_id,
             core_generation_id: pin.identity().generation_id.clone(),
-            retrieval_generation: None,
+            retrieval_generation: Some(lexical_input_hash),
         },
         core_pointer: pin.pointer().clone(),
     };
@@ -252,7 +255,7 @@ fn capture(
         "prepared core publication changed"
     );
     let layout = codestory_retrieval::SidecarLayout {
-        lexical_data_dir: prepared.lexical_root,
+        lexical_data_dir: prepared.lexical_root.clone(),
         semantic_data_dir: PathBuf::new(),
         scip_artifacts_root: PathBuf::new(),
         state_file: PathBuf::new(),
@@ -264,13 +267,24 @@ fn capture(
         question,
         16,
     )?;
-    let descriptors = freeze_witness_descriptors(&pin, &prepared.project_root, &hits)?;
+    let lexical = pin_witness_lexical_sources(
+        &prepared.lexical_root,
+        &pin.identity().generation_id,
+        &prepared.lexical_input_hash,
+        &hits
+            .iter()
+            .map(|hit| hit.file_path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let descriptors = freeze_witness_descriptors(&pin, &lexical, &prepared.project_root, &hits)?;
     let manifest = Manifest {
         contract: "codestory.witness-seam-input/v1".into(),
         case_id,
         phrasing_id,
         project_root: prepared.project_root,
         storage_path: prepared.storage_path,
+        lexical_root: prepared.lexical_root,
+        lexical_input_hash: prepared.lexical_input_hash.clone(),
         publication: prepared.publication,
         descriptors,
         capture: Some(json!({
@@ -295,8 +309,10 @@ fn replay(manifest_path: &Path, expected: &str, output: &Path) -> Result<()> {
     ensure!(!output.exists(), "receipt already exists");
     let manifest = read_manifest(manifest_path, expected)?;
     let pin = CoreReadSession::pin(&manifest.storage_path)?;
+    let lexical = manifest_lexical_pin(&manifest)?;
     let pair = run_witness_seam(
         &pin,
+        Some(&lexical),
         &manifest.project_root,
         &manifest.publication,
         &manifest.descriptors,
@@ -333,6 +349,24 @@ fn replay(manifest_path: &Path, expected: &str, output: &Path) -> Result<()> {
     Ok(())
 }
 
+fn manifest_lexical_pin(manifest: &Manifest) -> Result<WitnessLexicalPin> {
+    pin_witness_lexical_sources(
+        &manifest.lexical_root,
+        &manifest.publication.core_generation_id,
+        &manifest.lexical_input_hash,
+        &manifest
+            .descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                descriptor
+                    .path
+                    .as_ref()
+                    .map(|path| path.as_str().to_owned())
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +379,7 @@ mod tests {
             "contract": "codestory.witness-seam-input/v1", "case_id": "case-a",
             "phrasing_id": "original", "project_root": temp.path(),
             "storage_path": temp.path().join("codestory.db"),
+            "lexical_root": temp.path().join("lexical"), "lexical_input_hash": "hash",
             "publication": {"project_id": "p", "core_generation_id": "g", "retrieval_generation": null},
             "descriptors": [],
         });
@@ -405,12 +440,16 @@ mod tests {
         assert_eq!(manifest.descriptors.len(), 16);
         assert!(manifest.descriptors.iter().all(|candidate| matches!(
             candidate.anchor,
-            codestory_contracts::evidence_address::EvidenceAnchorV1::Match { .. }
-                | codestory_contracts::evidence_address::EvidenceAnchorV1::IndexedNode { .. }
+            Some(
+                codestory_contracts::evidence_address::EvidenceAnchorV1::Match { .. }
+                    | codestory_contracts::evidence_address::EvidenceAnchorV1::IndexedNode { .. }
+            )
         )));
         let pin = CoreReadSession::pin(&manifest.storage_path).unwrap();
+        let lexical = manifest_lexical_pin(&manifest).unwrap();
         let pair = run_witness_seam(
             &pin,
+            Some(&lexical),
             &manifest.project_root,
             &manifest.publication,
             &manifest.descriptors,
@@ -431,6 +470,21 @@ mod tests {
                 .all(|source| source.source.contains("needle"))
         );
         assert!(!output.join("runtime/models").exists());
+        for count in [0, 1, 15] {
+            let pair = run_witness_seam(
+                &pin,
+                Some(&lexical),
+                &manifest.project_root,
+                &manifest.publication,
+                &manifest.descriptors[..count],
+            )
+            .expect("natural retrieval underfill is preserved in both arms");
+            assert_eq!(pair.control_input.admissions.len(), count);
+            assert_eq!(
+                pair.control_input.admissions,
+                pair.addressed_input.admissions
+            );
+        }
         // A path result remains unaddressed rather than inventing a lexical match.
         let unaddressed = temp.path().join("path-capture.json");
         capture(
@@ -445,7 +499,111 @@ mod tests {
         let manifest = read_manifest(&unaddressed, &file_digest(&unaddressed).unwrap()).unwrap();
         assert!(manifest.descriptors.iter().any(|candidate| matches!(
             candidate.anchor,
-            codestory_contracts::evidence_address::EvidenceAnchorV1::PathOnly { .. }
+            Some(codestory_contracts::evidence_address::EvidenceAnchorV1::PathOnly { .. })
         )));
+        let pair = run_witness_seam(
+            &pin,
+            Some(&manifest_lexical_pin(&manifest).unwrap()),
+            &manifest.project_root,
+            &manifest.publication,
+            &manifest.descriptors,
+        )
+        .expect("missing source precision is an explicit gap, not a failed experiment");
+        assert!(!pair.addressed_input.admission_gaps.is_empty());
+        assert_eq!(
+            pair.control_input.admission_gaps,
+            pair.addressed_input.admission_gaps
+        );
+    }
+
+    #[test]
+    fn lexical_source_without_a_parser_file_is_authenticated_by_its_shard() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("lib.rs"), "pub fn ordinary() {}\n").unwrap();
+        std::fs::write(
+            project.join("guide.rst"),
+            format!("{}needle_document\n", "preamble\n".repeat(40)),
+        )
+        .unwrap();
+        let output = temp.path().join("prepared");
+        prepare(&project, &output).unwrap();
+        let preparation = output.join("prepared.json");
+        let captured = temp.path().join("capture.json");
+        capture(
+            &preparation,
+            &file_digest(&preparation).unwrap(),
+            "synthetic".into(),
+            "original".into(),
+            "needle_document",
+            &captured,
+        )
+        .unwrap();
+        let manifest = read_manifest(&captured, &file_digest(&captured).unwrap()).unwrap();
+        assert_eq!(manifest.descriptors.len(), 1);
+        let pin = CoreReadSession::pin(&manifest.storage_path).unwrap();
+        assert!(
+            pin.storage()
+                .get_file_by_path(&project.join("guide.rst"))
+                .unwrap()
+                .is_none()
+        );
+        let lexical = manifest_lexical_pin(&manifest).unwrap();
+        let pair = run_witness_seam(
+            &pin,
+            Some(&lexical),
+            &manifest.project_root,
+            &manifest.publication,
+            &manifest.descriptors,
+        )
+        .unwrap();
+        assert_eq!(pair.addressed_input.sources.len(), 1);
+        assert!(
+            pair.addressed_input.sources[0]
+                .source
+                .contains("needle_document")
+        );
+        let mut wrong = read_manifest(&captured, &file_digest(&captured).unwrap()).unwrap();
+        wrong.lexical_input_hash = "0".repeat(64);
+        assert!(
+            manifest_lexical_pin(&wrong).is_err(),
+            "a different lexical publication cannot authorize source"
+        );
+        std::fs::write(project.join("guide.rst"), "replaced\n").unwrap();
+        assert!(
+            run_witness_seam(
+                &pin,
+                Some(&lexical),
+                &manifest.project_root,
+                &manifest.publication,
+                &manifest.descriptors
+            )
+            .is_err()
+        );
+        let shard = manifest
+            .lexical_root
+            .join("shards")
+            .join(&manifest.publication.core_generation_id)
+            .join("lexical-index.sqlite3");
+        let mut permissions = std::fs::metadata(&shard).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&shard, permissions).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(shard)
+            .unwrap()
+            .set_len(16)
+            .unwrap();
+        assert!(
+            manifest_lexical_pin(&manifest).is_err(),
+            "component truncation invalidates its warm seal"
+        );
     }
 }

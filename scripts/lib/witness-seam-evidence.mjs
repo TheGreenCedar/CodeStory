@@ -117,20 +117,40 @@ export function verifyPairedInputs(receipt, manifest) {
   for (const input of [control, addressed]) {
     assert.deepEqual(input.publication, manifest.publication);
     assert.deepEqual(input.admissions, manifest.descriptors.map((value) => value.admission));
-    assert.equal(input.admissions.length, 16);
-    assert.equal(input.sources.length, 16);
+    assert.ok(input.admissions.length <= 16);
     assert.deepEqual(input.relations, []);
     assert.deepEqual(input.ambiguities, []);
-    assert.deepEqual(input.admission_gaps, []);
+    const sources = new Map(input.sources.map((source) => [source.stable_identity, source]));
+    const gaps = new Map(input.admission_gaps.map((gap) => [gap.stable_identity, gap]));
+    assert.equal(sources.size, input.sources.length, "duplicate hydrated identity");
+    assert.equal(gaps.size, input.admission_gaps.length, "duplicate source gap");
+    assert.equal(sources.size + gaps.size, input.admissions.length, "every admission needs source or a gap");
+    const orderedSources = [];
     input.admissions.forEach((admission, ordinal) => {
       assert.equal(admission.packet_ordinal, ordinal);
       assert.equal(admission.reserved_source_bytes, 512);
-      assert.equal(input.sources[ordinal].stable_identity, admission.stable_identity);
-      assert.ok(Buffer.byteLength(input.sources[ordinal].source) <= 512);
+      const source = sources.get(admission.stable_identity), gap = gaps.get(admission.stable_identity);
+      assert.ok(Boolean(source) !== Boolean(gap), "source and gap must be exclusive");
+      const anchor = manifest.descriptors[ordinal].anchor;
+      const unaddressed = !anchor || anchor.kind === "path_only";
+      if (source) {
+        assert.ok(!unaddressed, "unaddressed candidate fabricated source");
+        assert.ok(Buffer.byteLength(source.source) <= 512);
+        orderedSources.push(source);
+      } else {
+        assert.equal(gap.kind, unaddressed ? "source_unavailable" : "source_budget_exceeded");
+      }
     });
+    assert.deepEqual(input.sources, orderedSources, "hydration changed candidate ordering");
   }
   assert.equal(receipt.core_pointer.active.generation_id, manifest.publication.core_generation_id);
-  assert.deepEqual(control.sources.map((source) => source.stable_identity), addressed.sources.map((source) => source.stable_identity));
+  for (const source of control.sources) {
+    const other = addressed.sources.find((value) => value.stable_identity === source.stable_identity);
+    if (other) {
+      assert.equal(other.path, source.path);
+      assert.equal(other.parser_completeness, source.parser_completeness);
+    }
+  }
 }
 
 export function phase1AGate(records, expectedCases) {

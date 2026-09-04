@@ -94,11 +94,15 @@ node --test scripts/tests/witness-seam-evidence.test.mjs
 
 `codestory-witness-seam` is a benchmark binary, not a public CLI or MCP route.
 Its `prepare`, `capture`, and `replay` commands preserve the existing lexical
-order and compare two hydration addresses under one core pin. Replay requires
-a clean-source binary and an authenticated frozen manifest. It keeps sixteen
-candidates, 512-byte source charges, and the unchanged pure compiler. Missing
-source addresses are never replaced by headers. Lexical coverage omissions are
-recorded; preparation does not certify full installed-product readiness.
+order and compare two hydration addresses under the same core and lexical pins.
+Replay requires a clean-source binary and an authenticated frozen manifest.
+Both arms keep the same actual candidates, up to sixteen, with 512-byte source
+charges and the unchanged pure compiler. Empty or underfilled retrieval stays
+in the experiment. Missing source addresses retain their admissions with typed
+gaps, never header substitutes. Lexical-only files authenticate against their
+sealed source documents; partial parsing does not erase authenticated source or
+grant complete structural authority. Coverage omissions are recorded;
+preparation does not certify full installed-product readiness.
 
 Keep questions, independent annotations, descriptors, and receipts outside the
 repository. `scripts/codestory-witness-seam-evaluate.mjs` authenticates those

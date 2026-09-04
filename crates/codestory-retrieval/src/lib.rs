@@ -67,6 +67,42 @@ pub mod benchmark_support {
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
+    pub struct WitnessLexicalPin {
+        generation: String,
+        input_hash: String,
+        source_hashes: std::collections::BTreeMap<String, String>,
+    }
+
+    impl WitnessLexicalPin {
+        pub fn generation(&self) -> &str {
+            &self.generation
+        }
+        pub fn input_hash(&self) -> &str {
+            &self.input_hash
+        }
+        pub fn source_hash(&self, path: &str) -> Option<&str> {
+            self.source_hashes.get(path).map(String::as_str)
+        }
+    }
+
+    pub fn pin_witness_lexical_sources(
+        lexical_root: &Path,
+        generation: &str,
+        input_hash: &str,
+        paths: &[String],
+    ) -> Result<WitnessLexicalPin> {
+        Ok(WitnessLexicalPin {
+            generation: generation.into(),
+            input_hash: input_hash.into(),
+            source_hashes: crate::lexical_index::witness_source_hashes(
+                lexical_root,
+                generation,
+                input_hash,
+                paths,
+            )?,
+        })
+    }
+
     /// Prepare the existing lexical implementation without semantic or graph
     /// work. Only the frozen witness experiment consumes this isolated shard.
     pub fn prepare_witness_lexical_shard(

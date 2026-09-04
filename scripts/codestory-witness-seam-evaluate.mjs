@@ -37,6 +37,7 @@ export async function evaluateWitnessRun({ questions, annotations, runs }) {
     assert.equal(manifest.capture.question_sha256, sha256(question));
     assert.equal(manifest.capture.query_ordinal, 0);
     assert.equal(manifest.capture.candidate_limit, 16);
+    assert.equal(manifest.capture.candidate_count, manifest.descriptors.length);
     assert.equal(manifest.capture.semantic, false);
     assert.equal(manifest.capture.graph, false);
     assert.equal(receipt.manifest_sha256, row.manifest_sha256);
@@ -55,7 +56,7 @@ export async function evaluateWitnessRun({ questions, annotations, runs }) {
       ...set.required_source_atoms.map((atom) => atom.source_range), ...set.allowed_support_ranges,
       ...(set.required_relation_atoms ?? []).flatMap((atom) => [atom.occurrence, atom.from.source_range, atom.to.source_range]),
     ]);
-    const paths = new Set([...manifest.descriptors.map((value) => value.path), ...annotationRanges.map((range) => range.path)]);
+    const paths = new Set([...manifest.descriptors.filter((value) => value.content_digest).map((value) => value.path), ...annotationRanges.map((range) => range.path)]);
     const sources = new Map();
     for (const relative of paths) {
       const absolute = await realpath(path.join(root, relative));
@@ -64,11 +65,19 @@ export async function evaluateWitnessRun({ questions, annotations, runs }) {
     }
     for (const range of annotationRanges) authenticateRange(range, sources);
     for (const descriptor of manifest.descriptors) {
-      assert.equal(sha256(sources.get(descriptor.path)), descriptor.content_digest, "descriptor source changed");
+      if (descriptor.content_digest) {
+        assert.equal(sha256(sources.get(descriptor.path)), descriptor.content_digest, "descriptor source changed");
+      }
+      if (descriptor.anchor?.kind === "match") {
+        authenticateRange({ ...descriptor.anchor, path: descriptor.path, content_digest: descriptor.content_digest }, sources);
+      } else if (descriptor.anchor?.kind === "indexed_node") {
+        authenticateRange(descriptor.anchor.source_range, sources);
+      }
     }
     for (const arm of [receipt.control, receipt.addressed]) {
-      arm.input.sources.forEach((source, ordinal) => {
-        assert.equal(source.path, manifest.descriptors[ordinal].path, "hydration changed candidate path");
+      arm.input.sources.forEach((source) => {
+        const descriptor = manifest.descriptors.find((value) => value.admission.stable_identity === source.stable_identity);
+        assert.equal(source.path, descriptor.path, "hydration changed candidate path");
       });
       for (const output of arm.support.filter((value) => value.kind === "source_range")) {
         assert.ok(arm.input.sources.some((source) => source.path === output.path && source.start_line === output.start_line

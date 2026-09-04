@@ -589,6 +589,48 @@ pub(crate) struct LexicalSourceInput {
     source_seals: Vec<ArtifactSeal>,
 }
 
+/// The witness harness builds one immutable base, never a delta chain. Read
+/// source hashes from that authenticated base, not from the live worktree or
+/// the parser inventory (which intentionally omits many plain-text files).
+#[cfg(feature = "benchmark-support")]
+pub(crate) fn witness_source_hashes(
+    lexical_root: &Path,
+    generation: &str,
+    input_hash: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, String>> {
+    anyhow::ensure!(
+        paths.len() <= 16,
+        "witness source request exceeds its frozen pool"
+    );
+    let shard = shard_dir_for(lexical_root, generation);
+    let set = read_lexical_component_set(&shard, Some(generation), Some(input_hash))?
+        .context("witness lexical publication missing")?;
+    anyhow::ensure!(
+        set.deltas.is_empty(),
+        "witness preparation must be one immutable base"
+    );
+    validate_lexical_component_set_files(&shard, &set)?;
+    let connection = open_read_only(&shard.join(&set.base.file_name))?;
+    let mut query = connection.prepare(
+        "SELECT content FROM lexical_documents WHERE document_key = ?1 AND source = 'lexical_source'",
+    )?;
+    let mut hashes = BTreeMap::new();
+    for path in paths {
+        let content: Option<String> = query
+            .query_row([format!("source\0{path}")], |row| row.get(0))
+            .optional()?;
+        if let Some(content) = content {
+            hashes.insert(
+                path.clone(),
+                format!("{:x}", Sha256::digest(content.as_bytes())),
+            );
+        }
+    }
+    validate_lexical_component_set_files(&shard, &set)?;
+    Ok(hashes)
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedLexicalInput {
     pub fingerprint: LexicalInputFingerprint,

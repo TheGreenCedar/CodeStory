@@ -67,7 +67,7 @@ test("the paired-input contract binds cardinality, charge, order, and publicatio
   const publication = { core_generation_id: "core" };
   const input = { publication, admissions, sources: admissions.map((item) => ({ stable_identity: item.stable_identity, source: "bounded" })),
     relations: [], ambiguities: [], admission_gaps: [] };
-  const manifest = { case_id: "a", phrasing_id: "original", publication, descriptors: admissions.map((admission) => ({ admission })) };
+  const manifest = { case_id: "a", phrasing_id: "original", publication, descriptors: admissions.map((admission) => ({ admission, anchor: { kind: "indexed_node" } })) };
   const receipt = { contract: "codestory.witness-seam-receipt/v1", case_id: "a", phrasing_id: "original",
     core_pointer: { active: { generation_id: "core" } }, control: { input }, addressed: { input: structuredClone(input) } };
   verifyPairedInputs(receipt, manifest);
@@ -78,6 +78,32 @@ test("the paired-input contract binds cardinality, charge, order, and publicatio
     (copy) => copy.addressed.input.publication.core_generation_id = "other",
     (copy) => copy.addressed.input.sources[0].source = "x".repeat(513),
   ]) { const copy = structuredClone(receipt); mutate(copy); assert.throws(() => verifyPairedInputs(copy, manifest)); }
+});
+
+test("paired retrieval exhaustion and missing precision remain observations, not invalid experiments", () => {
+  for (const count of [0, 1, 15, 16]) {
+    const admissions = Array.from({ length: count }, (_, packet_ordinal) => ({
+      packet_ordinal, reserved_source_bytes: 512, stable_identity: `node:${packet_ordinal}`,
+    }));
+    const publication = { core_generation_id: "core" };
+    const sources = admissions.slice(1).map(({ stable_identity }) => ({ stable_identity, source: "bounded" }));
+    const admission_gaps = count ? [{ kind: "source_unavailable", stable_identity: "node:0", exact_selector_ordinal: null }] : [];
+    const input = { publication, admissions, sources, relations: [], ambiguities: [], admission_gaps };
+    const manifest = { case_id: "a", phrasing_id: "original", publication, descriptors: admissions.map((admission, i) => ({
+      admission, anchor: i ? { kind: "indexed_node" } : null,
+    })) };
+    const receipt = { contract: "codestory.witness-seam-receipt/v1", case_id: "a", phrasing_id: "original",
+      core_pointer: { active: { generation_id: "core" } }, control: { input }, addressed: { input: structuredClone(input) } };
+    verifyPairedInputs(receipt, manifest);
+    if (count) {
+      const missing = structuredClone(receipt);
+      missing.addressed.input.admission_gaps = [];
+      assert.throws(() => verifyPairedInputs(missing, manifest), "every missing source requires a typed gap");
+      const invented = structuredClone(receipt);
+      invented.addressed.input.sources.unshift({ stable_identity: "node:0", source: "header" });
+      assert.throws(() => verifyPairedInputs(invented, manifest), "unaddressed candidates never gain source");
+    }
+  }
 });
 
 test("invalid artifacts cannot create a quality aggregate or overwrite a decision", async () => {
