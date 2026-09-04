@@ -83,6 +83,63 @@ It authenticates the run ledger against the original receipt and reads only
 preserved transcript copies. The checksummed erratum withdraws affected
 comparisons without replacing the original receipt or its decision.
 
+The hidden source-address experiment uses these focused checks, run serially:
+
+```sh
+cargo test --locked -p codestory-contracts --test evidence_address
+cargo test --locked -p codestory-runtime --features benchmark-support --test addressed_hydration --test witness_seam
+cargo test --locked -p codestory-bench --bin codestory-witness-seam
+node --test scripts/tests/witness-seam-evidence.test.mjs
+```
+
+`codestory-witness-seam` is a benchmark binary, not a public CLI or MCP route.
+Its `prepare`, `capture`, and `replay` commands preserve the existing lexical
+order and compare two hydration addresses under the same core and lexical pins.
+Replay requires a clean-source binary and an authenticated frozen manifest.
+Both arms keep the same actual candidates, up to sixteen, with 512-byte source
+charges and the unchanged pure compiler. Empty or underfilled retrieval stays
+in the experiment. Missing source addresses retain their admissions with typed
+gaps, never header substitutes. Lexical-only files authenticate against their
+sealed source documents; partial parsing does not erase authenticated source or
+grant complete structural authority. Coverage omissions are recorded;
+preparation does not certify full installed-product readiness.
+
+Keep questions, independent annotations, descriptors, and receipts outside the
+repository. `scripts/codestory-witness-seam-evaluate.mjs` authenticates those
+inputs and requires every case and phrasing before producing an aggregate.
+Supply its explicit `--binary` with the frozen replay binary. Capture and replay
+must each have a successful, exact invocation and authenticated stdout, stderr,
+and output artifact. The native `validate-receipt` operation recomputes hydration
+and compilation against the prepared core/lexical and build identities; matching
+JSON hashes alone do not authenticate evidence. The complete public output,
+including publication and continuation metadata, fits 16 KiB or returns a typed
+`serialized_public_budget` gap. Detailed compiler inputs remain outside that
+public payload.
+Passing synthetic contracts does not pass the evidence-quality gate. Pool,
+graph, semantic, public-routing, and release changes remain gated separately.
+
+After a failed witness experiment, the hidden `coverage-diagnostic` command can
+compare the existing lexical cutoff with admitting any matching query term.
+Both arms retain the native ranker, mandatory quoted terms, sixteen candidates,
+512-byte hydration, and pure compiler. It reads a checksummed historical
+preparation, records preparation and execution builds separately, and produces
+only `codestory.lexical-coverage-diagnostic/v1` output. It cannot mint a canonical
+capture, change the original decision, or authorize product routing. The
+intervention exists only with `benchmark-support`; ordinary searches retain
+their current cutoff. Run the lexical-index tests with that feature and the
+witness binary tests when changing this diagnostic.
+
+The Cargo example `codestory_embedding_diagnostic` measures the existing native
+encoder on checksummed external inputs. It is not a shipped command and emits
+no packet or qualification decision. It requires a clean build with the pinned
+embedded model, a private state root containing `cache/` and `ipc/`, and matching
+cache and qualification-namespace environment settings. It retains the product
+query prefix, document encoder, accelerator policy, and token limit. Any rejected
+input aborts the result; it never truncates text or substitutes CPU execution.
+Run `cargo test --locked -p codestory-bench --example codestory_embedding_diagnostic`
+and an isolated native canary before using it for post-failure retrieval research.
+Keep its vectors, inputs, and research conclusions outside the repository.
+
 Run the relevant focused commands while implementing. A typical Rust lane is:
 
 ```sh

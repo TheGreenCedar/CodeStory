@@ -63,8 +63,101 @@ pub mod benchmark_support {
         AttestedSemanticPoint, AttestedVectorPublication, EmbeddedVectorIndex,
         ExpectedVectorAnchor, SemanticPoint, VectorEvidenceContract,
     };
+    pub use crate::lexical_index::LexicalCoverage;
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
+
+    pub struct WitnessLexicalPin {
+        generation: String,
+        input_hash: String,
+        source_hashes: std::collections::BTreeMap<String, String>,
+    }
+
+    impl WitnessLexicalPin {
+        pub fn generation(&self) -> &str {
+            &self.generation
+        }
+        pub fn input_hash(&self) -> &str {
+            &self.input_hash
+        }
+        pub fn source_hash(&self, path: &str) -> Option<&str> {
+            self.source_hashes.get(path).map(String::as_str)
+        }
+    }
+
+    pub fn pin_witness_lexical_sources(
+        lexical_root: &Path,
+        generation: &str,
+        input_hash: &str,
+        paths: &[String],
+    ) -> Result<WitnessLexicalPin> {
+        Ok(WitnessLexicalPin {
+            generation: generation.into(),
+            input_hash: input_hash.into(),
+            source_hashes: crate::lexical_index::witness_source_hashes(
+                lexical_root,
+                generation,
+                input_hash,
+                paths,
+            )?,
+        })
+    }
+
+    /// Isolated post-failure intervention, never a product search policy.
+    /// Both arms use the same native ranking and differ only in the unquoted
+    /// term-count cutoff. Mandatory quoted terms retain their existing meaning.
+    pub fn witness_lexical_coverage_diagnostic(
+        lexical_root: &Path,
+        generation: &str,
+        input_hash: &str,
+        query: &str,
+    ) -> Result<(Vec<crate::CandidateHit>, Vec<crate::CandidateHit>)> {
+        let (control, candidate) = crate::lexical_index::witness_coverage_diagnostic(
+            lexical_root,
+            generation,
+            input_hash,
+            query,
+        )?;
+        Ok((
+            control
+                .into_iter()
+                .map(crate::lexical_client::lexical_hit_to_candidate)
+                .collect::<Result<_>>()?,
+            candidate
+                .into_iter()
+                .map(crate::lexical_client::lexical_hit_to_candidate)
+                .collect::<Result<_>>()?,
+        ))
+    }
+
+    /// Prepare the existing lexical implementation without semantic or graph
+    /// work. Only the frozen witness experiment consumes this isolated shard.
+    pub fn prepare_witness_lexical_shard(
+        project_root: &Path,
+        core: &codestory_store::CoreReadSession,
+        lexical_root: &Path,
+    ) -> Result<(String, LexicalCoverage)> {
+        let source =
+            crate::lexical_index::lexical_source_input(project_root, core.generation_path())?;
+        let expected = crate::lexical_index::prepare_lexical_input_for_store(
+            source,
+            project_root,
+            core.storage(),
+        )?;
+        let input_hash = expected.fingerprint.hash.clone();
+        let coverage = expected.fingerprint.coverage.clone();
+        crate::lexical_index::build_prepared_lexical_shard(
+            lexical_root,
+            &core.identity().generation_id,
+            &expected,
+            &input_hash,
+            None,
+            || expected.revalidate_source_seals(project_root, core.generation_path()),
+        )?;
+        // The witness experiment preserves the existing candidate universe and
+        // its omissions. This does not attest to installed-product readiness.
+        Ok((input_hash, coverage))
+    }
 
     /// One vector the bake-off publishes and later scores against.
     #[derive(Debug, Clone, PartialEq)]

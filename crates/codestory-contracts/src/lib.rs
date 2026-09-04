@@ -18,6 +18,7 @@ pub mod compilation;
 pub mod config_registry;
 pub mod core_publication;
 pub mod events;
+pub mod evidence_address;
 pub mod graph;
 pub mod grounding;
 pub mod installed_agent_timing;
