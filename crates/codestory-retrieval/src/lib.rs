@@ -131,14 +131,55 @@ pub mod benchmark_support {
     }
 
     pub fn etr1_lexical_document(value: &str) -> String {
-        crate::lexical_index::normalize_lexical_text(value)
+        etr1_normalize_lexical_text(value)
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
     }
 
     pub fn etr1_lexical_query_terms(query: &str) -> Vec<String> {
-        crate::lexical_index::lexical_query_tokens(query)
+        const LEXICAL_STOP_WORDS: &[&str] = &[
+            "about", "after", "and", "are", "cite", "does", "explain", "file", "files", "flow",
+            "flows", "for", "from", "how", "into", "level", "path", "source", "sources", "support",
+            "that", "the", "through", "top", "what", "where", "which", "with",
+        ];
+
+        let mut tokens = Vec::new();
+        let normalized = etr1_normalize_lexical_text(query);
+        for token in normalized
+            .split_whitespace()
+            .filter(|token| token.len() >= 2)
+            .filter(|token| !LEXICAL_STOP_WORDS.contains(token))
+        {
+            if !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_string());
+            }
+        }
+        tokens
+    }
+
+    fn etr1_normalize_lexical_text(value: &str) -> String {
+        let mut normalized = String::with_capacity(value.len() + value.len() / 8);
+        let mut characters = value.chars().peekable();
+        let mut previous: Option<char> = None;
+        while let Some(character) = characters.next() {
+            let next = characters.peek().copied();
+            if character.is_uppercase()
+                && previous.is_some_and(|value: char| value.is_lowercase() || value.is_numeric())
+                || character.is_uppercase()
+                    && previous.is_some_and(|value: char| value.is_uppercase())
+                    && next.is_some_and(|value| value.is_lowercase())
+            {
+                normalized.push(' ');
+            }
+            if character.is_alphanumeric() {
+                normalized.extend(character.to_lowercase());
+            } else {
+                normalized.push(' ');
+            }
+            previous = Some(character);
+        }
+        normalized
     }
 
     pub struct WitnessLexicalPin {
