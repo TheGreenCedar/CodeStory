@@ -10612,8 +10612,26 @@ fn annotate_exact_runtime_import_bare_calls(
     let exact_target_spans = specs
         .iter()
         .flat_map(|spec| spec.exact_bare_call_target_spans.iter())
-        .map(|span| (span.start_line, span.start_col, span.end_line, span.end_col))
+        .copied()
         .collect::<HashSet<_>>();
+    annotate_callsite_target_spans(
+        &exact_target_spans,
+        languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER,
+        unique_nodes,
+        edges,
+        edge_keys,
+        flags,
+    );
+}
+
+fn annotate_callsite_target_spans(
+    exact_target_spans: &HashSet<GraphNodeSpan>,
+    marker: &'static str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
     if exact_target_spans.is_empty() {
         return;
     }
@@ -10623,19 +10641,19 @@ fn annotate_exact_runtime_import_bare_calls(
             || !unique_nodes
                 .get(&edge.target)
                 .and_then(|target| {
-                    Some((
-                        target.start_line?,
-                        target.start_col?,
-                        target.end_line?,
-                        target.end_col?,
-                    ))
+                    Some(GraphNodeSpan {
+                        start_line: target.start_line?,
+                        start_col: target.start_col?,
+                        end_line: target.end_line?,
+                        end_col: target.end_col?,
+                    })
                 })
                 .is_some_and(|span| exact_target_spans.contains(&span))
         {
             continue;
         }
         edge_keys.remove(&edge_dedup_key(edge, flags));
-        append_callsite_marker(edge, languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER);
+        append_callsite_marker(edge, marker);
         edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
         edge_keys.insert(edge_dedup_key(edge, flags));
     }
@@ -16351,6 +16369,16 @@ fn index_file_with_resolution_inputs(
         &mut edge_keys,
         flags,
     );
+    if matches!(language_config.language_name, "javascript" | "typescript") {
+        annotate_callsite_target_spans(
+            &languages::javascript::private_name_call_spans(&tree, source),
+            languages::javascript::PRIVATE_NAME_CALLSITE_MARKER,
+            &unique_nodes,
+            &mut result_edges,
+            &mut edge_keys,
+            flags,
+        );
+    }
     append_schema_endpoint_call_edges(
         language_config.language_name,
         source,

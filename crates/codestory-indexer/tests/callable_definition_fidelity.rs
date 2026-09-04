@@ -15,6 +15,14 @@ const NATIVE_FORMS: &[(&str, &str)] = &[
         "returned_callable",
         "int (*TOKEN(void))(int) {\n return 0;\n}\n",
     ),
+    (
+        "calling_convention",
+        "int (__stdcall TOKEN)(int x) {\n return x;\n}\n",
+    ),
+    (
+        "returned_calling_convention",
+        "int (__cdecl *TOKEN(void))(int) {\n return 0;\n}\n",
+    ),
 ];
 
 const SCRIPT_FORMS: &[(&str, &str)] = &[
@@ -214,6 +222,48 @@ fn cpp_declarators_keep_reference_and_qualified_names() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn cpp_specializations_keep_their_own_definition_identity() {
+    for (name, prefix, directory) in [
+        ("pebble", "", "alpha"),
+        ("opaque_942", "// shifted\n\n", "elsewhere"),
+    ] {
+        for (open, close) in [("", ""), ("namespace opaque_space {\n", "}\n")] {
+            for pointer in ["", "*"] {
+                let source = format!(
+                    "{prefix}{open}template<class T> T {pointer}{name}(T {pointer}x) {{ return x; }}\ntemplate<> int {pointer}{name}<int>(int {pointer}x) {{\n return x;\n}}\n{close}"
+                );
+                let config = get_language_for_ext("cpp").expect("C++ parser");
+                let result = index_file(
+                    Path::new(&format!("{directory}/special.cpp")),
+                    &source,
+                    &config,
+                    None,
+                    None,
+                )
+                .expect("index");
+                assert!(result.files.iter().all(|file| file.complete));
+                let specialization = format!("{name}<int>");
+                let target = result
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION
+                            && node.serialized_name == specialization
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("missing {specialization} for {source}: {:?}", result.nodes)
+                    });
+                let start = prefix.lines().count() as u32 + open.lines().count() as u32 + 2;
+                assert_eq!(
+                    (target.start_line, target.end_line),
+                    (Some(start), Some(start + 2))
+                );
+            }
+        }
+    }
 }
 
 #[test]

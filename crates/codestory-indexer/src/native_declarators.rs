@@ -35,6 +35,7 @@ fn declarator_name(mut node: Node<'_>) -> Option<Node<'_>> {
             "identifier"
             | "field_identifier"
             | "qualified_identifier"
+            | "template_function"
             | "destructor_name"
             | "operator_name" => return Some(node),
             "function_declarator" | "pointer_declarator" | "array_declarator" => {
@@ -45,9 +46,12 @@ fn declarator_name(mut node: Node<'_>) -> Option<Node<'_>> {
                 // Only the sole non-attribute child can carry the declaration;
                 // never search arbitrary descendants or parameter lists.
                 let mut cursor = node.walk();
-                let mut children = node
-                    .named_children(&mut cursor)
-                    .filter(|child| !matches!(child.kind(), "comment" | "attribute_declaration"));
+                let mut children = node.named_children(&mut cursor).filter(|child| {
+                    !matches!(
+                        child.kind(),
+                        "comment" | "attribute_declaration" | "ms_call_modifier"
+                    )
+                });
                 let child = children.next()?;
                 if children.next().is_some() {
                     return None;

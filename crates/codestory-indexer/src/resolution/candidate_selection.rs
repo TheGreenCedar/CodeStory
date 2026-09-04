@@ -24,6 +24,13 @@ pub(super) fn compute_call_resolution(
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
 
+    if is_js_private_name_call(EdgeKind::CALL, callsite_identity.as_deref()) {
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, None, &[])?,
+            strategy: None,
+        });
+    }
+
     if is_python_dotted_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {

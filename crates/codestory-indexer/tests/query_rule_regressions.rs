@@ -35,6 +35,89 @@ fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>
     Ok((storage.get_nodes()?, storage.get_edges()?))
 }
 
+#[test]
+fn script_private_callable_names_cannot_resolve_to_enclosing_definitions() -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for (private, directory) in [("quartz", "alpha"), ("opaque_731", "elsewhere")] {
+            for callable in ["function", "async function", "function*", "async function*"] {
+                for outer in [false, true] {
+                    for nested in [false, true] {
+                        let outer_source = if outer {
+                            format!("function {private}(x) {{ return 99; }}\n")
+                        } else {
+                            "// no outer declaration\n".into()
+                        };
+                        let invocation = format!("return {private}(x-1);");
+                        let body = if nested {
+                            format!("function child() {{ {invocation} }} return child();")
+                        } else {
+                            invocation
+                        };
+                        let source = format!(
+                            "{outer_source}const bound = {callable} {private}(x) {{\n {body}\n}};\nfunction outside() {{ return bound(2); }}\n"
+                        );
+                        let (nodes, edges) = index_project(&[(
+                            &format!("{directory}/fixture.{extension}"),
+                            &source,
+                        )])?;
+                        let calls = edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.kind == EdgeKind::CALL
+                                    && nodes.iter().any(|node| {
+                                        node.id == edge.target
+                                            && node.serialized_name == private
+                                            && node.start_line == Some(3)
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if calls.is_empty()
+                            || calls.iter().any(|edge| {
+                                edge.resolved_target.is_some() || !edge.candidate_targets.is_empty()
+                            })
+                        {
+                            failures.push(format!("{extension}/{callable}/outer={outer}/nested={nested}: private {private} escaped its scope: {calls:?}"));
+                        }
+                    }
+                }
+                let source = format!(
+                    "function {private}(x) {{ return x; }}\nconst bound = {callable}(x) {{\n return {private}(x);\n}};\nfunction outside() {{ return {private}(1); }}\n"
+                );
+                let (nodes, edges) =
+                    index_project(&[(&format!("{directory}/control.{extension}"), &source)])?;
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION
+                            && node.serialized_name == private
+                            && node.start_line == Some(1)
+                    })
+                    .expect("outer control");
+                assert!(
+                    edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+                        && edge.line == Some(3)
+                        && edge.resolved_target == Some(target.id)),
+                    "anonymous {extension}/{callable} keeps lexical outer lookup"
+                );
+                assert!(
+                    edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+                        && edge.line == Some(5)
+                        && edge.resolved_target == Some(target.id)),
+                    "outside {extension}/{callable} keeps lexical outer lookup"
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
 fn matches_name(actual: &str, wanted: &str) -> bool {
     actual == wanted
         || actual.ends_with(&format!(".{wanted}"))

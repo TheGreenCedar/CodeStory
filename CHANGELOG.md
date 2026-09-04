@@ -4,7 +4,8 @@
 
 - Pointer-returning C and C++ functions and variable-bound JavaScript,
   TypeScript, and TSX functions and generators retain their full definitions
-  in the source index.
+  in the source index. Calls through a function expression's private name no
+  longer resolve to an unrelated outer function with the same name.
 
 - Malformed text configuration files no longer block the entire repository
   index. Their source remains visible with an explicit coverage gap; stale
