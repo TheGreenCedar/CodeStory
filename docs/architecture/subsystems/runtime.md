@@ -37,6 +37,14 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Publication contract
 
+A complete core publication may retain verified malformed UTF-8 source with a
+`malformed` coverage gap. It retains the file identity and content digest, not
+structural units, symbol documents, or proof facts. Both full and incremental
+refresh reverify those bytes before publication. A transition from valid to
+malformed removes the old projection; unchanged malformed source does not
+trigger a retry. Unreadable source, incomplete discovery, source drift, and
+collector failures still prevent publication.
+
 Runtime publishes the core index through store, then asks retrieval to finalize
 immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
 requires query hits and candidate resolution to share one

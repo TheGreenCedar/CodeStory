@@ -88,11 +88,17 @@ pub(crate) fn observe_source_coverage(
         }
     };
 
-    // `ParserPartial` is the one coverage reason that survives publication —
-    // both refresh gates refuse to commit on any other — so it is exactly the
-    // defect a served packet can rest on, and reporting such a file `Indexed`
-    // would contradict this contract's own definition of the word.
-    let diagnostics = stored_file_coverage_diagnostics(&project_root, &storage).unwrap_or_default();
+    // Parser-partial and verified malformed sources survive publication with
+    // explicit gaps. Neither may be presented as complete indexed coverage.
+    let diagnostics = match stored_file_coverage_diagnostics(&project_root, &storage) {
+        Ok(diagnostics) => diagnostics,
+        Err(_) => {
+            return not_established(
+                &deduped,
+                SourceCoverageNotEstablishedCauseDto::LookupUnavailable,
+            );
+        }
+    };
     let incomplete: Vec<(PathBuf, codestory_contracts::graph::FileCoverageReason)> = diagnostics
         .iter()
         .map(|diagnostic| (project_root.join(&diagnostic.path), diagnostic.reason))
