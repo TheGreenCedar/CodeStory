@@ -134,7 +134,10 @@ export async function executeStr({binary,jobPath,directory,sourceRoot,env,canary
   return {receipt,request:requestBinding,binding:await fileBinding(receiptPath)};
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
-  const config=JSON.parse(await readFile(process.argv[2],"utf8"));
-  const result=await executeStr(config);console.log(JSON.stringify(result.binding));
-  if(result.receipt.experiment_status!=="completed")process.exitCode=1;
+  // Finish module evaluation before loading the validator, which imports this
+  // module too. Awaiting that cycle at top level deadlocks the corpus gate.
+  readFile(process.argv[2],"utf8").then(JSON.parse).then(executeStr).then(result=>{
+    console.log(JSON.stringify(result.binding));
+    if(result.receipt.experiment_status!=="completed")process.exitCode=1;
+  }).catch(error=>{console.error(error.stack);process.exitCode=1;});
 }
