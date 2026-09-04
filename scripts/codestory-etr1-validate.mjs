@@ -171,12 +171,12 @@ export function validateArm({ arm, expectedName, wording, repository, fragments,
   validateSourceAuthentication(arm, fragments, repository, sourceFiles);
 }
 
-function parseEvents(bytes) {
+export function parseEvents(bytes) {
   assert.equal(bytes.at(-1), 10, "qualification event log is unterminated");
-  let previous = 0;
+  let previous = null;
   return bytes.toString("utf8").trimEnd().split("\n").map(JSON.parse).filter((event) => {
     assert.equal(event.schema_version, 1, "qualification event schema changed");
-    assert.ok(event.sequence > previous, "qualification event sequence changed");
+    assert.ok(previous === null || event.sequence > previous, "qualification event sequence changed");
     previous = event.sequence;
     return event.action === "completed_tokens";
   });

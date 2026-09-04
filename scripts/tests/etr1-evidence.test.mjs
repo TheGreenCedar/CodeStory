@@ -6,7 +6,7 @@ import path from "node:path";
 import { authenticateFragment, encodedCandidateInput, evaluateArm, exactPublicBytes, fragmentId,
   LIMITS, maximizeCoveredAtoms, scoreOrder, selectSuccessors, sha256 } from "../lib/etr1-evidence.mjs";
 import { validateArm, validateDocumentVectorRecord, validateEngine,
-  validatePreAnnotationBoundary } from "../codestory-etr1-validate.mjs";
+  validatePreAnnotationBoundary, parseEvents } from "../codestory-etr1-validate.mjs";
 import { decision, evaluateEtr1, gateOne, gateTwo } from "../codestory-etr1-evaluate.mjs";
 
 function unit(index) {
@@ -82,6 +82,16 @@ test("candidate input shortening preserves UTF-8 and complete trailing lines", (
   const source = "first α\nsecond β\nthird γ\n";
   assert.equal(encodedCandidateInput("question", source, 1), "question\n\nfirst α\nsecond β\n");
   assert.throws(() => encodedCandidateInput("question", source, 3));
+});
+
+test("validator accepts the native zero-based qualification sequence", () => {
+  const event = (sequence) => JSON.stringify({ schema_version: 1, sequence,
+    action: "completed_tokens", status: "completed", server_event_sequence: 10 + sequence,
+    clock: {}, details: { completed_tokens: "5", native_completion_sequence: String(sequence + 1),
+      request_id: `request-${sequence}` } });
+  const events = parseEvents(Buffer.from(`${event(0)}\n${event(1)}\n`));
+  assert.deepEqual(events.map(({ sequence }) => sequence), [0, 1]);
+  assert.throws(() => parseEvents(Buffer.from(`${event(0)}\n${event(0)}\n`)));
 });
 
 test("validator reconstructs both arm query contracts and refuses hostile mutations", () => {

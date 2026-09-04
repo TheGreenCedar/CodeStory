@@ -346,17 +346,17 @@ fn read_completed_events(path: &Path) -> Result<Vec<QualificationEvent>> {
         "qualification_event_log_unterminated"
     );
     let mut events = Vec::new();
-    let mut previous = 0_u64;
+    let mut previous = None;
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let event: QualificationEvent = serde_json::from_slice(line)?;
         ensure!(
-            event.schema_version == 1 && event.sequence > previous,
+            event.schema_version == 1 && previous.is_none_or(|previous| event.sequence > previous),
             "qualification_event_sequence_invalid"
         );
-        previous = event.sequence;
+        previous = Some(event.sequence);
         if event.action == "completed_tokens" {
             ensure!(
                 event.status == "completed"
@@ -1099,6 +1099,35 @@ mod tests {
         assert_eq!(spec.encoded_input, "question\n\na\n");
         assert_eq!(spec.removed_trailing_source_lines, 1);
         assert!(shorten_single_query(&mut spec, "question", "a\nb\n").is_err());
+    }
+
+    #[test]
+    fn qualification_events_accept_the_native_zero_based_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"sequence\":0,\"action\":\"completed_tokens\",",
+                "\"status\":\"completed\",\"server_event_sequence\":10,\"clock\":{},",
+                "\"details\":{\"completed_tokens\":\"5\",\"native_completion_sequence\":\"1\",",
+                "\"request_id\":\"first\"}}\n",
+                "{\"schema_version\":1,\"sequence\":1,\"action\":\"completed_tokens\",",
+                "\"status\":\"completed\",\"server_event_sequence\":11,\"clock\":{},",
+                "\"details\":{\"completed_tokens\":\"7\",\"native_completion_sequence\":\"2\",",
+                "\"request_id\":\"second\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let events = read_completed_events(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[1].sequence, 1);
+
+        let bytes = fs::read_to_string(&path).unwrap();
+        fs::write(&path, bytes.replace("\"sequence\":1", "\"sequence\":0")).unwrap();
+        assert!(read_completed_events(&path).is_err());
     }
 
     #[test]
