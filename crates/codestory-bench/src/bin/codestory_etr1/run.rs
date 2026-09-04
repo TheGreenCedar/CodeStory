@@ -12,6 +12,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+// Only the separate measurement binary calls this module; ETR stays frozen.
+#[path = "str1.rs"]
+pub mod str1;
+
 const RUN_CONTRACT: &str = "codestory.etr1-run/v1";
 const ROW_CONTRACT: &str = "codestory.etr1-wording/v1";
 const VECTOR_CONTRACT: &str = "codestory.embedding-diagnostic-output/v1";
