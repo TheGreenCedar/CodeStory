@@ -50,8 +50,10 @@ export async function evaluateStr1({validation,annotations,oracle,sourceRoot}) {
   return {contract:"codestory.str1-evaluation/v1",authority:"visible_development_frontier_only",experiment_status:"valid",packet_decision:"not_evaluated",
     inputs:{validation,annotations,oracle},oracle_reproduction:reproduction,...aggregateStrRows(rows),rows};
 }
-if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+async function main() {
   const config=JSON.parse(await readFile(process.argv[2],"utf8"));let report;
   try{report=await evaluateStr1(config);}catch(error){report={contract:"codestory.str1-evaluation/v1",experiment_status:"invalid",decision:"not_evaluated",error:error.message};process.exitCode=1;}
   await writeFile(config.output,JSON.stringify(report),{flag:"wx",mode:0o600});console.log(JSON.stringify(await fileBinding(config.output)));
 }
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))
+  main().catch(error=>{console.error(error.stack);process.exitCode=1;});

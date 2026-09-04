@@ -112,8 +112,10 @@ export async function validateStr1({execution,executionRequest,graphExecution,gr
     reconstruction_root:reconstructionRoot,run:external.receipt.output,analysis:await strIdentity(sourceRoot),
     prepared_state_ns:totalWall,execution_wall_ns:external.receipt.wall_ns,outer_remainder_ns:external.receipt.wall_ns-totalWall}};
 }
-if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+async function main() {
   const config=JSON.parse(await readFile(process.argv[2],"utf8"));let report;
   try{report=(await validateStr1(config)).validation;}catch(error){report={contract:"codestory.str1-validation/v1",experiment_status:"invalid",decision:"not_evaluated",error:error.message};process.exitCode=1;}
   await writeFile(config.output,JSON.stringify(report),{flag:"wx",mode:0o600});console.log(JSON.stringify(await fileBinding(config.output)));
 }
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))
+  main().catch(error=>{console.error(error.stack);process.exitCode=1;});

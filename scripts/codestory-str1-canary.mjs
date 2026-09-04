@@ -5,14 +5,21 @@ import path from "node:path";
 import {randomUUID} from "node:crypto";
 import {fileURLToPath} from "node:url";
 import {executeRecorded,fileBinding} from "./lib/etr1-execution.mjs";
-import {executeStr,strIdentity} from "./lib/str1-execution.mjs";
+import {strIdentity,readExecutionBinding} from "./lib/str1-execution.mjs";
 import {validateEtr1} from "./codestory-etr1-validate.mjs";
-import {validateStr1} from "./codestory-str1-validate.mjs";
-import {evaluateStr1} from "./codestory-str1-evaluate.mjs";
 
 async function main() {
   const config=JSON.parse(await readFile(process.argv[2],"utf8")),{root,binary,etrBinary,diagnostic,method,sourceRoot}=config;
   await mkdir(root,{mode:0o700});const project=path.join(root,"repository");await mkdir(project,{mode:0o700});
+  // Exercise the same command entry points used by the corpus owner, not
+  // imported approximations that conceal asynchronous module-loading cycles.
+  const command=async(name,script,input)=>{
+    const file=path.join(root,`${name}-config.json`);await writeFile(file,JSON.stringify(input),{flag:"wx",mode:0o600});
+    const stdout=execFileSync(process.execPath,[path.join(sourceRoot,script),file],{cwd:sourceRoot,encoding:"utf8",timeout:120_000});
+    return stdout.trim().split("\n").map(line=>JSON.parse(line));
+  };
+  const supervise=async(name,input)=>{const output=await command(name,"scripts/lib/str1-execution.mjs",input);
+    assert.equal(output.length,2);return {request:output[0].prelaunch_request,binding:output[1],receipt:await readExecutionBinding(output[1])};};
   const source=Array.from({length:32},(_,i)=>`fn commonneedle_${i}() { ${i===0?Array.from({length:12},(_,j)=>`commonneedle_${j+18}();`).join(" "):`commonneedle_${(i+1)%32}();`}${i===0?" /* raremarker */":""} }${i===1?" /* a\u2028b\u2029c */":""}${i%3===0?"\r\n":"\n"}`).join("");
   await writeFile(path.join(project,"canary.rs"),source,{flag:"wx",mode:0o600});
   const git=(...args)=>execFileSync("git",["-C",project,"-c","core.hooksPath=/dev/null",...args],{stdio:"pipe"});
@@ -40,23 +47,25 @@ async function main() {
   const graphDir=path.join(root,"graph-core"),indexJob=await writeJob("index",{operation:"index_canary",preparation,method,cancel_file:cancelFile,output:graphDir});
   execFileSync(binary,["--job",indexJob],{cwd:sourceRoot,stdio:"pipe",timeout:120_000});
   const exportJob=await writeJob("export",{operation:"export_graphs",preparation,method,cancel_file:cancelFile,output:path.join(root,"graphs"),graph_preparations:{canary:await fileBinding(path.join(graphDir,"prepared.json"))}});
-  const graphExecution=await executeStr({binary,jobPath:exportJob,directory:path.join(root,"graph-execution"),sourceRoot,env:process.env});
+  const graphExecution=await supervise("graph-supervisor",{binary,jobPath:exportJob,directory:path.join(root,"graph-execution"),sourceRoot,env:process.env});
   assert.equal(graphExecution.receipt.experiment_status,"completed");
   const graphData=JSON.parse(await readFile(graphExecution.receipt.output.path,"utf8"));
   assert.ok(graphData.graphs[0].relations.length>=12,"canary failed to exercise certain witnessed relationships");
   const query=await makeState("query-state"),runDir=path.join(root,"run");
   const runJob=await writeJob("run",{operation:"run",preparation,method,graphs:graphExecution.receipt.output,vectors,control_run:controlRun,state_root:query.state,cancel_file:cancelFile,output:runDir});
-  const execution=await executeStr({binary,jobPath:runJob,directory:path.join(root,"run-execution"),sourceRoot,env:query.env});
+  const execution=await supervise("run-supervisor",{binary,jobPath:runJob,directory:path.join(root,"run-execution"),sourceRoot,env:query.env});
   assert.equal(execution.receipt.experiment_status,"completed");
-  const validated=await validateStr1({execution:execution.binding,executionRequest:execution.request,graphExecution:graphExecution.binding,graphRequest:graphExecution.request,sourceRoot,controlValidation,controlSourceRoot:sourceRoot,reconstructionRoot:root});
-  assert.ok(validated.run.rows.some(row=>row.candidate.steps.some(step=>step.eligible.length>8)),"canary did not exercise overflow");
-  assert.deepEqual(validated.run.rows.map(r=>r.seed_fragment_ids.length),[16,1,0]);
-  const validationPath=path.join(root,"validation.json");await writeFile(validationPath,JSON.stringify(validated.validation),{flag:"wx",mode:0o600});
-  const validation=await fileBinding(validationPath);
+  const validationPath=path.join(root,"validation.json");
+  const [validation]=await command("validation","scripts/codestory-str1-validate.mjs",{execution:execution.binding,executionRequest:execution.request,graphExecution:graphExecution.binding,graphRequest:graphExecution.request,sourceRoot,controlValidation,controlSourceRoot:sourceRoot,reconstructionRoot:root,output:validationPath});
+  assert.equal((await readExecutionBinding(validation)).experiment_status,"valid");
+  const run=await readExecutionBinding(execution.receipt.output);
+  assert.ok(run.rows.some(row=>row.candidate.steps.some(step=>step.eligible.length>8)),"canary did not exercise overflow");
+  assert.deepEqual(run.rows.map(r=>r.seed_fragment_ids.length),[16,1,0]);
   const first=p.fragments[0],truth={authority:"synthetic_canary_only",cases:p.wordings.map(row=>({case_id:row.case_id,acceptable_sets:[{set_id:"first",required_relation_atoms:[],required_source_atoms:[{atom_id:"first",source_range:{path:first.path,content_digest:first.content_digest,byte_range:first.byte_range,line_range:first.line_range}}]}]}))};
   const truthPath=path.join(root,"annotations.json");await writeFile(truthPath,JSON.stringify(truth),{flag:"wx",mode:0o600});
   const annotations=await fileBinding(truthPath);
-  const evaluated=await evaluateStr1({validation,annotations,sourceRoot});
+  const [evaluation]=await command("evaluation","scripts/codestory-str1-evaluate.mjs",{validation,annotations,sourceRoot,output:path.join(root,"evaluation.json")});
+  const evaluated=await readExecutionBinding(evaluation);
   assert.deepEqual(evaluated.rows.map(row=>row.candidate.recall),[1,1,0]);
   const args=["--test","scripts/tests/str1-evidence.test.mjs"];
   const stdout=execFileSync(process.execPath,args,{cwd:sourceRoot,encoding:"utf8",timeout:60_000});
