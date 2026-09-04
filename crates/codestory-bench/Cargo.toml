@@ -34,6 +34,10 @@ path = "src/bin/codestory_witness_seam.rs"
 name = "codestory-etr1"
 path = "src/bin/codestory_etr1.rs"
 
+[[bin]]
+name = "codestory-str1"
+path = "src/bin/codestory_str1.rs"
+
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
 criterion = { workspace = true }
