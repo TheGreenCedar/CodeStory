@@ -3917,7 +3917,7 @@ fn lexical_documents_hash(documents: &[LexicalDocument], coverage: &LexicalCover
         .hash
 }
 
-fn normalize_lexical_text(value: &str) -> String {
+pub(crate) fn normalize_lexical_text(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len() + value.len() / 8);
     let mut characters = value.chars().peekable();
     let mut previous: Option<char> = None;
@@ -4090,7 +4090,7 @@ fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize>
         .map_err(Into::into)
 }
 
-fn lexical_query_tokens(query: &str) -> Vec<String> {
+pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let normalized = normalize_lexical_text(query);
     for token in normalized

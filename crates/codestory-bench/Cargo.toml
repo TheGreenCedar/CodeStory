@@ -30,6 +30,10 @@ path = "src/bin/codestory_proof_availability.rs"
 name = "codestory-witness-seam"
 path = "src/bin/codestory_witness_seam.rs"
 
+[[bin]]
+name = "codestory-etr1"
+path = "src/bin/codestory_etr1.rs"
+
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
 criterion = { workspace = true }
