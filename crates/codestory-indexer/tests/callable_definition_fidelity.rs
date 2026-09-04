@@ -250,8 +250,7 @@ fn cpp_specializations_keep_their_own_definition_identity() {
                     .nodes
                     .iter()
                     .find(|node| {
-                        node.kind == NodeKind::FUNCTION
-                            && node.serialized_name == specialization
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == specialization
                     })
                     .unwrap_or_else(|| {
                         panic!("missing {specialization} for {source}: {:?}", result.nodes)
