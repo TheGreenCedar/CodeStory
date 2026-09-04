@@ -4,7 +4,7 @@ import {mkdir,readFile,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {randomUUID} from "node:crypto";
 import {fileURLToPath} from "node:url";
-import {executeRecorded,fileBinding} from "./lib/etr1-execution.mjs";
+import {executeRecorded,fileBinding,executionEnvironment} from "./lib/etr1-execution.mjs";
 import {strIdentity,readExecutionBinding} from "./lib/str1-execution.mjs";
 import {validateEtr1} from "./codestory-etr1-validate.mjs";
 
@@ -14,6 +14,7 @@ async function main() {
   // Exercise the same command entry points used by the corpus owner, not
   // imported approximations that conceal asynchronous module-loading cycles.
   const command=async(name,script,input)=>{
+    if(input.env)input={...input,env:executionEnvironment(input.env)};
     const file=path.join(root,`${name}-config.json`);await writeFile(file,JSON.stringify(input),{flag:"wx",mode:0o600});
     const stdout=execFileSync(process.execPath,[path.join(sourceRoot,script),file],{cwd:sourceRoot,encoding:"utf8",timeout:120_000});
     return stdout.trim().split("\n").map(line=>JSON.parse(line));
