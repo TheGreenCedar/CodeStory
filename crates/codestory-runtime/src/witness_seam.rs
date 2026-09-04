@@ -136,15 +136,13 @@ pub fn freeze_witness_descriptors(
                     file.id,
                     path.as_str()
                 );
-                if let (Some(start), Some(end)) = (node.start_line, node.end_line) {
-                    if let Some(source_range) = full_line_range(&source, &descriptor, start, end) {
-                        descriptor.anchor = EvidenceAnchorV1::IndexedNode {
-                            node_id: StableNodeId::new(
-                                descriptor.admission.stable_identity.clone(),
-                            )?,
-                            source_range,
-                        };
-                    }
+                if let (Some(start), Some(end)) = (node.start_line, node.end_line)
+                    && let Some(source_range) = full_line_range(&source, &descriptor, start, end)
+                {
+                    descriptor.anchor = EvidenceAnchorV1::IndexedNode {
+                        node_id: StableNodeId::new(descriptor.admission.stable_identity.clone())?,
+                        source_range,
+                    };
                 }
                 // Namespace/component documents can carry a display path while
                 // their core node has no source owner. They remain PathOnly.
@@ -333,12 +331,12 @@ pub fn run_witness_seam(
             focus.line_range.start(),
             focus.line_range.end(),
         )? {
-            if node.kind != NodeKind::FILE && node.file_node_id == Some(NodeId(file.id)) {
-                if let (Some(start), Some(end)) = (node.start_line, node.end_line) {
-                    if let Some(span) = full_line_range(source, descriptor, start, end) {
-                        syntax.push(span);
-                    }
-                }
+            if node.kind != NodeKind::FILE
+                && node.file_node_id == Some(NodeId(file.id))
+                && let (Some(start), Some(end)) = (node.start_line, node.end_line)
+                && let Some(span) = full_line_range(source, descriptor, start, end)
+            {
+                syntax.push(span);
             }
         }
         if node_bounds.is_some() {
