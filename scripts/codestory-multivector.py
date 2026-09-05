@@ -17,6 +17,7 @@ def publish(path, value):
         json.dump(value, out, separators=(',', ':'), allow_nan=False)
 
 def load_model(input_data):
+    assert {d.metadata['Name']: d.version for d in importlib.metadata.distributions()} == input_data['packages'], 'package identity changed'
     root = pathlib.Path(input_data['model_root'])
     for entry in input_data['assets']['entries']:
         assert digest((root / entry['path']).read_bytes()) == entry['sha256']
@@ -30,6 +31,12 @@ def load_model(input_data):
     assert model.query_length == 256 and model.document_length == 2048
     assert model.query_prefix == '[Q] ' and model.document_prefix == '[D] '
     assert not model.do_query_expansion and model[0].do_lower_case
+    # Hostile coordinate preflight: long input must be rejected, never shortened.
+    try:
+        tokens(model, 'boundary ' * 3000, True)
+        raise RuntimeError('oversize query was admitted')
+    except AssertionError as error:
+        assert str(error) == 'token overflow'
     return model
 
 def tokens(model, text, query):

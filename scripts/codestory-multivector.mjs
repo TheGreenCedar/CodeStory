@@ -57,15 +57,37 @@ function authenticate(data) {
   return sourceMaps;
 }
 
-function prepare(preparationPath, directory, assetPath, python, contract, synthetic = false) {
+function prepare(preparationPath, directory, assetPath, python, contract, canaryPath) {
+  const synthetic = canaryPath === '--synthetic';
   const preparation = read(preparationPath), preparationHash = hash(preparationPath);
   if (!synthetic) { assert.equal(preparationHash, PREPARATION); assert.equal(preparation.wordings.length, 72); }
   const assets = read(assetPath);
   assert.equal(assets.revision, REVISION);
   const modelRoot = path.join(path.dirname(assetPath), 'model');
   for (const e of assets.entries) assert.equal(hash(path.join(modelRoot, e.path)), e.sha256);
+  const environment = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? '/tmp',
+    LANG: 'en_US.UTF-8', PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
+  const packageProbe = spawnSync(python, ['-c', 'import json,importlib.metadata;print(json.dumps({d.metadata["Name"]:d.version for d in importlib.metadata.distributions()}))'],
+    { encoding: 'utf8', env: environment });
+  assert.equal(packageProbe.status, 0, packageProbe.stderr);
+  const packages = JSON.parse(packageProbe.stdout);
+  for (const [name, version] of Object.entries({ pylate: '1.3.4', transformers: '4.56.2', torch: '2.8.0' }))
+    assert.equal(Object.entries(packages).find(([key]) => key.toLowerCase() === name)?.[1], version);
+  let canary = null;
+  if (!synthetic) {
+    assert.ok(canaryPath, 'exact-source canary receipt required');
+    const receipt = read(canaryPath);
+    assert.equal(receipt.status, 'passed'); assert.equal(receipt.synthetic_only, true);
+    assert.deepEqual(receipt.source, identity());
+    assert.deepEqual(receipt.packages, packages);
+    assert.equal(receipt.assets_sha256, hash(assetPath));
+    for (const [file, field] of [['run/validation.json', 'validation_sha256'], ['run/evaluation.json', 'evaluation_sha256']])
+      assert.equal(hash(path.join(path.dirname(canaryPath), file)), receipt[field]);
+    canary = { path: path.resolve(canaryPath), sha256: hash(canaryPath) };
+  }
   const data = { authority: synthetic ? 'synthetic_canary_only' : 'burned_development_only',
     preparation_sha256: preparationHash, contract_sha256: hash(contract), source: identity(),
+    environment, packages, canary,
     assets, model_root: modelRoot, python: path.resolve(python), python_sha256: hash(python),
     repositories: preparation.repositories, fragments: preparation.fragments,
     wordings: preparation.wordings.map(w => Object.fromEntries(['case_id', 'phrasing_id', 'repository_id',
@@ -87,7 +109,7 @@ function run(directory) {
   const stdout = fs.openSync(path.join(directory, 'stdout.jsonl'), 'wx', 0o600);
   const stderr = fs.openSync(path.join(directory, 'stderr.log'), 'wx', 0o600);
   const start = performance.now();
-  const result = spawnSync(data.python, argv, { cwd: directory, stdio: ['ignore', stdout, stderr],
+  const result = spawnSync(data.python, argv, { cwd: directory, env: data.environment, stdio: ['ignore', stdout, stderr],
     timeout: 25 * 60 * 1000, killSignal: 'SIGKILL' });
   fs.closeSync(stdout); fs.closeSync(stderr);
   const completed = { start_sha256: hash(path.join(directory, 'execution-start.json')),
@@ -116,6 +138,11 @@ function validate(directory) {
   assert.equal(result.input_sha256, hash(inputPath));
   assert.equal(result.vectors_sha256, hash(path.join(directory, 'vectors.npz')));
   assert.equal(result.parameter_device, 'mps:0'); assert.equal(result.fallback, false);
+  assert.deepEqual(result.packages, data.packages);
+  if (data.authority !== 'synthetic_canary_only') {
+    assert.ok(data.canary); assert.equal(hash(data.canary.path), data.canary.sha256);
+    assert.deepEqual(read(data.canary.path).source, data.source);
+  }
   validateRows(data, result.rows);
   const fragments = new Map(data.fragments.map(f => [f.fragment_id, f]));
   for (const row of result.rows) {
@@ -126,7 +153,7 @@ function validate(directory) {
     sourcePacket(row.baseline.map(id => fragments.get(id)), repo.publication, sources.get(row.repository_id));
   }
   const check = spawnSync(data.python, [path.join(root, 'scripts/codestory-multivector.py'), 'verify', inputPath],
-    { cwd: directory, encoding: 'utf8', timeout: 15 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
+    { cwd: directory, env: data.environment, encoding: 'utf8', timeout: 15 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
   assert.equal(check.status, 0, check.stderr);
   const vectorReceipt = read(path.join(directory, 'vector-validation.json'));
   assert.equal(vectorReceipt.result_sha256, end.result_sha256);
@@ -179,7 +206,7 @@ function evaluate(directory, annotationPath) {
 
 const [command, ...args] = process.argv.slice(2);
 try {
-  if (command === 'prepare') prepare(...args.slice(0, 5), args[5] === '--synthetic');
+  if (command === 'prepare') prepare(...args);
   else if (command === 'run') run(...args);
   else if (command === 'validate') validate(...args);
   else if (command === 'evaluate') evaluate(...args);

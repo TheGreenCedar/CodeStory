@@ -70,6 +70,7 @@ const result = JSON.parse(fs.readFileSync(path.join(run, 'result.json')));
 assert.equal(result.rows[0].legal.length, 27);
 assert.equal(result.rows[1].legal.length, 3);
 publish(path.join(directory, 'canary.json'), { status: 'passed', synthetic_only: true,
+  assets_sha256: sha256(fs.readFileSync(assets)), packages: result.packages,
   validation_sha256: sha256(fs.readFileSync(validation)),
   evaluation_sha256: sha256(fs.readFileSync(path.join(run, 'evaluation.json'))),
   source: JSON.parse(fs.readFileSync(path.join(run, 'input.json'))).source });
