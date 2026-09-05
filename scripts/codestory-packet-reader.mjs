@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { sha256, fragmentId } from "./lib/etr1-evidence.mjs";
 import { referencePacket, sourcePacket, readerPrompt, READER_SCHEMA,
-  validateReaderEvents } from "./lib/packet-reader-evidence.mjs";
+  validateReaderEvents, validateReaderAnswer, readerAnswerIssues } from "./lib/packet-reader-evidence.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const FROZEN_READER_INPUTS = Object.freeze({
@@ -189,7 +189,34 @@ async function runInput({ input, command, model, output, signal }) {
   const events = execution.stdout.trim().split("\n").map(line => JSON.parse(line));
   const answer = validateReaderEvents(events, value.packet);
   return { case_id: value.case_id, input, execution: raw,
+    answer_issues: readerAnswerIssues(answer, value.packet),
     answer: await save(path.join(directory, "answer.json"), answer) };
+}
+
+async function reuseCompletedInput({ input, prior, command, model, output }) {
+  const value = await readBound(input.path, input.sha256);
+  const directory = path.join(path.dirname(prior.path), value.case_id);
+  const file = path.join(directory, "execution.json");
+  const retained = prior.executions.find(entry => entry.case_id === value.case_id);
+  if (!retained) return null;
+  assert.equal(retained.artifact.path, file);
+  const execution = await readBound(file, retained.artifact.sha256);
+  assert.equal(execution.request.path, path.join(directory, "request.json"));
+  const request = await readBound(execution.request.path, execution.request.sha256);
+  assert.equal(request.schema.path, path.join(directory, "answer-schema.json"));
+  assert.deepEqual(await readBound(request.schema.path, request.schema.sha256), READER_SCHEMA);
+  validateRequestExecution(request, execution, readerRequest({ command, model, directory, input,
+    schema: request.schema, prompt: readerPrompt(value.question, value.packet) }));
+  assert.equal(execution.exit_code, 0); assert.equal(execution.failure, null);
+  const answer = validateReaderEvents(execution.stdout.trim().split("\n").map(JSON.parse), value.packet);
+  const target = path.join(output, value.case_id);
+  await mkdir(target, { mode: 0o700 });
+  return { case_id: value.case_id, input,
+    execution: retained.artifact,
+    reused_response: { prior_run: prior.binding, source_build: prior.receipt.build,
+      reason: "preserve_first_completed_response_after_quality_classification_repair", timing_eligible: false },
+    answer_issues: readerAnswerIssues(answer, value.packet),
+    answer: await save(path.join(target, "answer.json"), answer) };
 }
 
 export async function validateCanary(file, digest, build, binary, model) {
@@ -216,12 +243,13 @@ export async function validateCanary(file, digest, build, binary, model) {
   assert.deepEqual(await readBound(request.schema.path, request.schema.sha256), READER_SCHEMA);
   assert.equal(execution.exit_code, 0); assert.equal(execution.failure, null);
   const answer = validateReaderEvents(execution.stdout.trim().split("\n").map(JSON.parse), input.packet);
+  validateReaderAnswer(answer, input.packet);
   assert.deepEqual(await readBound(row.answer.path, row.answer.sha256), answer);
   assert.ok(answer.claims.some(c => /\b42\b/.test(c.text)), "canary did not return the expected value");
 }
 
 async function run({ manifestPath, manifestDigest, command, model, output, signal, canary = false,
-  canaryPath, canaryDigest }) {
+  canaryPath, canaryDigest, priorPath, priorDigest }) {
   const build = buildIdentity(!canary);
   command = await realpath(command);
   const binary = { path: command, sha256: sha256(await readFile(command)) };
@@ -229,6 +257,28 @@ async function run({ manifestPath, manifestDigest, command, model, output, signa
   assert.equal(manifest.contract, "codestory.packet-reader-inputs/v1");
   assert.equal(manifest.authority, canary ? "synthetic_canary_only" : "visible_reference_diagnostic_only");
   assert.equal(manifest.reader_inputs.length, canary ? 1 : 8, "reader row count changed");
+  let prior = null;
+  if (priorPath) {
+    assert.equal(canary, false, "canary responses cannot be reused");
+    const preserved = await readBound(priorPath, priorDigest);
+    assert.equal(preserved.contract, "codestory.reader-preserved-responses/v1");
+    const receipt = await readBound(preserved.run.path, preserved.run.sha256);
+    assert.equal(receipt.contract, "codestory.packet-reader-run/v1");
+    assert.equal(receipt.authority, "visible_reference_diagnostic_only");
+    assert.equal(receipt.experiment_status, "invalid");
+    assert.equal(receipt.error, "citation escapes supplied source", "only citation classification repair permits response preservation");
+    assert.deepEqual(receipt.reader_binary, binary); assert.equal(receipt.model, model);
+    assert.deepEqual(receipt.manifest, { path: manifestPath, sha256: manifestDigest });
+    const completedCount = receipt.rows.length + 1;
+    const requiredIds = [];
+    for (const input of manifest.reader_inputs.slice(0, completedCount))
+      requiredIds.push((await readBound(input.path, input.sha256)).case_id);
+    assert.deepEqual(preserved.executions.map(e => e.case_id), requiredIds,
+      "every first completed response, including the citation failure, must be preserved");
+    assert.equal(new Set(preserved.executions.map(e => e.case_id)).size, preserved.executions.length);
+    prior = { path: preserved.run.path, binding: { path: priorPath, sha256: priorDigest }, receipt,
+      executions: preserved.executions };
+  }
   if (!canary) {
     await validateCanary(canaryPath, canaryDigest, build, binary, model);
     const expected = await reconstructInputs({
@@ -246,12 +296,15 @@ async function run({ manifestPath, manifestDigest, command, model, output, signa
     arguments: readerArgs(model, "<empty-case-directory>", "<schema-file>"),
     schema_sha256: sha256(JSON.stringify(READER_SCHEMA)),
     canary: canary ? null : { path: canaryPath, sha256: canaryDigest },
+    prior_response_preservation: prior?.binding ?? null,
   });
   const rows = [];
   let error = null;
   try {
-    for (const input of manifest.reader_inputs)
-      rows.push(await runInput({ input, command, model, output, signal }));
+    for (const input of manifest.reader_inputs) {
+      const retained = prior ? await reuseCompletedInput({ input, prior, command, model, output }) : null;
+      rows.push(retained ?? await runInput({ input, command, model, output, signal }));
+    }
     assert.equal(sha256(await readFile(command)), binary.sha256, "reader executable changed during run");
     assert.deepEqual(buildIdentity(!canary), build, "reader source changed during run");
   } catch (cause) { error = cause.message; }
@@ -291,7 +344,7 @@ async function main() {
   const { values, positionals } = parseArgs({ allowPositionals: true, options: Object.fromEntries([
     "preparation", "preparation-sha256", "annotations", "annotations-sha256",
     "questions", "questions-sha256", "manifest", "manifest-sha256", "output", "reader", "model",
-    "canary", "canary-sha256",
+    "canary", "canary-sha256", "preserve-run", "preserve-run-sha256",
   ].map(name => [name, { type: "string" }])) });
   assert.ok(values.output, "--output is required");
   const signal = new AbortController();
@@ -310,7 +363,8 @@ async function main() {
     else {
       assert.equal(positionals[0], "run", "expected prepare, canary or run");
       receipt = await run({ ...args, manifestPath: values.manifest, manifestDigest: values["manifest-sha256"],
-        canaryPath: values.canary, canaryDigest: values["canary-sha256"] });
+        canaryPath: values.canary, canaryDigest: values["canary-sha256"],
+        priorPath: values["preserve-run"], priorDigest: values["preserve-run-sha256"] });
     }
   }
   console.log(JSON.stringify(receipt));

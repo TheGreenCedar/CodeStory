@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fragmentId, sha256 } from "../lib/etr1-evidence.mjs";
 import { sourcePacket, referencePacket, readerPrompt, validateReaderAnswer,
-  validateReaderEvents } from "../lib/packet-reader-evidence.mjs";
+  validateReaderEvents, readerAnswerIssues } from "../lib/packet-reader-evidence.mjs";
 import { readerArgs, readerProcess, readerEnvironment, prepareReader, validateCanary,
   readerRequest, validateRequestExecution } from "../codestory-packet-reader.mjs";
 
@@ -94,6 +94,14 @@ test("only a completed no-tool reader turn can be scored", () => {
     { type: "item.completed", item: { id: "i", type: "agent_message", text: JSON.stringify(answer) } },
     { type: "turn.completed", usage: { input_tokens: 100, output_tokens: 20 } }];
   assert.deepEqual(validateReaderEvents(events, packet), answer);
+  const citationFailure = structuredClone(answer);
+  citationFailure.claims[0].citations[0].end_line = 3;
+  const validTurnBadAnswer = structuredClone(events);
+  validTurnBadAnswer[2].item.text = JSON.stringify(citationFailure);
+  assert.deepEqual(validateReaderEvents(validTurnBadAnswer, packet), citationFailure);
+  assert.equal(validateReaderAnswer(citationFailure, packet, { requireConfinedCitations: false })[0].code,
+    "citation_outside_supplied_source");
+  assert.equal(readerAnswerIssues({ claims: [], limitations: [] }, packet)[0].code, "invalid_reader_answer");
   for (const itemType of ["command_execution", "mcp_tool_call", "web_search", "collab_tool_call"]) {
     const changed = structuredClone(events);
     changed.splice(2, 0, { type: "item.started", item: { id: "tool", type: itemType } });

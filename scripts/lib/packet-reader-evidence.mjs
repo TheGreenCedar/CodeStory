@@ -118,7 +118,8 @@ export function readerPrompt(question, packet) {
   ].join("\n");
 }
 
-export function validateReaderAnswer(answer, packet) {
+export function validateReaderAnswer(answer, packet, { requireConfinedCitations = true } = {}) {
+  const citationIssues = [];
   exactKeys(answer, ["claims", "limitations"]);
   assert.ok(Array.isArray(answer.claims) && Array.isArray(answer.limitations), "invalid reader arrays");
   assert.ok(byteLength(answer) <= PUBLIC_BYTES, "reader output budget exceeded");
@@ -140,9 +141,14 @@ export function validateReaderAnswer(answer, packet) {
         if (row.start_line > cursor) break;
         cursor = row.end_line + 1;
       }
-      assert.ok(cursor > citation.end_line, "citation escapes supplied source");
+      if (cursor <= citation.end_line) {
+        citationIssues.push({ claim_index: answer.claims.indexOf(claim), citation,
+          code: "citation_outside_supplied_source" });
+        if (requireConfinedCitations) assert.fail("citation escapes supplied source");
+      }
     }
   }
+  return citationIssues;
 }
 
 export function validateReaderEvents(events, packet) {
@@ -162,6 +168,11 @@ export function validateReaderEvents(events, packet) {
   const usage = events.at(-1).usage;
   assert.ok(Number.isSafeInteger(usage?.input_tokens) && usage.input_tokens >= 0
     && Number.isSafeInteger(usage?.output_tokens) && usage.output_tokens >= 0, "reader token telemetry missing");
-  validateReaderAnswer(answers[0], packet);
   return answers[0];
+}
+
+/** Completed reader mistakes stay in the diagnostic rather than authorizing another response. */
+export function readerAnswerIssues(answer, packet) {
+  try { return validateReaderAnswer(answer, packet, { requireConfinedCitations: false }); }
+  catch (error) { return [{ code: "invalid_reader_answer", message: error.message }]; }
 }
