@@ -6,7 +6,8 @@ import path from "node:path";
 import { fragmentId, sha256 } from "../lib/etr1-evidence.mjs";
 import { sourcePacket, referencePacket, readerPrompt, validateReaderAnswer,
   validateReaderEvents } from "../lib/packet-reader-evidence.mjs";
-import { readerArgs, readerProcess, readerEnvironment, prepareReader, validateCanary } from "../codestory-packet-reader.mjs";
+import { readerArgs, readerProcess, readerEnvironment, prepareReader, validateCanary,
+  readerRequest, validateRequestExecution } from "../codestory-packet-reader.mjs";
 
 const publication = { project_id: "project", core_generation_id: "core", retrieval_generation: "retrieval" };
 function fixture(source = "first();\nsecond();\n", file = "src/a.rs") {
@@ -175,4 +176,24 @@ test("corpus canary authority binds status, source, executable and model", async
     await writeFile(file, bytes);
     await assert.rejects(validateCanary(file, sha256(bytes), build, binary, "fixed"));
   }
+});
+
+test("one request constructor binds the entire launch context and result", () => {
+  const expected = readerRequest({ command: "/reader", model: "fixed", directory: "/empty",
+    input: { path: "/input", sha256: "digest" }, schema: { path: "/schema", sha256: "schema" },
+    prompt: "question plus source", environment: { PATH: "/fixed/path" } });
+  const execution = Object.fromEntries(["input", "model", "command", "args", "prompt_sha256"]
+    .map(key => [key, structuredClone(expected[key])]));
+  validateRequestExecution(expected, execution, expected);
+  for (const mutate of [
+    r => { r.environment.PATH = "/other"; r.cwd = "/other"; r.timeout_ms = 1;
+      r.args = readerArgs(r.model, r.cwd, r.schema.path); },
+    r => { r.environment.EXTRA_CONTEXT = "changed"; },
+    r => { r.input.sha256 = "other"; },
+    r => { r.schema.sha256 = "other"; },
+    r => { r.prompt_sha256 = "other"; },
+  ]) { const changed = structuredClone(expected); mutate(changed);
+    assert.throws(() => validateRequestExecution(changed, execution, expected)); }
+  const changedOutput = structuredClone(execution); changedOutput.args = ["another invocation"];
+  assert.throws(() => validateRequestExecution(expected, changedOutput, expected));
 });

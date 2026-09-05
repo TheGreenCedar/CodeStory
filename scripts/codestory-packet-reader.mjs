@@ -119,6 +119,18 @@ export function readerEnvironment() {
     .filter(key => typeof process.env[key] === "string").map(key => [key, process.env[key]]));
 }
 
+export function readerRequest({ command, model, directory, input, schema, prompt,
+  environment = readerEnvironment() }) {
+  return { command, args: readerArgs(model, directory, schema.path), cwd: directory,
+    environment, model, input, schema, prompt_sha256: sha256(prompt), timeout_ms: 120000 };
+}
+
+export function validateRequestExecution(request, execution, expected) {
+  assert.deepEqual(request, expected, "reader prelaunch context changed");
+  for (const key of ["input", "model", "command", "args", "prompt_sha256"])
+    assert.deepEqual(execution[key], expected[key], "reader execution differs from request");
+}
+
 export async function readerProcess(command, args, prompt, {
   timeoutMs = 120000, signal, cwd, env = readerEnvironment(),
 } = {}) {
@@ -166,15 +178,12 @@ async function runInput({ input, command, model, output, signal }) {
   await mkdir(directory, { mode: 0o700 });
   const schema = await save(path.join(directory, "answer-schema.json"), READER_SCHEMA);
   const prompt = readerPrompt(value.question, value.packet);
-  const args = readerArgs(model, directory, schema.path);
-  const env = readerEnvironment();
-  const request = await save(path.join(directory, "request.json"), {
-    command, args, cwd: directory, environment: env, model, input, schema,
-    prompt_sha256: sha256(prompt), timeout_ms: 120000,
-  });
-  const execution = await readerProcess(command, args, prompt, { signal, cwd: directory, env });
+  const context = readerRequest({ command, model, directory, input, schema, prompt });
+  const request = await save(path.join(directory, "request.json"), context);
+  const execution = await readerProcess(context.command, context.args, prompt,
+    { signal, cwd: context.cwd, env: context.environment, timeoutMs: context.timeout_ms });
   const raw = await save(path.join(directory, "execution.json"), {
-    request, input, model, command, args, prompt_sha256: sha256(prompt), ...execution });
+    request, input, model, command, args: context.args, prompt_sha256: context.prompt_sha256, ...execution });
   assert.equal(execution.failure, null, execution.failure ?? "reader failed");
   assert.equal(execution.exit_code, 0, execution.stderr);
   const events = execution.stdout.trim().split("\n").map(line => JSON.parse(line));
@@ -197,11 +206,13 @@ export async function validateCanary(file, digest, build, binary, model) {
   assert.deepEqual(input, syntheticInput(), "canary input changed");
   const execution = await readBound(row.execution.path, row.execution.sha256);
   const request = await readBound(execution.request.path, execution.request.sha256);
-  assert.equal(request.command, binary.path);
-  assert.equal(request.model, model);
-  assert.deepEqual(request.input, row.input);
-  assert.deepEqual(request.args, readerArgs(model, request.cwd, request.schema.path));
-  assert.equal(request.prompt_sha256, sha256(readerPrompt(input.question, input.packet)));
+  const directory = path.join(path.dirname(file), "canary");
+  assert.equal(row.input.path, path.join(path.dirname(path.dirname(file)), "input.json"));
+  assert.equal(row.execution.path, path.join(directory, "execution.json"));
+  assert.equal(execution.request.path, path.join(directory, "request.json"));
+  assert.equal(request.schema.path, path.join(directory, "answer-schema.json"));
+  validateRequestExecution(request, execution, readerRequest({ command: binary.path, model,
+    directory, input: row.input, schema: request.schema, prompt: readerPrompt(input.question, input.packet) }));
   assert.deepEqual(await readBound(request.schema.path, request.schema.sha256), READER_SCHEMA);
   assert.equal(execution.exit_code, 0); assert.equal(execution.failure, null);
   const answer = validateReaderEvents(execution.stdout.trim().split("\n").map(JSON.parse), input.packet);
