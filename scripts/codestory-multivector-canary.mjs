@@ -16,7 +16,7 @@ function command(executable, args, cwd = directory) {
   assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
 }
 const prep = { repositories: [], fragments: [], wordings: [] }, annotations = { cases: [] };
-for (const [ordinal, count] of [40, 3].entries()) {
+for (const [ordinal, count] of [140, 3].entries()) {
   const repoRoot = path.join(directory, `repo-${ordinal}`);
   fs.mkdirSync(repoRoot);
   const lines = Array.from({ length: count }, (_, i) => `def transform_${i}(value): return value + ${i}\n`);
@@ -69,8 +69,16 @@ command(process.execPath, [controller, 'evaluate', run, annotationPath]);
 const result = JSON.parse(fs.readFileSync(path.join(run, 'result.json')));
 assert.equal(result.rows[0].legal.length, 27);
 assert.equal(result.rows[1].legal.length, 3);
+const cancellationRun = path.join(directory, 'cancelled');
+command(process.execPath, [controller, 'prepare', prepPath, cancellationRun, assets, python, contract, '--synthetic']);
+command(process.execPath, [controller, 'cancel', cancellationRun]);
+const cancelled = spawnSync(process.execPath, [controller, 'run', cancellationRun], { encoding: 'utf8', timeout: 60000 });
+assert.notEqual(cancelled.status, 0);
+assert.equal(JSON.parse(fs.readFileSync(path.join(cancellationRun, 'execution-end.json'))).experiment_status, 'invalid');
+assert.equal(fs.existsSync(path.join(cancellationRun, 'result.json')), false);
 publish(path.join(directory, 'canary.json'), { status: 'passed', synthetic_only: true,
   assets_sha256: sha256(fs.readFileSync(assets)), packages: result.packages,
+  module_code_sha256: sha256(JSON.stringify(JSON.parse(fs.readFileSync(path.join(run, 'input.json'))).module_code)),
   validation_sha256: sha256(fs.readFileSync(validation)),
   evaluation_sha256: sha256(fs.readFileSync(path.join(run, 'evaluation.json'))),
   source: JSON.parse(fs.readFileSync(path.join(run, 'input.json'))).source });

@@ -45,3 +45,23 @@ export function validateRows(input, rows) {
       'timing intervals do not reconcile');
   }
 }
+
+export function validateExecution(result, end, vectorReceipt, documentCount, queryCount) {
+  assert.equal(result.status, 'outputs_frozen');
+  assert.equal(end.experiment_status, 'outputs_frozen');
+  for (const key of ['preparation_ms', 'vector_serialization_ms', 'elapsed_before_result_serialization_ms'])
+    assert.ok(Number.isFinite(result[key]) && result[key] >= 0, `invalid ${key}`);
+  assert.ok(Number.isFinite(end.wall_ms) && end.wall_ms > 0);
+  const accounted = result.preparation_ms + result.vector_serialization_ms
+    + result.rows.reduce((sum, row) => sum + row.timing.whole_ms, 0);
+  assert.ok(result.elapsed_before_result_serialization_ms + .01 >= accounted, 'inner intervals exceed enclosing wall');
+  assert.ok(end.wall_ms >= result.elapsed_before_result_serialization_ms, 'inner wall exceeds process wall');
+  assert.equal(vectorReceipt.status, 'validated');
+  assert.equal(vectorReceipt.vectors_sha256, result.vectors_sha256);
+  assert.equal(vectorReceipt.documents_reencoded, documentCount);
+  assert.equal(vectorReceipt.queries_reencoded, queryCount);
+  assert.ok(Number.isFinite(vectorReceipt.maximum_score_error) && vectorReceipt.maximum_score_error >= 0
+    && vectorReceipt.maximum_score_error < 1e-4, 'invalid exact score verification');
+  return { request_loop_unaccounted_ms: result.elapsed_before_result_serialization_ms - accounted,
+    process_overhead_and_result_serialization_ms: end.wall_ms - result.elapsed_before_result_serialization_ms };
+}

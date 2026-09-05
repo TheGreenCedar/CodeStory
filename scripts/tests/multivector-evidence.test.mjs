@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { frontier, greedyRows, validateRows } from '../lib/multivector-evidence.mjs';
+import { frontier, greedyRows, validateRows, validateExecution } from '../lib/multivector-evidence.mjs';
 
 test('frontier has deterministic ties, natural underfill and independent successors', () => {
   const ids = Array.from({ length: 160 }, (_, i) => String(i).padStart(3, '0'));
@@ -12,6 +12,24 @@ test('frontier has deterministic ties, natural underfill and independent success
   assert.deepEqual(frontier(['b', 'a'], [1, 1], ['b']), ['b', 'a']);
   assert.deepEqual(frontier(ids, scores, []), []);
   assert.deepEqual(greedyRows(pool, ids, scores, new Map(ids.map(id => [id, 500])), 274), ids.slice(0, 16));
+});
+
+test('outer timing and complete verifier terminal fields cannot be self-omitted', () => {
+  const result = { status: 'outputs_frozen', vectors_sha256: 'v', preparation_ms: 10,
+    vector_serialization_ms: 2, elapsed_before_result_serialization_ms: 18,
+    rows: [{ timing: { whole_ms: 5 } }] };
+  const end = { experiment_status: 'outputs_frozen', wall_ms: 20 };
+  const receipt = { status: 'validated', vectors_sha256: 'v', documents_reencoded: 43,
+    queries_reencoded: 2, maximum_score_error: 0 };
+  assert.deepEqual(validateExecution(result, end, receipt, 43, 2),
+    { request_loop_unaccounted_ms: 1, process_overhead_and_result_serialization_ms: 2 });
+  for (const field of Object.keys(receipt)) {
+    const changed = { ...receipt }; delete changed[field];
+    assert.throws(() => validateExecution(result, end, changed, 43, 2));
+  }
+  for (const field of ['preparation_ms', 'vector_serialization_ms', 'elapsed_before_result_serialization_ms'])
+    assert.throws(() => validateExecution({ ...result, [field]: -1 }, end, receipt, 43, 2));
+  assert.throws(() => validateExecution(result, { ...end, wall_ms: 1 }, receipt, 43, 2));
 });
 
 test('exact row and metadata budgets; no compulsory seeds or oversize row substitution', () => {

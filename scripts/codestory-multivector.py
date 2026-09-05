@@ -9,6 +9,14 @@ import numpy as np
 import torch
 from pylate import models
 
+CANCEL_PATH = None
+INPUT_DIGEST = None
+
+def check_cancel():
+    if CANCEL_PATH is not None and CANCEL_PATH.exists():
+        assert json.loads(CANCEL_PATH.read_bytes()) == {'input_sha256': INPUT_DIGEST}, 'invalid cancellation binding'
+        raise RuntimeError('experiment_cancelled')
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -17,6 +25,9 @@ def publish(path, value):
         json.dump(value, out, separators=(',', ':'), allow_nan=False)
 
 def load_model(input_data):
+    check_cancel()
+    for entry in input_data['module_code']:
+        assert digest(pathlib.Path(entry['path']).read_bytes()) == entry['sha256'], 'module code changed'
     assert {d.metadata['Name']: d.version for d in importlib.metadata.distributions()} == input_data['packages'], 'package identity changed'
     root = pathlib.Path(input_data['model_root'])
     for entry in input_data['assets']['entries']:
@@ -50,8 +61,11 @@ def tokens(model, text, query):
             'token_ids': actual}
 
 def encode(model, texts, query):
-    result = model.encode(texts, is_query=query, batch_size=32, convert_to_numpy=False,
-                          convert_to_tensor=False, padding=False, pool_factor=1, show_progress_bar=False)
+    result = []
+    for offset in range(0, len(texts), 32):
+        check_cancel()
+        result.extend(model.encode(texts[offset:offset + 32], is_query=query, batch_size=32, convert_to_numpy=False,
+                                    convert_to_tensor=False, padding=False, pool_factor=1, show_progress_bar=False))
     for vector in result:
         assert vector.device.type == 'mps' and vector.ndim == 2 and vector.shape[1] == 48
         assert len(vector) > 0 and torch.isfinite(vector).all()
@@ -61,6 +75,7 @@ def encode(model, texts, query):
 def score_batches(query, batches):
     result = []
     for vectors, mask in batches:
+        check_cancel()
         dots = torch.matmul(query, vectors.transpose(1, 2))
         dots.masked_fill_(~mask[:, None, :], float('-inf'))
         result.extend(dots.max(dim=2).values.sum(dim=1).detach().cpu().tolist())
@@ -81,9 +96,11 @@ def authenticate(fragment, repo):
     return end - start
 
 def run(input_path):
+    global CANCEL_PATH, INPUT_DIGEST
     started = time.perf_counter()
     signal.alarm(25 * 60)
     input_bytes = input_path.read_bytes()
+    CANCEL_PATH, INPUT_DIGEST = input_path.parent / 'cancel.json', digest(input_bytes)
     data = json.loads(input_bytes)
     model = load_model(data)
     fragments = data['fragments']
@@ -109,6 +126,7 @@ def run(input_path):
     rows, queries = [], []
     repos = {r['repository_id']: r for r in data['repositories']}
     for ordinal, wording in enumerate(data['wordings']):
+        check_cancel()
         torch.mps.synchronize()
         start = time.perf_counter()
         receipt = tokens(model, wording['question'], True)
@@ -147,6 +165,7 @@ def run(input_path):
               'vector_serialization_ms': (time.perf_counter() - serialization_start) * 1000,
               'mps_driver_allocated_bytes': torch.mps.driver_allocated_memory(),
               'elapsed_before_result_serialization_ms': (time.perf_counter() - started) * 1000}
+    check_cancel()
     publish(input_path.parent / 'result.json', result)
 
 def verify(input_path):
@@ -170,13 +189,14 @@ def verify(input_path):
     model = load_model(data)
     assert [tokens(model, f['source'], False) for f in data['fragments']] == result['document_tokens']
     assert [tokens(model, w['question'], True) for w in data['wordings']] == result['query_tokens']
-    # Independently re-encode a deterministic sample, including first/last and each repo's first document.
-    sample = sorted({0, len(docs) - 1, *[by_id[r['fragment_ids'][0]] for r in data['repositories']]})
-    fresh = encode(model, [data['fragments'][i]['source'] for i in sample], False)
-    for i, vector in zip(sample, fresh):
-        assert np.max(np.abs(docs[i] - vector.cpu().numpy())) < 1e-4, 'substituted document vectors'
+    # Re-encode every document: score reconstruction alone cannot detect swapped blocks.
+    fresh = encode(model, [f['source'] for f in data['fragments']], False)
+    for old, vector in zip(docs, fresh):
+        assert old.shape == tuple(vector.shape), 'document token-mask shape changed'
+        assert np.max(np.abs(old - vector.cpu().numpy())) < 1e-4, 'substituted document vectors'
     fresh_queries = encode(model, [w['question'] for w in data['wordings']], True)
     for old, new in zip(queries, fresh_queries):
+        assert old.shape == tuple(new.shape), 'query token-mask shape changed'
         assert np.max(np.abs(old - new.cpu().numpy())) < 1e-4, 'substituted query vectors'
     max_error = 0
     assert len(result['rows']) == len(queries)
@@ -190,7 +210,7 @@ def verify(input_path):
     publish(input_path.parent / 'vector-validation.json', {'status': 'validated',
             'input_sha256': digest(input_path.read_bytes()), 'result_sha256': digest(result_bytes),
             'vectors_sha256': result['vectors_sha256'], 'maximum_score_error': max_error,
-            'sampled_document_indices': sample, 'all_queries_reencoded': True})
+            'documents_reencoded': len(fresh), 'queries_reencoded': len(fresh_queries)})
 
 if __name__ == '__main__':
     try:
