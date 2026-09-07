@@ -1845,6 +1845,72 @@ fn test_full_refresh_batches_artifact_cache_writes_per_file_chunk() -> Result<()
 }
 
 #[test]
+fn test_full_refresh_resolves_flushed_calls_in_serial_pipeline_and_cache_replay() -> Result<()> {
+    let dir = tempdir()?;
+    let caller = dir.path().join("caller.go");
+    let target = dir.path().join("target.go");
+    std::fs::write(&caller, "package sample\nfunc begin() { finish() }\n")?;
+    std::fs::write(&target, "package sample\nfunc finish() {}\n")?;
+    let plan = codestory_workspace::RefreshExecutionPlan {
+        mode: codestory_workspace::BuildMode::FullRefresh,
+        files_to_index: vec![caller, target.clone()],
+        files_to_remove: vec![],
+        existing_file_ids: HashMap::new(),
+    };
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+        IncrementalIndexingConfig {
+            file_batch_size: 1,
+            ..IncrementalIndexingConfig::default()
+        },
+    );
+    let pipeline_path = dir.path().join("pipeline.sqlite");
+    let mut serial = Storage::new_in_memory()?;
+    let mut pipeline = Storage::open_build(&pipeline_path)?;
+    let mut replay = Storage::open_build(dir.path().join("replay.sqlite"))?;
+    for (label, storage) in [("serial", &mut serial), ("pipeline", &mut pipeline)] {
+        let stats = indexer.run(storage, &plan, &EventBus::new(), None)?;
+        assert!(
+            stats.graph_projection_changed,
+            "{label}: fresh graph was flushed"
+        );
+        assert!(
+            stats.resolution_ran,
+            "{label}: full refresh must resolve its graph"
+        );
+        let nodes = storage.get_nodes()?;
+        let target_file = storage.get_files_by_paths(std::slice::from_ref(&target))?[&target].id;
+        let definition = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node.file_node_id == Some(NodeId(target_file))
+                    && node
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with("finish"))
+            })
+            .expect("the other file must contain the definition");
+        assert!(
+            storage.get_edges()?.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL && edge.resolved_target == Some(definition.id)
+            }),
+            "{label}: post-flush resolution must reach the other file's definition"
+        );
+    }
+    assert!(replay.copy_index_artifact_cache_from(&pipeline_path)? > 0);
+    let stats = indexer.run(&mut replay, &plan, &EventBus::new(), None)?;
+    assert!(stats.artifact_cache_hits > 0);
+    assert!(stats.graph_projection_changed);
+    assert!(
+        stats.resolution_ran,
+        "cache replay rebuilds a graph that still needs resolution"
+    );
+    assert_projection_snapshots_equal(&serial, &pipeline, "pipelined")?;
+    assert_projection_snapshots_equal(&serial, &replay, "cache-replayed")?;
+    Ok(())
+}
+
+#[test]
 fn test_file_backed_full_refresh_uses_bounded_projection_pipeline() -> Result<()> {
     use codestory_store::Store as Storage;
     use std::fs;
