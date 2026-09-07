@@ -1,3 +1,6 @@
+use codestory_contracts::packet_projection_v3::{
+    EvidenceAvailabilityV3Dto, RetrievalStateV3Dto, SearchProjectionV3Dto,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -59,6 +62,7 @@ struct RepoE2eStats {
     retrieval_manifest: RetrievalManifestStats,
     ground_seconds: f64,
     search_seconds: f64,
+    full_search_seconds: f64,
     symbol_seconds: f64,
     trail_seconds: f64,
     snippet_seconds: f64,
@@ -128,13 +132,54 @@ struct GroundStats {
 #[derive(Debug, Serialize)]
 struct SearchStats {
     query: String,
-    retrieval_shadow_mode: String,
-    legacy_search_retrieval_mode: String,
-    semantic_doc_count: u64,
-    indexed_symbol_hits: usize,
-    repo_text_hits: usize,
+    retrieval_state: RetrievalStateV3Dto,
+    full_retrieval_state: RetrievalStateV3Dto,
+    evidence_rows: usize,
+    symbol_rows: usize,
     top_symbol_id: String,
     top_symbol_name: String,
+}
+
+fn stats_search_projection(value: &Value) -> Result<SearchProjectionV3Dto, String> {
+    let mut payload = value.clone();
+    payload
+        .as_object_mut()
+        .ok_or("search output is not an object")?
+        .remove("_meta");
+    let projection: SearchProjectionV3Dto = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid v3 search projection: {error}"))?;
+    if projection.schema_version != 3 || projection.status != EvidenceAvailabilityV3Dto::Available {
+        return Err("search evidence is unavailable or has the wrong schema".into());
+    }
+    if projection.evidence.as_slice().iter().any(|row| {
+        row.symbol_id
+            .as_ref()
+            .is_some_and(|id| id.as_str().is_empty())
+    }) {
+        return Err("search supplied an empty symbol identity".into());
+    }
+    if !projection.evidence.as_slice().iter().any(|row| {
+        row.symbol_id
+            .as_ref()
+            .is_some_and(|id| !id.as_str().is_empty())
+    }) {
+        return Err("search supplied no resolvable symbol".into());
+    }
+    if projection.retrieval.state == RetrievalStateV3Dto::Full {
+        let publication = projection
+            .publication
+            .retrieval
+            .as_ref()
+            .ok_or("full search omitted its retrieval publication")?;
+        if projection.retrieval.generation_id.as_ref() != Some(&publication.retrieval_generation)
+            || publication.retrieval_generation.as_str().is_empty()
+            || publication.core_generation_id != projection.publication.core.generation_id
+            || publication.core_run_id != projection.publication.core.run_id
+        {
+            return Err("full search returned inconsistent publication identities".into());
+        }
+    }
+    Ok(projection)
 }
 
 #[derive(Debug, Serialize)]
@@ -538,6 +583,77 @@ fn release_readiness_proof_tier_requires_full_retrieval_evidence() {
     );
 }
 
+fn stats_search_fixture() -> Value {
+    serde_json::json!({
+        "kind":"complete", "schema_version":3, "status":"available",
+        "identity":{"packet_id":"search-1","request_id":"request-1","question_sha256":"a".repeat(64)},
+        "publication":{"core":{"project_id":"project-1","generation_id":"core-1","run_id":"run-1"},"retrieval":null},
+        "retrieval":{"state":"symbolic","generation_id":null},
+        "evidence":[{"identity":{"evidence_id":"row-1"},"path":"src/app.rs","symbol_id":"123",
+            "start_line":2,"end_line":2,"excerpt":"struct AppController;"}],
+        "gaps":[],"continuation":null,"diagnostics":{"availability":"unavailable"},
+        "_meta":{"operation":{"operation_id":"operation-1","attempt":1}}
+    })
+}
+
+#[test]
+fn repo_stats_consumes_public_v3_search_without_legacy_fields() {
+    let projection = stats_search_projection(&stats_search_fixture()).expect("v3 search");
+    assert_eq!(projection.retrieval.state, RetrievalStateV3Dto::Symbolic);
+    assert_eq!(
+        projection.evidence.as_slice()[0]
+            .symbol_id
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "123"
+    );
+}
+
+#[test]
+fn repo_stats_rejects_unavailable_unresolvable_and_wrong_schema_search() {
+    for (field, value) in [
+        ("status", serde_json::json!("unavailable")),
+        ("schema_version", serde_json::json!(4)),
+        ("evidence", serde_json::json!([])),
+    ] {
+        let mut fixture = stats_search_fixture();
+        fixture[field] = value;
+        assert!(stats_search_projection(&fixture).is_err());
+    }
+    let mut fixture = stats_search_fixture();
+    fixture["evidence"][0]["symbol_id"] = Value::Null;
+    assert!(stats_search_projection(&fixture).is_err());
+    fixture["evidence"][0]["symbol_id"] = serde_json::json!("");
+    assert!(stats_search_projection(&fixture).is_err());
+    fixture["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(stats_search_fixture()["evidence"][0].clone());
+    assert!(stats_search_projection(&fixture).is_err());
+    let legacy = serde_json::json!({"indexed_symbol_hits":[{"node_id":"123"}]});
+    assert!(stats_search_projection(&legacy).is_err());
+}
+
+#[test]
+fn repo_stats_full_search_requires_one_coherent_publication() {
+    let mut fixture = stats_search_fixture();
+    fixture["retrieval"] = serde_json::json!({"state":"full","generation_id":"retrieval-1"});
+    assert!(stats_search_projection(&fixture).is_err());
+    fixture["publication"]["retrieval"] = serde_json::json!({
+        "core_generation_id":"core-1", "core_run_id":"run-1", "retrieval_generation":"retrieval-1",
+        "retrieval_input_sha256":"a".repeat(64), "semantic_generation":"semantic-1"
+    });
+    stats_search_projection(&fixture).expect("coherent full retrieval");
+    for field in ["core_generation_id", "core_run_id", "retrieval_generation"] {
+        let mut changed = fixture.clone();
+        changed["publication"]["retrieval"][field] = serde_json::json!("other");
+        assert!(stats_search_projection(&changed).is_err());
+    }
+    fixture["retrieval"]["generation_id"] = Value::Null;
+    assert!(stats_search_projection(&fixture).is_err());
+}
+
 #[test]
 fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
     let proof_tier = release_readiness_proof_tier("full", "full");
@@ -545,6 +661,56 @@ fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
     assert_eq!(proof_tier, PROOF_TIER_FULL_RETRIEVAL);
     assert_ne!(proof_tier, "real_repo_drill");
     assert_ne!(proof_tier, "promotion_grade");
+}
+
+#[test]
+#[ignore = "native public search canary; supply CODESTORY_RELEASE_EVIDENCE_CLI_BINARY"]
+fn repo_stats_public_search_canary() {
+    let project = tempfile::tempdir().expect("isolated canary project");
+    let cache = tempfile::tempdir().expect("isolated canary cache");
+    fs::write(
+        project.path().join("app.rs"),
+        "pub struct AppController;\nimpl AppController { pub fn start(&self) {} }\n",
+    )
+    .expect("write canary source");
+    let binary = release_cli_binary();
+    run_cli_json(
+        &binary,
+        project.path(),
+        cache.path(),
+        &[
+            "index".into(),
+            "--refresh".into(),
+            "full".into(),
+            "--format".into(),
+            "json".into(),
+        ],
+    );
+    let (_, output) = run_cli_json(
+        &binary,
+        project.path(),
+        cache.path(),
+        &[
+            "search".into(),
+            "--query".into(),
+            "AppController".into(),
+            "--repo-text".into(),
+            "off".into(),
+            "--refresh".into(),
+            "none".into(),
+            "--format".into(),
+            "json".into(),
+        ],
+    );
+    let projection = stats_search_projection(&output).expect("real public search projection");
+    assert_eq!(projection.retrieval.state, RetrievalStateV3Dto::Symbolic);
+    assert!(
+        projection
+            .evidence
+            .as_slice()
+            .iter()
+            .any(|row| row.path.as_str() == "app.rs")
+    );
 }
 
 #[test]
@@ -773,6 +939,14 @@ fn repo_root() -> PathBuf {
 }
 
 fn release_cli_binary() -> PathBuf {
+    if let Some(binary) = env::var_os("CODESTORY_RELEASE_EVIDENCE_CLI_BINARY") {
+        let binary = PathBuf::from(binary);
+        assert!(
+            binary.is_absolute() && binary.is_file(),
+            "supplied release binary must be an existing absolute file"
+        );
+        return binary;
+    }
     repo_root()
         .join("target")
         .join("release")
@@ -862,6 +1036,33 @@ fn run_cli_output_with_sidecar_cache_root(
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();
+    if let Some(directory) = env::var_os("CODESTORY_RELEASE_EVIDENCE_COMMAND_DIR") {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ORDINAL: AtomicU64 = AtomicU64::new(0);
+        let directory = PathBuf::from(directory);
+        fs::create_dir_all(&directory).expect("create command evidence directory");
+        let file = directory.join(format!(
+            "{:04}.json",
+            ORDINAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(file)
+            .expect("create immutable command receipt");
+        let receipt = serde_json::json!({"binary": binary, "project": project_root, "cache": cache_dir,
+            "arguments": args, "wall_seconds": seconds, "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr)});
+        output_file
+            .write_all(
+                serde_json::to_string(&receipt)
+                    .expect("serialize command receipt")
+                    .as_bytes(),
+            )
+            .expect("write command receipt");
+        output_file.sync_all().expect("sync command receipt");
+    }
     assert!(
         output.status.success(),
         "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -1163,8 +1364,51 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
-    let top_symbol_id = string_field(&search_json, &["indexed_symbol_hits", "0", "node_id"]);
-    let top_symbol_name = string_field(&search_json, &["indexed_symbol_hits", "0", "display_name"]);
+    let search = stats_search_projection(&search_json).expect("usable v3 exact search");
+    assert_eq!(
+        search.retrieval.state,
+        RetrievalStateV3Dto::Symbolic,
+        "repo-text off must remain core-only"
+    );
+    let top_symbol_id = search
+        .evidence
+        .as_slice()
+        .iter()
+        .find_map(|row| row.symbol_id.as_ref())
+        .expect("resolvable exact search row")
+        .as_str();
+    let (full_search_seconds, full_search_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "search".into(),
+            "--query".into(),
+            "AppController".into(),
+            "--repo-text".into(),
+            "auto".into(),
+            "--limit".into(),
+            "10".into(),
+            "--refresh".into(),
+            "none".into(),
+            "--profile".into(),
+            "agent".into(),
+            "--run-id".into(),
+            sidecar_run_id.into(),
+            "--format".into(),
+            "json".into(),
+        ],
+    );
+    let full_search = stats_search_projection(&full_search_json).expect("usable v3 full search");
+    assert_eq!(full_search.retrieval.state, RetrievalStateV3Dto::Full);
+    assert_eq!(
+        full_search.publication.core, search.publication.core,
+        "read-only searches changed core generation"
+    );
+    assert!(
+        full_search.retrieval.generation_id.is_some(),
+        "full search must identify its retrieval generation"
+    );
 
     let (symbol_seconds, symbol_json) = run_cli_json(
         &binary,
@@ -1282,8 +1526,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         + repeat_semantic_reload_ms
         + repeat_semantic_prune_ms;
     let semantic_phase_seconds = semantic_phase_ms as f64 / 1000.0;
-    let search_retrieval_shadow_mode =
-        string_field(&search_json, &["retrieval_shadow", "retrieval_mode"]).to_string();
+    let full_search_retrieval_state = string_field(&full_search_json, &["retrieval", "state"]);
     let dense_reason_counts_json = string_field(
         &retrieval_status_json,
         &["manifest", "dense_reason_counts_json"],
@@ -1310,11 +1553,9 @@ fn codestory_repo_release_e2e_emits_stats() {
         dense_reason_count_total: dense_reason_count_total(&dense_reason_counts_json),
         dense_reason_counts_json,
     };
-    let proof_tier = release_readiness_proof_tier(
-        sidecar_retrieval_mode.as_str(),
-        search_retrieval_shadow_mode.as_str(),
-    )
-    .to_string();
+    let proof_tier =
+        release_readiness_proof_tier(sidecar_retrieval_mode.as_str(), full_search_retrieval_state)
+            .to_string();
     let stats_baseline = latest_phase_stats_baseline(project_root.as_path());
     let warnings = release_readiness_warnings(
         index_seconds,
@@ -1448,6 +1689,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         retrieval_manifest,
         ground_seconds,
         search_seconds,
+        full_search_seconds,
         symbol_seconds,
         trail_seconds,
         snippet_seconds,
@@ -1471,15 +1713,19 @@ fn codestory_repo_release_e2e_emits_stats() {
             coverage_total_files: u64_field(&ground_json, &["coverage", "total_files"]),
         },
         search: SearchStats {
-            query: string_field(&search_json, &["query"]).to_string(),
-            retrieval_shadow_mode: search_retrieval_shadow_mode,
-            legacy_search_retrieval_mode: string_field(&search_json, &["retrieval", "mode"])
-                .to_string(),
-            semantic_doc_count: u64_field(&search_json, &["retrieval", "semantic_doc_count"]),
-            indexed_symbol_hits: array_len(&search_json, &["indexed_symbol_hits"]),
-            repo_text_hits: array_len(&search_json, &["repo_text_hits"]),
+            query: "AppController".into(),
+            retrieval_state: search.retrieval.state.clone(),
+            full_retrieval_state: full_search.retrieval.state.clone(),
+            evidence_rows: search.evidence.as_slice().len(),
+            symbol_rows: search
+                .evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.symbol_id.is_some())
+                .count(),
             top_symbol_id: top_symbol_id.to_string(),
-            top_symbol_name: top_symbol_name.to_string(),
+            top_symbol_name: string_field(&symbol_json, &["symbol", "node", "display_name"])
+                .to_string(),
         },
         symbol: SymbolStats {
             display_name: string_field(&symbol_json, &["symbol", "node", "display_name"])
@@ -1538,8 +1784,9 @@ fn codestory_repo_release_e2e_emits_stats() {
         "strict grounding should reuse the prepared full retrieval state"
     );
     assert_eq!(
-        stats.search.retrieval_shadow_mode, "full",
-        "search should expose full retrieval shadow"
+        stats.search.full_retrieval_state,
+        RetrievalStateV3Dto::Full,
+        "full search should expose its prepared retrieval state"
     );
     assert!(
         stats.retrieval_manifest.symbol_doc_count > 0,
@@ -1587,7 +1834,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         "symbol lookup should resolve the same top hit returned by search"
     );
     assert!(
-        stats.search.indexed_symbol_hits > 0,
+        stats.search.symbol_rows > 0,
         "search should return indexed hits"
     );
     assert!(
