@@ -108,7 +108,22 @@ pub(super) fn bounded_markdown_snippet_from_path(
     truncation_suffix: &str,
 ) -> io::Result<BoundedSnippet> {
     let file = std::fs::File::open(path)?;
-    let mut reader = io::BufReader::new(file);
+    bounded_markdown_snippet_from_reader(
+        io::BufReader::new(file),
+        focus_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+pub(crate) fn bounded_markdown_snippet_from_reader<R: BufRead>(
+    mut reader: R,
+    focus_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
     let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP);
     let focus = focus_line.max(1) as usize;
     let start = focus.saturating_sub(context).max(1);
@@ -153,7 +168,26 @@ pub(super) fn bounded_markdown_snippet_range_from_path(
     truncation_suffix: &str,
 ) -> io::Result<BoundedSnippet> {
     let file = std::fs::File::open(path)?;
-    let mut reader = io::BufReader::new(file);
+    bounded_markdown_snippet_range_from_reader(
+        io::BufReader::new(file),
+        focus_line,
+        start_line,
+        end_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+pub(crate) fn bounded_markdown_snippet_range_from_reader<R: BufRead>(
+    mut reader: R,
+    focus_line: u32,
+    start_line: u32,
+    end_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
     let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP) as u32;
     let focus = focus_line.max(1);
     let start = start_line.saturating_sub(context).max(1);

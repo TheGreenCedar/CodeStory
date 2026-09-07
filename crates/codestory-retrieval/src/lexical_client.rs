@@ -95,7 +95,7 @@ impl LexicalClient {
     }
 }
 
-fn lexical_hit_to_candidate(hit: LexicalHit) -> Result<super::CandidateHit> {
+pub(crate) fn lexical_hit_to_candidate(hit: LexicalHit) -> Result<super::CandidateHit> {
     use super::candidate::{CandidateHit, CandidateSource};
     let mut candidate = CandidateHit::with_source(
         hit.path,

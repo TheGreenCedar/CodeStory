@@ -36,7 +36,8 @@ use codestory_store::{FileInfo, Store};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
+pub(crate) const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str =
+    "\n// ... source truncated by packet row cap\n```";
 
 pub(crate) struct FrozenPacketCompilationV1 {
     pub(crate) product: RepositoryDerivedCompilationV1,
@@ -273,7 +274,7 @@ fn hydrate_admitted_file_source(
     hydrated_source(admission, &path, None, &bounded.markdown)
 }
 
-fn hydrated_source(
+pub(crate) fn hydrated_source(
     admission: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
     path: &str,
     symbol: Option<String>,

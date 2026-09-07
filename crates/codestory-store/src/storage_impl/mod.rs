@@ -13370,6 +13370,31 @@ impl Storage {
         Ok(node_kinds.into_values().collect())
     }
 
+    /// Indexed declaration extents containing a source range, independent of
+    /// token occurrences on those lines. Used for addressed source hydration.
+    pub fn get_nodes_containing_source_lines(
+        &self,
+        file_id: NodeId,
+        start_line: u32,
+        end_line: u32,
+    ) -> Result<Vec<Node>, StorageError> {
+        if start_line == 0 || end_line < start_line {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col
+             FROM node WHERE file_node_id = ?1 AND start_line > 0
+             AND start_line <= ?2 AND end_line >= ?3
+             ORDER BY end_line - start_line, start_line, id",
+        )?;
+        let mut rows = statement.query(params![file_id.0, start_line, end_line])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
+        Ok(nodes)
+    }
+
     pub fn get_nodes_for_file_line(
         &self,
         path: &str,

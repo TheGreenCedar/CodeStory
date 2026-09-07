@@ -26,6 +26,10 @@ sha2 = { workspace = true }
 name = "codestory-proof-availability"
 path = "src/bin/codestory_proof_availability.rs"
 
+[[bin]]
+name = "codestory-witness-seam"
+path = "src/bin/codestory_witness_seam.rs"
+
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
 criterion = { workspace = true }
