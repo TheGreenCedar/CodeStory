@@ -1869,6 +1869,10 @@ fn test_full_refresh_resolves_flushed_calls_in_serial_pipeline_and_cache_replay(
     let mut replay = Storage::open_build(dir.path().join("replay.sqlite"))?;
     for (label, storage) in [("serial", &mut serial), ("pipeline", &mut pipeline)] {
         let stats = indexer.run(storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(
+            stats.full_refresh_queue_capacity,
+            usize::from(label == "pipeline")
+        );
         assert!(
             stats.graph_projection_changed,
             "{label}: fresh graph was flushed"
@@ -1900,6 +1904,7 @@ fn test_full_refresh_resolves_flushed_calls_in_serial_pipeline_and_cache_replay(
     assert!(replay.copy_index_artifact_cache_from(&pipeline_path)? > 0);
     let stats = indexer.run(&mut replay, &plan, &EventBus::new(), None)?;
     assert!(stats.artifact_cache_hits > 0);
+    assert_eq!(stats.full_refresh_queue_capacity, 1);
     assert!(stats.graph_projection_changed);
     assert!(
         stats.resolution_ran,
@@ -3116,6 +3121,8 @@ fn test_empty_full_refresh_reports_adaptive_chunk_config() -> Result<()> {
     assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
     assert_eq!(stats.projection_batch_transactions, 0);
     assert_eq!(stats.projection_batch_wall_ms, 0);
+    assert!(!stats.graph_projection_changed);
+    assert!(!stats.resolution_ran);
     Ok(())
 }
 
@@ -3705,6 +3712,11 @@ fn test_full_refresh_cancellation_after_writer_acceptance_drains_that_chunk() ->
     assert!(cancel_token.is_cancelled());
     assert_eq!(stats.full_refresh_chunks_produced, 1);
     assert_eq!(stats.full_refresh_chunks_persisted, 1);
+    assert!(stats.graph_projection_changed);
+    assert!(
+        !stats.resolution_ran,
+        "cancelled work must not enter resolution"
+    );
     let names = storage
         .get_nodes()?
         .into_iter()

@@ -1529,9 +1529,9 @@ impl<'a> ProjectionWriter<'a> {
                     .cleanup_ms
                     .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
             }
-        } else if self.mode == codestory_workspace::BuildMode::Incremental
-            && !local_storage.files.is_empty()
-        {
+        } else if !local_storage.files.is_empty() {
+            // Full refresh and newly indexed files both publish graph work.
+            // Only the existing incremental identity-only branch can reuse it.
             self.stats.graph_projection_changed = true;
         }
         let owning_file_ids = self

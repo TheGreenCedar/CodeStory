@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Full indexing now runs call and import resolution after writing the source
+  graph, including when replaying cached parser output. Previously, full
+  refreshes could leave relationships unresolved until an incremental edit.
+
 - Pointer-returning C and C++ functions and variable-bound JavaScript,
   TypeScript, and TSX functions and generators retain their full definitions
   in the source index. Calls through a function expression's private name no
