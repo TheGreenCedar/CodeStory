@@ -93,8 +93,36 @@ pub fn bash_resolution_work() -> BashResolutionWork {
 }
 
 #[cfg(test)]
-static JAVA_KOTLIN_RESOLUTION_WORK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+type ResolutionWorkCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+#[cfg(test)]
+thread_local! {
+    static JAVA_KOTLIN_RESOLUTION_WORK: std::cell::RefCell<Option<ResolutionWorkCounter>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn resolution_work_counter() -> Option<ResolutionWorkCounter> {
+    JAVA_KOTLIN_RESOLUTION_WORK.with(|work| work.borrow().clone())
+}
+
+#[cfg(test)]
+pub(super) struct ResolutionWorkScope(Option<ResolutionWorkCounter>);
+
+#[cfg(test)]
+impl Drop for ResolutionWorkScope {
+    fn drop(&mut self) {
+        JAVA_KOTLIN_RESOLUTION_WORK.with(|work| work.replace(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn inherit_resolution_work(
+    counter: &Option<ResolutionWorkCounter>,
+) -> ResolutionWorkScope {
+    ResolutionWorkScope(JAVA_KOTLIN_RESOLUTION_WORK.with(|work| work.replace(counter.clone())))
+}
 
 #[inline]
 fn count_rust_resolution_work(amount: usize) {
@@ -153,19 +181,31 @@ fn python_resolution_work() -> usize {
 #[inline]
 fn count_java_kotlin_resolution_work(amount: usize) {
     #[cfg(test)]
-    let _ = JAVA_KOTLIN_RESOLUTION_WORK.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+    JAVA_KOTLIN_RESOLUTION_WORK.with(|work| {
+        if let Some(counter) = work.borrow().as_ref() {
+            counter.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     #[cfg(not(test))]
     let _ = amount;
 }
 
 #[cfg(test)]
 fn reset_java_kotlin_resolution_work() {
-    JAVA_KOTLIN_RESOLUTION_WORK.store(0, std::sync::atomic::Ordering::Relaxed);
+    JAVA_KOTLIN_RESOLUTION_WORK.with(|work| {
+        work.replace(Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+    });
 }
 
 #[cfg(test)]
 fn java_kotlin_resolution_work() -> usize {
-    JAVA_KOTLIN_RESOLUTION_WORK.load(std::sync::atomic::Ordering::Relaxed)
+    JAVA_KOTLIN_RESOLUTION_WORK.with(|work| {
+        work.borrow().as_ref().map_or(0, |counter| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    })
 }
 
 #[inline]
@@ -20142,6 +20182,81 @@ mod java_kotlin_complexity_tests {
     use codestory_workspace::{BuildMode, RefreshInfo};
     use std::fs;
     use tree_sitter::Parser;
+
+    #[test]
+    fn overlapping_resolution_work_measurements_are_isolated() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles = [11, 31].map(|amount| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    reset_java_kotlin_resolution_work();
+                    barrier.wait();
+                    count_java_kotlin_resolution_work(amount);
+                    barrier.wait();
+                    assert_eq!(java_kotlin_resolution_work(), amount);
+                })
+            });
+            for handle in handles {
+                handle.join().expect("independent measurement must succeed");
+            }
+        });
+    }
+
+    #[test]
+    fn resolution_work_follows_owned_workers_and_restores_their_scope() {
+        reset_java_kotlin_resolution_work();
+        let counter = resolution_work_counter();
+        std::thread::spawn(move || {
+            reset_java_kotlin_resolution_work();
+            count_java_kotlin_resolution_work(3);
+            {
+                let _scope = inherit_resolution_work(&counter);
+                count_java_kotlin_resolution_work(7);
+            }
+            assert_eq!(java_kotlin_resolution_work(), 3);
+        })
+        .join()
+        .expect("worker measurement");
+        assert_eq!(java_kotlin_resolution_work(), 7);
+    }
+
+    #[test]
+    fn workspace_parser_jobs_inherit_the_measurement_owner() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..3 {
+            let path = project.path().join(format!("part_{index}.rs"));
+            fs::write(&path, format!("fn part_{index}() {{}}\n"))?;
+            paths.push(path);
+        }
+        reset_java_kotlin_resolution_work();
+        let expected = resolution_work_counter().expect("measurement owner");
+        let indexer = crate::WorkspaceIndexer::new(project.path().to_path_buf())
+            .with_pipeline_test_hooks(crate::FullRefreshPipelineTestHooks {
+                before_parse_job: Some(std::sync::Arc::new(move |_| {
+                    let actual = resolution_work_counter().expect("parser job must inherit owner");
+                    assert!(std::sync::Arc::ptr_eq(&actual, &expected));
+                    count_java_kotlin_resolution_work(7);
+                })),
+                ..Default::default()
+            });
+        let mut store = Store::open_build(project.path().join("stage.sqlite"))?;
+        let stats = indexer.run(
+            &mut store,
+            &codestory_workspace::RefreshExecutionPlan {
+                mode: BuildMode::FullRefresh,
+                files_to_index: paths,
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(stats.full_refresh_queue_capacity, 1);
+        assert_eq!(java_kotlin_resolution_work(), 21);
+        Ok(())
+    }
 
     fn measured_work(language: &str, source: &str) -> usize {
         let mut parser = Parser::new();
