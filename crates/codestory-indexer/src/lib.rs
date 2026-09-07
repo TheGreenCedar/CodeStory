@@ -1529,9 +1529,9 @@ impl<'a> ProjectionWriter<'a> {
                     .cleanup_ms
                     .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
             }
-        } else if self.mode == codestory_workspace::BuildMode::Incremental
-            && !local_storage.files.is_empty()
-        {
+        } else if !local_storage.files.is_empty() {
+            // Full refresh and newly indexed files both publish graph work.
+            // Only the existing incremental identity-only branch can reuse it.
             self.stats.graph_projection_changed = true;
         }
         let owning_file_ids = self
@@ -2266,9 +2266,13 @@ impl WorkspaceIndexer {
             .saturating_add(source_prepare_ms);
 
         let parse_started = Instant::now();
+        #[cfg(test)]
+        let resolution_work = proof_resolution::resolution_work_counter();
         let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
             .par_iter()
             .map(|prepared_input| {
+                #[cfg(test)]
+                let _resolution_work = proof_resolution::inherit_resolution_work(&resolution_work);
                 #[cfg(test)]
                 if let Some(hook) = &self.pipeline_test_hooks.before_parse_job {
                     hook(_chunk_index);
