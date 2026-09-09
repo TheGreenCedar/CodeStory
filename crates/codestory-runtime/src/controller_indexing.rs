@@ -754,7 +754,10 @@ impl AppController {
     }
 
     fn recover_failed_indexing(&self, storage_path: &Path, refresh_runtime_caches: bool) {
-        if refresh_runtime_caches && let Ok(mut storage) = Storage::open(storage_path) {
+        // Failure recovery may restore caches from a compatible publication,
+        // but must never migrate the predecessor that the failed refresh kept.
+        if refresh_runtime_caches && let Ok(mut storage) = Storage::open_observational(storage_path)
+        {
             let incomplete = storage.has_incomplete_incremental_run().unwrap_or(true);
             if !incomplete {
                 self.clear_search_state();
