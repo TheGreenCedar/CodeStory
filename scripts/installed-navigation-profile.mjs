@@ -329,7 +329,8 @@ async function participantCanary(session, request, started) {
     && Array.isArray(started.sandbox.writableRoots), 'actual host did not retain the workspace sandbox');
   requireThat(started.approvalPolicy === 'never', 'canary approval policy differs from non-interactive codex exec');
   const actualWritableRoots = await Promise.all(started.sandbox.writableRoots.map(directory => realpath(directory)));
-  requireThat(actualWritableRoots.includes(await realpath(env.TMPDIR)), 'actual host did not retain the isolated writable temporary root');
+  requireThat(actualWritableRoots.length === 1 && actualWritableRoots[0] === await realpath(env.TMPDIR),
+    'actual host changed the isolated writable temporary root set');
   const { expected, directories } = participantToolchainContract(env, project);
   const marker = randomBytes(16).toString('hex');
   const script = `(${participantProbe.toString()})(${JSON.stringify(expected)},${JSON.stringify(FORBIDDEN_TOOLCHAIN_ENVIRONMENT)},${JSON.stringify(directories)},${JSON.stringify(path.join(root, `forbidden-canary-${marker}`))},${JSON.stringify(marker)})`;

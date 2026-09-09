@@ -190,7 +190,7 @@ async function accountingFixture(t, option) {
       async request({id, method, params}) {
         if (method === 'initialize') return {id,result:{}};
         if (method === 'thread/start') return {id,result:{thread:{id:'fixture'}, approvalPolicy:'never',
-          sandbox:{type:'workspaceWrite',networkAccess:false,writableRoots:params.config['sandbox_workspace_write.writable_roots']}}};
+          sandbox:{type:'workspaceWrite',networkAccess:false,writableRoots:[...params.config['sandbox_workspace_write.writable_roots'], ...(option === 'native-canary-extra-root' ? [template] : [])]}}};
         if (method === 'mcpServerStatus/list') return {id,result:{data:[]}};
         assert.equal(method, 'command/exec');
         const {expected,directories}=participantToolchainContract(options.env, options.cwd);
@@ -222,11 +222,11 @@ async function accountingFixture(t, option) {
 }
 
 test('failure and budget matrix retains every row without launching after expiry', async t => {
-  for (const option of ['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','preparation','spawn','usage','model-failure']) {
+  for (const option of ['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','native-canary-extra-root','preparation','spawn','usage','model-failure']) {
     const result = await accountingFixture(t, option);
     assert.equal(result.summary.results.length, 2);
     assert.ok(result.summary.results.every(row => row.status !== 'not_run'));
-    if (['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes'].includes(option)) assert.equal(result.attempts, 0);
+    if (['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','native-canary-extra-root'].includes(option)) assert.equal(result.attempts, 0);
     else if (option === 'preparation') { assert.equal(result.attempts, 1); assert.equal(result.summary.results[0].status,'preparation_failed'); assert.equal(result.summary.results[1].status,'pass'); }
     else assert.equal(result.attempts, 2);
     if (option === 'usage') assert.ok(result.summary.results.every(row => row.telemetry_complete === false));
