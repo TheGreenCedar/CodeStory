@@ -26,7 +26,10 @@ host tools; an exact name can be searched; an unfamiliar repository may benefit
 from `ground` or `files`. No preliminary status or packet call is required.
 
 1. Locate candidates using an exact selector, text or behavior description.
-2. Inspect relevant source through `snippet`, `context` or ordinary host reads.
+2. Inspect relevant source through `snippet` or ordinary host reads.
+   `context` collects evidence around a target; its rows may contain only
+   locations. Read the source when returned excerpts do not show the code
+   needed for the claim.
    Copy returned opaque symbol IDs unchanged; resolve ambiguity using paths,
    scope and source instead of guessing an ID from a display name.
 3. Follow relevant callers, callees, references or other explicit relationships.
@@ -47,7 +50,8 @@ not an instruction to execute.
 | --- | --- |
 | Repository orientation or coverage | `ground` for a compact map; `files` for indexed files and coverage. |
 | Discover or disambiguate candidates | `search`; preserve an explicitly supplied symbol query unchanged. Use `repo_text: "off"` for existing core-only symbol search without embedding preparation. |
-| Inspect a selected target | `context` with a concrete `query` or a returned `symbol_id` as `id`; `snippet` for source windows; host reads for any relevant source or artifact. |
+| Collect evidence around a selected target | `context` with a concrete `query` or a returned `symbol_id` as `id`; inspect the excerpts and their limits. |
+| Inspect source text | `snippet` for source windows; host reads for any relevant source or artifact. A location alone does not show the implementation. |
 | Follow relationships | `callers`, `callees`, `references`, `trace` or `trail`; node-based `neighbors`, `shortest_path` and `query_subgraph` require actual returned node IDs. |
 | Inspect identities | `symbol`, `symbols`, `definition` and `get_node`. Names, IDs and source locations have different roles; keep their types intact. |
 | Review a diff | `affected` with explicit changed `paths`, `changed_paths` or `change_records`. Obtain the diff with host Git tools; this tool does not discover it. |
