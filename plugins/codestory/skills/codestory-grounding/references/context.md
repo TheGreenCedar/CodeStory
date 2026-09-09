@@ -3,7 +3,10 @@
 Builds target context around one concrete retrieval target (`query` must name a
 symbol, file, literal, API path, module, or behavior term, not a broad
 question). Fails closed unless full retrieval is ready. Use `search` for
-discovery, then inspect selected targets and follow their relationships.
+discovery, then collect evidence around selected targets and follow their
+relationships. Returned rows may contain only symbol locations or short
+excerpts. Use `snippet` or host reads when the needed implementation text is
+absent; a resolved target is not itself a source read.
 
 ## Syntax
 
