@@ -1,5 +1,5 @@
 import { acceptedFreezeStatus, validateAcceptanceProvenance } from '../../.github/scripts/release-freeze-barrier.mjs';
-import { deriveReleaseCells } from '../codestory-release-closeout.mjs';
+import { deriveReleaseCells, validateReleaseCloseoutLedger } from '../codestory-release-closeout.mjs';
 import { releaseClaimGraphDigest } from '../codestory-release-claims.mjs';
 import {
   SOURCE_PROOF_WORKFLOW, PACKAGED_WORKFLOW, RELEASE_WORKFLOW, AUTO_RELEASE_WORKFLOW,
@@ -133,6 +133,7 @@ export function closeoutEvidence(host, run, head, version, phase) {
     && ledger.cells.every(cell => ['pass', 'pass_with_exception', 'withheld'].includes(cell.status))
     && summary.counts?.required === expected.length && summary.counts.failed === 0 && summary.counts.missing === 0,
   'release closeout is not an accepted exact-head complete ledger');
+  validateReleaseCloseoutLedger({ graph, phase, ledger, summary });
   if (phase === 'post_publish') {
     const delivery = ledger.catalog_delivery;
     requireThat(graph.workflow_policy.catalog_delivery.states.some(state => state.id === delivery?.state && state.installer === delivery.installer)

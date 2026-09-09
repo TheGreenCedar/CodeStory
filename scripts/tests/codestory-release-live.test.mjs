@@ -91,6 +91,42 @@ test('an uncertain dispatch reply retains intent and never silently retries', as
   assert.equal(dispatches(f).length, 1);
 });
 
+test('an existing broad run blocks dispatch without acquiring cancellation ownership', async () => {
+  const f = await started();
+  f.data.runs.push({ id: 50, head_sha: C, path: '.github/workflows/source-proof.yml',
+    head_repository: { full_name: 'TheGreenCedar/CodeStory' }, status: 'queued' });
+  assert.match((await run(f)).blocker, /broad proof is already active/u);
+  assert.equal(dispatches(f).length, 0);
+  assert.equal(f.record().dispatches.length, 0);
+});
+
+test('lost dispatch response resumes only the persisted nonce and leaves an unrelated run alone', async () => {
+  const f = await started(); f.data.dispatchReplyLost = true;
+  assert.match((await run(f)).blocker, /uncertain network/u);
+  const owned = f.data.runs[0];
+  f.data.runs.push({ ...owned, id: 50, display_title: 'unrelated source proof' });
+  f.data.dispatchReplyLost = false;
+  assert.equal((await run(f, 'resume')).active_runs[0].id, owned.id);
+  assert.equal(dispatches(f).length, 1);
+  f.data.next = D; f.data.localHead = D;
+  await run(f, 'resume');
+  assert.equal(f.data.runs.find(row => row.id === 50).status, 'queued');
+  assert.equal(owned.conclusion, 'cancelled');
+});
+
+test('wrong or duplicate dispatch nonces cannot be adopted as owned work', async t => {
+  for (const kind of ['missing', 'different', 'duplicate']) await t.test(kind, async () => {
+    const f = await started(); f.data.dispatchReplyLost = true; await run(f);
+    if (kind === 'missing') delete f.data.runs[0].display_title;
+    if (kind === 'different') f.data.runs[0].display_title = 'codestory-release:another';
+    if (kind === 'duplicate') f.data.runs.push({ ...f.data.runs[0], id: 50 });
+    f.data.next = D; f.data.localHead = D;
+    assert.match((await run(f, 'resume')).blocker, /unconfirmed/u);
+    assert.ok(f.data.runs.every(row => row.status === 'queued'));
+    assert.equal(f.record().dispatches[0].id, undefined);
+  });
+});
+
 test('a failed newer attempt cannot reuse earlier successful evidence', async () => {
   const f = await started(); await run(f); f.completeSource(122);
   Object.assign(f.data.runs[0], { run_attempt: 2, conclusion: 'failure' });
@@ -181,6 +217,25 @@ async function qualified() {
   assert.equal(ready.phase, 'awaiting_approval');
   return f;
 }
+
+test('retained closeout must preserve mandatory cells, exception eligibility, and exact counts', async t => {
+  for (const kind of ['mandatory-withheld', 'all-withheld', 'exception', 'count', 'summary-withheld']) await t.test(kind, async () => {
+    const f = await qualified();
+    const artifact = f.data.artifacts.get(126)[0];
+    const names = ['pre_publish/ledger.json', 'pre_publish/summary.json', 'pre_publish/producer-provenance.json'];
+    const docs = f.host().readArtifact(artifact, names);
+    const ledger = JSON.parse(docs[names[0]]), summary = JSON.parse(docs[names[1]]);
+    if (kind === 'mandatory-withheld') ledger.cells.find(row => row.id.startsWith('package_identity:')).status = 'withheld';
+    if (kind === 'all-withheld') for (const row of ledger.cells) row.status = 'withheld';
+    if (kind === 'exception') ledger.cells.find(row => row.id.startsWith('package_identity:')).status = 'pass_with_exception';
+    if (kind === 'count') summary.counts.passed--;
+    if (kind === 'summary-withheld') summary.withheld_hosts = ['linux-x64-vulkan'];
+    docs[names[0]] = JSON.stringify(ledger); docs[names[1]] = JSON.stringify(summary);
+    f.data.artifacts.set(126, []); f.artifact(f.data.runs.find(row => row.id === 126), artifact.name, docs);
+    assert.ok((await run(f)).blocker);
+    assert.equal(f.record().approval, null);
+  });
+});
 
 test('three real calibration records retain their shared Actions producer and distinct raw identities', async () => {
   const f = await calibrated();

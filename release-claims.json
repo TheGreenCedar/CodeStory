@@ -1675,7 +1675,7 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "7eb0812b601c3f06d5885b741d4dd1775b85c10619b18fc680dbb77a9ccc13b4",
+        "job_manifest_sha256": "43c178977aec468d1c21a74167ac797db73c6e4d7a318476aae0ba976ac95f4b",
         "phases": {
           "source_stabilization": {
             "known_future_source_changes": [
@@ -1779,7 +1779,7 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "111a730a2ea35476aa94ee2fdb16d5795b5230e4e6002664ac3ff2d913a23c31",
+        "sha256": "8444a37b82dd47b62a86ff49102d064393df7eeeac73005f18afcc8e243218e1",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {

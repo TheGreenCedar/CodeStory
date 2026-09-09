@@ -116,17 +116,19 @@ export function githubFixture() {
     Object.assign(selected, { status: 'completed', conclusion: 'success' });
     const head = selected.head_sha;
     const provenance = json({ schema: 'codestory.release-actions-provenance/v1', test_fixture: true });
-    const cells = deriveReleaseCells(graph, phase).map(cell => ({ id: cell.id, status: 'pass',
+    const cells = deriveReleaseCells(graph, phase).map(cell => ({ id: cell.id, phase: cell.phase, claim: cell.claim,
+      evidence_type: cell.evidence_type, status: 'pass',
       ...(cell.id.startsWith('package_identity:') ? { archive: { name: `codestory-cli-v0.17.6-${cell.id.split(':')[1]}.tar.gz`, bytes: 100, sha256: 'a'.repeat(64) } } : {}),
     }));
     const delivery = graph.workflow_policy.catalog_delivery.states[0];
     const shared = { phase, decision: 'accept', graph_sha256: releaseClaimGraphDigest(graph), version: '0.17.6',
       identity: { repository: REPOSITORY, commit: head, source_tree: TREES[head] }, input_errors: [],
-      producer_provenance_sha256: sha256(provenance), withheld_claims: [],
+      producer_provenance_sha256: sha256(provenance), withheld_claims: [], withheld_cells: [], withheld_hosts: [],
+      partially_withheld_claims: [], withhold_policy: graph.non_claim_policy.withhold_policy,
       ...(phase === 'post_publish' ? { catalog_delivery: { state: delivery.id, installer: delivery.installer } } : {}),
     };
     const ledger = { ...shared, schema: graph.closeout.ledger_schema, cells };
-    const summary = { ...shared, schema: graph.closeout.summary_schema, counts: { required: cells.length, passed: cells.length, failed: 0, missing: 0, withheld: 0 } };
+    const summary = { ...shared, schema: graph.closeout.summary_schema, failed_cells: [], missing_cells: [], counts: { required: cells.length, passed: cells.length, failed: 0, missing: 0, withheld: 0 } };
     const suffix = phase === 'post_publish' ? '-attempt-1' : '';
     artifact(selected, `release-closeout-${phase.replace('_', '-')}-0.17.6-${head}${suffix}`, {
       [`${phase}/ledger.json`]: json(ledger), [`${phase}/summary.json`]: json(summary), [`${phase}/producer-provenance.json`]: provenance,
@@ -239,10 +241,12 @@ export function githubFixture() {
     if (endpoint.endsWith('/dispatches')) {
       if (data.dispatchFailure) throw new Error('uncertain network response');
       const run = { id: ++data.nextId, run_attempt: 1, status: 'queued', conclusion: null,
+        display_title: `codestory-release:${body.inputs.coordinator_dispatch_id}`,
         path: `.github/workflows/${endpoint.split('/').at(-2)}`, head_sha: body.inputs.expected_head_sha,
         head_repository: { full_name: REPOSITORY }, actor: { login: 'TheGreenCedar' }, event: 'workflow_dispatch',
         created_at: current(), run_started_at: current() };
       data.runs.push(run);
+      if (data.dispatchReplyLost) throw new Error('uncertain network response after dispatch');
       return output({ workflow_run_id: run.id, run_url: `https://api.github.com/${endpoint}/${run.id}`, html_url: `https://github.com/${REPOSITORY}/actions/runs/${run.id}` });
     }
     if (endpoint.includes('/actions/runs?')) return output({ workflow_runs: data.runs.filter(run => run.head_sha === new URL(`https://api.github.com/${endpoint}`).searchParams.get('head_sha')) });

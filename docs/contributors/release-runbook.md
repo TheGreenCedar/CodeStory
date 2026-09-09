@@ -15,8 +15,10 @@ node scripts/codestory-release.mjs resume
 `status` reconstructs phase from the recorded Actions runs, their latest
 attempts, and digest-checked artifacts. `advance` dispatches the next permitted
 workflow and waits while it is in flight. An uncertain dispatch response keeps
-its durable intent; the driver reconciles the matching run before doing more
-work. It never invents a run ID or retries an unconfirmed dispatch.
+its durable intent; the driver reconciles the unique dispatch ID echoed in
+GitHub's run title before doing more work. A matching head, actor, or timestamp
+cannot establish ownership. An existing broad run on the same head blocks a
+new dispatch. The driver never invents a run ID or retries an unconfirmed dispatch.
 
 Use a clean checkout of the exact pushed proof head when advancing. Python
 3.11 or newer, Node, Git, authenticated `gh`, and the repository's Node

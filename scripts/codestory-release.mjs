@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { initReceipt, invalidateReceipt, recordGroup, validatePhase } from '../.github/scripts/release-driver-receipt.mjs';
 import { createDefaultHost } from './lib/release-coordinator-github.mjs';
 import { sourceEvidence, calibrationEvidence, qualificationEvidence, closeoutEvidence } from './lib/release-coordinator-evidence.mjs';
@@ -72,6 +73,8 @@ function stepHead(record, phase) {
 function liveStep(host, step) {
   const run = host.getRun(step.id);
   validateRun(run, { repository: host.repository, head: step.head, workflow: step.workflow });
+  requireThat(typeof step.dispatch_id === 'string' && run.display_title === `codestory-release:${step.dispatch_id}`,
+    'release run does not carry its persisted dispatch identity');
   return run;
 }
 
@@ -79,7 +82,8 @@ function recoverIntents(record, host) {
   for (const step of record.dispatches.filter(row => !row.id && !row.rejected)) {
     const matches = host.runsFor(step.head.commit).filter(run => run.path === step.workflow
       && run.event === 'workflow_dispatch' && run.head_repository?.full_name === host.repository
-      && run.actor?.login === step.actor && Date.parse(run.created_at) >= Date.parse(step.started_at));
+      && run.actor?.login === step.actor && Date.parse(run.created_at) >= Date.parse(step.started_at)
+      && typeof step.dispatch_id === 'string' && run.display_title === `codestory-release:${step.dispatch_id}`);
     requireThat(matches.length === 1, `unconfirmed ${step.phase} dispatch: ${matches.length} matching runs; no replacement will be dispatched`);
     step.id = matches[0].id;
     liveStep(host, step);
@@ -307,8 +311,13 @@ async function advance(record, host, state, options) {
   }
   if (['complete', 'rehearsal_complete', 'publication'].includes(record.phase)) return state;
   const request = dispatchRequest(record, completed);
+  const collisions = host.runsFor(request.head.commit).filter(run => BROAD_WORKFLOWS.includes(run.path)
+    && run.head_repository?.full_name === host.repository && RUNNING.has(run.status));
+  requireThat(collisions.length === 0, `broad proof is already active for this head: ${collisions.map(run => run.id).join(', ')}`);
+  const dispatch_id = randomUUID();
+  request.inputs.coordinator_dispatch_id = dispatch_id;
   const probe = host.preflight(request.head, record.phase, request);
-  const intent = { ...request, started_at: host.now().toISOString(), actor: host.actor, preflight: probe };
+  const intent = { ...request, dispatch_id, started_at: host.now().toISOString(), actor: host.actor, preflight: probe };
   record.dispatches.push(intent);
   save(record, host); // Persist intent before the external effect. Uncertain replies never become retries.
   intent.id = host.dispatch(request);
