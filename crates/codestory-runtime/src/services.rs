@@ -3672,7 +3672,32 @@ pub(crate) mod activation_tests {
                 .ready_lease_present,
             "the restored lease must match before publication removal"
         );
-        fs::remove_file(&fixture.storage_path).expect("remove publication for hostile state");
+        fs::remove_file(&fixture.storage_path).expect("remove legacy database for hostile state");
+        assert!(
+            codestory_store::core_database_exists(&fixture.storage_path)
+                .expect("resolve retained generation"),
+            "removing the legacy file must not remove the active generation"
+        );
+        assert_observational(
+            "generation-only publication",
+            crate::activation_status::ReadyLeaseEvidence {
+                ready_lease_present: true,
+                ready_lease_admission_basis: "complete_source_observation".to_string(),
+                ready_lease_observer_epoch_coherence: "coherent".to_string(),
+                ready_lease_memo_holds_observations: true,
+            },
+            "full",
+        );
+
+        let layout =
+            codestory_store::CorePublicationLayout::from_storage_path(&fixture.storage_path)
+                .expect("publication layout");
+        fs::remove_file(layout.publication_path()).expect("remove active publication pointer");
+        assert!(
+            !codestory_store::core_database_exists(&fixture.storage_path)
+                .expect("observe missing publication"),
+            "unreferenced generation files must not count as an active publication"
+        );
         assert_observational(
             "missing publication",
             crate::activation_status::ReadyLeaseEvidence {
