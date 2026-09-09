@@ -231,7 +231,7 @@ async function prepareSession(row, manifest, installation, output, codex, helper
   validateInventory(listing.installed, row.arm, arm);
   const effective = { schema_version: 1, session: row, model: manifest.model, timeout_ms: 600_000,
     sandbox: 'workspace-write', host_features: { remote_plugin: false }, project, source_commit: repo.commit, source_tree: repo.tree,
-    package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(Object.entries(env).filter(([key]) => /^(HOME|USERPROFILE|TMPDIR|CODEX_HOME|CODESTORY_)/.test(key))) };
+    package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(HOST_ENVIRONMENT.filter(key => env[key] !== undefined).map(key => [key, env[key]])) };
   await save(path.join(root, 'effective-config.json'), effective);
   return { root, env, project, pluginRoot, task, arm, effective, codex };
 }
@@ -285,7 +285,9 @@ async function withInstalledHost(session, helpers, name, action) {
     const child = await observeChildEnvironment(channel, session, helpers);
     const call = (tool, args) => request('mcpServer/tool/call', { threadId, server: 'codestory', tool, arguments: args });
     const result = await action(call);
-    return { ...result, host_registration: 'explicit_installed_launcher', child, model_turns: 0 };
+    const config = await readFile(path.join(env.CODEX_HOME, 'config.toml'), 'utf8');
+    requireThat(config === session.effective.configuration, 'actual host configuration changed during preflight');
+    return { ...result, host_registration: 'explicit_installed_launcher', configuration_sha256: sha(config), child, model_turns: 0 };
   } finally {
     await channel.stop();
     await save(path.join(root, `${name}-transcript.json`), transcript);
