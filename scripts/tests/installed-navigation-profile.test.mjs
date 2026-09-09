@@ -36,6 +36,36 @@ test('runtime and host overrides cannot escape the isolated session', () => {
   for (const key of ['CODESTORY_CLI', 'CODESTORY_PLUGIN_DATA', 'OPENAI_API_KEY', 'PLUGIN_DATA']) assert.equal(env[key], undefined);
 });
 
+test('explicit host registration preserves installed transport and forwards only isolated controls', async () => {
+  const { installedHostConfig } = await import('../installed-navigation-profile.mjs');
+  const env = navigationEnvironment({ PATH: '/bin' }, '/isolated', 'nonce');
+  env.CODESTORY_PLUGIN_DATA = '/isolated/data';
+  env.CODESTORY_PLUGIN_RELEASE_DIR = '/archives';
+  env.CODESTORY_CLI = '/forbidden';
+  const config = installedHostConfig({ command: 'node', args: ['./scripts/codestory-mcp.cjs'], cwd: '.', env: {}, tool_timeout_sec: 300 }, '/installed', { marketplace_name: 'fixture' }, env);
+  assert.match(config, /\[plugins\."codestory@fixture"\.mcp_servers\.codestory\]\nenabled = false/);
+  assert.match(config, /\[mcp_servers\.codestory\]/);
+  assert.match(config, /tool_timeout_sec = 300/);
+  assert.match(config, /CODESTORY_PLUGIN_RELEASE_DIR/);
+  assert.match(config, /CODESTORY_EMBED_QUALIFICATION_NONCE/);
+  assert.doesNotMatch(config, /CODESTORY_CLI|approval|enabled_tools|disabled_tools|shell_environment/);
+  for (const bad of [{command:'node',args:['./scripts/codestory-mcp.cjs'],cwd:'.',env:{CODESTORY_CLI:'/wrong'}}, {command:'node',args:['../escape.cjs'],cwd:'.',env:{}}]) {
+    assert.throws(() => installedHostConfig(bad, '/installed', {marketplace_name:'fixture'}, env));
+  }
+});
+
+test('actual host boundary rejects missing controls and successful envelopes carrying unavailable tools', async () => {
+  const { validateChildEnvironment, toolPayload } = await import('../installed-navigation-profile.mjs');
+  const expected = { HOME:'/isolated/home', CODESTORY_PLUGIN_RELEASE_DIR:'/archives', CODESTORY_EMBED_QUALIFICATION_DIR:'/isolated/qualification', CODESTORY_EMBED_QUALIFICATION_NONCE:'nonce', CODESTORY_EMBED_ALLOW_CPU:'0' };
+  validateChildEnvironment(expected, expected);
+  for (const key of Object.keys(expected)) {
+    const actual={...expected};delete actual[key];assert.throws(()=>validateChildEnvironment(actual,expected));
+    actual[key]='/shared';assert.throws(()=>validateChildEnvironment(actual,expected));
+  }
+  for (const result of [{isError:true,content:[]}, {content:[{type:'text',text:JSON.stringify({code:'codestory_unavailable',failure:'managed_cli_asset_fetch_failed'})}]}])assert.throws(()=>toolPayload(result));
+  assert.deepEqual(toolPayload({structured_content:{kind:'preparing',state:'preparing'}}),{kind:'preparing',state:'preparing'});
+});
+
 test('ordinary launcher notifications are retained without consuming a response', async () => {
   const { createSequencedStdioSession } = await import('../codestory-agent-ab-benchmark.mjs');
   const notifications = [];
@@ -46,6 +76,35 @@ test('ordinary launcher notifications are retained without consuming a response'
     assert.equal(notifications[0].method, 'notifications/tools/list_changed');
     await channel.close();
   } finally { await channel.stop(); }
+});
+
+test('app-server transport handles versionless notifications without changing MCP defaults', async () => {
+  const { createSequencedStdioSession } = await import('../codestory-agent-ab-benchmark.mjs');
+  const notifications=[];
+  const script=`process.stdin.on('data', b=>{const r=JSON.parse(String(b));process.stdout.write(JSON.stringify({method:'thread/started',params:{}})+'\\n'+JSON.stringify({id:r.id,result:{ok:true}})+'\\n');});process.stdin.on('end',()=>process.exit(0));`;
+  const channel=createSequencedStdioSession(process.execPath,['-e',script],{protocol:'app-server',timeoutMs:5000,onNotification:n=>notifications.push(n)});
+  try { assert.deepEqual((await channel.request({id:1,method:'initialize'})).result,{ok:true});assert.equal(notifications[0].method,'thread/started');await channel.close(); }
+  finally { await channel.stop(); }
+});
+
+test('host catalog and participant runtime guards reject duplicates, changed tools, and nested provisioning failures', async () => {
+  const { validateHostCatalog, auditParticipantRuntime }=await import('../installed-navigation-profile.mjs');
+  const tool={name:'search',inputSchema:{type:'object'}};
+  const arm={version:'0.17.6',schema_version:3,runtime_source:'managed',runtime_sha256:'a'.repeat(64)};
+  const server={name:'codestory',runtimeStatus:'connected',pluginId:null,serverInfo:{name:'codestory',version:arm.version},tools:{search:tool}};
+  validateHostCatalog({data:[server]},[tool],arm);
+  validateHostCatalog({data:[server]},[{...tool,safety:{effect:'read_only'}}],{...arm,schema_version:2});
+  assert.throws(()=>validateHostCatalog({data:[server]},[{...tool,annotations:{readOnlyHint:false}}],{...arm,schema_version:2}));
+  for(const data of [[server,{...server,name:'duplicate'}],[{...server,tools:{}}],[{...server,pluginId:'unexpected'}]])assert.throws(()=>validateHostCatalog({data},[tool],arm));
+  const event=result=>({type:'item.completed',item:{type:'mcp_tool_call',server:'codestory',tool:'search',result,status:'completed'}});
+  const failed=event({content:[{type:'text',text:JSON.stringify({code:'codestory_unavailable',failure:'managed_cli_provision_failed:managed_cli_asset_fetch_failed'})}]});
+  const identity={schema_version:3,contract_runtime:{cli_sha256:arm.runtime_sha256,cli_source:'managed',cli_version:arm.version,plugin_cli_version:arm.version,plugin_version:arm.version,pinned_pair_matches:true,known_override_skew_channel:false}};
+  const good=event({_meta:{codestory_publication:identity}});
+  assert.deepEqual(auditParticipantRuntime([good],arm),{calls:1,identity_stamps:1,failures:[]});
+  assert.equal(auditParticipantRuntime([failed],arm).failures[0].code,'managed_cli_provision_failed:managed_cli_asset_fetch_failed');
+  const bad=structuredClone(good);bad.item.result._meta.codestory_publication.contract_runtime.cli_sha256='wrong';
+  assert.equal(auditParticipantRuntime([bad],arm).failures[0].code,'runtime_identity_mismatch');
+  assert.deepEqual(auditParticipantRuntime([],arm),{calls:0,identity_stamps:0,failures:[]});
 });
 
 test('typed canary rejects diagnostic substitutes, mixed source, and runtime drift', async () => {
