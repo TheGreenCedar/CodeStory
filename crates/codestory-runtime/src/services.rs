@@ -1544,11 +1544,31 @@ impl ActivationService {
         // retrieval fence are a current source snapshot; another repository
         // walk would prove the same thing again.
         let source_observer_before_probe = self.controller.observed_source_epoch(&project_root);
-        let summary = self
+        // Inspect compatibility before opening the live database: opening a
+        // legacy flat cache can migrate it in place and hide the need to
+        // rebuild parser artifacts. Recovery binds paths without opening the
+        // predecessor; the full refresh stages and publishes its replacement.
+        let summary = match self
             .controller
-            .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
-        let mut precomputed_core_probe = (summary.publication.is_some()
-            && summary.stats.node_count > 0)
+            .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
+        {
+            Ok(()) => Some(self.controller.open_project_summary_with_storage_path(
+                project_root.clone(),
+                storage_path.clone(),
+            )?),
+            Err(error)
+                if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
+            {
+                self.controller
+                    .bind_project_paths_for_refresh(project_root.clone(), storage_path.clone())?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let has_complete_core = summary
+            .as_ref()
+            .is_some_and(|summary| summary.publication.is_some() && summary.stats.node_count > 0);
+        let mut precomputed_core_probe = has_complete_core
             .then(|| self.controller.probe_incremental_plan_for_activation())
             .transpose()?;
         let complete_incremental_source_inventory = precomputed_core_probe
@@ -1560,13 +1580,12 @@ impl ActivationService {
         operation.set_stage(ActivationStage::CoreFreshness);
         let core_refresh_started = Instant::now();
         let mut refreshed_core = None;
-        let core_stale = summary.publication.is_none()
-            || summary.stats.node_count == 0
+        let core_stale = !has_complete_core
             || precomputed_core_probe
                 .as_ref()
                 .is_none_or(|probe| !probe.short_circuited());
         if core_stale {
-            let mode = if summary.publication.is_none() || summary.stats.node_count == 0 {
+            let mode = if !has_complete_core {
                 IndexMode::Full
             } else {
                 IndexMode::Incremental
@@ -1591,19 +1610,19 @@ impl ActivationService {
         }
         let local_ready = match refreshed_core.as_ref() {
             Some((_, stats)) => stats.node_count > 0 && stats.fatal_error_count == 0,
-            None => {
-                summary.publication.is_some()
-                    && summary.stats.node_count > 0
+            None => summary.as_ref().is_some_and(|summary| {
+                has_complete_core
                     && summary.stats.fatal_error_count == 0
                     && precomputed_core_probe
                         .as_ref()
                         .is_some_and(|probe| probe.short_circuited())
-            }
+            }),
         };
         let core_refresh_ms =
             u64::try_from(core_refresh_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !local_ready {
-            if summary.stats.node_count > 0
+            if let Some(summary) = summary.as_ref()
+                && summary.stats.node_count > 0
                 && summary.stats.fatal_error_count == 0
                 && let Some(publication) = summary.publication.clone()
             {
@@ -1617,7 +1636,11 @@ impl ActivationService {
         let local_publication = refreshed_core
             .as_ref()
             .map(|(publication, _)| publication.clone())
-            .or_else(|| summary.publication.clone())
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .and_then(|summary| summary.publication.clone())
+            })
             .expect("fresh complete core has a publication identity");
         operation.set_local_publication(local_publication.clone());
 
@@ -3261,6 +3284,9 @@ mod freshness_gate_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod activation_upgrade_tests;
 
 #[cfg(test)]
 pub(crate) mod activation_tests {
