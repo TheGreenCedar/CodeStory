@@ -37,6 +37,13 @@ export function validateChildEnvironment(actual, expected) {
   for (const [key, value] of Object.entries(expected)) requireThat(actual[key] === value, `actual MCP child environment mismatch: ${key}`);
 }
 
+export function hostConfigurationUpdates(before, after, project) {
+  if (before.trim() === after.trim()) return [];
+  const trust = `[projects.${JSON.stringify(project)}]\ntrust_level = "trusted"`;
+  requireThat(after.trim() === [before.trim(), trust].filter(Boolean).join('\n\n'), 'actual host changed configuration outside its selected-project trust entry');
+  return ['selected_project_trust'];
+}
+
 export function toolPayload(result) {
   requireThat(result && result.isError !== true, 'actual-host MCP tool failed');
   const value = result.structuredContent ?? result.structured_content
@@ -286,8 +293,11 @@ async function withInstalledHost(session, helpers, name, action) {
     const call = (tool, args) => request('mcpServer/tool/call', { threadId, server: 'codestory', tool, arguments: args });
     const result = await action(call);
     const config = await readFile(path.join(env.CODEX_HOME, 'config.toml'), 'utf8');
-    requireThat(config === session.effective.configuration, 'actual host configuration changed during preflight');
-    return { ...result, host_registration: 'explicit_installed_launcher', configuration_sha256: sha(config), child, model_turns: 0 };
+    const hostUpdates = hostConfigurationUpdates(session.effective.configuration, config, session.project);
+    session.effective.configuration = config;
+    await save(path.join(root, 'effective-config.json'), session.effective);
+    return { ...result, host_registration: 'explicit_installed_launcher', configuration_sha256: sha(config),
+      host_owned_configuration_updates: hostUpdates, child, model_turns: 0 };
   } finally {
     await channel.stop();
     await save(path.join(root, `${name}-transcript.json`), transcript);

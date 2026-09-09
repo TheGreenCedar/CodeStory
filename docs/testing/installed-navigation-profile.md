@@ -58,7 +58,9 @@ model starts. Canaries use Codex's zero-model app-server MCP path and verify the
 actual child environment, full retrieval, native identity, private native
 completion with CPU fallback disabled, and changed source after refresh. Each
 participant also gets an environment and catalog check without activating its
-project. Sessions get fresh whole checkouts and state, including separate
+project. Receipts capture the selected checkout's trust entry that Codex adds
+during normal startup; any other configuration change rejects the check.
+Sessions get fresh whole checkouts and state, including separate
 embedding qualification namespaces. The runner records prompts, effective
 configuration, package identity, canary traffic, model transcripts, usage, timing
 and failures. Every scheduled session has a durable row, including preparation,

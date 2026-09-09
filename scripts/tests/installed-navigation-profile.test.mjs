@@ -66,6 +66,15 @@ test('actual host boundary rejects missing controls and successful envelopes car
   assert.deepEqual(toolPayload({structured_content:{kind:'preparing',state:'preparing'}}),{kind:'preparing',state:'preparing'});
 });
 
+test('host configuration records only the ordinary selected-checkout trust addition', async () => {
+  const { hostConfigurationUpdates }=await import('../installed-navigation-profile.mjs');
+  const before='[mcp_servers.codestory]\ncommand = "node"\n';
+  const trust='[projects."/isolated/repository"]\ntrust_level = "trusted"\n';
+  assert.deepEqual(hostConfigurationUpdates(before,before,'/isolated/repository'),[]);
+  assert.deepEqual(hostConfigurationUpdates(before,before+'\n'+trust,'/isolated/repository'),['selected_project_trust']);
+  for(const after of [(before+'\n'+trust).replace('/isolated/repository','/another'),(before+'\n'+trust).replace('"node"','"wrong"'),before+'\napproval_policy = "never"\n',before+'\n'+trust+'\n[projects."/another"]\ntrust_level = "trusted"\n'])assert.throws(()=>hostConfigurationUpdates(before,after,'/isolated/repository'));
+});
+
 test('ordinary launcher notifications are retained without consuming a response', async () => {
   const { createSequencedStdioSession } = await import('../codestory-agent-ab-benchmark.mjs');
   const notifications = [];
