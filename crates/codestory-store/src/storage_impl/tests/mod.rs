@@ -7484,6 +7484,32 @@ fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
 }
 
 #[test]
+fn immutable_migration_does_not_publish_an_incomplete_legacy_predecessor() {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_promotion_file(&live, 1, "old.rs").expect("complete predecessor");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live).expect("layout");
+    let candidate = layout.create_staging_database_path().expect("stage");
+    seed_promotion_file(&candidate, 2, "new.rs").expect("complete replacement");
+    {
+        let previous = Storage::open(&live).expect("open predecessor");
+        previous
+            .begin_incremental_run()
+            .expect("mark interrupted writer");
+    }
+    let before = durable_sqlite_state(&live);
+    let error = Storage::promote_staged_snapshot(&candidate, &live)
+        .expect_err("incomplete predecessor cannot become a complete rollback generation");
+    assert!(error.to_string().contains("incomplete"), "{error}");
+    assert_eq!(durable_sqlite_state(&live), before);
+    assert!(layout.read_pointer().expect("pointer").is_none());
+    assert!(
+        candidate.exists(),
+        "failed candidate remains available for diagnosis"
+    );
+}
+
+#[test]
 fn promotion_journal_binds_source_policy_exclusion_count_and_digest() -> Result<(), StorageError> {
     let previous_path = unique_temp_db_path("promotion-policy-previous");
     let candidate_path = unique_temp_db_path("promotion-policy-candidate");

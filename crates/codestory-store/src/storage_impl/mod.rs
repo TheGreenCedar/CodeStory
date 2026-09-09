@@ -1518,6 +1518,14 @@ fn read_recovery_database_identity(
     };
     match schema_version {
         0 => Ok(None),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+            if contract == RecoveryDatabaseContract::CurrentPromotion =>
+        {
+            Err(promotion_error(format!(
+                "SQLite predecessor {} is incomplete and cannot become a rollback generation",
+                path.display()
+            )))
+        }
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
         }
@@ -7001,9 +7009,13 @@ impl Storage {
                     let identity = core_generation_identity(&previous, previous_bytes);
                     let materialized = layout
                         .materialize_existing_generation(live_path, &identity.generation_id)?;
-                    let materialized_publication = require_complete_promotion_database_identity(
+                    // This is the unchanged predecessor, not a new candidate.
+                    // Preserve its supported legacy schema rather than requiring
+                    // the schema of the replacement we already validated above.
+                    let materialized_publication = require_recovery_database_identity(
                         &materialized,
                         "Migrated immutable rollback generation",
+                        RecoveryDatabaseContract::CurrentPromotion,
                     )?;
                     if materialized_publication != previous {
                         return Err(promotion_error(

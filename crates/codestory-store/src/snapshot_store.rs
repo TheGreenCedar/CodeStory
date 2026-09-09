@@ -595,6 +595,12 @@ mod tests {
 
     #[test]
     fn full_replacement_publishes_generation_pointer_without_backup_or_restore() {
+        for previous_schema in [31, crate::CURRENT_SCHEMA_VERSION] {
+            assert_full_replacement_preserves_previous_schema(previous_schema);
+        }
+    }
+
+    fn assert_full_replacement_preserves_previous_schema(previous_schema: u32) {
         let temp = fresh_temp_root("full-replacement-telemetry");
         let live_path = temp.join("live.sqlite");
         {
@@ -621,6 +627,14 @@ mod tests {
                 .expect("identify previous live publication");
             publish_empty_source_policy(&mut live, &publication);
         }
+
+        {
+            let previous = rusqlite::Connection::open(&live_path).expect("open predecessor");
+            previous
+                .pragma_update(None, "user_version", previous_schema)
+                .expect("set supported predecessor schema");
+        }
+        let old_bytes = fs::read(&live_path).expect("read legacy database");
 
         let mut staged = SnapshotStore::open_staged(&live_path).expect("open replacement stage");
         staged
@@ -680,10 +694,23 @@ mod tests {
             .expect("read pointer")
             .expect("published pointer");
         assert_eq!(pointer.active.generation_id, "new-generation");
-        assert_eq!(
-            pointer.rollback.expect("rollback").generation_id,
-            "old-generation"
-        );
+        let rollback = pointer.rollback.expect("rollback");
+        assert_eq!(rollback.generation_id, "old-generation");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let rollback_path = layout
+            .generation_database_path(&rollback.generation_id)
+            .expect("rollback path");
+        let rollback_db = rusqlite::Connection::open_with_flags(
+            rollback_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read retained predecessor");
+        let retained_schema: u32 = rollback_db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("retained schema");
+        assert_eq!(retained_schema, previous_schema);
+        assert_eq!(fs::read(&live_path).expect("legacy bytes"), old_bytes);
+        drop(rollback_db);
 
         let _ = fs::remove_dir_all(&temp);
     }

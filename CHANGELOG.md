@@ -51,6 +51,10 @@
   embedding request, reducing client/server overhead without changing the
   model, dense coverage, stored vectors, or search ranking.
 
+- Upgrading a 0.17.5 cache can publish its rebuilt index while preserving the
+  previous schema and user annotations. The retained old generation no longer
+  has to match the new index schema.
+
 ## 0.17.5
 
 Cursor still dropped `files`, `snippet`, and preparing `packet`/`search`/`context` results: empty `policy_exclusions` were omitted, batched snippets used a ranges document, and the shared `codestory_preparing` envelope was undeclared.
