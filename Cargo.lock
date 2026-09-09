@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-agent"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "codestory-contracts",
  "serde",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-bench"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-contracts"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-indexer"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-llama-sys"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "codestory-contracts",
  "crossbeam-channel",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-agent",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-store"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-workspace"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
