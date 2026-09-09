@@ -55,6 +55,19 @@ host's MCP bindings. Nullable excerpts and line bounds stay nullable; a missing
 result is not an absence proof. `repo_text: "off"` requires an existing complete
 core publication and does not prepare embeddings.
 
+## Request the framework catalog when needed
+
+`files` still returns project file counts, language support tiers, errors,
+exclusions and coverage gaps by default. Its global framework capability
+catalog is now opt-in: pass `include_framework_coverage: true` through MCP or
+`--include-framework-coverage` on the CLI. This returns the complete catalog,
+independent of file filters.
+
+When `summary.framework_route_coverage_included` is false, the empty
+`framework_route_coverage` array means the catalog was omitted. It does not
+mean that no frameworks are supported. Older responses lack the inclusion
+marker; do not infer their inclusion state from a missing marker.
+
 ## Update packet requests
 
 | Removed input | Replacement |

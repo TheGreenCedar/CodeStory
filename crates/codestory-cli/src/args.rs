@@ -1456,6 +1456,11 @@ pub(crate) enum ExploreProfile {
 
 #[derive(Args, Debug)]
 pub(crate) struct FilesCommand {
+    #[arg(
+        long,
+        help = "Include the global framework route capability catalog and its limitations."
+    )]
+    pub(crate) include_framework_coverage: bool,
     #[arg(long, default_value = ".", help = "Repository root to query.")]
     pub(crate) project: PathBuf,
     #[arg(

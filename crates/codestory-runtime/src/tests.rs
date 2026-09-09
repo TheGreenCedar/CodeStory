@@ -2230,12 +2230,22 @@ fn indexed_files_reports_incomplete_reason_counts() {
         .expect("open project");
     let output = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: None,
             language: None,
             role: None,
             limit: Some(50),
         })
         .expect("indexed files");
+
+    assert!(
+        output.summary.framework_route_coverage.is_empty(),
+        "default inventory returned {} global framework entries ({} serialized bytes)",
+        output.summary.framework_route_coverage.len(),
+        serde_json::to_vec(&output.summary.framework_route_coverage)
+            .unwrap()
+            .len()
+    );
 
     assert_eq!(output.summary.incomplete_file_count, 2);
     assert_eq!(output.summary.error_file_count, 1);
@@ -2264,6 +2274,56 @@ fn indexed_files_reports_incomplete_reason_counts() {
     assert!(!partial.retryable);
     assert!(partial.verified_source);
     assert!(partial.projection_available);
+
+    for filter in [
+        serde_json::json!({}),
+        serde_json::json!({"path_contains":"unknown"}),
+        serde_json::json!({"language":"rust", "limit":1}),
+        serde_json::json!({"role":"source"}),
+        serde_json::json!({"role":"test"}),
+        serde_json::json!({"path_contains":"absent"}),
+    ] {
+        let request: IndexedFilesRequest = serde_json::from_value(filter).expect("default request");
+        assert!(!request.include_framework_coverage);
+        let compact = controller
+            .indexed_files(request.clone())
+            .expect("compact inventory");
+        let mut full = controller
+            .indexed_files(IndexedFilesRequest {
+                include_framework_coverage: true,
+                ..request
+            })
+            .expect("inventory with capability catalog");
+        assert_eq!(
+            compact.summary.framework_route_coverage_included,
+            Some(false)
+        );
+        assert_eq!(full.summary.framework_route_coverage_included, Some(true));
+        assert!(compact.summary.framework_route_coverage.is_empty());
+        assert_eq!(
+            serde_json::to_value(&full.summary.framework_route_coverage).unwrap(),
+            serde_json::to_value(framework_route_coverage_matrix()).unwrap()
+        );
+        assert_eq!(
+            &compact.summary.coverage_notes[..full.summary.coverage_notes.len()],
+            &full.summary.coverage_notes
+        );
+        assert_eq!(
+            compact.summary.coverage_notes.len(),
+            full.summary.coverage_notes.len() + 1
+        );
+        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        eprintln!("file inventory bytes: compact={compact_bytes}, with_catalog={full_bytes}");
+        assert!(compact_bytes < full_bytes);
+        full.summary.framework_route_coverage.clear();
+        full.summary.framework_route_coverage_included = Some(false);
+        full.summary.coverage_notes = compact.summary.coverage_notes.clone();
+        assert_eq!(
+            serde_json::to_value(&compact).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -3204,6 +3264,7 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
     );
     let files = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: Some("evidence-generated.json".into()),
             language: None,
             role: None,
@@ -3537,6 +3598,7 @@ fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation()
     );
     let error = admitting_controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: None,
             language: None,
             role: None,
@@ -3649,6 +3711,7 @@ fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_cover
     );
     let files = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: Some("rust_tictactoe.rs".into()),
             language: None,
             role: None,
@@ -3661,6 +3724,7 @@ fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_cover
     assert!(!files.policy_exclusions[0].semantic_coverage);
     let all_files = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: None,
             language: None,
             role: None,
@@ -3922,6 +3986,7 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
     assert_eq!(published.exclusion_count, 1);
     let files = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: Some("large.rs".into()),
             language: None,
             role: None,
@@ -3929,6 +3994,27 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
         })
         .expect("matching policy reader accepts the manifest");
     assert_eq!(files.policy_exclusions[0].byte_cap, 64);
+    let with_catalog = controller
+        .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: true,
+            path_contains: Some("large.rs".into()),
+            language: None,
+            role: None,
+            limit: None,
+        })
+        .expect("catalog does not change policy coverage");
+    assert_eq!(
+        serde_json::to_value(&files.policy_exclusions).unwrap(),
+        serde_json::to_value(&with_catalog.policy_exclusions).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&files.coverage_gaps).unwrap(),
+        serde_json::to_value(&with_catalog.coverage_gaps).unwrap()
+    );
+    assert_eq!(
+        files.summary.policy_exclusion_count,
+        with_catalog.summary.policy_exclusion_count
+    );
 
     for incompatible in [
         SourceIndexPolicy::oversized(65),
@@ -3956,6 +4042,7 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
         );
         let error = reader
             .indexed_files(IndexedFilesRequest {
+                include_framework_coverage: false,
                 path_contains: None,
                 language: None,
                 role: None,

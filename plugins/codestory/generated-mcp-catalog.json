@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "9775c1046298791674e8fe715700c890d095659152e5211c2fb61a181aa41d9f",
-      "2025-03-26": "f787b3e94c668b3d20cc0379605b989daefc99810717cd6895ea1f4efc72cbd3",
-      "2025-06-18": "3e932f14d8a218ef9245774fa468ce765a1f7b963bfbea54e756ce82a36c8391",
-      "2025-11-25": "a1929a789fac71298a3ed6b34217d30d9a626b7168531283b9d308935ae4434d"
+      "2024-11-05": "de5a0c7d0a1c024dc3ff4fa3cddcc56f940849ac30ae7c4811c4aaf91874282a",
+      "2025-03-26": "4440f4544930c84c476e9f786188e6658a8f6f9c1203989c6fee4683be7beb38",
+      "2025-06-18": "400577bca4552e5172e98415ef51f23cc8269b66b3072186f8194df96dba9bf9",
+      "2025-11-25": "e7e7304d0d3664f7f26467e79d67d6c9b8f7878ef471e8c57657b1dae38bb815"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "9775c1046298791674e8fe715700c890d095659152e5211c2fb61a181aa41d9f",
+      "discoveryContractSha256": "de5a0c7d0a1c024dc3ff4fa3cddcc56f940849ac30ae7c4811c4aaf91874282a",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -408,6 +408,11 @@
             "additionalProperties": false,
             "description": "List indexed files from the existing local index.",
             "properties": {
+              "include_framework_coverage": {
+                "default": false,
+                "description": "Include the global framework capability catalog and its limitations.",
+                "type": "boolean"
+              },
               "language": {
                 "description": "Only include files for this language.",
                 "type": "string"
@@ -1547,7 +1552,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "f787b3e94c668b3d20cc0379605b989daefc99810717cd6895ea1f4efc72cbd3",
+      "discoveryContractSha256": "4440f4544930c84c476e9f786188e6658a8f6f9c1203989c6fee4683be7beb38",
       "tools": [
         {
           "annotations": {
@@ -1967,6 +1972,11 @@
             "additionalProperties": false,
             "description": "List indexed files from the existing local index.",
             "properties": {
+              "include_framework_coverage": {
+                "default": false,
+                "description": "Include the global framework capability catalog and its limitations.",
+                "type": "boolean"
+              },
               "language": {
                 "description": "Only include files for this language.",
                 "type": "string"
@@ -3196,7 +3206,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "3e932f14d8a218ef9245774fa468ce765a1f7b963bfbea54e756ce82a36c8391",
+      "discoveryContractSha256": "400577bca4552e5172e98415ef51f23cc8269b66b3072186f8194df96dba9bf9",
       "tools": [
         {
           "_meta": {
@@ -5413,6 +5423,11 @@
             "additionalProperties": false,
             "description": "List indexed files from the existing local index.",
             "properties": {
+              "include_framework_coverage": {
+                "default": false,
+                "description": "Include the global framework capability catalog and its limitations.",
+                "type": "boolean"
+              },
               "language": {
                 "description": "Only include files for this language.",
                 "type": "string"
@@ -11576,7 +11591,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "a1929a789fac71298a3ed6b34217d30d9a626b7168531283b9d308935ae4434d",
+      "discoveryContractSha256": "e7e7304d0d3664f7f26467e79d67d6c9b8f7878ef471e8c57657b1dae38bb815",
       "tools": [
         {
           "_meta": {
@@ -13793,6 +13808,11 @@
             "additionalProperties": false,
             "description": "List indexed files from the existing local index.",
             "properties": {
+              "include_framework_coverage": {
+                "default": false,
+                "description": "Include the global framework capability catalog and its limitations.",
+                "type": "boolean"
+              },
               "language": {
                 "description": "Only include files for this language.",
                 "type": "string"
@@ -22172,6 +22192,11 @@
         "additionalProperties": false,
         "description": "List indexed files from the existing local index.",
         "properties": {
+          "include_framework_coverage": {
+            "default": false,
+            "description": "Include the global framework capability catalog and its limitations.",
+            "type": "boolean"
+          },
           "language": {
             "description": "Only include files for this language.",
             "type": "string"

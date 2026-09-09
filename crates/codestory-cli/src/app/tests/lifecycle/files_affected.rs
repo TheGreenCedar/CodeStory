@@ -13,6 +13,7 @@ fn files_markdown_reports_incomplete_reason_text() {
         project_root: "C:/repo".to_string(),
         usable: true,
         summary: IndexedFilesSummaryDto {
+            framework_route_coverage_included: None,
             file_count: 1,
             indexed_file_count: 1,
             filtered_file_count: 1,
@@ -62,6 +63,7 @@ fn files_markdown_labels_verified_policy_exclusions_as_non_graph_evidence() {
             project_root: "/repo".into(),
             usable: true,
             summary: IndexedFilesSummaryDto {
+                framework_route_coverage_included: None,
                 file_count: 1,
                 indexed_file_count: 1,
                 filtered_file_count: 1,

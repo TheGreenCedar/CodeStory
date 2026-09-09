@@ -132,6 +132,7 @@ pub(in crate::app) fn run_files(cmd: FilesCommand) -> Result<()> {
         let output = runtime
             .browser
             .indexed_files(IndexedFilesRequest {
+                include_framework_coverage: cmd.include_framework_coverage,
                 path_contains: cmd.path.clone(),
                 language: cmd.language.clone(),
                 role: cmd.role.map(Into::into),

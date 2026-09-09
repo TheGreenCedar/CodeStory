@@ -10,6 +10,9 @@
 - Agents can search, inspect source and follow relationships in any useful
   order, using native tools whenever needed. Packets remain optional experiments
   and do not decide whether an investigation is complete.
+- File listings keep project coverage details concise. Request the global
+  framework capability catalog with `--include-framework-coverage` or the
+  matching MCP option when checking framework support limits.
 - **Breaking interface change:** search, context and packet adopt publication
   schema 3. Consumers must read evidence identities, status and gaps instead of
   older hit/support/disposition shapes. Obsolete packet inputs are rejected;

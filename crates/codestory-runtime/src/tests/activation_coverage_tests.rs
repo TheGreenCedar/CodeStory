@@ -121,6 +121,7 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
             drop(storage);
             let public_files = controller
                 .indexed_files(IndexedFilesRequest {
+                    include_framework_coverage: false,
                     path_contains: Some(name.into()),
                     language: None,
                     role: None,
@@ -289,6 +290,7 @@ fn full_refresh_publishes_verified_generic_tagged_template_parser_partial() {
         .expect("strict reader must admit the completed search generation");
     let diagnostics = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: Some("job-store.ts".to_string()),
             language: None,
             role: None,
