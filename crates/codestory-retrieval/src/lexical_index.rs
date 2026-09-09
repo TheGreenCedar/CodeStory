@@ -3584,8 +3584,8 @@ fn lexical_source_policy(
             storage_path.display()
         );
     }
-    let storage =
-        Store::open_read_only(storage_path).context("open storage for lexical source policy")?;
+    let storage = Store::open_observational(storage_path)
+        .context("observe storage for lexical source policy")?;
     let publication = storage
         .get_complete_index_publication()
         .context("load complete core publication for lexical source policy")?
@@ -5560,6 +5560,44 @@ mod tests {
             format!("{error:#}")
                 .contains("complete core publication for lexical source policy is missing")
         );
+    }
+
+    #[test]
+    fn pinned_source_policy_observation_does_not_materialize_sqlite_sidecars() {
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        crate::test_support::publish_empty_complete_core_fixture(project.path(), &storage_path)
+            .expect("complete core");
+        let before = std::fs::read(&storage_path).expect("core bytes");
+        assert_eq!(std::fs::read_dir(cache.path()).expect("entries").count(), 1);
+
+        lexical_source_policy(project.path(), Some(&storage_path)).expect("source policy");
+
+        assert_eq!(
+            std::fs::read(&storage_path).expect("unchanged core"),
+            before
+        );
+        assert_eq!(std::fs::read_dir(cache.path()).expect("entries").count(), 1);
+
+        let journal = std::path::PathBuf::from(format!(
+            "{}{}",
+            storage_path.display(),
+            codestory_contracts::owned_artifacts::PROMOTION_PREPARED_JOURNAL_SUFFIX,
+        ));
+        std::fs::write(&journal, b"pending recovery").expect("pending promotion");
+        let error = lexical_source_policy(project.path(), Some(&storage_path))
+            .expect_err("policy observation cannot recover a promotion");
+        assert!(format!("{error:#}").contains("promotion recovery is pending"));
+        assert_eq!(
+            std::fs::read(&journal).expect("unchanged journal"),
+            b"pending recovery"
+        );
+        assert_eq!(
+            std::fs::read(&storage_path).expect("unchanged core"),
+            before
+        );
+        assert_eq!(std::fs::read_dir(cache.path()).expect("entries").count(), 2);
     }
 
     #[test]
