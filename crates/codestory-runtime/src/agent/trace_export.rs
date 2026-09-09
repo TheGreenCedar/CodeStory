@@ -739,6 +739,7 @@ mod tests {
 
     fn sample_answer(steps: Vec<AgentRetrievalStepDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "a1".to_string(),
             prompt: "q".to_string(),

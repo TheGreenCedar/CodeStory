@@ -430,7 +430,7 @@ pub fn project_context_v3(
         &answer.retrieval_trace.request_id,
         answer.retrieval_trace.retrieval_publication.as_ref(),
     )?;
-    let evidence = answer
+    let mut evidence: Vec<_> = answer
         .citations
         .iter()
         .enumerate()
@@ -451,7 +451,73 @@ pub fn project_context_v3(
         })
         .take(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
         .collect();
-    let gaps = answer_gap_rows(answer)?;
+    let mut gaps = answer_gap_rows(answer)?;
+    if let Some(source) = &answer.focused_source {
+        let line_count = source
+            .end_line
+            .checked_sub(source.start_line)
+            .and_then(|count| count.checked_add(1));
+        let bound = source.start_line > 0
+            && line_count == u32::try_from(source.excerpt.split('\n').count()).ok()
+            && target_symbol_id == Some(source.node_id.0.as_str())
+            && service.focused_source_matches_current(source, target_path);
+        if bound {
+            let window = crate::snippets::cap_source_window(
+                &source.excerpt,
+                source.start_line,
+                codestory_contracts::packet_projection_v3::EXCERPT_MAX_BYTES_V3,
+            );
+            let source_row = ContextEvidenceRowV3Dto {
+                identity: evidence_identity(&format!("context-source-{}", source.node_id.0)),
+                path: path_text(&source.path),
+                symbol_id: symbol_text(Some(&source.node_id.0)),
+                start_line: Some(window.start_line),
+                end_line: Some(window.end_line),
+                excerpt: Some(bounded_excerpt(&window.text)),
+            };
+            if let Some(row) = evidence.iter_mut().find(|row| {
+                row.symbol_id == source_row.symbol_id
+                    && row.path == source_row.path
+                    && row.excerpt.is_none()
+            }) {
+                row.start_line = source_row.start_line;
+                row.end_line = source_row.end_line;
+                row.excerpt = source_row.excerpt;
+            } else if evidence.len()
+                < codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3
+            {
+                evidence.push(source_row);
+            } else {
+                gaps.push(gap_row(
+                    "context-focused-source-rows",
+                    GapKindV3Dto::OutputBudgetExceeded,
+                    Some("The focused source window did not fit the response row budget."),
+                )?);
+            }
+            if source.truncated || window.truncated {
+                gaps.push(gap_row(
+                    "context-focused-source-bytes",
+                    GapKindV3Dto::OutputBudgetExceeded,
+                    Some("The focused source window was truncated to its byte budget."),
+                )?);
+            }
+        } else {
+            gaps.push(gap_row(
+                "context-focused-source-binding",
+                GapKindV3Dto::SourceUnavailable,
+                Some("Focused source did not match the selected target and pinned publication."),
+            )?);
+        }
+    } else if answer.retrieval_trace.steps.iter().any(|step| {
+        step.kind == codestory_contracts::api::AgentRetrievalStepKindDto::SourceRead
+            && step.status == codestory_contracts::api::AgentRetrievalStepStatusDto::Error
+    }) {
+        gaps.push(gap_row(
+            "context-focused-source-read",
+            GapKindV3Dto::SourceUnavailable,
+            Some("Focused source could not be read from the pinned publication."),
+        )?);
+    }
     build_context_projection_v3(&FinalizedContextProjectionInputV3::new(
         identity,
         publication,
@@ -1758,6 +1824,367 @@ mod tests {
 
         let row = packet_evidence_row(0, &location).expect("location evidence");
         assert_eq!(row.summary.as_ref().unwrap().as_str(), "src/lib.rs:7");
+    }
+
+    #[test]
+    fn context_projection_retains_the_focused_source_read() {
+        use codestory_contracts::api::{
+            AgentAskRequest, AgentResponseBlockDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+            AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto,
+            AgentRetrievalStepStatusDto, NodeId,
+        };
+        use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind};
+        use codestory_retrieval::{SidecarProfile, SidecarRuntimeConfig, test_support};
+        use codestory_store::{
+            FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+        };
+        use sha2::{Digest, Sha256};
+
+        for source in [
+            "pub fn focused_source_anchor() -> &'static str {\n    \"retained-source-body\"\n}\n"
+                .to_owned(),
+            format!(
+                "pub fn focused_source_anchor() -> &'static str {{\n    \"retained-source-body{}\"\n}}\n",
+                "界".repeat(12_000)
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("project");
+            let state = tempfile::tempdir().expect("isolated state");
+            let source_path = project.path().join("fixture.rs");
+            fs::write(&source_path, &source).expect("source");
+            let storage_path = state.path().join("codestory.db");
+            let mut store = Store::open(&storage_path).expect("store");
+            let file = FileInfo {
+                id: 10,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: codestory_workspace::clamp_system_time_to_epoch_millis(
+                    fs::metadata(&source_path)
+                        .expect("metadata")
+                        .modified()
+                        .expect("mtime"),
+                ),
+                indexed: true,
+                complete: true,
+                line_count: 3,
+                file_role: FileRole::Source,
+            };
+            store.insert_file(&file).expect("file");
+            store
+                .update_file_metadata(
+                    &file,
+                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+                )
+                .expect("source hash");
+            store
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(10),
+                        kind: NodeKind::FILE,
+                        serialized_name: source_path.to_string_lossy().into_owned(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(20),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "focused_source_anchor".into(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        start_line: Some(1),
+                        end_line: Some(3),
+                        ..Default::default()
+                    },
+                ])
+                .expect("nodes");
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "focused-source-run".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            store
+                .publish_structural_text_unit_generation(&publication)
+                .expect("complete structural text unit publication");
+            test_support::publish_complete_core_fixture(&mut store, project.path(), &publication)
+                .expect("complete core");
+            drop(store);
+            let config =
+                codestory_retrieval::with_test_cache_root(&state.path().join("retrieval"), || {
+                    SidecarRuntimeConfig::for_project_profile(
+                        Some(project.path()),
+                        SidecarProfile::Agent,
+                    )
+                });
+            test_support::publish_zero_dense_pinned_query_fixture(
+                project.path(),
+                &storage_path,
+                &config,
+            )
+            .expect("test-only zero-dense retrieval publication");
+            let controller = crate::AppController::new_with_config(config);
+            {
+                let mut controller_state = controller.state.lock();
+                controller_state.project_root = Some(project.path().to_path_buf());
+                controller_state.storage_path = Some(storage_path);
+            }
+            let service = crate::services::PublicOperationService::new(controller.clone());
+            let operation = service
+                .run_with_cancel("context", Arc::new(AtomicBool::new(false)), || {
+                    let reads_before = crate::search_evidence::verified_source_read_count();
+                    let mut request = AgentAskRequest {
+                        prompt: "focused_source_anchor".into(),
+                        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+                            preset: AgentRetrievalPresetDto::Investigate,
+                        },
+                        focus_node_id: Some(NodeId("20".into())),
+                        max_results: Some(8),
+                        response_mode: AgentResponseModeDto::Structured,
+                        latency_budget_ms: None,
+                        include_evidence: true,
+                        hybrid_weights: None,
+                    };
+                    let answer = controller.agent_ask(request.clone())?;
+                    assert!(
+                        answer.retrieval_trace.steps.iter().any(|step| {
+                            step.kind == AgentRetrievalStepKindDto::SourceRead
+                                && step.status == AgentRetrievalStepStatusDto::Ok
+                        }),
+                        "the real source-read branch must succeed before testing projection"
+                    );
+                    assert!(
+                        answer
+                            .sections
+                            .iter()
+                            .flat_map(|section| &section.blocks)
+                            .any(|block| {
+                                matches!(block, AgentResponseBlockDto::Markdown { markdown }
+                        if markdown.contains("retained-source-body"))
+                            }),
+                        "the runtime already produced the source body"
+                    );
+                    let focused = answer
+                        .focused_source
+                        .as_ref()
+                        .expect("typed focused source");
+                    if source.len() <= 16 * 1024 {
+                        assert_eq!((focused.start_line, focused.end_line), (1, 3));
+                        assert_eq!(focused.excerpt, source.trim_end_matches('\n'));
+                        assert!(!focused.truncated);
+                    } else {
+                        assert_eq!((focused.start_line, focused.end_line), (1, 2));
+                        assert!(
+                            focused.excerpt.len() <= 16 * 1024
+                                && focused.excerpt.len() > 16 * 1024 - 4
+                        );
+                        assert!(focused.truncated);
+                    }
+                    let reads_after = crate::search_evidence::verified_source_read_count();
+                    assert_eq!(
+                        reads_after - reads_before,
+                        1,
+                        "one verified focused-file read"
+                    );
+
+                    let has_source = |projection: &ContextProjectionV3Dto| {
+                        projection.evidence.as_slice().iter().any(|row| {
+                            row.excerpt
+                                .as_ref()
+                                .is_some_and(|text| text.as_str().contains("retained-source-body"))
+                        })
+                    };
+                    for mutation in [
+                        "node",
+                        "file",
+                        "path",
+                        "project",
+                        "generation",
+                        "run",
+                        "hash",
+                        "start",
+                        "end",
+                    ] {
+                        let mut altered = answer.clone();
+                        let source = altered.focused_source.as_mut().expect("source");
+                        match mutation {
+                            "node" => source.node_id = NodeId("10".into()),
+                            "file" => source.file_id = 999,
+                            "path" => {
+                                source.path = project
+                                    .path()
+                                    .join("other.rs")
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }
+                            "project" => source.project_id.push_str("-other"),
+                            "generation" => source.core_generation_id.push_str("-other"),
+                            "run" => source.core_run_id.push_str("-other"),
+                            "hash" => source.content_sha256 = "0".repeat(64),
+                            "start" => source.start_line = 0,
+                            "end" => source.end_line = 20,
+                            _ => unreachable!(),
+                        }
+                        let projected = project_context_v3(
+                            &service,
+                            "test",
+                            source_path.to_str(),
+                            Some("20"),
+                            &altered,
+                        )?;
+                        assert!(!has_source(&projected), "reject mismatched {mutation}");
+                        assert!(
+                            projected
+                                .gaps
+                                .as_slice()
+                                .iter()
+                                .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+                        );
+                    }
+                    for (path, id) in [
+                        (Some("other.rs"), Some("20")),
+                        (source_path.to_str(), Some("10")),
+                    ] {
+                        let projected = project_context_v3(&service, "test", path, id, &answer)?;
+                        assert!(
+                            !has_source(&projected),
+                            "reject a different requested target"
+                        );
+                    }
+                    let mut with_excerpt = answer.clone();
+                    with_excerpt.citations.push(serde_json::from_value(json!({
+                    "node_id":"20", "display_name":"focused_source_anchor", "kind":"FUNCTION",
+                    "file_path":source_path, "line":1, "score":1.0, "origin":"indexed_symbol",
+                    "resolvable":true, "source_excerpt":"existing citation excerpt"
+                })).expect("citation"));
+                    let projected = project_context_v3(
+                        &service,
+                        "test",
+                        source_path.to_str(),
+                        Some("20"),
+                        &with_excerpt,
+                    )?;
+                    assert!(has_source(&projected));
+                    assert!(
+                        projected.evidence.as_slice().iter().any(|row| {
+                            row.excerpt
+                                .as_ref()
+                                .is_some_and(|text| text.as_str() == "existing citation excerpt")
+                        }),
+                        "existing citation excerpts remain intact"
+                    );
+
+                    let round_trip: AgentAnswerDto = serde_json::from_value(
+                        serde_json::to_value(&answer).expect("serialize answer"),
+                    )
+                    .expect("deserialize answer");
+                    let projection = project_context_v3(
+                        &service,
+                        "test",
+                        source_path.to_str(),
+                        Some("20"),
+                        &round_trip,
+                    )?;
+                    assert_eq!(
+                        crate::search_evidence::verified_source_read_count(),
+                        reads_after,
+                        "projection and internal transport never reopen the source"
+                    );
+                    let mut failed = answer.clone();
+                    failed.focused_source = None;
+                    failed
+                        .retrieval_trace
+                        .steps
+                        .iter_mut()
+                        .filter(|step| step.kind == AgentRetrievalStepKindDto::SourceRead)
+                        .for_each(|step| step.status = AgentRetrievalStepStatusDto::Error);
+                    let failed = project_context_v3(
+                        &service,
+                        "test",
+                        source_path.to_str(),
+                        Some("20"),
+                        &failed,
+                    )?;
+                    assert!(!has_source(&failed));
+                    assert!(
+                        failed
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+                    );
+
+                    request.retrieval_profile = AgentRetrievalProfileSelectionDto::Custom {
+                        config: codestory_contracts::api::AgentCustomRetrievalConfigDto {
+                            enable_source_reads: false,
+                            ..Default::default()
+                        },
+                    };
+                    let skipped = controller.agent_ask(request)?;
+                    assert!(skipped.focused_source.is_none());
+                    assert!(
+                        skipped
+                            .retrieval_trace
+                            .steps
+                            .iter()
+                            .any(|step| step.kind == AgentRetrievalStepKindDto::SourceRead
+                                && step.status == AgentRetrievalStepStatusDto::Skipped)
+                    );
+                    let skipped = project_context_v3(
+                        &service,
+                        "test",
+                        source_path.to_str(),
+                        Some("20"),
+                        &skipped,
+                    )?;
+                    assert!(!has_source(&skipped));
+                    assert!(
+                        !skipped
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+                    );
+                    assert_eq!(
+                        crate::search_evidence::verified_source_read_count(),
+                        reads_after
+                    );
+                    Ok(projection)
+                })
+                .expect("real context operation");
+            assert!(
+                operation.value.evidence.as_slice().iter().any(|row| {
+                    row.symbol_id.as_ref().is_some_and(|id| id.as_str() == "20")
+                        && row.excerpt.as_ref().is_some_and(|excerpt| {
+                            excerpt.as_str().contains("retained-source-body")
+                        })
+                }),
+                "v3 must retain the focused source the runtime already read"
+            );
+            if source.len() > 8 * 1024 {
+                assert!(
+                    operation
+                        .value
+                        .gaps
+                        .as_slice()
+                        .iter()
+                        .any(|gap| gap.kind == GapKindV3Dto::OutputBudgetExceeded)
+                );
+                let row = operation
+                    .value
+                    .evidence
+                    .as_slice()
+                    .iter()
+                    .find(|row| {
+                        row.excerpt
+                            .as_ref()
+                            .is_some_and(|text| text.as_str().contains("retained-source-body"))
+                    })
+                    .expect("source row");
+                assert_eq!((row.start_line, row.end_line), (Some(1), Some(2)));
+                assert!(row.excerpt.as_ref().expect("excerpt").as_str().len() <= 8 * 1024);
+            }
+        }
     }
 
     #[test]

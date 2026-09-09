@@ -297,6 +297,12 @@ fn agent_ask_with_packet_hits(
 
     let packet_hits = std::mem::take(&mut bundle.packet_hits);
     let answer = AgentAnswerDto {
+        focused_source: req.focus_node_id.as_ref().and_then(|id| {
+            source_context
+                .as_ref()
+                .filter(|source| source.evidence.node_id == *id)
+                .map(|source| source.evidence.clone())
+        }),
         source_coverage: Vec::new(),
         answer_id: request_id,
         prompt,
@@ -1740,7 +1746,10 @@ fn maybe_read_source_context(
         return None;
     };
 
-    let (Some(path), Some(line)) = (node.file_path.clone(), node.start_line) else {
+    let (Some(_), Some(_)) = (
+        node.file_path.as_ref(),
+        node.start_line.filter(|line| *line > 0),
+    ) else {
         trace.finish_skipped(
             source_step,
             "Focused node has no file path and line metadata.",
@@ -1749,19 +1758,12 @@ fn maybe_read_source_context(
         return None;
     };
 
-    match controller.bounded_file_snippet(
-        &path,
-        line,
-        6,
+    match controller.focused_source_context(
+        node,
         request.resolved_profile.max_source_bytes,
         SOURCE_SNIPPET_TRUNCATION_SUFFIX,
     ) {
-        Ok((resolved_path, bounded)) => {
-            let context = FocusedSourceContext {
-                path: resolved_path,
-                line,
-                snippet: bounded.markdown,
-            };
+        Ok(context) => {
             trace.finish_ok(
                 source_step,
                 vec![
@@ -1772,7 +1774,7 @@ fn maybe_read_source_context(
                         request.resolved_profile.max_source_bytes.to_string(),
                     ),
                     field("snippet_bytes", context.snippet.len().to_string()),
-                    field("truncated", bounded.truncated.to_string()),
+                    field("truncated", context.truncated.to_string()),
                 ],
             );
             Some(context)

@@ -4978,6 +4978,7 @@ mod tests {
     #[test]
     fn context_markdown_contract_includes_evidence_packet_shape() {
         let answer = AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "build_packet".to_string(),
@@ -5077,6 +5078,7 @@ mod tests {
 
     fn well_grounded_packet_answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-telemetry".to_string(),
             prompt: "Explain how the installer dispatches commands.".to_string(),
@@ -5775,6 +5777,7 @@ mod tests {
     #[test]
     fn context_markdown_surfaces_low_confidence_trace_gaps() {
         let answer = AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "weak_hit".to_string(),

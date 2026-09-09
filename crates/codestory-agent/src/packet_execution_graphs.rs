@@ -62,6 +62,7 @@ mod tests {
 
     fn answer(graphs: Vec<GraphArtifactDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             answer_id: "answer".to_string(),
             prompt: "question".to_string(),
             summary: "summary".to_string(),

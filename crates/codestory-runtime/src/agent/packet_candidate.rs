@@ -911,6 +911,7 @@ mod tests {
 
     fn answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             answer_id: "answer".into(),
             prompt: "prompt".into(),
             summary: "summary".into(),

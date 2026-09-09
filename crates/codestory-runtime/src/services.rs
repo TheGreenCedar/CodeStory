@@ -2196,6 +2196,15 @@ impl PublicOperationService {
         })
     }
 
+    pub(crate) fn focused_source_matches_current(
+        &self,
+        source: &codestory_contracts::api::FocusedSourceEvidenceDto,
+        target_path: Option<&str>,
+    ) -> bool {
+        self.controller
+            .focused_source_matches_current(source, target_path)
+    }
+
     pub(crate) fn active_project_identity_v3(
         &self,
     ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {

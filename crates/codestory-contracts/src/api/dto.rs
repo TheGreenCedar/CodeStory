@@ -2663,6 +2663,21 @@ pub struct AgentRetrievalTraceDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct FocusedSourceEvidenceDto {
+    pub node_id: NodeId,
+    pub file_id: i64,
+    pub path: String,
+    pub project_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub content_sha256: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub excerpt: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAnswerDto {
     pub answer_id: String,
     pub prompt: String,
@@ -2676,6 +2691,10 @@ pub struct AgentAnswerDto {
     /// `NotEstablished` observation rather than as an absent list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_coverage: Vec<SourceCoverageObservationDto>,
+    /// A focused source window read once and verified against the pinned file hash.
+    /// Kept separate from single-line citations so projections retain its actual range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_source: Option<FocusedSourceEvidenceDto>,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub subgraph_ids: Vec<String>,

@@ -84,6 +84,7 @@ mod tests {
 
     fn answer(citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer".into(),
             prompt: "irrelevant wording".into(),
