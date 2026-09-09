@@ -4658,7 +4658,8 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
         .as_str()
         .expect("cold status storage path");
     assert!(
-        !Path::new(storage_path).exists(),
+        !codestory_runtime::core_database_exists(Path::new(storage_path))
+            .expect("inspect cold core storage"),
         "malformed affected input must not create storage before activation: {cold_status}"
     );
 
@@ -4677,7 +4678,27 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
     let result = assert_tool_success(&legacy, json!("affected-cold-legacy"));
     assert_eq!(result["changed_paths"], json!(["src/runtime.rs"]));
     assert_eq!(result["matched_file_count"], json!(1));
-    assert!(Path::new(storage_path).exists());
+    assert!(
+        codestory_runtime::core_database_exists(Path::new(storage_path))
+            .expect("inspect activated core storage")
+    );
+    let activated_status = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-activated-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let activated_status = json_resource_content(
+        assert_success_envelope(&activated_status, json!("affected-activated-status")),
+        "codestory://status",
+    );
+    assert!(
+        activated_status["index_publication"].is_object(),
+        "the valid retry must publish a complete core generation: {activated_status}"
+    );
 }
 
 #[test]
