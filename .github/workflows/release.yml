@@ -1,5 +1,7 @@
 name: Release
 
+run-name: ${{ inputs.coordinator_dispatch_id && format('codestory-release:{0}', inputs.coordinator_dispatch_id) || 'Release' }}
+
 on:
   workflow_call:
     inputs:
@@ -19,6 +21,11 @@ on:
         default: false
   workflow_dispatch:
     inputs:
+      coordinator_dispatch_id:
+        description: Optional release coordinator identity for resumable dispatch ownership.
+        required: false
+        default: ""
+        type: string
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true

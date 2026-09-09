@@ -12,14 +12,35 @@ node scripts/codestory-release.mjs advance
 node scripts/codestory-release.mjs resume
 ```
 
-`status` reconstructs phase from GitHub. `advance` dispatches only the next
-permitted workflow and is a no-op while that workflow is in flight. Promotion
-and publication require `--record-approval --approver <name>`. Rehearse the
-machine against live GitHub without tagging or `publish_release: true`:
+`status` reconstructs phase from the recorded Actions runs, their latest
+attempts, and digest-checked artifacts. `advance` dispatches the next permitted
+workflow and waits while it is in flight. An uncertain dispatch response keeps
+its durable intent; the driver reconciles the unique dispatch ID echoed in
+GitHub's run title before doing more work. A matching head, actor, or timestamp
+cannot establish ownership. An existing broad run on the same head blocks a
+new dispatch. The driver never invents a run ID or retries an unconfirmed dispatch.
+
+Use a clean checkout of the exact pushed proof head when advancing. Python
+3.11 or newer, Node, Git, authenticated `gh`, and the repository's Node
+dependencies are required. `CODESTORY_PYTHON` can select the Python executable.
+If more than one coordinator is open, pass `--issue <number>`. Existing
+preflight-only records migrate in place; legacy records containing simulated
+proof are rejected and remain available for investigation.
+
+The driver coordinates native releases. Plugin-only publication remains owned
+by the automatic plugin workflow; native evidence cannot authorize that lane.
+Promotion requires `--record-approval --approver <GitHub-login>` after the
+qualified candidate and concrete promotion PR are ready. The login must match
+the authenticated operator. Rehearse against live GitHub without publishing:
 
 ```sh
 node scripts/codestory-release.mjs start --version <version> --lane native --rehearse
 ```
+
+A rehearsal stops at `rehearsal_complete` after accepted pre-publish proof.
+That state makes no tag, publication, post-publish, or catalog-delivery claim.
+The local tests exercise the real GitHub adapter against a hermetic command
+boundary; they are not a live release rehearsal.
 
 The [repository release rules](../../AGENTS.md#release-rules) own policy, the
 [testing matrix](testing-matrix.md#workflow-and-release-automation) owns proof
@@ -131,21 +152,29 @@ CPU fallback disabled. Assemble their authenticated bundle, then commit only
 the generated per-user embedding-server constant-set file as the direct child
 of the accepted calibration source.
 
+Before stabilization, the input constant set must have `status: unfrozen` and
+`freeze_record: null`; retaining a previous release's freeze prevents fresh
+calibration. The coordinator checks this before dispatch. It reads calibration
+contracts from the pinned source commit and records the three distinct raw-run
+identities within their actual Actions producer run and attempt.
+
+The generated freeze is first pushed to an owned branch and draft PR. Review
+that exact change and finish its focused checks, then advance the checked
+fast-forward into dev. Frozen acceptance binds the resulting stable dev head;
+accepting a PR first and then moving its base would invalidate that binding.
+
 Treat that generated head as a new candidate. Record its commit, tree, and
 freeze receipt. Re-run exact-head acceptance with
 `acceptance_phase=frozen_candidate`, bound to exact commit `F`. This acceptance
 proves the constant-only lineage and reruns hostile mutations plus native
-probes; it must not repeat the workspace source proof. Run package, protected
-hardware, installed-candidate, and qualification lanes from artifacts built
-from that same head. Qualification is a program gate; the
+probes; it must not repeat the workspace source proof. The driver runs the
+canonical `qualification` mode and then the proof-only `release.yml` workflow.
+The latter owns the package, protected hardware, installed-candidate, and
+pre-publish ledger cells. There is no separate `installed` dispatch mode.
+Qualification is a program gate; the
 live release workflow does not yet authenticate an earlier qualification run,
-so record its complete run identity in the release-driver receipt rather than
-implying the workflow already carries it:
-
-```sh
-node .github/scripts/release-driver-receipt.mjs record qualification \
-  --receipt release-driver-receipt.json --data-file qualification.json
-```
+so the coordinator authenticates and retains that run separately before
+allowing the pre-publish and approval transitions.
 
 Use the testing matrix and workflow inputs as the command authority. Do not copy
 a target checklist from this page; `release-claims.json` declares the current
@@ -199,6 +228,13 @@ A run ID without its attempt, immutable artifact name, and digest is not an
 evidence handoff. A failed newer attempt cannot fall back to an older successful
 attempt. Reuse is valid only when the machine policy accepts the exact commit,
 tree, artifact, identity, and evidence window.
+
+The driver rechecks these bindings on resume. It cancels only runs recorded as
+owned by this release when the source moves, waits for terminal state, and makes
+one force-cancel request after a thirty-second grace period when needed. It
+preserves failed attempts. After investigating a failed run and completing any
+required causal probe, `resume --retry-failed` explicitly requests another run;
+ordinary `resume` does not repeat a failed gate.
 
 Validate the record before each transition. Validation is cumulative, requires
 exactly the groups available at that phase, and rejects later-phase groups when
