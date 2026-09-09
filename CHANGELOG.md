@@ -2,58 +2,43 @@
 
 ## Unreleased
 
-- Agents can search, inspect source and follow relationships adaptively, using
-  native tools whenever useful. Automatic packets are optional and experimental;
-  their evidence availability does not establish that an answer is complete.
-- **Breaking interface change:** search, context and packet use publication
-  schema 3. Integrations must read evidence rows and gaps instead of the older
-  hit/support/disposition shapes. See the [upgrade guide](docs/users/upgrading.md).
+## 0.17.6
 
-- Full indexing now runs call and import resolution after writing the source
-  graph, including when replaying cached parser output. Previously, full
-  refreshes could leave relationships unresolved until an incremental edit.
-
+- Agents can search, inspect source and follow relationships in any useful
+  order, using native tools whenever needed. Packets remain optional experiments
+  and do not decide whether an investigation is complete.
+- **Breaking interface change:** search, context and packet adopt publication
+  schema 3. Consumers must read evidence identities, status and gaps instead of
+  older hit/support/disposition shapes. Obsolete packet inputs are rejected;
+  `--diagnostics-out` replaces `--step-trace-out`. See the
+  [upgrade guide](docs/users/upgrading.md) for migration and rollback examples.
+- Core-only `search --repo-text off` reads the existing complete symbol index
+  without preparing embeddings, including when retrieval catalogs are
+  unwritable. An unindexed project returns `project_unavailable` without
+  creating a cache.
+- Full indexing resolves calls and imports after writing the source graph,
+  including when reusing cached parser output. Relationships no longer require
+  a later incremental edit to become available.
+- Malformed text configuration files no longer block the whole repository
+  index. Their source remains visible with explicit coverage gaps, and stale
+  structural claims are removed. JSONC comments and trailing commas work in
+  supported configuration files; ordinary JSON remains strict.
 - Pointer-returning C and C++ functions and variable-bound JavaScript,
-  TypeScript, and TSX functions and generators retain their full definitions
-  in the source index. Calls through a function expression's private name no
-  longer resolve to an unrelated outer function with the same name.
-
-- Malformed text configuration files no longer block the entire repository
-  index. Their source remains visible with an explicit coverage gap; stale
-  symbols and structural claims from an earlier valid version are removed.
-
-- Exact `search --repo-text off --refresh none` works from the existing core
-  publication even when retrieval catalogs are unwritable. A project without
-  a published core returns `project_unavailable` without creating a cache.
-- Explicit `search --repo-text off` now reads the complete core symbol index
-  without waiting for embeddings. Packet assembly reuses the retrieval result
-  that established admission instead of rerunning it under a shorter deadline.
-- Packet requests no longer accept `task_class`. Ordinary wording reaches
-  generic retrieval; the public packet reports `answer_sufficiency: not_asserted`.
-- The serialized public packet is capped at 16 KiB. When exact hydration cannot
-  fit, the packet records a typed `serialized_public_budget` gap instead of
-  silently dropping evidence.
-- `affected` reports indexed tests in the same package as a changed source file
-  as focused hints when the graph walk does not reach them.
-
-- Packet, context, and search now return closed CodeStory schema-3 evidence
-  projections. They report concrete evidence, gaps, retrieval state, and one
-  bounded continuation without claiming that an arbitrary natural-language
-  answer is proved. Packet diagnostics can be written separately with
-  `--diagnostics-out` or read through a short-lived session capability.
-- MCP discovery and results now match the negotiated 2024, March 2025, June
-  2025, or November 2025 protocol profile. Older profiles receive JSON text;
-  modern profiles receive matching structured content and JSON text. Invalid
-  packet fields fail as invalid arguments, and packet no longer accepts
-  `include_evidence` or `--no-evidence`.
-- TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
-- Full-coverage cold indexing sends more documents through each bounded
-  embedding request, reducing client/server overhead without changing the
-  model, dense coverage, stored vectors, or search ranking.
-
-- Upgrading a 0.17.5 cache can publish its rebuilt index while preserving the
-  previous schema and user annotations. The retained old generation no longer
-  has to match the new index schema.
+  TypeScript and TSX functions retain their full definitions. A function
+  expression's private name no longer resolves to an unrelated outer function.
+- Normal cache upgrades preserve bookmarks and annotations while moving from
+  schema 31 to immutable schema-32 generations. Failed or interrupted
+  publication preserves the previous complete generation for recovery.
+- Cold indexing sends more documents through each bounded embedding request
+  while retaining the same model, vectors and dense coverage. Packet assembly
+  reuses the retrieval result that established admission.
+- Experimental packets retain at most sixteen evidence rows and a 16 KiB
+  serialized result. Missing or oversized evidence produces explicit gaps;
+  evidence availability never asserts answer sufficiency.
+- MCP discovery and results agree with each supported protocol profile. Older
+  profiles receive JSON text and modern profiles receive matching structured
+  content. `affected` also reports same-package tests as focused hints when
+  graph traversal does not reach them.
 
 ## 0.17.5
 
