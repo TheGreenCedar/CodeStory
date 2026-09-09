@@ -24,8 +24,9 @@ changing the launcher. Binary and custom MCP-server overrides are unsupported.
 The installation JSON binds to the task manifest's SHA-256, contains the `arms`
 map and freezes `budget.max_sessions` and `budget.max_wall_ms`. A pilot can also
 set its original `budget.deadline_utc`. Each arm names `codex_home_template`;
-CodeStory arms additionally name `plugin_relative_path`, `package_sha256`,
-`source_commit`, `runtime_sha256`, `version`, `tools_sha256` and optionally
+CodeStory arms additionally name `marketplace_name`, `plugin_relative_path`,
+`package_sha256`, `source_commit`, `runtime_sha256`, `runtime_source`,
+`schema_version`, `version`, `tools_sha256` and optionally
 `release_directory`. An optional `auth_file` is copied privately into isolated
 homes; credentials are never written into results.
 
@@ -42,7 +43,8 @@ arm must pass installation, launcher, schema and edit/refresh canaries before an
 model starts. Sessions get fresh whole checkouts and state, including separate
 embedding qualification namespaces. The runner records prompts, effective
 configuration, package identity, canary traffic, model transcripts, usage, timing
-and failures. Output directories are never overwritten or silently resumed.
+and failures. Every scheduled session has a durable row, including preparation,
+spawn and budget failures. Output directories are never overwritten or silently resumed.
 Independent correctness grading and release acceptance follow execution; process
 success alone does not establish either.
 

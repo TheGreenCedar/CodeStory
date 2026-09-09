@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { cp, mkdir, readFile, writeFile, stat, realpath } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile, stat, realpath, readdir, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { parseArgs } from 'node:util';
@@ -7,11 +7,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { directoryDigest } from '../.github/scripts/install-codestory-marketplace-proof.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
-const json = async file => JSON.parse(await readFile(file, 'utf8'));
 const save = (file, value) => writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 const requireThat = (condition, message) => { if (!condition) throw new Error(message); };
-const relative = value => typeof value === 'string' && value.length > 0 && !path.isAbsolute(value)
-  && !value.split(/[\\/]/).some(part => part === '..' || part === '');
+const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value);
 
 export function validateManifest(manifest) {
   requireThat(manifest.schema_version === 1, 'unsupported navigation manifest');
@@ -22,11 +20,11 @@ export function validateManifest(manifest) {
   requireThat(repos.size === manifest.repositories.length && tasks.size === manifest.tasks.length, 'duplicate repository or task');
   for (const repo of repos.values()) requireThat(/^[a-f0-9]{40}$/.test(repo.commit) && /^[a-f0-9]{40}$/.test(repo.tree) && path.isAbsolute(repo.seed_clone), 'repository needs pinned commit, tree and seed clone');
   for (const task of tasks.values()) requireThat(repos.has(task.repository_id) && typeof task.prompt === 'string' && task.prompt.length > 0 && ['read_only', 'change'].includes(task.effect_mode), 'invalid navigation task');
-  requireThat(new Set(manifest.arms).size === manifest.arms.length && manifest.arms.includes('native'), 'unique arms including native required');
+  requireThat(Array.isArray(manifest.arms) && manifest.arms.every(safeId) && new Set(manifest.arms).size === manifest.arms.length && manifest.arms.includes('native'), 'unique arms including native required');
   const seen = new Set();
   const ids = new Set();
   manifest.sessions.forEach((row, index) => {
-    requireThat(row.sequence === index + 1 && /^[a-zA-Z0-9_-]+$/.test(row.session_id) && !ids.has(row.session_id), 'invalid sequence or duplicate session id');
+    requireThat(row.sequence === index + 1 && safeId(row.session_id) && !ids.has(row.session_id), 'invalid sequence or duplicate session id');
     ids.add(row.session_id);
     requireThat(tasks.has(row.task_id) && manifest.arms.includes(row.arm) && Number.isInteger(row.repeat) && row.repeat > 0 && row.repeat <= manifest.repeats, 'invalid session');
     const key = `${row.task_id}:${row.arm}:${row.repeat}`;
@@ -38,6 +36,54 @@ export function validateManifest(manifest) {
     for (const category of ['discovery', 'relationship', 'edit_refresh']) requireThat([...tasks.values()].filter(task => task.category === category).length === 2, 'maintenance category allocation changed');
   }
   return { repos, tasks };
+}
+
+export function validateTemplateConfig(config, armName, arm) {
+  let section = null;
+  for (const raw of config.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    requireThat(armName !== 'native', 'native template contains host configuration');
+    if (line.startsWith('[')) {
+      if (line === `[marketplaces.${arm.marketplace_name}]`) section = 'marketplace';
+      else if (line === `[plugins."codestory@${arm.marketplace_name}"]`) section = 'plugin';
+      else throw new Error(`unexpected installation configuration section: ${line}`);
+    } else {
+      requireThat((section === 'plugin' && line === 'enabled = true')
+        || (section === 'marketplace' && /^(source_type|source|ref) = "[^"\n]*"$/.test(line)), 'installation configuration contains a policy override');
+    }
+  }
+}
+
+export function validateInventory(installed, armName, arm) {
+  requireThat(Array.isArray(installed), 'missing plugin inventory');
+  if (armName === 'native') return requireThat(installed.length === 0, 'native arm contains plugins');
+  requireThat(installed.length === 1, 'expected one installed CodeStory plugin');
+  const plugin = installed[0];
+  requireThat(plugin.name === 'codestory' && plugin.pluginId === `codestory@${arm.marketplace_name}`
+    && plugin.marketplaceName === arm.marketplace_name && plugin.version === arm.version
+    && plugin.installed === true && plugin.enabled === true, 'Codex did not expose the expected enabled plugin');
+}
+
+export function validateRuntime(result, arm) {
+  const publication = result?._meta?.codestory_publication;
+  const runtime = publication?.contract_runtime;
+  requireThat(publication?.schema_version === arm.schema_version && publication?.served_from === 'complete_publication'
+    && typeof publication?.core_publication?.generation_id === 'string'
+    && runtime?.cli_sha256 === arm.runtime_sha256 && runtime?.cli_source === arm.runtime_source
+    && runtime?.cli_version === arm.version && runtime?.plugin_cli_version === arm.version
+    && runtime?.plugin_version === arm.version && runtime?.pinned_pair_matches === true
+    && runtime?.known_override_skew_channel === false, 'typed installed runtime/publication identity mismatch');
+}
+
+export function validateSourceRead(result, project, marker) {
+  const ranges = result?.structuredContent?.ranges;
+  requireThat(Array.isArray(ranges) && ranges.length === 1, 'source-read canary needs exactly one range');
+  const range = ranges[0];
+  requireThat(range.path === path.join(project, 'index.js') && range.start_line === 1 && range.end_line === 1
+    && range.snippet_truncated === false && typeof range.snippet === 'string'
+    && range.snippet.includes(`export function navigationCanary() { return "${marker}"; }`)
+    && !range.snippet.includes(marker === 'BEFORE_REFRESH' ? 'AFTER_REFRESH' : 'BEFORE_REFRESH'), 'source-read canary returned missing, mixed or stale source');
 }
 
 export function navigationCommand(codex, project, output) {
@@ -76,30 +122,35 @@ async function prepareSession(row, manifest, installation, output, codex, helper
   requireThat(await git(['-C', project, 'rev-parse', 'HEAD^{tree}']) === repo.tree, 'checkout tree mismatch');
   const arm = installation.arms[row.arm];
   requireThat(arm && path.isAbsolute(arm.codex_home_template), 'missing isolated installation template');
-  await cp(arm.codex_home_template, env.CODEX_HOME, { recursive: true, force: true, dereference: false });
-  // The template is a fresh installation, never a prior agent run. Auth stays private.
-  for (const forbidden of ['sessions', 'memories', 'AGENTS.md']) {
-    requireThat(!await stat(path.join(env.CODEX_HOME, forbidden)).then(() => true, () => false), `template contains ${forbidden}`);
+  // Copy only installation-owned material; reject host instructions before copying.
+  for (const entry of await readdir(arm.codex_home_template, { withFileTypes: true })) {
+    requireThat(['config.toml', 'plugins', 'tmp', '.tmp'].includes(entry.name) && !entry.isSymbolicLink(), `unexpected template entry: ${entry.name}`);
   }
-  if (installation.auth_file) await cp(installation.auth_file, path.join(env.CODEX_HOME, 'auth.json'));
-  const config = await readFile(path.join(env.CODEX_HOME, 'config.toml'), 'utf8');
-  requireThat(!/approval_policy|ignore_user_config|developer_instructions|model_instructions_file|mcp_servers|sandbox_mode|shell_environment_policy/.test(config), 'installation config contains a policy or server override');
-  const listingRaw = await checkedProcess(helpers.runProcess, codex, ['plugin', 'list', '--json'], { env });
-  const listing = JSON.parse(listingRaw);
-  const installed = listing.installed ?? [];
+  const config = await readFile(path.join(arm.codex_home_template, 'config.toml'), 'utf8');
+  validateTemplateConfig(config, row.arm, arm);
+  await writeFile(path.join(env.CODEX_HOME, 'config.toml'), config);
   let pluginRoot = null;
-  if (row.arm === 'native') requireThat(installed.length === 0, 'native arm contains plugins');
-  else {
-    requireThat(installed.length === 1 && relative(arm.plugin_relative_path), 'expected one installed CodeStory plugin');
-    pluginRoot = path.join(env.CODEX_HOME, arm.plugin_relative_path);
-    requireThat((await realpath(pluginRoot)).startsWith(`${await realpath(env.CODEX_HOME)}${path.sep}`), 'plugin escaped isolated home');
-    requireThat(directoryDigest(pluginRoot) === arm.package_sha256, 'installed package drift');
-    env.CODESTORY_PLUGIN_DATA = path.join(env.CODEX_HOME, 'plugins/data', `codestory-${installed[0].marketplaceName}`);
+  if (row.arm !== 'native') {
+    requireThat(safeId(arm.marketplace_name) && /^\d+\.\d+\.\d+$/.test(arm.version), 'invalid installed identity');
+    const expectedPath = `plugins/cache/${arm.marketplace_name}/codestory/${arm.version}`;
+    requireThat(arm.plugin_relative_path === expectedPath, 'unexpected installed package path');
+    const sourcePlugin = path.join(arm.codex_home_template, expectedPath);
+    requireThat(!(await lstat(sourcePlugin)).isSymbolicLink(), 'template plugin is a symlink');
+    requireThat((await realpath(sourcePlugin)).startsWith(`${await realpath(arm.codex_home_template)}${path.sep}`), 'template plugin escaped isolated home');
+    requireThat(directoryDigest(sourcePlugin) === arm.package_sha256, 'installed package drift');
+    pluginRoot = path.join(env.CODEX_HOME, expectedPath);
+    await cp(sourcePlugin, pluginRoot, { recursive: true, dereference: false });
+    requireThat(directoryDigest(pluginRoot) === arm.package_sha256, 'copied installed package drift');
+    env.CODESTORY_PLUGIN_DATA = path.join(env.CODEX_HOME, 'plugins/data', `codestory-${arm.marketplace_name}`);
     await mkdir(env.CODESTORY_PLUGIN_DATA, { recursive: true, mode: 0o700 });
-    requireThat(/^[a-f0-9]{40}$/.test(arm.source_commit) && /^[a-f0-9]{64}$/.test(arm.runtime_sha256), 'missing source/runtime identity');
-    // Local release mirrors are allowed; binary override paths are deliberately unsupported.
+    requireThat(/^[a-f0-9]{40}$/.test(arm.source_commit) && /^[a-f0-9]{64}$/.test(arm.runtime_sha256)
+      && [2, 3].includes(arm.schema_version) && ['managed', 'local_dev_override'].includes(arm.runtime_source), 'missing source/runtime identity');
     if (arm.release_directory) env.CODESTORY_PLUGIN_RELEASE_DIR = arm.release_directory;
   }
+  if (installation.auth_file) await cp(installation.auth_file, path.join(env.CODEX_HOME, 'auth.json'));
+  const listingRaw = await checkedProcess(helpers.runProcess, codex, ['plugin', 'list', '--json'], { env });
+  const listing = JSON.parse(listingRaw);
+  validateInventory(listing.installed, row.arm, arm);
   const effective = { schema_version: 1, session: row, model: manifest.model, timeout_ms: 600_000,
     sandbox: 'workspace-write', project, source_commit: repo.commit, source_tree: repo.tree,
     package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(Object.entries(env).filter(([key]) => /^(HOME|USERPROFILE|TMPDIR|CODEX_HOME|CODESTORY_)/.test(key))) };
@@ -135,19 +186,18 @@ async function operationCanary(session, helpers) {
       while (true) {
         const result = await request('tools/call', { name, arguments: { project, ...args } });
         const state = result.structuredContent;
-        if (!['preparing', 'updating'].includes(state?.state)) return result;
+        if (!['preparing', 'updating'].includes(state?.state)) { validateRuntime(result, arm); return result; }
         requireThat(performance.now() < deadline, 'managed preparation exceeded canary budget');
         await delay(Math.min(5000, Math.max(100, state.retry_after_ms ?? 1000)));
       }
     };
     await call('files', {});
     const before = await call('snippet', { path: 'index.js', start_line: 1, end_line: 1 });
-    requireThat(JSON.stringify(before).includes('BEFORE_REFRESH'), 'source-read canary failed');
+    validateSourceRead(before, project, 'BEFORE_REFRESH');
     await writeFile(path.join(project, 'index.js'), 'export function navigationCanary() { return "AFTER_REFRESH"; }\n');
     await call('files', {});
     const after = await call('snippet', { path: 'index.js', start_line: 1, end_line: 1 });
-    requireThat(JSON.stringify(after).includes('AFTER_REFRESH') && !JSON.stringify(after).includes('BEFORE_REFRESH'), 'refresh returned stale source');
-    requireThat(JSON.stringify(transcript).includes(arm.runtime_sha256), 'runtime executable digest missing or mismatched');
+    validateSourceRead(after, project, 'AFTER_REFRESH');
     await channel.close();
     return { status: 'pass', surface: 'installed-plugin', catalog_sha256: arm.tools_sha256, runtime_sha256: arm.runtime_sha256 };
   } finally {
@@ -175,42 +225,82 @@ export async function runInstalledNavigation(argv, helpers) {
   await mkdir(output); // No overwrite/resume: failures stay in their original attempt.
   const runStart = performance.now();
   const remainingMs = () => Math.min(installation.budget.max_wall_ms - (performance.now() - runStart), installation.budget.deadline_utc ? Date.parse(installation.budget.deadline_utc) - Date.now() : Infinity);
-  requireThat(remainingMs() > 0, 'navigation budget expired');
+  const allowance = requested => {
+    const available = Math.floor(Math.min(requested, remainingMs()));
+    requireThat(available > 0, 'navigation elapsed budget exhausted');
+    return available;
+  };
+  const bounded = { ...helpers,
+    runProcess: async (command, args, options = {}) => {
+      const result = await helpers.runProcess(command, args, { ...options, timeoutMs: allowance(options.timeoutMs ?? 90_000) });
+      return result;
+    },
+    createSequencedStdioSession: (command, args, options) => {
+      const channel = helpers.createSequencedStdioSession(command, args, { ...options, timeoutMs: allowance(options.timeoutMs) });
+      return { ...channel, request: async request => { allowance(1); const result = await channel.request(request); return result; } };
+    },
+  };
   const prepared = [];
-  // Every arm must pass deterministic checks before any model starts.
-  for (const armName of manifest.arms) {
-    const example = manifest.sessions.find(row => row.arm === armName);
-    const session = await prepareSession({ ...example, session_id: `preflight-${armName}` }, manifest, installation, output, values.codex, helpers);
-    const canary = await operationCanary(session, helpers);
-    prepared.push({ arm: armName, canary, effective_config_sha256: sha(await readFile(path.join(session.root, 'effective-config.json'))) });
-    await save(path.join(output, 'preflight.json'), prepared);
+  const results = manifest.sessions.map(row => ({ ...row, status: 'not_run', model_attempted: false, whole_task_wall_ms: 0, telemetry_complete: false }));
+  const persist = () => save(path.join(output, 'summary.json'), { schema_version: 1, profile: manifest.profile,
+    manifest_sha256: sha(manifestBytes), installations_sha256: sha(installationBytes),
+    expected_sessions: manifest.sessions.length, recorded_sessions: results.filter(row => row.status !== 'not_run').length, model_attempts: results.filter(row => row.model_attempted).length,
+    results, preflight: prepared, acceptance: 'pending_independent_evaluator', elapsed_ms: performance.now() - runStart });
+  await persist();
+  try {
+    // Every arm must pass deterministic checks before any model starts.
+    for (const armName of manifest.arms) {
+      allowance(1);
+      const example = manifest.sessions.find(row => row.arm === armName);
+      const session = await prepareSession({ ...example, session_id: `preflight-${armName}` }, manifest, installation, output, values.codex, bounded);
+      const canary = await operationCanary(session, bounded);
+      allowance(1);
+      prepared.push({ arm: armName, canary, effective_config_sha256: sha(await readFile(path.join(session.root, 'effective-config.json'))) });
+      await save(path.join(output, 'preflight.json'), prepared);
+    }
+  } catch (error) {
+    prepared.push({ status: 'fail', error: error.message });
+    for (const row of results) { row.status = 'not_run_preflight_failed'; row.error = error.message; }
+    await save(path.join(output, 'preflight.json'), prepared); await persist(); throw error;
   }
-  if (values['preflight-only']) return;
-  const results = [];
-  for (const row of manifest.sessions) {
-    requireThat(remainingMs() > 0, 'navigation elapsed budget exhausted');
+  if (values['preflight-only']) { await persist(); return; }
+  for (const [index, row] of manifest.sessions.entries()) {
     const started = performance.now();
-    const session = await prepareSession(row, manifest, installation, output, values.codex, helpers);
-    const invocation = navigationCommand(values.codex, session.project, path.join(session.root, 'answer.md'));
-    const preparationMs = performance.now() - started;
-    await writeFile(path.join(session.root, 'prompt.txt'), session.task.prompt);
-    const run = await helpers.runProcess(invocation.command, invocation.args, { cwd: session.project, env: session.env,
-      stdin: session.task.prompt, timeoutMs: Math.min(600_000, remainingMs()), killProcessTree: true, maxOutputBytes: 64 * 1024 * 1024 });
-    await writeFile(path.join(session.root, 'transcript.jsonl'), run.stdout);
-    await writeFile(path.join(session.root, 'stderr.txt'), run.stderr);
-    const events = []; const malformed = [];
-    for (const line of run.stdout.split('\n').filter(Boolean)) { try { events.push(JSON.parse(line)); } catch { malformed.push(line); } }
-    const usage = helpers.extractUsage(events);
-    const result = { ...row, status: run.status, exit_code: run.exitCode, timed_out: run.timedOut,
-      preparation_ms: preparationMs, whole_task_wall_ms: performance.now() - started,
-      usage, telemetry_complete: malformed.length === 0 && usage.input_tokens != null && events.some(event => event.type === 'turn.completed'),
-      transcript_sha256: sha(run.stdout), malformed_lines: malformed.length,
-      analysis: helpers.analyzeTranscript(events, session.project), grading: 'pending_independent_evaluator' };
-    await save(path.join(session.root, 'result.json'), result); results.push(result);
-    await save(path.join(output, 'summary.json'), { schema_version: 1, profile: manifest.profile,
-      manifest_sha256: sha(manifestBytes), installations_sha256: sha(installationBytes),
-      expected_sessions: manifest.sessions.length, completed_sessions: results.length, results,
-      acceptance: 'pending_independent_evaluator', elapsed_ms: performance.now() - runStart });
-    // A failed model attempt remains counted; subsequent scheduled arms still execute.
+    const root = path.join(output, row.session_id);
+    let phase = 'preparation';
+    const result = { ...row, status: 'preparation_failed', model_attempted: false, telemetry_complete: false,
+      usage: { input_tokens: null, output_tokens: null, total_tokens: null }, grading: 'pending_independent_evaluator' };
+    let stdout = ''; let stderr = '';
+    try {
+      allowance(1);
+      const session = await prepareSession(row, manifest, installation, output, values.codex, bounded);
+      const invocation = navigationCommand(values.codex, session.project, path.join(root, 'answer.md'));
+      result.preparation_ms = performance.now() - started;
+      await writeFile(path.join(root, 'prompt.txt'), session.task.prompt);
+      allowance(1); // No model process may start after preparation consumes the budget.
+      phase = 'model'; result.model_attempted = true;
+      const run = await bounded.runProcess(invocation.command, invocation.args, { cwd: session.project, env: session.env,
+        stdin: session.task.prompt, timeoutMs: 600_000, killProcessTree: true, maxOutputBytes: 64 * 1024 * 1024 });
+      stdout = run.stdout; stderr = run.stderr;
+      const events = []; const malformed = [];
+      for (const line of stdout.split('\n').filter(Boolean)) { try { events.push(JSON.parse(line)); } catch { malformed.push(line); } }
+      const usage = helpers.extractUsage(events);
+      Object.assign(result, { status: run.status, exit_code: run.exitCode, timed_out: run.timedOut, usage,
+        telemetry_complete: malformed.length === 0 && ['input_tokens', 'output_tokens', 'total_tokens'].every(key => Number.isFinite(usage[key]) && usage[key] >= 0)
+          && events.some(event => event.type === 'turn.completed'),
+        malformed_lines: malformed.length, analysis: helpers.analyzeTranscript(events, session.project) });
+    } catch (error) {
+      result.status = remainingMs() <= 0 ? 'budget_exhausted' : `${phase}_failed`;
+      result.error = error.message; stderr += `${error.message}\n`;
+    } finally {
+      result.whole_task_wall_ms = performance.now() - started;
+      result.transcript_sha256 = sha(stdout);
+      await mkdir(root, { recursive: true });
+      await writeFile(path.join(root, 'transcript.jsonl'), stdout);
+      await writeFile(path.join(root, 'stderr.txt'), stderr);
+      await save(path.join(root, 'result.json'), result);
+      results[index] = result; await persist();
+    }
+    // Failed attempts and unstarted budget rows retain their places in the denominator.
   }
 }
