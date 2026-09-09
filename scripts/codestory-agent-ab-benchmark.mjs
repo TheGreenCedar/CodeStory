@@ -7519,6 +7519,11 @@ function createSequencedStdioSession(command, args, options) {
     terminate("SIGTERM");
   }
   function dispatchResponse(response) {
+    if (options.onNotification && response?.jsonrpc === "2.0"
+      && typeof response.method === "string" && !Object.hasOwn(response, "id")) {
+      options.onNotification(response);
+      return;
+    }
     if (queuedResponses.length >= 4) {
       fail("fail", "retrieval-engine stdio emitted too many unmatched responses");
       return;
@@ -15057,6 +15062,13 @@ async function runAgentBenchmarkPipeline({
 }
 
 async function main() {
+  if (process.argv.includes("--installed-navigation")) {
+    const { runInstalledNavigation } = await import("./installed-navigation-profile.mjs");
+    await runInstalledNavigation(process.argv.slice(2), {
+      runProcess, createSequencedStdioSession, extractUsage, analyzeTranscript,
+    });
+    return;
+  }
   const opts = parseArgs(process.argv.slice(2));
   if (opts.selfTest) {
     runSelfTest();
@@ -15414,6 +15426,8 @@ async function main() {
 }
 
 export {
+  createSequencedStdioSession,
+  extractUsage,
   aggregateShardRuns,
   agentRunnerEnv,
   analyzeTranscript,
