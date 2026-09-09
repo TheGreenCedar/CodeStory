@@ -24,7 +24,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `packet` | `question` | `budget`, typed `probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Experimental bounded evidence selection. No `include_evidence`, `task_class`, or `extra_probes`. |
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery for adaptive source and relationship inspection. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
-| `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
+| `files` | | `language`, `path`, `role`, `limit`, `include_framework_coverage` | Refreshes the local map before dispatch. No `refresh` field. |
 | `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
 | `symbol` | `query` or `id` | `choose` | |
 | `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose` | There is no `mode` field. |

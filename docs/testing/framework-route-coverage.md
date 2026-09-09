@@ -10,7 +10,8 @@ single heuristic hit. Language support tiers are defined separately in
 ## Current Route Extraction Scope
 
 These bullets list extractor coverage or tracked fixture targets, not full
-framework parity; use `summary.framework_route_coverage` for per-framework
+framework parity; request `files --include-framework-coverage` and use
+`summary.framework_route_coverage` for per-framework
 status, confidence floor, handler-link support, known gaps, and promotability.
 
 - JavaScript/TypeScript: Express module-scope route calls on source-ordered app
@@ -119,7 +120,7 @@ a static path.
 4. For data bridge work, assert collection registration nodes, operation-aware
    usage edges, and the relevant `payload:<operation>:<slug>:...` callsite
    identity.
-5. Run `codestory-cli files --project <fixture> --format json` and inspect
+5. Run `codestory-cli files --project <fixture> --format json --include-framework-coverage` and inspect
    `summary.framework_route_coverage` for framework, language, status,
    coverage evidence, confidence floor, handler-link support, unsupported
    patterns, known gaps, and promotable status.

@@ -695,6 +695,7 @@ pub(crate) fn indexed_files_from_storage(
     source_index_policy: &SourceIndexPolicy,
     req: IndexedFilesRequest,
 ) -> Result<IndexedFilesDto, ApiError> {
+    let include_framework_coverage = req.include_framework_coverage;
     let inventory = IndexedFilesInventory::load(storage, root, source_index_policy)?;
     let aggregation = IndexedFilesAggregation::from_inventory(root, &inventory);
     let selection = IndexedFilesSelection::from_inventory(root, inventory, req);
@@ -719,6 +720,12 @@ pub(crate) fn indexed_files_from_storage(
             selection.policy_exclusion_count
         ));
     }
+    if !include_framework_coverage {
+        coverage_notes.push(
+            "Global framework capability catalog omitted; request include_framework_coverage for its limitations. File inventory does not establish route coverage."
+                .to_string(),
+        );
+    }
 
     Ok(IndexedFilesDto {
         project_root: root.to_string_lossy().to_string(),
@@ -734,7 +741,12 @@ pub(crate) fn indexed_files_from_storage(
             incomplete_reason_counts: aggregation.incomplete_reason_counts,
             truncated: selection.truncated,
             language_counts: aggregation.language_counts,
-            framework_route_coverage: framework_route_coverage_matrix(),
+            framework_route_coverage: if include_framework_coverage {
+                framework_route_coverage_matrix()
+            } else {
+                Vec::new()
+            },
+            framework_route_coverage_included: Some(include_framework_coverage),
             coverage_notes,
         },
         coverage_gaps: aggregation.coverage_gaps,

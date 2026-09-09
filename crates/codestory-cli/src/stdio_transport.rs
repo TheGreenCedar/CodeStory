@@ -4015,6 +4015,10 @@ fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> 
     runtime
         .browser
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: request
+                .pointer("/params/arguments/include_framework_coverage")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             path_contains: request
                 .pointer("/params/arguments/path")
                 .and_then(|value| value.as_str())

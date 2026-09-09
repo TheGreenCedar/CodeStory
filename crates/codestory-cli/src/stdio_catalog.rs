@@ -2082,6 +2082,11 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "List indexed files from the existing local index.",
     &[
+        SchemaProperty::boolean(
+            "include_framework_coverage",
+            "Include the global framework capability catalog and its limitations.",
+        )
+        .with_default(ValueLiteral::Boolean(false)),
         SchemaProperty::string("path", "Only include files whose path contains this text."),
         SchemaProperty::string("language", "Only include files for this language."),
         SchemaProperty::string("role", "Only include files with this inferred role.")
@@ -3025,6 +3030,7 @@ mod tests {
             project_root: "/repo".to_string(),
             usable: true,
             summary: codestory_contracts::api::IndexedFilesSummaryDto {
+                framework_route_coverage_included: None,
                 file_count: 0,
                 indexed_file_count: 0,
                 filtered_file_count: 0,
@@ -3043,6 +3049,14 @@ mod tests {
             files: Vec::new(),
         };
         let payload = serde_json::to_value(&files).expect("serialize indexed files");
+        assert!(
+            payload["summary"]
+                .get("framework_route_coverage_included")
+                .is_none()
+        );
+        let legacy: codestory_contracts::api::IndexedFilesDto =
+            serde_json::from_value(payload.clone()).expect("older inventory response");
+        assert_eq!(legacy.summary.framework_route_coverage_included, None);
         assert_eq!(
             payload.get("policy_exclusions"),
             Some(&json!([])),

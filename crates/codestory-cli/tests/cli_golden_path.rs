@@ -1591,6 +1591,49 @@ fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
         &["files", "--refresh", "none", "--format", "json"],
     );
 
+    assert_eq!(
+        files["summary"]["framework_route_coverage_included"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        files["summary"]["framework_route_coverage"],
+        serde_json::json!([])
+    );
+    let full = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "files",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--include-framework-coverage",
+        ],
+    );
+    assert_eq!(
+        full["summary"]["framework_route_coverage_included"],
+        serde_json::json!(true)
+    );
+    assert!(
+        full["summary"]["framework_route_coverage"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    for field in [
+        "files",
+        "coverage_gaps",
+        "policy_exclusions",
+        "project_root",
+        "usable",
+    ] {
+        assert_eq!(files.get(field), full.get(field), "{field}");
+    }
+    assert_eq!(
+        files["summary"]["language_counts"],
+        full["summary"]["language_counts"]
+    );
+
     assert!(
         files["summary"]["language_counts"]
             .as_array()

@@ -305,6 +305,95 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
 }
 
 #[test]
+fn files_framework_catalog_is_explicit_in_every_mcp_revision() {
+    let fixture = indexed_fixture();
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let mut server = spawn_stdio_server(&fixture);
+        let init = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0", "id":"files-init", "method":"initialize",
+                "params":{"protocolVersion":revision}
+            }),
+        );
+        assert_success_envelope(&init, json!("files-init"));
+        let mut outputs = Vec::new();
+        for (id, requested) in [
+            ("default", None),
+            ("false", Some(false)),
+            ("true", Some(true)),
+        ] {
+            let mut arguments = json!({"project":fixture.workspace.path(), "limit":1});
+            if let Some(requested) = requested {
+                arguments["include_framework_coverage"] = json!(requested);
+            }
+            let response = send_json(
+                &mut server,
+                json!({
+                    "jsonrpc":"2.0", "id":id, "method":"tools/call",
+                    "params":{"name":"files", "arguments":arguments}
+                }),
+            );
+            let result = assert_success_envelope(&response, json!(id));
+            assert_ne!(result.get("isError"), Some(&json!(true)), "{response}");
+            let payload: Value = serde_json::from_str(
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("JSON fallback"),
+            )
+            .expect("file inventory");
+            if revision >= "2025-06-18" {
+                assert_eq!(result["structuredContent"], payload);
+            }
+            assert_eq!(
+                payload["summary"]["framework_route_coverage_included"],
+                json!(requested.unwrap_or(false))
+            );
+            assert_eq!(
+                payload["summary"]["framework_route_coverage"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                requested != Some(true)
+            );
+            outputs.push(payload);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        for field in [
+            "files",
+            "coverage_gaps",
+            "policy_exclusions",
+            "project_root",
+            "usable",
+        ] {
+            assert_eq!(
+                outputs[0].get(field),
+                outputs[2].get(field),
+                "{revision}: {field}"
+            );
+        }
+        for field in [
+            "file_count",
+            "indexed_file_count",
+            "filtered_file_count",
+            "visible_file_count",
+            "incomplete_file_count",
+            "error_file_count",
+            "policy_exclusion_count",
+            "incomplete_reason_counts",
+            "truncated",
+            "language_counts",
+        ] {
+            assert_eq!(
+                outputs[0]["summary"].get(field),
+                outputs[2]["summary"].get(field),
+                "{revision}: {field}"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
     for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
         let fixture = unindexed_fixture();
@@ -329,6 +418,13 @@ fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
         let mut overflow_probes = exact_path_probes.clone();
         overflow_probes.push(json!({"kind":"exact_path","path":"src/overflow.rs"}));
         let cases = vec![
+            (
+                "files-framework-type",
+                "files",
+                json!({"project":project,"include_framework_coverage":"yes"}),
+                "/arguments/include_framework_coverage",
+                "invalid_type",
+            ),
             (
                 "status-project-type",
                 "status",

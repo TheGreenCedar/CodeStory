@@ -1212,6 +1212,9 @@ pub enum IndexedFileRoleDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct IndexedFilesRequest {
+    /// Include the global capability catalog, independent of this project's inventory.
+    #[serde(default)]
+    pub include_framework_coverage: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1307,6 +1310,9 @@ pub struct IndexedFilesSummaryDto {
     pub language_counts: Vec<IndexedFileLanguageCountDto>,
     #[serde(default)]
     pub framework_route_coverage: Vec<FrameworkRouteCoverageDto>,
+    /// None denotes an older response that did not declare whether the catalog was included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_route_coverage_included: Option<bool>,
     #[serde(default)]
     pub coverage_notes: Vec<String>,
 }
