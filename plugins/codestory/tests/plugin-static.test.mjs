@@ -153,11 +153,11 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
   for (const [revision, profile] of Object.entries(catalog.revisionProfiles)) {
-    assert.equal(profile.tools.length, 21, `${revision} must advertise exactly 21 tools`);
+    assert.equal(profile.tools.length, 20, `${revision} must advertise exactly 20 navigation tools`);
     assert.equal(
       profile.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length,
-      1,
-      `${revision} must advertise verify_indexed_direct_calls exactly once`,
+      0,
+      `${revision} must keep experimental verification outside the default catalog`,
     );
     assert.equal(
       profile.tools.filter(({ name }) => name === "prove_call_path").length,
@@ -165,8 +165,8 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
       `${revision} must not advertise legacy prove_call_path in the public catalog`,
     );
   }
-  assert.equal(catalog.tools.length, 21);
-  assert.equal(catalog.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length, 1);
+  assert.equal(catalog.tools.length, 20);
+  assert.equal(catalog.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length, 0);
   assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 0);
   assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
   assert.ok(
@@ -5118,11 +5118,11 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       id: "cold-tools",
       method: "tools/list",
     });
-    assert.equal(coldTools.result.tools.length, 21);
+    assert.equal(coldTools.result.tools.length, 20);
     assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
     assert.equal(
       coldTools.result.tools.filter((tool) => tool.name === "verify_indexed_direct_calls").length,
-      1,
+      0,
     );
     assert.equal(coldTools.result.tools.filter((tool) => tool.name === "prove_call_path").length, 0);
     const coldGround = await request({

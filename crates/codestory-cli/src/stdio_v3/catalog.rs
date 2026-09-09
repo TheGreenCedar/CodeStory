@@ -28,7 +28,7 @@ const PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3: &str = concat!(
 );
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
-    tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
+    tools_for_surface_v3(revision, V3SurfaceSet::EvidenceOnly)
 }
 
 pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSet) -> Vec<Value> {
@@ -692,7 +692,7 @@ mod tests {
             ),
         ];
         for revision in [McpRevisionV3::June2025, McpRevisionV3::November2025] {
-            let tools = tools_for_revision_v3(revision);
+            let tools = tools_for_surface_v3(revision, V3SurfaceSet::WithProof);
             for projected in &tools {
                 assert_eq!(
                     projected.pointer("/outputSchema/type"),

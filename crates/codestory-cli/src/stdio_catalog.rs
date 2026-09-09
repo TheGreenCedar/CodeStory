@@ -995,7 +995,7 @@ static SYMBOL_SUMMARY_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for graph or source follow-up.",
+    "CodeStory discovery results DTO. Search rows select candidates for graph or source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval readiness."),
@@ -1013,7 +1013,10 @@ pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
             "Repo text scan cap, byte, and truncation telemetry.",
         )
         .nullable(),
-        SchemaProperty::object("counts", "Source counts before merged-result deduplication."),
+        SchemaProperty::object(
+            "counts",
+            "Source counts before merged-result deduplication.",
+        ),
         SchemaProperty::array("hits", "Merged hit list.", &SEARCH_HIT_SCHEMA),
         SchemaProperty::string("code", "Typed API error code."),
         SchemaProperty::string("message", "Human-readable API error message."),
@@ -2330,21 +2333,21 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Gather an experimental bounded packet of source evidence, availability and gaps, with at most one generation-bound continuation. It does not assert answer sufficiency. Ordinary search, source reads and relationship navigation remain available.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "search",
-        description: "Discover candidate symbols and retrieval hits; for broad structural questions call packet before snippet/source reads. CodeStory prepares managed retrieval automatically.",
+        description: "Discover candidate symbols and retrieval hits for inspection and relationship navigation. Use repo_text=off for existing core-only symbol search without embedding preparation; other modes prepare managed retrieval automatically.",
         input_schema: SEARCH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SEARCH_RESULTS_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "ground",
-        description: "Return a compact repository map for orientation before packet/search; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
+        description: "Return a compact repository map for orientation; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
         input_schema: GROUND_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2400,7 +2403,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "get_node",
-        description: "Return one stable graph node with file refs before requesting a packet.",
+        description: "Return one stable graph node with file references for source inspection and relationship navigation.",
         input_schema: GRAPH_TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2421,7 +2424,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "query_subgraph",
-        description: "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
+        description: "Return a bounded subgraph around one resolved node for relationship navigation.",
         input_schema: QUERY_SUBGRAPH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2449,7 +2452,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "snippet",
-        description: "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
+        description: "Read line-numbered source for a selected symbol or path. Use `paths` to inspect several file ranges in one call; ordinary host source reads are also available.",
         input_schema: SNIPPET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),

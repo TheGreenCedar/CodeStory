@@ -64,7 +64,10 @@ Impact hints are not test results.
 
 ## Packet and search
 
-Only trust output when `retrieval status` reports `retrieval_mode: "full"`.
+Semantic search and experimental packets require full, current retrieval.
+Explicit `search --repo-text off --refresh none` reads an existing complete
+core without embedding preparation. Readiness alone does not establish answer
+quality.
 
 ```sh
 codestory-cli packet --project <repo> --question "<broad task question>"
@@ -75,45 +78,6 @@ Packets use the standard evidence budget by default. Pass `--budget compact`
 when minimizing context matters more than keeping the fuller evidence set.
 
 Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrieval-mode).
-
-## Exact call-path verification
-
-The verifier reads one contract written in the `call-path/v1` grammar. Write the
-document yourself; CodeStory parses it and does not translate prose into one.
-
-```text
-call-path/v1
-from symbol "crate::module::Alpha"
-direct-call symbol "crate::module::Beta"
-direct-call symbol "Gamma" in "src/gamma.rs"
-prohibit-through symbol "crate::detail::Helper"
-exclude-from-projection symbol "crate::test_support"
-```
-
-The version line comes first. Exactly one `from` and one to six `direct-call`
-lines are required. `prohibit-through` and `exclude-from-projection` are
-optional and capped at sixteen each. Selectors are
-`symbol "<qualified-name>" [in "<project-relative-path>"]` or
-`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
-identities are not selectors. Blank lines and indentation are ignored.
-
-```sh
-codestory-cli verify-indexed-direct-calls --project <repo> --spec <call-path.txt>
-cat call-path.txt | codestory-cli verify-indexed-direct-calls --project <repo> --spec -
-```
-
-The MCP tool `verify_indexed_direct_calls` takes the same document as its
-`call_path` argument. Both transports cap the document at 8192 bytes.
-
-The command is observational and does not start broad semantic retrieval.
-`contract_proven` and `contract_refuted` apply only to the indexed source-call
-contract you wrote. Any line the grammar cannot read is reported as an
-unresolved clause and makes the whole result `unknown`, so the verifier never
-proves a smaller contract than the one you supplied. Unsupported proof-domain
-cases return typed `unknown` or `unavailable` results.
-
-Verification results carry `provenance.availability: "unavailable"`. There is no
-proof-provenance artifact registry yet, so no artifact reference is offered.
 
 ## Stale local cache
 

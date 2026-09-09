@@ -1,8 +1,8 @@
-# `packet` - Broad Evidence Packet
+# `packet` - Experimental Evidence Selection
 
-Builds a bounded answer packet for a broad repository question. Use it before
-ordinary source-file reads when the task is explanation, planning, route
-tracing, ownership discovery, or change-impact analysis.
+Builds an experimental bounded source selection for a repository question.
+Use it explicitly when useful; search, source reads and relation navigation
+remain available before and after a packet. It never asserts answer sufficiency.
 
 ## Syntax
 
@@ -13,11 +13,11 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
+| Explicit experiment | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
 | `available` | Use the returned evidence rows first. Follow an exact identity with `snippet`, `context`, or an explicit graph operation when the task still needs it. | The packet never asserts answer sufficiency. |
 | `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded compiler continuation; ordinary exact navigation remains available afterward. |
 | `no_useful_evidence` / `unavailable` | Preserve the reported gap and use exact search, source, or relations if the task can still be grounded. | Do not turn absence of packet evidence into an absence claim. |
-| Explicit target | `search`, `context`, `trail`, or `snippet` may be used directly when the user or prior evidence identifies the target. | These are the packet compiler's substrate and fallback. |
+| Explicit target | `search`, `context`, `trail`, or `snippet` may be used directly when the user or prior evidence identifies the target. | These are independent navigation operations. |
 | Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
 
 ## Notes
@@ -26,9 +26,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 - When the user supplies an exact packet question, copy it verbatim into
   `question`, including its punctuation. Do not paraphrase or trim it, and use
   the same bytes for an offered continuation.
-- Prefer the default standard packet before manually opening source files for a
-  broad explanation or plan. Select `compact` explicitly when minimizing
-  context is more important than retaining the fuller evidence set.
+- Use the standard budget unless the task benefits from a smaller `compact`
+  selection. The packet does not replace source inspection or decide when the
+  investigation is complete.
 - `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
   `qualified_symbol`, `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
@@ -62,7 +62,7 @@ CLI flags. Every call requires `project` (absolute repository root).
   repository. Preserve the gap when falling back to exact navigation.
 - Packet JSON is a closed root object. It contains no internal plan,
   obligations, score, eligibility, or proof-disposition fields.
-- The complete MCP ToolResult is limited to 16 KiB. If the mandatory envelope
+- Evidence is limited to sixteen rows and the complete MCP ToolResult to 16 KiB. If the mandatory envelope
   cannot fit, packet returns the explicit `budget_exceeded` variant with no
   partial evidence. Diagnostics remain immutable and separately capability-
   addressed for ten minutes in the serving session.
