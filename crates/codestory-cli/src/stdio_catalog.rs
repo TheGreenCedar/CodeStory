@@ -2818,6 +2818,7 @@ mod tests {
     fn the_context_packet_emits_only_fields_its_schema_declares() {
         let declared = CONTEXT_PACKET_SCHEMA.declared_property_names();
         let mut answer = codestory_contracts::api::AgentAnswerDto {
+            focused_source: None,
             answer_id: "packet".to_string(),
             prompt: "question".to_string(),
             summary: "summary".to_string(),

@@ -4,9 +4,20 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-struct VerifiedSourceFile {
-    path: PathBuf,
-    content: String,
+#[cfg(test)]
+thread_local! {
+    static VERIFIED_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn verified_source_read_count() -> usize {
+    VERIFIED_SOURCE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) struct VerifiedSourceFile {
+    pub(crate) path: PathBuf,
+    pub(crate) content: String,
+    pub(crate) content_sha256: String,
 }
 
 struct VerifiedFileIndex<'a> {
@@ -157,7 +168,7 @@ fn bounded_source_window_at_line(content: &str, line: u32) -> Option<String> {
     Some(lines[start..end].join("\n"))
 }
 
-fn verified_file(
+pub(crate) fn verified_file(
     storage: &Store,
     project_root: Option<&Path>,
     file: &FileInfo,
@@ -168,6 +179,8 @@ fn verified_file(
         Some(root) => contained_existing_read_path(root, &path).ok()?,
         None => path.clone(),
     };
+    #[cfg(test)]
+    VERIFIED_SOURCE_READS.with(|count| count.set(count.get() + 1));
     let bytes = std::fs::read(read_path).ok()?;
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return None;
@@ -175,6 +188,7 @@ fn verified_file(
     Some(VerifiedSourceFile {
         path,
         content: String::from_utf8(bytes).ok()?,
+        content_sha256: expected_hash,
     })
 }
 
@@ -449,6 +463,78 @@ mod tests {
             hit.verification_targets.is_empty(),
             "independent byte fragments must not infer an interface relationship"
         );
+    }
+
+    #[test]
+    fn verified_source_rejects_drift_missing_hash_and_invalid_text() {
+        let project = tempfile::tempdir().expect("project");
+        let path = project.path().join("source.rs");
+        let original = b"pub fn old_value() {}\n";
+        std::fs::write(&path, original).expect("source");
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let storage = Store::new_in_memory().expect("store");
+        insert_file(&storage, 1, Path::new("source.rs"), original);
+        let file = storage
+            .get_file_by_id(1)
+            .expect("file query")
+            .expect("file");
+        let read = || super::verified_file(&storage, Some(project.path()), &file);
+        let verified = read().expect("verified source");
+        assert_eq!(verified.content.as_bytes(), original);
+
+        std::fs::write(&path, b"pub fn new_value() {}\n").expect("same-length edit");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("file")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore modification time");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            modified
+        );
+        assert!(
+            read().is_none(),
+            "matching metadata cannot admit different bytes"
+        );
+        assert_eq!(
+            verified.content.as_bytes(),
+            original,
+            "the retained buffer does not follow a later edit"
+        );
+
+        let invalid = b"\xff invalid UTF-8";
+        std::fs::write(&path, invalid).expect("invalid source");
+        storage
+            .update_file_metadata(&file, Some(&format!("{:x}", Sha256::digest(invalid))))
+            .expect("bind invalid bytes");
+        assert!(
+            read().is_none(),
+            "even hash-matched malformed text is not an excerpt"
+        );
+
+        let missing_hash_file = FileInfo {
+            id: 2,
+            path: PathBuf::from("no-hash.rs"),
+            ..file.clone()
+        };
+        std::fs::write(project.path().join(&missing_hash_file.path), original)
+            .expect("source without hash");
+        storage
+            .insert_file(&missing_hash_file)
+            .expect("file without hash");
+        assert!(super::verified_file(&storage, Some(project.path()), &missing_hash_file).is_none());
+
+        std::fs::remove_file(&path).expect("remove source");
+        assert!(read().is_none(), "deleted source is unavailable");
+        std::fs::create_dir(&path).expect("unreadable file replacement");
+        assert!(read().is_none(), "a directory cannot supply source bytes");
     }
 
     #[test]

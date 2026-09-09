@@ -4,6 +4,9 @@
 
 ## 0.17.6
 
+- Context responses include verified focused source snippets that were
+  previously omitted. Truncated snippets report their retained line ranges
+  and limits.
 - Agents can search, inspect source and follow relationships in any useful
   order, using native tools whenever needed. Packets remain optional experiments
   and do not decide whether an investigation is complete.

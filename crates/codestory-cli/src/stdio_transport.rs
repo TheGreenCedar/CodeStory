@@ -8288,6 +8288,7 @@ mod tests {
         );
 
         let context_answer = codestory_contracts::api::AgentAnswerDto {
+            focused_source: None,
             answer_id: "context-v2-fixture".to_string(),
             prompt: "AppController".to_string(),
             summary: "Dispatch context.".to_string(),
