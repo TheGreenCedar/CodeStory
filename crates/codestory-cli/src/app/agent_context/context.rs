@@ -127,28 +127,6 @@ fn render_context_projection_markdown(
     markdown
 }
 
-#[cfg(test)]
-mod source_rendering_tests {
-    #[test]
-    fn context_markdown_retains_source_as_code_and_explains_its_gap() {
-        let context = serde_json::from_value(serde_json::json!({
-            "kind":"complete", "schema_version":3,
-            "identity":{"packet_id":"context", "question_sha256":"0".repeat(64), "request_id":"request"},
-            "publication":{"core":{"project_id":"project", "generation_id":"generation", "run_id":"run"}, "retrieval":null},
-            "status":"available", "target":{"path":"source.rs", "symbol_id":"20"},
-            "evidence":[{"identity":{"evidence_id":"source"}, "path":"source.rs", "symbol_id":"20",
-                "start_line":1, "end_line":2, "excerpt":"let value = 7;\n```` # source text"}],
-            "gaps":[{"identity":{"gap_id":"limit"}, "kind":"output_budget_exceeded", "message":"Further source lines were omitted."}],
-            "continuation":null, "diagnostics":{"availability":"unavailable"}
-        })).expect("context projection");
-        let markdown = super::render_context_projection_markdown(&context);
-        assert!(markdown.contains("source.rs:1-2"));
-        assert!(markdown.contains("      let value = 7;\n      ```` # source text\n"));
-        assert!(markdown.contains("Further source lines were omitted."));
-        assert!(!markdown.lines().any(|line| line.starts_with("````")));
-    }
-}
-
 fn resolve_context_target(
     runtime: &RuntimeContext,
     cmd: &ContextCommand,
@@ -269,4 +247,26 @@ fn annotate_context_with_bookmark_focus(answer: &mut AgentAnswerDto, bookmark: &
         .retrieval_trace
         .annotations
         .push(RetrievalAnnotationDto::observation(annotation));
+}
+
+#[cfg(test)]
+mod source_rendering_tests {
+    #[test]
+    fn context_markdown_retains_source_as_code_and_explains_its_gap() {
+        let context = serde_json::from_value(serde_json::json!({
+            "kind":"complete", "schema_version":3,
+            "identity":{"packet_id":"context", "question_sha256":"0".repeat(64), "request_id":"request"},
+            "publication":{"core":{"project_id":"project", "generation_id":"generation", "run_id":"run"}, "retrieval":null},
+            "status":"available", "target":{"path":"source.rs", "symbol_id":"20"},
+            "evidence":[{"identity":{"evidence_id":"source"}, "path":"source.rs", "symbol_id":"20",
+                "start_line":1, "end_line":2, "excerpt":"let value = 7;\n```` # source text"}],
+            "gaps":[{"identity":{"gap_id":"limit"}, "kind":"output_budget_exceeded", "message":"Further source lines were omitted."}],
+            "continuation":null, "diagnostics":{"availability":"unavailable"}
+        })).expect("context projection");
+        let markdown = super::render_context_projection_markdown(&context);
+        assert!(markdown.contains("source.rs:1-2"));
+        assert!(markdown.contains("      let value = 7;\n      ```` # source text\n"));
+        assert!(markdown.contains("Further source lines were omitted."));
+        assert!(!markdown.lines().any(|line| line.starts_with("````")));
+    }
 }
