@@ -30,17 +30,20 @@ incompatible cache and `incremental` for a compatible existing publication, so e
 forcing a full rebuild of a compatible cache. Use `none` to query the existing cache only, or `full` to force a rebuild \
 after a cache reset, schema change, or indexing failure. Explicit `incremental` never escalates to `full`.";
 const CLI_LONG_ABOUT: &str = "\
-CodeStory turns a local repository into auditable grounding evidence.
+CodeStory indexes a local repository for source navigation and retrieval.
 
 Common lanes:
-  New repo:      codestory-cli index --project <repo> --refresh full
-  Broad question: codestory-cli packet --project <repo> --question \"How does this system work?\"
-  Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
+  Prepare:       codestory-cli index --project <repo> --refresh auto
+  Find source:   codestory-cli search --project <repo> --query <name-or-behavior>
+  Existing core: codestory-cli search --project <repo> --query <symbol> --repo-text off --refresh none
+  Inspect:       codestory-cli snippet --project <repo> --id <returned-symbol-id>
 
-Packet and search initialize the embedded retrieval engine automatically and require retrieval_mode=full.";
+Use searches, source reads and relationships to investigate broad questions.
+The packet command is optional experimental evidence selection; it does not assert answer sufficiency.
+Semantic search and packets require full retrieval. Core-only search reads an existing complete index without embedding preparation.";
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
+#[command(author, version, about = "Local repository navigation and retrieval", long_about = CLI_LONG_ABOUT)]
 /// Top-level CLI parser.
 ///
 /// `Command` is the dispatch boundary used by `main`; adding a variant here

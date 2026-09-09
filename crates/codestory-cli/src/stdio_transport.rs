@@ -7234,35 +7234,14 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
     let project = "<absolute-project-root>";
     serde_json::json!({
         "purpose": "Direct CodeStory tools for repository orientation, navigation, and broad search.",
-        "recommended_call_sequence": [
-            {
-                "step": 1,
-                "action": "resolve_project_root",
-                "note": "Pass the exact absolute repository root as project on every CodeStory call."
-            },
-            {
-                "step": 2,
-                "action": "call_matching_tool",
-                "arguments": {"project": project},
-                "note": "Call the tool that matches the task. Do not call status first. Orientation may use ground; it is not the first required call."
-            },
-            {
-                "step": 3,
-                "action": "retry_same_tool",
-                "when": ["preparing", "updating"],
-                "after_field": "retry_after_ms",
-                "note": "Wait retry_after_ms and retry the same tool with the same arguments. Do not poll status."
-            },
-            {
-                "step": 4,
-                "action": "read_focused_source_for_remaining_gaps",
-                "note": "Preserve cited anchors. Read focused source only for remaining evidence gaps."
-            }
-        ],
+        "canonical_skill": {
+            "source": "plugins/codestory/skills/codestory-grounding/SKILL.md",
+            "markdown": include_str!("../../../plugins/codestory/skills/codestory-grounding/SKILL.md")
+        },
         "readiness_lanes": [
             {
                 "readiness_goal": "local_navigation",
-                "condition": "Call the intended tool directly. CodeStory refreshes the repository map when needed.",
+                "condition": "Requires a complete local publication; applicable tools may refresh the repository map.",
                 "surfaces": ["ground", "files", "symbol", "definition", "get_node", "callers", "callees", "neighbors", "shortest_path", "query_subgraph", "symbols", "snippet", "references", "trace", "trail", "affected"],
                 "calls": [
                     {
@@ -7333,7 +7312,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             },
             {
                 "readiness_goal": "agent_packet_search",
-                "condition": "Call packet, search, or context directly. If CodeStory is preparing broad search, retry the same tool after retry_after_ms.",
+                "condition": "Semantic search, selected context and experimental packets require full current retrieval. Search with repo_text=off instead reads the existing core.",
                 "surfaces": ["packet", "search", "context"],
                 "calls": [
                     {
@@ -7364,49 +7343,6 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                     }
                 ]
             }
-        ],
-        "surface_decisions": [
-            {
-                "surface": "ground",
-                "kind": "tool and codestory://grounding resource",
-                "when": "Use for repository orientation. It is not a required first call."
-            },
-            {
-                "surface": "packet",
-                "kind": "tool",
-                "when": "Use for broad structural questions. Retry the same call when CodeStory reports preparing."
-            },
-            {
-                "surface": "search",
-                "kind": "tool",
-                "when": "Use for bounded candidate discovery. Retry the same call when CodeStory reports preparing."
-            },
-            {
-                "surface": "context",
-                "kind": "tool",
-                "when": "Use after selecting one concrete target. Retry the same call when CodeStory reports preparing."
-            },
-            {
-                "surface": "direct_source_reads",
-                "kind": "fallback",
-                "when": "Use only when CodeStory reports unavailable or when exact source inspection is needed."
-            },
-            {
-                "surface": "cache identity, retrieval status",
-                "kind": "deferred",
-                "when": "Use CLI or resources until these receive explicit read-only stdio contracts."
-            }
-        ],
-        "safety_notes": [
-            "CodeStory tools never edit repository source. Product calls refresh local managed state and initialize the packaged retrieval engine automatically; all are non-destructive, idempotent, and require no confirmation.",
-            "Pass the same absolute project path to every tool call.",
-            "Call the matching tool first. Orientation may use ground; it is not required first.",
-            "Use packet for broad task questions and context after selecting a concrete target.",
-            "When a tool reports preparing, wait retry_after_ms and retry that same tool. Do not ask the user to repair CodeStory.",
-            "Read packet evidence availability directly. For a generation-bound continuation when availability is continuation_available, repeat the original question with parent_packet_id=continuation.continuation_id, continuation.gap_ids as option_ids, and the core and retrieval generation ids from publication. Follow it at most once, then answer from evidence rows and state every remaining gap.",
-            "Use continuation links from search or definition results before broadening retrieval.",
-            "Keep search limits bounded; stdio search clamps limit to 1..50.",
-            "Treat repo-text hits as navigation clues and search hits as discovery clues until backed by graph or source evidence."
         ]
     })
 }
@@ -9613,35 +9549,6 @@ mod tests {
                 .as_array()
                 .is_some_and(|calls| calls.iter().all(|call| call["tool"] != json!("status"))),
             "status is not a product next call outside host-reload: {other_repair}"
-        );
-    }
-
-    #[test]
-    fn agent_guide_sequence_matches_skill_matching_tool_loop() {
-        let guide = read_stdio_agent_guide_resource();
-        let sequence = guide["recommended_call_sequence"]
-            .as_array()
-            .expect("agent guide publishes a call sequence");
-        assert_eq!(sequence[0]["action"], json!("resolve_project_root"));
-        assert_eq!(sequence[1]["action"], json!("call_matching_tool"));
-        assert_eq!(sequence[2]["action"], json!("retry_same_tool"));
-        assert_ne!(sequence[0].get("tool"), Some(&json!("ground")));
-        assert_ne!(sequence[1].get("tool"), Some(&json!("ground")));
-        let packet = guide["readiness_lanes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|lane| lane["readiness_goal"] == json!("agent_packet_search"))
-            .and_then(|lane| lane["calls"].as_array().cloned())
-            .into_iter()
-            .flatten()
-            .find(|call| call["tool"] == json!("packet"))
-            .expect("packet example");
-        assert_eq!(packet["arguments"]["budget"], json!("standard"));
-        let guide_text = guide.to_string();
-        assert!(
-            !guide_text.contains("Use ground first"),
-            "agent guide must not teach ground as the first required call: {guide}"
         );
     }
 

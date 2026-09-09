@@ -1533,23 +1533,6 @@ fn assert_ground_activation_call(status: &Value) {
     assert_eq!(calls[0]["activation_required"], json!(true));
 }
 
-fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => strings.push(text),
-        Value::Array(values) => {
-            for child in values {
-                string_values_recursive(child, strings);
-            }
-        }
-        Value::Object(map) => {
-            for child in map.values() {
-                string_values_recursive(child, strings);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn json_resource_content(result: &Value, uri: &str) -> Value {
     let content = result["contents"]
         .as_array()
@@ -6285,196 +6268,35 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
 }
 
 #[test]
-fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
-    let fixture = indexed_fixture();
+fn resources_read_agent_guide_serves_the_canonical_skill_without_a_parallel_policy() {
+    let fixture = unindexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
-
     let response = send_json(
         &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "agent-guide-resource",
-            "method": "resources/read",
-            "params": {"uri": "codestory://agent-guide"}
-        }),
+        json!({"jsonrpc":"2.0","id":"agent-guide-resource","method":"resources/read",
+            "params":{"uri":"codestory://agent-guide"}}),
     );
-
     let result = assert_success_envelope(&response, json!("agent-guide-resource"));
     let guide = json_resource_content(result, "codestory://agent-guide");
-    let sequence = guide
-        .get("recommended_call_sequence")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("agent guide should include recommended_call_sequence: {guide}"));
-    assert!(
-        sequence
-            .iter()
-            .any(|step| step["action"] == json!("call_matching_tool")
-                && step.pointer("/arguments/project").is_some())
-            && sequence
-                .iter()
-                .any(|step| step["action"] == json!("retry_same_tool"))
-            && sequence.first().is_some_and(|step| {
-                step["action"] == json!("resolve_project_root")
-                    && step.get("tool") != Some(&json!("ground"))
-            })
-            && guide
-                .get("readiness_lanes")
-                .and_then(Value::as_array)
-                .is_some_and(|lanes| lanes.len() >= 2),
-        "agent guide should publish the matching-tool loop, not ground-first: {guide}"
-    );
-    let local_lane = guide["readiness_lanes"]
-        .as_array()
-        .and_then(|lanes| {
-            lanes
-                .iter()
-                .find(|lane| lane["readiness_goal"] == json!("local_navigation"))
-        })
-        .unwrap_or_else(|| panic!("agent guide should include local_navigation lane: {guide}"));
-    let local_surfaces = local_lane["surfaces"]
-        .as_array()
-        .unwrap_or_else(|| panic!("local lane should list surfaces: {guide}"));
-    for expected in [
-        "ground",
-        "files",
-        "symbol",
-        "definition",
-        "get_node",
-        "callers",
-        "callees",
-        "neighbors",
-        "shortest_path",
-        "query_subgraph",
-        "symbols",
-        "snippet",
-        "references",
-        "trace",
-        "trail",
-        "affected",
-    ] {
-        assert!(
-            local_surfaces.iter().any(|surface| surface == expected),
-            "local lane should include {expected}: {guide}"
-        );
-    }
-    assert!(
-        !local_surfaces.iter().any(|surface| surface == "context"),
-        "context is sidecar-backed and should not be in the local lane: {guide}"
-    );
-    let agent_lane = guide["readiness_lanes"]
-        .as_array()
-        .and_then(|lanes| {
-            lanes
-                .iter()
-                .find(|lane| lane["readiness_goal"] == json!("agent_packet_search"))
-        })
-        .unwrap_or_else(|| panic!("agent guide should include agent_packet_search lane: {guide}"));
-    let agent_surfaces = agent_lane["surfaces"]
-        .as_array()
-        .unwrap_or_else(|| panic!("agent lane should list surfaces: {guide}"));
-    for expected in ["packet", "search", "context"] {
-        assert!(
-            agent_surfaces.iter().any(|surface| surface == expected),
-            "agent lane should include {expected}: {guide}"
-        );
-    }
-    let packet_example = agent_lane["calls"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|call| call["tool"] == json!("packet"))
-        .unwrap_or_else(|| panic!("agent lane should include a packet example: {guide}"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/codestory/skills/codestory-grounding/SKILL.md");
     assert_eq!(
-        packet_example["arguments"]["budget"],
-        json!("standard"),
-        "packet example budget must be standard, not compact: {guide}"
+        guide["canonical_skill"]["markdown"],
+        fs::read_to_string(source).expect("canonical skill")
     );
-    let mut strings = Vec::new();
-    string_values_recursive(&guide, &mut strings);
-    for expected in [
-        "ground",
-        "packet",
-        "search",
-        "context",
-        "definition",
-        "snippet",
+    for parallel_policy in [
+        "recommended_call_sequence",
+        "surface_decisions",
+        "safety_notes",
     ] {
         assert!(
-            strings.iter().any(|value| value.contains(expected)),
-            "agent guide should recommend {expected} in its call sequence: {guide}"
+            guide.get(parallel_policy).is_none(),
+            "parallel routing owner: {parallel_policy}"
         );
     }
-    let guide_text = strings.join("\n").to_ascii_lowercase();
-    let unconditional_sequence_text = guide
-        .get("recommended_call_sequence")
-        .and_then(Value::as_array)
-        .map(|calls| Value::Array(calls.clone()).to_string())
-        .unwrap_or_default();
     assert!(
-        !unconditional_sequence_text.contains("\"tool\":\"packet\"")
-            && !unconditional_sequence_text.contains("\"tool\":\"search\""),
-        "packet/search should not be unconditional normal next steps: {guide}"
-    );
-    assert!(
-        guide_text.contains("matching tool") && !guide_text.contains("use ground first"),
-        "agent guide should follow the matching-tool loop instead of requiring ground first: {guide}"
-    );
-    assert!(
-        guide_text.contains("preparing")
-            && guide_text.contains("retry")
-            && guide_text.contains("same tool"),
-        "agent guide should tell agents to retry the intended tool while CodeStory prepares: {guide}"
-    );
-    assert!(
-        guide_text.contains("repo-text hits as navigation clues"),
-        "agent guide should treat repo-text hits as navigation clues: {guide}"
-    );
-    assert!(
-        guide_text.contains("search hits as discovery clues")
-            && guide_text.contains("graph or source evidence"),
-        "agent guide should distinguish discovery clues from evidence: {guide}"
-    );
-    assert!(
-        guide_text.contains("evidence availability")
-            && guide_text.contains("generation-bound continuation")
-            && guide_text.contains("evidence rows")
-            && guide_text.contains("remaining gap"),
-        "agent guide should name the evidence-only availability contract: {guide}"
-    );
-    assert!(
-        guide_text.contains("direct_source_reads")
-            && guide_text.contains("unavailable")
-            && guide_text.contains("exact source inspection"),
-        "agent guide should name the direct source-read fallback: {guide}"
-    );
-    assert!(
-        guide_text.contains("ground")
-            && guide_text.contains("files")
-            && guide_text.contains("definition")
-            && guide_text.contains("get_node")
-            && guide_text.contains("neighbors")
-            && guide_text.contains("shortest_path")
-            && guide_text.contains("query_subgraph")
-            && guide_text.contains("symbols")
-            && guide_text.contains("affected")
-            && guide_text.contains("local_navigation"),
-        "agent guide should record local navigation surfaces: {guide}"
-    );
-    assert!(
-        !guide_text.contains("files, affected, cache identity, retrieval status"),
-        "agent guide should not describe allowed files/affected surfaces as deferred: {guide}"
-    );
-    assert!(
-        !guide_text.contains("repo-text hits as evidence"),
-        "agent guide should not present repo-text hits as evidence: {guide}"
-    );
-    assert!(
-        contains_key_recursive(&guide, &["safety_notes", "safety"])
-            || strings.iter().any(|value| {
-                let value = value.to_ascii_lowercase();
-                value.contains("read-only") || value.contains("non-destructive")
-            }),
-        "agent guide should include safety notes: {guide}"
+        !fixture.cache_dir.path().join("core").exists(),
+        "static guidance must not activate a project"
     );
 }
 
