@@ -662,6 +662,13 @@ mod tests {
             .upsert_retrieval_index_manifest(&manifest)
             .expect("legacy retrieval manifest");
         let before = std::fs::read(&storage_path).expect("legacy bytes");
+        let cache_entries = || {
+            std::fs::read_dir(cache.path())
+                .expect("cache entries")
+                .map(|entry| entry.expect("cache entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let entries_before = cache_entries();
         for strict in [false, true] {
             let report = status_with_runtime(
                 project.path(),
@@ -680,6 +687,11 @@ mod tests {
         assert_eq!(
             std::fs::read(&storage_path).expect("unchanged legacy bytes"),
             before
+        );
+        assert_eq!(
+            cache_entries(),
+            entries_before,
+            "status must not create SQLite sidecars"
         );
     }
 
