@@ -227,7 +227,10 @@ fn status_with_runtime(
     let embedding_device = embedding_snapshot.device;
     let project_id = sidecar_project_id_for_runtime(project_root, &runtime)?;
 
-    if let Some(path) = storage_path.filter(|path| path.exists()) {
+    if let Some(path) = storage_path
+        && codestory_store::core_database_exists(path)
+            .context("resolve core publication for retrieval status")?
+    {
         let storage = Store::open_observational(path)
             .context("open storage observationally for retrieval manifest")?;
         let manifest = storage
@@ -574,6 +577,156 @@ fn manifest_contract_drift_should_win(reason: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn status_reads_generation_only_manifest_without_creating_legacy_database() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        let stage =
+            codestory_store::SnapshotStore::staged_path(&storage_path).expect("staged path");
+        crate::test_support::publish_empty_complete_core_fixture(project.path(), &stage)
+            .expect("complete staged core");
+        codestory_store::CorePublishTransaction::begin_from_stage(&storage_path, stage)
+            .expect("publication transaction")
+            .commit_rehydrate(&storage_path)
+            .expect("publish generation");
+        let runtime = SidecarRuntimeConfig::local();
+        let project_id =
+            sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
+        let manifest = crate::test_support::retrieval_manifest_fixture(&project_id, "fixture");
+        Store::open_observational(&storage_path)
+            .expect("published store")
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("publish retrieval manifest");
+        assert!(!storage_path.exists());
+
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("status");
+            assert_eq!(
+                report.manifest.as_ref().map(|value| &value.project_id),
+                Some(&project_id)
+            );
+            assert!(
+                !report.is_live_ready(),
+                "a manifest alone cannot establish readiness"
+            );
+            assert!(
+                !storage_path.exists(),
+                "status must not create a legacy database"
+            );
+        }
+
+        let generation =
+            codestory_store::resolve_core_database_path(&storage_path).expect("active generation");
+        std::fs::remove_file(&generation).expect("remove active generation");
+        for strict in [false, true] {
+            assert!(
+                status_with_runtime(
+                    project.path(),
+                    Some(&storage_path),
+                    strict,
+                    runtime.clone(),
+                    SidecarHealthScope::Full,
+                )
+                .is_err(),
+                "a dangling publication must fail closed"
+            );
+        }
+        assert!(!storage_path.exists());
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn status_preserves_legacy_manifest_observation() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        crate::test_support::publish_empty_complete_core_fixture(project.path(), &storage_path)
+            .expect("complete legacy core");
+        let runtime = SidecarRuntimeConfig::local();
+        let project_id =
+            sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
+        let manifest = crate::test_support::retrieval_manifest_fixture(&project_id, "fixture");
+        Store::open(&storage_path)
+            .expect("legacy store")
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("legacy retrieval manifest");
+        let before = std::fs::read(&storage_path).expect("legacy bytes");
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("legacy status");
+            assert_eq!(
+                report.manifest.as_ref().map(|value| &value.project_id),
+                Some(&project_id)
+            );
+            assert!(!report.is_live_ready());
+        }
+        assert_eq!(
+            std::fs::read(&storage_path).expect("unchanged legacy bytes"),
+            before
+        );
+    }
+
+    #[test]
+    fn status_does_not_create_missing_or_repair_corrupt_publications() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("missing").join("codestory.db");
+        let runtime = SidecarRuntimeConfig::local();
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("missing status");
+            assert!(report.manifest.is_none());
+            assert!(!report.is_live_ready());
+        }
+        assert!(!storage_path.parent().expect("parent").exists());
+
+        let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+            .expect("layout");
+        let pointer = layout.publication_path();
+        std::fs::create_dir_all(pointer.parent().expect("pointer parent")).expect("parent");
+        std::fs::write(&pointer, "{broken").expect("corrupt pointer");
+        for strict in [false, true] {
+            assert!(
+                status_with_runtime(
+                    project.path(),
+                    Some(&storage_path),
+                    strict,
+                    runtime.clone(),
+                    SidecarHealthScope::Full,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(pointer).expect("unchanged pointer"),
+            "{broken"
+        );
+        assert!(!storage_path.exists());
+    }
 
     #[test]
     fn strict_readiness_ignores_storage_owned_search_metadata() {
