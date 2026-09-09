@@ -25,7 +25,7 @@ test('schedule and source mutations fail closed before execution', () => {
 });
 test('same normal sandbox and low reasoning without approval override or tool restrictions', () => {
   const { args } = navigationCommand('codex', '/checkout', '/output/answer.md');
-  assert.deepEqual(args, ['exec', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', '/checkout', '--json', '--output-last-message', '/output/answer.md', '-']);
+  assert.deepEqual(args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', '/checkout', '--json', '--output-last-message', '/output/answer.md', '-']);
 });
 test('runtime and host overrides cannot escape the isolated session', () => {
   const env = navigationEnvironment({ PATH: '/bin', HOME: '/real', CODEX_HOME: '/real/.codex', CODESTORY_CLI: '/wrong/binary', CODESTORY_PLUGIN_DATA: '/shared', CODESTORY_EMBED_QUALIFICATION_DIR: '/shared', OPENAI_API_KEY: 'never-retain', PLUGIN_DATA: '/shared' }, '/isolated', 'nonce');
@@ -99,12 +99,13 @@ async function accountingFixture(t, option) {
       return pass(args.includes('rev-parse') ? args.at(-1)==='HEAD^{tree}' ? 'b'.repeat(40) : 'a'.repeat(40) : '');
     }
     if (args[0] === 'plugin') {
+      assert.ok(args.includes('--disable') && args.includes('remote_plugin'));
       const preflight = options.env.CODEX_HOME.includes('preflight-');
       if (option === 'deadline-preflight' && preflight || option === 'deadline-preparation' && !preflight) now += 20000;
       if (option === 'preparation' && options.env.CODEX_HOME.includes('native-1')) return {...pass(''),status:'fail',stderr:'inventory unavailable'};
       return pass('{"installed":[]}');
     }
-    attempts++; assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 600000);
+    attempts++; assert.ok(args.includes('--disable') && args.includes('remote_plugin')); assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 600000);
     if (option === 'spawn') throw new Error('spawn unavailable');
     const usage = option === 'usage' ? {input_tokens:11} : {input_tokens:11,output_tokens:7,total_tokens:18};
     return {...pass(`${JSON.stringify({type:'turn.completed',usage})}\n`), ...(option === 'model-failure' ? {status:'fail',exitCode:1} : {})};

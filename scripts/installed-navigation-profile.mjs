@@ -87,7 +87,7 @@ export function validateSourceRead(result, project, marker) {
 }
 
 export function navigationCommand(codex, project, output) {
-  return { command: codex, args: ['exec', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', project, '--json', '--output-last-message', output, '-'] };
+  return { command: codex, args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', project, '--json', '--output-last-message', output, '-'] };
 }
 
 export function navigationEnvironment(parent, root, nonce) {
@@ -148,11 +148,11 @@ async function prepareSession(row, manifest, installation, output, codex, helper
     if (arm.release_directory) env.CODESTORY_PLUGIN_RELEASE_DIR = arm.release_directory;
   }
   if (installation.auth_file) await cp(installation.auth_file, path.join(env.CODEX_HOME, 'auth.json'));
-  const listingRaw = await checkedProcess(helpers.runProcess, codex, ['plugin', 'list', '--json'], { env });
+  const listingRaw = await checkedProcess(helpers.runProcess, codex, ['plugin', 'list', '--json', '--disable', 'remote_plugin'], { env });
   const listing = JSON.parse(listingRaw);
   validateInventory(listing.installed, row.arm, arm);
   const effective = { schema_version: 1, session: row, model: manifest.model, timeout_ms: 600_000,
-    sandbox: 'workspace-write', project, source_commit: repo.commit, source_tree: repo.tree,
+    sandbox: 'workspace-write', host_features: { remote_plugin: false }, project, source_commit: repo.commit, source_tree: repo.tree,
     package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(Object.entries(env).filter(([key]) => /^(HOME|USERPROFILE|TMPDIR|CODEX_HOME|CODESTORY_)/.test(key))) };
   await save(path.join(root, 'effective-config.json'), effective);
   return { root, env, project, pluginRoot, task, arm, effective };

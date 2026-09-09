@@ -4,6 +4,10 @@ The `--installed-navigation` profile in `scripts/codestory-agent-ab-benchmark.mj
 compares ordinary installed CodeStory plugins with native repository tools. It
 uses Terra at low reasoning, the same workspace-write sandbox in each arm, and a
 ten-minute session timeout. It adds no investigation prelude or approval override.
+Authenticated accounts can discover remote plugins even with an empty isolated
+Codex home. This profile passes `--disable remote_plugin` to inventory and model
+execution in every arm. It records that setting explicitly; installed local
+CodeStory plugins and native source-reading tools remain available.
 Historical benchmark profiles retain their existing contracts.
 
 An independent evaluator freezes the task manifest and keeps answer keys outside
