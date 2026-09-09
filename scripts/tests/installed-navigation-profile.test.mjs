@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateManifest, navigationCommand, navigationEnvironment } from './installed-navigation-profile.mjs';
+import { validateManifest, navigationCommand, navigationEnvironment } from '../installed-navigation-profile.mjs';
 
 const fixture = () => ({ schema_version: 1, profile: 'pilot', model: { name: 'gpt-5.6-terra', reasoning_effort: 'low' },
   repositories: [{ id: 'r', commit: 'a'.repeat(40), tree: 'b'.repeat(40), seed_clone: '/tmp/seed' }],
@@ -37,7 +37,7 @@ test('runtime and host overrides cannot escape the isolated session', () => {
 });
 
 test('ordinary launcher notifications are retained without consuming a response', async () => {
-  const { createSequencedStdioSession } = await import('./codestory-agent-ab-benchmark.mjs');
+  const { createSequencedStdioSession } = await import('../codestory-agent-ab-benchmark.mjs');
   const notifications = [];
   const script = `process.stdin.on('data', b => { const request=JSON.parse(String(b)); process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/tools/list_changed'})+'\\n'); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{ok:true}})+'\\n'); }); process.stdin.on('end',()=>process.exit(0));`;
   const channel = createSequencedStdioSession(process.execPath, ['-e', script], { timeoutMs: 5000, onNotification: value => notifications.push(value) });
@@ -49,7 +49,7 @@ test('ordinary launcher notifications are retained without consuming a response'
 });
 
 test('typed canary rejects diagnostic substitutes, mixed source, and runtime drift', async () => {
-  const { validateRuntime, validateSourceRead, validateInventory, validateTemplateConfig } = await import('./installed-navigation-profile.mjs');
+  const { validateRuntime, validateSourceRead, validateInventory, validateTemplateConfig } = await import('../installed-navigation-profile.mjs');
   const arm = { marketplace_name: 'fixture', version: '0.17.5', schema_version: 2, runtime_source: 'managed', runtime_sha256: 'c'.repeat(64) };
   const result = { _meta: { codestory_publication: { schema_version: 2, served_from: 'complete_publication', core_publication: { generation_id: 'g' }, contract_runtime: { cli_sha256: arm.runtime_sha256, cli_source: 'managed', cli_version: arm.version, plugin_cli_version: arm.version, plugin_version: arm.version, pinned_pair_matches: true, known_override_skew_channel: false } } }, structuredContent: { ranges: [{ path: '/repo/index.js', start_line: 1, end_line: 1, snippet_truncated: false, snippet: 'export function navigationCanary() { return "BEFORE_REFRESH"; }' }] } };
   validateRuntime(result, arm); validateSourceRead(result, '/repo', 'BEFORE_REFRESH');
@@ -78,8 +78,8 @@ test('arm names cannot escape preflight output', () => {
 async function accountingFixture(t, option) {
   const fs = await import('node:fs/promises'); const os = await import('node:os'); const path = await import('node:path');
   const { createHash } = await import('node:crypto');
-  const { runInstalledNavigation } = await import('./installed-navigation-profile.mjs');
-  const { extractUsage } = await import('./codestory-agent-ab-benchmark.mjs');
+  const { runInstalledNavigation } = await import('../installed-navigation-profile.mjs');
+  const { extractUsage } = await import('../codestory-agent-ab-benchmark.mjs');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'navigation-test-'));
   t.after(() => fs.rm(root, {recursive:true,force:true}));
   const template = path.join(root, 'template'); await fs.mkdir(template); await fs.writeFile(path.join(template, 'config.toml'), '');

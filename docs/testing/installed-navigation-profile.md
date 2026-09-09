@@ -51,6 +51,6 @@ success alone does not establish either.
 Focused verification:
 
 ```sh
-node --test scripts/installed-navigation-profile.test.mjs
+node --test scripts/tests/installed-navigation-profile.test.mjs
 node scripts/codestory-agent-ab-benchmark.mjs --self-test
 ```
