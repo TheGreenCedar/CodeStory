@@ -14,6 +14,11 @@ Every CodeStory call selects its repository with an absolute `project` root.
 Keep project, source and publication identities attached when combining results
 across repositories; never rely on a global active project.
 
+In code-mode hosts, display each payload once. MCP results can repeat identical
+JSON in text and structured content. Keep the complete payload, errors, metadata
+and any distinct content; omit only an exact duplicate. Use the
+[code-mode display example](references/code-mode.md) when printing tool results.
+
 ## Investigation loop
 
 Choose the smallest useful operation. A named file can be read directly with
