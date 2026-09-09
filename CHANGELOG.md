@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Agents can search, inspect source and follow relationships adaptively, using
+  native tools whenever useful. Automatic packets are optional and experimental;
+  their evidence availability does not establish that an answer is complete.
+- **Breaking interface change:** search, context and packet use publication
+  schema 3. Integrations must read evidence rows and gaps instead of the older
+  hit/support/disposition shapes. See the [upgrade guide](docs/users/upgrading.md).
+
 - Full indexing now runs call and import resolution after writing the source
   graph, including when replaying cached parser output. Previously, full
   refreshes could leave relationships unresolved until an incremental edit.
@@ -26,16 +33,9 @@
 - The serialized public packet is capped at 16 KiB. When exact hydration cannot
   fit, the packet records a typed `serialized_public_budget` gap instead of
   silently dropping evidence.
-- Indexed call-path verification uses the frozen `from` / `direct-call`
-  grammar. Compact results are capped at 4 KiB, and
-  `translation_status` is `host_supplied`.
 - `affected` reports indexed tests in the same package as a changed source file
   as focused hints when the graph walk does not reach them.
 
-- Added an observational exact call-path verifier to the CLI and MCP. It checks
-  a complete host-supplied typed contract against one pinned indexed
-  publication, reports proof-domain uncertainty explicitly, and never treats
-  packet, context, or search output as proof authority.
 - Packet, context, and search now return closed CodeStory schema-3 evidence
   projections. They report concrete evidence, gaps, retrieval state, and one
   bounded continuation without claiming that an arbitrary natural-language

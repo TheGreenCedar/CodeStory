@@ -22,13 +22,12 @@ old or new publication.
 | Resolved symbol, caller, trail, or snippet from a ready map | Source-navigation evidence |
 | `affected` output | A bounded change-planning aid, never proof that a test ran or that every impact was found |
 | Packet with `available` status and resolvable evidence rows | Evidence for only what those rows directly establish; returned gaps still matter |
-| Packet with `continuation_available` status | Run the one returned continuation, then answer from the combined evidence and gaps |
+| Packet with `continuation_available` status | Follow the offered continuation once if useful; source reads and navigation remain available |
 | Packet with `no_useful_evidence` status | Name the material gap; do not infer a negative result from a bounded search |
 | Packet with `unavailable` status | Broad retrieval could not serve the request; fall back to focused source inspection and state the gap |
 | Repo-text or semantic suggestion without a resolved symbol | Navigation hint to verify in source |
 | `working_locally` state | Use local graph tools; broad search is still preparing |
 | `unavailable` state | Fall back to focused source inspection and state the gap |
-| Exact verifier `contract_proven` / `contract_refuted` | Authority only for the complete host-supplied indexed source-call contract; it does not prove runtime execution or translate prose |
 
 `retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
 does not guarantee that a particular answer found enough evidence. The packet's
@@ -45,8 +44,8 @@ must not run yet.
   `continuation_available` / `no_useful_evidence` without the evidence needed
   for the claim.
 - Citations cannot be resolved to the files they name.
-- The agent substituted a generic tree search without reporting the CodeStory
-  gap.
+- The agent treats a CodeStory gap as proof of absence, or attributes evidence
+  from another source to a CodeStory result that did not contain it.
 - Status reports an actual runtime, protocol, publication, or schema failure for
   that surface.
 

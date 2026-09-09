@@ -11,7 +11,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`, `verify_indexed_direct_calls`.
+`snippet`, `context`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -21,8 +21,8 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, typed `probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`, `task_class`, or `extra_probes`. |
-| `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
+| `packet` | `question` | `budget`, typed `probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Experimental bounded evidence selection. No `include_evidence`, `task_class`, or `extra_probes`. |
+| `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery for adaptive source and relationship inspection. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
 | `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
@@ -34,41 +34,12 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `get_node` | `query` or `id` | `choose` | |
 | `neighbors` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | |
 | `shortest_path` | `from_id`, `to_id` | `max_depth`, `max_nodes` | |
-| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | Not a substitute for `packet`. |
+| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | Bounded node-centered relationship navigation. |
 | `definition` | `query` or `id` | `choose` | |
 | `references` | `query` or `id` | `choose` | Incoming references. |
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
-| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
+| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | Read a selected source target; ordinary host reads remain available. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-| `verify_indexed_direct_calls` | `call_path` | | Observational exact verification of a `call-path/v1` document (see below). Never translate free English into one, and never invoke this tool automatically. |
-
-### `call-path/v1`
-
-`call_path` is a text document, not JSON. One contract per document, one clause
-per line:
-
-```text
-call-path/v1
-from symbol "crate::module::Alpha"
-direct-call symbol "crate::module::Beta"
-direct-call symbol "Gamma" in "src/gamma.rs"
-prohibit-through symbol "crate::detail::Helper"
-exclude-from-projection symbol "crate::test_support"
-```
-
-The version line comes first. Exactly one `from` and one to six `direct-call`
-lines are required. `prohibit-through` and `exclude-from-projection` are
-optional and capped at sixteen each. Selectors are
-`symbol "<qualified-name>" [in "<project-relative-path>"]` or
-`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
-node identities are not selectors.
-
-Blank lines and indentation are ignored. Any other line the grammar cannot read
-becomes an unresolved clause, and the whole verification then reports
-`graph_disposition: "unknown"` instead of proving a smaller contract than you
-wrote. The document is capped at 8192 bytes. Compact results are capped at
-4 KiB.
-
 ## Resources and prompts
 
 Project-scoped resources use `{?project}` templates, for example

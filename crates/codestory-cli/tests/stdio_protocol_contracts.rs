@@ -13,6 +13,58 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+#[test]
+fn default_navigation_surface_rejects_proof_before_project_activation() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize",
+                "params":{"protocolVersion":revision,"capabilities":{},
+                    "clientInfo":{"name":"navigation-contract","version":"1"}}}),
+        );
+        assert_success_envelope(&initialized, json!("init"));
+        for name in ["verify_indexed_direct_calls", "prove_call_path"] {
+            for arguments in [
+                json!({}),
+                json!({"project":fixture.workspace.path(),
+                "call_path":"call-path/v1\nfrom symbol \"a\"\ndirect-call symbol \"b\"\n"}),
+            ] {
+                let response = send_json(
+                    &mut server,
+                    json!({"jsonrpc":"2.0","id":"proof","method":"tools/call",
+                        "params":{"name":name,"arguments":arguments}}),
+                );
+                assert_eq!(
+                    response.pointer("/error/code"),
+                    Some(&json!(-32602)),
+                    "{response}"
+                );
+                assert_eq!(
+                    response.pointer("/error/message"),
+                    Some(&json!(format!("Unknown tool: {name}"))),
+                    "{response}"
+                );
+            }
+        }
+        let listed = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+        );
+        let tools = assert_success_envelope(&listed, json!("list"))["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 20);
+        assert!(!tools.iter().any(|tool| matches!(
+            tool["name"].as_str(),
+            Some("verify_indexed_direct_calls" | "prove_call_path")
+        )));
+        assert!(!fixture.cache_dir.path().join("core").exists());
+        assert!(!fixture.cache_dir.path().join("search-generations").exists());
+    }
+}
+
 /// Every wire value `GroundingOrientationUncertaintyDto` can serialize to.
 ///
 /// The match is exhaustive on purpose: the declared MCP output schema is
@@ -49,7 +101,7 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
 };
 
 #[test]
-fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
+fn public_v3_negotiates_revision_native_evidence_discovery() {
     let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
         .expect("compatibility profile fixture json");
     let revisions = profiles
@@ -160,31 +212,34 @@ fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 21);
-        for route in ["packet", "context", "search", "verify_indexed_direct_calls"] {
+        assert_eq!(tools.len(), 20);
+        for route in ["packet", "context", "search"] {
             assert_eq!(
                 tools.iter().filter(|tool| tool["name"] == route).count(),
                 1,
                 "{route} must register exactly once"
             );
         }
-        let proof = tools
+        let navigation = tools
             .iter()
-            .find(|tool| tool["name"] == "verify_indexed_direct_calls")
-            .expect("exact proof tool");
-        assert!(proof.get("safety").is_none());
+            .find(|tool| tool["name"] == "search")
+            .expect("search tool");
+        assert!(navigation.get("safety").is_none());
         if revision >= "2025-03-26" {
             assert_eq!(
-                proof.pointer("/annotations/readOnlyHint"),
+                navigation.pointer("/annotations/readOnlyHint"),
                 Some(&json!(true))
             );
         } else {
-            assert!(proof.get("annotations").is_none());
+            assert!(navigation.get("annotations").is_none());
         }
         if revision >= "2025-06-18" {
-            assert_eq!(proof.pointer("/outputSchema/type"), Some(&json!("object")));
+            assert_eq!(
+                navigation.pointer("/outputSchema/type"),
+                Some(&json!("object"))
+            );
         } else {
-            assert!(proof.get("outputSchema").is_none());
+            assert!(navigation.get("outputSchema").is_none());
         }
         let packet = tools
             .iter()
@@ -247,149 +302,6 @@ fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
         );
         assert_eq!(invalid.pointer("/error/code"), Some(&json!(-32602)));
     }
-}
-
-#[test]
-fn public_exact_proof_call_is_revision_native_and_keeps_uncertainty_successful() {
-    let fixture = indexed_proof_fixture();
-    let exact = exact_proof_arguments(&fixture);
-    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
-        let mut server = spawn_stdio_server(&fixture);
-        let initialized = send_json(
-            &mut server,
-            json!({
-                "jsonrpc":"2.0",
-                "id":"init",
-                "method":"initialize",
-                "params":{
-                    "protocolVersion":revision,
-                    "capabilities":{},
-                    "clientInfo":{"name":"proof-contract","version":"0"}
-                }
-            }),
-        );
-        assert_success_envelope(&initialized, json!("init"));
-
-        let proven = send_json(
-            &mut server,
-            json!({
-                "jsonrpc":"2.0",
-                "id":"proven",
-                "method":"tools/call",
-                "params":{"name":"verify_indexed_direct_calls","arguments":exact}
-            }),
-        );
-        let result = assert_success_envelope(&proven, json!("proven"));
-        assert_eq!(result["isError"], false, "{proven}");
-        let text_root = serde_json::from_str::<Value>(
-            result
-                .pointer("/content/0/text")
-                .and_then(Value::as_str)
-                .unwrap(),
-        )
-        .expect("proof text JSON");
-        assert_eq!(
-            text_root.pointer("/disposition/kind"),
-            Some(&json!("contract_proven")),
-            "{text_root}"
-        );
-        assert_eq!(text_root["domain"], "call-path/v1");
-        assert_eq!(text_root["translation_status"], "host_supplied");
-        assert_eq!(text_root["graph_disposition"], "proven");
-        assert_eq!(text_root["runtime_execution_proven"], false);
-        assert!(text_root.get("contract_interpretation").is_none());
-        assert_eq!(
-            text_root["provenance"],
-            json!({"availability":"unavailable"}),
-            "the verifier must not advertise a provenance artifact it cannot serve"
-        );
-        if revision >= "2025-06-18" {
-            assert_eq!(result["structuredContent"], text_root);
-        } else {
-            assert!(result.get("structuredContent").is_none());
-        }
-
-        let unknown = send_json(
-            &mut server,
-            json!({
-                "jsonrpc":"2.0",
-                "id":"unknown",
-                "method":"tools/call",
-                "params":{
-                    "name":"verify_indexed_direct_calls",
-                    "arguments":{
-                        "project": fixture.workspace.path(),
-                        "call_path": unknown_proof_document(),
-                    }
-                }
-            }),
-        );
-        let result = assert_success_envelope(&unknown, json!("unknown"));
-        assert_eq!(result["isError"], false, "{unknown}");
-        let root = serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
-            .expect("unknown proof JSON");
-        assert_eq!(root.pointer("/disposition/kind"), Some(&json!("unknown")));
-
-        // A line the grammar cannot read is anchored as unresolved material, so
-        // the whole verification reports unknown instead of silently proving a
-        // smaller contract than the caller wrote.
-        let incomplete_translation = send_json(
-            &mut server,
-            json!({
-                "jsonrpc":"2.0",
-                "id":"translation-unknown",
-                "method":"tools/call",
-                "params":{
-                    "name":"verify_indexed_direct_calls",
-                    "arguments":{
-                        "project": fixture.workspace.path(),
-                        "call_path": format!(
-                            "{}also check crate::module::Extra\n",
-                            exact_proof_document(&fixture)
-                        ),
-                    }
-                }
-            }),
-        );
-        let result = assert_success_envelope(&incomplete_translation, json!("translation-unknown"));
-        assert_eq!(result["isError"], false, "{incomplete_translation}");
-        let root = serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
-            .expect("translation unknown proof JSON");
-        assert_eq!(root.pointer("/disposition/kind"), Some(&json!("unknown")));
-        assert_eq!(
-            root.pointer("/disposition/gaps/0/kind"),
-            Some(&json!("unresolved_material_clause"))
-        );
-
-        // The old byte-indexed clause surface is gone: any field other than the
-        // document itself is rejected before the runtime is touched.
-        let invalid = send_json(
-            &mut server,
-            json!({
-                "jsonrpc":"2.0",
-                "id":"semantic",
-                "method":"tools/call",
-                "params":{
-                    "name":"verify_indexed_direct_calls",
-                    "arguments":{
-                        "project": fixture.workspace.path(),
-                        "source_text": "exact direct ordered call path",
-                        "clauses": [],
-                        "spec": {},
-                    }
-                }
-            }),
-        );
-        assert_eq!(
-            invalid.pointer("/error/code"),
-            Some(&json!(-32602)),
-            "{invalid}"
-        );
-    }
-    assert!(
-        !fixture.cache_dir.path().join("search-generations").exists(),
-        "proof execution must not initialize semantic retrieval"
-    );
 }
 
 #[test]
@@ -488,6 +400,20 @@ fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
                 "unknown_property",
             ),
             (
+                "packet-retired-task-class",
+                "packet",
+                json!({"project":project,"question":"why","task_class":"architecture_explanation"}),
+                "/arguments/task_class",
+                "unknown_property",
+            ),
+            (
+                "packet-retired-evidence-opt-out",
+                "packet",
+                json!({"project":project,"question":"why","include_evidence":false}),
+                "/arguments/include_evidence",
+                "unknown_property",
+            ),
+            (
                 "context-selector-required",
                 "context",
                 json!({"project":project}),
@@ -540,7 +466,7 @@ fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
 }
 
 #[test]
-fn public_v3_cli_exposes_exact_proof_without_packet_proof_switches() {
+fn public_v3_cli_keeps_experimental_verification_out_of_default_help() {
     let output = test_support::cli_command()
         .args(["packet", "--help"])
         .output()
@@ -596,6 +522,10 @@ fn public_v3_cli_exposes_exact_proof_without_packet_proof_switches() {
         .expect("run top-level help");
     let top_level = String::from_utf8(output.stdout).expect("UTF-8 top-level help");
     assert!(!top_level.contains("prove-call-path"), "{top_level}");
+    assert!(
+        !top_level.contains("verify-indexed-direct-calls"),
+        "{top_level}"
+    );
 }
 
 #[test]
@@ -706,72 +636,6 @@ fn verify_indexed_direct_calls_cli_keeps_file_stdin_parity_and_caps_before_parsi
             "{label}: {combined}"
         );
         assert_eq!(output.status.success(), !exceeds, "{label}: {combined}");
-    }
-}
-
-#[test]
-fn public_exact_proof_cold_project_returns_preparing_with_retry() {
-    let fixture = unindexed_fixture();
-    let spec_root = tempfile::tempdir().expect("cold proof spec root");
-    let spec_file = spec_root.path().join("call-path.txt");
-    fs::write(&spec_file, unknown_proof_document()).expect("write cold call path document");
-
-    let mut cli = test_support::cli_command();
-    cli.args(["verify-indexed-direct-calls", "--project"])
-        .arg(fixture.workspace.path())
-        .arg("--spec")
-        .arg(&spec_file)
-        .env("CODESTORY_CACHE_ROOT", fixture.cache_dir.path())
-        .env("CODESTORY_STDIO_CACHE_ROOT", fixture.cache_dir.path());
-    let cli = cli.output().expect("run cold CLI proof");
-    // Cold CLI may finish a tiny fixture activation before returning; the MCP
-    // contract below is the preparing+retry surface under test.
-    let _ = cli;
-
-    let mut server = spawn_stdio_server(&fixture);
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc":"2.0",
-            "id":"cold-proof",
-            "method":"tools/call",
-            "params":{
-                "name":"verify_indexed_direct_calls",
-                "arguments":{
-                    "project": fixture.workspace.path(),
-                    "call_path": unknown_proof_document(),
-                }
-            }
-        }),
-    );
-    let result = assert_success_envelope(&response, json!("cold-proof"));
-    assert_eq!(result["isError"], false, "{response}");
-    let content = result
-        .get("structuredContent")
-        .cloned()
-        .or_else(|| {
-            result
-                .pointer("/content/0/text")
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str(text).ok())
-        })
-        .expect("cold proof structured content");
-    match content.get("kind").and_then(Value::as_str) {
-        Some("preparing") => {
-            assert_eq!(content["state"], json!("preparing"));
-            assert!(content["retry_after_ms"].as_u64().is_some_and(|ms| ms > 0));
-            assert!(content["operation"].is_object());
-            assert_eq!(
-                content.pointer("/minimum_next/kind"),
-                Some(&json!("retry_same_request")),
-                "a preparing verification must name the smallest sufficient next action: {content}"
-            );
-        }
-        Some("complete" | "budget_exceeded") => {
-            // Tiny cold fixtures can finish core activation before the tool returns.
-            assert_eq!(content["domain"], "call-path/v1");
-        }
-        other => panic!("cold proof must prepare or verify, got {other:?}: {content}"),
     }
 }
 
@@ -892,49 +756,6 @@ fn indexed_fixture() -> StdioFixture {
     assert!(
         output.status.success(),
         "index failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    StdioFixture {
-        workspace,
-        cache_dir,
-        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        disable_release_probe: false,
-        disable_installed_cli_probe: false,
-        plugin_data_dir: None,
-        plugin_cli_source: None,
-        dirty_marker_path: None,
-        dirty_marker_project_root: None,
-        local_refresh_timeout_ms: None,
-    }
-}
-
-fn indexed_proof_fixture() -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-    let source_path = workspace.path().join("src/lib.rs");
-    let mut source = fs::read_to_string(&source_path).expect("read proof fixture source");
-    source.push_str("\npub fn exact_callee() {}\npub fn exact_caller() { exact_callee(); }\n");
-    fs::write(source_path, source).expect("write proof fixture source");
-
-    let mut command = test_support::cli_command();
-    command
-        .arg("index")
-        .arg("--refresh")
-        .arg("full")
-        .arg("--format")
-        .arg("json")
-        .arg("--project")
-        .arg(workspace.path())
-        .arg("--cache-dir")
-        .arg(cache_dir.path());
-    allow_explicit_cpu_embeddings(&mut command);
-    let output = command.output().expect("run proof fixture index");
-    assert!(
-        output.status.success(),
-        "proof fixture index failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1370,77 +1191,6 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
-fn proof_node_column(fixture: &StdioFixture, name: &str, column: &str) -> String {
-    let direct = fixture.cache_dir.path().join("codestory.db");
-    let nested = fixture
-        .cache_dir
-        .path()
-        .join(codestory_workspace::workspace_id_v3_for_root(
-            fixture.workspace.path(),
-        ))
-        .join("codestory.db");
-    let storage_path = [direct, nested]
-        .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| {
-            panic!(
-                "proof fixture missing codestory.db under {}",
-                fixture.cache_dir.path().display()
-            )
-        });
-    // Immutable core keeps graph rows in the published generation database; the
-    // legacy live path may exist as an empty compatibility stub.
-    let db_path = published_core_database_path(&storage_path).unwrap_or(storage_path);
-    let connection = rusqlite::Connection::open(&db_path).expect("open indexed proof fixture");
-    connection
-        .query_row(
-            &format!(
-                "SELECT {column} FROM node WHERE serialized_name = ?1 AND kind = 13 AND {column} IS NOT NULL ORDER BY id LIMIT 1"
-            ),
-            [name],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|error| panic!("fixture function {name} in {}: {error}", db_path.display()))
-}
-
-fn proof_qualified_name(fixture: &StdioFixture, name: &str) -> String {
-    proof_node_column(fixture, name, "COALESCE(qualified_name, serialized_name)")
-}
-
-fn published_core_database_path(storage_path: &Path) -> Option<PathBuf> {
-    let parent = storage_path.parent()?;
-    let core_root = parent.join("core");
-    let pointer_bytes = fs::read(core_root.join("publication.json")).ok()?;
-    let pointer: Value = serde_json::from_slice(&pointer_bytes).ok()?;
-    let generation_id = pointer
-        .pointer("/active/generation_id")
-        .and_then(Value::as_str)?;
-    let path = core_root
-        .join("generations")
-        .join(generation_id)
-        .join("codestory.db");
-    path.is_file().then_some(path)
-}
-
-fn exact_proof_arguments(fixture: &StdioFixture) -> Value {
-    json!({
-        "project": fixture.workspace.path(),
-        "call_path": exact_proof_document(fixture),
-    })
-}
-
-/// The public contract is a `call-path/v1` document. Nothing here supplies a
-/// clause classification or an internal node identity; the parser derives both.
-fn exact_proof_document(fixture: &StdioFixture) -> String {
-    format!(
-        "call-path/v1\nfrom symbol \"{}\"\ndirect-call symbol \"{}\"\n",
-        proof_qualified_name(fixture, "exact_caller"),
-        proof_qualified_name(fixture, "exact_callee"),
-    )
-}
-
-/// A syntactically complete contract naming symbols the publication does not
-/// contain, so validation succeeds and the graph answer is `unknown`.
 fn unknown_proof_document() -> &'static str {
     "call-path/v1\nfrom symbol \"crate::missing::start\"\ndirect-call symbol \"crate::missing::target\"\n"
 }
@@ -2855,32 +2605,12 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "symbols",
             "trace",
             "trail",
-            "verify_indexed_direct_calls",
         ],
         "stdio product tool names should stay stable: {tools}"
     );
     assert!(
         !tool_names.iter().any(|name| name.starts_with("codestory_")),
         "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
-    );
-    let packet_description = tool_by_name(&tools, "packet")["description"]
-        .as_str()
-        .expect("packet description");
-    assert!(
-        packet_description.contains("broad structural questions")
-            && packet_description.contains("closed evidence rows")
-            && packet_description.contains("typed availability and gaps")
-            && packet_description.contains("generation-bound continuation")
-            && packet_description.contains("before source snippets"),
-        "packet description should route broad questions to the evidence-only v3 contract: {packet_description}"
-    );
-    let search_description = tool_by_name(&tools, "search")["description"]
-        .as_str()
-        .expect("search description");
-    assert!(
-        search_description.contains("Discover candidate")
-            && search_description.contains("packet before snippet/source reads"),
-        "search description should label discovery before source proof reads: {search_description}"
     );
     let ground_description = tool_by_name(&tools, "ground")["description"]
         .as_str()
@@ -2912,14 +2642,6 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             && affected_description.contains("does not wait for broad search"),
         "affected description should state its last-complete and activation boundary: {affected_description}"
     );
-    let snippet_description = tool_by_name(&tools, "snippet")["description"]
-        .as_str()
-        .expect("snippet description");
-    assert!(
-        snippet_description.contains("after packet, search, or graph evidence"),
-        "snippet description should not be the first stop for broad structural questions: {snippet_description}"
-    );
-
     for tool in tools["tools"].as_array().expect("tools array") {
         assert_tool_safety_metadata(tool);
     }

@@ -67,9 +67,10 @@ pub(crate) enum Command {
     Report(ReportCommand),
     #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),
-    #[command(about = "Answer a broad repository question with evidence.")]
+    #[command(about = "Gather an experimental bounded evidence packet for a repository question.")]
     Packet(PacketCommand),
     #[command(
+        hide = true,
         about = "Verify one exact indexed source call path written in the call-path/v1 grammar."
     )]
     VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand),

@@ -1145,6 +1145,8 @@ struct StdioServerSession {
     tainted_project: Option<args::ProjectArgs>,
     protocol_v3: crate::stdio_v3::NativeSessionV3,
     diagnostics_v3: Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
+    #[cfg(test)]
+    proof_fixture: bool,
 }
 
 impl StdioServerSession {
@@ -1166,7 +1168,22 @@ impl StdioServerSession {
             diagnostics_v3: Arc::new(std::sync::Mutex::new(
                 crate::stdio_v3::DiagnosticsRegistryV3::new(),
             )),
+            #[cfg(test)]
+            proof_fixture: false,
         }
+    }
+
+    fn admits_tool(&self, name: &str) -> bool {
+        if is_stdio_tool_name(name) {
+            return true;
+        }
+        // Exercise the sealed verifier in unit fixtures without exposing it
+        // through a product flag, environment variable, or MCP request.
+        #[cfg(test)]
+        if self.proof_fixture && crate::prove_call_path::is_proof_tool_name(name) {
+            return true;
+        }
+        false
     }
 
     fn active_project_mut(&mut self) -> (&RuntimeContext, &mut StdioServerState) {
@@ -1666,7 +1683,7 @@ fn handle_stdio_request(
                     "Invalid params: missing tool name",
                 ));
             };
-            if !is_stdio_tool_name(name) && !crate::prove_call_path::is_proof_tool_name(name) {
+            if !session.admits_tool(name) {
                 return Some(stdio_jsonrpc_error(
                     id,
                     -32602,
@@ -12363,6 +12380,7 @@ version = "0.11.20"
         .expect("write core-only verification fixture");
 
         let mut session = StdioServerSession::new(None);
+        session.proof_fixture = true;
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
             allow_sensitive_project_root: false,

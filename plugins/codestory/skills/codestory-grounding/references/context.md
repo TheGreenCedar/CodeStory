@@ -2,8 +2,8 @@
 
 Builds target context around one concrete retrieval target (`query` must name a
 symbol, file, literal, API path, module, or behavior term, not a broad
-question). Fails closed unless full retrieval is ready. For broad questions use
-`packet`; for discovery use `search`.
+question). Fails closed unless full retrieval is ready. Use `search` for
+discovery, then inspect selected targets and follow their relationships.
 
 ## Syntax
 
@@ -19,9 +19,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 ## Notes
 
-- Do not pass broad questions to `context`. Use `packet` with `question` for
-  broad tasks, `search` for candidate discovery, then `context` with `id` for
-  selected anchors.
+- Keep each `context` request focused. Broad investigations may combine
+  searches, selected contexts, source reads and relationship operations; an
+  experimental packet is optional.
 - A user-supplied exact name, file name, literal, API path, module, or behavior
   term is a `query`. Use `id` only for an opaque `symbol_id` copied unchanged
   from a CodeStory result. Never guess an ID from a display name.
