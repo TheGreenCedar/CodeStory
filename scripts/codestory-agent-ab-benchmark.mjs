@@ -7476,6 +7476,7 @@ function mergeRetrievalStatusWithEngineDiagnostics(retrievalStatus, diagnostics)
 function createSequencedStdioSession(command, args, options) {
   const child = (options.spawnProcess ?? spawn)(command, args, {
     env: options.env,
+    cwd: options.cwd,
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -7519,7 +7520,7 @@ function createSequencedStdioSession(command, args, options) {
     terminate("SIGTERM");
   }
   function dispatchResponse(response) {
-    if (options.onNotification && response?.jsonrpc === "2.0"
+    if (options.onNotification && (response?.jsonrpc === "2.0" || options.protocol === "app-server")
       && typeof response.method === "string" && !Object.hasOwn(response, "id")) {
       options.onNotification(response);
       return;
@@ -7535,10 +7536,10 @@ function createSequencedStdioSession(command, args, options) {
 
   child.stdout.on("data", (chunk) => {
     stdoutBytes += chunk.length;
-    if (stdoutBytes > 1_048_576) {
+    if (stdoutBytes > (options.maxOutputBytes ?? 1_048_576)) {
       stdoutBuffer = trimTail(stdoutBuffer, 4096);
       child.stdout.pause();
-      fail("fail", "retrieval-engine stdio response exceeded 1 MiB");
+      fail("fail", `retrieval-engine stdio response exceeded ${options.maxOutputBytes ? `${options.maxOutputBytes} bytes` : "1 MiB"}`);
       return;
     }
     stdoutBuffer += stdoutDecoder.write(chunk);
@@ -7612,7 +7613,7 @@ function createSequencedStdioSession(command, args, options) {
     const response = await nextResponse();
     const ownsResult = Object.prototype.hasOwnProperty.call(response ?? {}, "result");
     const ownsError = Object.prototype.hasOwnProperty.call(response ?? {}, "error");
-    if (response?.jsonrpc !== "2.0" || response?.id !== payload.id || ownsResult === ownsError) {
+    if ((response?.jsonrpc !== "2.0" && options.protocol !== "app-server") || response?.id !== payload.id || ownsResult === ownsError) {
       fail(
         "fail",
         `retrieval-engine stdio response envelope mismatch for id=${JSON.stringify(payload.id)}`,
@@ -7641,7 +7642,7 @@ function createSequencedStdioSession(command, args, options) {
     clearTimeout(timeoutTimer);
     options.signal?.removeEventListener("abort", onAbort);
   }
-  return { request, send, close, stop, stderr: () => stderr };
+  return { request, send, close, stop, pid: child.pid, stderr: () => stderr };
 }
 
 async function codestoryDoctorSnapshot(
