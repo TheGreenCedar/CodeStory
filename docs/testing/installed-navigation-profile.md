@@ -10,6 +10,18 @@ execution in every arm. It records that setting explicitly; installed local
 CodeStory plugins and native source-reading tools remain available.
 Historical benchmark profiles retain their existing contracts.
 
+Each participant receives a fresh temporary directory, explicitly declared as an
+additional writable root alongside its checkout. This is the same bounded
+workspace-write policy in every arm; it does not grant access to arbitrary
+temporary paths or change approval behavior. Use the participant's `TMPDIR` for
+scratch files. Go, npm, Python, Cargo and compiler-cache state is redirected into
+that directory, including explicit cache overrides inherited from the operator.
+Go and npm user-configuration paths and shell startup overrides cannot redirect
+these settings back into the operator's home. Installed toolchains remain
+discoverable through the existing executable path, `GOROOT` and `RUSTUP_HOME`.
+The receipt records these participant settings separately from the installed
+MCP child's infrastructure controls.
+
 An independent evaluator freezes the task manifest and keeps answer keys outside
 it. The manifest names pinned complete repository clones, tasks, arms, repeats,
 and the complete ordered session schedule. The maintenance profile requires three
@@ -54,11 +66,19 @@ node scripts/codestory-agent-ab-benchmark.mjs --installed-navigation \
 
 Omit `--preflight-only` and use a new output directory for the comparison. Every
 arm must pass installation, launcher, schema and edit/refresh canaries before any
-model starts. Canaries use Codex's zero-model app-server MCP path and verify the
-actual child environment, full retrieval, native identity, private native
-completion with CPU fallback disabled, and changed source after refresh. Each
-participant also gets an environment and catalog check without activating its
-project. Receipts capture the selected checkout's trust entry that Codex adds
+model starts. Canaries use Codex's zero-model app-server path. In every arm,
+an actual sandboxed command checks the participant environment, writes and rereads
+temporary sentinels in the checkout and declared cache directories, removes them,
+and verifies that an unrelated write outside the declared roots is denied. A
+missing setting or unwritable cache fails before participants run. This command
+canary proves shell execution and write boundaries; it does not claim that every
+editor tool treats arbitrary temporary paths identically.
+
+CodeStory canaries additionally verify the installed MCP child environment,
+full retrieval, native identity, private native completion with CPU fallback
+disabled, and changed source after refresh. Each participant also gets the
+sandbox check and its applicable catalog check without activating its project.
+Receipts capture the selected checkout's trust entry that Codex adds
 during normal startup; any other configuration change rejects the check.
 Sessions get fresh whole checkouts and state, including separate
 embedding qualification namespaces. The runner records prompts, effective

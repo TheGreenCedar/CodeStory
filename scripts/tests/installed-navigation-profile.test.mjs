@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateManifest, navigationCommand, navigationEnvironment } from '../installed-navigation-profile.mjs';
+import { validateManifest, navigationCommand, navigationEnvironment, participantToolchainContract } from '../installed-navigation-profile.mjs';
 
 const fixture = () => ({ schema_version: 1, profile: 'pilot', model: { name: 'gpt-5.6-terra', reasoning_effort: 'low' },
   repositories: [{ id: 'r', commit: 'a'.repeat(40), tree: 'b'.repeat(40), seed_clone: '/tmp/seed' }],
@@ -24,8 +24,9 @@ test('schedule and source mutations fail closed before execution', () => {
   ]) { const manifest = fixture(); mutate(manifest); assert.throws(() => validateManifest(manifest)); }
 });
 test('same normal sandbox and low reasoning without approval override or tool restrictions', () => {
-  const { args } = navigationCommand('codex', '/checkout', '/output/answer.md');
-  assert.deepEqual(args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', '/checkout', '--json', '--output-last-message', '/output/answer.md', '-']);
+  const { args } = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp');
+  assert.deepEqual(args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', '/checkout', '--add-dir', '/session/tmp', '--json', '--output-last-message', '/output/answer.md', '-']);
+  assert.throws(() => navigationCommand('codex', '/checkout', '/output/answer.md', 'relative/tmp'));
 });
 test('runtime and host overrides cannot escape the isolated session', () => {
   const env = navigationEnvironment({ PATH: '/bin', HOME: '/real', CODEX_HOME: '/real/.codex', CODESTORY_CLI: '/wrong/binary', CODESTORY_PLUGIN_DATA: '/shared', CODESTORY_EMBED_QUALIFICATION_DIR: '/shared', OPENAI_API_KEY: 'never-retain', PLUGIN_DATA: '/shared' }, '/isolated', 'nonce');
@@ -34,6 +35,28 @@ test('runtime and host overrides cannot escape the isolated session', () => {
   assert.equal(env.CODESTORY_EMBED_QUALIFICATION_DIR, '/isolated/qualification');
   assert.equal(env.PATH, '/bin');
   for (const key of ['CODESTORY_CLI', 'CODESTORY_PLUGIN_DATA', 'OPENAI_API_KEY', 'PLUGIN_DATA']) assert.equal(env[key], undefined);
+});
+
+test('mutable toolchain state ignores poisoned parent paths and stays separate between sessions', () => {
+  const paths = ['TMPDIR', 'TMP', 'TEMP', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'GOCACHE', 'GOMODCACHE', 'GOPATH', 'GOTMPDIR',
+    'npm_config_cache', 'NPM_CONFIG_CACHE', 'PIP_CACHE_DIR', 'UV_CACHE_DIR',
+    'PYTHONPYCACHEPREFIX', 'PYTHONUSERBASE', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'SCCACHE_DIR', 'CCACHE_DIR'];
+  const parent = { PATH: '/tools/bin', HOME: '/operator', GOROOT: '/tools/go', RUSTUP_HOME: '/tools/rustup',
+    GOENV: '/operator/go-env', GOFLAGS: '-modfile=/operator/go.mod',
+    BASH_ENV: '/operator/bash-init', ENV: '/operator/sh-init', ZDOTDIR: '/operator/zsh',
+    RUSTC_WRAPPER: '/operator/wrapper', PYTHONPATH: '/operator/modules',
+    ...Object.fromEntries(paths.map(key => [key, `/operator/${key}`])) };
+  const first = navigationEnvironment(parent, '/run/first', 'first');
+  const second = navigationEnvironment(parent, '/run/second', 'second');
+  for (const key of paths) {
+    assert.ok(first[key] === '/run/first/tmp' || first[key].startsWith('/run/first/tmp/'), `${key} escaped the first writable temporary root`);
+    assert.ok(second[key] === '/run/second/tmp' || second[key].startsWith('/run/second/tmp/'), `${key} escaped the second writable temporary root`);
+  }
+  assert.equal(first.GOENV, 'off');
+  assert.equal(first.GOTOOLCHAIN, 'local');
+  assert.equal(first.ZDOTDIR, first.HOME);
+  for (const key of ['GOFLAGS', 'BASH_ENV', 'ENV', 'RUSTC_WRAPPER', 'PYTHONPATH']) assert.equal(first[key], undefined);
+  for (const key of ['PATH', 'GOROOT', 'RUSTUP_HOME']) assert.equal(first[key], parent[key]);
 });
 
 test('explicit host registration preserves installed transport and forwards only isolated controls', async () => {
@@ -161,7 +184,21 @@ async function accountingFixture(t, option) {
   await fs.writeFile(path.join(root, 'installations.json'), JSON.stringify(installation));
   let attempts = 0;
   const pass = stdout => ({status:'pass',stdout,stderr:'',exitCode:0,timedOut:false});
-  const helpers = { extractUsage, analyzeTranscript:()=>({}), runProcess:async(command,args,options) => {
+  const helpers = { extractUsage, analyzeTranscript:()=>({}),
+    createSequencedStdioSession: (_command, _args, options) => ({
+      send() {}, async stop() {}, stderr: () => '',
+      async request({id, method, params}) {
+        if (method === 'initialize') return {id,result:{}};
+        if (method === 'thread/start') return {id,result:{thread:{id:'fixture'}, approvalPolicy:'never',
+          sandbox:{type:'workspaceWrite',networkAccess:false,writableRoots:[...params.config['sandbox_workspace_write.writable_roots'], ...(option === 'native-canary-extra-root' ? [template] : [])]}}};
+        if (method === 'mcpServerStatus/list') return {id,result:{data:[]}};
+        assert.equal(method, 'command/exec');
+        const {expected,directories}=participantToolchainContract(options.env, options.cwd);
+        if (option === 'native-canary-environment') expected.GOCACHE='/operator/cache';
+        return {id,result:{exitCode:0,stderr:'',stdout:JSON.stringify({environment:expected,
+          writable_directories:directories,outside_write_denied:option !== 'native-canary-writes'})}};
+      },
+    }), runProcess:async(command,args,options) => {
     if (command === 'git') {
       if (args.includes('clone')) await fs.mkdir(args.at(-1), {recursive:true});
       return pass(args.includes('rev-parse') ? args.at(-1)==='HEAD^{tree}' ? 'b'.repeat(40) : 'a'.repeat(40) : '');
@@ -185,11 +222,11 @@ async function accountingFixture(t, option) {
 }
 
 test('failure and budget matrix retains every row without launching after expiry', async t => {
-  for (const option of ['skills','deadline-preflight','deadline-preparation','preparation','spawn','usage','model-failure']) {
+  for (const option of ['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','native-canary-extra-root','preparation','spawn','usage','model-failure']) {
     const result = await accountingFixture(t, option);
     assert.equal(result.summary.results.length, 2);
     assert.ok(result.summary.results.every(row => row.status !== 'not_run'));
-    if (['skills','deadline-preflight','deadline-preparation'].includes(option)) assert.equal(result.attempts, 0);
+    if (['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','native-canary-extra-root'].includes(option)) assert.equal(result.attempts, 0);
     else if (option === 'preparation') { assert.equal(result.attempts, 1); assert.equal(result.summary.results[0].status,'preparation_failed'); assert.equal(result.summary.results[1].status,'pass'); }
     else assert.equal(result.attempts, 2);
     if (option === 'usage') assert.ok(result.summary.results.every(row => row.telemetry_complete === false));
