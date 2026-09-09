@@ -13,6 +13,19 @@ const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(val
 const HOST_ENVIRONMENT = ['HOME', 'USERPROFILE', 'TMPDIR', 'CODEX_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME',
   'CODESTORY_PLUGIN_DATA', 'CODESTORY_PLUGIN_RELEASE_DIR', 'CODESTORY_CACHE_ROOT', 'CODESTORY_STDIO_CACHE_ROOT',
   'CODESTORY_EMBED_ALLOW_CPU', 'CODESTORY_EMBED_QUALIFICATION_DIR', 'CODESTORY_EMBED_QUALIFICATION_NONCE'];
+const TOOLCHAIN_DIRECTORIES = {
+  XDG_CACHE_HOME: 'cache', XDG_CONFIG_HOME: 'config',
+  GOCACHE: 'cache/go/build', GOMODCACHE: 'cache/go/mod', GOPATH: 'go', GOTMPDIR: 'go-tmp',
+  npm_config_cache: 'cache/npm', NPM_CONFIG_CACHE: 'cache/npm',
+  PIP_CACHE_DIR: 'cache/pip', UV_CACHE_DIR: 'cache/uv', PYTHONPYCACHEPREFIX: 'cache/pycache', PYTHONUSERBASE: 'python-user',
+  CARGO_HOME: 'cargo-home', CARGO_TARGET_DIR: 'cargo-target', SCCACHE_DIR: 'cache/sccache', CCACHE_DIR: 'cache/ccache',
+};
+const PARTICIPANT_ENVIRONMENT = [...new Set([...HOST_ENVIRONMENT, ...Object.keys(TOOLCHAIN_DIRECTORIES),
+  'TMP', 'TEMP', 'GOENV', 'GOTOOLCHAIN', 'GOROOT', 'RUSTUP_HOME', 'ZDOTDIR',
+  'npm_config_userconfig', 'NPM_CONFIG_USERCONFIG', 'npm_config_globalconfig', 'NPM_CONFIG_GLOBALCONFIG', 'PIP_CONFIG_FILE'])];
+const TOOLCHAIN_ENVIRONMENT = PARTICIPANT_ENVIRONMENT.filter(key => !key.startsWith('CODEX_') && !key.startsWith('CODESTORY_'));
+const FORBIDDEN_TOOLCHAIN_ENVIRONMENT = ['GOFLAGS', 'BASH_ENV', 'ENV', 'PYTHONPATH', 'NODE_OPTIONS', 'NODE_PATH',
+  'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_TARGET_DIR'];
 const canonical = value => Array.isArray(value) ? value.map(canonical)
   : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 
@@ -168,15 +181,26 @@ export function validateSourceRead(result, project, marker) {
     && !range.snippet.includes(marker === 'BEFORE_REFRESH' ? 'AFTER_REFRESH' : 'BEFORE_REFRESH'), 'source-read canary returned missing, mixed or stale source');
 }
 
-export function navigationCommand(codex, project, output) {
-  return { command: codex, args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', project, '--json', '--output-last-message', output, '-'] };
+export function navigationCommand(codex, project, output, temporary) {
+  requireThat(path.isAbsolute(temporary), 'participant needs an explicit isolated temporary root');
+  return { command: codex, args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', project, '--add-dir', temporary, '--json', '--output-last-message', output, '-'] };
 }
 
 export function navigationEnvironment(parent, root, nonce) {
-  const env = Object.fromEntries(Object.entries(parent).filter(([key]) => !/^(CODEX_|CODESTORY_|CLAUDE_|COPILOT_|PLUGIN_|OPENAI_API_KEY$)/.test(key)));
+  const env = Object.fromEntries(Object.entries(parent).filter(([key]) => !/^(CODEX_|CODESTORY_|CLAUDE_|COPILOT_|PLUGIN_|OPENAI_API_KEY$|npm_config_|GOENV$)/i.test(key)
+    && !FORBIDDEN_TOOLCHAIN_ENVIRONMENT.includes(key)));
+  const temporary = path.join(root, 'tmp');
+  const toolchain = Object.fromEntries(Object.entries(TOOLCHAIN_DIRECTORIES).map(([key, relative]) => [key, path.join(temporary, relative)]));
+  const npmUser = path.join(temporary, 'config/npmrc');
+  const npmGlobal = path.join(temporary, 'config/npm-globalrc');
   return { ...env, HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'),
-    CODEX_HOME: path.join(root, 'codex'), TMPDIR: path.join(root, 'tmp'),
-    XDG_CACHE_HOME: path.join(root, 'home/.cache'), XDG_CONFIG_HOME: path.join(root, 'home/.config'),
+    ...toolchain, GOENV: 'off', GOTOOLCHAIN: 'local',
+    ...(parent.RUSTUP_HOME || parent.HOME ? { RUSTUP_HOME: parent.RUSTUP_HOME ?? path.join(parent.HOME, '.rustup') } : {}),
+    ZDOTDIR: path.join(root, 'home'), TMPDIR: temporary, TMP: temporary, TEMP: temporary,
+    npm_config_userconfig: npmUser, NPM_CONFIG_USERCONFIG: npmUser,
+    npm_config_globalconfig: npmGlobal, NPM_CONFIG_GLOBALCONFIG: npmGlobal,
+    PIP_CONFIG_FILE: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    CODEX_HOME: path.join(root, 'codex'),
     CODESTORY_CACHE_ROOT: path.join(root, 'cache'), CODESTORY_STDIO_CACHE_ROOT: path.join(root, 'cache'),
     CODESTORY_EMBED_ALLOW_CPU: '0',
     CODESTORY_EMBED_QUALIFICATION_DIR: path.join(root, 'qualification'),
@@ -196,6 +220,9 @@ async function prepareSession(row, manifest, installation, output, codex, helper
   await mkdir(root); // Existing attempts are never overwritten or silently resumed.
   const env = navigationEnvironment(process.env, root, randomBytes(32).toString('hex'));
   for (const folder of ['home', 'codex', 'tmp', 'cache', 'qualification']) await mkdir(path.join(root, folder), { mode: 0o700 });
+  for (const directory of new Set(Object.keys(TOOLCHAIN_DIRECTORIES).map(key => env[key]))) await mkdir(directory, { recursive: true, mode: 0o700 });
+  await mkdir(path.dirname(env.npm_config_userconfig), { recursive: true, mode: 0o700 });
+  for (const config of [env.npm_config_userconfig, env.npm_config_globalconfig]) await writeFile(config, '', { flag: 'wx', mode: 0o600 });
   const project = path.join(root, 'repository');
   const git = args => checkedProcess(helpers.runProcess, 'git', ['-c', 'core.hooksPath=/dev/null', ...args], { env });
   requireThat(await git(['-C', repo.seed_clone, 'rev-parse', repo.commit]) === repo.commit, 'seed commit mismatch');
@@ -237,8 +264,8 @@ async function prepareSession(row, manifest, installation, output, codex, helper
   const listing = JSON.parse(listingRaw);
   validateInventory(listing.installed, row.arm, arm);
   const effective = { schema_version: 1, session: row, model: manifest.model, timeout_ms: 600_000,
-    sandbox: 'workspace-write', host_features: { remote_plugin: false }, project, source_commit: repo.commit, source_tree: repo.tree,
-    package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(HOST_ENVIRONMENT.filter(key => env[key] !== undefined).map(key => [key, env[key]])) };
+    sandbox: 'workspace-write', writable_roots: [project, env.TMPDIR], host_features: { remote_plugin: false }, project, source_commit: repo.commit, source_tree: repo.tree,
+    package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(PARTICIPANT_ENVIRONMENT.filter(key => env[key] !== undefined).map(key => [key, env[key]])) };
   await save(path.join(root, 'effective-config.json'), effective);
   return { root, env, project, pluginRoot, task, arm, effective, codex };
 }
@@ -266,7 +293,58 @@ async function observeChildEnvironment(channel, session, helpers) {
   return { pid: children[0].pid, environment_sha256: sha(JSON.stringify(canonical(actual))), verified_names: Object.keys(expected) };
 }
 
-async function withInstalledHost(session, helpers, name, action) {
+function participantProbe(expected, forbiddenEnvironment, directories, outside, marker) {
+  // Serialized into the actual sandboxed child, never evaluated by this module.
+  const fs = require('node:fs');
+  const actual = Object.fromEntries(Object.keys(expected).map(key => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(expected)) if (actual[key] !== value) throw Error(`participant environment mismatch: ${key}`);
+  for (const key of forbiddenEnvironment) if (process.env[key] !== undefined) throw Error(`inherited participant override: ${key}`);
+  const writes = [];
+  for (const directory of directories) {
+    const target = require('node:path').join(directory, `.codestory-write-canary-${marker}`);
+    try {
+      fs.writeFileSync(target, marker, { flag: 'wx', mode: 0o600 });
+      if (fs.readFileSync(target, 'utf8') !== marker) throw Error('sandbox write/read mismatch');
+      writes.push(directory);
+    } finally { if (fs.existsSync(target)) fs.unlinkSync(target); }
+  }
+  let denied = false;
+  try { fs.writeFileSync(outside, marker, { flag: 'wx', mode: 0o600 }); }
+  catch (error) { if (!['EPERM', 'EACCES'].includes(error.code)) throw error; denied = true; }
+  finally { if (fs.existsSync(outside)) fs.unlinkSync(outside); }
+  if (!denied) throw Error('participant sandbox permits a write outside its declared roots');
+  process.stdout.write(JSON.stringify({ environment: actual, writable_directories: writes, outside_write_denied: denied }));
+}
+
+export function participantToolchainContract(env, project) {
+  return {
+    expected: Object.fromEntries(TOOLCHAIN_ENVIRONMENT.filter(key => env[key] !== undefined).map(key => [key, env[key]])),
+    directories: [...new Set([project, env.TMPDIR, ...Object.keys(TOOLCHAIN_DIRECTORIES).map(key => env[key])])],
+  };
+}
+
+async function participantCanary(session, request, started) {
+  const { env, root, project } = session;
+  requireThat(started.sandbox?.type === 'workspaceWrite' && started.sandbox.networkAccess === false
+    && Array.isArray(started.sandbox.writableRoots), 'actual host did not retain the workspace sandbox');
+  requireThat(started.approvalPolicy === 'never', 'canary approval policy differs from non-interactive codex exec');
+  const actualWritableRoots = await Promise.all(started.sandbox.writableRoots.map(directory => realpath(directory)));
+  requireThat(actualWritableRoots.includes(await realpath(env.TMPDIR)), 'actual host did not retain the isolated writable temporary root');
+  const { expected, directories } = participantToolchainContract(env, project);
+  const marker = randomBytes(16).toString('hex');
+  const script = `(${participantProbe.toString()})(${JSON.stringify(expected)},${JSON.stringify(FORBIDDEN_TOOLCHAIN_ENVIRONMENT)},${JSON.stringify(directories)},${JSON.stringify(path.join(root, `forbidden-canary-${marker}`))},${JSON.stringify(marker)})`;
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const command = [process.env.SHELL || '/bin/sh', '-lc', `${quote(process.execPath)} -e ${quote(script)}`];
+  const result = await request('command/exec', { command, cwd: project, sandboxPolicy: started.sandbox, timeoutMs: 30_000, outputBytesCap: 64 * 1024 });
+  requireThat(result.exitCode === 0, `sandboxed participant canary failed: ${result.stderr}`);
+  const proof = JSON.parse(result.stdout);
+  validateChildEnvironment(proof.environment, expected);
+  requireThat(proof.outside_write_denied === true && JSON.stringify(proof.writable_directories) === JSON.stringify(directories), 'participant write-boundary receipt mismatch');
+  return { environment_sha256: sha(JSON.stringify(canonical(proof.environment))), verified_names: Object.keys(expected),
+    writable_directories: proof.writable_directories, outside_write_denied: true, sandbox: started.sandbox, approval_policy: started.approvalPolicy };
+}
+
+async function withParticipantHost(session, helpers, name, action) {
   const { root, env, pluginRoot, arm, codex } = session;
   const transcript = [];
   const channel = helpers.createSequencedStdioSession(codex, ['app-server', '--disable', 'remote_plugin', '--stdio'],
@@ -282,22 +360,28 @@ async function withInstalledHost(session, helpers, name, action) {
   try {
     await request('initialize', { clientInfo: { name: 'installed-navigation-canary', version: '1' }, capabilities: { experimentalApi: true } });
     channel.send({ method: 'initialized' });
-    const started = await request('thread/start', { cwd: session.project, model: 'gpt-5.6-terra', sandbox: 'workspace-write', ephemeral: true, config: { model_reasoning_effort: 'low' } });
+    const started = await request('thread/start', { cwd: session.project, model: 'gpt-5.6-terra', sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: true,
+      config: { model_reasoning_effort: 'low', 'sandbox_workspace_write.writable_roots': [env.TMPDIR] } });
     const threadId = started.thread?.id;
     requireThat(typeof threadId === 'string', 'actual host did not create an ephemeral inspection context');
     const inventory = await request('mcpServerStatus/list', { threadId });
-    const catalog = JSON.parse(await readFile(path.join(pluginRoot, 'generated-mcp-catalog.json'), 'utf8'));
-    requireThat(sha(JSON.stringify(catalog.tools)) === arm.tools_sha256, 'installed catalog receipt mismatch');
-    validateHostCatalog(inventory, catalog.tools, arm);
-    const child = await observeChildEnvironment(channel, session, helpers);
+    let child = null;
+    if (pluginRoot) {
+      const catalog = JSON.parse(await readFile(path.join(pluginRoot, 'generated-mcp-catalog.json'), 'utf8'));
+      requireThat(sha(JSON.stringify(catalog.tools)) === arm.tools_sha256, 'installed catalog receipt mismatch');
+      validateHostCatalog(inventory, catalog.tools, arm);
+      child = await observeChildEnvironment(channel, session, helpers);
+    } else requireThat(Array.isArray(inventory.data) && inventory.data.every(server => server.name === 'codex_apps' && server.pluginId === null),
+      'native actual host unexpectedly loaded a configured or plugin MCP server');
+    const toolchain = await participantCanary(session, request, started);
     const call = (tool, args) => request('mcpServer/tool/call', { threadId, server: 'codestory', tool, arguments: args });
     const result = await action(call);
     const config = await readFile(path.join(env.CODEX_HOME, 'config.toml'), 'utf8');
     const hostUpdates = hostConfigurationUpdates(session.effective.configuration, config, session.project);
     session.effective.configuration = config;
     await save(path.join(root, 'effective-config.json'), session.effective);
-    return { ...result, host_registration: 'explicit_installed_launcher', configuration_sha256: sha(config),
-      host_owned_configuration_updates: hostUpdates, child, model_turns: 0 };
+    return { ...result, host_registration: pluginRoot ? 'explicit_installed_launcher' : 'native', configuration_sha256: sha(config),
+      host_owned_configuration_updates: hostUpdates, child, toolchain, model_turns: 0 };
   } finally {
     await channel.stop();
     await save(path.join(root, `${name}-transcript.json`), transcript);
@@ -307,12 +391,13 @@ async function withInstalledHost(session, helpers, name, action) {
 
 async function operationCanary(session, helpers) {
   const { root, env, pluginRoot, arm } = session;
-  if (!pluginRoot) return { status: 'pass', surface: 'native', operations: ['git clone', 'git checkout', 'plugin inventory'] };
+  if (!pluginRoot) return withParticipantHost(session, helpers, 'canary', async () => ({ status: 'pass', surface: 'native',
+    operations: ['git clone', 'git checkout', 'plugin inventory', 'sandboxed environment and writes'] }));
   const project = path.join(root, 'operation-canary');
   await mkdir(project);
   await writeFile(path.join(project, 'index.js'), 'export function navigationCanary() { return "BEFORE_REFRESH"; }\n');
   await checkedProcess(helpers.runProcess, 'git', ['-c', 'core.hooksPath=/dev/null', 'init', project], { env });
-  return withInstalledHost(session, helpers, 'canary', async hostCall => {
+  return withParticipantHost(session, helpers, 'canary', async hostCall => {
     const call = async (name, args) => {
       const deadline = performance.now() + 75_000;
       while (true) {
@@ -358,8 +443,9 @@ export async function runInstalledNavigation(argv, helpers) {
   const installation = JSON.parse(installationBytes);
   requireThat(installation.manifest_sha256 === sha(manifestBytes), 'installation receipt targets another manifest');
   requireThat(installation.budget?.max_sessions >= manifest.sessions.length && installation.budget?.max_wall_ms >= manifest.sessions.length * 600_000, 'frozen budget must cover all ten-minute sessions');
-  const output = path.resolve(values.out);
-  await mkdir(output); // No overwrite/resume: failures stay in their original attempt.
+  const requestedOutput = path.resolve(values.out);
+  await mkdir(requestedOutput); // No overwrite/resume: failures stay in their original attempt.
+  const output = await realpath(requestedOutput);
   const runStart = performance.now();
   const remainingMs = () => Math.min(installation.budget.max_wall_ms - (performance.now() - runStart), installation.budget.deadline_utc ? Date.parse(installation.budget.deadline_utc) - Date.now() : Infinity);
   const allowance = requested => {
@@ -412,11 +498,10 @@ export async function runInstalledNavigation(argv, helpers) {
     try {
       allowance(1);
       const session = await prepareSession(row, manifest, installation, output, values.codex, bounded);
-      if (session.pluginRoot) {
-        const host = await withInstalledHost(session, bounded, 'participant-host', async () => ({ status: 'pass', catalog_sha256: session.arm.tools_sha256 }));
-        await save(path.join(root, 'participant-host.json'), host);
-      }
-      const invocation = navigationCommand(values.codex, session.project, path.join(root, 'answer.md'));
+      const host = await withParticipantHost(session, bounded, 'participant-host', async () => ({ status: 'pass',
+        ...(session.pluginRoot ? { catalog_sha256: session.arm.tools_sha256 } : {}) }));
+      await save(path.join(root, 'participant-host.json'), host);
+      const invocation = navigationCommand(values.codex, session.project, path.join(root, 'answer.md'), session.env.TMPDIR);
       result.preparation_ms = performance.now() - started;
       await writeFile(path.join(root, 'prompt.txt'), session.task.prompt);
       allowance(1); // No model process may start after preparation consumes the budget.
