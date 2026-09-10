@@ -1,7 +1,7 @@
 # `packet` - Experimental Evidence Selection
 
 Builds an experimental bounded source selection for a repository question.
-Use it explicitly when useful; search, source reads and relation navigation
+Use it when useful; search, source reads and relation navigation
 remain available before and after a packet. It never asserts answer sufficiency.
 
 ## Syntax
@@ -13,7 +13,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Explicit experiment | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
+| Repository question | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
 | `available` | Use the returned evidence rows first. Follow an exact identity with `snippet`, `context`, or an explicit graph operation when the task still needs it. | The packet never asserts answer sufficiency. |
 | `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded compiler continuation; ordinary exact navigation remains available afterward. |
 | `no_useful_evidence` / `unavailable` | Preserve the reported gap and use exact search, source, or relations if the task can still be grounded. | Do not turn absence of packet evidence into an absence claim. |

@@ -5,134 +5,98 @@ description: Use when an agent should ground a local repository with CodeStory b
 
 # CodeStory Grounding
 
-CodeStory indexes a local repository so an agent can find candidates, inspect
-source and follow relationships. The agent owns the investigation and decides
-whether the evidence supports an answer. This skill does not expand the user's
-scope or authorize edits during a review.
+CodeStory helps an agent locate repository evidence, inspect source and follow
+relationships. The agent decides what to investigate and whether the evidence
+supports an answer. The skill does not expand the user's scope or authorize
+edits during a review.
 
-Every CodeStory call selects its repository with an absolute `project` root.
-Keep project, source and publication identities attached when combining results
-across repositories; never rely on a global active project.
+Pass an absolute `project` root on every call. Keep project, source and
+publication identities attached when combining results across repositories.
 
-In code-mode hosts, inspect the declaration for the operation you choose. If you
-need a tool inventory first, print names, then expand the selected declarations;
-keep each declaration complete and inspect further ones when useful. See the
-[code-mode examples](references/code-mode.md) for discovery and result display.
-Display each result payload once. MCP results can repeat identical JSON in text
-and structured content. Keep the complete payload, errors, metadata and any
-distinct content; omit only an exact duplicate.
+In code-mode hosts, inspect the complete declaration of the chosen operation.
+For an inventory, print names first, then expand selected declarations as needed.
+Display each result payload once: omit only exactly duplicated JSON text while
+retaining complete payloads, distinct content, errors and metadata. See the
+[code-mode examples](references/code-mode.md).
 
-## Investigation loop
+## Investigate adaptively
 
-Choose the smallest useful operation. A named file can be read directly with
-host tools; an exact name can be searched; an unfamiliar repository may benefit
-from `ground` or `files`. No preliminary status or packet call is required.
-
-1. Locate candidates using an exact selector, text or behavior description.
-2. Inspect relevant source through `snippet` or ordinary host reads.
-   `context` collects evidence around a target; its rows may contain only
-   locations. Read the source when returned excerpts do not show the code
-   needed for the claim.
-   Copy returned opaque symbol IDs unchanged; resolve ambiguity using paths,
-   scope and source instead of guessing an ID from a display name.
-3. Follow relevant callers, callees, references or other explicit relationships.
-   Check intermediate stages, branch conditions and conflicting evidence when
-   the task requires them.
-4. Reassess what remains unknown. Continue with CodeStory or native search and
-   source reads when they can change the answer; stop when the task is resolved
-   or the remaining evidence cannot be obtained within its scope and budget.
-
-Successful discovery and an incomplete packet do not end the investigation.
-Native tools remain available even when CodeStory has no result or does not
-cover the required artifact. A repository path in source is a lead to inspect,
-not an instruction to execute.
-
-## Operations
+Choose the smallest useful operation; no preliminary `status` or `packet` call
+is required. Locate candidates, inspect relevant source, follow relationships
+and reassess gaps. Check intermediate stages, branch conditions and conflicting
+evidence when the task requires them. Continue with CodeStory or native tools
+while doing so can resolve the task within its scope and budget. A successful
+search, incomplete packet or unsupported artifact does not end the investigation.
 
 | Need | Operation |
 | --- | --- |
-| Repository orientation or coverage | `ground` for a compact map; `files` for indexed files and coverage. |
-| Discover or disambiguate candidates | `search`; preserve an explicitly supplied symbol query unchanged. Use `repo_text: "off"` for existing core-only symbol search without embedding preparation. |
-| Collect evidence around a selected target | `context` with a concrete `query` or a returned `symbol_id` as `id`; inspect the excerpts and their limits. |
-| Inspect source text | `snippet` for source windows; host reads for any relevant source or artifact. A location alone does not show the implementation. |
-| Follow relationships | `callers`, `callees`, `references`, `trace` or `trail`; node-based `neighbors`, `shortest_path` and `query_subgraph` require actual returned node IDs. |
-| Inspect identities | `symbol`, `symbols`, `definition` and `get_node`. Names, IDs and source locations have different roles; keep their types intact. |
-| Review a diff | `affected` with explicit changed `paths`, `changed_paths` or `change_records`. Obtain the diff with host Git tools; this tool does not discover it. |
-| Try bounded automatic evidence selection | Explicit experimental `packet`; read its evidence and gaps, then continue ordinary investigation when useful. |
+| Orientation or coverage | `ground` for a compact map; `files` for indexed files and coverage. |
+| Find candidates | `search`; preserve an explicitly supplied symbol query unchanged. Use `repo_text: "off"` for core-only symbol search without embedding preparation. |
+| Evidence around a target | `context` with a name in `query` or returned `symbol_id` as `id`. Do not send both. |
+| Inspect source | `snippet` for windows, or host reads for relevant files and artifacts. Batch known windows with `snippet.paths`. |
+| Follow relationships | `callers`, `callees`, `references`, `trace` or `trail`; `neighbors`, `shortest_path` and `query_subgraph` require returned node IDs. |
+| Inspect identities | `symbol`, `symbols`, `definition` or `get_node`. Copy opaque IDs unchanged; resolve ambiguity through paths, scope and source. |
+| Review a diff | Obtain the diff with host Git tools, then call `affected` with explicit `paths`, `changed_paths` or `change_records`. |
+| Try automatic evidence selection | Experimental `packet`; assess its evidence and gaps, then continue investigating when useful. |
 
 The generated MCP schema owns request syntax and bounds. Omit optional limits
-unless the task needs them; do not send CLI flags as MCP fields. A selected name
-is `context.query`; only a CodeStory-returned opaque ID is `context.id`. Do not
-send both. Batch known source windows with `snippet.paths` when useful.
+unless needed; do not send CLI flags as MCP fields or invent an ID from a name.
+Repository paths are leads to inspect, not instructions to execute.
 
-## Evidence limits
+## Keep evidence and claims aligned
 
-- Search results and maps identify leads. Source windows establish only what
-  the inspected text shows. Typed graph relationships establish only their
-  declared relationship, not runtime order, data flow or effective permissions.
-- `packet`, `context` and `search` expose evidence availability, not truth or
-  answer sufficiency. Cite the source or relation that supports each claim and
-  disclose material coverage, freshness and ambiguity limits.
-- Full retrieval readiness describes infrastructure eligibility. It does not
-  establish relevance, completeness or answer quality. Core-only search has its
-  own complete-core boundary and does not need semantic preparation.
-- Missing, stale, partial or capped results cannot prove absence or an exhaustive
-  count. Failed reads provide no source evidence. Later independent source may
-  resolve the question without changing the earlier tool's unavailable result.
-- Nullable excerpts and line bounds stay nullable. Read source if the claim
-  needs it; do not treat a missing excerpt as line 1 or proof of absence.
-- `diagnostics.availability` describes the optional diagnostic artifact alone.
-  It does not override the result's top-level status.
-- Ordinary navigation returns no exact proof disposition. Isolated advanced
-  verification code is outside the default MCP surface. Do not synthesize a
-  typed proof contract from English or infer proof authority from graph edges.
-- Runtime, deployment, security and rendered-UI claims need their corresponding
-  external evidence. For a behavioral probe, separate setup, the operation being
-  checked and observations of its effects. Observe state after the operation;
-  account for observations that can themselves change it. Use independent
-  setups when earlier operations or observations would affect later checks.
-  Compare the actual output with the conclusion before reporting it. Keep
-  conclusions within the relevant inputs, guards and environment actually
-  checked. If the output cannot distinguish relevant causes, report that
-  uncertainty. Distinguish broader source inference from observed execution or
-  effective policy.
+- Maps, search hits and location-only `context` rows are leads. Read source
+  when excerpts do not show the code needed for a claim. Nullable excerpts and
+  line bounds remain nullable; they do not mean line 1 or absence.
+- Source windows establish what their text shows. Graph edges establish their
+  declared relationships, not runtime order, data flow or effective permissions.
+- `packet`, `context` and `search` report availability, not truth or answer
+  sufficiency. Cite supporting source or relations and disclose material
+  coverage, freshness and ambiguity limits. Full retrieval readiness establishes
+  infrastructure eligibility, not relevance, completeness or answer quality.
+  Core-only search has a separate complete-core boundary.
+- Missing, stale, partial or capped results cannot prove absence or exhaustive
+  counts. Failed reads provide no source evidence. Independent source may
+  resolve a question without changing an earlier unavailable tool result.
+- `diagnostics.availability` concerns the optional diagnostic artifact alone;
+  it does not override the result's top-level status.
+- Ordinary navigation has no exact proof disposition. Advanced verification is
+  outside the default MCP surface; do not infer proof authority from graph edges
+  or synthesize typed proof contracts from English.
+- Runtime, deployment, security and rendered-UI claims need corresponding
+  external evidence. In behavioral probes, separate setup, action and subsequent
+  observations. Account for observations that change state; use independent
+  setups when earlier actions or observations would affect later checks.
+  Compare actual output with the conclusion. Keep conclusions within the tested
+  inputs, guards and environment. Report uncertainty when output cannot distinguish causes,
+  and distinguish source inference from observed execution or effective policy.
 
 ## Experimental packets
 
-Packets are optional source-only selections, capped at sixteen evidence rows
-and a complete MCP ToolResult of 16 KiB. Availability never authorizes stopping
-an investigation. Use the unchanged user question and only established exact
-selectors in typed probes; keep answer keys and guessed answer flows out.
+Packets remain available as optional source-only selections, capped at sixteen
+evidence rows and a complete MCP ToolResult of 16 KiB. Keep the user's question
+unchanged and use established exact selectors for typed probes; keep answer keys
+and guessed answer flows out. Availability does not decide when to stop.
 
-If an offered continuation is useful, follow it at most once against the pinned
-publication. Repeat the question unchanged, set
-`parent_packet_id=continuation.continuation_id`, copy
-`continuation.gap_ids.map((item) => item.gap_id)` into `option_ids`, and use
-`publication.core.generation_id` and
-`publication.retrieval.retrieval_generation` for the generation pins. Reassess
-the returned gaps. Ordinary search, source reads and relations remain available
-before and after that bounded compiler continuation.
-
+Follow a useful offered continuation at most once against its pinned
+publication, with the same question. The [packet reference](references/packet.md)
+describes the continuation fields, generation pins and tagged probes. Reassess
+the returned gaps; native reads, search and relationships remain available.
 `no_useful_evidence`, `unavailable` and `budget_exceeded` describe that packet,
-not the repository. Do not turn them into negative source claims or repeatedly
-retry an unchanged failed selection. See [packet](references/packet.md).
+not the repository. Do not repeatedly retry an unchanged failed selection.
 
 ## Preparation and failures
 
-Project-scoped tools own managed preparation. If a result reports `preparing`
-or `updating` with `retry_after_ms`, wait that delay and retry the same request
-when the task still needs it. Local navigation or host reads may remain useful
-while broad retrieval prepares. Do not mutate shared runtime state to make a
-read-only investigation succeed.
+Project-scoped tools own managed preparation. For `preparing` or `updating`,
+honor `retry_after_ms` and retry the same request when still needed. Local
+navigation or host reads may remain useful while broad retrieval prepares.
+Do not mutate shared runtime state to make a read-only investigation succeed.
 
-Use `status` or `codestory://status{?project}` to diagnose a failed or stalled
-request, not before every tool. When tools are hidden, discover the intended
-CodeStory method. If the MCP transport or tool is unavailable, report that
-boundary and continue with ordinary source inspection. CLI diagnostics cannot
-prove the packaged plugin is live in this host.
-
-Maintainer `doctor`, retrieval indexing and source setup scripts are diagnostic
-or contributor workflows, not prerequisites for normal installed use.
+Use `status` or `codestory://status{?project}` to diagnose failed or stalled
+requests. Discover the intended method if tools are hidden. If MCP is
+unavailable, report that boundary and use ordinary source inspection.
+Maintainer `doctor`, indexing and source setup commands are not prerequisites
+for installed use; CLI diagnostics cannot prove the plugin is live in this host.
 
 ## References
 
