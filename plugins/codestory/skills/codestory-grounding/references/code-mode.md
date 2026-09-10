@@ -1,4 +1,31 @@
-# Displaying CodeStory results in code mode
+# CodeStory discovery and results in code mode
+
+## Inspect selected tool declarations
+
+When the needed operation is known, inspect its exact callable declaration.
+If you need an inventory first, print tool names, then inspect the declarations
+for the operations you choose. All operations remain available.
+
+In hosts exposing `ALL_TOOLS`, a names-only inventory avoids printing every
+request and response schema:
+
+```javascript
+text(ALL_TOOLS.filter(tool => /codestory/i.test(tool.name)).map(tool => tool.name));
+```
+
+After choosing an operation, match its actual exposed name exactly. This example
+selects search; choose any operation or set of operations the task needs:
+
+```javascript
+const selectedNames = new Set(["mcp__codestory__search"]);
+text(ALL_TOOLS.filter(tool => selectedNames.has(tool.name)));
+```
+
+Keep each selected declaration complete. Inspect further declarations when they
+become useful. A plugin-wide predicate over names and descriptions can print
+many unused declarations; discovery does not require displaying all of them.
+
+## Display each result payload once
 
 Some hosts expose both `content` and `structuredContent` (or
 `structured_content`) to JavaScript. Printing the whole wrapper can put the
