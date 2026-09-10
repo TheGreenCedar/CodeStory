@@ -26,6 +26,8 @@ V3 JSON contains `identity`, `publication`, `status`, `evidence`, `gaps`,
 `retrieval`, `continuation` and `diagnostics`. Each evidence row includes its own
 identity, path, optional symbol ID, optional line bounds and optional excerpt.
 The older top-level `hits` and `query_assessment` are not the public v3 shape.
+Evidence rows retain the search engine's relevance order; their opaque
+identities are not sort keys.
 
 Use a returned non-null `symbol_id` with `context.id`, `snippet` or a relation
 operation. Inspect paths and source when several candidates are plausible;
