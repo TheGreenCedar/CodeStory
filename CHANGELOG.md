@@ -18,6 +18,8 @@ throughout.
   Affected-code results also suggest relevant tests in the same package.
 - **Follow search results in relevance order.** Results keep their relevance
   order across the CLI and agent responses.
+- **Retry during CLI installation.** Hosts that validate MCP responses can
+  accept the retry guidance while the CLI installs.
 - **Keep working past broken configuration files.** Malformed text
   configuration no longer blocks the whole repository index. Unsupported or
   broken content is reported as a coverage gap. Supported JSONC files accept

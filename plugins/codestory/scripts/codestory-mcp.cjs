@@ -3950,6 +3950,10 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       kind: 'preparing',
       state: 'preparing',
       retry_after_ms: provisioningOperation.retry_after_ms,
+      minimum_next: {
+        kind: 'retry_same_request',
+        after_ms: provisioningOperation.retry_after_ms,
+      },
       operation: provisioningOperation,
     };
     return {
