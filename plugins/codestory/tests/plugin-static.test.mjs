@@ -537,16 +537,35 @@ test("fail-open preparing is a successful revision-native result in every profil
     const toolResult = frames[1].result;
     const text = JSON.parse(toolResult.content[0].text);
     assert.equal(toolResult.isError, false, `${revision} preparing must not be a tool error`);
-    assert.deepEqual(Object.keys(text).sort(), ["kind", "operation", "retry_after_ms", "state"]);
+    assert.deepEqual(Object.keys(text).sort(), ["kind", "minimum_next", "operation", "retry_after_ms", "state"]);
     assert.equal(text.kind, "preparing");
     assert.equal(text.state, "preparing");
     assert.ok(text.retry_after_ms > 0);
+    assert.deepEqual(text.minimum_next, { kind: "retry_same_request", after_ms: text.retry_after_ms });
     assert.equal(typeof text.operation, "object");
     if (revision === "2024-11-05" || revision === "2025-03-26") {
       assert.equal(toolResult.structuredContent, undefined);
     } else {
       assert.deepEqual(toolResult.structuredContent, text);
     }
+  }
+});
+
+test("managed provisioning replies satisfy every non-status tool output schema", () => {
+  const status = { managed_retrieval: { state: "preparing" }, warnings: [], readiness: [] };
+  const tools = generatedCatalog.tools.filter((tool) => tool.name !== "status");
+  assert.equal(tools.length, 19);
+  for (const tool of tools) {
+    const result = launcherTest.failOpenToolResult(tool.name, status, { project: repoRoot });
+    assert.deepEqual(
+      launcherTest.validatePublishedSchemaValue(tool.outputSchema, result.structuredContent, "/result"),
+      [],
+      `${tool.name} provisioning response must satisfy its published output schema`,
+    );
+    assert.deepEqual(result.structuredContent.minimum_next, {
+      kind: "retry_same_request",
+      after_ms: result.structuredContent.retry_after_ms,
+    });
   }
 });
 
@@ -1379,6 +1398,7 @@ test("preparing fail-open surfaces share one progress-derived retry hint", () =>
     const ground = launcherTest.failOpenToolResult("ground", preparingStatus, { project: repoRoot });
     assert.equal(ground.structuredContent.retry_after_ms, 3000);
     assert.equal(ground.structuredContent.operation.retry_after_ms, 3000);
+    assert.equal(ground.structuredContent.minimum_next.after_ms, 3000);
     const status = launcherTest.failOpenToolResult("status", preparingStatus, { project: repoRoot });
     assert.equal(status.structuredContent.retry_after_ms, 3000);
     assert.equal(status.structuredContent.current_operation.retry_after_ms, 3000);
@@ -5136,7 +5156,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent, undefined);
     assert.deepEqual(
       Object.keys(coldGroundPreparing).sort(),
-      ["kind", "operation", "retry_after_ms", "state"],
+      ["kind", "minimum_next", "operation", "retry_after_ms", "state"],
     );
     assert.equal(coldGroundPreparing.kind, "preparing");
     assert.equal(coldGroundPreparing.state, "preparing");
