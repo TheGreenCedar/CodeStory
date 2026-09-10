@@ -415,9 +415,11 @@ pub(crate) fn build_context_projection_v3(
 pub(crate) fn build_search_projection_v3(
     input: &FinalizedSearchProjectionInputV3,
 ) -> Result<SearchProjectionV3Dto, ProjectionBuildErrorV3> {
-    let mut evidence = input.evidence.clone();
-    evidence.sort_by(|left, right| left.identity.cmp(&right.identity));
-    reject_duplicate_evidence_v3(&evidence, |row| &row.identity)?;
+    let evidence = input.evidence.clone();
+    // Runtime owns relevance order; opaque identities only order validation.
+    let mut identity_order: Vec<_> = evidence.iter().collect();
+    identity_order.sort_by(|left, right| left.identity.cmp(&right.identity));
+    reject_duplicate_evidence_v3(&identity_order, |row| &row.identity)?;
     let gaps = canonical_gaps_v3(&input.gaps)?;
     let continuation = canonical_continuation_v3(input.continuation.as_ref(), &gaps)?;
     let diagnostic_rows =
@@ -731,11 +733,12 @@ mod tests {
             BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionKindV3Dto, ContextTargetV3Dto,
             ContinuationStateV3Dto, DiagnosticArtifactKindV3Dto, DiagnosticArtifactV3Dto,
             DiagnosticCategoryV3Dto, DiagnosticCodeTextV3, DiagnosticRowV3Dto,
-            DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, EvidenceIdentityV3Dto,
-            EvidenceKindV3Dto, GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, MessageTextV3,
-            PACKET_EVIDENCE_ROWS_MAX_V3, PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3,
-            ProjectionGapRowV3Dto, PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto,
-            RetrievalStateV3Dto, SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
+            DiagnosticsCapabilityV3Dto, EVIDENCE_ROWS_MAX_V3, EvidenceAvailabilityV3Dto,
+            EvidenceIdentityV3Dto, EvidenceKindV3Dto, ExcerptTextV3, GapIdentityV3Dto,
+            GapKindV3Dto, IdentityTextV3, MessageTextV3, PACKET_EVIDENCE_ROWS_MAX_V3,
+            PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3, ProjectionGapRowV3Dto,
+            PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
+            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
         },
     };
 
@@ -1598,8 +1601,92 @@ mod tests {
         )
     }
 
+    fn search_input_fixture(
+        evidence: Vec<SearchEvidenceRowV3Dto>,
+    ) -> FinalizedSearchProjectionInputV3 {
+        let record = record_fixture("ranked source candidates");
+        FinalizedSearchProjectionInputV3::new(
+            packet_identity(&record),
+            publication(&record),
+            record.retrieval().clone(),
+            evidence,
+            Vec::new(),
+            None,
+            DiagnosticsCapabilityV3Dto::Unavailable,
+            Vec::new(),
+        )
+    }
+
+    fn ranked_search_rows(count: usize, opaque_ids: bool) -> Vec<SearchEvidenceRowV3Dto> {
+        (0..count)
+            .map(|index| SearchEvidenceRowV3Dto {
+                identity: EvidenceIdentityV3Dto {
+                    evidence_id: identity(&if opaque_ids {
+                        format!("opaque-{:03}", count - index)
+                    } else {
+                        format!("search-{index}-selected")
+                    }),
+                },
+                path: PathTextV3::new(format!("src/definition_{index}.rs")).unwrap(),
+                symbol_id: None,
+                start_line: Some(index as u32 + 1),
+                end_line: None,
+                excerpt: Some(ExcerptTextV3::new(format!("fn item_{index}() {{}}")).unwrap()),
+            })
+            .collect()
+    }
+
     #[test]
-    fn packet_projection_v3_context_and_search_canonicalize_and_reject_dangling_references() {
+    fn search_projection_v3_preserves_ranked_rows_across_identity_boundaries() {
+        for opaque_ids in [false, true] {
+            for count in [0, 1, 9, 10, 11, 50, EVIDENCE_ROWS_MAX_V3] {
+                let rows = ranked_search_rows(count, opaque_ids);
+                let input = search_input_fixture(rows.clone());
+                let projected = build_search_projection_v3(&input).expect("bounded ranked search");
+                assert_eq!(
+                    projected.evidence.as_slice(),
+                    rows.as_slice(),
+                    "preserve every ranked row and field: count={count}, opaque_ids={opaque_ids}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_projection_v3_rejects_nonadjacent_duplicates_canonically() {
+        for (ids, expected) in [
+            (vec!["z", "middle", "z"], "z"),
+            (vec!["z", "a", "z", "a"], "a"),
+        ] {
+            let mut rows = ranked_search_rows(ids.len(), false);
+            for (row, id) in rows.iter_mut().zip(ids) {
+                row.identity.evidence_id = identity(id);
+            }
+            assert_eq!(
+                build_search_projection_v3(&search_input_fixture(rows)),
+                Err(ProjectionBuildErrorV3::InvalidInput(
+                    ProjectionInputErrorV3::DuplicateEvidenceIdentity(expected.to_owned())
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn search_projection_v3_rejects_rows_beyond_the_public_bound() {
+        let count = EVIDENCE_ROWS_MAX_V3 + 1;
+        assert_eq!(
+            build_search_projection_v3(&search_input_fixture(ranked_search_rows(count, false))),
+            Err(ProjectionBuildErrorV3::BoundViolation(
+                BoundViolationV3::TooManyItems {
+                    maximum: EVIDENCE_ROWS_MAX_V3,
+                    actual: count,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn packet_projection_v3_context_and_search_validate_closed_references() {
         let record = record_fixture("finalized typed context and search");
         let context_input = context_input_fixture(&record);
         let context = build_context_projection_v3(&context_input).expect("canonical context");
@@ -1733,7 +1820,7 @@ mod tests {
             DiagnosticsCapabilityV3Dto::Unavailable,
             context_input.diagnostic_rows.clone(),
         );
-        let search = build_search_projection_v3(&search_input).expect("canonical search");
+        let search = build_search_projection_v3(&search_input).expect("ranked search");
         assert_eq!(
             search
                 .evidence
@@ -1741,7 +1828,7 @@ mod tests {
                 .iter()
                 .map(|row| row.identity.evidence_id.as_str())
                 .collect::<Vec<_>>(),
-            ["evidence-a", "evidence-b"]
+            ["evidence-b", "evidence-a"]
         );
 
         let mut zero_round_continuation = search_input.clone();

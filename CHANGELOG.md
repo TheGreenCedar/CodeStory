@@ -16,6 +16,8 @@ throughout.
 - **Follow relationships from the first index.** Calls and imports are
   available after full indexing, including when parser results are reused.
   Affected-code results also suggest relevant tests in the same package.
+- **Follow search results in relevance order.** Results keep their relevance
+  order across the CLI and agent responses.
 - **Keep working past broken configuration files.** Malformed text
   configuration no longer blocks the whole repository index. Unsupported or
   broken content is reported as a coverage gap. Supported JSONC files accept
