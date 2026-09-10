@@ -84,7 +84,8 @@ send both. Batch known source windows with `snippet.paths` when useful.
   verification code is outside the default MCP surface. Do not synthesize a
   typed proof contract from English or infer proof authority from graph edges.
 - Runtime, deployment, security and rendered-UI claims need their corresponding
-  external evidence. Keep a plausible source explanation distinct from an
+  external evidence. Keep conclusions within the relevant inputs, guards and
+  environment actually checked. Distinguish broader source inference from
   observed execution or effective policy.
 
 ## Experimental packets
