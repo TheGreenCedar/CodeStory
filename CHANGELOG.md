@@ -25,6 +25,8 @@ throughout.
   Core-only `search --repo-text off` searches an existing symbol index without
   starting embeddings. File listings focus on project coverage; the full
   framework catalog remains available on request.
+- **Search linked source files.** Repository search accepts selected symlinks
+  to source files inside the project and retains their selected paths.
 - **Keep bookmarks through upgrades and interruptions.** Cache upgrades
   preserve bookmarks and annotations. If publishing an updated index fails or
   is interrupted, the previous complete index remains available for recovery.
