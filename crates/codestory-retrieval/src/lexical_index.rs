@@ -583,17 +583,73 @@ enum LexicalHitPayload {
     DescriptorOnly,
 }
 
+/// A source route may be an admitted in-project alias. Keep that route for
+/// document identity, but seal its resolved regular file. Published artifacts
+/// continue to use ArtifactSeal directly and cannot be terminal symlinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LexicalSourceSeal {
+    selected_path: PathBuf,
+    target: ArtifactSeal,
+    identity: codestory_workspace::WorkspacePathIdentity,
+}
+
+impl LexicalSourceSeal {
+    fn observe(project_root: &Path, selected_path: &Path) -> Result<Self> {
+        let target_path = selected_path.canonicalize()?;
+        if !matches!(
+            codestory_workspace::resolve_project_relative_path(project_root, &target_path)?,
+            codestory_workspace::ProjectRelativePathResolution::Existing { .. }
+        ) {
+            bail!("lexical source target is not an in-project regular file");
+        }
+        let target = ArtifactSeal::observe(&target_path)?;
+        if !target.is_present() {
+            bail!("lexical source target disappeared during observation");
+        }
+        let identity = codestory_workspace::workspace_path_identity(&target_path)?;
+        if codestory_workspace::workspace_path_identity(selected_path)? != identity
+            || ArtifactSeal::observe(&target_path)? != target
+        {
+            bail!("lexical source identity changed during observation");
+        }
+        Ok(Self {
+            selected_path: selected_path.to_path_buf(),
+            target,
+            identity,
+        })
+    }
+
+    fn open_verified(&self) -> Result<std::fs::File> {
+        // Read the sealed target through a handle whose native identity agrees
+        // with the observation. A retarget-and-restore of the selected alias
+        // cannot substitute different bytes between path checks.
+        let file = std::fs::File::open(self.target.path())?;
+        self.verify_opened(&file)?;
+        Ok(file)
+    }
+
+    fn verify_opened(&self, file: &std::fs::File) -> Result<()> {
+        if codestory_workspace::workspace_file_identity(file)? != self.identity
+            || ArtifactSeal::observe(self.target.path())? != self.target
+            || codestory_workspace::workspace_path_identity(&self.selected_path)? != self.identity
+        {
+            bail!("lexical source identity changed before its content inspection");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct LexicalSourceInput {
     coverage: LexicalCoverage,
     documents: Vec<LexicalDocument>,
-    source_seals: Vec<ArtifactSeal>,
+    source_seals: Vec<LexicalSourceSeal>,
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedLexicalInput {
     pub fingerprint: LexicalInputFingerprint,
     documents: Vec<LexicalDocument>,
-    source_seals: Vec<ArtifactSeal>,
+    source_seals: Vec<LexicalSourceSeal>,
     /// Present for a bounded transition whose `documents` contain only the
     /// changed rows. The complete key/hash state remains canonical and is what
     /// binds the published base-plus-delta view.
@@ -620,7 +676,7 @@ impl PreparedLexicalInput {
 
 struct LexicalScanOutcome {
     coverage: LexicalCoverage,
-    source_seals: Vec<ArtifactSeal>,
+    source_seals: Vec<LexicalSourceSeal>,
 }
 
 #[cfg(test)]
@@ -731,6 +787,25 @@ pub(crate) fn prepare_bounded_lexical_input(
         Err(_) => bounded_ineligible!("previous_component_set_invalid"),
     };
 
+    // Core's bounded receipt admits regular source paths only. Preserve that
+    // contract, revalidate its original observations, and carry source seals
+    // into the same publication fence used by a full lexical scan. Aliases
+    // without such a receipt continue through full preparation.
+    let source_seals = match source_seals
+        .iter()
+        .map(|seal| {
+            let source = LexicalSourceSeal::observe(project_root, seal.path())?;
+            if ArtifactSeal::observe(seal.path())? != *seal {
+                bail!("bounded lexical source changed since core discovery");
+            }
+            Ok(source)
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(seals) => seals,
+        Err(_) => bounded_ineligible!("core_source_inventory_changed"),
+    };
+
     let mut changed_documents = Vec::with_capacity(changed_existing_sources.len());
     let mut desired_documents = previous_state.documents.clone();
     let mut previous_path: Option<&str> = None;
@@ -748,12 +823,12 @@ pub(crate) fn prepare_bounded_lexical_input(
         }
         previous_path = Some(relative.as_str());
         let path = project_root.join(relative_path);
-        let before = match ArtifactSeal::observe(&path) {
+        let before = match LexicalSourceSeal::observe(project_root, &path) {
             Ok(seal) => seal,
             Err(_) => bounded_ineligible!("changed_source_unsealable"),
         };
         if !source_seals
-            .binary_search_by(|seal| seal.path().cmp(&path))
+            .binary_search_by(|seal| seal.selected_path.as_path().cmp(&path))
             .ok()
             .is_some_and(|position| source_seals[position] == before)
         {
@@ -767,14 +842,14 @@ pub(crate) fn prepare_bounded_lexical_input(
             bounded_ineligible!("changed_source_oversized");
         }
         let Some(content) =
-            (match read_lexical_file_text_limited(&path, current_policy.max_file_bytes) {
+            (match read_lexical_source_text_limited(&before, current_policy.max_file_bytes) {
                 Ok(content) => content,
                 Err(_) => bounded_ineligible!("changed_source_unreadable"),
             })
         else {
             bounded_ineligible!("changed_source_invalid_utf8_or_oversized");
         };
-        let after = ArtifactSeal::observe(&path).with_context(|| {
+        let after = LexicalSourceSeal::observe(project_root, &path).with_context(|| {
             format!("seal bounded lexical source after read {}", path.display())
         })?;
         if after != before {
@@ -3454,7 +3529,7 @@ fn scan_lexical_documents(
         if source_policy.excluded_paths.contains(&relative) {
             continue;
         }
-        let before = ArtifactSeal::observe(&path)
+        let before = LexicalSourceSeal::observe(project_root, &path)
             .with_context(|| format!("seal lexical source before read {}", path.display()))?;
         source_seals.push(before.clone());
         coverage.discovered_files = coverage.discovered_files.saturating_add(1);
@@ -3471,7 +3546,8 @@ fn scan_lexical_documents(
             push_coverage_sample(&mut coverage.omitted_path_sample, relative);
             continue;
         }
-        let content = match read_lexical_file_text_limited(&path, source_policy.max_file_bytes) {
+        let content = match read_lexical_source_text_limited(&before, source_policy.max_file_bytes)
+        {
             Ok(Some(content)) => content,
             Ok(None) => {
                 coverage.omitted_oversized = coverage.omitted_oversized.saturating_add(1);
@@ -3484,7 +3560,7 @@ fn scan_lexical_documents(
                 continue;
             }
         };
-        let after = ArtifactSeal::observe(&path)
+        let after = LexicalSourceSeal::observe(project_root, &path)
             .with_context(|| format!("seal lexical source after read {}", path.display()))?;
         if after != before {
             bail!("lexical source changed while reading {}", path.display());
@@ -3509,7 +3585,7 @@ fn scan_lexical_documents(
 fn observe_lexical_source_seals(
     project_root: &Path,
     source_storage_path: Option<&Path>,
-) -> Result<Vec<ArtifactSeal>> {
+) -> Result<Vec<LexicalSourceSeal>> {
     let source_policy = lexical_source_policy(project_root, source_storage_path)?;
     let workspace = match source_storage_path {
         Some(storage_path) => {
@@ -3531,15 +3607,18 @@ fn observe_lexical_source_seals(
                 .contains(&lexical_relative_path(project_root, path))
         })
         .map(|path| {
-            ArtifactSeal::observe(&path)
+            LexicalSourceSeal::observe(project_root, &path)
                 .with_context(|| format!("revalidate lexical source identity {}", path.display()))
         })
         .collect()
 }
 
-fn read_lexical_file_text_limited(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
-    let file = std::fs::File::open(path)?;
-    read_lexical_text_limited(file, max_bytes)
+fn read_lexical_source_text_limited(
+    seal: &LexicalSourceSeal,
+    max_bytes: u64,
+) -> Result<Option<String>> {
+    let file = seal.open_verified()?;
+    Ok(read_lexical_text_limited(file, max_bytes)?)
 }
 
 fn read_lexical_text_limited(reader: impl Read, max_bytes: u64) -> std::io::Result<Option<String>> {
@@ -4524,6 +4603,10 @@ mod tests {
         let policy = codestory_contracts::workspace::SourceIndexPolicy::default();
         let source_seals = observe_lexical_source_seals(&project, Some(&current_storage_path))
             .expect("seal complete core inventory");
+        let source_seals: Vec<_> = source_seals
+            .iter()
+            .map(|seal| ArtifactSeal::observe(&seal.selected_path).expect("core source receipt"))
+            .collect();
         let bounded = prepare_bounded_lexical_input(
             &project,
             &current_storage_path,
@@ -5598,6 +5681,208 @@ mod tests {
             before
         );
         assert_eq!(std::fs::read_dir(cache.path()).expect("entries").count(), 2);
+    }
+
+    #[cfg(unix)]
+    fn select_lexical_source_fixture(project_root: &Path, source_path: &str) {
+        // Pin a route: discovery deduplicates aliases by canonical target.
+        std::fs::write(
+            project_root.join("codestory_project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "source aliases", "version": 1,
+                "source_groups": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "language": "JavaScript", "standard": "Default",
+                    "source_paths": [source_path], "exclude_patterns": [],
+                    "include_paths": [], "defines": {}, "language_specific": "Other"
+                }]
+            }))
+            .expect("manifest bytes"),
+        )
+        .expect("explicit source selection");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_source_aliases_prepare_and_revalidate() {
+        use std::os::unix::fs::symlink;
+
+        for directory_alias in [false, true] {
+            let project = TempDir::new().expect("project");
+            let project_root = project.path().canonicalize().expect("canonical project");
+            let source_dir = project_root.join("source");
+            std::fs::create_dir(&source_dir).expect("source directory");
+            let content = "export const selected_source = 'inside';\n";
+            std::fs::write(source_dir.join("entry.js"), content).expect("source");
+            let (selected_root, selected_file) = if directory_alias {
+                symlink("source", project_root.join("alias-dir")).expect("directory alias");
+                ("alias-dir", "alias-dir/entry.js")
+            } else {
+                symlink("source/entry.js", project_root.join("linked.js")).expect("file alias");
+                ("linked.js", "linked.js")
+            };
+            select_lexical_source_fixture(&project_root, selected_root);
+            let storage_root = TempDir::new().expect("storage root");
+            let storage_path = storage_root.path().join("core.db");
+            let mut storage = Store::open(&storage_path).expect("core storage");
+            publish_test_source_policy(&mut storage, &project_root, MAX_FILE_BYTES, &[]);
+
+            let source = lexical_source_input(&project_root, &storage_path)
+                .expect("admitted in-project aliases remain lexical source inputs");
+            assert!(
+                source.documents.iter().any(|document| {
+                    document.path == selected_file && document.content == content
+                }),
+                "selected alias must retain its path and target content"
+            );
+            let prepared = prepare_lexical_input_for_store(source, &project_root, &storage)
+                .expect("prepared alias inputs");
+            prepared
+                .revalidate_source_seals(&project_root, &storage_path)
+                .expect("unchanged aliases retain their source fence");
+            assert!(
+                ArtifactSeal::observe(&project_root.join(selected_root)).is_err(),
+                "published artifact seals must continue to refuse symlinks"
+            );
+
+            std::fs::write(
+                source_dir.join("entry.js"),
+                "export const selected_source = 'change';\n",
+            )
+            .expect("same-size source rewrite through alias target");
+            assert!(
+                prepared
+                    .revalidate_source_seals(&project_root, &storage_path)
+                    .is_err(),
+                "alias targets retain the source rewrite fence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_source_aliases_reject_retargeting_and_target_replacement() {
+        use std::os::unix::fs::symlink;
+
+        for directory_alias in [false, true] {
+            for mutation in ["inside", "outside", "dangling", "directory", "replacement"] {
+                let project = TempDir::new().expect("project");
+                let root = project.path().canonicalize().expect("root");
+                let outside = TempDir::new().expect("outside");
+                for dir in [
+                    root.join("one"),
+                    root.join("two"),
+                    outside.path().join("other"),
+                ] {
+                    std::fs::create_dir(&dir).expect("target directory");
+                    std::fs::write(dir.join("entry.js"), "same source bytes\n").expect("target");
+                }
+                let alias = root.join("alias");
+                symlink(
+                    if directory_alias {
+                        "one"
+                    } else {
+                        "one/entry.js"
+                    },
+                    &alias,
+                )
+                .expect("alias");
+                let selected = if directory_alias {
+                    alias.join("entry.js")
+                } else {
+                    alias.clone()
+                };
+                let before = LexicalSourceSeal::observe(&root, &selected).expect("seal alias");
+                let opened = before.open_verified().expect("open sealed file");
+                if mutation == "replacement" {
+                    std::fs::rename(root.join("one/entry.js"), root.join("one/old.js"))
+                        .expect("retain old inode");
+                    std::fs::write(root.join("one/entry.js"), "same source bytes\n")
+                        .expect("replace target");
+                } else {
+                    std::fs::remove_file(&alias).expect("remove alias");
+                    let destination = match mutation {
+                        "inside" => root.join(if directory_alias {
+                            "two"
+                        } else {
+                            "two/entry.js"
+                        }),
+                        "outside" => outside.path().join(if directory_alias {
+                            "other"
+                        } else {
+                            "other/entry.js"
+                        }),
+                        "dangling" => root.join("missing"),
+                        "directory" => root.clone(),
+                        _ => unreachable!(),
+                    };
+                    symlink(destination, &alias).expect("retarget alias");
+                }
+                assert!(
+                    before.open_verified().is_err(),
+                    "{directory_alias}/{mutation}: stale seal cannot open new source"
+                );
+                assert!(
+                    LexicalSourceSeal::observe(&root, &selected)
+                        .map_or(true, |after| after != before),
+                    "{directory_alias}/{mutation}: source publication fence detects drift"
+                );
+                assert_eq!(
+                    read_lexical_text_limited(opened, MAX_FILE_BYTES).expect("read pinned handle"),
+                    Some("same source bytes\n".into()),
+                    "already-open file retains original target"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_source_aliases_reject_an_unrelated_open_handle() {
+        let project = TempDir::new().expect("project");
+        let root = project.path().canonicalize().expect("root");
+        let selected = root.join("source.js");
+        let unrelated = root.join("unrelated.js");
+        std::fs::write(&selected, "same bytes").expect("selected");
+        std::fs::write(&unrelated, "same bytes").expect("unrelated");
+        let seal = LexicalSourceSeal::observe(&root, &selected).expect("source seal");
+        let file = std::fs::File::open(unrelated).expect("different file handle");
+        assert_eq!(
+            LexicalSourceSeal::observe(&root, &selected).expect("unchanged source"),
+            seal
+        );
+        assert!(
+            seal.verify_opened(&file).is_err(),
+            "unchanged path observations cannot admit an unrelated handle"
+        );
+        seal.open_verified()
+            .expect("original selected file still opens");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_source_aliases_revalidate_inventory_before_publication() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new().expect("project");
+        let root = project.path().canonicalize().expect("root");
+        std::fs::write(root.join("one.js"), "one\n").expect("one");
+        std::fs::write(root.join("two.js"), "two\n").expect("two");
+        let alias = root.join("linked.js");
+        symlink("one.js", &alias).expect("alias");
+        select_lexical_source_fixture(&root, "linked.js");
+        let storage_root = TempDir::new().expect("storage");
+        let storage_path = storage_root.path().join("core.db");
+        let mut storage = Store::open(&storage_path).expect("core");
+        publish_test_source_policy(&mut storage, &root, MAX_FILE_BYTES, &[]);
+        let source = lexical_source_input(&root, &storage_path).expect("source");
+        let prepared = prepare_lexical_input_for_store(source, &root, &storage).expect("prepared");
+        std::fs::remove_file(&alias).expect("remove alias");
+        symlink("two.js", &alias).expect("retarget alias");
+        assert!(
+            prepared
+                .revalidate_source_seals(&root, &storage_path)
+                .is_err()
+        );
     }
 
     #[test]

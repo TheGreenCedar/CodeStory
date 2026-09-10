@@ -809,7 +809,7 @@ mod tests {
                 embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
                 embedding_dim: Some(768),
                 sidecar_schema_version: Some(2),
-                sidecar_input_hash: Some("aaaaaaaaaaaaaaaa".repeat(1)),
+                sidecar_input_hash: Some("aaaaaaaaaaaaaaaa".to_string()),
                 sidecar_generation: Some("repo-v1-project-aaaaaaaaaaaaaaaa".into()),
                 projection_count: Some(1),
                 symbol_doc_count: Some(1),
@@ -853,17 +853,17 @@ mod tests {
             report.blocked_bytes,
             report.entries
         );
-        assert_eq!(
-            path_is_under_retained("00112233445566aa/codestory.db", "00112233445566aa"),
-            true
-        );
-        assert_eq!(
-            path_is_under_retained("00112233445566aa", "00112233445566aa"),
-            true
-        );
-        assert_eq!(
-            path_is_under_retained("00112233445566ab/codestory.db", "00112233445566aa"),
-            false
-        );
+        assert!(path_is_under_retained(
+            "00112233445566aa/codestory.db",
+            "00112233445566aa"
+        ));
+        assert!(path_is_under_retained(
+            "00112233445566aa",
+            "00112233445566aa"
+        ));
+        assert!(!path_is_under_retained(
+            "00112233445566ab/codestory.db",
+            "00112233445566aa"
+        ));
     }
 }
