@@ -4,47 +4,44 @@
 
 ## 0.17.6
 
-- Context responses include verified focused source snippets that were
-  previously omitted. Truncated snippets report their retained line ranges
-  and limits.
-- Agents can search, inspect source and follow relationships in any useful
-  order, using native tools whenever needed. Packets remain optional experiments
-  and do not decide whether an investigation is complete.
-- File listings keep project coverage details concise. Request the global
-  framework capability catalog with `--include-framework-coverage` or the
-  matching MCP option when checking framework support limits.
-- **Breaking interface change:** search, context and packet adopt publication
-  schema 3. Consumers must read evidence identities, status and gaps instead of
-  older hit/support/disposition shapes. Obsolete packet inputs are rejected;
-  `--diagnostics-out` replaces `--step-trace-out`. See the
-  [upgrade guide](docs/users/upgrading.md) for migration and rollback examples.
-- Core-only `search --repo-text off` reads the existing complete symbol index
-  without preparing embeddings, including when retrieval catalogs are
-  unwritable. An unindexed project returns `project_unavailable` without
-  creating a cache.
-- Full indexing resolves calls and imports after writing the source graph,
-  including when reusing cached parser output. Relationships no longer require
-  a later incremental edit to become available.
-- Malformed text configuration files no longer block the whole repository
-  index. Their source remains visible with explicit coverage gaps, and stale
-  structural claims are removed. JSONC comments and trailing commas work in
-  supported configuration files; ordinary JSON remains strict.
-- Pointer-returning C and C++ functions and variable-bound JavaScript,
-  TypeScript and TSX functions retain their full definitions. A function
-  expression's private name no longer resolves to an unrelated outer function.
-- Normal cache upgrades preserve bookmarks and annotations while moving from
-  schema 31 to immutable schema-32 generations. Failed or interrupted
-  publication preserves the previous complete generation for recovery.
-- Cold indexing sends more documents through each bounded embedding request
-  while retaining the same model, vectors and dense coverage. Packet assembly
-  reuses the retrieval result that established admission.
-- Experimental packets retain at most sixteen evidence rows and a 16 KiB
-  serialized result. Missing or oversized evidence produces explicit gaps;
-  evidence availability never asserts answer sufficiency.
-- MCP discovery and results agree with each supported protocol profile. Older
-  profiles receive JSON text and modern profiles receive matching structured
-  content. `affected` also reports same-package tests as focused hints when
-  graph traversal does not reach them.
+CodeStory 0.17.6 lets agents choose how to investigate a repository and puts
+more of the relevant source in their results. Search, inspect code and follow
+relationships in the order the task needs, with native tools available
+throughout.
+
+- **Inspect useful source directly.** Context results include focused source
+  snippets with verified line ranges and clear truncation limits. C and C++
+  functions returning pointers, and functions assigned to variables in
+  JavaScript, TypeScript and TSX, retain their complete definitions.
+- **Follow relationships from the first index.** Calls and imports are
+  available after full indexing, including when parser results are reused.
+  Affected-code results also suggest relevant tests in the same package.
+- **Keep working past broken configuration files.** Malformed text
+  configuration no longer blocks the whole repository index. Unsupported or
+  broken content is reported as a coverage gap. Supported JSONC files accept
+  comments and trailing commas; ordinary JSON remains strict.
+- **Reuse work and keep navigation focused.** Indexing reuses unchanged
+  components and exact vectors, and packets reuse completed retrieval work.
+  Core-only `search --repo-text off` searches an existing symbol index without
+  starting embeddings. File listings focus on project coverage; the full
+  framework catalog remains available on request.
+- **Keep bookmarks through upgrades and interruptions.** Cache upgrades
+  preserve bookmarks and annotations. If publishing an updated index fails or
+  is interrupted, the previous complete index remains available for recovery.
+
+### Upgrading
+
+**Breaking interface change:** search, context and packet responses move to
+publication schema 3. Custom clients must use evidence identities, status and
+gaps in place of the previous hit, support and disposition shapes. Obsolete
+packet arguments are rejected, and `--diagnostics-out` replaces
+`--step-trace-out`. MCP responses use the format required by each supported
+protocol profile.
+
+See the [upgrade guide](docs/users/upgrading.md) for migration examples and the
+rollback procedure, which uses a preserved pre-upgrade cache copy. Packets
+remain optional experiments, bounded to sixteen evidence rows and 16 KiB;
+their results do not decide whether an investigation is complete.
 
 ## 0.17.5
 

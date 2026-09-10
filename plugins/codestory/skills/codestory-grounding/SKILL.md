@@ -87,9 +87,15 @@ send both. Batch known source windows with `snippet.paths` when useful.
   verification code is outside the default MCP surface. Do not synthesize a
   typed proof contract from English or infer proof authority from graph edges.
 - Runtime, deployment, security and rendered-UI claims need their corresponding
-  external evidence. Keep conclusions within the relevant inputs, guards and
-  environment actually checked. Distinguish broader source inference from
-  observed execution or effective policy.
+  external evidence. For a behavioral probe, separate setup, the operation being
+  checked and observations of its effects. Observe state after the operation;
+  account for observations that can themselves change it. Use independent
+  setups when earlier operations or observations would affect later checks.
+  Compare the actual output with the conclusion before reporting it. Keep
+  conclusions within the relevant inputs, guards and environment actually
+  checked. If the output cannot distinguish relevant causes, report that
+  uncertainty. Distinguish broader source inference from observed execution or
+  effective policy.
 
 ## Experimental packets
 
