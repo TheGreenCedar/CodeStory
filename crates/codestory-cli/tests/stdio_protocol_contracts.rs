@@ -1399,9 +1399,18 @@ fn required_on_any_branch(schema: &Value, field: &str) -> bool {
         })
 }
 
+fn schema_value<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
+    schema.pointer(pointer).or_else(|| {
+        schema
+            .get("allOf")
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(|branch| schema_value(branch, pointer))
+    })
+}
+
 fn required_fields(schema: &Value) -> BTreeSet<&str> {
-    schema
-        .get("required")
+    schema_value(schema, "/required")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("schema should include required fields: {schema}"))
         .iter()
@@ -1414,14 +1423,12 @@ fn required_fields(schema: &Value) -> BTreeSet<&str> {
 }
 
 fn schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
-    schema
-        .pointer(&format!("/properties/{name}"))
+    schema_value(schema, &format!("/properties/{name}"))
         .unwrap_or_else(|| panic!("schema should include property {name}: {schema}"))
 }
 
 fn assert_schema_enum_values(schema: &Value, pointer: &str, expected: &[&str]) {
-    let values: BTreeSet<_> = schema
-        .pointer(pointer)
+    let values: BTreeSet<_> = schema_value(schema, pointer)
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("schema should include enum array at {pointer}: {schema}"))
         .iter()
@@ -2271,7 +2278,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             .expect("tools array")
             .iter()
             .all(|tool| {
-                tool.pointer("/inputSchema/required")
+                schema_value(&tool["inputSchema"], "/required")
                     .and_then(Value::as_array)
                     .is_some_and(|required| required.contains(&json!("project")))
             }),
@@ -2944,12 +2951,14 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "affected.filter should be a string: {affected}"
     );
     assert!(
-        affected.get("anyOf").is_none(),
+        schema_value(affected, "/anyOf").is_none(),
         "affected exact-one input contract should not be described as anyOf: {affected}"
     );
-    let affected_one_of = affected["oneOf"].as_array().unwrap_or_else(|| {
-        panic!("affected should require exactly one path source via oneOf: {affected}")
-    });
+    let affected_one_of = schema_value(affected, "/oneOf")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("affected should require exactly one path source via oneOf: {affected}")
+        });
     assert!(
         affected_one_of
             .iter()
@@ -6444,7 +6453,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_preparing_or_unavailable(&search, json!("cold-search-unavailable"));
-    assert_eq!(error["tool"], json!("search"));
+    assert_eq!(error["tool"], json!("search"), "search result: {error}");
     assert!(
         error["diagnostics_uri"]
             .as_str()

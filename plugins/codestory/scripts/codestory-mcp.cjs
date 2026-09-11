@@ -4353,14 +4353,12 @@ function validatePublishedSchemaValue(schema, value, pointer = '/arguments') {
     }
   }
   if (Array.isArray(schema.allOf)) {
-    const failed = schema.allOf.find((constraint) => !publishedSchemaAccepts(constraint, value));
-    if (failed) {
-      if (schema.allOf.length === 1) {
-        violations.push(...validatePublishedSchemaValue(failed, value, pointer));
-      } else {
-        const names = Array.isArray(failed?.not?.required)
-          ? failed.not.required.map((name) => `\`${name}\``).join(' and ')
-          : '';
+    const combinedBudget = schema.allOf.length > 1
+      && schema.allOf.every((constraint) => Array.isArray(constraint?.not?.required));
+    if (combinedBudget) {
+      const failed = schema.allOf.find((constraint) => !publishedSchemaAccepts(constraint, value));
+      if (failed) {
+        const names = failed.not.required.map((name) => `\`${name}\``).join(' and ');
         violations.push(publishedSchemaViolation(
           names ? 'combined_item_limit' : 'unsatisfied_all_of',
           pointer,
@@ -4368,6 +4366,10 @@ function validatePublishedSchemaValue(schema, value, pointer = '/arguments') {
             ? `${names} may hold at most ${schema.allOf.length} item(s) together`
             : 'value violates a declared combined constraint',
         ));
+      }
+    } else {
+      for (const constraint of schema.allOf) {
+        violations.push(...validatePublishedSchemaValue(constraint, value, pointer));
       }
     }
   }

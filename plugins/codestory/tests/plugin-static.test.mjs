@@ -179,7 +179,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   );
   const snippet = catalog.tools.find(({ name }) => name === "snippet");
   assert.deepEqual(
-    Object.keys(snippet.inputSchema.properties).sort(),
+    Object.keys(snippet.inputSchema.allOf[0].properties).sort(),
     ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "path", "paths", "project", "query", "scope", "start_line", "symbol_id"],
   );
 });
@@ -661,6 +661,28 @@ test("fail-open schema interpreter covers const anyOf and allOf", () => {
   const violations = validate(schema, { kind: "wrong", value: "forbidden" }, "/arguments");
   assert.ok(violations.some(({ code, pointer }) => code === "invalid_const_value" && pointer === "/arguments/kind"));
   assert.ok(violations.some(({ code, pointer }) => code === "forbidden_combination" && pointer === "/arguments"));
+});
+
+test("composed selectors preserve argument diagnostics and project routing", () => {
+  const common = {
+    type: "object", additionalProperties: false, required: ["project"],
+    properties: {
+      project: { type: "string", minLength: 1 },
+      id: { type: "string", minLength: 1 },
+      query: { type: "string", minLength: 1 },
+    },
+  };
+  const selector = { oneOf: [{ required: ["id"] }, { required: ["query"] }] };
+  const flat = { ...common, ...selector };
+  const composed = { type: "object", allOf: [common, selector] };
+  const validate = launcherTest.validatePublishedSchemaValue;
+  for (const value of [null, [], 1, "x", {}, { id: "a" }, { project: "", id: "" },
+    { project: "/repo", id: "a", query: "b", extra: true }, { project: "/repo", query: "b" }]) {
+    assert.deepEqual(validate(composed, value), validate(flat, value), JSON.stringify(value));
+  }
+  const nestedFlat = { type: "array", items: flat };
+  const nestedComposed = { type: "array", items: composed };
+  assert.deepEqual(validate(nestedComposed, [{ id: "" }, 2]), validate(nestedFlat, [{ id: "" }, 2]));
 });
 
 test("fail-open schema validation covers every generated input keyword", () => {

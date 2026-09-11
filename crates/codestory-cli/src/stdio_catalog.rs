@@ -114,7 +114,10 @@ impl ToolSpec {
         let mut tool = Map::from_iter([
             ("name".to_string(), json!(self.name)),
             ("description".to_string(), json!(self.description)),
-            ("inputSchema".to_string(), input_schema),
+            (
+                "inputSchema".to_string(),
+                compose_input_selectors(input_schema),
+            ),
             ("safety".to_string(), self.safety.to_json()),
             ("annotations".to_string(), self.safety.annotations_json()),
         ]);
@@ -126,6 +129,58 @@ impl ToolSpec {
         }
         Value::Object(tool)
     }
+}
+
+/// Keep common named arguments visible to hosts that project `oneOf` as a union.
+/// Only selector-only object unions need factoring; tagged unions keep their
+/// branch-local properties. Traverse schema positions, never defaults or examples.
+fn compose_input_selectors(mut schema: Value) -> Value {
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            *property = compose_input_selectors(property.take());
+        }
+    }
+    for keyword in ["items", "not"] {
+        if let Some(child) = object.get_mut(keyword) {
+            *child = compose_input_selectors(child.take());
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                *child = compose_input_selectors(child.take());
+            }
+        }
+    }
+    let selector_union = object
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| {
+            !branches.is_empty()
+                && branches.iter().all(|branch| {
+                    branch.as_object().is_some_and(|branch| {
+                        branch.len() == 1 && branch.get("required").is_some_and(Value::is_array)
+                    })
+                })
+        });
+    if object.get("type") != Some(&json!("object"))
+        || !object.get("properties").is_some_and(Value::is_object)
+        || !selector_union
+    {
+        return schema;
+    }
+    let mut constraints = Map::new();
+    for keyword in ["anyOf", "oneOf", "allOf", "not"] {
+        if let Some(value) = object.remove(keyword) {
+            constraints.insert(keyword.to_string(), value);
+        }
+    }
+    // The outer type keeps invalid scalar inputs from reaching selector-only
+    // branches, which have no type constraint of their own.
+    json!({"type": "object", "allOf": [schema, constraints]})
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2685,6 +2740,32 @@ pub(crate) fn prompt_get_json(name: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_composition_exposes_named_arguments_without_rewriting_data_or_tagged_unions() {
+        let tagged = json!({"oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "a"}}, "required": ["kind"]},
+            {"type": "object", "properties": {"kind": {"const": "b"}}, "required": ["kind"]}
+        ]});
+        let data = json!({"type": "object", "properties": {}, "oneOf": [{"required": ["x"]}]});
+        let schema = json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"oneOf": {"default": data}, "tagged": tagged,
+                "items": {"type": "array", "items": {
+                    "type": "object", "properties": {"id": {"type": "string"}, "query": {"type": "string"}},
+                    "oneOf": [{"required": ["id"]}, {"required": ["query"]}]
+                }}},
+            "required": ["items"], "oneOf": [{"required": ["oneOf"]}, {"required": ["tagged"]}]
+        });
+        let composed = compose_input_selectors(schema);
+        assert_eq!(composed["type"], "object");
+        let common = &composed["allOf"][0];
+        assert_eq!(common["properties"]["oneOf"]["default"], data);
+        assert_eq!(common["properties"]["tagged"], tagged);
+        assert!(common["properties"]["items"]["items"]["allOf"][0]["properties"]["id"].is_object());
+        assert_eq!(common["required"], json!(["items"]));
+        assert_eq!(compose_input_selectors(composed.clone()), composed);
+    }
 
     fn packet_probe_schema() -> Value {
         let catalog = tools_list_json();
