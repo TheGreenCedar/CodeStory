@@ -401,19 +401,30 @@ fn validate_combinators(
             ));
         }
     }
-    if let Some(constraints) = schema.get("allOf").and_then(Value::as_array)
-        && let Some(failed) = constraints
-            .iter()
-            .find(|constraint| !accepts(constraint, value))
-    {
-        if constraints.len() == 1 {
-            validate_value(failed, value, pointer, out);
+    if let Some(constraints) = schema.get("allOf").and_then(Value::as_array) {
+        // Split-budget clauses are one user-facing constraint. Ordinary
+        // intersections preserve every leaf diagnostic, including project routing.
+        let combined_budget = constraints.len() > 1
+            && constraints.iter().all(|constraint| {
+                constraint
+                    .pointer("/not/required")
+                    .is_some_and(Value::is_array)
+            });
+        if combined_budget {
+            if let Some(failed) = constraints
+                .iter()
+                .find(|constraint| !accepts(constraint, value))
+            {
+                out.push(combined_constraint_violation(
+                    constraints.len(),
+                    failed,
+                    pointer,
+                ));
+            }
         } else {
-            out.push(combined_constraint_violation(
-                constraints.len(),
-                failed,
-                pointer,
-            ));
+            for constraint in constraints {
+                validate_value(constraint, value, pointer, out);
+            }
         }
     }
     if let Some(forbidden) = schema.get("not")
@@ -647,9 +658,17 @@ mod tests {
     fn every_tool_declares_a_published_input_schema() {
         for tool in crate::stdio_catalog::tool_names() {
             let schema = crate::stdio_catalog::tool_input_schema(tool).expect("published schema");
-            assert_eq!(
-                schema.get("additionalProperties"),
-                Some(&json!(false)),
+            let mut violations = Vec::new();
+            validate_value(
+                schema,
+                &json!({"undeclared_argument": true}),
+                "/arguments",
+                &mut violations,
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.code == "unknown_property"),
                 "{tool} must deny undeclared arguments"
             );
         }
@@ -703,6 +722,51 @@ mod tests {
             ),
             vec!["unknown_property", "invalid_selector"]
         );
+    }
+
+    #[test]
+    fn composed_selectors_preserve_all_argument_diagnostics() {
+        let common = json!({
+            "type": "object", "additionalProperties": false, "required": ["project"],
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "id": {"type": "string", "minLength": 1},
+                "query": {"type": "string", "minLength": 1}
+            }
+        });
+        let selectors = json!({"oneOf": [{"required": ["id"]}, {"required": ["query"]}]});
+        let mut flat = common.clone();
+        flat.as_object_mut()
+            .unwrap()
+            .extend(selectors.as_object().unwrap().clone());
+        let composed = json!({"type": "object", "allOf": [common, selectors]});
+        for value in [
+            json!(null),
+            json!([]),
+            json!(1),
+            json!("x"),
+            json!({}),
+            json!({"id": "a"}),
+            json!({"project": "", "id": ""}),
+            json!({"project": "/repo", "id": "a", "query": "b", "extra": true}),
+            json!({"project": "/repo", "query": "b"}),
+        ] {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            validate_value(&flat, &value, "/arguments", &mut before);
+            validate_value(&composed, &value, "/arguments", &mut after);
+            assert_eq!(
+                before
+                    .iter()
+                    .map(ArgumentViolation::to_json)
+                    .collect::<Vec<_>>(),
+                after
+                    .iter()
+                    .map(ArgumentViolation::to_json)
+                    .collect::<Vec<_>>(),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -1501,6 +1565,21 @@ const ARGUMENT_SYNONYMS: &[&[&str]] = &[
     &["depth", "max_depth"],
 ];
 
+fn schema_declares_property(schema: &Value, name: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(name))
+        || schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| schema_declares_property(branch, name))
+            })
+}
+
 /// Rewrite supplied argument names to the spelling this tool's schema declares.
 ///
 /// Only ever renames when exactly one member of a synonym group is declared and the caller
@@ -1511,14 +1590,13 @@ pub(crate) fn reconcile_argument_synonyms(tool: &str, arguments: &mut Value) {
     let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
         return;
     };
-    let Some(declared) = schema.get("properties").and_then(Value::as_object) else {
-        return;
-    };
     let Some(supplied) = arguments.as_object_mut() else {
         return;
     };
     for group in ARGUMENT_SYNONYMS {
-        let mut accepted = group.iter().filter(|name| declared.contains_key(**name));
+        let mut accepted = group
+            .iter()
+            .filter(|name| schema_declares_property(schema, name));
         let (Some(canonical), None) = (accepted.next(), accepted.next()) else {
             continue;
         };

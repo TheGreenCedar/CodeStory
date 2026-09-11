@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Code-mode hosts can see named navigation arguments, including project routing
+and snippet ranges, when a tool accepts alternative selectors.
+
 ## 0.17.6
 
 CodeStory 0.17.6 lets agents choose how to investigate a repository and puts
