@@ -1,7 +1,7 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
-use codestory_indexer::resolution::RESOLUTION_SUPPORT_SNAPSHOT_VERSION;
 use codestory_indexer::WorkspaceIndexer;
+use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_store::Store as Storage;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -16846,7 +16846,14 @@ func string(n int) int { return n }
 func Convert() int { return string(2) }
 "#,
     )])?;
-    assert_resolved_call_to_kind("G04", &nodes, &edges, "Convert", "string", NodeKind::FUNCTION);
+    assert_resolved_call_to_kind(
+        "G04",
+        &nodes,
+        &edges,
+        "Convert",
+        "string",
+        NodeKind::FUNCTION,
+    );
     assert_no_resolved_call_to_method_owner("G04", &nodes, &edges, "Convert", "Handler", "String");
 
     // G05: named conversion must not target Handler.Token.
@@ -16922,10 +16929,38 @@ func RealUpper(h Handler) string { return h.String() }
 func RealLower(h Handler) string { return h.string() }
 "#;
     let (nodes, edges) = index_files(&[("g07.go", source)])?;
-    assert_resolved_call_to_method_owner("G07-upper", &nodes, &edges, "RealUpper", "Handler", "String");
-    assert_resolved_call_to_method_owner("G07-lower", &nodes, &edges, "RealLower", "Handler", "string");
-    assert_no_resolved_call_to_method_owner("G07-upper", &nodes, &edges, "RealUpper", "Other", "String");
-    assert_no_resolved_call_to_method_owner("G07-lower", &nodes, &edges, "RealLower", "Other", "string");
+    assert_resolved_call_to_method_owner(
+        "G07-upper",
+        &nodes,
+        &edges,
+        "RealUpper",
+        "Handler",
+        "String",
+    );
+    assert_resolved_call_to_method_owner(
+        "G07-lower",
+        &nodes,
+        &edges,
+        "RealLower",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G07-upper",
+        &nodes,
+        &edges,
+        "RealUpper",
+        "Other",
+        "String",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G07-lower",
+        &nodes,
+        &edges,
+        "RealLower",
+        "Other",
+        "string",
+    );
     Ok(())
 }
 
@@ -16947,9 +16982,25 @@ func Convert(k Key) string { return string(k) }
 func Variable(run func() int) int { return run() }
 "#;
     let (nodes, edges) = index_files(&[("methods.go", methods), ("calls.go", conversions)])?;
-    assert_no_resolved_call_to_method_owner("G08-string", &nodes, &edges, "Convert", "Handler", "String");
-    assert_no_resolved_call_to_method_owner("G08-string-lower", &nodes, &edges, "Convert", "Handler", "string");
-    assert_no_resolved_call_to_method_owner("G08-run", &nodes, &edges, "Variable", "Handler", "run");
+    assert_no_resolved_call_to_method_owner(
+        "G08-string",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G08-string-lower",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G08-run", &nodes, &edges, "Variable", "Handler", "run",
+    );
     assert_no_resolved_call_of_kind("G08-string", &nodes, &edges, "Convert", NodeKind::METHOD);
     assert_no_resolved_call_of_kind("G08-run", &nodes, &edges, "Variable", NodeKind::METHOD);
 
@@ -17042,9 +17093,13 @@ func Guess(x any) { x.String() }
 }
 
 #[test]
-fn test_go_ownerless_bare_call_eligibility_survives_resolution_support_refresh() -> anyhow::Result<()>
-{
-    // G13: snapshot reuse, then refresh changing the misleading method's case.
+fn test_go_ownerless_bare_call_eligibility_survives_resolution_support_refresh()
+-> anyhow::Result<()> {
+    // G13: eligibility after snapshot-loaded resolution, then after a method-case
+    // refresh. Unchanged incremental indexing skips ResolutionPass when
+    // graph_projection_changed is false; the authentic reuse path is the same
+    // standalone ResolutionPass::run used by the existing snapshot integration
+    // test.
     let dir = tempdir()?;
     let root = dir.path();
     let file_path = root.join("g13.go");
@@ -17083,8 +17138,39 @@ func Convert(k Key) string { return string(k) }
 
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
-    assert_no_resolved_call_to_method_owner("G13-initial", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_to_method_owner(
+        "G13-initial",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
     assert_no_resolved_call_of_kind("G13-initial", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    let snapshot_loaded = ResolutionPass::new().run(&mut storage)?;
+    assert!(
+        snapshot_loaded.telemetry.support_snapshot_hit,
+        "G13 must load v7 call-candidate kind from the stored snapshot"
+    );
+    assert!(!snapshot_loaded.telemetry.support_snapshot_stored);
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner(
+        "G13-snapshot-hit",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_of_kind(
+        "G13-snapshot-hit",
+        &nodes,
+        &edges,
+        "Convert",
+        NodeKind::METHOD,
+    );
 
     fs::write(
         &file_path,
@@ -17100,8 +17186,22 @@ func Convert(k Key) string { return string(k) }
 
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
-    assert_no_resolved_call_to_method_owner("G13-refresh", &nodes, &edges, "Convert", "Handler", "string");
-    assert_no_resolved_call_to_method_owner("G13-refresh", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_to_method_owner(
+        "G13-refresh",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G13-refresh",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
     assert_no_resolved_call_of_kind("G13-refresh", &nodes, &edges, "Convert", NodeKind::METHOD);
     Ok(())
 }

@@ -1089,8 +1089,8 @@ mod tests {
     }
 
     #[test]
-    fn go_ownerless_bare_call_does_not_select_semantic_method_when_fallback_is_enabled() -> Result<()>
-    {
+    fn go_ownerless_bare_call_does_not_select_semantic_method_when_fallback_is_enabled()
+    -> Result<()> {
         let conn = Connection::open_in_memory()?;
         create_node_table(&conn)?;
         insert_typed_callable(
@@ -1134,7 +1134,15 @@ mod tests {
             1,
             4,
         )?;
-        insert_typed_callable(&conn, 11, NodeKind::FUNCTION, "string", "probe.string", 1, 6)?;
+        insert_typed_callable(
+            &conn,
+            11,
+            NodeKind::FUNCTION,
+            "string",
+            "probe.string",
+            1,
+            6,
+        )?;
 
         let index =
             CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32])?;
@@ -1148,8 +1156,7 @@ mod tests {
                 confidence: 0.95,
             }],
         )?;
-        let without_semantic =
-            compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+        let without_semantic = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
 
         assert_eq!(
             with_semantic.strategy,
