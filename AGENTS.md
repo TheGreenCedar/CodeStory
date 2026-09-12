@@ -6,26 +6,37 @@ pages, runbooks, and workflows own detailed mechanics.
 
 ## Start Here
 
-- Establish current truth before choosing work: inspect the current branch and
-  integration head, active worktrees, open PR or issue ownership, and the
-  release state. Do not reuse an active lane or implement routine work directly
-  on `dev/codestory-next`.
+- Before mutating the tree, creating a lane, or delegating work, inspect the
+  current branch, integration head, active worktrees, and open PR or issue
+  ownership. Inspect release state only for release work. Do not reuse an
+  active lane or implement routine work directly on `dev/codestory-next`.
 - Run `node scripts/codex-worktree-setup.mjs` for a delegated worktree. Treat
   its printed base, child head, PR head, and proof target as authoritative
   before cache repair, readiness work, or verification. When changing setup,
   keep the PowerShell and POSIX implementations behaviorally aligned and run
   the setup self-tests from the testing matrix.
-- Before source claims, planning edits, choosing tests, or reviewing changes,
-  use the canonical CodeStory grounding skill when its MCP tools are visible.
-  Every MCP call must carry the target repository's absolute `project` root.
-  Call the tool that matches the task directly; tool gating owns readiness and
+- Use the canonical CodeStory grounding skill when its MCP tools are visible
+  and the task is repository discovery, relationship tracing, change-impact
+  analysis, or CodeStory retrieval / installed-plugin validation. Skip that
+  loop only for bounded inspection or editing of named files that does not
+  require those operations; naming a file does not by itself forbid CodeStory.
+  Every
+  MCP call must carry the target repository's absolute `project` root. Call
+  the tool that matches the task directly; tool gating owns readiness and
   managed preparation. Read status only after a call fails to converge. If the
   MCP tools are not visible, use ordinary source inspection and report the
   visibility gap. CLI diagnostics do not prove that the packaged plugin MCP is
-  live in the agent host.
-- For a large change, read `docs/architecture/overview.md`, the owning
-  subsystem page, `docs/contributors/debugging.md`, and
-  `docs/contributors/testing-matrix.md` before editing.
+  live in the agent host. Qualify CodeStory results as retrieval or
+  installed-plugin evidence, not as live runtime behavior, unless the matching
+  proof tier exists.
+- When a linked document path is already known, bound `rg` or search to that
+  file. Do not run a broad package or repository search merely to rediscover a
+  documented path.
+- Route reading by the task: the owning architecture page (from
+  `docs/architecture/overview.md` and the subsystem page) when contracts
+  change, `docs/contributors/debugging.md` for failures, and the relevant lane
+  in `docs/contributors/testing-matrix.md` when selecting proof. Do not
+  pre-read all four contributor docs for every large change.
 
 ## Ownership Boundaries
 
@@ -136,9 +147,12 @@ adapter to compensate for incorrect upstream state.
   isolated cache/install/plugin state roots.
   Never clean or write the real user cache to make a test pass, and never
   serialize the suite to hide state leakage.
-- Docs-only scope is `README.md`, `docs/**`, `plugins/codestory/README.md`,
-  `plugins/codestory/docs/**`, and `plugins/codestory/skills/**`. Read changed
-  pages back, then run `git diff --check` and
+- Docs-only scope, including the exception that
+  `docs/contributors/testing-matrix.md` is not in this lane and remains a
+  crate-durability path pin, is owned by
+  `docs/contributors/testing-matrix.md#docs-only-fast-path`. That stronger
+  existing gate applies; this file does not redefine or reduce it. Read
+  changed pages back, then run `git diff --check` and
   `node .github/scripts/check-doc-links.mjs`. Do not add tests that assert prose.
   Plugin adapter changes also run
   `node --test plugins/codestory/tests/plugin-static.test.mjs`.
@@ -201,7 +215,12 @@ adapter to compensate for incorrect upstream state.
 
 ## Release Rules
 
-### Candidate freeze and proof budget
+Operator sequence, freeze states, invalidation commands, and bump surface lists
+live in `docs/contributors/release-runbook.md`. Named proof lanes live in
+`docs/contributors/testing-matrix.md`. This section owns policy. If prose and
+machine policy disagree, stop and reconcile their owners before continuing.
+
+### Authority, freeze, and proof budget
 
 - Before any gate expected to exceed five minutes, record the exact commit and
   tree, confirm the worktree is clean and pushed, and confirm that every
@@ -213,14 +232,11 @@ adapter to compensate for incorrect upstream state.
   dispatch a broad source, package, calibration, or hardware gate until all
   support PRs are integrated into the release lane. Broad proof belongs to the
   final integration head, not every independently mergeable PR.
-- Release order is: merge all blockers, run focused checks, run actual-host
-  microprobes, run source stabilization on the pushed final source head, then
-  calibrate, apply the sole generated constant-set change, accept and freeze
-  that generated head, and qualify. Source stabilization runs the hostile
-  mutations, generalization checks, all-target/all-feature lint, complete
-  workspace test, and Windows source contracts concurrently. If another source
-  or workflow change becomes necessary, immediately invalidate the candidate
-  and cancel every queued or running proof for it.
+- Release order is: merge all blockers, focused checks, actual-host
+  microprobes, source stabilization on the pushed final source head, calibrate,
+  sole generated constant-set change, freeze that generated head, then
+  qualify. If another source or workflow change becomes necessary, immediately
+  invalidate the candidate and cancel every queued or running proof for it.
 - Run the full workspace source proof exactly once per release candidate, as
   part of source stabilization before calibration. Calibration cannot start
   without that exact-head receipt. The generated constant-only head receives
@@ -239,46 +255,32 @@ adapter to compensate for incorrect upstream state.
   mutation matrix and only the context needed to execute it. Its output is
   limited to counterexamples or acceptance evidence. After two failed
   revisions of the same shape, stop patching examples and redesign the seam.
-
-- Freeze the selected release claim before qualification. For the standard
-  v0.16 release described in `CHANGELOG.md`, build one candidate; install its
-  exact archives on Apple Silicon macOS, Windows x64, and Linux x64; complete
-  one real project-scoped `ground` on each with Metal or Vulkan as applicable;
-  verify archive checksums and bundled runtime identity; then promote and
-  publish through the canonical workflow.
-- That standard claim does not include answer-accuracy or performance
-  thresholds, benchmark baselines, or same-attempt optional evaluation
-  alignment. Do not start, repair, or rerun those lanes unless the selected
-  claim or changed owning code requires them. A failure in optional evaluation
-  machinery is not a release blocker.
+- Freeze the selected release claim before qualification. The standard claim
+  installs the candidate's exact archives on Apple Silicon macOS, Windows x64,
+  and Linux x64; completes one real project-scoped `ground` on each with Metal
+  or Vulkan as applicable; verifies archive checksums and bundled runtime
+  identity; then promotes and publishes through the canonical workflow. It
+  does not include answer-accuracy or performance thresholds, benchmark
+  baselines, or same-attempt optional evaluation alignment. Do not start,
+  repair, or rerun those lanes unless the selected claim or changed owning
+  code requires them. A failure in optional evaluation machinery is not a
+  release blocker.
 - Reuse passing evidence for the same candidate. After two equivalent failures,
   do not make a third attempt without new evidence and a changed approach. When
   the selected claim is proved or the user says the evidence is sufficient,
   preserve the artifacts and stop. Signing, notarization, checksums, and
   publication remain owned by the canonical release workflow.
-- `crates/codestory-cli/Cargo.toml` is the release version source. Bump every
-  surface with `node scripts/bump-version.mjs --version <version>`, which writes
-  all of them and then runs the release validator; `--check` reports drift
-  without writing. Do not edit them by hand. The surfaces are every
-  `codestory-*` workspace crate, `Cargo.lock`, the `producer.version` in
-  `crates/codestory-llama-sys/model-contract.json`, the CLI version pin in
-  `plugins/codestory/cli-version.json`, and these plugin manifests:
-  (`producer.embedding_revision` is deliberately not a release surface: it keys
-  persisted vectors, so bumping it discards every user's dense sidecars. Move it
-  only when the embeddings themselves change -- model, llama.cpp commit,
-  pooling, normalization, dimension, prefixes, or vector schema.)
-  - `plugins/codestory/plugin.json`
-  - `plugins/codestory/.codex-plugin/plugin.json`
-  - `plugins/codestory/.cursor-plugin/plugin.json`
-  - `plugins/codestory/.claude-plugin/plugin.json`
-  - `plugins/codestory/.github/plugin/plugin.json`
-- For a plugin-only release, use
-  `node scripts/bump-version.mjs --version <plugin-version> --lane plugin`.
-  That lane leaves native and model versions unchanged, fetches the pinned
-  CLI release's published checksum file, and writes all three archive digests
-  into `plugins/codestory/cli-version.json`.
-  `--archive-checksums <path-or-https-url>` is the explicit offline/test source;
-  never type those digests by hand.
+
+### Version, lineage, and CPU
+
+- `crates/codestory-cli/Cargo.toml` is the release version source. Apply bumps
+  only through `node scripts/bump-version.mjs`; `--check` reports drift. Do not
+  edit version surfaces by hand. `producer.embedding_revision` is not a
+  release surface: it keys persisted vectors, so bumping it discards every
+  user's dense sidecars. Move it only when the embeddings themselves change
+  (model, llama.cpp commit, pooling, normalization, dimension, prefixes, or
+  vector schema). Surface list, plugin-only lane, and checksum sourcing are in
+  the release runbook.
 - Release ordering is **bump-then-calibrate**. Bump the version first,
   calibrate the per-user embedding server on the bumped tree, land the
   constant-set freeze commit, then package and release. The frozen-candidate
@@ -305,6 +307,9 @@ adapter to compensate for incorrect upstream state.
 - Validate release changes with
   `python .github/scripts/check-codestory-release.py --version <version>` and
   `node .github/scripts/check-workflow-policy.mjs`.
+
+### Promotion, tags, evidence tiers, and catalog truth
+
 - Never create or push `v*` tags manually. A synchronized version bump on
   `main` triggers the release workflow that creates the tag, GitHub release,
   native archives, and `SHA256SUMS.txt`.
@@ -323,54 +328,27 @@ adapter to compensate for incorrect upstream state.
   hardware, post-publish, installed-runtime, and live behavior evidence for the
   claims being shipped. A merge, tag, or downloadable archive alone is not
   release completion.
-- Both release lanes own marketplace publication. The `marketplace-publish` job
-  in `release.yml` and in `plugin-release.yml` points
-  `TheGreenCedar/AgentPluginMarketplace` at the published commit after the
-  release exists. Do not hand-edit the catalog before a release; preflight proves
-  the install path against a candidate-pinned fixture and no longer requires the
-  live catalog to match an unreleased commit.
-- Catalog publication is delivery, not a release gate. It runs after an
-  irreversible tag, so a missing credential or a rejected push must not fail the
-  release; `release-claims.json` records that with
-  `workflow_policy.catalog_delivery.release_gate: false`. The job absorbs its own
-  failure and records one of two explicit states, and post-publish smoke runs
-  either way: `published` resolves the live catalog, `deferred` resolves a catalog
-  pinned to the released commit and stamps the distinct installer identity
-  `codex_marketplace_deferred_fixture` into the release ledger. A release may say
-  the catalog was updated only when the push actually landed; the honest outcome
-  otherwise is "released, catalog sync deferred".
-- The two states are distinct **end to end**, not just in a log line. Each has its
+- Catalog publication is delivery, not a release gate
+  (`workflow_policy.catalog_delivery.release_gate: false`). Do not hand-edit
+  the catalog. A release may say the catalog was updated only when the push
+  actually landed; otherwise the honest outcome is "released, catalog sync
+  deferred". `published` and `deferred` are distinct end to end: each has its
   own installer identity, its own `marketplace.repository` in the install
-  attestation (`local:candidate-pinned-marketplace-fixture` for a fixture), and
-  its own accepted shape in `marketplace_installation.py` — the resolver reports a
-  local source, a marketplace root outside the Codex home, and no pinned `ref`,
-  which the live shape cannot describe and must never be relaxed to admit. A
-  deferred install must resolve a catalog carrying the
-  `.codestory-marketplace-fixture.json` marker naming the exact released commit,
-  so an arbitrary local git directory cannot pass for one. The three names live in
-  `.github/scripts/marketplace-delivery-identity.mjs`; add a state there, in the
-  Python predicate, and in `release-claims.json` together or not at all.
-- The closeout *reads* the mark. `workflow_policy.catalog_delivery.installed_cell_group`
-  names the post-publish cells whose signed `installer` identity resolves the
-  state, and `ledger.json`/`summary.json` carry `catalog_delivery`. Every one of
-  those cells must agree on one declared identity; an undeclared installer or a
-  disagreement between targets rejects the closeout rather than passing quietly.
-- `marketplace-sync.yml` is the recovery path for a deferred catalog. Re-run it
-  with the published version and commit rather than editing the catalog by hand;
-  it is idempotent, so re-running it against an already-synced catalog succeeds
-  without pushing. It mints its token from the same `MARKETPLACE_APP_ID` /
-  `MARKETPLACE_APP_PRIVATE_KEY` in the same `marketplace-publish` environment the
-  release lanes use, so it recovers a push that was **rejected**, not a
-  credential that does not exist. While those secrets are absent every release
-  defers and re-running the sync defers too: the exit is to provision the
-  credential first. That is deliberate — the alternative is a second, unscoped
-  way to write another repository — but it means "deferred" persists until
-  someone with repository-settings access acts, and the ledger says so rather
-  than implying a one-click fix.
-- For a local plugin-source change Codex must observe outside a release, refresh
-  the installed package and verify the managed runtime path/version plus
-  project-scoped status. CodeStory repository state alone does not update an
-  already-installed host.
+  attestation (`local:candidate-pinned-marketplace-fixture` for a fixture),
+  and its own accepted shape in `marketplace_installation.py`. The live shape
+  must never be relaxed to admit a local source, a marketplace root outside
+  the Codex home, and no pinned `ref`. A deferred install must resolve a
+  catalog carrying the `.codestory-marketplace-fixture.json` marker naming the
+  exact released commit. The three names live in
+  `.github/scripts/marketplace-delivery-identity.mjs`; add a state there, in
+  the Python predicate, and in `release-claims.json` together or not at all.
+  Closeout reads the mark: every named post-publish cell must agree on one
+  declared installer identity; an undeclared installer or disagreement
+  rejects the closeout. Recovery procedure is in the release runbook.
+- For a local plugin-source change a host must observe outside a release,
+  refresh the installed package and verify the managed runtime path/version
+  plus project-scoped status. CodeStory repository state alone does not
+  update an already-installed host.
 
 ## Platform and Security Notes
 
@@ -395,6 +373,8 @@ adapter to compensate for incorrect upstream state.
   `docs/contributors/debugging.md`
 - Verification, CI maturity, release proof, and evidence tiers:
   `docs/contributors/testing-matrix.md`
+- Release operator sequence and bump surfaces:
+  `docs/contributors/release-runbook.md`
 - Retrieval design and operations: `docs/architecture/retrieval-design.md`,
   `docs/testing/retrieval-architecture.md`, and
   `docs/ops/retrieval-engine.md`

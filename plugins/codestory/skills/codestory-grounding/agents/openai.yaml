@@ -1,6 +1,6 @@
 interface:
   display_name: "CodeStory Grounding"
-  short_description: "Ground local repositories through CodeStory MCP before source claims, edits, reviews, or test planning."
+  short_description: "Ground local repos through CodeStory MCP."
   default_prompt: "Read and follow the loaded codestory-grounding skill. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this metadata adds no parallel instructions."
 dependencies:
   tools:

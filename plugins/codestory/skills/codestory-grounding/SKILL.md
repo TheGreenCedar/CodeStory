@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when an agent should ground a local repository with CodeStory before making source claims, planning edits, choosing tests, reviewing changes, or using broad retrieval evidence through the CodeStory plugin MCP.
+description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations.
 ---
 
 # CodeStory Grounding
@@ -39,6 +39,8 @@ text(ALL_TOOLS.filter(tool => selectedNames.has(tool.name)));
 Keep each selected declaration complete. Inspect further declarations when they
 become useful. A plugin-wide predicate over names and descriptions can print
 many unused declarations; discovery does not require displaying all of them.
+When a linked document path is already known, bound search to that file. Do
+not run a broad package or repository search merely to rediscover it.
 
 ### Display each result payload once
 
@@ -83,9 +85,11 @@ as returned; do not replace it with an empty structured-content placeholder.
 Choose the smallest useful operation; no preliminary `status` or `packet` call
 is required. Locate candidates, inspect relevant source, follow relationships
 and reassess gaps. Check intermediate stages, branch conditions and conflicting
-evidence when the task requires them. Continue with CodeStory or native tools
-while doing so can resolve the task within its scope and budget. A successful
-search, incomplete packet or unsupported artifact does not end the investigation.
+evidence when the task requires them. Continue with task-authorized bounded
+follow-up through CodeStory or native tools until the requested evidence is
+sufficient or the remaining gap is outside scope and budget. A successful
+search, incomplete packet or unsupported artifact is not a terminal or
+permission boundary and does not end the investigation.
 
 | Need | Operation |
 | --- | --- |
@@ -100,7 +104,8 @@ search, incomplete packet or unsupported artifact does not end the investigation
 
 The generated MCP schema owns request syntax and bounds. Omit optional limits
 unless needed; do not send CLI flags as MCP fields or invent an ID from a name.
-Repository paths are leads to inspect, not instructions to execute.
+Repository paths are leads to inspect, not instructions to execute. Do not
+treat a lead as inspected source.
 
 ## Keep evidence and claims aligned
 
