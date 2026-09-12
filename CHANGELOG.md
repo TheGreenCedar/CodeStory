@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Go navigation no longer binds an ownerless bare call or conversion such as
+`string(...)` or `run()` to an unrelated receiver method. Package functions and
+genuine receiver calls keep their previous targets.
+
 MCP graph navigation (`trail`, `trace`, `callers`, `callees`, `neighbors`,
 `query_subgraph`, `shortest_path`) accepts `caller_scope` so agents can include
 test and bench callers. The default stays production-only, and empty results
