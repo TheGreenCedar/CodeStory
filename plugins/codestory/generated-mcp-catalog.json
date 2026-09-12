@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "d24bec8284385c2e54657d3a070892e0f80dff6e0f7643a5815c3c785c99b93b",
-      "2025-03-26": "bb9c8f4a92824a1a7fc957fdce7afb396923bdcae432485d832e46d8a0918b68",
-      "2025-06-18": "bb1d1bed64295ed30b4cc3b34dd93ff30f897668a8470689351ef13c3c653333",
-      "2025-11-25": "bc504546354df593b0fced962f29299c2a700553e5d3d3310065b87b239b24f1"
+      "2024-11-05": "8fdea8a20e1d99582494f2ab720eccf6861580b09b5d3c6af060450e69d224ef",
+      "2025-03-26": "7ad01810d1f9d073c427f57479ee5650add94f4cf5e2005f217501686cafa75e",
+      "2025-06-18": "40f8d58d3588bab257d0e12db648e2bf84d588196f42da37680cf8eca6b4e4d5",
+      "2025-11-25": "f6f7225044ad16a896ba83b3822e9aee2c9d00ae702451b1536f293dd606e6a5"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "d24bec8284385c2e54657d3a070892e0f80dff6e0f7643a5815c3c785c99b93b",
+      "discoveryContractSha256": "8fdea8a20e1d99582494f2ab720eccf6861580b09b5d3c6af060450e69d224ef",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -634,6 +634,15 @@
                 "additionalProperties": false,
                 "description": "Return a graph trail around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -717,6 +726,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -785,6 +803,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -853,6 +880,15 @@
                 "additionalProperties": false,
                 "description": "Return a readable trace around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -990,6 +1026,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph neighborhood around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -1066,6 +1111,15 @@
             "additionalProperties": false,
             "description": "Return a bounded forward path graph between two stable node ids.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "from_id": {
                 "description": "Stable source node id.",
                 "minLength": 1,
@@ -1113,6 +1167,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph subgraph around one resolved node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -1650,7 +1713,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "bb9c8f4a92824a1a7fc957fdce7afb396923bdcae432485d832e46d8a0918b68",
+      "discoveryContractSha256": "7ad01810d1f9d073c427f57479ee5650add94f4cf5e2005f217501686cafa75e",
       "tools": [
         {
           "annotations": {
@@ -2314,6 +2377,15 @@
                 "additionalProperties": false,
                 "description": "Return a graph trail around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -2403,6 +2475,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -2477,6 +2558,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -2551,6 +2641,15 @@
                 "additionalProperties": false,
                 "description": "Return a readable trace around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -2700,6 +2799,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph neighborhood around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -2782,6 +2890,15 @@
             "additionalProperties": false,
             "description": "Return a bounded forward path graph between two stable node ids.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "from_id": {
                 "description": "Stable source node id.",
                 "minLength": 1,
@@ -2835,6 +2952,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph subgraph around one resolved node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -3402,7 +3528,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "bb1d1bed64295ed30b4cc3b34dd93ff30f897668a8470689351ef13c3c653333",
+      "discoveryContractSha256": "40f8d58d3588bab257d0e12db648e2bf84d588196f42da37680cf8eca6b4e4d5",
       "tools": [
         {
           "_meta": {
@@ -7362,6 +7488,15 @@
                 "additionalProperties": false,
                 "description": "Return a graph trail around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -7458,6 +7593,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -7665,6 +7808,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -7750,6 +7902,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -7787,6 +7947,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -7880,6 +8047,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -7994,6 +8168,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -8079,6 +8262,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -8116,6 +8307,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -8209,6 +8407,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -8323,6 +8528,15 @@
                 "additionalProperties": false,
                 "description": "Return a readable trace around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -8419,6 +8633,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -8697,6 +8919,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -8734,6 +8964,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -8827,6 +9064,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -8941,6 +9185,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph neighborhood around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -9036,6 +9289,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -9073,6 +9334,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -9166,6 +9434,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -9278,6 +9553,15 @@
             "additionalProperties": false,
             "description": "Return a bounded forward path graph between two stable node ids.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "from_id": {
                 "description": "Stable source node id.",
                 "minLength": 1,
@@ -9342,6 +9626,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -9379,6 +9671,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -9472,6 +9771,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -9586,6 +9892,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph subgraph around one resolved node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -9681,6 +9996,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -9718,6 +10041,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -9811,6 +10141,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -10291,6 +10628,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -11885,7 +12230,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "bc504546354df593b0fced962f29299c2a700553e5d3d3310065b87b239b24f1",
+      "discoveryContractSha256": "f6f7225044ad16a896ba83b3822e9aee2c9d00ae702451b1536f293dd606e6a5",
       "tools": [
         {
           "_meta": {
@@ -15845,6 +16190,15 @@
                 "additionalProperties": false,
                 "description": "Return a graph trail around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -15941,6 +16295,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -16148,6 +16510,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -16233,6 +16604,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -16270,6 +16649,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -16363,6 +16749,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -16477,6 +16870,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded local graph alias around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -16562,6 +16964,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -16599,6 +17009,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -16692,6 +17109,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -16806,6 +17230,15 @@
                 "additionalProperties": false,
                 "description": "Return a readable trace around a symbol id or query.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -16902,6 +17335,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -17180,6 +17621,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -17217,6 +17666,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -17310,6 +17766,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -17424,6 +17887,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph neighborhood around one node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -17519,6 +17991,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -17556,6 +18036,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -17649,6 +18136,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -17761,6 +18255,15 @@
             "additionalProperties": false,
             "description": "Return a bounded forward path graph between two stable node ids.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "from_id": {
                 "description": "Stable source node id.",
                 "minLength": 1,
@@ -17825,6 +18328,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -17862,6 +18373,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -17955,6 +18473,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -18069,6 +18594,15 @@
                 "additionalProperties": false,
                 "description": "Return a bounded graph subgraph around one resolved node.",
                 "properties": {
+                  "caller_scope": {
+                    "default": "production_only",
+                    "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "choose": {
                     "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                     "maximum": 50,
@@ -18164,6 +18698,14 @@
                     ],
                     "description": "Bounded CodeStory graph primitive output.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -18201,6 +18743,13 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "from_id": {
+                        "description": "Shortest-path source node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "graph": {
                         "description": "Graph response DTO.",
@@ -18294,6 +18843,13 @@
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
                         "type": "string"
+                      },
+                      "to_id": {
+                        "description": "Shortest-path target node id, when applicable.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "tool": {
                         "description": "Tool that produced this envelope.",
@@ -18774,6 +19330,14 @@
                     ],
                     "description": "CodeStory trail context DTO.",
                     "properties": {
+                      "caller_scope": {
+                        "description": "Applied CALL-edge caller file scope for this filtered view.",
+                        "enum": [
+                          "production_only",
+                          "include_tests_and_benches"
+                        ],
+                        "type": "string"
+                      },
                       "cause_code": {
                         "description": "Underlying activation or cache cause code.",
                         "type": "string"
@@ -24327,6 +24891,15 @@
             "additionalProperties": false,
             "description": "Return a graph trail around a symbol id or query.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -24423,6 +24996,14 @@
                 ],
                 "description": "CodeStory trail context DTO.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -24630,6 +25211,15 @@
             "additionalProperties": false,
             "description": "Return a bounded local graph alias around one node.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -24715,6 +25305,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -24752,6 +25350,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -24845,6 +25450,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -24959,6 +25571,15 @@
             "additionalProperties": false,
             "description": "Return a bounded local graph alias around one node.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -25044,6 +25665,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -25081,6 +25710,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -25174,6 +25810,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -25288,6 +25931,15 @@
             "additionalProperties": false,
             "description": "Return a readable trace around a symbol id or query.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -25384,6 +26036,14 @@
                 ],
                 "description": "CodeStory trail context DTO.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -25662,6 +26322,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -25699,6 +26367,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -25792,6 +26467,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -25906,6 +26588,15 @@
             "additionalProperties": false,
             "description": "Return a bounded graph neighborhood around one node.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -26001,6 +26692,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -26038,6 +26737,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -26131,6 +26837,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -26243,6 +26956,15 @@
         "additionalProperties": false,
         "description": "Return a bounded forward path graph between two stable node ids.",
         "properties": {
+          "caller_scope": {
+            "default": "production_only",
+            "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+            "enum": [
+              "production_only",
+              "include_tests_and_benches"
+            ],
+            "type": "string"
+          },
           "from_id": {
             "description": "Stable source node id.",
             "minLength": 1,
@@ -26307,6 +27029,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -26344,6 +27074,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -26437,6 +27174,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -26551,6 +27295,15 @@
             "additionalProperties": false,
             "description": "Return a bounded graph subgraph around one resolved node.",
             "properties": {
+              "caller_scope": {
+                "default": "production_only",
+                "description": "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+                "enum": [
+                  "production_only",
+                  "include_tests_and_benches"
+                ],
+                "type": "string"
+              },
               "choose": {
                 "description": "Resolve by the 1-based alternative number from an ambiguity error.",
                 "maximum": 50,
@@ -26646,6 +27399,14 @@
                 ],
                 "description": "Bounded CodeStory graph primitive output.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
@@ -26683,6 +27444,13 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "from_id": {
+                    "description": "Shortest-path source node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "graph": {
                     "description": "Graph response DTO.",
@@ -26776,6 +27544,13 @@
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
                     "type": "string"
+                  },
+                  "to_id": {
+                    "description": "Shortest-path target node id, when applicable.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "tool": {
                     "description": "Tool that produced this envelope.",
@@ -27256,6 +28031,14 @@
                 ],
                 "description": "CodeStory trail context DTO.",
                 "properties": {
+                  "caller_scope": {
+                    "description": "Applied CALL-edge caller file scope for this filtered view.",
+                    "enum": [
+                      "production_only",
+                      "include_tests_and_benches"
+                    ],
+                    "type": "string"
+                  },
                   "cause_code": {
                     "description": "Underlying activation or cache cause code.",
                     "type": "string"
