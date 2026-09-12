@@ -40,7 +40,10 @@ Markdown trail output renders edge certainty directly in the arrow shape:
 | missing certainty | `-call-> [unresolved]` | Legacy or unresolved certainty metadata |
 
 MCP `trail` optional `story: true` includes a readable trail story DTO. There
-is no `mode`, `include_tests`, `mermaid`, or `output_file` field.
+is no `mode`, `mermaid`, or `output_file` field. Optional `caller_scope`
+(`production_only` default, or `include_tests_and_benches`) maps to the existing
+runtime caller-scope contract. A production-only empty graph is a filtered view,
+not proof that no CALL edges were indexed and not truncation.
 
 ## Interpreting Trail Noise
 
