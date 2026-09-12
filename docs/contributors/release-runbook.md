@@ -133,7 +133,33 @@ python .github/scripts/check-codestory-release.py --version <version>
 node .github/scripts/check-workflow-policy.mjs
 ```
 
-Do not edit version surfaces by hand.
+Do not edit version surfaces by hand. The bump writes every `codestory-*`
+workspace crate, `Cargo.lock`, `producer.version` in
+`crates/codestory-llama-sys/model-contract.json`, the CLI version pin in
+`plugins/codestory/cli-version.json`, and these plugin manifests:
+
+- `plugins/codestory/plugin.json`
+- `plugins/codestory/.codex-plugin/plugin.json`
+- `plugins/codestory/.cursor-plugin/plugin.json`
+- `plugins/codestory/.claude-plugin/plugin.json`
+- `plugins/codestory/.github/plugin/plugin.json`
+
+`--check` reports drift without writing. The script then runs the release
+validator.
+
+For a plugin-only release, use
+`node scripts/bump-version.mjs --version <plugin-version> --lane plugin`.
+That lane leaves native and model versions unchanged, fetches the pinned CLI
+release's published checksum file, and writes all three archive digests into
+`plugins/codestory/cli-version.json`.
+`--archive-checksums <path-or-https-url>` is the explicit offline/test source;
+never type those digests by hand.
+
+Native and plugin release lanes both own marketplace publication. The
+`marketplace-publish` job in `release.yml` and in `plugin-release.yml` points
+`TheGreenCedar/AgentPluginMarketplace` at the published commit after the
+release exists. Preflight proves the install path against a candidate-pinned
+fixture and does not require the live catalog to match an unreleased commit.
 
 ## Freeze and qualification
 
