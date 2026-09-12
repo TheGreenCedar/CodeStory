@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Go navigation no longer binds an ownerless bare call or conversion such as
+`string(...)` or `run()` to an unrelated receiver method. Package functions and
+genuine receiver calls keep their previous targets.
+
 Code-mode hosts can see named navigation arguments, including project routing
 and snippet ranges, when a tool accepts alternative selectors.
 
