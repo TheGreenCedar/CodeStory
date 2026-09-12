@@ -77,7 +77,10 @@ const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
     EdgeKind::ANNOTATION_USAGE,
 ];
 /// Version for cached resolution-support snapshots.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 6;
+///
+/// Bumped when call-candidate snapshots gained stored node kind so Go
+/// ownerless bare-call eligibility can be reapplied after snapshot load.
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -106,6 +109,7 @@ struct ResolutionLookupCache {
 #[derive(Debug, Clone)]
 struct CandidateNode {
     id: i64,
+    kind: i32,
     file_node_id: Option<i64>,
     file_path: Option<String>,
     normalized_file_path: Option<String>,
@@ -118,6 +122,7 @@ struct CandidateNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CandidateNodeSnapshot {
     id: i64,
+    kind: i32,
     file_node_id: Option<i64>,
     file_path: Option<String>,
     serialized_name: String,
@@ -1829,7 +1834,7 @@ impl CandidateIndex {
         let reference_node_ids = Self::load_reference_node_ids(conn)?;
         let kind_clause = kind_clause(kinds);
         let query = format!(
-            "SELECT n.id, n.file_node_id, n.serialized_name, n.qualified_name, file_node.serialized_name
+            "SELECT n.id, n.file_node_id, n.kind, n.serialized_name, n.qualified_name, file_node.serialized_name
              FROM node n
              LEFT JOIN node file_node ON file_node.id = n.file_node_id
              WHERE n.kind IN ({})
@@ -1838,17 +1843,18 @@ impl CandidateIndex {
         );
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
-            let serialized_name: String = row.get(2)?;
-            let file_path: Option<String> = row.get(4)?;
+            let serialized_name: String = row.get(3)?;
+            let file_path: Option<String> = row.get(5)?;
             let id = row.get(0)?;
             Ok(CandidateNode {
                 id,
                 file_node_id: row.get(1)?,
+                kind: row.get(2)?,
                 normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
                 file_path,
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
-                qualified_name: row.get(3)?,
+                qualified_name: row.get(4)?,
                 is_declaration: !reference_node_ids.contains(&id),
             })
         })?;
@@ -1926,6 +1932,7 @@ impl CandidateIndex {
             .iter()
             .map(|node| CandidateNodeSnapshot {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
@@ -1940,6 +1947,7 @@ impl CandidateIndex {
             .iter()
             .map(|node| CandidateNodeSnapshot {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
@@ -1969,6 +1977,7 @@ impl CandidateIndex {
             .into_iter()
             .map(|node| CandidateNode {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 normalized_file_path: node
                     .file_path
@@ -2061,6 +2070,13 @@ impl CandidateIndex {
 
     fn is_import_binding_node(&self, node_id: i64) -> bool {
         self.import_binding_node_ids.contains(&node_id)
+    }
+
+    fn node_kind(&self, node_id: i64) -> Option<i32> {
+        self.node_offset_by_id
+            .get(&node_id)
+            .and_then(|offset| self.nodes.get(*offset))
+            .map(|node| node.kind)
     }
 
     #[cfg(test)]
@@ -3919,6 +3935,7 @@ mod tests {
     fn test_relative_import_lookup_matches_imported_file_symbol() {
         let index = CandidateIndex::from_nodes(vec![CandidateNode {
             id: 42,
+            kind: NodeKind::FUNCTION as i32,
             file_node_id: Some(2),
             file_path: Some(r"\\?\C:\repo\lib\client.js".to_string()),
             normalized_file_path: normalize_resolution_path(r"\\?\C:\repo\lib\client.js"),
@@ -3948,6 +3965,7 @@ mod tests {
         let mut nodes = (0..250)
             .map(|idx| CandidateNode {
                 id: 10_000 + idx,
+                kind: NodeKind::METHOD as i32,
                 file_node_id: Some(1),
                 file_path: None,
                 normalized_file_path: None,
@@ -3959,6 +3977,7 @@ mod tests {
             .collect::<Vec<_>>();
         nodes.push(CandidateNode {
             id: 42,
+            kind: NodeKind::METHOD as i32,
             file_node_id: Some(1),
             file_path: None,
             normalized_file_path: None,

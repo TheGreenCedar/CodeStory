@@ -1,5 +1,6 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, ResolutionCertainty};
+use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
+use codestory_indexer::resolution::RESOLUTION_SUPPORT_SNAPSHOT_VERSION;
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
 use std::collections::{HashMap, HashSet};
@@ -603,6 +604,66 @@ fn assert_resolved_call_to_name(
     assert!(
         found,
         "Case `{case_name}`: expected CALL from `{caller_name}` to resolve to `{callee_name}`. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
+fn assert_resolved_call_to_kind(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    callee_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_name(&source.serialized_name, caller_name) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            node_by_id.get(&resolved_id).copied()
+        })
+        .any(|resolved| {
+            is_matching_name(&resolved.serialized_name, callee_name)
+                && resolved.kind == expected_kind
+        });
+
+    assert!(
+        found,
+        "Case `{case_name}`: expected CALL from `{caller_name}` to resolve to `{callee_name}` with kind {expected_kind:?}. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
+fn assert_no_resolved_call_of_kind(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_name(&source.serialized_name, caller_name) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            node_by_id.get(&resolved_id).copied()
+        })
+        .any(|resolved| resolved.kind == expected_kind);
+
+    assert!(
+        !found,
+        "Case `{case_name}`: CALL from `{caller_name}` must not resolve to kind {expected_kind:?}. Calls: {:?}",
         describe_call_edges(edges, nodes)
     );
 }
@@ -16728,5 +16789,319 @@ public ref struct TypeMapPlanBuilder(TypeMap typeMap)
 
     assert_no_call_self_edges("csharp automapper mirror", &edges);
     assert_no_type_usage_self_edges("csharp automapper mirror", &edges);
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_rejects_receiver_methods() -> anyhow::Result<()> {
+    // G01: builtin conversion vs uppercase method.
+    let (nodes, edges) = index_files(&[(
+        "g01.go",
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )])?;
+    assert_no_resolved_call_to_method_owner("G01", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_of_kind("G01", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G02: same conversion vs lowercase method.
+    let (nodes, edges) = index_files(&[(
+        "g02.go",
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) string() int { return 1 }
+func Convert(k Key) string { return string(k) }
+"#,
+    )])?;
+    assert_no_resolved_call_to_method_owner("G02", &nodes, &edges, "Convert", "Handler", "string");
+    assert_no_resolved_call_of_kind("G02", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G03: callable parameter vs same-named method.
+    let (nodes, edges) = index_files(&[(
+        "g03.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) run() int { return 1 }
+func Variable(run func() int) int { return run() }
+"#,
+    )])?;
+    assert_no_resolved_call_to_method_owner("G03", &nodes, &edges, "Variable", "Handler", "run");
+    assert_no_resolved_call_of_kind("G03", &nodes, &edges, "Variable", NodeKind::METHOD);
+
+    // G04: package function named string wins over Handler.String.
+    let (nodes, edges) = index_files(&[(
+        "g04.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) String() int { return 1 }
+func string(n int) int { return n }
+func Convert() int { return string(2) }
+"#,
+    )])?;
+    assert_resolved_call_to_kind("G04", &nodes, &edges, "Convert", "string", NodeKind::FUNCTION);
+    assert_no_resolved_call_to_method_owner("G04", &nodes, &edges, "Convert", "Handler", "String");
+
+    // G05: named conversion must not target Handler.Token.
+    let (nodes, edges) = index_files(&[(
+        "g05.go",
+        r#"
+package probe
+type Token string
+type Handler struct{}
+func (Handler) Token() {}
+func Convert() Token { return Token("x") }
+"#,
+    )])?;
+    assert_no_resolved_call_to_method_owner("G05", &nodes, &edges, "Convert", "Handler", "Token");
+    assert_no_resolved_call_of_kind("G05", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G06: package Run() vs method Run(), declaration order method-first.
+    let (nodes, edges) = index_files(&[(
+        "g06.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) Run() {}
+func Run() {}
+func Caller() { Run() }
+"#,
+    )])?;
+    assert_resolved_call_to_kind("G06", &nodes, &edges, "Caller", "Run", NodeKind::FUNCTION);
+    assert_no_resolved_call_to_method_owner("G06", &nodes, &edges, "Caller", "Handler", "Run");
+
+    let (nodes, edges) = index_files(&[(
+        "g06b.go",
+        r#"
+package probe
+type Handler struct{}
+func Run() {}
+func (Handler) Run() {}
+func Caller() { Run() }
+"#,
+    )])?;
+    assert_resolved_call_to_kind(
+        "G06-function-first",
+        &nodes,
+        &edges,
+        "Caller",
+        "Run",
+        NodeKind::FUNCTION,
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G06-function-first",
+        &nodes,
+        &edges,
+        "Caller",
+        "Handler",
+        "Run",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_go_owner_qualified_receiver_calls_keep_intended_owner() -> anyhow::Result<()> {
+    // G07: genuine lowercase/uppercase receiver calls with other-owner collisions.
+    let source = r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "H" }
+func (Handler) string() string { return "h" }
+type Other struct{}
+func (Other) String() string { return "O" }
+func (Other) string() string { return "o" }
+func RealUpper(h Handler) string { return h.String() }
+func RealLower(h Handler) string { return h.string() }
+"#;
+    let (nodes, edges) = index_files(&[("g07.go", source)])?;
+    assert_resolved_call_to_method_owner("G07-upper", &nodes, &edges, "RealUpper", "Handler", "String");
+    assert_resolved_call_to_method_owner("G07-lower", &nodes, &edges, "RealLower", "Handler", "string");
+    assert_no_resolved_call_to_method_owner("G07-upper", &nodes, &edges, "RealUpper", "Other", "String");
+    assert_no_resolved_call_to_method_owner("G07-lower", &nodes, &edges, "RealLower", "Other", "string");
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_rejects_cross_file_method_and_keeps_package_function()
+-> anyhow::Result<()> {
+    // G08: misleading METHOD lives in a second file of the same package.
+    let methods = r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func (Handler) string() int { return 1 }
+func (Handler) run() int { return 1 }
+"#;
+    let conversions = r#"
+package probe
+type Key string
+func Convert(k Key) string { return string(k) }
+func Variable(run func() int) int { return run() }
+"#;
+    let (nodes, edges) = index_files(&[("methods.go", methods), ("calls.go", conversions)])?;
+    assert_no_resolved_call_to_method_owner("G08-string", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_to_method_owner("G08-string-lower", &nodes, &edges, "Convert", "Handler", "string");
+    assert_no_resolved_call_to_method_owner("G08-run", &nodes, &edges, "Variable", "Handler", "run");
+    assert_no_resolved_call_of_kind("G08-string", &nodes, &edges, "Convert", NodeKind::METHOD);
+    assert_no_resolved_call_of_kind("G08-run", &nodes, &edges, "Variable", NodeKind::METHOD);
+
+    // G09: package FUNCTION in a second file, competing receiver METHOD.
+    let helpers = r#"
+package probe
+func Run() {}
+"#;
+    let methods = r#"
+package probe
+type Handler struct{}
+func (Handler) Run() {}
+"#;
+    let caller = r#"
+package probe
+func Caller() { Run() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("helpers.go", helpers),
+        ("methods.go", methods),
+        ("caller.go", caller),
+    ])?;
+    assert_resolved_call_to_kind("G09", &nodes, &edges, "Caller", "Run", NodeKind::FUNCTION);
+    assert_no_resolved_call_to_method_owner("G09", &nodes, &edges, "Caller", "Handler", "Run");
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_and_unowned_selector_controls_stay_in_place() -> anyhow::Result<()> {
+    // G10: imported typed receiver with same-named methods elsewhere.
+    let notifier_source = r#"
+package notifier
+type Notifier interface {
+    Notify()
+}
+"#;
+    let workflow_source = r#"
+package workflow
+import mail "example.com/project/notifier"
+type Notifier interface {
+    Notify()
+}
+func Run(n mail.Notifier) {
+    n.Notify()
+}
+"#;
+    let other_notifier_source = r#"
+package other
+type Notifier interface {
+    Notify()
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("project/notifier/notifier.go", notifier_source),
+        ("other/notifier/notifier.go", other_notifier_source),
+        ("workflow.go", workflow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "G10",
+        &nodes,
+        &edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "project/notifier/notifier.go",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "G10",
+        &nodes,
+        &edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "other/notifier/notifier.go",
+    );
+
+    // G11: unowned selector must not gain a concrete METHOD target.
+    let (nodes, edges) = index_files(&[(
+        "g11.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Guess(x any) { x.String() }
+"#,
+    )])?;
+    assert_no_resolved_call_to_method_owner("G11", &nodes, &edges, "Guess", "Handler", "String");
+    assert_no_resolved_call_of_kind("G11", &nodes, &edges, "Guess", NodeKind::METHOD);
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_eligibility_survives_resolution_support_refresh() -> anyhow::Result<()>
+{
+    // G13: snapshot reuse, then refresh changing the misleading method's case.
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("g13.go");
+    fs::write(
+        &file_path,
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let refresh = |storage: &mut Storage, files: Vec<std::path::PathBuf>| {
+        indexer.run_incremental(
+            storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: files,
+                files_to_remove: vec![],
+                existing_file_ids: std::collections::HashMap::new(),
+            },
+            &event_bus,
+            None,
+        )
+    };
+
+    let first = refresh(&mut storage, vec![file_path.clone()])?;
+    assert!(!first.resolution_support_snapshot_hit);
+    assert!(first.resolution_support_snapshot_stored);
+    assert!(storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
+
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner("G13-initial", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_of_kind("G13-initial", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    fs::write(
+        &file_path,
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) string() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )?;
+    refresh(&mut storage, vec![file_path])?;
+
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner("G13-refresh", &nodes, &edges, "Convert", "Handler", "string");
+    assert_no_resolved_call_to_method_owner("G13-refresh", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_of_kind("G13-refresh", &nodes, &edges, "Convert", NodeKind::METHOD);
     Ok(())
 }
