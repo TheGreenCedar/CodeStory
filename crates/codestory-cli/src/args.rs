@@ -1894,6 +1894,7 @@ pub(crate) struct SymbolJsonOutput<'a> {
 pub(crate) struct TrailJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) trail: &'a TrailContextDto,
+    pub(crate) caller_scope: &'static str,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) notes: Vec<String>,
 }
@@ -2604,6 +2605,13 @@ pub(crate) fn build_trail_request(
     cmd: &TrailCommand,
 ) -> codestory_contracts::api::TrailConfigDto {
     build_trail_request_impl(root_id, cmd)
+}
+
+pub(crate) fn trail_caller_scope_wire_label(scope: TrailCallerScope) -> &'static str {
+    match scope {
+        TrailCallerScope::ProductionOnly => "production_only",
+        TrailCallerScope::IncludeTestsAndBenches => "include_tests_and_benches",
+    }
 }
 
 fn build_trail_request_impl(

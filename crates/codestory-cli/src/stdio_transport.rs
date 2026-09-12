@@ -4961,13 +4961,29 @@ fn handle_stdio_trail(
         .pointer("/params/arguments/story")
         .and_then(|value| value.as_bool())
         .unwrap_or(default_story);
+    let caller_scope = stdio_graph_caller_scope(request);
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
-            let mut config = browser_trail_config(target.selected.node_id, depth, direction, story);
+            let mut config = browser_trail_config(
+                target.selected.node_id,
+                depth,
+                direction,
+                story,
+                caller_scope,
+            );
             config.max_nodes = max_nodes;
             runtime.browser.trail_context(config).map_err(map_api_error)
         })
-        .map(|result| serde_json::json!({"result": result}))
+        .map(|result| {
+            let mut value = serde_json::to_value(result).unwrap_or(serde_json::Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "caller_scope".to_string(),
+                    serde_json::json!(args::trail_caller_scope_wire_label(caller_scope)),
+                );
+            }
+            serde_json::json!({"result": value})
+        })
         .unwrap_or_else(
             |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
@@ -5066,10 +5082,16 @@ fn handle_stdio_neighbors(
     let direction = fixed_direction.unwrap_or_else(|| stdio_graph_direction(request));
     let depth = stdio_graph_u32_arg(request, "depth", default_depth, 0, 3);
     let max_nodes = stdio_graph_u32_arg(request, "max_nodes", default_max_nodes, 1, 120);
+    let caller_scope = stdio_graph_caller_scope(request);
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
-            let mut config =
-                browser_trail_config(target.selected.node_id.clone(), depth, direction, false);
+            let mut config = browser_trail_config(
+                target.selected.node_id.clone(),
+                depth,
+                direction,
+                false,
+                caller_scope,
+            );
             config.max_nodes = max_nodes;
             runtime
                 .browser
@@ -5089,8 +5111,10 @@ fn handle_stdio_neighbors(
                             "direction": stdio_graph_direction_label(direction),
                             "depth": depth,
                             "max_nodes": max_nodes,
-                            "max_edges": max_nodes.saturating_mul(3).max(128)
+                            "max_edges": max_nodes.saturating_mul(3).max(128),
+                            "caller_scope": args::trail_caller_scope_wire_label(caller_scope)
                         }),
+                        caller_scope,
                     )
                 })
         })
@@ -5114,6 +5138,7 @@ fn handle_stdio_shortest_path(
     };
     let max_depth = stdio_graph_u32_arg(request, "max_depth", 6, 1, 10);
     let max_nodes = stdio_graph_u32_arg(request, "max_nodes", 80, 2, 120);
+    let caller_scope = stdio_graph_caller_scope(request);
     let from = NodeId(from_id.to_string());
     let to = NodeId(to_id.to_string());
     if let Err(error) = runtime
@@ -5136,7 +5161,7 @@ fn handle_stdio_shortest_path(
             target_id: Some(to.clone()),
             depth: max_depth,
             direction: TrailDirection::Outgoing,
-            caller_scope: TrailCallerScope::ProductionOnly,
+            caller_scope,
             edge_filter: Vec::new(),
             show_utility_calls: false,
             hide_speculative: false,
@@ -5154,8 +5179,10 @@ fn handle_stdio_shortest_path(
                     "direction": "outgoing",
                     "max_depth": max_depth,
                     "max_nodes": max_nodes,
-                    "max_edges": max_nodes.saturating_mul(3).max(128)
+                    "max_edges": max_nodes.saturating_mul(3).max(128),
+                    "caller_scope": args::trail_caller_scope_wire_label(caller_scope)
                 }),
+                caller_scope,
             );
             if let Some(object) = output.as_object_mut() {
                 object.insert("from_id".to_string(), serde_json::json!(from.0.as_str()));
@@ -5384,6 +5411,16 @@ fn stdio_graph_direction_label(direction: TrailDirection) -> &'static str {
     }
 }
 
+fn stdio_graph_caller_scope(request: &serde_json::Value) -> TrailCallerScope {
+    match request
+        .pointer("/params/arguments/caller_scope")
+        .and_then(|value| value.as_str())
+    {
+        Some("include_tests_and_benches") => TrailCallerScope::IncludeTestsAndBenches,
+        _ => TrailCallerScope::ProductionOnly,
+    }
+}
+
 fn stdio_graph_u32_arg(
     request: &serde_json::Value,
     name: &str,
@@ -5410,6 +5447,7 @@ fn stdio_graph_tool_output(
     resolution: serde_json::Value,
     graph: GraphResponse,
     limits: serde_json::Value,
+    caller_scope: TrailCallerScope,
 ) -> serde_json::Value {
     let file_refs = stdio_graph_file_refs(&graph);
     let node_count = graph.nodes.len();
@@ -5424,6 +5462,7 @@ fn stdio_graph_tool_output(
         "node_count": node_count,
         "edge_count": edge_count,
         "truncated": truncated,
+        "caller_scope": args::trail_caller_scope_wire_label(caller_scope),
     })
 }
 
@@ -7642,6 +7681,7 @@ fn read_stdio_template_resource(
                 BROWSER_TRAIL_DEFAULT_DEPTH,
                 TrailDirection::Both,
                 false,
+                TrailCallerScope::ProductionOnly,
             ))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),

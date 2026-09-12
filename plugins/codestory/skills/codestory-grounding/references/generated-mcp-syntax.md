@@ -27,14 +27,14 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `files` | | `language`, `path`, `role`, `limit`, `include_framework_coverage` | Refreshes the local map before dispatch. No `refresh` field. |
 | `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
 | `symbol` | `query` or `id` | `choose` | |
-| `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose` | There is no `mode` field. |
-| `callers` | `query` or `id` | `depth`, `max_nodes`, `choose` | |
-| `callees` | `query` or `id` | `depth`, `max_nodes`, `choose` | |
-| `trace` | `query` or `id` | `direction`, `depth`, `max_nodes`, `story`, `choose` | |
+| `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose`, `caller_scope` (`production_only`/`include_tests_and_benches`) | There is no `mode` field. Default caller scope hides test/bench callers. |
+| `callers` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `callees` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `trace` | `query` or `id` | `direction`, `depth`, `max_nodes`, `story`, `choose`, `caller_scope` | |
 | `get_node` | `query` or `id` | `choose` | |
-| `neighbors` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | |
-| `shortest_path` | `from_id`, `to_id` | `max_depth`, `max_nodes` | |
-| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | Bounded node-centered relationship navigation. |
+| `neighbors` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `shortest_path` | `from_id`, `to_id` | `max_depth`, `max_nodes`, `caller_scope` | |
+| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose`, `caller_scope` | Bounded node-centered relationship navigation. |
 | `definition` | `query` or `id` | `choose` | |
 | `references` | `query` or `id` | `choose` | Incoming references. |
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |

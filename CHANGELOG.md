@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+MCP graph navigation (`trail`, `trace`, `callers`, `callees`, `neighbors`,
+`query_subgraph`, `shortest_path`) accepts `caller_scope` so agents can include
+test and bench callers. The default stays production-only, and empty results
+describe that filtered view instead of claiming no graph edges were indexed.
+
 Code-mode hosts can see named navigation arguments, including project routing
 and snippet ranges, when a tool accepts alternative selectors.
 

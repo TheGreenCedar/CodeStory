@@ -279,6 +279,7 @@ pub(crate) fn handle_http_request(
                         depth,
                         direction,
                         story,
+                        TrailCallerScope::ProductionOnly,
                     ))
                     .map_err(map_api_error)
             }) {
@@ -435,6 +436,7 @@ pub(crate) fn browser_trail_config(
     depth: u32,
     direction: TrailDirection,
     story: bool,
+    caller_scope: TrailCallerScope,
 ) -> TrailConfigDto {
     TrailConfigDto {
         root_id,
@@ -442,7 +444,7 @@ pub(crate) fn browser_trail_config(
         target_id: None,
         depth,
         direction,
-        caller_scope: TrailCallerScope::ProductionOnly,
+        caller_scope,
         edge_filter: Vec::new(),
         show_utility_calls: false,
         hide_speculative: false,
