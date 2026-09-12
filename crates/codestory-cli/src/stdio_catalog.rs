@@ -813,6 +813,13 @@ const PACKET_EVIDENCE_RESOLUTIONS: &[&str] = &[
     "diagnostic_only",
 ];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
+const GRAPH_CALLER_SCOPES: &[&str] = &["production_only", "include_tests_and_benches"];
+const GRAPH_CALLER_SCOPE_PROPERTY: SchemaProperty = SchemaProperty::string(
+    "caller_scope",
+    "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+)
+.with_enum(GRAPH_CALLER_SCOPES)
+.with_default(ValueLiteral::String("production_only"));
 const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "unknown"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
@@ -1566,6 +1573,11 @@ static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("focus", "Focused node details DTO."),
         SchemaProperty::object("trail", "Graph response DTO."),
         SchemaProperty::object("story", "Optional readable trail story DTO.").nullable(),
+        SchemaProperty::string(
+            "caller_scope",
+            "Applied CALL-edge caller file scope for this filtered view.",
+        )
+        .with_enum(GRAPH_CALLER_SCOPES),
     ],
     &["focus", "trail"],
 );
@@ -1586,6 +1598,15 @@ static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("node_count", "Returned node count."),
         SchemaProperty::integer("edge_count", "Returned edge count."),
         SchemaProperty::boolean("truncated", "Whether the graph result was truncated."),
+        SchemaProperty::string(
+            "caller_scope",
+            "Applied CALL-edge caller file scope for this filtered view.",
+        )
+        .with_enum(GRAPH_CALLER_SCOPES),
+        SchemaProperty::string("from_id", "Shortest-path source node id, when applicable.")
+            .nullable(),
+        SchemaProperty::string("to_id", "Shortest-path target node id, when applicable.")
+            .nullable(),
     ],
     &[
         "certainty",
@@ -1877,6 +1898,7 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 120),
         SchemaProperty::boolean("story", "Include a readable trail story DTO.")
             .with_default(ValueLiteral::Boolean(false)),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -1898,6 +1920,7 @@ static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(50))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -1924,6 +1947,7 @@ static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 120),
         SchemaProperty::boolean("story", "Include a readable trail story DTO.")
             .with_default(ValueLiteral::Boolean(true)),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -2079,6 +2103,7 @@ static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(50))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -2095,6 +2120,7 @@ static SHORTEST_PATH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(80))
             .with_bounds(2, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &["from_id", "to_id"],
 );
@@ -2118,6 +2144,7 @@ static QUERY_SUBGRAPH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(80))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -3152,6 +3179,68 @@ mod tests {
         assert!(
             satisfies_required_any_of(&schema, &payload),
             "files success payload must satisfy an anyOf required branch: {schema}"
+        );
+    }
+
+    fn graph_schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
+        schema
+            .pointer(&format!("/properties/{name}"))
+            .or_else(|| {
+                schema
+                    .get("allOf")
+                    .and_then(Value::as_array)
+                    .and_then(|branches| {
+                        branches
+                            .iter()
+                            .find_map(|branch| branch.pointer(&format!("/properties/{name}")))
+                    })
+            })
+            .unwrap_or_else(|| panic!("missing property {name}: {schema}"))
+    }
+
+    #[test]
+    fn graph_tools_advertise_caller_scope_with_production_only_default() {
+        let catalog = tools_list_json();
+        let tools = catalog["result"]["tools"].as_array().expect("tools");
+        let expected = json!(["production_only", "include_tests_and_benches"]);
+        for name in [
+            "trail",
+            "trace",
+            "callers",
+            "callees",
+            "neighbors",
+            "query_subgraph",
+            "shortest_path",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            let scope = graph_schema_property(&tool["inputSchema"], "caller_scope");
+            assert_eq!(
+                scope["enum"], expected,
+                "{name} must publish the runtime caller-scope choice: {scope}"
+            );
+            assert_eq!(
+                scope.get("default"),
+                Some(&json!("production_only")),
+                "{name} must keep production-only as the documented default: {scope}"
+            );
+            let output = graph_schema_property(&tool["outputSchema"], "caller_scope");
+            assert_eq!(
+                output["enum"], expected,
+                "{name} output must make the applied caller scope visible: {output}"
+            );
+        }
+        let get_node = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_node")
+            .expect("get_node");
+        assert!(
+            get_node["inputSchema"]["properties"]
+                .get("caller_scope")
+                .is_none(),
+            "get_node is not a caller-scoped graph walk: {get_node}"
         );
     }
 }

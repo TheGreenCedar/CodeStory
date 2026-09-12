@@ -3079,6 +3079,27 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         Some(&json!(false)),
         "trail.story should document the stdio default: {trail}"
     );
+    for name in [
+        "trail",
+        "trace",
+        "callers",
+        "callees",
+        "neighbors",
+        "query_subgraph",
+        "shortest_path",
+    ] {
+        let schema = tool_input_schema(&tools, name);
+        assert_eq!(
+            schema_property(schema, "caller_scope")["enum"],
+            json!(["production_only", "include_tests_and_benches"]),
+            "{name}.caller_scope must publish the runtime caller-scope choice: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "caller_scope").get("default"),
+            Some(&json!("production_only")),
+            "{name}.caller_scope must keep production-only as the default: {schema}"
+        );
+    }
     for name in ["callers", "callees"] {
         let alias = tool_input_schema(&tools, name);
         assert_eq!(
@@ -7181,5 +7202,308 @@ fn unknown_prompt_returns_jsonrpc_error() {
             .expect("error message")
             .contains("Unknown prompt"),
         "unknown prompt message should identify the missing prompt: {response}"
+    );
+}
+
+fn write_python_test_scope_workspace(root: &Path) {
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"test-scope-probe\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write pyproject.toml");
+    let tests = root.join("tests");
+    fs::create_dir_all(&tests).expect("create tests dir");
+    fs::write(
+        tests.join("test_flow.py"),
+        "def leaf():\n    return 1\n\ndef test_entry():\n    return leaf()\n",
+    )
+    .expect("write test_flow.py");
+}
+
+fn indexed_python_test_scope_fixture() -> StdioFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_python_test_scope_workspace(workspace.path());
+
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path());
+    let output = command.output().expect("run index");
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
+        disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
+    }
+}
+
+fn graph_edge_count(payload: &Value) -> usize {
+    payload
+        .pointer("/graph/edges")
+        .or_else(|| payload.pointer("/trail/edges"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn graph_truncated(payload: &Value) -> bool {
+    payload
+        .get("truncated")
+        .or_else(|| payload.pointer("/trail/truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn graph_omitted_edge_count(payload: &Value) -> u64 {
+    payload
+        .pointer("/graph/omitted_edge_count")
+        .or_else(|| payload.pointer("/trail/omitted_edge_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn call_graph_tool(server: &mut StdioServer, id: &str, name: &str, arguments: Value) -> Value {
+    let response = send_json(
+        server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }),
+    );
+    assert_tool_success(&response, json!(id)).clone()
+}
+
+#[test]
+fn mcp_graph_caller_scope_hides_stored_test_call_until_explicitly_included() {
+    let fixture = indexed_python_test_scope_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-scope");
+
+    let test_entry = call_graph_tool(
+        &mut server,
+        "symbol-test-entry",
+        "symbol",
+        json!({
+            "project": fixture.workspace.path(),
+            "query": "test_entry"
+        }),
+    );
+    let test_id = test_entry["node"]["id"]
+        .as_str()
+        .expect("test_entry id")
+        .to_string();
+    let leaf = call_graph_tool(
+        &mut server,
+        "symbol-leaf",
+        "symbol",
+        json!({
+            "project": fixture.workspace.path(),
+            "query": "leaf"
+        }),
+    );
+    let leaf_id = leaf["node"]["id"].as_str().expect("leaf id").to_string();
+
+    for (name, extra) in [
+        (
+            "callees",
+            json!({"id": test_id, "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "trail",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "trace",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "neighbors",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "query_subgraph",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+    ] {
+        let mut default_args = extra.clone();
+        default_args
+            .as_object_mut()
+            .expect("args")
+            .insert("project".to_string(), json!(fixture.workspace.path()));
+        let default_payload = call_graph_tool(
+            &mut server,
+            &format!("{name}-default"),
+            name,
+            default_args.clone(),
+        );
+        assert_eq!(
+            default_payload["caller_scope"],
+            json!("production_only"),
+            "{name} default must name production-only scope: {default_payload}"
+        );
+        assert_eq!(
+            graph_edge_count(&default_payload),
+            0,
+            "{name} default must hide the stored test CALL: {default_payload}"
+        );
+        assert!(
+            !graph_truncated(&default_payload),
+            "{name} empty production-only view is filtered, not truncated: {default_payload}"
+        );
+        assert_eq!(
+            graph_omitted_edge_count(&default_payload),
+            0,
+            "{name} must not invent omitted-edge counts for caller-scope filtering: {default_payload}"
+        );
+
+        let mut include_args = default_args;
+        include_args.as_object_mut().expect("args").insert(
+            "caller_scope".to_string(),
+            json!("include_tests_and_benches"),
+        );
+        let include_payload =
+            call_graph_tool(&mut server, &format!("{name}-include"), name, include_args);
+        assert_eq!(
+            include_payload["caller_scope"],
+            json!("include_tests_and_benches"),
+            "{name} include-tests must name the selected scope: {include_payload}"
+        );
+        assert_eq!(
+            graph_edge_count(&include_payload),
+            1,
+            "{name} include-tests must expose the stored CALL: {include_payload}"
+        );
+        assert!(
+            !graph_truncated(&include_payload),
+            "{name} single stored CALL must not be reported as truncated: {include_payload}"
+        );
+    }
+
+    let callers_default = call_graph_tool(
+        &mut server,
+        "callers-default",
+        "callers",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": leaf_id,
+            "depth": 1,
+            "max_nodes": 12
+        }),
+    );
+    assert_eq!(callers_default["caller_scope"], json!("production_only"));
+    assert_eq!(graph_edge_count(&callers_default), 0, "{callers_default}");
+
+    let callers_include = call_graph_tool(
+        &mut server,
+        "callers-include",
+        "callers",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": leaf_id,
+            "depth": 1,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(
+        callers_include["caller_scope"],
+        json!("include_tests_and_benches")
+    );
+    assert_eq!(graph_edge_count(&callers_include), 1, "{callers_include}");
+
+    let both_include = call_graph_tool(
+        &mut server,
+        "neighbors-both",
+        "neighbors",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": test_id,
+            "direction": "both",
+            "depth": 1,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(graph_edge_count(&both_include), 1, "{both_include}");
+
+    let path_default = call_graph_tool(
+        &mut server,
+        "path-default",
+        "shortest_path",
+        json!({
+            "project": fixture.workspace.path(),
+            "from_id": test_id,
+            "to_id": leaf_id,
+            "max_depth": 4,
+            "max_nodes": 12
+        }),
+    );
+    assert_eq!(path_default["caller_scope"], json!("production_only"));
+    assert_eq!(graph_edge_count(&path_default), 0, "{path_default}");
+
+    let path_include = call_graph_tool(
+        &mut server,
+        "path-include",
+        "shortest_path",
+        json!({
+            "project": fixture.workspace.path(),
+            "from_id": test_id,
+            "to_id": leaf_id,
+            "max_depth": 4,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(
+        path_include["caller_scope"],
+        json!("include_tests_and_benches")
+    );
+    assert_eq!(graph_edge_count(&path_include), 1, "{path_include}");
+
+    let malformed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "bad-scope",
+            "method": "tools/call",
+            "params": {
+                "name": "callees",
+                "arguments": {
+                    "project": fixture.workspace.path(),
+                    "id": test_id,
+                    "caller_scope": "all"
+                }
+            }
+        }),
+    );
+    assert_invalid_params(
+        &malformed,
+        json!("bad-scope"),
+        "callees",
+        "/arguments/caller_scope",
+        "invalid_enum_value",
     );
 }
