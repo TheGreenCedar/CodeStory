@@ -13690,6 +13690,7 @@ pub fn rematerialize_proof_resolution_projection(
         &file_content_hash_by_id,
         &governed_by_id,
         &record_by_file_id,
+        &python_projection_index,
     )?;
     enforce_exact_evidence_corroboration(
         &mut claims,
@@ -19059,6 +19060,7 @@ fn enforce_exact_dependency_eligibility(
     file_content_hashes: &HashMap<i64, String>,
     governed_files: &HashMap<i64, &codestory_store::FileInfo>,
     records: &HashMap<i64, &ResolutionCacheRecord>,
+    python_index: &PythonProjectionIndex,
 ) -> Result<()> {
     for claim in claims
         .iter_mut()
@@ -19114,6 +19116,11 @@ fn enforce_exact_dependency_eligibility(
             }
         }
         for file_id in expected_file_ids {
+            if claim.input.language == "python"
+                && !python_index.package_ancestry_by_file.contains_key(&file_id)
+            {
+                eligible = false;
+            }
             let file = files
                 .get(&file_id)
                 .ok_or_else(|| anyhow!("proof exact dependency file {file_id} is missing"))?;
