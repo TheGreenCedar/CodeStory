@@ -5774,10 +5774,32 @@ fn walk_tree_nodes<'tree, F>(node: TsNode<'tree>, visit: &mut F)
 where
     F: FnMut(TsNode<'tree>),
 {
+    // Root-first named-child preorder on the heap. Visit the start node even
+    // when it is unnamed, then skip unnamed child subtrees entirely so the
+    // walk matches `named_children` recursion without a call-stack frame per
+    // depth. TreeCursor sibling/parent moves stay inside this subtree.
     visit(node);
+    let start_id = node.id();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_tree_nodes(child, visit);
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let current = cursor.node();
+        if current.is_named() {
+            visit(current);
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() || cursor.node().id() == start_id {
+                return;
+            }
+        }
     }
 }
 

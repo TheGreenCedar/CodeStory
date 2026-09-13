@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Indexing C and C++ no longer crashes on deeply nested syntax trees.
+
 Go navigation no longer binds an ownerless bare call or conversion such as
 `string(...)` or `run()` to an unrelated receiver method. Package functions and
 genuine receiver calls keep their previous targets.

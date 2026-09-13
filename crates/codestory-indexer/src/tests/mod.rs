@@ -16,6 +16,8 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+mod walk_tree_nodes;
+
 fn measured_go_method_identity_qualification_work(method_count: usize) -> usize {
     let mut nodes = HashMap::new();
     let mut roles = HashMap::new();
