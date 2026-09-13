@@ -5248,6 +5248,11 @@ impl Storage {
                     .saturating_add(page_size - 1)
                     / page_size;
                 conn.pragma_update(None, "wal_autocheckpoint", checkpoint_pages)?;
+                conn.pragma_update(
+                    None,
+                    "journal_size_limit",
+                    DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64,
+                )?;
             }
         }
         if matches!(mode, StorageOpenMode::Build) {

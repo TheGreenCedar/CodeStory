@@ -31,12 +31,15 @@ never rolled back merely because a backup remains.
 The fresh full-refresh stage is explicitly disposable until publication. It
 keeps WAL so a bounded artifact-cache reader can be opened when verified
 structural rows were copied forward, uses relaxed synchronous writes with a
-bounded nonzero checkpoint window, and is never served or resumed. Parser rows
-are not copied, and a stage with no copied structural rows opens no cache
-reader. Its consuming publish path restores NORMAL synchronization, completes a
-TRUNCATE checkpoint, syncs the standalone database and directory, and permits
-no later stage writes before entering the promotion journal. Live stores,
-generic build callers, and staged incremental clones remain WAL/NORMAL.
+bounded nonzero checkpoint window, limits retained WAL allocation to that same
+window when SQLite can safely reset the journal, and is never served or resumed.
+Active WAL growth may exceed the retention limit while a transaction or pinned
+reader needs its frames. Parser rows are not copied, and a stage with no copied
+structural rows opens no cache reader. Its consuming publish path restores
+NORMAL synchronization, completes a TRUNCATE checkpoint, syncs the standalone
+database and directory, and permits no later stage writes before entering the
+promotion journal. Live stores, generic build callers, and staged incremental
+clones remain WAL/NORMAL with their default journal retention.
 
 Incremental refresh writes a durable clone and promotes the completed
 replacement through the same journal. Readers that need publication coherence
