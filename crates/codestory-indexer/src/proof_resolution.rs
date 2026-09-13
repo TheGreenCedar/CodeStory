@@ -4,7 +4,7 @@ use crate::cache::{
     CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
     CachedInherentMethod, CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
     CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
-    CachedTopLevelDeclaration,
+    CachedTopLevelDeclaration, decode_index_artifact,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -13362,7 +13362,7 @@ pub fn rematerialize_proof_resolution_projection(
     let governed_cache_paths = PreparedGovernedCachePaths::prepare(&governed, &governed_identities);
     let mut records_by_id = HashMap::<i64, Vec<ResolutionCacheRecord>>::new();
     for entry in store.get_index_artifact_cache_entries()? {
-        let artifact: CachedIndexArtifact = match serde_json::from_slice(&entry.artifact_blob) {
+        let artifact: CachedIndexArtifact = match decode_index_artifact(&entry.artifact_blob) {
             Ok(artifact) => artifact,
             Err(error) => {
                 if governed_cache_paths.contains(&entry.file_path)? {

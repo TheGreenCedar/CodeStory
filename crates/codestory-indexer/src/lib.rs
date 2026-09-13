@@ -103,7 +103,8 @@ pub mod symbol_table;
 pub mod template_pipeline;
 use cache::{
     CachedIndexArtifact, CachedStructuralArtifact, build_index_artifact_cache_key,
-    build_structural_artifact_cache_key, index_artifact_cache_path,
+    build_structural_artifact_cache_key, decode_index_artifact, encode_index_artifact,
+    index_artifact_cache_path,
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
@@ -3290,7 +3291,7 @@ impl WorkspaceIndexer {
         };
 
         match cache_access.get_parser(cache_path, cache_key, &mut stats.parser_artifact_cache) {
-            Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
+            Ok(Some(blob)) => match decode_index_artifact(&blob) {
                 Ok(artifact)
                     if proof_resolution::cached_resolution_inputs_are_current(
                         &artifact,
@@ -3865,13 +3866,13 @@ impl WorkspaceIndexer {
                     .as_ref()
                     .zip(prepared_input.artifact_cache_key.as_ref())
                     .and_then(|(path, cache_key)| {
-                        serde_json::to_vec(&artifact)
-                            .ok()
-                            .map(|artifact_blob| ArtifactCacheWrite {
+                        encode_index_artifact(&artifact).ok().map(|artifact_blob| {
+                            ArtifactCacheWrite {
                                 path: path.clone(),
                                 cache_key: cache_key.clone(),
                                 artifact_blob,
-                            })
+                            }
+                        })
                     });
                 let mut local_storage = artifact.into_intermediate_storage();
                 if let Some(file_info) = local_storage.files.first() {
