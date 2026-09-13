@@ -4865,18 +4865,23 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
     let category_id = storage.create_bookmark_category("Favorites")?;
     let _ = storage.add_bookmark(category_id, function_node.id, Some("keep"))?;
     storage.conn.execute(
+        "INSERT INTO proof_resolution_provenance (
+            provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+         ) VALUES (1, 500, ?1, ?1, '[]')",
+        ["2".repeat(64)],
+    )?;
+    storage.conn.execute(
         "INSERT INTO proof_resolution_fact (
             fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
-            file_id, source_sha256, start_byte, end_byte_exclusive,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
             line, column, callee_form, raw_target, caller_node_id,
-            target_node_id, status, reason, evidence_json, dependency_json,
+            target_node_id, status, reason, evidence_json,
             lookup_domain_complete, producer, fact_schema_version, algorithm,
-            language_adapter, language_adapter_version, parser_fingerprint,
-            evidence_digest
-         ) VALUES (?1, NULL, NULL, NULL, 500, ?2, 1, 2, 1, 1,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 500, 1, 1, 2, 1, 1,
             'identifier', 'missing', 501, NULL, 'missing_binding',
-            'missing_binding', '[]', '[]', 1, 'codestory-internal', 1,
-            'exact-call-resolution-v1', 'rust', 'test', ?2, ?2)",
+            'missing_binding', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2)",
         params!["1".repeat(64), "2".repeat(64)],
     )?;
     storage.conn.execute(
@@ -4897,6 +4902,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         "occurrence",
         "proof_resolution_publication",
         "proof_resolution_fact",
+        "proof_resolution_provenance",
         "edge",
         "llm_symbol_doc",
         "symbol_summary",
@@ -6621,18 +6627,24 @@ fn proof_rollback_identity_preserves_valid_absence_and_authenticates_receipts() 
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
     conn.execute(
+        "INSERT INTO proof_resolution_provenance (
+            provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+         ) VALUES (1, 999, ?1, ?1, '[]')",
+        ["2".repeat(64)],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO proof_resolution_fact (
             fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
-            file_id, source_sha256, start_byte, end_byte_exclusive,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
             line, column, callee_form, raw_target, caller_node_id,
-            target_node_id, status, reason, evidence_json, dependency_json,
+            target_node_id, status, reason, evidence_json,
             lookup_domain_complete, producer, fact_schema_version, algorithm,
-            language_adapter, language_adapter_version, parser_fingerprint,
-            evidence_digest
-         ) VALUES (?1, NULL, NULL, NULL, 999, ?2, 1, 2, 1, 1,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 999, 1, 1, 2, 1, 1,
             'identifier', 'missing', 999, NULL, 'missing_binding',
-            'missing_binding', '[]', '[]', 1, 'codestory-internal', 1,
-            'exact-call-resolution-v1', 'rust', 'test', ?2, ?2)",
+            'missing_binding', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2)",
         params!["1".repeat(64), "2".repeat(64)],
     )
     .unwrap();
@@ -6642,6 +6654,231 @@ fn proof_rollback_identity_preserves_valid_absence_and_authenticates_receipts() 
     assert!(error.to_string().contains("no publication"), "{error}");
 
     cleanup_sqlite_sidecars(&path).unwrap();
+}
+
+#[test]
+fn schema_32_proof_receipt_remains_readable_during_pre_migration_recovery() {
+    let path = unique_temp_db_path("schema-32-proof-rollback-identity");
+    seed_promotion_file(&path, 1, "old.rs").expect("seed publication");
+    let mut storage = Storage::open(&path).expect("open publication");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    let receipt = storage
+        .replace_proof_resolution_projection(
+            &publication,
+            &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                adapter_roster: vec![
+                    codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                        language: "rust".to_string(),
+                        adapter_version: "test".to_string(),
+                    },
+                ],
+                facts: Vec::new(),
+                funnel: Vec::new(),
+            },
+        )
+        .expect("publish authenticated projection");
+    storage.finalize_staged_snapshot().unwrap();
+    drop(storage);
+
+    let conn = Connection::open(&path).expect("open schema conversion");
+    conn.execute_batch(
+        "CREATE TABLE proof_resolution_fact_legacy AS
+         SELECT f.fact_id, f.edge_id, f.raw_edge_target_id,
+                f.raw_callsite_identity, f.file_id, p.source_sha256,
+                f.start_byte, f.end_byte_exclusive, f.line, f.column,
+                f.callee_form, f.raw_target, f.caller_node_id,
+                f.target_node_id, f.status, f.reason, f.evidence_json,
+                p.dependency_json, f.lookup_domain_complete, f.producer,
+                f.fact_schema_version, f.algorithm, f.language_adapter,
+                f.language_adapter_version, p.parser_fingerprint,
+                f.evidence_digest
+         FROM proof_resolution_fact AS f
+         JOIN proof_resolution_provenance AS p
+           ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+         ORDER BY f.rowid;
+         DROP TABLE proof_resolution_fact;
+         ALTER TABLE proof_resolution_fact_legacy RENAME TO proof_resolution_fact;
+         DROP TABLE proof_resolution_provenance;
+         PRAGMA user_version = 32;",
+    )
+    .expect("construct authentic schema-32 proof shape");
+    drop(conn);
+
+    let identity = read_proof_resolution_rollback_identity(&path, &publication)
+        .expect("schema-32 recovery read")
+        .expect("authenticated schema-32 proof identity");
+    assert_eq!(identity.fact_count, 0);
+    assert_eq!(identity.fact_digest, receipt.fact_digest);
+
+    cleanup_sqlite_sidecars(&path).unwrap();
+}
+
+#[test]
+fn schema_33_rejects_two_referenced_duplicate_logical_provenance_groups() {
+    for (case, schema, expected_facts) in [
+        (
+            "duplicate logical groups",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            FOREIGN KEY(provenance_id, file_id)
+                REFERENCES proof_resolution_provenance(provenance_id, file_id)
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]'),
+            (2, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1), ('fact-2', 1, 2);
+         PRAGMA user_version = 32;",
+            2,
+        ),
+        (
+            "partial logical unique",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id)
+         );
+         CREATE UNIQUE INDEX partial_provenance_identity
+           ON proof_resolution_provenance(
+             file_id, source_sha256, parser_fingerprint, dependency_json
+           ) WHERE provenance_id > 0;
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            FOREIGN KEY(provenance_id, file_id)
+                REFERENCES proof_resolution_provenance(provenance_id, file_id)
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1);
+         PRAGMA user_version = 32;",
+            1,
+        ),
+        (
+            "extended provenance foreign key",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            provenance_scope TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id),
+            UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json),
+            UNIQUE(provenance_id, file_id, provenance_scope)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            provenance_scope TEXT NOT NULL,
+            FOREIGN KEY(provenance_id, file_id, provenance_scope)
+                REFERENCES proof_resolution_provenance(
+                    provenance_id, file_id, provenance_scope
+                )
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]', 'extra');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1, 'extra');
+         PRAGMA user_version = 32;",
+            1,
+        ),
+    ] {
+        let conn = Connection::open_in_memory().expect("database");
+        conn.execute_batch(schema)
+            .unwrap_or_else(|error| panic!("construct {case}: {error}"));
+
+        assert!(
+            super::schema::migrate_v33_proof_resolution_provenance(&conn, true).is_err(),
+            "{case} must not be stamped current"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            32,
+            "{case}"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            expected_facts,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn schema_33_rejects_nonempty_normalized_provenance_beside_legacy_facts() {
+    let conn = Connection::open_in_memory().expect("database");
+    conn.execute_batch(
+        "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id),
+            UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            source_sha256 TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES
+            ('legacy-fact',
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             '[]', 'parser');
+         PRAGMA user_version = 32;",
+    )
+    .expect("construct mixed legacy and normalized shape");
+
+    super::schema::migrate_v33_proof_resolution_provenance(&conn, true)
+        .expect_err("nonempty mixed shape must not be repaired or stamped current");
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
 }
 
 fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> {
@@ -6877,10 +7114,11 @@ fn restamp_complete_promotion_fixture(
     schema_version: u32,
 ) -> Result<(), StorageError> {
     let conn = Connection::open(path)?;
-    if schema_version < SCHEMA_VERSION {
+    if schema_version < PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
         conn.execute_batch(
             "DROP TABLE IF EXISTS proof_resolution_publication;
-             DROP TABLE IF EXISTS proof_resolution_fact;",
+             DROP TABLE IF EXISTS proof_resolution_fact;
+             DROP TABLE IF EXISTS proof_resolution_provenance;",
         )?;
     }
     if schema_version < STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
@@ -11682,7 +11920,7 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 32);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 33);
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");

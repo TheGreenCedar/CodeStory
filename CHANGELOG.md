@@ -5,6 +5,10 @@
 Parser caches compress extraction data to reduce stored bytes while preserving
 source and call-resolution information. Existing caches remain readable.
 
+Proof-resolution indexes store repeated file provenance once per shared group,
+reducing index size without changing proof facts. Existing indexes migrate
+automatically when opened for project preparation.
+
 Fresh project preparation reclaims oversized retained SQLite journal storage
 after active transactions and readers release it.
 

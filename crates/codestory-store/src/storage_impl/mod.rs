@@ -73,7 +73,7 @@ pub(crate) struct SealedCoreCandidateReceipt {
     artifacts: Vec<ArtifactSeal>,
 }
 
-const SCHEMA_VERSION: u32 = 32;
+const SCHEMA_VERSION: u32 = 33;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -184,6 +184,7 @@ const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
 const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
 const ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION: u32 = 31;
+const PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 32;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -1142,6 +1143,18 @@ fn read_proof_resolution_rollback_identity(
             path.display()
         )));
     }
+    let legacy_v32_shape = if schema_version == PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
+        let mut statement = conn.prepare("PRAGMA table_info(proof_resolution_fact)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        ["source_sha256", "dependency_json", "parser_fingerprint"]
+            .iter()
+            .all(|column| columns.contains(*column))
+            && !columns.contains("provenance_id")
+    } else {
+        false
+    };
     let storage = Storage {
         conn,
         retrieval_publication_path: None,
@@ -1159,14 +1172,17 @@ fn read_proof_resolution_rollback_identity(
             path.display()
         )));
     };
-    let receipt = storage
-        .validate_stored_proof_resolution_publication(publication)
-        .map_err(|error| {
-            promotion_error(format!(
-                "Proof resolution rollback identity does not match {}: {error}",
-                path.display()
-            ))
-        })?;
+    let receipt = if legacy_v32_shape {
+        storage.validate_stored_legacy_v32_proof_resolution_publication(publication)
+    } else {
+        storage.validate_stored_proof_resolution_publication(publication)
+    }
+    .map_err(|error| {
+        promotion_error(format!(
+            "Proof resolution rollback identity does not match {}: {error}",
+            path.display()
+        ))
+    })?;
     Ok(Some(ProofResolutionRollbackIdentity {
         core_generation_id: receipt.core_generation_id,
         core_run_id: receipt.core_run_id,
@@ -2452,14 +2468,74 @@ fn delete_proof_facts_for_removed_edges_in_tx(
     tx: &rusqlite::Transaction<'_>,
     edge_predicate: &str,
     file_node_id: i64,
-) -> Result<usize, StorageError> {
-    Ok(tx.execute(
+) -> Result<BTreeSet<i64>, StorageError> {
+    delete_proof_facts_matching_in_tx(
+        tx,
+        &format!("edge_id IN (SELECT id FROM edge WHERE {edge_predicate})"),
+        file_node_id,
+    )
+}
+
+fn delete_proof_facts_matching_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    fact_predicate: &str,
+    file_node_id: i64,
+) -> Result<BTreeSet<i64>, StorageError> {
+    let missing_provenance: i64 = tx.query_row(
         &format!(
-            "DELETE FROM proof_resolution_fact
-             WHERE edge_id IN (SELECT id FROM edge WHERE {edge_predicate})"
+            "SELECT EXISTS(
+                SELECT 1 FROM proof_resolution_fact AS f
+                LEFT JOIN proof_resolution_provenance AS p
+                  ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+                WHERE f.rowid IN (
+                    SELECT rowid FROM proof_resolution_fact WHERE {fact_predicate}
+                ) AND p.provenance_id IS NULL
+            )"
         ),
         params![file_node_id],
-    )?)
+        |row| row.get(0),
+    )?;
+    if missing_provenance != 0 {
+        return Err(StorageError::Other(
+            "affected proof facts have missing or cross-file provenance".to_string(),
+        ));
+    }
+    let mut statement = tx.prepare(&format!(
+        "DELETE FROM proof_resolution_fact
+         WHERE {fact_predicate}
+         RETURNING provenance_id"
+    ))?;
+    let provenance_ids = statement
+        .query_map(params![file_node_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(provenance_ids)
+}
+
+fn delete_orphan_proof_provenance_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    provenance_ids: &BTreeSet<i64>,
+) -> Result<usize, StorageError> {
+    let mut deleted = 0;
+    for chunk in provenance_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks(400)
+    {
+        let placeholders = numbered_placeholders(1, chunk.len());
+        deleted += tx.execute(
+            &format!(
+                "DELETE FROM proof_resolution_provenance
+                 WHERE provenance_id IN ({placeholders})
+                   AND NOT EXISTS (
+                     SELECT 1 FROM proof_resolution_fact AS f
+                     WHERE f.provenance_id = proof_resolution_provenance.provenance_id
+                   )"
+            ),
+            params_from_iter(chunk.iter()),
+        )?;
+    }
+    Ok(deleted)
 }
 
 fn get_index_artifact_cache_from_connection(
@@ -5915,6 +5991,7 @@ impl Storage {
         if invalidate_proof_resolution {
             transaction.execute("DELETE FROM proof_resolution_publication", [])?;
             transaction.execute("DELETE FROM proof_resolution_fact", [])?;
+            transaction.execute("DELETE FROM proof_resolution_provenance", [])?;
         }
         transaction.execute(
             "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
@@ -6497,6 +6574,7 @@ impl Storage {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM proof_resolution_publication", [])?;
         tx.execute("DELETE FROM proof_resolution_fact", [])?;
+        tx.execute("DELETE FROM proof_resolution_provenance", [])?;
         tx.execute("DELETE FROM callable_projection_state", [])?;
         tx.execute("DELETE FROM structural_text_unit_publication", [])?;
         tx.execute("DELETE FROM structural_text_unit", [])?;
@@ -9134,7 +9212,9 @@ impl Storage {
             EdgeKind::CALL as i32,
             EdgeKind::USAGE as i32
         );
-        delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_id)?;
+        let provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_id)?;
+        delete_orphan_proof_provenance_in_tx(&tx, &provenance_ids)?;
         let removed_edges = tx.execute(
             &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_id],
@@ -9244,7 +9324,9 @@ impl Storage {
             EdgeKind::CALL as i32,
             EdgeKind::USAGE as i32
         );
-        delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_node_id)?;
+        let provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_node_id)?;
+        delete_orphan_proof_provenance_in_tx(&tx, &provenance_ids)?;
         let removed_edges = tx.execute(
             &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_node_id],
@@ -13742,17 +13824,19 @@ impl Storage {
 
         // Inherited proof facts hold foreign keys into the edge, node, and file
         // rows removed below, so they have to go first.
-        delete_proof_facts_for_removed_edges_in_tx(tx, &removed_edge_predicate, file_node_id)?;
-        tx.execute(
+        let mut provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(tx, &removed_edge_predicate, file_node_id)?;
+        provenance_ids.extend(delete_proof_facts_matching_in_tx(
+            tx,
             &format!(
-                "DELETE FROM proof_resolution_fact
-                 WHERE file_id = ?1
+                "file_id = ?1
                  OR caller_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR raw_edge_target_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
             ),
-            params![file_node_id],
-        )?;
+            file_node_id,
+        )?);
+        delete_orphan_proof_provenance_in_tx(tx, &provenance_ids)?;
 
         let removed_edges = tx.execute(
             &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
