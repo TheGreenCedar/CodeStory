@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-Indexing C and C++ no longer crashes on deeply nested syntax trees.
+Indexing C and C++ no longer crashes on deeply nested syntax trees. Collecting
+calls and declarations in those trees no longer aborts either.
 
 Go navigation no longer binds an ownerless bare call or conversion such as
 `string(...)` or `run()` to an unrelated receiver method. Package functions and

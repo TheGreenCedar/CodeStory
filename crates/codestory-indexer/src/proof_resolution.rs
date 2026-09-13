@@ -3217,6 +3217,13 @@ struct CCppProducer<'index, 'tree> {
     scopes: Vec<CCppScope>,
 }
 
+struct CCppWalkFrame {
+    node_id: usize,
+    context: CCppWalkContext,
+    pushed_namespace: bool,
+    pushed_scope: bool,
+}
+
 impl<'index, 'tree> CCppProducer<'index, 'tree> {
     fn new(index: &'index mut CCppResolutionIndex<'tree>, source: &'index str) -> Self {
         Self {
@@ -3232,6 +3239,56 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
     }
 
     fn visit(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        // Named-child preorder on the heap. Enter records namespace, scope,
+        // and context for descendants only; leave restores them before the
+        // next sibling so a deep tree cannot overflow the call stack.
+        let start_id = node.id();
+        let mut frames = vec![self.enter_node(node, context)];
+        let mut cursor = node.walk();
+        if !cursor.goto_first_child() {
+            self.leave_node(frames.pop().expect("C/C++ proof walk root frame"));
+            return;
+        }
+        loop {
+            let current = cursor.node();
+            if current.is_named() {
+                let parent_context = frames
+                    .last()
+                    .expect("named child has an entered parent")
+                    .context;
+                frames.push(self.enter_node(current, parent_context));
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                let frame = frames.pop().expect("entered named leaf");
+                assert_eq!(
+                    frame.node_id,
+                    current.id(),
+                    "C/C++ proof walk left a named leaf it did not enter"
+                );
+                self.leave_node(frame);
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() || cursor.node().id() == start_id {
+                    assert_eq!(frames.len(), 1, "C/C++ proof walk left an unrestored frame");
+                    self.leave_node(frames.pop().expect("C/C++ proof walk root frame"));
+                    return;
+                }
+                let frame = frames.pop().expect("entered named ancestor");
+                assert_eq!(
+                    frame.node_id,
+                    cursor.node().id(),
+                    "C/C++ proof walk restored a different node than it entered"
+                );
+                self.leave_node(frame);
+            }
+        }
+    }
+
+    fn enter_node(&mut self, node: TsNode<'tree>, mut context: CCppWalkContext) -> CCppWalkFrame {
         count_c_cpp_resolution_work(1);
         let namespace_name = (node.kind() == "namespace_definition")
             .then(|| node.child_by_field_name("name"))
@@ -3252,7 +3309,6 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
                 insertions: Vec::new(),
             });
         }
-        let mut context = context;
         if matches!(
             node.kind(),
             "template_declaration"
@@ -3275,15 +3331,19 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
         self.collect_write(node, context);
         self.collect_macro(node);
         self.collect_call(node, context);
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.visit(child, context);
+        CCppWalkFrame {
+            node_id: node.id(),
+            context,
+            pushed_namespace: namespace_name.is_some(),
+            pushed_scope: is_scope,
         }
-        if is_scope {
+    }
+
+    fn leave_node(&mut self, frame: CCppWalkFrame) {
+        if frame.pushed_scope {
             self.leave_scope();
         }
-        if namespace_name.is_some() {
+        if frame.pushed_namespace {
             self.namespace_path.pop();
         }
     }
@@ -3847,14 +3907,20 @@ fn c_cpp_normalize_signature_text(surface: &str) -> String {
 }
 
 fn c_cpp_declarator_bound_names(node: TsNode<'_>, source: &str) -> Option<Vec<String>> {
-    fn collect(node: TsNode<'_>, source: &str, names: &mut Vec<String>) -> Option<()> {
+    // Heap walk of the same nodes the recursive collector entered. A deep
+    // pointer declarator overflowed the call stack inside `index_file`; do
+    // not grow the stack, skip the file, or cap the depth instead.
+    let mut names = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
         count_c_cpp_resolution_work(1);
         match node.kind() {
             "identifier" | "field_identifier" | "type_identifier" => {
                 names.push(node_text(node, source)?.to_string());
-                Some(())
             }
-            "qualified_identifier" => collect(node.child_by_field_name("name")?, source, names),
+            "qualified_identifier" => {
+                pending.push(node.child_by_field_name("name")?);
+            }
             "structured_binding_declarator" => {
                 let mut cursor = node.walk();
                 let bindings = node.named_children(&mut cursor).collect::<Vec<_>>();
@@ -3865,10 +3931,12 @@ fn c_cpp_declarator_bound_names(node: TsNode<'_>, source: &str) -> Option<Vec<St
                 {
                     return None;
                 }
-                for binding in bindings {
-                    collect(binding, source, names)?;
+                // The recursive collector visited bindings left to right.
+                // Push right to left so this stack yields that order before
+                // the final sort.
+                for binding in bindings.into_iter().rev() {
+                    pending.push(binding);
                 }
-                Some(())
             }
             "init_declarator"
             | "pointer_declarator"
@@ -3886,14 +3954,11 @@ fn c_cpp_declarator_bound_names(node: TsNode<'_>, source: &str) -> Option<Vec<St
                     };
                     Some(*declarator)
                 })?;
-                collect(declarator, source, names)
+                pending.push(declarator);
             }
-            _ => None,
+            _ => return None,
         }
     }
-
-    let mut names = Vec::new();
-    collect(node, source, &mut names)?;
     names.sort();
     names.dedup();
     (!names.is_empty()).then_some(names)
@@ -20173,6 +20238,10 @@ mod c_cpp_complexity_tests {
         assert!(c_cpp_resolution_work() >= spans.len() * 4);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/c_cpp_proof_walk.rs"]
+mod c_cpp_proof_walk_tests;
 
 #[cfg(test)]
 mod java_kotlin_complexity_tests {
