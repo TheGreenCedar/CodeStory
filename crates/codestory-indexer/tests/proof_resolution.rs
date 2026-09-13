@@ -3985,6 +3985,55 @@ fn python_relative_imports_reject_symlinked_source_package_ancestry() -> anyhow:
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn python_same_file_calls_under_symlinked_package_do_not_abort_publication() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir()?;
+    let native_package = project.path().join("Lib/pkg");
+    fs::create_dir_all(&native_package)?;
+    fs::write(native_package.join("__init__.py"), "")?;
+    fs::write(
+        native_package.join("main.py"),
+        "def target():\n    pass\ndef caller():\n    target()\n",
+    )?;
+    let alias_parent = project.path().join("Misc/mypy");
+    fs::create_dir_all(&alias_parent)?;
+    let alias_package = alias_parent.join("pkg");
+    symlink("../../Lib/pkg", &alias_package)?;
+
+    let mut store = Store::new_in_memory()?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: vec![
+                alias_package.join("__init__.py"),
+                alias_package.join("main.py"),
+            ],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("same-file Python fact");
+    assert_eq!(fact.status, ProofResolutionStatus::IncompleteDomain);
+    assert_eq!(fact.reason, ProofResolutionReason::LookupDomainIncomplete);
+    assert!(!fact.lookup_domain_complete);
+    assert!(fact.target.is_none());
+    assert!(fact.evidence_chain.is_empty());
+    Ok(())
+}
+
 #[test]
 fn python_relative_imports_reject_parenthesized_one_name_forms() -> anyhow::Result<()> {
     for statement in [
