@@ -16,7 +16,25 @@ use codestory_workspace::{BuildMode, RefreshInfo};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+
+const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
+
+fn decode_index_artifact_json(blob: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return Ok(serde_json::from_slice(blob)?);
+    };
+    let (raw_len, compressed) = encoded
+        .split_at_checked(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("compressed parser artifact header is truncated"))?;
+    let expected_len = usize::try_from(u64::from_le_bytes(raw_len.try_into()?))?;
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut raw = Vec::with_capacity(expected_len);
+    decoder.read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() == expected_len, "parser artifact length mismatch");
+    Ok(serde_json::from_slice(&raw)?)
+}
 
 fn publication(generation: u64) -> IndexPublicationRecord {
     IndexPublicationRecord {
@@ -1854,7 +1872,7 @@ fn csharp_swift_and_dart_cache_blob_semantics_are_not_self_authenticating() -> a
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut artifact: serde_json::Value = serde_json::from_slice(&blob)?;
+        let mut artifact = decode_index_artifact_json(&blob)?;
         match mutation {
             "binding" => {
                 artifact["call_resolution_inputs"][0]["binding"]["kind"] = "unsupported".into()
@@ -3674,7 +3692,7 @@ fn c_cpp_header_provenance_uses_the_language_selected_during_indexing() -> anyho
         let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut fingerprints = HashMap::new();
         for row in rows {
-            let artifact: serde_json::Value = serde_json::from_slice(&row?)?;
+            let artifact = decode_index_artifact_json(&row?)?;
             let file = &artifact["resolution_file"];
             let language = file["language"].as_str().expect("cached language");
             let fingerprint = file["parser_fingerprint"]
@@ -3706,7 +3724,7 @@ fn c_cpp_header_provenance_uses_the_language_selected_during_indexing() -> anyho
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for (file_path, artifact_blob) in cached_rows {
-        let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+        let mut artifact = decode_index_artifact_json(&artifact_blob)?;
         if artifact["resolution_file"]["language"] == "cpp" {
             artifact["resolution_file"]["parser_fingerprint"] = c_fingerprint.clone().into();
             for call in artifact["call_resolution_inputs"]
@@ -3771,7 +3789,7 @@ fn proof_parser_evidence_uses_the_raw_predecode_source_hash() -> anyhow::Result<
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let artifact = decode_index_artifact_json(&artifact_blob)?;
     assert_eq!(artifact["resolution_file"]["source_sha256"], raw_hash);
     assert!(
         artifact["call_resolution_inputs"]
@@ -3789,7 +3807,7 @@ fn proof_parser_evidence_uses_the_raw_predecode_source_hash() -> anyhow::Result<
         "non-UTF-8 source must not create proof-authoritative call facts"
     );
 
-    let mut substituted: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut substituted = decode_index_artifact_json(&artifact_blob)?;
     substituted["resolution_file"]["source_sha256"] = decoded_hash.clone().into();
     for call in substituted["call_resolution_inputs"]
         .as_array_mut()
@@ -7226,7 +7244,7 @@ fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fac
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     artifact["call_resolution_inputs"] = serde_json::Value::Array(Vec::new());
     store.get_connection().execute(
         "UPDATE index_artifact_cache SET artifact_blob = ?1",
@@ -7343,7 +7361,7 @@ fn go_returned_closure_h6_seals_current_go_cache_and_fact_provenance() -> anyhow
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     artifact["resolution_file"]["adapter_version"] = "stale-go-adapter".into();
     for call in artifact["call_resolution_inputs"]
         .as_array_mut()
@@ -10677,7 +10695,7 @@ fn complete_projection_rejects_parser_completeness_mismatch() -> anyhow::Result<
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     artifact["resolution_file"]["complete"] = serde_json::Value::Bool(false);
     store.get_connection().execute(
         "UPDATE index_artifact_cache SET artifact_blob = ?1",
@@ -10707,7 +10725,7 @@ fn complete_projection_rejects_an_attacker_supplied_parser_fingerprint() -> anyh
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     let attacker_fingerprint = "f".repeat(64);
     artifact["resolution_file"]["parser_fingerprint"] =
         serde_json::Value::String(attacker_fingerprint.clone());
@@ -10746,7 +10764,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             [],
             |row| row.get::<_, Vec<u8>>(0),
         )?;
-        let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+        let mut artifact = decode_index_artifact_json(&artifact_blob)?;
         match mutation {
             0 => artifact["resolution_input_schema_version"] = 5.into(),
             1 => artifact["resolution_file"]["adapter_version"] = "reference-v5".into(),
@@ -11121,7 +11139,7 @@ fn stale_rust_glob_local_adapter_inputs_reject_rematerialization() -> anyhow::Re
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     artifact["resolution_file"]["adapter_version"] = "reference-v18".into();
     for call in artifact["call_resolution_inputs"]
         .as_array_mut()
@@ -11945,7 +11963,7 @@ fn non_utf8_parser_source_keeps_navigation_but_cannot_authorize_proof() -> anyho
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let artifact = decode_index_artifact_json(&artifact_blob)?;
     assert_eq!(artifact["resolution_file"]["source_sha256"], expected_hash);
     assert_eq!(artifact["resolution_file"]["lookup_input_complete"], false);
     assert_eq!(
@@ -11996,7 +12014,7 @@ fn non_utf8_semantic_reauthentication_accepts_only_coverage_without_calls() -> a
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
     artifact["resolution_file"]["lookup_input_complete"] = true.into();
     store.get_connection().execute(
         "UPDATE index_artifact_cache SET artifact_blob = ?1",

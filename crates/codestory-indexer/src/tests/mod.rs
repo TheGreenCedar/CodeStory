@@ -1422,6 +1422,61 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 }
 
 #[test]
+fn parser_artifact_cache_writer_compacts_and_replays_a_meaningful_projection() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("many_calls.rs");
+    let mut source = String::from("fn target() {}\n");
+    for index in 0..256 {
+        source.push_str(&format!("fn caller_{index}() {{ target(); }}\n"));
+    }
+    std::fs::write(&path, source)?;
+    let refresh = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![path],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+
+    let first = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert_eq!(first.parser_artifact_cache.misses, 1);
+    assert_eq!(first.artifact_cache_writes, 1);
+    let encoded: Vec<u8> = storage.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get(0),
+    )?;
+    let decoded = crate::cache::decode_index_artifact(&encoded)?;
+    let raw = serde_json::to_vec(&decoded)?;
+    assert_eq!(crate::cache::encode_index_artifact(&decoded)?, encoded);
+    assert_eq!(decoded.files.len(), 1);
+    assert!(decoded.files[0].complete);
+    assert!(!decoded.nodes.is_empty());
+    assert!(!decoded.edges.is_empty());
+    assert!(!decoded.occurrences.is_empty());
+    assert!(!decoded.call_resolution_inputs.is_empty());
+    let resolution_file = decoded
+        .resolution_file
+        .as_ref()
+        .expect("stored parser artifact must retain resolution file inputs");
+    assert!(resolution_file.complete);
+    assert!(resolution_file.lookup_input_complete);
+    assert!(
+        encoded.len() < raw.len() / 2,
+        "stored parser artifact did not materially compact: encoded={} raw={}",
+        encoded.len(),
+        raw.len()
+    );
+
+    let replay = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert_eq!(replay.parser_artifact_cache.hits, 1);
+    assert_eq!(replay.parser_artifact_cache.misses, 0);
+    assert_eq!(replay.artifact_cache_writes, 0);
+    Ok(())
+}
+
+#[test]
 fn test_incremental_indexing() -> Result<()> {
     use codestory_store::Store as Storage;
     use codestory_workspace::RefreshInfo;

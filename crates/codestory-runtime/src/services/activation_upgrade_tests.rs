@@ -1,6 +1,54 @@
 use super::*;
 use crate::Runtime;
+use flate2::{Decompress, FlushDecompress, Status};
 use std::fs;
+
+const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
+const MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES: usize = 64 * 1024 * 1024;
+
+fn decode_seed_parser_artifact(blob: &[u8]) -> serde_json::Value {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return serde_json::from_slice(blob).expect("legacy raw parser artifact");
+    };
+    let (raw_len, compressed) = encoded
+        .split_at_checked(std::mem::size_of::<u64>())
+        .expect("encoded parser artifact header");
+    let expected_len = usize::try_from(u64::from_le_bytes(raw_len.try_into().unwrap()))
+        .expect("parser artifact length fits this platform");
+    assert!(
+        expected_len <= MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES,
+        "seed parser artifact exceeds the test decoder bound"
+    );
+    let mut decoder = Decompress::new(true);
+    let mut raw = Vec::with_capacity(expected_len.saturating_add(1));
+    loop {
+        let input_before = decoder.total_in();
+        let output_before = decoder.total_out();
+        let input_offset = usize::try_from(input_before).expect("compressed input offset");
+        let status = decoder
+            .decompress_vec(
+                &compressed[input_offset..],
+                &mut raw,
+                FlushDecompress::Finish,
+            )
+            .expect("valid seed parser artifact");
+        assert!(raw.len() <= expected_len, "seed parser artifact length");
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert!(
+            decoder.total_in() != input_before || decoder.total_out() != output_before,
+            "seed parser artifact is truncated"
+        );
+    }
+    assert_eq!(raw.len(), expected_len, "seed parser artifact length");
+    assert_eq!(
+        decoder.total_in(),
+        compressed.len() as u64,
+        "seed parser artifact trailing bytes"
+    );
+    serde_json::from_slice(&raw).expect("seed parser artifact JSON")
+}
 
 fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let project = tempfile::tempdir().expect("project");
@@ -37,13 +85,51 @@ fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf
     permissions.set_readonly(false);
     fs::set_permissions(&storage_path, permissions).unwrap();
     let connection = rusqlite::Connection::open(&storage_path).unwrap();
-    connection.execute_batch(&format!(
-        "PRAGMA user_version = {}; UPDATE index_artifact_cache SET cache_key = 'legacy-' || cache_key,
-         artifact_blob = CAST(json_remove(CAST(artifact_blob AS TEXT), '$.resolution_file',
-         '$.resolution_input_schema_version', '$.call_resolution_inputs') AS BLOB);
-         DELETE FROM proof_resolution_publication; PRAGMA wal_checkpoint(TRUNCATE);",
-        codestory_store::CURRENT_SCHEMA_VERSION - 1,
-    )).expect("simulate prior schema and parser artifacts");
+    connection
+        .execute_batch(&format!(
+            "PRAGMA user_version = {};
+         UPDATE index_artifact_cache SET cache_key = 'legacy-' || cache_key;",
+            codestory_store::CURRENT_SCHEMA_VERSION - 1,
+        ))
+        .expect("simulate prior schema and cache keys");
+    let cached_rows = {
+        let mut statement = connection
+            .prepare("SELECT rowid, artifact_blob FROM index_artifact_cache")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        !cached_rows.is_empty(),
+        "seed must contain parser artifacts"
+    );
+    for (rowid, blob) in cached_rows {
+        let mut artifact = decode_seed_parser_artifact(&blob);
+        let fields = artifact
+            .as_object_mut()
+            .expect("seed parser artifact is an object");
+        for field in [
+            "resolution_file",
+            "resolution_input_schema_version",
+            "call_resolution_inputs",
+        ] {
+            assert!(fields.remove(field).is_some(), "seed artifact has {field}");
+        }
+        connection
+            .execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE rowid = ?2",
+                (serde_json::to_vec(&artifact).unwrap(), rowid),
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch("DELETE FROM proof_resolution_publication; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("finish prior schema fixture");
     drop(connection);
     (project, cache, storage_path)
 }

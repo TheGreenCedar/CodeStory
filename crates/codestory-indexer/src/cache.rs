@@ -5,11 +5,17 @@ use codestory_contracts::graph::{
 };
 use codestory_contracts::proof_resolution::ExactCallsite;
 use codestory_store::FileInfo;
+use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
 const INDEX_ARTIFACT_CACHE_VERSION: u32 = 29;
+const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
+const INDEX_ARTIFACT_ENCODING_HEADER_BYTES: usize = 16;
+const MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -386,6 +392,227 @@ impl CachedIndexArtifact {
             impl_anchor_node_ids: self.impl_anchor_node_ids,
             errors: Vec::new(),
         }
+    }
+}
+
+pub(crate) fn encode_index_artifact(artifact: &CachedIndexArtifact) -> anyhow::Result<Vec<u8>> {
+    let raw = serde_json::to_vec(artifact)?;
+    Ok(encode_serialized_index_artifact(
+        raw,
+        MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES,
+    ))
+}
+
+fn encode_serialized_index_artifact(raw: Vec<u8>, compressed_decode_limit: usize) -> Vec<u8> {
+    if raw.len() > compressed_decode_limit {
+        return raw;
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(&raw).is_err() {
+        return raw;
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return raw;
+    };
+    if INDEX_ARTIFACT_ENCODING_HEADER_BYTES.saturating_add(compressed.len()) >= raw.len() {
+        return raw;
+    }
+    let Ok(raw_len) = u64::try_from(raw.len()) else {
+        return raw;
+    };
+    let mut encoded = Vec::with_capacity(INDEX_ARTIFACT_ENCODING_HEADER_BYTES + compressed.len());
+    encoded.extend_from_slice(INDEX_ARTIFACT_ENCODING_MAGIC);
+    encoded.extend_from_slice(&raw_len.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    encoded
+}
+
+pub(crate) fn decode_index_artifact(blob: &[u8]) -> anyhow::Result<CachedIndexArtifact> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return serde_json::from_slice(blob).map_err(Into::into);
+    };
+    let (raw_len, compressed) = encoded
+        .split_at_checked(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("compressed parser artifact header is truncated"))?;
+    let expected_len = usize::try_from(u64::from_le_bytes(
+        raw_len
+            .try_into()
+            .expect("split parser artifact length has exact width"),
+    ))
+    .map_err(|_| anyhow::anyhow!("compressed parser artifact length exceeds this platform"))?;
+    if expected_len > MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact declares {expected_len} bytes above the {}-byte limit",
+            MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES
+        ));
+    }
+    let mut decoder = Decompress::new(true);
+    let mut raw = Vec::with_capacity(expected_len.saturating_add(1));
+    loop {
+        let input_before = decoder.total_in();
+        let output_before = decoder.total_out();
+        let input_offset = usize::try_from(input_before).map_err(|_| {
+            anyhow::anyhow!("compressed parser artifact input exceeds this platform")
+        })?;
+        let status = decoder
+            .decompress_vec(
+                &compressed[input_offset..],
+                &mut raw,
+                FlushDecompress::Finish,
+            )
+            .map_err(|error| anyhow::anyhow!("compressed parser artifact is corrupt: {error}"))?;
+        if raw.len() > expected_len {
+            return Err(anyhow::anyhow!(
+                "compressed parser artifact exceeds its declared {expected_len}-byte length"
+            ));
+        }
+        if status == Status::StreamEnd {
+            break;
+        }
+        if decoder.total_in() == input_before && decoder.total_out() == output_before {
+            return Err(anyhow::anyhow!(
+                "compressed parser artifact stream is truncated"
+            ));
+        }
+    }
+    if raw.len() != expected_len {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact length mismatch: decoded={} declared={expected_len}",
+            raw.len()
+        ));
+    }
+    if decoder.total_in() != compressed.len() as u64 {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact has trailing data"
+        ));
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|error| anyhow::anyhow!("compressed parser artifact JSON is invalid: {error}"))
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use codestory_contracts::graph::NodeKind;
+
+    fn repeated_artifact() -> CachedIndexArtifact {
+        CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: Vec::new(),
+            nodes: (0..512)
+                .map(|index| Node {
+                    id: NodeId(index + 1),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("repeated_package::repeated_function_{index}"),
+                    qualified_name: Some(format!("repeated_package::repeated_function_{index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            edges: Vec::new(),
+            occurrences: Vec::new(),
+            component_access: Vec::new(),
+            callable_projection_states: Vec::new(),
+            impl_anchor_node_ids: Vec::new(),
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        }
+    }
+
+    #[test]
+    fn parser_artifact_encoding_round_trips_exact_json_meaning() -> anyhow::Result<()> {
+        let artifact = repeated_artifact();
+        let raw = serde_json::to_vec(&artifact)?;
+        let encoded = encode_index_artifact(&artifact)?;
+        assert_eq!(encode_index_artifact(&artifact)?, encoded);
+        assert!(encoded.starts_with(INDEX_ARTIFACT_ENCODING_MAGIC));
+        assert!(
+            encoded.len() < raw.len() / 2,
+            "encoded={} raw={}",
+            encoded.len(),
+            raw.len()
+        );
+        let decoded = decode_index_artifact(&encoded)?;
+        assert_eq!(serde_json::to_vec(&decoded)?, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn parser_artifact_decoder_accepts_legacy_and_raw_oversize_fallback() -> anyhow::Result<()> {
+        let artifact = repeated_artifact();
+        let raw = serde_json::to_vec(&artifact)?;
+        assert_eq!(serde_json::to_vec(&decode_index_artifact(&raw)?)?, raw);
+
+        let encoded = encode_serialized_index_artifact(raw.clone(), raw.len() - 1);
+        assert_eq!(encoded, raw, "over-limit artifacts must retain raw JSON");
+        decode_index_artifact(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parser_artifact_decoder_rejects_corrupt_bounded_and_trailing_envelopes() -> anyhow::Result<()>
+    {
+        let encoded = encode_index_artifact(&repeated_artifact())?;
+        assert!(encoded.starts_with(INDEX_ARTIFACT_ENCODING_MAGIC));
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[6] = b'2';
+        let mut truncated_header = INDEX_ARTIFACT_ENCODING_MAGIC.to_vec();
+        truncated_header.extend_from_slice(&[0; 7]);
+        let mut corrupt_payload = encoded.clone();
+        corrupt_payload[INDEX_ARTIFACT_ENCODING_HEADER_BYTES + 1] ^= 0xff;
+        let mut inconsistent_length = encoded.clone();
+        let declared = u64::from_le_bytes(
+            inconsistent_length[8..16]
+                .try_into()
+                .expect("encoded length header"),
+        );
+        inconsistent_length[8..16].copy_from_slice(&(declared + 1).to_le_bytes());
+        let mut over_limit = encoded.clone();
+        over_limit[8..16].copy_from_slice(
+            &(MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES as u64 + 1).to_le_bytes(),
+        );
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b"trailing");
+        let mut concatenated_stream = encoded.clone();
+        concatenated_stream.extend_from_slice(&encoded[INDEX_ARTIFACT_ENCODING_HEADER_BYTES..]);
+        let mut concatenated_envelope = encoded.clone();
+        concatenated_envelope.extend_from_slice(&encoded);
+        let truncated_stream = &encoded[..encoded.len() - 1];
+        let invalid_json = encode_serialized_index_artifact(
+            vec![b'x'; 1_024],
+            MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES,
+        );
+
+        for (name, blob) in [
+            ("version", unsupported_version.as_slice()),
+            ("header", truncated_header.as_slice()),
+            ("payload", corrupt_payload.as_slice()),
+            ("length", inconsistent_length.as_slice()),
+            ("limit", over_limit.as_slice()),
+            ("json", invalid_json.as_slice()),
+            ("trailing", trailing.as_slice()),
+            ("concatenated stream", concatenated_stream.as_slice()),
+            ("concatenated envelope", concatenated_envelope.as_slice()),
+            ("stream", truncated_stream),
+        ] {
+            assert!(
+                decode_index_artifact(blob).is_err(),
+                "{name} corruption was accepted"
+            );
+        }
+        for end in [0, 1, 7, 8, 9, 15, 16] {
+            assert!(
+                decode_index_artifact(&encoded[..end]).is_err(),
+                "truncation at byte {end} was accepted"
+            );
+        }
+        for removed in 1..=4 {
+            assert!(
+                decode_index_artifact(&encoded[..encoded.len() - removed]).is_err(),
+                "truncating {removed} footer bytes was accepted"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -925,7 +1152,8 @@ mod tests {
             "impl_anchor_node_ids": []
         });
 
-        let decoded: CachedIndexArtifact = serde_json::from_value(legacy).unwrap();
+        let raw = serde_json::to_vec(&legacy).unwrap();
+        let decoded = decode_index_artifact(&raw).unwrap();
         assert_eq!(decoded.resolution_input_schema_version, 0);
         assert!(decoded.call_resolution_inputs.is_empty());
         assert!(decoded.resolution_file.is_none());

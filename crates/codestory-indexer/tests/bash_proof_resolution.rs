@@ -14,7 +14,25 @@ use codestory_store::{
 use codestory_workspace::{BuildMode, RefreshInfo};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
+
+fn decode_index_artifact_json(blob: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return Ok(serde_json::from_slice(blob)?);
+    };
+    let (raw_len, compressed) = encoded
+        .split_at_checked(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("compressed parser artifact header is truncated"))?;
+    let expected_len = usize::try_from(u64::from_le_bytes(raw_len.try_into()?))?;
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut raw = Vec::with_capacity(expected_len);
+    decoder.read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() == expected_len, "parser artifact length mismatch");
+    Ok(serde_json::from_slice(&raw)?)
+}
 
 fn publication(generation: u64) -> IndexPublicationRecord {
     IndexPublicationRecord {
@@ -571,7 +589,7 @@ fn bash_semantic_cache_is_reauthenticated_from_source_before_replay() -> anyhow:
         [],
         |row| row.get::<_, Vec<u8>>(0),
     )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&blob)?;
+    let mut artifact = decode_index_artifact_json(&blob)?;
     let target_call = artifact["call_resolution_inputs"]
         .as_array_mut()
         .expect("Bash cache calls")

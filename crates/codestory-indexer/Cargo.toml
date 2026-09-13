@@ -13,6 +13,7 @@ codestory-contracts = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
+flate2 = "=1.1.9"
 ignore = { workspace = true }
 jsonc-parser = { workspace = true }
 parking_lot = { workspace = true }

@@ -39,5 +39,6 @@ codestory-agent = { workspace = true, features = ["test-support"] }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-store = { workspace = true, features = ["test-support"] }
 codestory-workspace = { workspace = true, features = ["test-support"] }
+flate2 = "=1.1.9"
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
