@@ -22,7 +22,7 @@ use codestory_store::{
     ExactCallEdgeProjection, IndexPublicationRecord, ProofResolutionPublication, Store,
 };
 use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Parser, Tree};
 
@@ -13656,7 +13656,7 @@ pub fn rematerialize_proof_resolution_projection(
         .collect::<HashMap<_, _>>();
     let rust_projection_index = RustProjectionIndex::prepare(&records)?;
     let go_projection_index = GoProjectionIndex::prepare(&records)?;
-    let java_kotlin_projection_index = JavaKotlinProjectionIndex::prepare(&records);
+    let java_kotlin_projection_index = JavaKotlinProjectionIndex::prepare(&records, &nodes);
     let python_projection_index = PythonProjectionIndex::prepare(&records, &record_by_path)?;
     let claim_indexes = SyntaxClaimIndexes {
         files: &file_by_id,
@@ -16640,6 +16640,7 @@ struct JavaKotlinImportDomain {
     poisoned: bool,
     dependencies: Vec<FileId>,
     dependency_members: HashSet<FileId>,
+    unsupported_owner_names: HashSet<String>,
     declarations: HashMap<(Option<String>, String), Vec<JavaKotlinImportCandidate>>,
     classes: HashMap<String, Vec<JavaKotlinImportCandidate>>,
     cross_module_visible_nodes: HashSet<NodeId>,
@@ -16810,7 +16811,7 @@ fn resolve_dart_literal_import(
 }
 
 impl JavaKotlinProjectionIndex {
-    fn prepare(records: &[ResolutionCacheRecord]) -> Self {
+    fn prepare(records: &[ResolutionCacheRecord], nodes: &[Node]) -> Self {
         let mut domains = HashMap::<(String, String), JavaKotlinImportDomain>::new();
         let mut php_domains = HashMap::<CachedPhpNamespace, JavaKotlinImportDomain>::new();
         let mut php_identity_by_file = HashMap::new();
@@ -16821,6 +16822,51 @@ impl JavaKotlinProjectionIndex {
         let mut ruby_functions = HashMap::<String, Vec<JavaKotlinImportCandidate>>::new();
         let mut ruby_classes = HashMap::<String, Vec<JavaKotlinImportCandidate>>::new();
         let mut ruby_methods = HashMap::<(String, String), Vec<JavaKotlinImportCandidate>>::new();
+        let java_package_by_file = records
+            .iter()
+            .filter(|record| record.file.language == "java")
+            .filter_map(|record| {
+                record
+                    .file
+                    .java_kotlin_package
+                    .as_ref()
+                    .map(|package| (record.file.file_id, package.as_str()))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut java_package_dependency_files = HashSet::new();
+        let mut java_unsupported_owner_names = HashMap::<&str, HashSet<String>>::new();
+        for node in nodes.iter().filter(|node| {
+            node.file_node_id
+                .is_some_and(|file_id| java_package_by_file.contains_key(&file_id))
+        }) {
+            let Some(file_id) = node.file_node_id else {
+                continue;
+            };
+            let Some(package) = java_package_by_file.get(&file_id).copied() else {
+                continue;
+            };
+            let Some((parent, name)) = node
+                .qualified_name
+                .as_deref()
+                .and_then(|qualified| qualified.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if parent != package {
+                continue;
+            }
+            if matches!(
+                node.kind,
+                NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+            ) {
+                java_package_dependency_files.insert(FileId(file_id.0));
+            } else if matches!(node.kind, NodeKind::INTERFACE | NodeKind::ANNOTATION) {
+                java_unsupported_owner_names
+                    .entry(package)
+                    .or_default()
+                    .insert(name.to_string());
+            }
+        }
         for record in records
             .iter()
             .filter(|record| record.file.language == "ruby")
@@ -16950,7 +16996,9 @@ impl JavaKotlinProjectionIndex {
             }
             domain.poisoned |= record.file.export_poison_all;
             let file_id = FileId(record.file.file_id.0);
-            if domain.dependency_members.insert(file_id) {
+            if (record.file.language != "java" || java_package_dependency_files.contains(&file_id))
+                && domain.dependency_members.insert(file_id)
+            {
                 domain.dependencies.push(file_id);
             }
             for declaration in &record.file.top_level_declarations {
@@ -17013,8 +17061,13 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
-        for ((language, _), domain) in &mut domains {
+        for ((language, package), domain) in &mut domains {
             if is_java_kotlin_language(language) {
+                if language == "java"
+                    && let Some(names) = java_unsupported_owner_names.get(package.as_str())
+                {
+                    domain.unsupported_owner_names.extend(names.iter().cloned());
+                }
                 domain.dependencies.sort();
                 domain.dependencies.dedup();
                 for candidates in domain.declarations.values_mut() {
@@ -17200,6 +17253,9 @@ impl JavaKotlinProjectionIndex {
         imported_name: &str,
     ) -> JavaKotlinImportResolution {
         if !domain.complete || domain.poisoned {
+            return JavaKotlinImportResolution::Incomplete;
+        }
+        if owner_name.is_some_and(|owner| domain.unsupported_owner_names.contains(owner)) {
             return JavaKotlinImportResolution::Incomplete;
         }
         count_ruby_php_resolution_work(1);
@@ -19032,6 +19088,31 @@ fn resolve_syntax_claim(
             exact_dependency_files.clear();
         }
     }
+    if status == ProofResolutionStatus::Exact && source_record.file.language == "java" {
+        let same_package_receiver = input.callsite.callee_form == CalleeForm::ExplicitReceiver
+            && (matches!(
+                evidence_chain.as_slice(),
+                [
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SamePackageDeclaration { .. },
+                ] if constructor == receiver_type
+            ) || matches!(
+                evidence_chain.as_slice(),
+                [
+                    ResolutionEvidence::ExplicitReceiverType { .. },
+                    ResolutionEvidence::SamePackageDeclaration { .. },
+                ]
+            ));
+        if !same_package_receiver {
+            exact_dependency_files = exact_node_file_expectations
+                .iter()
+                .map(|(_, file_id)| *file_id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+    }
     if !source_file.complete
         || !source_record.file.complete
         || !source_record.file.lookup_input_complete
@@ -19777,7 +19858,7 @@ mod ruby_php_complexity_tests {
             })
             .collect::<Vec<_>>();
         reset_ruby_php_resolution_work();
-        let index = JavaKotlinProjectionIndex::prepare(&records);
+        let index = JavaKotlinProjectionIndex::prepare(&records, &[]);
         for record in &records {
             for declaration in &record.file.top_level_declarations {
                 if record.file.language == "ruby" {
