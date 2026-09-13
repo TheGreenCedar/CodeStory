@@ -180,6 +180,89 @@ fn incomplete_domain_projection() -> ProofResolutionProjection {
     }
 }
 
+fn mixed_status_projection() -> ProofResolutionProjection {
+    let mut facts = vec![exact_fact(EdgeId(7))];
+    for (index, (status, reason, lookup_domain_complete)) in [
+        (
+            ProofResolutionStatus::Ambiguous,
+            ProofResolutionReason::MultipleBindings,
+            true,
+        ),
+        (
+            ProofResolutionStatus::Unsupported,
+            ProofResolutionReason::UnsupportedConstruct,
+            true,
+        ),
+        (
+            ProofResolutionStatus::MissingBinding,
+            ProofResolutionReason::MissingBinding,
+            true,
+        ),
+        (
+            ProofResolutionStatus::IncompleteDomain,
+            ProofResolutionReason::LookupDomainIncomplete,
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fact = incomplete_domain_fact();
+        fact.callsite.start_byte = 40 + index as u64 * 10;
+        fact.callsite.end_byte_exclusive = fact.callsite.start_byte + 6;
+        fact.callsite.column = 40 + index as u32 * 10;
+        fact.status = status;
+        fact.reason = reason;
+        fact.lookup_domain_complete = lookup_domain_complete;
+        facts.push(seal_call_resolution_fact(fact).expect("seal closed fact"));
+    }
+    ProofResolutionProjection {
+        adapter_roster: vec![ProofResolutionAdapter {
+            language: "rust".to_owned(),
+            adapter_version: "rust-exact-v1".to_owned(),
+        }],
+        facts,
+        funnel: vec![
+            ProofResolutionFunnelRow {
+                language: "rust".to_owned(),
+                callee_form: Some(CalleeForm::Identifier),
+                evidence_kind: None,
+                counts: ProofResolutionFunnelCounts {
+                    syntax_calls: 4,
+                    adapter_supported: 3,
+                    exact: 0,
+                    ambiguous: 1,
+                    missing_binding: 1,
+                    incomplete_domain: 1,
+                    unsupported: 1,
+                    exact_call_linked: 0,
+                    proof_shape_admitted: 0,
+                    authoritative_receipts: 0,
+                    complete_proofs: 0,
+                },
+            },
+            ProofResolutionFunnelRow {
+                language: "rust".to_owned(),
+                callee_form: Some(CalleeForm::Identifier),
+                evidence_kind: Some(ResolutionEvidenceKind::SameFileDeclaration),
+                counts: ProofResolutionFunnelCounts {
+                    syntax_calls: 1,
+                    adapter_supported: 1,
+                    exact: 1,
+                    ambiguous: 0,
+                    missing_binding: 0,
+                    incomplete_domain: 0,
+                    unsupported: 0,
+                    exact_call_linked: 1,
+                    proof_shape_admitted: 0,
+                    authoritative_receipts: 0,
+                    complete_proofs: 0,
+                },
+            },
+        ],
+    }
+}
+
 fn seed_exact_graph(store: &mut Store) {
     let file = FileInfo {
         id: 1,
@@ -898,14 +981,463 @@ fn graph_read_authorizations_for_projection(fact_count: u32) -> usize {
 }
 
 #[test]
-fn schema_32_migration_creates_no_synthetic_proof_publication() {
+fn schema_33_migration_creates_no_synthetic_proof_publication() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("codestory.db");
     let store = Store::open(&path).expect("store");
 
-    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 32);
+    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 33);
     assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
     assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+}
+
+#[test]
+fn schema_33_migration_preserves_legacy_fact_and_publication_seals() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("codestory.db");
+    let publication = publication();
+    let expected_fact = exact_fact(EdgeId(7));
+    let expected_receipt = {
+        let mut store = Store::open(&path).expect("store");
+        seed_exact_graph(&mut store);
+        store
+            .replace_proof_resolution_projection(
+                &publication,
+                &projection(vec![expected_fact.clone()]),
+            )
+            .expect("publish normalized fixture")
+    };
+
+    let legacy = rusqlite::Connection::open(&path).expect("open legacy conversion");
+    legacy
+        .execute_batch(
+            "CREATE TABLE proof_resolution_fact_legacy AS
+             SELECT f.fact_id, f.edge_id, f.raw_edge_target_id,
+                    f.raw_callsite_identity, f.file_id, p.source_sha256,
+                    f.start_byte, f.end_byte_exclusive, f.line, f.column,
+                    f.callee_form, f.raw_target, f.caller_node_id,
+                    f.target_node_id, f.status, f.reason, f.evidence_json,
+                    p.dependency_json, f.lookup_domain_complete, f.producer,
+                    f.fact_schema_version, f.algorithm, f.language_adapter,
+                    f.language_adapter_version, p.parser_fingerprint,
+                    f.evidence_digest
+             FROM proof_resolution_fact AS f
+             JOIN proof_resolution_provenance AS p
+               ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id;
+             DROP TABLE proof_resolution_fact;
+             ALTER TABLE proof_resolution_fact_legacy RENAME TO proof_resolution_fact;
+             DROP TABLE proof_resolution_provenance;
+             PRAGMA user_version = 32;",
+        )
+        .expect("construct legacy schema-32 proof rows");
+    drop(legacy);
+
+    let store = Store::open(&path).expect("atomically migrate schema-32 proof rows");
+    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 33);
+    assert_eq!(
+        store.get_proof_resolution_facts().unwrap(),
+        vec![expected_fact]
+    );
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(expected_receipt)
+    );
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect("migrated fact and publication seals remain valid");
+}
+
+#[test]
+fn shared_file_provenance_round_trips_with_fewer_pages_than_denormalized_facts() {
+    const FACT_COUNT: u32 = 512;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("codestory.db");
+    let mut store = Store::open(&path).expect("store");
+    seed_repeated_exact_graph(&mut store, FACT_COUNT);
+    let publication = publication();
+    let expected_facts = (0..FACT_COUNT)
+        .map(|index| {
+            let mut fact = repeated_exact_fact(index);
+            if index >= FACT_COUNT - 8 {
+                fact.provenance.parser_fingerprint = "2".repeat(64);
+                fact = seal_call_resolution_fact(fact).expect("seal second provenance group");
+            }
+            fact
+        })
+        .collect::<Vec<_>>();
+
+    let receipt = store
+        .replace_proof_resolution_projection(&publication, &projection(expected_facts.clone()))
+        .expect("publish repeated exact facts");
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect("validate normalized projection");
+
+    let loaded_facts = store.get_proof_resolution_facts().unwrap();
+    assert_eq!(loaded_facts, expected_facts);
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(receipt.fact_count, u64::from(FACT_COUNT));
+
+    let page_size: i64 = store
+        .get_connection()
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("read product database page size");
+    let legacy_path = temp.path().join("legacy-proof.db");
+    let mut legacy = rusqlite::Connection::open(&legacy_path).expect("open legacy control");
+    legacy
+        .pragma_update(None, "page_size", page_size)
+        .expect("match product database page size");
+    legacy
+        .execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+             CREATE TABLE node (id INTEGER PRIMARY KEY);
+             CREATE TABLE edge (id INTEGER PRIMARY KEY);
+             CREATE TABLE proof_resolution_fact (
+                fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+                edge_id INTEGER,
+                raw_edge_target_id INTEGER,
+                raw_callsite_identity TEXT,
+                file_id INTEGER NOT NULL,
+                source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+                start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+                end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+                line INTEGER NOT NULL CHECK(line > 0),
+                column INTEGER NOT NULL CHECK(column > 0),
+                callee_form TEXT NOT NULL CHECK(callee_form IN (
+                    'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+                    'implicit_receiver', 'constructor', 'dynamic_access'
+                )),
+                raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+                caller_node_id INTEGER NOT NULL,
+                target_node_id INTEGER,
+                status TEXT NOT NULL CHECK(status IN (
+                    'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+                )),
+                reason TEXT NOT NULL CHECK(reason IN (
+                    'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+                    'missing_binding', 'lookup_domain_incomplete'
+                )),
+                evidence_json TEXT NOT NULL,
+                dependency_json TEXT NOT NULL,
+                lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+                producer TEXT NOT NULL,
+                fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+                algorithm TEXT NOT NULL,
+                language_adapter TEXT NOT NULL,
+                language_adapter_version TEXT NOT NULL,
+                parser_fingerprint TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+                UNIQUE(file_id, start_byte, end_byte_exclusive),
+                CHECK(status != 'exact' OR (
+                    target_node_id IS NOT NULL AND edge_id IS NOT NULL
+                    AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+                    AND lookup_domain_complete = 1
+                )),
+                FOREIGN KEY(edge_id) REFERENCES edge(id),
+                FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
+                FOREIGN KEY(file_id) REFERENCES file(id),
+                FOREIGN KEY(caller_node_id) REFERENCES node(id),
+                FOREIGN KEY(target_node_id) REFERENCES node(id)
+             );
+             CREATE UNIQUE INDEX idx_proof_resolution_exact_edge
+               ON proof_resolution_fact(edge_id) WHERE status = 'exact';
+             CREATE INDEX idx_proof_resolution_file
+               ON proof_resolution_fact(file_id);
+             CREATE INDEX idx_proof_resolution_caller_target
+               ON proof_resolution_fact(caller_node_id, target_node_id, status);",
+        )
+        .expect("create exact legacy proof schema");
+    {
+        let tx = legacy.transaction().expect("begin legacy control write");
+        tx.execute("INSERT INTO file (id) VALUES (1)", [])
+            .expect("insert legacy control file");
+        for node_id in [2_i64, 3, 4] {
+            tx.execute("INSERT INTO node (id) VALUES (?1)", [node_id])
+                .expect("insert legacy control node");
+        }
+        for index in 0..FACT_COUNT {
+            tx.execute(
+                "INSERT INTO edge (id) VALUES (?1)",
+                [7_i64 + i64::from(index)],
+            )
+            .expect("insert legacy control edge");
+        }
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO proof_resolution_fact (
+                        fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+                        file_id, source_sha256, start_byte, end_byte_exclusive,
+                        line, column, callee_form, raw_target, caller_node_id,
+                        target_node_id, status, reason, evidence_json, dependency_json,
+                        lookup_domain_complete, producer, fact_schema_version, algorithm,
+                        language_adapter, language_adapter_version, parser_fingerprint,
+                        evidence_digest
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                        ?24, ?25, ?26
+                     )",
+                )
+                .expect("prepare legacy control insert");
+            for fact in &loaded_facts {
+                insert
+                    .execute(rusqlite::params![
+                        fact.fact_id,
+                        fact.edge_id.map(|edge_id| edge_id.0),
+                        fact.raw_edge_target.map(|node_id| node_id.0),
+                        fact.raw_callsite_identity,
+                        fact.callsite.file_id.0,
+                        fact.callsite.source_sha256,
+                        i64::try_from(fact.callsite.start_byte).unwrap(),
+                        i64::try_from(fact.callsite.end_byte_exclusive).unwrap(),
+                        i64::from(fact.callsite.line),
+                        i64::from(fact.callsite.column),
+                        fact.callsite.callee_form.as_str(),
+                        fact.callsite.raw_target,
+                        fact.caller.0,
+                        fact.target.map(|target| target.0),
+                        fact.status.as_str(),
+                        fact.reason.as_str(),
+                        serde_json::to_string(&fact.evidence_chain).unwrap(),
+                        serde_json::to_string(&fact.provenance.dependency_file_hashes).unwrap(),
+                        i64::from(fact.lookup_domain_complete),
+                        fact.provenance.producer,
+                        i64::from(fact.provenance.fact_schema_version),
+                        fact.provenance.algorithm,
+                        fact.provenance.language_adapter,
+                        fact.provenance.language_adapter_version,
+                        fact.provenance.parser_fingerprint,
+                        fact.provenance.evidence_sha256,
+                    ])
+                    .expect("insert legacy control fact");
+            }
+        }
+        tx.commit().expect("commit legacy control facts");
+    }
+
+    let owned_bytes = |connection: &rusqlite::Connection, tables: &[String]| -> i64 {
+        tables
+            .iter()
+            .flat_map(|table| {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type IN ('table', 'index') AND tbl_name = ?1",
+                    )
+                    .expect("prepare owned SQLite object inventory");
+                statement
+                    .query_map([table], |row| row.get::<_, String>(0))
+                    .expect("query owned SQLite object inventory")
+                    .map(|row| row.expect("read owned SQLite object name"))
+                    .collect::<Vec<_>>()
+            })
+            .map(|name| {
+                connection
+                    .query_row(
+                        "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?1",
+                        [&name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or_else(|error| panic!("measure {name} pages: {error}"))
+            })
+            .sum()
+    };
+    let mut actual_tables = vec!["proof_resolution_fact".to_owned()];
+    let mut provenance_tables = store
+        .get_connection()
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table'
+               AND name LIKE 'proof_resolution%provenance%'
+             ORDER BY name",
+        )
+        .expect("prepare provenance table inventory")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query provenance table inventory")
+        .map(|row| row.expect("read provenance table name"))
+        .collect::<Vec<_>>();
+    actual_tables.append(&mut provenance_tables);
+    let actual_bytes = owned_bytes(store.get_connection(), &actual_tables);
+    let legacy_bytes = owned_bytes(&legacy, &["proof_resolution_fact".to_owned()]);
+    eprintln!(
+        "proof provenance dbstat bytes: actual={actual_bytes}, legacy={legacy_bytes}, saved={}",
+        legacy_bytes.saturating_sub(actual_bytes)
+    );
+    assert!(
+        actual_bytes.saturating_mul(5) <= legacy_bytes.saturating_mul(4),
+        "shared provenance must save at least 20% of proof fact and index pages: actual={actual_bytes}, legacy={legacy_bytes}, actual_tables={actual_tables:?}"
+    );
+}
+
+#[test]
+fn shared_provenance_preserves_every_closed_status_and_exact_fact() {
+    let mut store = Store::new_in_memory().expect("store");
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    let projection = mixed_status_projection();
+
+    let receipt = store
+        .replace_proof_resolution_projection(&publication, &projection)
+        .expect("publish mixed proof statuses");
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect("validate mixed proof statuses");
+
+    assert_eq!(
+        store.get_proof_resolution_facts().unwrap(),
+        projection.facts
+    );
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(receipt)
+    );
+}
+
+#[test]
+fn shared_provenance_mutations_fail_closed_without_rewriting_the_receipt() {
+    for mutation in [
+        "source",
+        "parser",
+        "dependency",
+        "missing",
+        "extra",
+        "cross_file",
+    ] {
+        let mut store = Store::new_in_memory().unwrap();
+        seed_exact_graph(&mut store);
+        let second_file = FileInfo {
+            id: 5,
+            path: "src/other.rs".into(),
+            language: "rust".to_owned(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        };
+        store.insert_file(&second_file).unwrap();
+        store
+            .update_file_metadata(&second_file, Some(&"b".repeat(64)))
+            .unwrap();
+        let publication = publication();
+        let receipt = store
+            .replace_proof_resolution_projection(
+                &publication,
+                &projection(vec![exact_fact(EdgeId(7))]),
+            )
+            .unwrap();
+
+        match mutation {
+            "source" => {
+                store
+                    .get_connection()
+                    .execute(
+                        "UPDATE proof_resolution_provenance SET source_sha256 = ?1",
+                        ["b".repeat(64)],
+                    )
+                    .unwrap();
+            }
+            "parser" => {
+                store
+                    .get_connection()
+                    .execute(
+                        "UPDATE proof_resolution_provenance SET parser_fingerprint = ?1",
+                        ["2".repeat(64)],
+                    )
+                    .unwrap();
+            }
+            "dependency" => {
+                store
+                    .get_connection()
+                    .execute(
+                        "UPDATE proof_resolution_provenance SET dependency_json = '[]'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "missing" => {
+                store
+                    .get_connection()
+                    .pragma_update(None, "foreign_keys", false)
+                    .unwrap();
+                store
+                    .get_connection()
+                    .execute("DELETE FROM proof_resolution_provenance", [])
+                    .unwrap();
+            }
+            "extra" => {
+                store
+                    .get_connection()
+                    .execute(
+                        "INSERT INTO proof_resolution_provenance (
+                            provenance_id, file_id, source_sha256,
+                            parser_fingerprint, dependency_json
+                         ) VALUES (99, 1, ?1, ?2, '[]')",
+                        rusqlite::params!["b".repeat(64), "3".repeat(64)],
+                    )
+                    .unwrap();
+            }
+            _ => {
+                store
+                    .get_connection()
+                    .pragma_update(None, "foreign_keys", false)
+                    .unwrap();
+                store
+                    .get_connection()
+                    .execute("UPDATE proof_resolution_provenance SET file_id = 5", [])
+                    .unwrap();
+            }
+        }
+
+        store
+            .validate_proof_resolution_publication(&publication)
+            .unwrap_err();
+        assert_eq!(
+            store.get_proof_resolution_publication().unwrap(),
+            Some(receipt),
+            "{mutation} must not rewrite the sealed publication row"
+        );
+    }
+}
+
+#[test]
+fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    let expected_fact = exact_fact(EdgeId(7));
+    let receipt = store
+        .replace_proof_resolution_projection(&publication, &projection(vec![expected_fact.clone()]))
+        .unwrap();
+    store
+        .get_connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_proof_provenance_insert
+             BEFORE INSERT ON proof_resolution_provenance
+             BEGIN SELECT RAISE(ABORT, 'forced provenance write failure'); END;",
+        )
+        .unwrap();
+
+    store
+        .replace_proof_resolution_projection(&publication, &projection(vec![expected_fact.clone()]))
+        .expect_err("the injected shared provenance write must fail");
+
+    assert_eq!(
+        store.get_proof_resolution_facts().unwrap(),
+        vec![expected_fact]
+    );
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(receipt)
+    );
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect("the previous complete projection survives rollback");
 }
 
 #[test]
@@ -1773,7 +2305,7 @@ fn stored_proof_json_requires_exact_typed_canonical_bytes() {
     for mutation in ["whitespace", "key_order"] {
         for (table, column, reader) in [
             ("proof_resolution_fact", "evidence_json", "facts"),
-            ("proof_resolution_fact", "dependency_json", "facts"),
+            ("proof_resolution_provenance", "dependency_json", "facts"),
             (
                 "proof_resolution_publication",
                 "adapter_roster_json",

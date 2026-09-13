@@ -15,6 +15,29 @@ const PUBLICATION_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-publicatio
 const PUBLICATION_FACT_ID_DIGEST_DOMAIN: &[u8] =
     b"codestory-proof-resolution-publication-fact-ids-v2\0";
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StoredProofProvenanceKey {
+    file_id: i64,
+    source_sha256: String,
+    parser_fingerprint: String,
+    dependency_json: String,
+}
+
+impl StoredProofProvenanceKey {
+    fn for_fact(fact: &CallResolutionFact) -> Result<Self, StorageError> {
+        let dependency_json = serde_json::to_string(&fact.provenance.dependency_file_hashes)
+            .map_err(|error| {
+                proof_error(format!("failed to serialize dependency hashes: {error}"))
+            })?;
+        Ok(Self {
+            file_id: fact.callsite.file_id.0,
+            source_sha256: fact.callsite.source_sha256.clone(),
+            parser_fingerprint: fact.provenance.parser_fingerprint.clone(),
+            dependency_json,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProofResolutionPublicationValidation {
     pub(crate) manifest: ProofResolutionPublication,
@@ -2803,6 +2826,48 @@ fn parse_stored_proof_resolution_fact(
 }
 
 impl Storage {
+    fn validate_proof_resolution_provenance_topology(&self) -> Result<(), StorageError> {
+        let (
+            fact_count,
+            joined_fact_count,
+            provenance_count,
+            referenced_provenance_count,
+            logical_provenance_count,
+        ) = self.conn.query_row(
+            "SELECT
+                    (SELECT COUNT(*) FROM proof_resolution_fact),
+                    (SELECT COUNT(*)
+                     FROM proof_resolution_fact AS f
+                     JOIN proof_resolution_provenance AS p
+                       ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id),
+                    (SELECT COUNT(*) FROM proof_resolution_provenance),
+                    (SELECT COUNT(DISTINCT provenance_id) FROM proof_resolution_fact),
+                    (SELECT COUNT(*) FROM (
+                        SELECT 1 FROM proof_resolution_provenance
+                        GROUP BY file_id, source_sha256, parser_fingerprint, dependency_json
+                    ))",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        if fact_count != joined_fact_count
+            || provenance_count != referenced_provenance_count
+            || provenance_count != logical_provenance_count
+        {
+            return Err(proof_error(
+                "proof provenance rows are missing, orphaned, or rebound across files",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn proof_resolution_fact_count(&self) -> Result<u64, StorageError> {
         let count: i64 =
             self.conn
@@ -2880,24 +2945,55 @@ impl Storage {
         &self,
         edge_id: Option<EdgeId>,
     ) -> Result<Vec<CallResolutionFact>, StorageError> {
-        let mut sql = "SELECT fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
-                              file_id, source_sha256, start_byte,
-                              end_byte_exclusive, line, column, callee_form, raw_target,
-                              caller_node_id, target_node_id, status, reason, evidence_json,
-                              dependency_json, lookup_domain_complete, producer,
-                              fact_schema_version, algorithm, language_adapter,
-                              language_adapter_version, parser_fingerprint, evidence_digest
-                       FROM proof_resolution_fact"
+        if edge_id.is_none() {
+            self.validate_proof_resolution_provenance_topology()?;
+        }
+        let mut sql = "SELECT f.fact_id, f.edge_id, f.raw_edge_target_id, f.raw_callsite_identity,
+                              f.file_id, p.source_sha256, f.start_byte,
+                              f.end_byte_exclusive, f.line, f.column, f.callee_form, f.raw_target,
+                              f.caller_node_id, f.target_node_id, f.status, f.reason, f.evidence_json,
+                              p.dependency_json, f.lookup_domain_complete, f.producer,
+                              f.fact_schema_version, f.algorithm, f.language_adapter,
+                              f.language_adapter_version, p.parser_fingerprint, f.evidence_digest
+                       FROM proof_resolution_fact AS f
+                       LEFT JOIN proof_resolution_provenance AS p
+                         ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id"
             .to_owned();
         if edge_id.is_some() {
-            sql.push_str(" WHERE edge_id = ?1 AND status = 'exact'");
+            sql.push_str(" WHERE f.edge_id = ?1 AND f.status = 'exact'");
         }
-        sql.push_str(" ORDER BY rowid");
+        sql.push_str(" ORDER BY f.rowid");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = match edge_id {
             Some(edge_id) => stmt.query(params![edge_id.0])?,
             None => stmt.query([])?,
         };
+        let mut facts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let fact = parse_stored_proof_resolution_fact(row)?;
+            if edge_id.is_some() {
+                validate_fact_seal(&fact)?;
+            }
+            facts.push(fact);
+        }
+        Ok(facts)
+    }
+
+    fn read_legacy_v32_proof_resolution_facts(
+        &self,
+    ) -> Result<Vec<CallResolutionFact>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+                    file_id, source_sha256, start_byte, end_byte_exclusive,
+                    line, column, callee_form, raw_target, caller_node_id,
+                    target_node_id, status, reason, evidence_json, dependency_json,
+                    lookup_domain_complete, producer, fact_schema_version, algorithm,
+                    language_adapter, language_adapter_version, parser_fingerprint,
+                    evidence_digest
+             FROM proof_resolution_fact
+             ORDER BY rowid",
+        )?;
+        let mut rows = statement.query([])?;
         let mut facts = Vec::new();
         while let Some(row) = rows.next()? {
             facts.push(parse_stored_proof_resolution_fact(row)?);
@@ -2916,25 +3012,55 @@ impl Storage {
         for chunk in fact_ids.chunks(400) {
             let placeholders = numbered_placeholders(1, chunk.len());
             let sql = format!(
-                "SELECT fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
-                        file_id, source_sha256, start_byte,
-                        end_byte_exclusive, line, column, callee_form, raw_target,
-                        caller_node_id, target_node_id, status, reason, evidence_json,
-                        dependency_json, lookup_domain_complete, producer,
-                        fact_schema_version, algorithm, language_adapter,
-                        language_adapter_version, parser_fingerprint, evidence_digest
-                 FROM proof_resolution_fact
-                 WHERE fact_id IN ({placeholders})
-                 ORDER BY fact_id"
+                "SELECT f.fact_id, f.edge_id, f.raw_edge_target_id, f.raw_callsite_identity,
+                        f.file_id, p.source_sha256, f.start_byte,
+                        f.end_byte_exclusive, f.line, f.column, f.callee_form, f.raw_target,
+                        f.caller_node_id, f.target_node_id, f.status, f.reason, f.evidence_json,
+                        p.dependency_json, f.lookup_domain_complete, f.producer,
+                        f.fact_schema_version, f.algorithm, f.language_adapter,
+                        f.language_adapter_version, p.parser_fingerprint, f.evidence_digest
+                 FROM proof_resolution_fact AS f
+                 LEFT JOIN proof_resolution_provenance AS p
+                   ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+                 WHERE f.fact_id IN ({placeholders})
+                 ORDER BY f.fact_id"
             );
             let mut statement = self.conn.prepare(&sql)?;
             let mut rows = statement.query(params_from_iter(chunk.iter()))?;
             while let Some(row) = rows.next()? {
-                facts.push(parse_stored_proof_resolution_fact(row)?);
+                let fact = parse_stored_proof_resolution_fact(row)?;
+                validate_fact_seal(&fact)?;
+                facts.push(fact);
             }
         }
         facts.sort_by(|left, right| left.fact_id.cmp(&right.fact_id));
         Ok(facts)
+    }
+
+    fn read_provenance_ids_by_fact_ids(
+        &self,
+        fact_ids: &[String],
+    ) -> Result<BTreeMap<String, i64>, StorageError> {
+        let mut provenance_ids = BTreeMap::new();
+        for chunk in fact_ids.chunks(400) {
+            let placeholders = numbered_placeholders(1, chunk.len());
+            let mut statement = self.conn.prepare(&format!(
+                "SELECT fact_id, provenance_id
+                 FROM proof_resolution_fact
+                 WHERE fact_id IN ({placeholders})"
+            ))?;
+            let mut rows = statement.query(params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                let fact_id = row.get::<_, String>(0)?;
+                let provenance_id = row.get::<_, i64>(1)?;
+                if provenance_ids.insert(fact_id, provenance_id).is_some() {
+                    return Err(proof_error(
+                        "proof fact has duplicate stored provenance identities",
+                    ));
+                }
+            }
+        }
+        Ok(provenance_ids)
     }
 
     fn validate_facts_against_graph(
@@ -4257,23 +4383,52 @@ impl Storage {
             .map_err(|error| proof_error(format!("failed to serialize adapter roster: {error}")))?;
         let funnel_json = serde_json::to_string(&manifest.funnel)
             .map_err(|error| proof_error(format!("failed to serialize funnel: {error}")))?;
+        let provenance_ids = facts
+            .iter()
+            .map(StoredProofProvenanceKey::for_fact)
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                i64::try_from(index + 1)
+                    .map(|provenance_id| (key, provenance_id))
+                    .map_err(|_| proof_error("proof provenance count exceeds SQLite integer"))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM proof_resolution_publication", [])?;
         tx.execute("DELETE FROM proof_resolution_fact", [])?;
+        tx.execute("DELETE FROM proof_resolution_provenance", [])?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO proof_resolution_provenance (
+                    provenance_id, file_id, source_sha256,
+                    parser_fingerprint, dependency_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (provenance, provenance_id) in &provenance_ids {
+                statement.execute(params![
+                    provenance_id,
+                    provenance.file_id,
+                    provenance.source_sha256,
+                    provenance.parser_fingerprint,
+                    provenance.dependency_json,
+                ])?;
+            }
+        }
         {
             let mut statement = tx.prepare(
                 "INSERT INTO proof_resolution_fact (
                     fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
-                    file_id, source_sha256, start_byte,
+                    file_id, provenance_id, start_byte,
                     end_byte_exclusive, line, column, callee_form, raw_target,
                     caller_node_id, target_node_id, status, reason, evidence_json,
-                    dependency_json, lookup_domain_complete, producer,
+                    lookup_domain_complete, producer,
                     fact_schema_version, algorithm, language_adapter,
-                    language_adapter_version, parser_fingerprint, evidence_digest
+                    language_adapter_version, evidence_digest
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                    ?25, ?26
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )",
             )?;
             for fact in &facts {
@@ -4290,19 +4445,17 @@ impl Storage {
                     serde_json::to_string(&fact.evidence_chain).map_err(|error| {
                         proof_error(format!("failed to serialize typed evidence: {error}"))
                     })?;
-                let dependency_json = serde_json::to_string(
-                    &fact.provenance.dependency_file_hashes,
-                )
-                .map_err(|error| {
-                    proof_error(format!("failed to serialize dependency hashes: {error}"))
-                })?;
+                let provenance_key = StoredProofProvenanceKey::for_fact(fact)?;
+                let provenance_id = provenance_ids
+                    .get(&provenance_key)
+                    .ok_or_else(|| proof_error("proof fact lost its prepared provenance group"))?;
                 statement.execute(params![
                     fact.fact_id,
                     fact.edge_id.map(|edge_id| edge_id.0),
                     fact.raw_edge_target.map(|node_id| node_id.0),
                     fact.raw_callsite_identity,
                     fact.callsite.file_id.0,
-                    fact.callsite.source_sha256,
+                    provenance_id,
                     i64::try_from(fact.callsite.start_byte)
                         .map_err(|_| proof_error("callsite start byte exceeds SQLite integer"))?,
                     i64::try_from(fact.callsite.end_byte_exclusive)
@@ -4316,14 +4469,12 @@ impl Storage {
                     fact.status.as_str(),
                     fact.reason.as_str(),
                     evidence_json,
-                    dependency_json,
                     i64::from(fact.lookup_domain_complete),
                     fact.provenance.producer,
                     i64::from(fact.provenance.fact_schema_version),
                     fact.provenance.algorithm,
                     fact.provenance.language_adapter,
                     fact.provenance.language_adapter_version,
-                    fact.provenance.parser_fingerprint,
                     fact.provenance.evidence_sha256,
                 ])?;
             }
@@ -4428,6 +4579,7 @@ impl Storage {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let provenance_id_by_fact_id = self.read_provenance_ids_by_fact_ids(&affected_fact_ids)?;
         let mut facts = self.read_proof_resolution_facts_by_ids(&affected_fact_ids)?;
         let observed_fact_ids = facts
             .iter()
@@ -4441,6 +4593,7 @@ impl Storage {
             ));
         }
         let mut updates = Vec::<(String, CallResolutionFact)>::new();
+        let mut provenance_updates = BTreeMap::<i64, StoredProofProvenanceKey>::new();
         for fact in &mut facts {
             validate_fact_seal(fact)?;
             let mut changed = false;
@@ -4461,6 +4614,21 @@ impl Storage {
             if changed {
                 let previous_fact_id = fact.fact_id.clone();
                 let resealed = seal_call_resolution_fact(fact.clone())?;
+                let provenance_id = provenance_id_by_fact_id
+                    .get(&previous_fact_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        proof_error("source-identity rebind lost a provenance identity")
+                    })?;
+                let provenance = StoredProofProvenanceKey::for_fact(&resealed)?;
+                if provenance_updates
+                    .insert(provenance_id, provenance.clone())
+                    .is_some_and(|prior| prior != provenance)
+                {
+                    return Err(proof_error(
+                        "source-identity rebind split one shared provenance group",
+                    ));
+                }
                 *fact = resealed.clone();
                 updates.push((previous_fact_id, resealed));
             }
@@ -4529,25 +4697,38 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut statement = tx.prepare(
+                "UPDATE proof_resolution_provenance
+                 SET source_sha256 = ?2,
+                     parser_fingerprint = ?3,
+                     dependency_json = ?4
+                 WHERE provenance_id = ?1 AND file_id = ?5",
+            )?;
+            for (provenance_id, provenance) in &provenance_updates {
+                let changed = statement.execute(params![
+                    provenance_id,
+                    provenance.source_sha256,
+                    provenance.parser_fingerprint,
+                    provenance.dependency_json,
+                    provenance.file_id,
+                ])?;
+                if changed != 1 {
+                    return Err(proof_error(
+                        "source-identity provenance changed during its staged rebind",
+                    ));
+                }
+            }
+        }
+        {
+            let mut statement = tx.prepare(
                 "UPDATE proof_resolution_fact
                  SET fact_id = ?2,
-                     source_sha256 = ?3,
-                     dependency_json = ?4,
-                     evidence_digest = ?5
+                     evidence_digest = ?3
                  WHERE fact_id = ?1",
             )?;
             for (previous_fact_id, fact) in &updates {
-                let dependency_json = serde_json::to_string(
-                    &fact.provenance.dependency_file_hashes,
-                )
-                .map_err(|error| {
-                    proof_error(format!("failed to serialize dependency hashes: {error}"))
-                })?;
                 let changed = statement.execute(params![
                     previous_fact_id,
                     fact.fact_id,
-                    fact.callsite.source_sha256,
-                    dependency_json,
                     fact.provenance.evidence_sha256,
                 ])?;
                 if changed != 1 {
@@ -4626,6 +4807,50 @@ impl Storage {
             .map(|validation| validation.manifest)
     }
 
+    pub(crate) fn validate_stored_legacy_v32_proof_resolution_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<ProofResolutionPublication, StorageError> {
+        let manifest = self
+            .get_proof_resolution_publication()?
+            .ok_or_else(|| proof_error("complete publication receipt is missing"))?;
+        if !manifest.complete
+            || manifest.fact_schema_version != PROOF_RESOLUTION_FACT_SCHEMA_VERSION
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+        {
+            return Err(proof_error(
+                "complete publication receipt does not match the core publication",
+            ));
+        }
+        let facts = self.read_legacy_v32_proof_resolution_facts()?;
+        validate_adapter_roster(&facts, &manifest.adapter_roster)?;
+        let expected_funnel = recompute_funnel(&facts);
+        let fact_id_digest = publication_fact_id_integrity_digest_for_facts(
+            &facts,
+            &manifest.adapter_roster,
+            &manifest.funnel,
+        )?;
+        let legacy_digest = (manifest.fact_digest != fact_id_digest)
+            .then(|| {
+                publication_integrity_digest(&facts, &manifest.adapter_roster, &manifest.funnel)
+            })
+            .transpose()?;
+        if manifest.funnel != expected_funnel
+            || manifest.fact_count != facts.len() as u64
+            || (manifest.fact_digest != fact_id_digest
+                && legacy_digest.as_deref() != Some(manifest.fact_digest.as_str()))
+        {
+            return Err(proof_error(
+                "fact rows do not match their publication digest",
+            ));
+        }
+        self.validate_facts_against_graph(&facts, false)?;
+        proof_resolution_publication_validation(manifest, &facts)
+            .map(|validation| validation.manifest)
+    }
+
     fn validate_proof_resolution_publication_contents(
         &self,
         publication: &IndexPublicationRecord,
@@ -4662,9 +4887,13 @@ impl Storage {
                 "proof publication is not eligible for bounded source-identity rebind",
             ));
         }
+        self.validate_proof_resolution_provenance_topology()?;
         let mut statement = self.conn.prepare(
-            "SELECT fact_id, file_id, dependency_json
-             FROM proof_resolution_fact ORDER BY fact_id",
+            "SELECT f.fact_id, f.file_id, p.dependency_json
+             FROM proof_resolution_fact AS f
+             JOIN proof_resolution_provenance AS p
+               ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+             ORDER BY f.fact_id",
         )?;
         let mut rows = statement.query([])?;
         let mut sorted_fact_ids = Vec::with_capacity(manifest.fact_count as usize);

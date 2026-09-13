@@ -13,6 +13,8 @@ recovery.
 - grounding snapshots and canonical paged search-symbol reads from the node
   table; the legacy materialized search projection remains compatibility-only;
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
+- sealed call-resolution facts, with source hash, parser fingerprint, and
+  canonical dependency hashes stored once per distinct file-provenance group;
 - verified source-policy exclusion rows and their project/workspace/core-bound
   count-and-digest manifest;
 - versioned structural text units, per-file complete projections, their
@@ -67,6 +69,15 @@ that carries its producer, including zero-unit files. Replacing one file's
 hash, graph rows, units, projection, and dedicated cache entry is atomic and
 invalidates the complete manifest until runtime republishes it. Schema migration
 creates the tables but no synthetic completeness claim.
+
+Schema v33 normalizes proof provenance without changing the typed fact or its
+seal. Each fact retains its callsite file and an internal reference to a unique
+`(file, source hash, parser fingerprint, canonical dependency list)` group;
+reads reconstruct the original `CallResolutionFact` before validating its fact
+and publication digests. Multiple groups for one file remain valid. Missing,
+orphaned, extra, or cross-file provenance references fail closed. The v32 row
+rewrite, its row-count/publication checks, and the schema-33 writer barrier
+commit atomically, and migration never creates a proof publication receipt.
 
 The projection transaction also replaces file-scoped errors and marks
 grounding summary/detail plus resolution-support state dirty. Those writes do
