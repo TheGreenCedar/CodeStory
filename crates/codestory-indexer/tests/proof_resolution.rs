@@ -2881,6 +2881,198 @@ fn java_and_kotlin_cross_file_package_and_import_receipts_are_exact() -> anyhow:
 }
 
 #[test]
+fn java_same_package_dependency_closure_excludes_interface_only_files() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "p/Lib.java",
+                "package p; public class Lib { public static void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p; class Caller { void caller() { Lib.target(); } }\n",
+            ),
+            ("p/Unused.java", "package p; class Unused {}\n"),
+            ("p/Kind.java", "package p; enum Kind { ONE }\n"),
+            (
+                "p/Protocol.java",
+                "package p; interface Protocol { int VALUE = 1; }\n",
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "java" && fact.callsite.raw_target == "target"
+        })
+        .expect("same-package Java receiver fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(matches!(
+        fact.evidence_chain.as_slice(),
+        [
+            ResolutionEvidence::ExplicitReceiverType { .. },
+            ResolutionEvidence::SamePackageDeclaration { .. }
+        ]
+    ));
+
+    let files = store.get_files()?;
+    let file_id = |suffix: &str| {
+        FileId(
+            files
+                .iter()
+                .find(|file| file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing indexed Java file {suffix}"))
+                .id,
+        )
+    };
+    let expected = ["p/Caller.java", "p/Lib.java", "p/Unused.java"]
+        .into_iter()
+        .map(|suffix| file_id(suffix))
+        .collect::<BTreeSet<_>>();
+    let observed = fact
+        .provenance
+        .dependency_file_hashes
+        .iter()
+        .map(|dependency| dependency.file_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(observed, expected, "{fact:#?}");
+    assert!(
+        !observed.contains(&file_id("p/Kind.java"))
+            && !observed.contains(&file_id("p/Protocol.java")),
+        "{fact:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn java_same_file_and_imported_receivers_do_not_acquire_package_closure() -> anyhow::Result<()> {
+    for (name, files, expected_paths) in [
+        (
+            "same_file",
+            vec![
+                (
+                    "p/Caller.java",
+                    "package p; class Caller { static void target() {} void caller() { Caller.target(); } }\n",
+                ),
+                ("p/Unused.java", "package p; class Unused {}\n"),
+                ("p/Protocol.java", "package p; interface Protocol {}\n"),
+            ],
+            vec!["p/Caller.java"],
+        ),
+        (
+            "imported",
+            vec![
+                (
+                    "p/Lib.java",
+                    "package p; public class Lib { public static void target() {} }\n",
+                ),
+                ("p/Unused.java", "package p; class Unused {}\n"),
+                ("p/Protocol.java", "package p; interface Protocol {}\n"),
+                (
+                    "q/Caller.java",
+                    concat!(
+                        "package q;\n",
+                        "import static p.Lib.target;\n",
+                        "class Caller {\n",
+                        "  void caller() { target(); }\n",
+                        "}\n",
+                    ),
+                ),
+            ],
+            vec!["p/Lib.java", "q/Caller.java"],
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "java" && fact.callsite.raw_target == "target"
+            })
+            .unwrap_or_else(|| panic!("{name} Java receiver fact"));
+        assert_eq!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{name}: {fact:#?}"
+        );
+        let files = store.get_files()?;
+        let expected = expected_paths
+            .into_iter()
+            .map(|suffix| {
+                FileId(
+                    files
+                        .iter()
+                        .find(|file| file.path.ends_with(suffix))
+                        .unwrap_or_else(|| panic!("missing {name} dependency {suffix}"))
+                        .id,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let observed = fact
+            .provenance
+            .dependency_file_hashes
+            .iter()
+            .map(|dependency| dependency.file_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(observed, expected, "{name}: {fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn java_unsupported_same_name_owner_keeps_package_receiver_nonexact() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "p/Lib.java",
+                "package p; public class Lib { public static void target() {} }\n",
+            ),
+            ("p/Protocol.java", "package p; interface Lib {}\n"),
+            (
+                "p/Caller.java",
+                "package p; class Caller { void caller() { Lib.target(); } }\n",
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "java" && fact.callsite.raw_target == "target"
+        })
+        .expect("same-name unsupported Java owner fact");
+    assert_eq!(
+        fact.status,
+        ProofResolutionStatus::IncompleteDomain,
+        "{fact:#?}"
+    );
+    assert!(
+        fact.target.is_none() && fact.evidence_chain.is_empty(),
+        "{fact:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn java_same_package_receiver_receipt_replays_and_rejects_domain_mutations() -> anyhow::Result<()> {
     for mutation in ["none", "package", "member", "source"] {
         let project = tempfile::tempdir()?;

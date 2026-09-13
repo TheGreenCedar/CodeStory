@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Project preparation no longer rejects Java packages merely because they contain
+interface-only source files.
+
 Indexing C and C++ no longer crashes on deeply nested syntax trees. Collecting
 calls and declarations in those trees no longer aborts either.
 
