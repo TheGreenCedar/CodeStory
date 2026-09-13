@@ -698,6 +698,7 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
+ "flate2",
  "nucleo-matcher",
  "parking_lot",
  "rayon",
