@@ -2734,13 +2734,14 @@ fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
 
 #[test]
 fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), StorageError> {
-    fn profile(storage: &Storage) -> Result<(String, i64, i64, i64), StorageError> {
+    fn profile(storage: &Storage) -> Result<(String, i64, i64, i64, i64), StorageError> {
         let connection = storage.get_connection();
         Ok((
             connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
             connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?,
             connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?,
             connection.query_row("PRAGMA page_size", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))?,
         ))
     }
 
@@ -2755,18 +2756,25 @@ fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), Stor
     let mut incremental_clone = crate::SnapshotStore::clone_live_to_staged(&live_path)?;
 
     for (name, storage) in [("live", &live), ("generic build", &generic_build)] {
-        let (journal_mode, synchronous, _, _) = profile(storage)?;
+        let (journal_mode, synchronous, _, _, journal_size_limit) = profile(storage)?;
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal", "{name}");
         assert_eq!(synchronous, 1, "{name} must retain synchronous=NORMAL");
+        assert_eq!(journal_size_limit, -1, "{name} WAL retention changed");
     }
-    let (journal_mode, synchronous, _, _) = profile(incremental_clone.store_mut())?;
+    let (journal_mode, synchronous, _, _, journal_size_limit) =
+        profile(incremental_clone.store_mut())?;
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(
         synchronous, 1,
         "incremental clone must retain synchronous=NORMAL"
     );
+    assert_eq!(
+        journal_size_limit, -1,
+        "incremental clone WAL retention changed"
+    );
 
-    let (journal_mode, synchronous, checkpoint_pages, page_size) = profile(&disposable)?;
+    let (journal_mode, synchronous, checkpoint_pages, page_size, journal_size_limit) =
+        profile(&disposable)?;
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(synchronous, 0);
     assert_eq!(
@@ -2774,6 +2782,99 @@ fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), Stor
         (DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64 + page_size - 1) / page_size
     );
     assert!(checkpoint_pages > 0);
+    assert_eq!(
+        journal_size_limit,
+        DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64
+    );
+    Ok(())
+}
+
+#[test]
+fn disposable_full_build_reclaims_oversized_wal_only_after_a_safe_reset() -> Result<(), StorageError>
+{
+    const PAYLOAD_ROWS: usize = 68;
+    const PAYLOAD_BYTES: i64 = 1024 * 1024;
+
+    let dir = tempfile::tempdir().map_err(|error| StorageError::Other(error.to_string()))?;
+    let path = dir.path().join("wal-retention.sqlite");
+    let storage = Storage::open_disposable_full_build(&path)?;
+    let connection = storage.get_connection();
+    connection.execute_batch(
+        "CREATE TABLE wal_retention_probe (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+         INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1));",
+    )?;
+
+    let observer = Storage::open_observational(&path)?;
+    let snapshot = observer.read_snapshot()?;
+    let pinned_rows: i64 = snapshot.storage().get_connection().query_row(
+        "SELECT COUNT(*) FROM wal_retention_probe",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(pinned_rows, 1);
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    for _ in 0..PAYLOAD_ROWS {
+        connection.execute(
+            "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(?1))",
+            [PAYLOAD_BYTES],
+        )?;
+    }
+    connection.execute_batch("COMMIT")?;
+
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let oversized_wal = fs::metadata(&wal_path)
+        .map_err(|error| StorageError::Other(error.to_string()))?
+        .len();
+    assert!(
+        oversized_wal > DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "large commit must establish an oversized retained WAL: {oversized_wal}"
+    );
+    assert_eq!(
+        snapshot.storage().get_connection().query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM wal_retention_probe",
+            [],
+            |row| row.get(0),
+        )?,
+        1,
+        "pinned reader must retain its pre-reset snapshot"
+    );
+    assert!(
+        fs::metadata(&wal_path)
+            .map_err(|error| StorageError::Other(error.to_string()))?
+            .len()
+            > DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "active reader must prevent unsafe WAL reclamation"
+    );
+    snapshot.finish()?;
+    drop(observer);
+
+    // The first commit after releasing the reader permits the passive
+    // checkpoint to finish. A following commit can then safely reset the WAL.
+    connection.execute(
+        "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1))",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1))",
+        [],
+    )?;
+    let reclaimed_wal = fs::metadata(&wal_path)
+        .map_err(|error| StorageError::Other(error.to_string()))?
+        .len();
+    assert!(
+        reclaimed_wal <= DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "safe reset retained {reclaimed_wal} WAL bytes above the established limit"
+    );
+    let (rows, payload_bytes): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), SUM(length(payload)) FROM wal_retention_probe",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(rows, PAYLOAD_ROWS as i64 + 3);
+    assert_eq!(payload_bytes, PAYLOAD_ROWS as i64 * PAYLOAD_BYTES + 3);
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
     Ok(())
 }
 

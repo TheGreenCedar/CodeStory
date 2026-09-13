@@ -5,6 +5,9 @@
 Parser caches compress extraction data to reduce stored bytes while preserving
 source and call-resolution information. Existing caches remain readable.
 
+Fresh project preparation reclaims oversized retained SQLite journal storage
+after active transactions and readers release it.
+
 Project preparation no longer rejects Java packages merely because they contain
 interface-only source files.
 
