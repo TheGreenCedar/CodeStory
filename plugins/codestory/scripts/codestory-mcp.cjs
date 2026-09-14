@@ -2698,9 +2698,8 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
-    // Keep the completed archive on the same filesystem as its own partial so publication is a
-    // same-directory rename. The managed extraction root remains the fallback when the download
-    // cache is unavailable.
+    // Keep the completed archive beside its partial for atomic download publication and reuse the
+    // verified download-cache entry across provisioning attempts.
     let archivePath = path.join(tempRoot, asset);
     let archivePartialPath = `${archivePath}.part`;
     try {
