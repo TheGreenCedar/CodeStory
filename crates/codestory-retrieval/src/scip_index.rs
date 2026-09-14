@@ -786,8 +786,8 @@ pub(crate) fn reference_defect(
     lookup: &ScipSymbolLookup<'_>,
     source: ScipEvidenceSource,
 ) -> Option<ScipProofDefect> {
-    let target_symbol = proof.target_symbol.as_deref().unwrap_or("").trim();
-    if target_symbol.is_empty() {
+    let target_symbol = proof.target_symbol.as_deref().unwrap_or("");
+    if target_symbol.trim().is_empty() {
         return Some(ScipProofDefect::ReferenceMissingTargetSymbol);
     }
     match source {
@@ -798,7 +798,7 @@ pub(crate) fn reference_defect(
             if proof.edge_kind.is_some() {
                 return Some(ScipProofDefect::ReferenceForgedEdgeKind);
             }
-            (!lookup.has_symbol_named(target_symbol))
+            (!lookup.has_symbol_named(target_symbol.trim()))
                 .then_some(ScipProofDefect::ReferenceTargetSymbolUnknown)
         }
         ScipEvidenceSource::GraphProjection => {
@@ -2796,6 +2796,170 @@ mod tests {
                 .expect("core after emit"),
             core_before,
             "SCIP admission must not rewrite or remove core nodes"
+        );
+    }
+
+    // Adapted from Terra's independent hostile overlay for #2236.
+    #[test]
+    fn scip_emit_trims_unicode_blank_endpoints_without_normalizing_named_symbols() {
+        let project = TempDir::new().expect("project");
+        let storage_path = adjacency_fixture_store(&project);
+        let mut storage = Store::open(&storage_path).expect("reopen store");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(5),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "\u{2003}".into(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(70),
+                    start_col: Some(0),
+                    end_line: Some(70),
+                    end_col: Some(0),
+                },
+                Node {
+                    id: NodeId(6),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "  padded endpoint  ".into(),
+                    qualified_name: Some("  padded endpoint  ".into()),
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(75),
+                    start_col: Some(0),
+                    end_line: Some(75),
+                    end_col: Some(0),
+                },
+            ])
+            .expect("insert whitespace and padded nodes");
+        storage
+            .insert_edges_batch(&[
+                Edge {
+                    id: EdgeId(2),
+                    source: NodeId(4),
+                    target: NodeId(6),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(55),
+                    resolved_source: Some(NodeId(4)),
+                    resolved_target: Some(NodeId(6)),
+                    confidence: Some(1.0),
+                    certainty: Some(ResolutionCertainty::Certain),
+                    callsite_identity: Some("src/client.rs:55".into()),
+                    candidate_targets: Vec::new(),
+                },
+                Edge {
+                    id: EdgeId(3),
+                    source: NodeId(5),
+                    target: NodeId(2),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(72),
+                    resolved_source: Some(NodeId(5)),
+                    resolved_target: Some(NodeId(2)),
+                    confidence: Some(1.0),
+                    certainty: Some(ResolutionCertainty::Certain),
+                    callsite_identity: Some("src/client.rs:72".into()),
+                    candidate_targets: Vec::new(),
+                },
+            ])
+            .expect("insert named and blank-endpoint edges");
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
+            .expect("emit")
+            .expect("named symbols publish");
+        let index = load_scip_symbols(&scip_dir)
+            .expect("load scip")
+            .expect("index");
+
+        assert!(
+            !index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.node_id.as_deref() == Some("5")),
+            "unicode-whitespace identities must not become symbols"
+        );
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.symbol == "  padded endpoint  "),
+            "a nonempty display name is evidence verbatim, not trim-normalized"
+        );
+        assert!(
+            index.proofs.iter().any(|proof| {
+                proof.is_reference()
+                    && proof.node_id.as_deref() == Some("4")
+                    && proof.target_node_id.as_deref() == Some("6")
+                    && proof.target_symbol.as_deref() == Some("  padded endpoint  ")
+            }),
+            "the named endpoint relationship must remain exact"
+        );
+        assert!(
+            !index.proofs.iter().any(|proof| {
+                proof.is_reference()
+                    && (proof.node_id.as_deref() == Some("5")
+                        || proof.target_node_id.as_deref() == Some("5")
+                        || proof.symbol.trim().is_empty()
+                        || proof
+                            .target_symbol
+                            .as_deref()
+                            .is_some_and(|symbol| symbol.trim().is_empty()))
+            }),
+            "a skipped blank endpoint must not be fabricated into adjacency"
+        );
+
+        let mut corrupted = index.clone();
+        corrupted
+            .proofs
+            .iter_mut()
+            .find(|proof| {
+                proof.is_reference()
+                    && proof.node_id.as_deref() == Some("4")
+                    && proof.target_node_id.as_deref() == Some("6")
+            })
+            .expect("padded target reference")
+            .target_symbol = Some(" padded endpoint  ".into());
+        assert!(matches!(
+            corrupted.validate_records("generation-a"),
+            Err(ScipArtifactDefect::InvalidRecord {
+                defect: ScipProofDefect::ReferenceNodeIdentityDisagreesWithSymbol,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn imported_reference_target_lookup_preserves_trimmed_compatibility_and_rejects_blank() {
+        let symbols = vec![component_symbol("1", "src/lib.rs", "target")];
+        let lookup = ScipSymbolLookup::new(&symbols);
+        let mut proof = ScipProofRecord {
+            role: SCIP_REFERENCE_ROLE.into(),
+            path: "src/lib.rs".into(),
+            symbol: "caller".into(),
+            start_line: 1,
+            start_character_utf16: 0,
+            end_line: 1,
+            end_character_utf16: 0,
+            target_symbol: Some("  target  ".into()),
+            node_id: None,
+            target_node_id: None,
+            edge_kind: None,
+        };
+
+        assert_eq!(
+            reference_defect(&proof, &lookup, ScipEvidenceSource::ImportedProof),
+            None,
+            "imported references retain their existing trimmed name lookup"
+        );
+        proof.target_symbol = Some(" \u{2003} ".into());
+        assert_eq!(
+            reference_defect(&proof, &lookup, ScipEvidenceSource::ImportedProof),
+            Some(ScipProofDefect::ReferenceMissingTargetSymbol),
+            "trim-recognized blank imported targets remain inadmissible"
         );
     }
 
