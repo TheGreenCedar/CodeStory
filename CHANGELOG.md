@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Search correctly prioritizes extensionless files from the selected project
+without treating files from another working directory as project evidence.
+
 Parser caches compress extraction data to reduce stored bytes while preserving
 source and call-resolution information. Existing caches remain readable.
 

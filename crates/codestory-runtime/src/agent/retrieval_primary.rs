@@ -2261,13 +2261,22 @@ fn candidate_source_label(source: CandidateSource) -> String {
 }
 
 fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
-    let rel = normalize_repo_relative_path(project_root, file_path);
-    let trimmed = rel.trim();
-    !trimmed.is_empty()
-        && candidate_path_text_is_path_like(trimmed)
-        && candidate_lookup_paths(project_root, &rel)
-            .into_iter()
-            .any(|path| path.exists())
+    let normalized = normalize_storage_path_text(file_path);
+    if normalized.trim().is_empty() {
+        return false;
+    }
+    let source_rooted = source_root_candidate_path(&normalized);
+    std::iter::once(normalized.as_str())
+        .chain(source_rooted.as_deref())
+        .any(|candidate| {
+            matches!(
+                codestory_workspace::resolve_project_relative_path(
+                    project_root,
+                    Path::new(candidate)
+                ),
+                Ok(codestory_workspace::ProjectRelativePathResolution::Existing { .. })
+            )
+        })
 }
 
 /// Stable-partition resolvable candidates ahead of unresolvable ones.
@@ -3685,6 +3694,77 @@ mod tests {
                 .any(|path| path.to_string_lossy() == canonical.to_string_lossy()),
             "lookup paths should include canonical storage path: {paths:?}"
         );
+    }
+
+    #[test]
+    fn candidate_path_resolution_admits_only_selected_project_root_extensionless_file() {
+        let project = tempfile::tempdir().expect("project");
+        let foreign = tempfile::tempdir().expect("foreign project");
+        std::fs::write(project.path().join("LICENSE"), "selected\n").expect("write selected file");
+        let foreign_path = foreign.path().join("LICENSE");
+        std::fs::write(&foreign_path, "foreign\n").expect("write foreign file");
+
+        assert_eq!(
+            (
+                candidate_path_resolvable(project.path(), "LICENSE"),
+                candidate_path_resolvable(project.path(), &foreign_path.to_string_lossy()),
+            ),
+            (true, false),
+            "extensionless admission must bind an existing file to the selected project"
+        );
+    }
+
+    #[test]
+    fn candidate_path_resolution_does_not_borrow_foreign_process_cwd_file() {
+        let project = tempfile::tempdir().expect("selected project");
+        let cwd_file = Path::new("Cargo.toml");
+        assert!(
+            cwd_file.is_file(),
+            "Cargo runs this crate's unit tests from the crate root"
+        );
+        assert!(!project.path().join(cwd_file).exists());
+
+        assert!(
+            !candidate_path_resolvable(project.path(), &cwd_file.to_string_lossy()),
+            "candidate lookup must not borrow a file from the process working directory"
+        );
+    }
+
+    #[test]
+    fn candidate_path_resolution_preserves_nonblank_spaced_filename() {
+        let project = tempfile::tempdir().expect("selected project");
+        std::fs::write(project.path().join(" LICENSE"), "spaced\n").expect("write spaced filename");
+
+        assert_eq!(
+            (
+                candidate_path_resolvable(project.path(), " LICENSE"),
+                candidate_path_resolvable(project.path(), "LICENSE"),
+            ),
+            (true, false),
+            "ordinary resolution must preserve the actual filename instead of borrowing its trimmed neighbor"
+        );
+    }
+
+    #[test]
+    fn ordinary_candidate_order_prioritizes_selected_extensionless_over_foreign_cwd_file() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(project.path().join("LICENSE"), "selected\n").expect("write selected file");
+        let cwd_file = Path::new("Cargo.toml");
+        assert!(cwd_file.is_file(), "expected crate-root Cargo.toml");
+        assert!(!project.path().join(cwd_file).exists());
+
+        let candidates = vec![
+            CandidateHit::with_source("LICENSE", None, 1.0, CandidateSource::Lexical),
+            CandidateHit::with_source("Cargo.toml", None, 0.5, CandidateSource::Lexical),
+        ];
+        let ordered = ordered_sidecar_candidates(&candidates, |candidate| {
+            candidate_path_resolvable(project.path(), &candidate.file_path)
+        });
+
+        assert_eq!(ordered[0].1.file_path, "LICENSE");
+        assert!(ordered[0].2);
+        assert_eq!(ordered[1].1.file_path, "Cargo.toml");
+        assert!(!ordered[1].2);
     }
 
     #[cfg(windows)]
