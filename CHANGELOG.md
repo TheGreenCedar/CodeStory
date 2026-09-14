@@ -10,6 +10,7 @@ when the same tests also qualify as package-level suggestions.
 
 Project preparation reuses an unchanged complete source index when search or
 retrieval data needs to be built, avoiding an unnecessary copy of that index.
+It can also prepare search data when no earlier search publication exists.
 
 Route navigation keeps declarations with matching HTTP methods and paths
 separate, preserving links to each declaration’s own file and handler.
