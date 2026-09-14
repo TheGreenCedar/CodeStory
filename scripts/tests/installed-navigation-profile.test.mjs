@@ -23,10 +23,16 @@ test('schedule and source mutations fail closed before execution', () => {
     m => { m.profile = 'codestory-0176-navigation-maintenance'; },
   ]) { const manifest = fixture(); mutate(manifest); assert.throws(() => validateManifest(manifest)); }
 });
-test('same normal sandbox and low reasoning without approval override or tool restrictions', () => {
-  const { args } = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp');
-  assert.deepEqual(args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', '/checkout', '--add-dir', '/session/tmp', '--json', '--output-last-message', '/output/answer.md', '-']);
-  assert.throws(() => navigationCommand('codex', '/checkout', '/output/answer.md', 'relative/tmp'));
+test('task effect mode selects the model sandbox without changing the common invocation policy', () => {
+  const readOnly = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp', 'read_only');
+  assert.deepEqual(readOnly.args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'read-only', '--cd', '/checkout', '--add-dir', '/session/tmp', '--json', '--output-last-message', '/output/answer.md', '-']);
+  const change = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp', 'change');
+  assert.equal(change.args[change.args.indexOf('--sandbox') + 1], 'workspace-write');
+  const normalizedChange = [...change.args]; normalizedChange[normalizedChange.indexOf('--sandbox') + 1] = 'read-only';
+  assert.deepEqual(normalizedChange, readOnly.args);
+  assert.throws(() => navigationCommand('codex', '/checkout', '/output/answer.md', 'relative/tmp', 'read_only'));
+  assert.throws(() => navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp'));
+  assert.throws(() => navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp', 'unknown'));
 });
 test('runtime and host overrides cannot escape the isolated session', () => {
   const env = navigationEnvironment({ PATH: '/bin', HOME: '/real', CODEX_HOME: '/real/.codex', CODESTORY_CLI: '/wrong/binary', CODESTORY_PLUGIN_DATA: '/shared', CODESTORY_EMBED_QUALIFICATION_DIR: '/shared', OPENAI_API_KEY: 'never-retain', PLUGIN_DATA: '/shared' }, '/isolated', 'nonce');
@@ -176,13 +182,14 @@ async function accountingFixture(t, option) {
   const template = path.join(root, 'template'); await fs.mkdir(template); await fs.writeFile(path.join(template, 'config.toml'), '');
   if (option === 'skills') { await fs.mkdir(path.join(template, 'skills')); }
   const manifest = fixture(); manifest.arms = ['native']; manifest.repeats = 2;
+  if (option === 'change-policy') manifest.tasks[0].effect_mode = 'change';
   manifest.sessions = [1,2].map((repeat, index) => ({sequence:index+1,session_id:`native-${repeat}`,task_id:'t',arm:'native',repeat}));
   const bytes = JSON.stringify(manifest); await fs.writeFile(path.join(root, 'manifest.json'), bytes);
   const originalNow = Date.now; let now = originalNow();
   const installation = { manifest_sha256:createHash('sha256').update(bytes).digest('hex'), budget:{max_sessions:2,max_wall_ms:1200000}, arms:{native:{codex_home_template:template}} };
   if (option.startsWith('deadline')) { installation.budget.deadline_utc = new Date(now + 10000).toISOString(); Date.now = () => now; }
   await fs.writeFile(path.join(root, 'installations.json'), JSON.stringify(installation));
-  let attempts = 0;
+  let attempts = 0; let sourceChanged = false; const invocations = [];
   const pass = stdout => ({status:'pass',stdout,stderr:'',exitCode:0,timedOut:false});
   const helpers = { extractUsage, analyzeTranscript:()=>({}),
     createSequencedStdioSession: (_command, _args, options) => ({
@@ -201,7 +208,18 @@ async function accountingFixture(t, option) {
     }), runProcess:async(command,args,options) => {
     if (command === 'git') {
       if (args.includes('clone')) await fs.mkdir(args.at(-1), {recursive:true});
-      return pass(args.includes('rev-parse') ? args.at(-1)==='HEAD^{tree}' ? 'b'.repeat(40) : 'a'.repeat(40) : '');
+      const firstSourceCloseout = sourceChanged && args.some(arg => String(arg).includes('native-1'));
+      if (args.includes('status')) {
+        if (firstSourceCloseout && option.startsWith('read-only-source-change')) return pass(' M README.md');
+        if (firstSourceCloseout && option === 'read-only-untracked') return pass('?? notes.md');
+        return pass('');
+      }
+      if (args.includes('rev-parse')) {
+        if (firstSourceCloseout && args.at(-1) === 'HEAD' && ['read-only-changed-head', 'read-only-changed-head-tree'].includes(option)) return pass('c'.repeat(40));
+        if (firstSourceCloseout && args.at(-1) === 'HEAD^{tree}' && option === 'read-only-changed-head-tree') return pass('d'.repeat(40));
+        return pass(args.at(-1)==='HEAD^{tree}' ? 'b'.repeat(40) : 'a'.repeat(40));
+      }
+      return pass('');
     }
     if (args[0] === 'plugin') {
       assert.ok(args.includes('--disable') && args.includes('remote_plugin'));
@@ -210,16 +228,48 @@ async function accountingFixture(t, option) {
       if (option === 'preparation' && options.env.CODEX_HOME.includes('native-1')) return {...pass(''),status:'fail',stderr:'inventory unavailable'};
       return pass('{"installed":[]}');
     }
-    attempts++; assert.ok(args.includes('--disable') && args.includes('remote_plugin')); assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 600000);
+    attempts++; invocations.push(args); assert.ok(args.includes('--disable') && args.includes('remote_plugin')); assert.equal(options.stdin, manifest.tasks[0].prompt); assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 600000);
     if (option === 'spawn') throw new Error('spawn unavailable');
     const usage = option === 'usage' ? {input_tokens:11} : {input_tokens:11,output_tokens:7,total_tokens:18};
-    return {...pass(`${JSON.stringify({type:'turn.completed',usage})}\n`), ...(option === 'model-failure' ? {status:'fail',exitCode:1} : {})};
+    if (option.startsWith('read-only-') && attempts === 1) {
+      sourceChanged = true;
+      if (option.startsWith('read-only-source-change')) await fs.writeFile(path.join(options.cwd, 'README.md'), 'changed by participant\n');
+      if (option === 'read-only-untracked') await fs.writeFile(path.join(options.cwd, 'notes.md'), 'untracked participant output\n');
+      if (option === 'read-only-source-change-spawn') throw new Error('spawn unavailable after source change');
+    }
+    return {...pass(`${JSON.stringify({type:'turn.completed',usage})}\n`), ...(['model-failure', 'read-only-source-change-model-failure'].includes(option) ? {status:'fail',exitCode:1} : {})};
   } };
   let error;
   try { await runInstalledNavigation(['--manifest',path.join(root,'manifest.json'),'--installations',path.join(root,'installations.json'),'--out',path.join(root,'out')],helpers); }
   catch (caught) { error = caught; } finally { Date.now = originalNow; }
-  return { attempts, error, summary:JSON.parse(await fs.readFile(path.join(root,'out/summary.json'),'utf8')) };
+  const effective = option.endsWith('policy') ? await Promise.all(manifest.sessions.map(row => fs.readFile(path.join(root, 'out', row.session_id, 'effective-config.json'), 'utf8').then(JSON.parse))) : [];
+  return { attempts, error, invocations, effective, summary:JSON.parse(await fs.readFile(path.join(root,'out/summary.json'),'utf8')) };
 }
+
+test('runner records the selected task and actual read-only model invocation policy', async t => {
+  for (const [option, effectMode, sandbox] of [['model-policy', 'read_only', 'read-only'], ['change-policy', 'change', 'workspace-write']]) {
+    const result = await accountingFixture(t, option);
+    assert.equal(result.error, undefined);
+    assert.equal(result.attempts, 2);
+    assert.ok(result.invocations.every(args => args[args.indexOf('--sandbox') + 1] === sandbox));
+    for (const effective of result.effective) {
+      assert.equal(effective.sandbox, 'workspace-write');
+      assert.deepEqual(effective.model_policy, { task_id: 't', effect_mode: effectMode, sandbox });
+    }
+  }
+});
+
+test('read-only source changes fail closeout before a later model is admitted', async t => {
+  for (const option of ['read-only-source-change', 'read-only-untracked', 'read-only-changed-head', 'read-only-changed-head-tree',
+    'read-only-source-change-model-failure', 'read-only-source-change-spawn']) {
+    const result = await accountingFixture(t, option);
+    assert.equal(result.error, undefined);
+    assert.equal(result.attempts, 1);
+    assert.equal(result.summary.results[0].status, 'source_closeout_failed');
+    assert.equal(result.summary.results[0].source_closeout.clean, false);
+    assert.equal(result.summary.results[1].status, 'not_run_source_closeout_failed');
+  }
+});
 
 test('failure and budget matrix retains every row without launching after expiry', async t => {
   for (const option of ['skills','deadline-preflight','deadline-preparation','native-canary-environment','native-canary-writes','native-canary-extra-root','preparation','spawn','usage','model-failure']) {

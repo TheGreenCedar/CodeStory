@@ -181,9 +181,12 @@ export function validateSourceRead(result, project, marker) {
     && !range.snippet.includes(marker === 'BEFORE_REFRESH' ? 'AFTER_REFRESH' : 'BEFORE_REFRESH'), 'source-read canary returned missing, mixed or stale source');
 }
 
-export function navigationCommand(codex, project, output, temporary) {
+export function navigationCommand(codex, project, output, temporary, effectMode) {
   requireThat(path.isAbsolute(temporary), 'participant needs an explicit isolated temporary root');
-  return { command: codex, args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'workspace-write', '--cd', project, '--add-dir', temporary, '--json', '--output-last-message', output, '-'] };
+  requireThat(['read_only', 'change'].includes(effectMode), 'participant needs a declared task effect mode');
+  const sandbox = effectMode === 'read_only' ? 'read-only' : 'workspace-write';
+  return { command: codex, sandbox,
+    args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', sandbox, '--cd', project, '--add-dir', temporary, '--json', '--output-last-message', output, '-'] };
 }
 
 export function navigationEnvironment(parent, root, nonce) {
@@ -263,11 +266,22 @@ async function prepareSession(row, manifest, installation, output, codex, helper
   const listingRaw = await checkedProcess(helpers.runProcess, codex, ['plugin', 'list', '--json', '--disable', 'remote_plugin'], { env });
   const listing = JSON.parse(listingRaw);
   validateInventory(listing.installed, row.arm, arm);
+  const invocation = navigationCommand(codex, project, path.join(root, 'answer.md'), env.TMPDIR, task.effect_mode);
   const effective = { schema_version: 1, session: row, model: manifest.model, timeout_ms: 600_000,
     sandbox: 'workspace-write', writable_roots: [project, env.TMPDIR], host_features: { remote_plugin: false }, project, source_commit: repo.commit, source_tree: repo.tree,
+    model_policy: { task_id: task.id, effect_mode: task.effect_mode, sandbox: invocation.sandbox },
     package: arm, configuration: config, plugin_listing: listing, environment: Object.fromEntries(PARTICIPANT_ENVIRONMENT.filter(key => env[key] !== undefined).map(key => [key, env[key]])) };
   await save(path.join(root, 'effective-config.json'), effective);
-  return { root, env, project, pluginRoot, task, arm, effective, codex };
+  return { root, env, project, pluginRoot, task, arm, effective, codex, invocation };
+}
+
+async function sourceCloseout(session, helpers) {
+  const git = args => checkedProcess(helpers.runProcess, 'git', ['-c', 'core.hooksPath=/dev/null', ...args], { env: session.env });
+  const head = await git(['-C', session.project, 'rev-parse', 'HEAD']);
+  const tree = await git(['-C', session.project, 'rev-parse', 'HEAD^{tree}']);
+  const porcelain = await git(['-C', session.project, 'status', '--porcelain=v1', '--untracked-files=all']);
+  return { expected_head: session.effective.source_commit, expected_tree: session.effective.source_tree,
+    head, tree, porcelain, clean: head === session.effective.source_commit && tree === session.effective.source_tree && porcelain === '' };
 }
 
 async function observeChildEnvironment(channel, session, helpers) {
@@ -495,19 +509,18 @@ export async function runInstalledNavigation(argv, helpers) {
     let phase = 'preparation';
     const result = { ...row, status: 'preparation_failed', model_attempted: false, telemetry_complete: false,
       usage: { input_tokens: null, output_tokens: null, total_tokens: null }, grading: 'pending_independent_evaluator' };
-    let stdout = ''; let stderr = '';
+    let stdout = ''; let stderr = ''; let session = null; let sourceCloseoutFailed = false;
     try {
       allowance(1);
-      const session = await prepareSession(row, manifest, installation, output, values.codex, bounded);
+      session = await prepareSession(row, manifest, installation, output, values.codex, bounded);
       const host = await withParticipantHost(session, bounded, 'participant-host', async () => ({ status: 'pass',
         ...(session.pluginRoot ? { catalog_sha256: session.arm.tools_sha256 } : {}) }));
       await save(path.join(root, 'participant-host.json'), host);
-      const invocation = navigationCommand(values.codex, session.project, path.join(root, 'answer.md'), session.env.TMPDIR);
       result.preparation_ms = performance.now() - started;
       await writeFile(path.join(root, 'prompt.txt'), session.task.prompt);
       allowance(1); // No model process may start after preparation consumes the budget.
       phase = 'model'; result.model_attempted = true;
-      const run = await bounded.runProcess(invocation.command, invocation.args, { cwd: session.project, env: session.env,
+      const run = await bounded.runProcess(session.invocation.command, session.invocation.args, { cwd: session.project, env: session.env,
         stdin: session.task.prompt, timeoutMs: 600_000, killProcessTree: true, maxOutputBytes: 64 * 1024 * 1024 });
       stdout = run.stdout; stderr = run.stderr;
       const events = []; const malformed = [];
@@ -529,6 +542,20 @@ export async function runInstalledNavigation(argv, helpers) {
       result.status = remainingMs() <= 0 ? 'budget_exhausted' : `${phase}_failed`;
       result.error = error.message; stderr += `${error.message}\n`;
     } finally {
+      if (session?.task.effect_mode === 'read_only' && result.model_attempted) {
+        try {
+          result.source_closeout = await sourceCloseout(session, bounded);
+          sourceCloseoutFailed = !result.source_closeout.clean;
+        } catch (error) {
+          result.source_closeout = { clean: false, error: error.message };
+          sourceCloseoutFailed = true;
+        }
+        if (sourceCloseoutFailed) {
+          result.execution_status = result.status;
+          result.status = 'source_closeout_failed';
+          result.error = [result.error, result.source_closeout.error ?? 'read-only source identity changed'].filter(Boolean).join('; ');
+        }
+      }
       result.whole_task_wall_ms = performance.now() - started;
       result.transcript_sha256 = sha(stdout);
       await mkdir(root, { recursive: true });
@@ -536,6 +563,10 @@ export async function runInstalledNavigation(argv, helpers) {
       await writeFile(path.join(root, 'stderr.txt'), stderr);
       await save(path.join(root, 'result.json'), result);
       results[index] = result; await persist();
+    }
+    if (sourceCloseoutFailed) {
+      for (const pending of results.slice(index + 1)) { pending.status = 'not_run_source_closeout_failed'; pending.error = 'read-only source closeout failed'; }
+      await persist(); return;
     }
     if ([...infrastructureFailures.values()].some(count => count >= 2)) {
       for (const pending of results.slice(index + 1)) { pending.status = 'not_run_runtime_failed'; pending.error = 'two equivalent actual-host runtime failures'; }
