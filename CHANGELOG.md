@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Go method navigation keeps the declared receiver when a nested closure captures
+it, preserving direct calls elsewhere in the method.
+
 Managed CLI installation removes temporary extraction bytes before publishing
 the runtime, so a host interrupted after publication does not retain a duplicate
 runtime copy.
