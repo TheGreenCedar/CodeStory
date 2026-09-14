@@ -486,7 +486,7 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_line ON node(file_node_id, kind, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_name ON node(file_node_id, kind, qualified_name, serialized_name)",
-    "CREATE INDEX IF NOT EXISTS idx_node_canonical_id ON node(canonical_id)",
+    NODE_CANONICAL_SUFFIX_INDEX,
     "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",
@@ -539,6 +539,9 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
+
+const NODE_CANONICAL_SUFFIX_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_node_canonical_suffix
+     ON node(COALESCE(substr(CAST(canonical_id AS BLOB), -32), X''))";
 
 const GROUNDING_FILE_SNAPSHOT_PATH_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)";
@@ -801,7 +804,7 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     }
     migrate_v33_proof_resolution_provenance(
         &storage.conn,
-        stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+        stored_version < PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION,
     )?;
     // The proof provenance rewrite advances the core schema to v33. Existing
     // immutable generations are CoW-cloned and migrated by the incremental
@@ -815,11 +818,49 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     } else {
         StorageOpenMode::Live
     };
+    if stored_version < CANONICAL_SUFFIX_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        migrate_v34_canonical_suffix_index(
+            &storage.conn,
+            matches!(index_mode, StorageOpenMode::Live),
+            stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+        )?;
+    }
     create_indexes(&storage.conn, index_mode)?;
 
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
     }
+    Ok(())
+}
+
+/// Replace the full canonical string index with a bounded suffix bucket while
+/// keeping the complete string in the table as the identity authority.
+///
+/// Live migrations create the replacement and advance the writer barrier in
+/// one transaction. Build stores defer secondary index creation to their
+/// existing finalization fence. Interrupted incremental stores retain their
+/// sentinel until `finish_incremental_run` commits.
+pub(super) fn migrate_v34_canonical_suffix_index(
+    conn: &Connection,
+    create_suffix_index: bool,
+    stamp_current_version: bool,
+) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DROP INDEX IF EXISTS idx_node_canonical_id", [])?;
+    tx.execute("DROP INDEX IF EXISTS idx_node_canonical_suffix", [])?;
+    if create_suffix_index {
+        tx.execute(NODE_CANONICAL_SUFFIX_INDEX, [])?;
+    }
+    if stamp_current_version {
+        tx.pragma_update(
+            None,
+            "user_version",
+            CANONICAL_SUFFIX_SCHEMA_VERSION.to_string(),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1548,7 +1589,11 @@ pub(super) fn migrate_v33_proof_resolution_provenance(
             ));
         }
         if stamp_current_version {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
+            conn.pragma_update(
+                None,
+                "user_version",
+                PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION.to_string(),
+            )?;
         }
         return Ok(());
     }
@@ -1751,7 +1796,11 @@ pub(super) fn migrate_v33_proof_resolution_provenance(
         [],
     )?;
     if stamp_current_version {
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
+        tx.pragma_update(
+            None,
+            "user_version",
+            PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION.to_string(),
+        )?;
     }
     tx.commit()?;
     Ok(())

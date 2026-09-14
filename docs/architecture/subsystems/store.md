@@ -79,6 +79,14 @@ orphaned, extra, or cross-file provenance references fail closed. The v32 row
 rewrite, its row-count/publication checks, and the schema-33 writer barrier
 commit atomically, and migration never creates a proof publication receipt.
 
+Schema v34 replaces the full canonical-ID index with a 32-byte binary suffix
+expression index. Canonical strings and node IDs remain unchanged. The suffix
+selects a candidate bucket only; exact canonical-string equality still
+authorizes every result, including multiple nodes with the same canonical
+string and suffix collisions. Live migration replaces the indexes and advances
+the schema version in one transaction, while staged builds use the existing
+deferred-index fence.
+
 The projection transaction also replaces file-scoped errors and marks
 grounding summary/detail plus resolution-support state dirty. Those writes do
 not follow the graph commit as independent autocommits. Store telemetry counts

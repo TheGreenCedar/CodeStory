@@ -73,7 +73,9 @@ pub(crate) struct SealedCoreCandidateReceipt {
     artifacts: Vec<ArtifactSeal>,
 }
 
-const SCHEMA_VERSION: u32 = 33;
+const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
+const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
+const SCHEMA_VERSION: u32 = CANONICAL_SUFFIX_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -1132,7 +1134,7 @@ fn read_proof_resolution_rollback_identity(
         |row| row.get(0),
     )?;
     if fact_table_exists == 0 || publication_table_exists == 0 {
-        if schema_version < SCHEMA_VERSION
+        if schema_version < PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION
             && fact_table_exists == 0
             && publication_table_exists == 0
         {
@@ -2066,17 +2068,21 @@ fn read_journal_less_recovery_auxiliary_identities(
     } else {
         None
     };
-    if schema_version == SCHEMA_VERSION && source_policy.is_none() {
+    // Schema 27 introduced the source-policy receipt as optional recovery
+    // metadata. Schema 28 made it part of every complete structural
+    // publication, so later feature schemas must carry it even after the
+    // current schema advances.
+    if schema_version >= STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION && source_policy.is_none() {
         return Err(promotion_error(format!(
-            "Current-schema {role} {} has no complete source policy exclusion manifest",
+            "Feature-schema {role} {} has no complete source policy exclusion manifest",
             path.display()
         )));
     }
-    let structural_text = if schema_version == SCHEMA_VERSION {
+    let structural_text = if schema_version >= STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
         let identity = read_structural_text_unit_rollback_identity(path, publication)?;
         if identity.is_none() {
             return Err(promotion_error(format!(
-                "Current-schema {role} {} has no complete structural text unit manifest",
+                "Feature-schema {role} {} has no complete structural text unit manifest",
                 path.display()
             )));
         }
@@ -2084,7 +2090,7 @@ fn read_journal_less_recovery_auxiliary_identities(
     } else {
         None
     };
-    let proof_resolution = if schema_version == SCHEMA_VERSION {
+    let proof_resolution = if schema_version >= PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
         read_proof_resolution_rollback_identity(path, publication)?
     } else {
         None
@@ -7950,20 +7956,19 @@ impl Storage {
             .map(|canonical_id| (canonical_id, Vec::new()))
             .collect::<BTreeMap<_, _>>();
 
-        for batch in unique_canonical_ids.chunks(variable_limit) {
-            let placeholders = question_placeholders(batch.len());
-            let query = format!(
-                "SELECT canonical_id, id
-                 FROM node
-                 WHERE canonical_id IN ({placeholders})
-                 ORDER BY canonical_id ASC, id ASC"
-            );
-            let mut stmt = self.conn.prepare(&query)?;
-            let mut rows = stmt.query(params_from_iter(batch.iter()))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id
+             FROM node AS n
+             WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+               AND n.canonical_id = ?1
+             ORDER BY n.id ASC",
+        )?;
+        for canonical_id in &unique_canonical_ids {
+            let mut rows = stmt.query(params![canonical_id])?;
             while let Some(row) = rows.next()? {
-                let canonical_id: String = row.get(0)?;
-                let node_id = NodeId(row.get(1)?);
-                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(&canonical_id) {
+                let node_id = NodeId(row.get(0)?);
+                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(canonical_id) {
                     node_ids.push(node_id);
                 }
             }
@@ -14204,7 +14209,13 @@ impl Storage {
         canonical_id: &str,
     ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
         self.annotation_anchors(
-            &format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.canonical_id = ?1 ORDER BY n.id ASC"),
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                       COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+                   AND n.canonical_id = ?1
+                 ORDER BY n.id ASC"
+            ),
             params![canonical_id],
         )
     }

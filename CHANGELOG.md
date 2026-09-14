@@ -15,6 +15,10 @@ Proof-resolution indexes store repeated file provenance once per shared group,
 reducing index size without changing proof facts. Existing indexes migrate
 automatically when opened for project preparation.
 
+Canonical symbol lookup indexes store a bounded suffix instead of repeating
+complete identifiers, reducing index storage while preserving exact matches.
+Existing indexes migrate automatically during project preparation.
+
 Fresh project preparation reclaims oversized retained SQLite journal storage
 after active transactions and readers release it.
 
