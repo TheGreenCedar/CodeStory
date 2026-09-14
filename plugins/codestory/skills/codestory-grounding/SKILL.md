@@ -91,6 +91,13 @@ sufficient or the remaining gap is outside scope and budget. A successful
 search, incomplete packet or unsupported artifact is not a terminal or
 permission boundary and does not end the investigation.
 
+When composing a core-only search, use one symbol-name pattern per query. A
+qualified owner/member pattern is one target; several independent names are not
+unioned. Preserve an explicit user-supplied query, and add bounded targeted
+lookups for separate names when useful. For behavior-oriented discovery, use
+the ordinary search mode when richer evidence is needed; it requires full
+retrieval readiness and may trigger managed preparation.
+
 | Need | Operation |
 | --- | --- |
 | Orientation or coverage | `ground` for a compact map; `files` for indexed files and coverage. |
