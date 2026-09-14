@@ -12280,6 +12280,25 @@ impl Storage {
     ) -> Result<BuildNodeLookup, StorageError> {
         const OPERATION: &str = "get_nodes_by_ids_no_cache_for_build";
         self.require_build_mode(OPERATION)?;
+        self.get_nodes_by_ids_no_cache(ids)
+    }
+
+    /// Loads canonical node identities from SQLite without consulting or
+    /// populating `StorageCache`. Callers holding a read snapshot therefore
+    /// receive identities from the same pinned database view as adjacent rows.
+    pub fn get_node_canonical_ids_by_ids_no_cache(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, Option<String>>, StorageError> {
+        Ok(self
+            .get_nodes_by_ids_no_cache(ids)?
+            .nodes
+            .into_iter()
+            .map(|(node_id, node)| (node_id, node.canonical_id))
+            .collect())
+    }
+
+    fn get_nodes_by_ids_no_cache(&self, ids: &[NodeId]) -> Result<BuildNodeLookup, StorageError> {
         if ids.is_empty() {
             return Ok(BuildNodeLookup {
                 nodes: HashMap::new(),
