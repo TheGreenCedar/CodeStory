@@ -371,6 +371,7 @@ fn agent_packet_with_session(
     let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
     controller.begin_packet_retrieval();
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
+    let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
 
     if !req.option_ids.is_empty() && req.parent_packet_id.is_none() {
         return Err(ApiError::invalid_argument(
@@ -403,11 +404,23 @@ fn agent_packet_with_session(
             descriptor_queries.push(query.to_string());
         }
     }
-    preadmit_packet_descriptor_queries(controller, &descriptor_queries, req.latency_budget_ms)?;
+    let descriptor_budget_ms =
+        packet_remaining_for_handoff(controller, packet_latency, "descriptor admission")?;
+    preadmit_packet_descriptor_queries(
+        controller,
+        &descriptor_queries,
+        Some(descriptor_budget_ms),
+    )?;
+    packet_remaining_for_handoff(
+        controller,
+        packet_latency,
+        "exact probe citation resolution",
+    )?;
     let exact_probe_citations =
         exact_packet_probe_citations(controller, &plan.probe_resolutions, &question, true);
+    let downstream_budget_ms =
+        packet_remaining_for_handoff(controller, packet_latency, "initial retrieval")?;
     let limits = packet_budget_limits_for_request(req.budget, is_drill_continuation);
-    let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(req.budget, &limits, is_drill_continuation);
     let (mut answer, initial_packet_hits) = agent_ask_with_packet_hits(
         controller,
@@ -421,7 +434,7 @@ fn agent_packet_with_session(
                     .clamp(1, INTERIM_MAX_ADMITTED_CANDIDATES as u32),
             ),
             response_mode: AgentResponseModeDto::Structured,
-            latency_budget_ms: req.latency_budget_ms,
+            latency_budget_ms: Some(downstream_budget_ms),
             include_evidence: true,
             hybrid_weights: None,
         },
@@ -479,8 +492,8 @@ fn agent_packet_with_session(
 
     let phase_started = Instant::now();
     if answer.retrieval_trace.retrieval_shadow.is_none()
-        && let Some(shadow) =
-            maybe_run_retrieval_shadow(controller, &question, req.latency_budget_ms)
+        && let Some(remaining_ms) = packet_latency.remaining_for_handoff()
+        && let Some(shadow) = maybe_run_retrieval_shadow(controller, &question, Some(remaining_ms))
     {
         answer
             .retrieval_trace
@@ -572,6 +585,27 @@ fn agent_packet_with_session(
         enforce_packet_output_budget(&project_root, &mut packet);
     }
     Ok(packet)
+}
+
+fn packet_remaining_for_handoff(
+    controller: &AppController,
+    packet_latency: PacketLatencyBudget,
+    phase: &str,
+) -> Result<u32, ApiError> {
+    if crate::services::active_public_operation_cancellation()
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return Err(ApiError::new(
+            "cancelled",
+            format!("request cancelled before packet {phase}"),
+        ));
+    }
+    packet_latency.remaining_for_handoff().ok_or_else(|| {
+        sidecar_retrieval_unavailable_error(
+            controller,
+            format!("packet latency budget exhausted before {phase}"),
+        )
+    })
 }
 
 fn packet_budget_limits_for_request(

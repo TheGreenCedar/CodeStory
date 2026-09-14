@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Packet retrieval shares one latency allowance across its stages and stops
+starting retrieval work when that allowance runs out.
+
 Loading precise source evidence uses less temporary disk and rejects malformed
 record ordering.
 
