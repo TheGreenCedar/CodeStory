@@ -8,8 +8,8 @@ keeping navigation tied to the selected source path.
 Affected test hints preserve graph-backed distances, confidence and reasons
 when the same tests also qualify as package-level suggestions.
 
-Project preparation can reuse a complete source index when its retrieval
-publication has not yet been built.
+Project preparation reuses an unchanged complete source index when search or
+retrieval data needs to be built, avoiding an unnecessary copy of that index.
 
 Route navigation keeps declarations with matching HTTP methods and paths
 separate, preserving links to each declaration’s own file and handler.
