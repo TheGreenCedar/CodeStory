@@ -86,6 +86,13 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
     if cmd.dry_run {
         let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
         let refresh_mode = decision.effective_mode.unwrap_or(IndexMode::Incremental);
+        runtime
+            .index
+            .bind_project_paths_for_refresh(
+                runtime.project_root.clone(),
+                runtime.storage_path.clone(),
+            )
+            .map_err(|error| map_api_error_for_project(error, &runtime.project_root))?;
         let dry_run = runtime.index.dry_run_index(refresh_mode).map_err(|error| {
             map_api_error_for_project(
                 annotate_refresh_error(error, cmd.refresh, refresh_mode),
