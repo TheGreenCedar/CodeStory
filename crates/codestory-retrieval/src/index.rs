@@ -1383,7 +1383,7 @@ fn external_retrieval_publication_is_physically_absent(storage_path: &Path) -> R
         return Ok(false);
     }
     Ok(matches!(
-        fs::symlink_metadata(layout.retrieval_publication_path()),
+        std::fs::symlink_metadata(layout.retrieval_publication_path()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     ))
 }
