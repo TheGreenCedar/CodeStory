@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Project preparation no longer fails when source data contains empty or
+whitespace-only property names.
+
 Managed CLI recovery reclaims interrupted pre-publication extraction directories,
 preventing abandoned runtime copies from accumulating outside retention.
 
