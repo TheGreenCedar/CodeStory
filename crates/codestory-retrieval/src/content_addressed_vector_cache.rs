@@ -410,6 +410,7 @@ impl ContentAddressedVectorCache {
         Ok(indices)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_batch(
         &mut self,
         batch: &[VectorCacheBatchInput<'_>],
