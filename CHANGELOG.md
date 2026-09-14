@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Managed CLI recovery reclaims interrupted pre-publication extraction directories,
+preventing abandoned runtime copies from accumulating outside retention.
+
 Incremental project refreshes preserve supported in-project source symlinks,
 keeping navigation tied to the selected source path.
 
