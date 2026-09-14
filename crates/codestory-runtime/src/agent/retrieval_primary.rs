@@ -2262,12 +2262,11 @@ fn candidate_source_label(source: CandidateSource) -> String {
 
 fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
     let normalized = normalize_storage_path_text(file_path);
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
+    if normalized.trim().is_empty() {
         return false;
     }
-    let source_rooted = source_root_candidate_path(trimmed);
-    std::iter::once(trimmed)
+    let source_rooted = source_root_candidate_path(&normalized);
+    std::iter::once(normalized.as_str())
         .chain(source_rooted.as_deref())
         .any(|candidate| {
             matches!(
@@ -3728,6 +3727,21 @@ mod tests {
         assert!(
             !candidate_path_resolvable(project.path(), &cwd_file.to_string_lossy()),
             "candidate lookup must not borrow a file from the process working directory"
+        );
+    }
+
+    #[test]
+    fn candidate_path_resolution_preserves_nonblank_spaced_filename() {
+        let project = tempfile::tempdir().expect("selected project");
+        std::fs::write(project.path().join(" LICENSE"), "spaced\n").expect("write spaced filename");
+
+        assert_eq!(
+            (
+                candidate_path_resolvable(project.path(), " LICENSE"),
+                candidate_path_resolvable(project.path(), "LICENSE"),
+            ),
+            (true, false),
+            "ordinary resolution must preserve the actual filename instead of borrowing its trimmed neighbor"
         );
     }
 
