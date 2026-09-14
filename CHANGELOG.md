@@ -19,6 +19,10 @@ Canonical symbol lookup indexes store a bounded suffix instead of repeating
 complete identifiers, reducing index storage while preserving exact matches.
 Existing indexes migrate automatically during project preparation.
 
+Vector caching preserves reusable embedding batches when separate symbols share
+one source span, while keeping complete anchor coverage when identity is missing
+or ambiguous.
+
 Fresh project preparation reclaims oversized retained SQLite journal storage
 after active transactions and readers release it.
 

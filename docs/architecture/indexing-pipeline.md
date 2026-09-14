@@ -653,6 +653,10 @@ core or producer-compatibility publication receives a distinct immutable vector
 generation and producer-evidence identity. Retrieval embeds the selected inputs
 in bounded batches, validates exact anchor/hash coverage and vector properties,
 and publishes the attested generation. Core indexing never loads the model.
+Content-addressed vector reuse binds each anchor's kind, source path and span to
+the exact durable canonical symbol identity from the same pinned core snapshot;
+store-local node IDs remain outside the reuse key. If that mapping is missing or
+ambiguous, retrieval keeps every anchor and proceeds without cache reuse.
 
 ### What timing output means
 

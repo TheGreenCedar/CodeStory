@@ -1738,6 +1738,20 @@ fn ensure_semantic_index(
     } else {
         None
     };
+    let dense_anchor_canonical_ids = if content_vector_cache.is_some() {
+        ensure_retrieval_index_not_cancelled(cancelled, "resolving dense anchor cache identities")?;
+        load_dense_anchor_canonical_ids_for_cache(
+            snapshot.storage(),
+            &anchors,
+            project_id,
+            &mut content_vector_cache,
+        )
+    } else {
+        None
+    };
+    if content_vector_cache.is_some() {
+        ensure_retrieval_index_not_cancelled(cancelled, "planning dense anchor cache identities")?;
+    }
 
     let point_count = if let Some(point_count) = reusable_point_count {
         record_finalize_component_work("vectors", "reused", Some(point_count), Some(0), Some(0));
@@ -1780,6 +1794,7 @@ fn ensure_semantic_index(
                         produce_missing_dense_anchors(
                             &anchors,
                             missing,
+                            dense_anchor_canonical_ids.as_ref(),
                             retention.runtime,
                             cancelled,
                             &mut content_vector_cache,
@@ -1893,6 +1908,7 @@ fn ensure_semantic_index(
         }
         let ordered_anchors = canonical_dense_anchor_order(
             anchors.iter().collect::<Vec<_>>(),
+            dense_anchor_canonical_ids.as_ref(),
             &mut content_vector_cache,
         );
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
@@ -2067,13 +2083,17 @@ struct CacheableDenseAnchor<'a> {
 
 fn canonical_dense_anchor_order<'a>(
     anchors: Vec<&'a DenseAnchorInput>,
+    canonical_ids: Option<&HashMap<i64, String>>,
     content_vector_cache: &mut Option<ContentAddressedVectorCache>,
 ) -> Vec<CacheableDenseAnchor<'a>> {
     let mut current = anchors
         .into_iter()
         .map(|anchor| CacheableDenseAnchor {
             anchor,
-            identity: stable_dense_anchor_identity(anchor),
+            identity: canonical_ids
+                .and_then(|canonical_ids| canonical_ids.get(&anchor.node_id.0))
+                .map(|canonical_id| stable_dense_anchor_identity(anchor, canonical_id))
+                .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     let inputs = current
@@ -2111,9 +2131,9 @@ fn canonical_dense_anchor_order<'a>(
         .collect()
 }
 
-fn stable_dense_anchor_identity(anchor: &DenseAnchorInput) -> String {
+fn stable_dense_anchor_identity(anchor: &DenseAnchorInput, canonical_id: &str) -> String {
     let mut digest = Sha256::new();
-    hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+    hash_part(&mut digest, "codestory-stable-dense-anchor-v3");
     hash_part(&mut digest, &(anchor.kind as i32).to_string());
     hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
     hash_optional_dense_anchor_part(
@@ -2132,7 +2152,64 @@ fn stable_dense_anchor_identity(anchor: &DenseAnchorInput) -> String {
             .map(|value| value.to_string())
             .as_deref(),
     );
+    hash_part(&mut digest, canonical_id);
     format!("{:x}", digest.finalize())
+}
+
+fn load_dense_anchor_canonical_ids(
+    storage: &Store,
+    anchors: &[DenseAnchorInput],
+) -> Result<HashMap<i64, String>> {
+    let mut requested_ids = anchors
+        .iter()
+        .map(|anchor| anchor.node_id)
+        .collect::<Vec<_>>();
+    requested_ids.sort_unstable_by_key(|node_id| node_id.0);
+    requested_ids.dedup();
+    let canonical_ids = storage
+        .get_node_canonical_ids_by_ids_no_cache(&requested_ids)
+        .context("load dense anchor canonical identities")?;
+    if canonical_ids.len() != requested_ids.len()
+        || canonical_ids.keys().any(|node_id| {
+            requested_ids
+                .binary_search_by_key(&node_id.0, |requested| requested.0)
+                .is_err()
+        })
+    {
+        bail!("dense anchor canonical identity lookup coverage mismatch");
+    }
+
+    requested_ids
+        .into_iter()
+        .map(|node_id| {
+            let canonical_id = canonical_ids
+                .get(&node_id)
+                .context("dense anchor canonical identity lookup omitted a requested node")?
+                .clone()
+                .context("dense anchor node has no canonical identity")?;
+            Ok((node_id.0, canonical_id))
+        })
+        .collect()
+}
+
+fn load_dense_anchor_canonical_ids_for_cache(
+    storage: &Store,
+    anchors: &[DenseAnchorInput],
+    project_id: &str,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Option<HashMap<i64, String>> {
+    match load_dense_anchor_canonical_ids(storage, anchors) {
+        Ok(canonical_ids) => Some(canonical_ids),
+        Err(error) => {
+            warn!(
+                project_id = %project_id,
+                error = %format!("{error:#}"),
+                "dense anchor canonical identities are incomplete; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            None
+        }
+    }
 }
 
 fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
@@ -2148,6 +2225,7 @@ fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
 fn produce_missing_dense_anchors(
     anchors: &[DenseAnchorInput],
     missing: &[ExpectedVectorAnchor],
+    canonical_ids: Option<&HashMap<i64, String>>,
     runtime: &SidecarRuntimeConfig,
     cancelled: &AtomicBool,
     content_vector_cache: &mut Option<ContentAddressedVectorCache>,
@@ -2172,7 +2250,8 @@ fn produce_missing_dense_anchors(
             Ok(*anchor)
         })
         .collect::<Result<Vec<_>>>()?;
-    let missing_anchors = canonical_dense_anchor_order(missing_anchors, content_vector_cache);
+    let missing_anchors =
+        canonical_dense_anchor_order(missing_anchors, canonical_ids, content_vector_cache);
     let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
     for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
         ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
@@ -3640,6 +3719,7 @@ mod tests {
     use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{SearchSymbolProjection, SearchSymbolProjectionDetail};
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -3787,7 +3867,8 @@ mod tests {
             source_identity: "core:generation-a:run-a".into(),
             updated_at_epoch_ms: 1,
         };
-        let expected = stable_dense_anchor_identity(&anchor);
+        let canonical_id = "rust:function:pkg::do_work";
+        let expected = stable_dense_anchor_identity(&anchor, canonical_id);
 
         anchor.node_id = NodeId(99);
         anchor.file_node_id = Some(NodeId(100));
@@ -3797,10 +3878,545 @@ mod tests {
         anchor.document_hash = "different-document-hash".into();
         anchor.source_identity = "core:generation-b:run-b".into();
         anchor.updated_at_epoch_ms = 2;
-        assert_eq!(stable_dense_anchor_identity(&anchor), expected);
+        assert_eq!(
+            stable_dense_anchor_identity(&anchor, canonical_id),
+            expected
+        );
 
         anchor.start_line = Some(5);
-        assert_ne!(stable_dense_anchor_identity(&anchor), expected);
+        assert_ne!(
+            stable_dense_anchor_identity(&anchor, canonical_id),
+            expected
+        );
+    }
+
+    fn dense_anchor_identity_fixture(
+        node_id: i64,
+        canonical_id: &str,
+        start_line: u32,
+    ) -> (DenseAnchorInput, String) {
+        (
+            DenseAnchorInput {
+                node_id: NodeId(node_id),
+                file_node_id: Some(NodeId(500)),
+                kind: NodeKind::FUNCTION,
+                display_name: format!("anchor-{node_id}"),
+                qualified_name: Some(format!("fixture::anchor_{node_id}")),
+                file_path: Some("src/shared.py".into()),
+                start_line: Some(start_line),
+                end_line: Some(start_line + 2),
+                file_role: FileRole::Source,
+                source_provenance: "parser".into(),
+                text: format!("prepared anchor {canonical_id}"),
+                document_hash: format!("document-{canonical_id}"),
+                selection_reason: "public_api".into(),
+                policy_version: "graph_first_v3".into(),
+                source_identity: "core:generation-a:run-a".into(),
+                updated_at_epoch_ms: 1,
+            },
+            canonical_id.into(),
+        )
+    }
+
+    fn current_dense_anchor_identity_for_canonical(
+        anchor: &DenseAnchorInput,
+        canonical_id: &str,
+    ) -> String {
+        stable_dense_anchor_identity(anchor, canonical_id)
+    }
+
+    fn legacy_dense_anchor_identity_v2(anchor: &DenseAnchorInput) -> String {
+        let mut digest = Sha256::new();
+        hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+        hash_part(&mut digest, &(anchor.kind as i32).to_string());
+        hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+        hash_optional_dense_anchor_part(
+            &mut digest,
+            anchor
+                .start_line
+                .as_ref()
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        hash_optional_dense_anchor_part(
+            &mut digest,
+            anchor
+                .end_line
+                .as_ref()
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        format!("{:x}", digest.finalize())
+    }
+
+    fn vector_cache_runtime(cache: &TempDir) -> SidecarRuntimeConfig {
+        use crate::config::{
+            SidecarProcessDefaults, SidecarProfile, SidecarRuntimeDefaults,
+            SidecarRuntimeOverrides, private_cache_directory,
+        };
+
+        let private_root = cache.path().join("private");
+        private_cache_directory(&private_root).expect("private cache root");
+        let defaults = SidecarProcessDefaults::new(private_root, SidecarRuntimeDefaults::default());
+        SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            SidecarProfile::Local,
+            None,
+            &defaults,
+            &SidecarRuntimeOverrides::default(),
+        )
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_distinguishes_co_located_canonical_anchors() {
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (mut second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 20);
+        second.text = first.text.clone();
+        second.document_hash = first.document_hash.clone();
+
+        assert_ne!(first_canonical, second_canonical);
+        assert_ne!(
+            current_dense_anchor_identity_for_canonical(&first, &first_canonical),
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical),
+            "distinct repository identities at one legitimate source span must not disable cache planning"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_reuses_exact_batch_after_node_id_remap() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (mut second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 20);
+        second.text = first.text.clone();
+        second.document_hash = first.document_hash.clone();
+        let first_identity = current_dense_anchor_identity_for_canonical(&first, &first_canonical);
+        let second_identity =
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical);
+        let first_batch = [
+            VectorCacheBatchInput {
+                anchor_identity: &first_identity,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &second_identity,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        let exact_vectors = vec![vec![1.0, -0.0], vec![0.0, 1.0]];
+        let mut owner = ContentAddressedVectorCache::open(
+            &runtime,
+            "scope-a",
+            "producer-a",
+            exact_vectors[0].len(),
+        )
+        .expect("open vector cache");
+        assert_eq!(
+            owner.canonical_order(&first_batch).expect("first plan"),
+            [0, 1]
+        );
+        assert_eq!(
+            owner
+                .publish_batch(&first_batch, &exact_vectors)
+                .expect("publish exact batch"),
+            exact_vectors
+        );
+
+        let (remapped_first, remapped_first_canonical) =
+            dense_anchor_identity_fixture(901, "python:function:pkg.first", 20);
+        let (mut remapped_second, remapped_second_canonical) =
+            dense_anchor_identity_fixture(902, "python:function:pkg.second", 20);
+        remapped_second.text = remapped_first.text.clone();
+        remapped_second.document_hash = remapped_first.document_hash.clone();
+        let remapped_first_identity =
+            current_dense_anchor_identity_for_canonical(&remapped_first, &remapped_first_canonical);
+        let remapped_second_identity = current_dense_anchor_identity_for_canonical(
+            &remapped_second,
+            &remapped_second_canonical,
+        );
+        let reversed_after_remap = [
+            VectorCacheBatchInput {
+                anchor_identity: &remapped_second_identity,
+                document_hash: &remapped_second.document_hash,
+                text: &remapped_second.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &remapped_first_identity,
+                document_hash: &remapped_first.document_hash,
+                text: &remapped_first.text,
+            },
+        ];
+        let order = owner
+            .canonical_order(&reversed_after_remap)
+            .expect("reproduce canonical plan after node remap");
+        assert_eq!(order, [1, 0]);
+        let canonical_after_remap = order
+            .into_iter()
+            .map(|index| VectorCacheBatchInput {
+                anchor_identity: reversed_after_remap[index].anchor_identity,
+                document_hash: reversed_after_remap[index].document_hash,
+                text: reversed_after_remap[index].text,
+            })
+            .collect::<Vec<_>>();
+        let reused = owner
+            .load_batch(&canonical_after_remap)
+            .expect("load cached batch")
+            .expect("exact cache hit after remap");
+        assert_eq!(reused, exact_vectors);
+        assert_eq!(reused[0][1].to_bits(), (-0.0_f32).to_bits());
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_keeps_repeated_canonical_strings_at_distinct_spans() {
+        let (first, canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.overload", 20);
+        let (second, repeated_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.overload", 40);
+
+        assert_eq!(canonical, repeated_canonical);
+        assert_ne!(
+            current_dense_anchor_identity_for_canonical(&first, &canonical),
+            current_dense_anchor_identity_for_canonical(&second, &repeated_canonical)
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_preserves_exact_canonical_bytes() {
+        let (anchor, _) = dense_anchor_identity_fixture(1, "unused", 20);
+        let canonical_ids = [
+            "",
+            "python:function:pkg.a\0b",
+            "python:function:pkg.ab",
+            "python:function:pkg.é",
+            "python:function:pkg.e\u{301}",
+        ];
+        let identities = canonical_ids
+            .iter()
+            .map(|canonical_id| stable_dense_anchor_identity(&anchor, canonical_id))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(identities.len(), canonical_ids.len());
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_requires_complete_non_null_mapping() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 40);
+        let anchors = [first, second];
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".into(),
+                canonical_id: Some(first_canonical),
+                ..Default::default()
+            }])
+            .expect("insert first node");
+        let mut missing_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "missing", "producer-a", 2)
+                .expect("open missing-node cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &storage,
+                &anchors,
+                "project-a",
+                &mut missing_cache,
+            )
+            .is_none()
+        );
+        assert!(missing_cache.is_none(), "missing node disables reuse");
+
+        storage
+            .insert_node(&Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "second".into(),
+                canonical_id: None,
+                ..Default::default()
+            })
+            .expect("insert node without canonical identity");
+        let mut null_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "null", "producer-a", 2)
+                .expect("open null-identity cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &storage,
+                &anchors,
+                "project-a",
+                &mut null_cache,
+            )
+            .is_none()
+        );
+        assert!(
+            null_cache.is_none(),
+            "null canonical identity disables reuse"
+        );
+
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "second".into(),
+                    canonical_id: Some(second_canonical),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(99),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "foreign".into(),
+                    canonical_id: Some("python:function:foreign".into()),
+                    ..Default::default()
+                },
+            ])
+            .expect("complete requested nodes");
+        let observed = load_dense_anchor_canonical_ids(&storage, &anchors)
+            .expect("complete canonical mapping");
+        assert_eq!(observed.len(), anchors.len());
+        assert!(!observed.contains_key(&99));
+
+        let broken = Store::new_in_memory().expect("broken store fixture");
+        broken
+            .insert_node(&Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".into(),
+                canonical_id: Some("python:function:pkg.first".into()),
+                ..Default::default()
+            })
+            .expect("insert node before lookup failure");
+        broken
+            .get_connection()
+            .execute("DROP TABLE node", [])
+            .expect("inject canonical lookup failure");
+        let mut failed_lookup_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "lookup-error", "producer-a", 2)
+                .expect("open lookup-error cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &broken,
+                &anchors[..1],
+                "project-a",
+                &mut failed_lookup_cache,
+            )
+            .is_none()
+        );
+        assert!(
+            failed_lookup_cache.is_none(),
+            "SQL lookup failure disables reuse"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_reads_the_active_snapshot_not_node_cache() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "anchor".into(),
+                canonical_id: Some("python:function:cached".into()),
+                ..Default::default()
+            }])
+            .expect("insert cached node");
+        assert_eq!(
+            storage
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("prime node cache")
+                .get(&NodeId(1))
+                .and_then(|node| node.canonical_id.as_deref()),
+            Some("python:function:cached")
+        );
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = 'python:function:snapshot' WHERE id = 1",
+                [],
+            )
+            .expect("change database without updating node cache");
+        let (anchor, _) = dense_anchor_identity_fixture(1, "unused", 20);
+
+        let snapshot = storage.read_snapshot().expect("pin active database view");
+        let observed = load_dense_anchor_canonical_ids(snapshot.storage(), &[anchor])
+            .expect("load identity from pinned snapshot");
+
+        assert_eq!(
+            observed.get(&1).map(String::as_str),
+            Some("python:function:snapshot"),
+            "cache reuse identity must come from the same SQLite snapshot as dense inputs"
+        );
+        snapshot.finish().expect("finish snapshot");
+        assert_eq!(
+            storage
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("read original cache after snapshot")
+                .get(&NodeId(1))
+                .and_then(|node| node.canonical_id.as_deref()),
+            Some("python:function:cached"),
+            "snapshot-safe lookup must not rewrite the ordinary node cache"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_crosses_store_batch_boundary() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        let fixtures = (1..=405)
+            .map(|node_id| {
+                dense_anchor_identity_fixture(
+                    node_id,
+                    &format!("python:function:pkg.anchor_{node_id}"),
+                    u32::try_from(node_id).expect("fixture line"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let anchors = fixtures
+            .iter()
+            .map(|(anchor, _)| anchor.clone())
+            .collect::<Vec<_>>();
+        let nodes = fixtures
+            .iter()
+            .map(|(anchor, canonical_id)| Node {
+                id: anchor.node_id,
+                kind: anchor.kind,
+                serialized_name: anchor.display_name.clone(),
+                canonical_id: Some(canonical_id.clone()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert nodes beyond one lookup batch");
+
+        let observed =
+            load_dense_anchor_canonical_ids(&storage, &anchors).expect("bounded canonical lookup");
+        assert_eq!(observed.len(), anchors.len());
+        for (anchor, canonical_id) in fixtures {
+            assert_eq!(observed.get(&anchor.node_id.0), Some(&canonical_id));
+        }
+    }
+
+    #[test]
+    fn actual_duplicate_dense_anchor_identity_disables_cache_without_dropping_coverage() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.duplicate", 20);
+        let (mut duplicate, duplicate_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.duplicate", 20);
+        duplicate.text = first.text.clone();
+        duplicate.document_hash = first.document_hash.clone();
+        assert_eq!(canonical, duplicate_canonical);
+        assert_eq!(
+            current_dense_anchor_identity_for_canonical(&first, &canonical),
+            current_dense_anchor_identity_for_canonical(&duplicate, &duplicate_canonical)
+        );
+        let canonical_ids = HashMap::from([
+            (first.node_id.0, canonical),
+            (duplicate.node_id.0, duplicate_canonical),
+        ]);
+
+        let mut owner = Some(
+            ContentAddressedVectorCache::open(&runtime, "scope-a", "producer-a", 2)
+                .expect("open vector cache"),
+        );
+        let ordered = canonical_dense_anchor_order(
+            vec![&first, &duplicate],
+            Some(&canonical_ids),
+            &mut owner,
+        );
+
+        assert!(owner.is_none(), "ambiguous logical identity disables reuse");
+        assert_eq!(ordered.len(), 2, "fallback keeps every dense anchor");
+        assert_eq!(ordered[0].anchor.node_id, first.node_id);
+        assert_eq!(ordered[1].anchor.node_id, duplicate.node_id);
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_namespace_does_not_reuse_v2_corpus_plan() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 40);
+        let legacy_first = legacy_dense_anchor_identity_v2(&first);
+        let legacy_second = legacy_dense_anchor_identity_v2(&second);
+        let legacy = [
+            VectorCacheBatchInput {
+                anchor_identity: &legacy_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &legacy_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        let mut owner = ContentAddressedVectorCache::open(&runtime, "scope-a", "producer-a", 2)
+            .expect("open vector cache");
+        assert_eq!(owner.canonical_order(&legacy).expect("legacy plan"), [0, 1]);
+        owner
+            .publish_batch(&legacy, &[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("legacy batch");
+
+        let current_first = current_dense_anchor_identity_for_canonical(&first, &first_canonical);
+        let current_second =
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical);
+        assert_ne!(current_first, legacy_first);
+        assert_ne!(current_second, legacy_second);
+        let current_forward = [
+            VectorCacheBatchInput {
+                anchor_identity: &current_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &current_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        assert!(
+            owner
+                .load_batch(&current_forward)
+                .expect("new namespace lookup")
+                .is_none(),
+            "a legacy v2 batch must not be returned for corrected identities"
+        );
+        let current_reversed = [
+            VectorCacheBatchInput {
+                anchor_identity: &current_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &current_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+        ];
+        assert_eq!(
+            owner
+                .canonical_order(&current_reversed)
+                .expect("new namespace plan"),
+            [0, 1],
+            "an old identity plan must be a cache miss rather than control the corrected namespace"
+        );
     }
 
     #[test]
