@@ -191,6 +191,11 @@ const GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES: &[&str] = &[
     "Imports, references, substitutions, execution behavior, and typed targets are not resolved.",
     "The collector records exact source anchors only; it does not admit packet semantic proof.",
 ];
+const TERRAFORM_STRUCTURAL_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Expressions, references, interpolation, providers, and module resolution are not evaluated.",
+    "Resource graphs, dependency order, plans, state, and external module implementations are not inferred.",
+    "The collector records conservative block, assignment, and simple unquoted object-key anchors with exact source spans only.",
+];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
     StructuralSourceProofContract {
@@ -290,6 +295,18 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         semantic_proof_allowed: false,
     },
     StructuralSourceProofContract {
+        collector_name: "terraform",
+        path_pattern: "**/*.{tf,tfvars}",
+        emitted_node_kinds: &[NodeKind::MODULE, NodeKind::ANNOTATION],
+        source_span: "1-based exact source span for a conservative block header, assignment key, or simple unquoted object key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: TERRAFORM_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not HCL expression evaluation, resource-graph construction, provider or module resolution, external module source, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
         collector_name: "typescript_config_jsonc",
         path_pattern: "basename-scoped tsconfig.json, tsconfig.<suffix>.json, jsconfig.json, or jsconfig.<suffix>.json",
         emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
@@ -375,6 +392,7 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     structural_profile("yaml", &["yml", "yaml"]),
     structural_profile("toml", &["toml"]),
     structural_profile("json", &["json"]),
+    structural_profile("terraform", &["tf", "tfvars"]),
     structural_profile("shell", &["zsh", "ksh", "command"]),
     structural_profile("powershell", &["ps1", "psm1"]),
     structural_profile("docker_compose", &[]),
@@ -969,6 +987,55 @@ mod tests {
         assert!(
             language_name_for_path(Some("src/app/Program.cshtml")).is_none(),
             "Razor .cshtml files are workspace-compatible, but not a public parser-backed C# claim"
+        );
+    }
+
+    #[test]
+    fn terraform_extensions_claim_only_structural_source_proof() {
+        for extension in ["tf", ".TFVARS"] {
+            let profile = language_support_profile_for_ext(extension)
+                .expect("Terraform extension should have a public profile");
+            assert_eq!(profile.language_name, "terraform");
+            assert_eq!(
+                profile.support_mode,
+                LanguageSupportMode::StructuralCollector
+            );
+            assert_eq!(profile.evidence_tier, LanguageEvidenceTier::StructuralOnly);
+            assert_eq!(
+                language_claim_tiers_for_profile(profile),
+                STRUCTURAL_CLAIM_TIERS
+            );
+        }
+        assert_eq!(
+            structural_language_name_for_path(Some("environments/prod/main.tf")),
+            Some("terraform")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("environments/prod.tfvars")),
+            Some("terraform")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("generated/main.tf.json")),
+            Some("json"),
+            "Terraform JSON keeps the existing JSON structural contract"
+        );
+        let contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "terraform")
+            .expect("Terraform structural proof contract");
+        assert_eq!(
+            contract.evidence_tier,
+            PacketEvidenceTierDto::StructuralText
+        );
+        assert_eq!(
+            contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert!(!contract.semantic_proof_allowed);
+        assert!(
+            contract
+                .claim_boundary
+                .contains("not HCL expression evaluation")
         );
     }
 

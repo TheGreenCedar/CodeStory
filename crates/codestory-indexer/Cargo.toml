@@ -44,3 +44,4 @@ tree-sitter-kotlin-ng = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-dart-orchard = { workspace = true }
 tree-sitter-bash = { workspace = true }
+tree-sitter-hcl = { workspace = true }

@@ -16,6 +16,7 @@ mod github_actions;
 mod html;
 mod jsonc;
 mod sql;
+mod terraform;
 
 pub(crate) use blanking::byte_offset_line_col;
 pub use blanking::{
@@ -124,6 +125,7 @@ pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
         Some("yml" | "yaml") => Some("structural_yaml_collector"),
         Some("toml") => Some("structural_toml_collector"),
         Some("json") => Some("structural_json_collector"),
+        Some("tf" | "tfvars") => Some("structural_terraform_collector"),
         Some("zsh" | "ksh" | "command") => Some("structural_shell_collector"),
         Some("ps1" | "psm1") => Some("structural_powershell_collector"),
         _ => None,
@@ -410,6 +412,9 @@ pub(crate) fn index_structural_source_with_role_and_unit_cap(
             }
             Some("toml") => generic::collect_toml_entities(path, source, file_id, &mut storage)?,
             Some("json") => generic::collect_json_entities(path, source, file_id, &mut storage)?,
+            Some("tf" | "tfvars") => {
+                terraform::collect_terraform_entities(path, source, file_id, &mut storage)?
+            }
             Some("zsh" | "ksh" | "command") => {
                 generic::collect_shell_entities(path, source, file_id, &mut storage)?
             }
@@ -475,6 +480,234 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn terraform_structural_source_keeps_exact_anchors_and_masks_hostile_literals() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("main.tf");
+        let source = concat!(
+            "terraform {\n",
+            "  required_version = \">= 1.5\"\n",
+            "}\n",
+            "provider \"aws\" {\n",
+            "  region = var.region\n",
+            "  note = \"resource \\\"hidden\\\" { fake = true } // #\"\n",
+            "}\n",
+            "# resource \"commented\" \"hash\" { fake = true }\n",
+            "/* module \"commented\" { fake = true } */\n",
+            "module \"eks\" {\n",
+            "  source = \"terraform-aws-modules/eks/aws\"\n",
+            "  config = <<-EOT\n",
+            "    resource \"hidden\" \"heredoc\" {\n",
+            "      fake = true\n",
+            "    }\n",
+            "  EOT\n",
+            "}\n",
+            "resource \"aws_eks_cluster\" \"main\" /* header comment */ {\n",
+            "  name = var.name\n",
+            "  tags = {\n",
+            "    description = \"café\", Owner = \"platform\"\n",
+            "  }\n",
+            "}\n",
+            "resource \"aws_s3_bucket\" /* interleaved */ \"logs\" { }\n",
+        );
+        std::fs::write(&path, source).expect("write Terraform fixture");
+
+        let first = index_structural_file(&path).expect("index Terraform fixture");
+        let second = index_structural_file(&path).expect("repeat Terraform fixture");
+        assert_eq!(first.files[0].language, "terraform");
+        assert!(first.files[0].indexed && first.files[0].complete);
+        assert_eq!(first.structural_text_units, second.structural_text_units);
+        assert_eq!(
+            first.structural_text_projections,
+            second.structural_text_projections
+        );
+        assert_eq!(
+            first.structural_text_projections[0].producer,
+            "structural_terraform_collector"
+        );
+
+        let mut actual = first
+            .structural_text_units
+            .iter()
+            .map(|unit| {
+                assert_eq!(unit.evidence_tier, "structural_text");
+                assert_eq!(unit.resolution, "source_range_only");
+                assert_eq!(unit.producer, "structural_terraform_collector");
+                std::str::from_utf8(
+                    exact_source_range_bytes(
+                        source,
+                        unit.start_line,
+                        unit.start_col,
+                        unit.end_line,
+                        unit.end_col,
+                    )
+                    .expect("exact Terraform span"),
+                )
+                .expect("UTF-8 Terraform span")
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = [
+            "terraform",
+            "required_version",
+            "provider \"aws\"",
+            "region",
+            "note",
+            "module \"eks\"",
+            "source",
+            "config",
+            "resource \"aws_eks_cluster\" \"main\"",
+            "resource \"aws_s3_bucket\" /* interleaved */ \"logs\"",
+            "name",
+            "tags",
+            "description",
+            "Owner",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn terraform_tfvars_assignments_are_structural_and_malformed_input_fails_closed() {
+        let tfvars = concat!(
+            "region = \"ca-central-1\"\n",
+            "node_groups = {\n",
+            "  primary = { instance_types = [\"m7g.large\"] }\n",
+            "}\n",
+        );
+        let storage = index_structural_source(Path::new("prod.tfvars"), tfvars)
+            .expect("index Terraform variables");
+        let names = storage
+            .nodes
+            .iter()
+            .filter(|node| node.kind != NodeKind::FILE)
+            .map(|node| node.serialized_name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from(["region", "node_groups", "primary", "instance_types"])
+        );
+
+        for (name, malformed) in [
+            (
+                "brace",
+                "resource \"aws_vpc\" \"main\" {\n  cidr = \"10.0.0.0/16\"\n",
+            ),
+            ("comment", "/* resource \"hidden\" \"main\" {}\n"),
+            ("string", "name = \"unterminated\n"),
+            ("heredoc", "policy = <<EOF\nresource hidden {}\n"),
+        ] {
+            let error = match index_structural_source(Path::new("main.tf"), malformed) {
+                Ok(_) => panic!("{name}: malformed Terraform must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, StructuralCollectionError::Malformed(_)),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn terraform_parser_rejects_malformed_input_and_accepts_masked_delimiters() {
+        for (name, malformed) in [
+            ("unclosed-list", "regions = [\"us-east-1\"\n"),
+            ("unclosed-parenthesis", "condition = (var.enabled\n"),
+            ("mismatched-list-close", "tags = { values = [\"x\") }\n"),
+            (
+                "mismatched-parenthesis-close",
+                "condition = [var.enabled)\n",
+            ),
+            (
+                "unterminated-template-expression",
+                "value = \"${join(\",\", var.items)\"\n",
+            ),
+            (
+                "template-expression-unclosed-parenthesis",
+                "value = \"${join(\",\", var.items}\"\n",
+            ),
+            (
+                "ambiguous-multiple-heredoc-openers",
+                "values = [<<FIRST, <<SECOND]\n",
+            ),
+            ("operator-missing-operand", "value = 1 +\n"),
+        ] {
+            let error = match index_structural_source(Path::new("main.tf"), malformed) {
+                Ok(_) => panic!("{name}: unbalanced Terraform delimiters must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, StructuralCollectionError::Malformed(_)),
+                "{name}: {error}"
+            );
+        }
+
+        let deeply_nested_source =
+            format!("value = {}true{}\n", "(".repeat(4_096), ")".repeat(4_096));
+        let deep_storage = index_structural_source(Path::new("main.tf"), &deeply_nested_source)
+            .expect("deep valid Terraform parses and walks without recursive Rust traversal");
+        assert!(
+            deep_storage
+                .nodes
+                .iter()
+                .any(|node| node.serialized_name == "value")
+        );
+
+        let cancelled =
+            match terraform::parse_terraform_with_progress_budget(&deeply_nested_source, 0) {
+                Ok(_) => panic!("zero parser-work budget must cancel deterministically"),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(&cancelled, StructuralCollectionError::Malformed(message) if message.contains("progress limit")),
+            "parser work cancellation: {cancelled}"
+        );
+
+        let valid = concat!(
+            "resource \"aws_vpc\" \"main\" {\n",
+            "  condition = (var.enabled && (var.flag || true))\n",
+            "  cidrs = [\n",
+            "    {\n",
+            "      nested = [\"[]\", \"()\", \"{}\"]\n",
+            "    },\n",
+            "  ]\n",
+            "  literal = \"[] () {} <<EOF // #\"\n",
+            "  joined = \"${join(\"//\", var.items)}\"\n",
+            "  markers = \"${join(\"[](){}\", var.items)}\"\n",
+            "  comment_markers = \"${var.enabled ? \"#\" : \"/* */\"}\"\n",
+            "  # ignored = [unterminated\n",
+            "  policy = <<-EOF\n",
+            "    fake = [unterminated\n",
+            "  EOF\n",
+            "}\n",
+        );
+        let storage = index_structural_source(Path::new("main.tf"), valid)
+            .expect("balanced delimiters outside strings, comments, and heredoc body");
+        let names = storage
+            .nodes
+            .iter()
+            .filter(|node| node.kind != NodeKind::FILE)
+            .map(|node| node.serialized_name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "resource \"aws_vpc\" \"main\"",
+                "condition",
+                "cidrs",
+                "nested",
+                "literal",
+                "joined",
+                "markers",
+                "comment_markers",
+                "policy",
+            ])
+        );
     }
 
     #[test]
