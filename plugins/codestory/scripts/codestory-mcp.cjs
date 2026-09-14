@@ -2693,14 +2693,14 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       warnings.push(`managed_cli_publication:reprovision:${existing.reason}`);
     }
     warnings.push('managed_cli_publication:publisher');
-    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
+    tempRoot = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
     tempRootIdentity = captureManagedCliTempRootIdentity(tempRoot);
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
     // Keep the completed archive on the same filesystem as its own partial so publication is a
-    // same-directory rename. The temp root frequently sits on a different mount from the managed
-    // root, and a cross-device rename fails after the whole transfer has already succeeded.
+    // same-directory rename. The managed extraction root remains the fallback when the download
+    // cache is unavailable.
     let archivePath = path.join(tempRoot, asset);
     let archivePartialPath = `${archivePath}.part`;
     try {

@@ -5706,6 +5706,9 @@ test("managed cli retires extraction before a post-publication publisher crash",
       { preload: preloadPath },
     );
     await waitForPath(publishedMarker);
+    const provisioningChildrenAtPublication = (await readdir(join(dataDir, "codestory-cli")))
+      .filter((name) => name.startsWith(`.provisioning-${version}-`));
+    assert.deepEqual(provisioningChildrenAtPublication, []);
     assert.equal(crashed.child.kill("SIGKILL"), true);
     const crashedResult = await crashed.completed;
     crashed = null;
@@ -5724,10 +5727,128 @@ test("managed cli retires extraction before a post-publication publisher crash",
     assert.equal(observed.source, "managed");
     assert.equal(observed.sha256, publishedSha256);
     assert.equal(await realpath(observed.path), await realpath(publishedCli));
+  } finally {
+    if (crashed?.child.exitCode === null) {
+      crashed.child.kill("SIGKILL");
+      await crashed.completed;
+    }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+    await rm(isolatedTmp, { recursive: true, force: true });
+  }
+});
 
-    const retainedExtractions = (await readdir(isolatedTmp))
-      .filter((name) => name.startsWith("codestory-plugin-cli-"));
-    assert.deepEqual(retainedExtractions, []);
+test("managed cli recovery reclaims dead prepublication extraction and staging without sweeping os temp", { timeout: 30000 }, async () => {
+  const version = await readPinnedCliVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-prepublication-recovery-data-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-prepublication-recovery-release-"));
+  const isolatedTmp = await mkdtemp(join(tmpdir(), "codestory-prepublication-recovery-tmp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failedOut = join(dataDir, "failed.json");
+  const recoveredOut = join(dataDir, "recovered.json");
+  const stoppedMarker = join(isolatedTmp, "stopped-before-extraction-cleanup.json");
+  const preloadPath = join(isolatedTmp, "stop-before-extraction-cleanup.cjs");
+  const managedRoot = join(dataDir, "codestory-cli");
+  const foreignTmp = join(isolatedTmp, "codestory-plugin-cli-foreign");
+  const foreignSentinel = join(foreignTmp, "foreign-sentinel");
+  let crashed;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    await mkdir(foreignTmp);
+    await writeFile(foreignSentinel, "foreign\n", "utf8");
+    await writeFile(
+      preloadPath,
+      [
+        "'use strict';",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const mkdtempSync = fs.mkdtempSync;",
+        "const rmSync = fs.rmSync;",
+        "const createdRoots = [];",
+        "let stopped = false;",
+        "fs.mkdtempSync = function(prefix) {",
+        "  const created = Reflect.apply(mkdtempSync, fs, arguments);",
+        "  const prefixPath = path.resolve(String(prefix));",
+        "  const parent = path.dirname(prefixPath);",
+        "  const name = path.basename(prefixPath);",
+        "  const managedRoot = path.resolve(process.env.CODESTORY_TEST_MANAGED_ROOT);",
+        "  const tempRoot = path.resolve(process.env.CODESTORY_TEST_TEMP_ROOT);",
+        "  const stagingPrefix = '.provisioning-' + process.env.CODESTORY_TEST_PUBLICATION_VERSION + '-';",
+        "  if ((parent === tempRoot && name === 'codestory-plugin-cli-') ||",
+        "      (parent === managedRoot && name.startsWith(stagingPrefix))) createdRoots.push(created);",
+        "  return created;",
+        "};",
+        "fs.rmSync = function(target) {",
+        "  const targetPath = path.resolve(String(target));",
+        "  const stagingDir = createdRoots.find((root) =>",
+        "    path.resolve(root) !== targetPath && fs.existsSync(path.join(root, 'manifest.json')));",
+        "  if (!stopped && createdRoots.some((root) => path.resolve(root) === targetPath) && stagingDir) {",
+        "    stopped = true;",
+        "    fs.writeFileSync(process.env.CODESTORY_TEST_STOPPED_MARKER, JSON.stringify({",
+        "      extractionRoot: targetPath,",
+        "      stagingDir: path.resolve(stagingDir),",
+        "      createdRoots: createdRoots.map((root) => path.resolve(root)),",
+        "    }));",
+        "    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);",
+        "  }",
+        "  return Reflect.apply(rmSync, fs, arguments);",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const common = {
+      CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+      TMPDIR: isolatedTmp,
+      TMP: isolatedTmp,
+      TEMP: isolatedTmp,
+    };
+    crashed = spawnLauncher(
+      launcher,
+      {
+        ...common,
+        TEST_OUT: failedOut,
+        CODESTORY_TEST_MANAGED_ROOT: managedRoot,
+        CODESTORY_TEST_TEMP_ROOT: isolatedTmp,
+        CODESTORY_TEST_PUBLICATION_VERSION: version,
+        CODESTORY_TEST_STOPPED_MARKER: stoppedMarker,
+      },
+      { preload: preloadPath },
+    );
+    await waitForPath(stoppedMarker);
+    const stopped = JSON.parse(await readFile(stoppedMarker, "utf8"));
+    assert.equal(stopped.createdRoots.length, 2, JSON.stringify(stopped));
+    assert.notEqual(stopped.extractionRoot, stopped.stagingDir);
+    assert.equal(fs.existsSync(stopped.extractionRoot), true);
+    assert.equal(fs.existsSync(stopped.stagingDir), true);
+    assert.equal(fs.existsSync(join(managedRoot, version)), false);
+
+    assert.equal(crashed.child.kill("SIGKILL"), true);
+    const crashedResult = await crashed.completed;
+    crashed = null;
+    assert.equal(crashedResult.signal, "SIGKILL", JSON.stringify(crashedResult));
+    assert.equal(fs.existsSync(failedOut), false);
+
+    const recovered = spawnLauncher(launcher, { ...common, TEST_OUT: recoveredOut });
+    const recoveredResult = await recovered.completed;
+    assert.equal(recoveredResult.status, 0, recoveredResult.stderr);
+    const observed = JSON.parse(await readFile(recoveredOut, "utf8"));
+    const publishedManifest = JSON.parse(
+      await readFile(join(managedRoot, version, "manifest.json"), "utf8"),
+    );
+    const publishedCli = join(managedRoot, version, ...publishedManifest.path.split("/"));
+    assert.equal(observed.source, "managed");
+    assert.equal(
+      createHash("sha256").update(await readFile(publishedCli)).digest("hex"),
+      publishedManifest.sha256,
+    );
+
+    assert.equal(fs.existsSync(stopped.extractionRoot), false);
+    assert.equal(fs.existsSync(stopped.stagingDir), false);
+    assert.equal(await readFile(foreignSentinel, "utf8"), "foreign\n");
   } finally {
     if (crashed?.child.exitCode === null) {
       crashed.child.kill("SIGKILL");
@@ -5764,9 +5885,10 @@ test("managed cli cleanup failure cannot publish over prior managed state", { ti
         "const rmSync = fs.rmSync;",
         "fs.rmSync = function(target) {",
         "  const pathname = path.resolve(String(target));",
-        "  const expectedParent = path.resolve(process.env.CODESTORY_TEST_TEMP_ROOT);",
+        "  const expectedParent = path.resolve(process.env.CODESTORY_TEST_MANAGED_ROOT);",
+        "  const expectedPrefix = '.provisioning-' + process.env.CODESTORY_TEST_PUBLICATION_VERSION + '-';",
         "  if (path.dirname(pathname) === expectedParent &&",
-        "      path.basename(pathname).startsWith('codestory-plugin-cli-')) {",
+        "      path.basename(pathname).startsWith(expectedPrefix)) {",
         "    fs.writeFileSync(process.env.CODESTORY_TEST_CLEANUP_FAILURE_MARKER, 'failed\\n');",
         "    const error = new Error('synthetic extraction cleanup failure');",
         "    error.code = 'EACCES';",
@@ -5788,7 +5910,8 @@ test("managed cli cleanup failure cannot publish over prior managed state", { ti
         TMPDIR: isolatedTmp,
         TMP: isolatedTmp,
         TEMP: isolatedTmp,
-        CODESTORY_TEST_TEMP_ROOT: isolatedTmp,
+        CODESTORY_TEST_MANAGED_ROOT: join(dataDir, "codestory-cli"),
+        CODESTORY_TEST_PUBLICATION_VERSION: version,
         CODESTORY_TEST_CLEANUP_FAILURE_MARKER: failureMarker,
       },
       { preload: preloadPath },
@@ -5841,8 +5964,9 @@ test("managed cli refuses cleanup when its temporary directory identity changes"
         "let swapped = false;",
         "fs.mkdtempSync = function(prefix) {",
         "  const created = Reflect.apply(mkdtempSync, fs, arguments);",
-        "  if (path.dirname(String(prefix)) === path.resolve(process.env.CODESTORY_TEST_TEMP_ROOT) &&",
-        "      path.basename(String(prefix)) === 'codestory-plugin-cli-') extractionRoot = created;",
+        "  const expectedPrefix = '.provisioning-' + process.env.CODESTORY_TEST_PUBLICATION_VERSION + '-';",
+        "  if (!extractionRoot && path.dirname(String(prefix)) === path.resolve(process.env.CODESTORY_TEST_MANAGED_ROOT) &&",
+        "      path.basename(String(prefix)).startsWith(expectedPrefix)) extractionRoot = created;",
         "  return created;",
         "};",
         "fs.writeFileSync = function(filename) {",
@@ -5873,7 +5997,7 @@ test("managed cli refuses cleanup when its temporary directory identity changes"
         TMPDIR: isolatedTmp,
         TMP: isolatedTmp,
         TEMP: isolatedTmp,
-        CODESTORY_TEST_TEMP_ROOT: isolatedTmp,
+        CODESTORY_TEST_MANAGED_ROOT: join(dataDir, "codestory-cli"),
         CODESTORY_TEST_PUBLICATION_VERSION: version,
         CODESTORY_TEST_SWAP_MARKER: swapMarker,
       },
