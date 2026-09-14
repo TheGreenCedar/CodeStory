@@ -927,27 +927,34 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         storage_path,
         &pinned_core_publication,
     );
-    let exact_core_predecessor = bounded_receipt
-        .as_ref()
-        .map(|receipt| {
-            storage.get_retrieval_index_manifest_bound_to_core(
-                &receipt.previous_core.generation_id,
-                &receipt.previous_core.run_id,
-            )
-        })
-        .transpose()
-        .context("load retrieval publication for the exact predecessor core")?
-        .flatten();
-    let previous_manifest = exact_core_predecessor
-        .as_ref()
-        .map(|bound| bound.manifest.clone())
-        .map(Some)
-        .unwrap_or(physical_predecessor_manifest(&storage, &project_id)?);
-    let previous_bound_manifest = match exact_core_predecessor {
-        Some(bound) => Some(bound),
-        None => storage
-            .get_bound_retrieval_index_manifest(&project_id)
-            .context("load exact predecessor retrieval publication")?,
+    let first_external_publication =
+        external_retrieval_publication_is_physically_absent(storage_path)?;
+    let (previous_manifest, previous_bound_manifest) = if first_external_publication {
+        (None, None)
+    } else {
+        let exact_core_predecessor = bounded_receipt
+            .as_ref()
+            .map(|receipt| {
+                storage.get_retrieval_index_manifest_bound_to_core(
+                    &receipt.previous_core.generation_id,
+                    &receipt.previous_core.run_id,
+                )
+            })
+            .transpose()
+            .context("load retrieval publication for the exact predecessor core")?
+            .flatten();
+        let previous_manifest = exact_core_predecessor
+            .as_ref()
+            .map(|bound| bound.manifest.clone())
+            .map(Some)
+            .unwrap_or(physical_predecessor_manifest(&storage, &project_id)?);
+        let previous_bound_manifest = match exact_core_predecessor.as_ref() {
+            Some(bound) => Some(bound.clone()),
+            None => storage
+                .get_bound_retrieval_index_manifest(&project_id)
+                .context("load exact predecessor retrieval publication")?,
+        };
+        (previous_manifest, previous_bound_manifest)
     };
     let graph_equivalent_predecessor = bounded_receipt
         .as_ref()
@@ -1359,6 +1366,26 @@ fn physical_predecessor_manifest(
                 .cmp(&right.built_at_epoch_ms)
                 .then_with(|| left.project_id.cmp(&right.project_id))
         }))
+}
+
+/// Distinguish the first external retrieval publication from every strict-read failure.
+///
+/// Production callers hold the project finalization lock. Embedded legacy storage deliberately
+/// returns false so its existing manifest-row semantics remain authoritative.
+fn external_retrieval_publication_is_physically_absent(storage_path: &Path) -> Result<bool> {
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+        .context("resolve core publication layout for retrieval finalization")?;
+    if layout
+        .read_pointer()
+        .context("read core publication layout for retrieval finalization")?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        std::fs::symlink_metadata(layout.retrieval_publication_path()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ))
 }
 
 fn with_finalize_progress<T>(
@@ -3341,6 +3368,11 @@ fn prepare_generation_retention(
     storage: &Store,
     storage_path: &Path,
 ) -> Result<PreparedGenerationRetention> {
+    if external_retrieval_publication_is_physically_absent(storage_path)? {
+        return Ok(PreparedGenerationRetention {
+            verified_previous: None,
+        });
+    }
     let now = Utc::now().timestamp_millis();
     let bound_previous = storage
         .get_bound_retrieval_index_manifest(project_id)
@@ -5225,6 +5257,332 @@ mod tests {
         assert!(is_retrieval_index_cancelled(&error));
         assert!(error.to_string().contains("cancelled before preflight"));
         assert!(!storage_path.exists());
+    }
+
+    #[cfg(feature = "test-support")]
+    struct FirstRetrievalPublicationFixture {
+        project: TempDir,
+        _cache: TempDir,
+        _storage_dir: TempDir,
+        storage_path: PathBuf,
+        runtime: SidecarRuntimeConfig,
+        publication: IndexPublicationRecord,
+        core_database_path: PathBuf,
+        core_database_bytes: Vec<u8>,
+        core_pointer_path: PathBuf,
+        core_pointer_bytes: Vec<u8>,
+        retrieval_pointer_path: PathBuf,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl FirstRetrievalPublicationFixture {
+        fn new() -> Self {
+            let project = TempDir::new().expect("project");
+            let cache = TempDir::new().expect("cache");
+            let storage_dir = TempDir::new().expect("storage dir");
+            let storage_path = storage_dir.path().join("codestory.db");
+            fs::write(
+                project.path().join("fixture.rs"),
+                "pub fn first_retrieval_publication_fixture() {}\n",
+            )
+            .expect("write source fixture");
+
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-2222-4333-8444-555555555555".into(),
+                run_id: "first-retrieval-publication-run".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            let mut staged =
+                codestory_store::SnapshotStore::open_disposable_full_refresh(&storage_path)
+                    .expect("open staged core fixture");
+            staged
+                .store_mut()
+                .insert_file(&codestory_store::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("fixture.rs"),
+                    language: "rust".into(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert staged source fixture");
+            staged
+                .store_mut()
+                .insert_nodes_batch(&[
+                    Node {
+                        id: NodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: "fixture.rs".into(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: NodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "first_retrieval_publication_fixture".into(),
+                        qualified_name: Some("fixture::first_retrieval_publication_fixture".into()),
+                        file_node_id: Some(NodeId(1)),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert staged graph fixture");
+            staged
+                .store_mut()
+                .publish_structural_text_unit_generation(&publication)
+                .expect("publish complete staged structural text fixture");
+            crate::test_support::publish_complete_core_fixture(
+                staged.store_mut(),
+                project.path(),
+                &publication,
+            )
+            .expect("publish complete staged core fixture");
+            staged
+                .publish(&storage_path)
+                .expect("publish immutable core fixture");
+
+            let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("resolve core publication layout");
+            let core_database_path = layout
+                .generation_database_path(&publication.generation_id)
+                .expect("resolve immutable core database");
+            let core_database_bytes = fs::read(&core_database_path).expect("read immutable core");
+            let core_pointer_path = layout.publication_path();
+            let core_pointer_bytes = fs::read(&core_pointer_path).expect("read core pointer");
+            let retrieval_pointer_path = layout.retrieval_publication_path();
+            fs::remove_file(&retrieval_pointer_path)
+                .expect("remove initial empty retrieval publication pointer");
+            assert!(
+                matches!(
+                    fs::symlink_metadata(&retrieval_pointer_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ),
+                "fixture must begin with a physically absent retrieval pointer"
+            );
+
+            let runtime = crate::config::with_test_cache_root(cache.path(), || {
+                SidecarRuntimeConfig::for_project_profile(
+                    Some(project.path()),
+                    crate::SidecarProfile::Local,
+                )
+            });
+            Self {
+                project,
+                _cache: cache,
+                _storage_dir: storage_dir,
+                storage_path,
+                runtime,
+                publication,
+                core_database_path,
+                core_database_bytes,
+                core_pointer_path,
+                core_pointer_bytes,
+                retrieval_pointer_path,
+            }
+        }
+
+        fn assert_core_unchanged(&self) {
+            assert_eq!(
+                fs::read(&self.core_database_path).expect("read immutable core after finalization"),
+                self.core_database_bytes,
+                "retrieval finalization must not rewrite the immutable core database"
+            );
+            assert_eq!(
+                fs::read(&self.core_pointer_path).expect("read core pointer after finalization"),
+                self.core_pointer_bytes,
+                "retrieval finalization must not republish the core pointer"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_reaches_native_commit_fence_without_predecessor() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured_phases = std::rc::Rc::clone(&phases);
+
+        let error = finalize_index_for_runtime_with_progress_and_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+            move |phase| captured_phases.borrow_mut().push(phase),
+        )
+        .expect_err("source-only proof must stop at the managed native identity fence");
+        let rendered = format!("{error:#}");
+
+        fixture.assert_core_unchanged();
+        assert_eq!(
+            &*phases.borrow(),
+            &[
+                "lexical sidecar",
+                "embedded vectors",
+                "graph artifact",
+                "manifest write",
+            ],
+            "missing predecessor admission must run every deterministic component and reach the existing commit fence"
+        );
+        assert!(
+            rendered.contains(
+                "validate managed per-user embedding server identity before final probes"
+            ) && rendered.contains("embedding_server_transport_unavailable"),
+            "unexpected downstream publication-fence failure: {rendered}"
+        );
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "a source-only run stopped at the native fence must not create the external pointer"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_rejects_corrupt_existing_pointer() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let corrupt = b"not a retrieval publication database";
+        fs::write(&fixture.retrieval_pointer_path, corrupt).expect("write corrupt pointer");
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+        )
+        .expect_err("a corrupt existing pointer must not become first-publication absence");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("load previous retrieval_index_manifest"),
+            "unexpected corrupt-pointer failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("file is not a database"),
+            "strict predecessor read did not diagnose corruption: {rendered}"
+        );
+        assert_eq!(
+            fs::read(&fixture.retrieval_pointer_path).expect("read preserved corrupt pointer"),
+            corrupt
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn first_retrieval_publication_rejects_dangling_pointer_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let target = fixture
+            .retrieval_pointer_path
+            .with_file_name("missing-retrieval-publication-target");
+        symlink(&target, &fixture.retrieval_pointer_path).expect("create dangling pointer symlink");
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+        )
+        .expect_err("a dangling pointer symlink must not become first-publication absence");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("load previous retrieval_index_manifest"),
+            "unexpected symlink failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("Retrieval publication pointer is not a regular file"),
+            "strict predecessor read did not reject the symlink: {rendered}"
+        );
+        assert!(
+            fs::symlink_metadata(&fixture.retrieval_pointer_path)
+                .expect("inspect preserved pointer symlink")
+                .file_type()
+                .is_symlink(),
+            "failed finalization must preserve the hostile pointer"
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_pre_cancel_preserves_absent_pointer_and_core() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(true),
+        )
+        .expect_err("pre-cancelled first publication must fail before construction");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("cancelled before preflight"),
+            "unexpected pre-cancel failure: {rendered}"
+        );
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "pre-cancelled finalization must not create a retrieval pointer"
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_retention_has_no_rollback_predecessor() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let storage = Store::open(&fixture.storage_path).expect("open immutable core fixture");
+        let project_id = sidecar_project_id_for_runtime(fixture.project.path(), &fixture.runtime)
+            .expect("resolve fixture project identity");
+        let active = crate::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test embedding residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "first-retrieval-publication-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+
+        let prepared = prepare_generation_retention(
+            &context,
+            &project_id,
+            &active,
+            &storage,
+            &fixture.storage_path,
+        )
+        .expect("a physically absent first publication has no rollback predecessor");
+
+        assert!(prepared.verified_previous.is_none());
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "retention preparation must remain observational before atomic publication"
+        );
+        fixture.assert_core_unchanged();
     }
 
     #[test]
