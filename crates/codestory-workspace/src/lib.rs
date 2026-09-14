@@ -98,6 +98,7 @@ pub enum Language {
     Yaml,
     Toml,
     Json,
+    Terraform,
     Svelte,
     Vue,
     Astro,
@@ -2578,6 +2579,7 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Yaml, "yaml")
             | (&Language::Toml, "toml")
             | (&Language::Json, "json")
+            | (&Language::Terraform, "terraform")
     )
 }
 
@@ -2827,6 +2829,7 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Json,
+            Language::Terraform,
             Language::Svelte,
             Language::Vue,
             Language::Astro,
@@ -3236,6 +3239,37 @@ mod tests {
         );
         assert_eq!(inventory.policy_exclusions[0].observed_size, 65);
         assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_inventory_admits_terraform_structural_sources() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let module = root.join("main.tf");
+        let variables = root.join("prod.tfvars");
+        let unsupported = root.join("terraform.tfstate");
+        fs::write(&module, "module \"app\" { source = \"./app\" }\n")?;
+        fs::write(&variables, "region = \"ca-central-1\"\n")?;
+        fs::write(&unsupported, "{}\n")?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "terraform".to_string(),
+                version: 1,
+                source_groups: vec![test_source_group(Language::Terraform, root.clone(), &[])],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&module));
+        assert!(inventory.files.contains(&variables));
+        assert!(!inventory.files.contains(&unsupported));
+        assert!(inventory.policy_exclusions.is_empty());
         Ok(())
     }
 
@@ -4628,7 +4662,7 @@ mod tests {
                 test_source_group(language, root.clone(), &excludes)
             })
             .collect::<Vec<_>>();
-        assert_eq!(groups.len(), 27);
+        assert_eq!(groups.len(), 28);
 
         let manifest = WorkspaceManifest::from_parts(
             WorkspaceSettings {
@@ -4795,6 +4829,7 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Json,
+            Language::Terraform,
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
@@ -4891,6 +4926,7 @@ mod tests {
             ("Yaml", Language::Yaml),
             ("Toml", Language::Toml),
             ("Json", Language::Json),
+            ("Terraform", Language::Terraform),
             ("Svelte", Language::Svelte),
             ("Vue", Language::Vue),
             ("Astro", Language::Astro),

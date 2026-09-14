@@ -36,7 +36,7 @@ inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, basename-scoped TypeScript/JavaScript config JSONC, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, Terraform/HCL (`.tf` and `.tfvars`), basename-scoped TypeScript/JavaScript config JSONC, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
@@ -108,6 +108,15 @@ fallback emits function and import anchors outside heredocs only for `.zsh`,
 comments. These collectors do not interpret references, substitutions,
 imports, execution behavior, or typed targets.
 
+Terraform `.tf` and `.tfvars` files emit conservative block-header,
+assignment-key, and simple unquoted object-key anchors from an error-free HCL
+concrete syntax tree. A block-header span runs from its first through last real
+header token: trailing comments are excluded, while comments interleaved among
+header tokens remain verbatim in the exact declaration range and are never
+separate anchors. Those exact spans do not evaluate HCL expressions or
+interpolation, construct a resource graph, resolve providers or modules,
+inspect state or plans, or supply the source of external modules.
+
 Dedicated routing wins before generic collection: workflow and Compose paths
 keep their YAML producers, `Cargo.toml` keeps its manifest producer, recognized
 TypeScript/JavaScript config names keep their JSONC producer, and OpenAPI/Swagger
@@ -132,7 +141,7 @@ agent-facing packet quality is not promoted until one coherent fresh run passes
 the preregistered task-success, factual-integrity, source-work, context, and
 timing gates. Run-specific scorecards belong in PRs, issues, release notes, or ignored
 `target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
-SQL, Markdown/MDX, generic YAML/TOML/JSON, basename-scoped TypeScript/JavaScript
+SQL, Markdown/MDX, generic YAML/TOML/JSON, Terraform `.tf`/`.tfvars`, basename-scoped TypeScript/JavaScript
 config JSONC, non-parser shell, PowerShell, GitHub Actions workflows, Docker
 Compose manifests, and Cargo manifests remain
 structural source-proof collectors; OpenAPI schemas remain a dedicated
@@ -176,7 +185,7 @@ Workspace parser policy:
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
 GitHub Actions workflows, Docker Compose manifests, Markdown/MDX, generic
-YAML/TOML/JSON, non-parser shell, and PowerShell remain structural runtime
+YAML/TOML/JSON, Terraform `.tf`/`.tfvars`, non-parser shell, and PowerShell remain structural runtime
 paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |

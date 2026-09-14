@@ -43,6 +43,7 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-swift = "0.7.3"
 tree-sitter-dart-orchard = "0.4.0"
 tree-sitter-bash = "0.25.1"
+tree-sitter-hcl = "=1.1.0"
 
 # Semantic Analysis
 tree-sitter-graph = { path = "vendor/tree-sitter-graph" }

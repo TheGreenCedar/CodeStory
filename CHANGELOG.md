@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Terraform `.tf` and `.tfvars` files provide exact structural source anchors for
+blocks and assignments without claiming resource-graph or expression semantics.
+
 Search correctly prioritizes extensionless files from the selected project
 without treating files from another working directory as project evidence.
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::Runtime;
 use flate2::{Decompress, FlushDecompress, Status};
+use std::collections::BTreeSet;
 use std::fs;
 
 const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
@@ -177,6 +178,90 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
         Store::database_index_publication(&storage_path).unwrap(),
         Some(publication)
     );
+}
+
+#[test]
+fn activation_publishes_complete_terraform_structural_artifacts() {
+    let project = tempfile::tempdir().expect("project");
+    let cache = tempfile::tempdir().expect("cache");
+    let source = concat!(
+        "resource \"aws_eks_cluster\" \"main\" {\n",
+        "  name = var.cluster_name\n",
+        "  tags = { Owner = \"platform\" }\n",
+        "}\n",
+    );
+    fs::write(project.path().join("main.tf"), source).expect("write Terraform source");
+    let storage_path = cache.path().join("codestory.db");
+
+    Runtime::new()
+        .activation_service()
+        .activate_core_only(
+            project.path(),
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("publish Terraform core");
+
+    let core_path = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve published Terraform core");
+    let store = Store::open_read_only(&core_path).expect("open published Terraform core");
+    let publication = store
+        .get_complete_index_publication()
+        .expect("read Terraform publication")
+        .expect("complete Terraform publication");
+    assert_eq!(
+        publication.mode,
+        codestory_store::IndexPublicationMode::Full
+    );
+    store
+        .validate_structural_text_unit_publication(&publication)
+        .expect("validate Terraform structural text publication");
+
+    let file = store
+        .get_files()
+        .expect("read published files")
+        .into_iter()
+        .find(|file| file.path.file_name().is_some_and(|name| name == "main.tf"))
+        .expect("published Terraform file");
+    assert_eq!(file.language, "terraform");
+    assert!(file.indexed && file.complete);
+
+    let anchors = store
+        .get_nodes()
+        .expect("read published nodes")
+        .into_iter()
+        .filter(|node| {
+            node.file_node_id == Some(codestory_contracts::graph::NodeId(file.id))
+                && node.kind != codestory_contracts::graph::NodeKind::FILE
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        anchors
+            .iter()
+            .map(|node| node.serialized_name.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "Owner",
+            "name",
+            "resource \"aws_eks_cluster\" \"main\"",
+            "tags",
+        ])
+    );
+    for anchor in anchors {
+        let start_line = anchor.start_line.expect("anchor start line");
+        let start_col = anchor.start_col.expect("anchor start column");
+        let end_line = anchor.end_line.expect("anchor end line");
+        let end_col = anchor.end_col.expect("anchor end column");
+        assert_eq!(start_line, end_line, "fixture anchors stay on one line");
+        let line = source
+            .lines()
+            .nth(start_line.saturating_sub(1) as usize)
+            .expect("anchor source line");
+        let exact = line
+            .get(start_col.saturating_sub(1) as usize..end_col as usize)
+            .expect("exact anchor source bytes");
+        assert_eq!(exact, anchor.serialized_name);
+    }
 }
 
 #[test]
