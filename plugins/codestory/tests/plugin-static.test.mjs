@@ -1100,8 +1100,9 @@ async function writeReleaseFixture(releaseDir, version, writeCli = writeFakeCli)
   return { archiveName, archivePath, archiveSha256, cliName, sumsPath };
 }
 
-function spawnLauncher(launcher, env) {
-  const child = spawn(process.execPath, [launcher], {
+function spawnLauncher(launcher, env, options = {}) {
+  const preload = options.preload ? ["--require", options.preload] : [];
+  const child = spawn(process.execPath, [...preload, launcher], {
     env: { ...process.env, CODESTORY_CLI: "", ...env },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -5646,6 +5647,273 @@ test("managed cli publication reclaims crashes after lock and before publication
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
     await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retires extraction before a post-publication publisher crash", { timeout: 30000 }, async () => {
+  const version = await readPinnedCliVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-post-publication-data-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-post-publication-release-"));
+  const isolatedTmp = await mkdtemp(join(tmpdir(), "codestory-post-publication-tmp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failedOut = join(dataDir, "failed.json");
+  const recoveredOut = join(dataDir, "recovered.json");
+  const publishedMarker = join(isolatedTmp, "published");
+  const preloadPath = join(isolatedTmp, "block-after-publication.cjs");
+  const versionDir = join(dataDir, "codestory-cli", version);
+  let crashed;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    await writeFile(
+      preloadPath,
+      [
+        "'use strict';",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const renameSync = fs.renameSync;",
+        "fs.renameSync = function(source, destination) {",
+        "  const result = Reflect.apply(renameSync, fs, arguments);",
+        "  const expectedTarget = path.resolve(process.env.CODESTORY_TEST_PUBLICATION_TARGET);",
+        "  const expectedPrefix = `.provisioning-${process.env.CODESTORY_TEST_PUBLICATION_VERSION}-`;",
+        "  if (path.resolve(String(destination)) === expectedTarget &&",
+        "      path.basename(String(source)).startsWith(expectedPrefix)) {",
+        "    fs.writeFileSync(process.env.CODESTORY_TEST_PUBLICATION_MARKER, 'published\\n');",
+        "    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);",
+        "  }",
+        "  return result;",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const common = {
+      CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+      TMPDIR: isolatedTmp,
+      TMP: isolatedTmp,
+      TEMP: isolatedTmp,
+    };
+    crashed = spawnLauncher(
+      launcher,
+      {
+        ...common,
+        TEST_OUT: failedOut,
+        CODESTORY_TEST_PUBLICATION_MARKER: publishedMarker,
+        CODESTORY_TEST_PUBLICATION_TARGET: versionDir,
+        CODESTORY_TEST_PUBLICATION_VERSION: version,
+      },
+      { preload: preloadPath },
+    );
+    await waitForPath(publishedMarker);
+    assert.equal(crashed.child.kill("SIGKILL"), true);
+    const crashedResult = await crashed.completed;
+    crashed = null;
+    assert.equal(crashedResult.signal, "SIGKILL", JSON.stringify(crashedResult));
+    assert.equal(fs.existsSync(failedOut), false);
+
+    const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+    const publishedCli = join(versionDir, ...manifest.path.split("/"));
+    const publishedSha256 = createHash("sha256").update(await readFile(publishedCli)).digest("hex");
+    assert.equal(publishedSha256, manifest.sha256);
+
+    const recovered = spawnLauncher(launcher, { ...common, TEST_OUT: recoveredOut });
+    const recoveredResult = await recovered.completed;
+    assert.equal(recoveredResult.status, 0, recoveredResult.stderr);
+    const observed = JSON.parse(await readFile(recoveredOut, "utf8"));
+    assert.equal(observed.source, "managed");
+    assert.equal(observed.sha256, publishedSha256);
+    assert.equal(await realpath(observed.path), await realpath(publishedCli));
+
+    const retainedExtractions = (await readdir(isolatedTmp))
+      .filter((name) => name.startsWith("codestory-plugin-cli-"));
+    assert.deepEqual(retainedExtractions, []);
+  } finally {
+    if (crashed?.child.exitCode === null) {
+      crashed.child.kill("SIGKILL");
+      await crashed.completed;
+    }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+    await rm(isolatedTmp, { recursive: true, force: true });
+  }
+});
+
+test("managed cli cleanup failure cannot publish over prior managed state", { timeout: 30000 }, async () => {
+  const version = await readPinnedCliVersion();
+  const priorVersion = "0.0.1";
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-cleanup-failure-data-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-cleanup-failure-release-"));
+  const isolatedTmp = await mkdtemp(join(tmpdir(), "codestory-cleanup-failure-tmp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failureMarker = join(isolatedTmp, "cleanup-failed");
+  const preloadPath = join(isolatedTmp, "fail-extraction-cleanup.cjs");
+  const versionDir = join(dataDir, "codestory-cli", version);
+  let launched;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    const prior = await writeManagedCliFixture(dataDir, priorVersion, "preserved prior runtime\n");
+    const priorCli = await readFile(prior.cliPath);
+    const priorManifest = await readFile(join(prior.versionDir, "manifest.json"));
+    await writeFile(
+      preloadPath,
+      [
+        "'use strict';",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const rmSync = fs.rmSync;",
+        "fs.rmSync = function(target) {",
+        "  const pathname = path.resolve(String(target));",
+        "  const expectedParent = path.resolve(process.env.CODESTORY_TEST_TEMP_ROOT);",
+        "  if (path.dirname(pathname) === expectedParent &&",
+        "      path.basename(pathname).startsWith('codestory-plugin-cli-')) {",
+        "    fs.writeFileSync(process.env.CODESTORY_TEST_CLEANUP_FAILURE_MARKER, 'failed\\n');",
+        "    const error = new Error('synthetic extraction cleanup failure');",
+        "    error.code = 'EACCES';",
+        "    throw error;",
+        "  }",
+        "  return Reflect.apply(rmSync, fs, arguments);",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    launched = spawnLauncher(
+      launcher,
+      {
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: join(dataDir, "unexpected.json"),
+        TMPDIR: isolatedTmp,
+        TMP: isolatedTmp,
+        TEMP: isolatedTmp,
+        CODESTORY_TEST_TEMP_ROOT: isolatedTmp,
+        CODESTORY_TEST_CLEANUP_FAILURE_MARKER: failureMarker,
+      },
+      { preload: preloadPath },
+    );
+    await waitForPath(failureMarker);
+    launched.child.kill("SIGKILL");
+    await launched.completed;
+    launched = null;
+
+    assert.equal(fs.existsSync(versionDir), false);
+    assert.deepEqual(await readFile(prior.cliPath), priorCli);
+    assert.deepEqual(await readFile(join(prior.versionDir, "manifest.json")), priorManifest);
+  } finally {
+    if (launched?.child.exitCode === null) {
+      launched.child.kill("SIGKILL");
+      await launched.completed;
+    }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+    await rm(isolatedTmp, { recursive: true, force: true });
+  }
+});
+
+test("managed cli refuses cleanup when its temporary directory identity changes", { timeout: 30000 }, async () => {
+  const version = await readPinnedCliVersion();
+  const priorVersion = "0.0.1";
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-cleanup-identity-data-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-cleanup-identity-release-"));
+  const isolatedTmp = await mkdtemp(join(tmpdir(), "codestory-cleanup-identity-tmp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const swapMarker = join(isolatedTmp, "swapped.json");
+  const preloadPath = join(isolatedTmp, "swap-extraction-before-cleanup.cjs");
+  const versionDir = join(dataDir, "codestory-cli", version);
+  const lockPath = join(dataDir, "codestory-cli", ".retention-lock");
+  let launched;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    const prior = await writeManagedCliFixture(dataDir, priorVersion, "preserved prior runtime\n");
+    const priorCli = await readFile(prior.cliPath);
+    const priorManifest = await readFile(join(prior.versionDir, "manifest.json"));
+    await writeFile(
+      preloadPath,
+      [
+        "'use strict';",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const mkdtempSync = fs.mkdtempSync;",
+        "const writeFileSync = fs.writeFileSync;",
+        "let extractionRoot = null;",
+        "let swapped = false;",
+        "fs.mkdtempSync = function(prefix) {",
+        "  const created = Reflect.apply(mkdtempSync, fs, arguments);",
+        "  if (path.dirname(String(prefix)) === path.resolve(process.env.CODESTORY_TEST_TEMP_ROOT) &&",
+        "      path.basename(String(prefix)) === 'codestory-plugin-cli-') extractionRoot = created;",
+        "  return created;",
+        "};",
+        "fs.writeFileSync = function(filename) {",
+        "  const result = Reflect.apply(writeFileSync, fs, arguments);",
+        "  const stagingPrefix = `.provisioning-${process.env.CODESTORY_TEST_PUBLICATION_VERSION}-`;",
+        "  if (!swapped && extractionRoot && path.basename(String(filename)) === 'manifest.json' &&",
+        "      path.basename(path.dirname(String(filename))).startsWith(stagingPrefix)) {",
+        "    swapped = true;",
+        "    const movedRoot = `${extractionRoot}-owned`;",
+        "    fs.renameSync(extractionRoot, movedRoot);",
+        "    fs.mkdirSync(extractionRoot);",
+        "    fs.writeFileSync(path.join(extractionRoot, 'foreign-sentinel'), 'foreign\\n');",
+        "    fs.writeFileSync(process.env.CODESTORY_TEST_SWAP_MARKER, JSON.stringify({ extractionRoot, movedRoot }));",
+        "  }",
+        "  return result;",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    launched = spawnLauncher(
+      launcher,
+      {
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: join(dataDir, "runtime.json"),
+        TMPDIR: isolatedTmp,
+        TMP: isolatedTmp,
+        TEMP: isolatedTmp,
+        CODESTORY_TEST_TEMP_ROOT: isolatedTmp,
+        CODESTORY_TEST_PUBLICATION_VERSION: version,
+        CODESTORY_TEST_SWAP_MARKER: swapMarker,
+      },
+      { preload: preloadPath },
+    );
+    await waitForPath(swapMarker);
+    const swap = JSON.parse(await readFile(swapMarker, "utf8"));
+    const lockDeadline = Date.now() + 10000;
+    while (fs.existsSync(lockPath) && Date.now() < lockDeadline) await delay(10);
+    const lockReleased = !fs.existsSync(lockPath);
+    if (launched.child.exitCode === null) launched.child.kill("SIGKILL");
+    await launched.completed;
+    launched = null;
+
+    assert.deepEqual(
+      {
+        replacementSurvived: fs.existsSync(join(swap.extractionRoot, "foreign-sentinel")),
+        originalExtractionPreserved: fs.existsSync(swap.movedRoot),
+        publicationAbsent: !fs.existsSync(versionDir),
+        priorCliPreserved: (await readFile(prior.cliPath)).equals(priorCli),
+        priorManifestPreserved: (await readFile(join(prior.versionDir, "manifest.json"))).equals(priorManifest),
+        lockReleased,
+      },
+      {
+        replacementSurvived: true,
+        originalExtractionPreserved: true,
+        publicationAbsent: true,
+        priorCliPreserved: true,
+        priorManifestPreserved: true,
+        lockReleased: true,
+      },
+    );
+  } finally {
+    if (launched?.child.exitCode === null) {
+      launched.child.kill("SIGKILL");
+      await launched.completed;
+    }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+    await rm(isolatedTmp, { recursive: true, force: true });
   }
 });
 

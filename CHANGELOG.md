@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Managed CLI installation removes temporary extraction bytes before publishing
+the runtime, so a host interrupted after publication does not retain a duplicate
+runtime copy.
+
 Terraform `.tf` and `.tfvars` files provide exact structural source anchors for
 blocks and assignments without claiming resource-graph or expression semantics.
 
