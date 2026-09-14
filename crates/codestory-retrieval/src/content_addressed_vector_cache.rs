@@ -2102,6 +2102,82 @@ mod tests {
     }
 
     #[test]
+    fn forward_resume_trace_has_zero_hits_with_two_batch_lru() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let open = || {
+            ContentAddressedVectorCache::open_with_limits(
+                &selected_runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                row_weight * 2,
+                1024 * 1024,
+            )
+            .expect("open bounded cache")
+        };
+        let a_rows = [("a", "doc-a", "a")];
+        let b_rows = [("b", "doc-b", "b")];
+        let c_rows = [("c", "doc-c", "c")];
+        let a = inputs(&a_rows);
+        let b = inputs(&b_rows);
+        let c = inputs(&c_rows);
+        let a_vectors = vec![vec![1.0, -0.0]];
+        let b_vectors = vec![vec![0.0, 1.0]];
+        let c_vectors = vec![vec![-1.0, 0.0]];
+
+        let mut owner = open();
+        owner.publish_batch(&a, &a_vectors).expect("publish a");
+        owner.publish_batch(&b, &b_vectors).expect("publish b");
+        owner.publish_batch(&c, &c_vectors).expect("publish c");
+        assert!(owner.load_batch(&a).expect("load evicted a").is_none());
+        let retained_b = owner
+            .load_batch(&b)
+            .expect("load retained b")
+            .expect("b remains reusable before resume");
+        let retained_c = owner
+            .load_batch(&c)
+            .expect("load retained c")
+            .expect("c remains reusable before resume");
+        assert_eq!(retained_b, b_vectors);
+        assert_eq!(retained_c, c_vectors);
+        assert_eq!(retained_b[0][0].to_bits(), b_vectors[0][0].to_bits());
+        assert_eq!(retained_c[0][0].to_bits(), c_vectors[0][0].to_bits());
+        drop(owner);
+
+        let mut resumed = open();
+        let mut recomputed = Vec::new();
+        for (label, batch, vectors) in [
+            ("a", a.as_slice(), a_vectors.as_slice()),
+            ("b", b.as_slice(), b_vectors.as_slice()),
+            ("c", c.as_slice(), c_vectors.as_slice()),
+        ] {
+            assert!(
+                resumed
+                    .load_batch(batch)
+                    .unwrap_or_else(|error| panic!("load resumed {label}: {error:#}"))
+                    .is_none(),
+                "forward resume unexpectedly reused {label}"
+            );
+            recomputed.push(label);
+            let published = resumed
+                .publish_batch(batch, vectors)
+                .unwrap_or_else(|error| panic!("publish resumed {label}: {error:#}"));
+            assert_eq!(published.as_slice(), vectors);
+            for (observed, expected) in published.iter().zip(vectors) {
+                for (observed, expected) in observed.iter().zip(expected) {
+                    assert_eq!(observed.to_bits(), expected.to_bits());
+                }
+            }
+        }
+
+        assert_eq!(recomputed, ["a", "b", "c"]);
+        assert_eq!(resumed.activity(), (0, 3));
+        assert!(resumed.accounted_payload_bytes().expect("payload") <= row_weight * 2);
+    }
+
+    #[test]
     fn one_project_budget_covers_all_embedding_contracts() {
         let cache = TempDir::new().expect("cache root");
         let selected_runtime = runtime(&cache, 128);
