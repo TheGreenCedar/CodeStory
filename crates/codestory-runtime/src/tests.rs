@@ -9551,6 +9551,75 @@ fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
     }
 }
 
+#[cfg(unix)]
+fn publish_source_alias_incremental_baseline() -> EmptyPlanShortCircuitFixture {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace dir");
+    let target_path = workspace.path().join("source.rs");
+    let source_path = workspace.path().join("linked.rs");
+    fs::write(&target_path, "pub fn linked_source() -> i32 { 1 }\n").expect("write alias target");
+    symlink("source.rs", &source_path).expect("create in-project source alias");
+    fs::write(
+        workspace.path().join("codestory_project.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "incremental source alias",
+            "version": 1,
+            "source_groups": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "language": "Rust",
+                "standard": "Default",
+                "source_paths": ["linked.rs"],
+                "exclude_patterns": [],
+                "include_paths": [],
+                "defines": {},
+                "language_specific": "Other"
+            }]
+        }))
+        .expect("serialize alias manifest"),
+    )
+    .expect("write alias manifest");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open source-alias project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish source-alias baseline");
+    let baseline_storage = Storage::open(&storage_path).expect("open source-alias baseline");
+    assert!(
+        baseline_storage
+            .get_file_by_path(&source_path)
+            .expect("read selected alias path")
+            .is_some(),
+        "full indexing must retain the selected alias path"
+    );
+    let baseline_publication = baseline_storage
+        .get_complete_index_publication()
+        .expect("read source-alias publication")
+        .expect("complete source-alias publication");
+    drop(baseline_storage);
+    let baseline_search_generations = persisted_search_generation_names(&storage_path);
+    assert_eq!(
+        baseline_search_generations.len(),
+        1,
+        "the alias baseline must publish one completed search generation"
+    );
+    EmptyPlanShortCircuitFixture {
+        _workspace: workspace,
+        controller,
+        storage_path,
+        source_path,
+        baseline_publication,
+        baseline_search_generations,
+    }
+}
+
 #[test]
 fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding_search() {
     let fixture = publish_empty_plan_short_circuit_baseline();
@@ -9612,6 +9681,99 @@ fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding
         persisted_search_generation_names(&fixture.storage_path),
         fixture.baseline_search_generations,
         "a short-circuited refresh must not build a new search generation"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_refresh_does_not_short_circuit_an_unsealed_source_alias_inventory() {
+    let fixture = publish_source_alias_incremental_baseline();
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over an admitted source alias");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("the alias refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        "a generic artifact seal cannot authorize an alias inventory short-circuit: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+    assert!(
+        timings.publish_ms.is_some(),
+        "the unsealed inventory must continue through the staged refresh"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open refreshed alias storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read refreshed alias publication")
+        .expect("complete refreshed alias publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    assert!(
+        storage
+            .get_file_by_path(&fixture.source_path)
+            .expect("read retained alias path")
+            .is_some(),
+        "the staged fallback must retain the selected alias identity"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_staged_refresh_falls_back_from_an_unsealable_source_alias() {
+    let fixture = publish_source_alias_incremental_baseline();
+    let generation_root = search_index_generation_root(&fixture.storage_path);
+    for name in &fixture.baseline_search_generations {
+        fs::remove_dir_all(generation_root.join(name))
+            .expect("remove completed alias search generation");
+    }
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("staged incremental fallback over an admitted source alias");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("the staged alias refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete,
+        "the missing search generation must remain the staged-refresh reason: {probe:?}"
+    );
+    assert!(timings.publish_ms.is_some());
+    assert_eq!(
+        persisted_search_generation_names(&fixture.storage_path).len(),
+        1,
+        "the fallback must rebuild one completed search generation"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open staged alias result");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read staged alias publication")
+            .expect("complete staged alias publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    assert!(
+        storage
+            .get_file_by_path(&fixture.source_path)
+            .expect("read staged alias identity")
+            .is_some(),
+        "the fallback must retain the selected alias identity"
     );
     assert_no_staged_publication_artifacts(&fixture.storage_path);
 }

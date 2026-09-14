@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Incremental project refreshes preserve supported in-project source symlinks,
+keeping navigation tied to the selected source path.
+
 Affected test hints preserve graph-backed distances, confidence and reasons
 when the same tests also qualify as package-level suggestions.
 
