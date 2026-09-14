@@ -15,10 +15,19 @@ embedding preparation or a writable retrieval catalog. A cold project with no
 published core returns `project_unavailable` without creating a cache. Other
 modes require full, current retrieval and may prepare it automatically.
 
-Preserve an explicitly supplied symbol query. A behavior description can locate
-candidates without a known name. Field-qualified queries support `kind:`,
-`path:`, `name:` and `lang:` filters; they narrow candidates rather than prove a
-relationship or an exhaustive result set.
+In this core-only mode, `query` is one fuzzy pattern matched independently
+against each symbol name. Qualified owner/member text can form one pattern;
+several independent names in the same query are not a union of lookups. Preserve
+an explicit user-supplied query, then use bounded targeted follow-ups for
+separate names when useful. An empty composed query does not prove each name is
+absent. Behavior-oriented discovery can instead use the ordinary `auto` mode
+when its full-retrieval readiness and possible managed preparation are
+warranted.
+
+Behavior descriptions can locate candidates without a known name.
+Field-qualified queries support `kind:`, `path:`, `name:` and `lang:` filters;
+they narrow candidates rather than prove a relationship or an exhaustive result
+set.
 
 ## Reading results
 
