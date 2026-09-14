@@ -2635,6 +2635,41 @@ function releaseManagedCliLock(lock) {
   }
 }
 
+function captureManagedCliTempRootIdentity(tempRoot) {
+  let metadata;
+  try {
+    metadata = fs.lstatSync(tempRoot, { bigint: true });
+  } catch (error) {
+    throw new Error(`managed_cli_temp_root_unreadable:${error.code || managedCliFailureCode(error)}`);
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error('managed_cli_temp_root_not_direct');
+  }
+  return { dev: metadata.dev, ino: metadata.ino };
+}
+
+function removeManagedCliTempRoot(tempRoot, identity, options = {}) {
+  let metadata;
+  try {
+    metadata = fs.lstatSync(tempRoot, { bigint: true });
+  } catch (error) {
+    if (error.code === 'ENOENT' && options.allowMissing === true) return;
+    throw new Error(`managed_cli_temp_root_unreadable:${error.code || managedCliFailureCode(error)}`);
+  }
+  if (
+    !identity ||
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    metadata.dev !== identity.dev ||
+    metadata.ino !== identity.ino
+  ) {
+    throw new Error('managed_cli_temp_root_identity_changed');
+  }
+  // This check rejects observed replacement; it cannot make a hostile same-UID filesystem race
+  // between lstat and removal impossible.
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+}
+
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
   const { target, asset, buildSource } = managedAssetIdentity(version);
@@ -2646,6 +2681,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
   if (lock.waited) warnings.push('managed_cli_publication:waiter');
   if (lock.reclaimed) warnings.push('managed_cli_publication:reclaimed_lock');
   let tempRoot = null;
+  let tempRootIdentity = null;
   let stagingDir = null;
   try {
     trimManagedCliQuarantines(root, version);
@@ -2658,6 +2694,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     }
     warnings.push('managed_cli_publication:publisher');
     tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
+    tempRootIdentity = captureManagedCliTempRootIdentity(tempRoot);
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
@@ -2743,6 +2780,11 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     if (!staged.verified) {
       throw new Error(`managed_cli_staging_verification_failed:${staged.reason}`);
     }
+    if (tempRoot) {
+      removeManagedCliTempRoot(tempRoot, tempRootIdentity);
+      tempRoot = null;
+      tempRootIdentity = null;
+    }
     if (fs.existsSync(versionDir)) throw new Error('managed_cli_publish_target_reappeared');
     fs.renameSync(stagingDir, versionDir);
     stagingDir = null;
@@ -2750,9 +2792,14 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     managedCliDownloadProgress.stage = null;
     return resolveManifest(path.join(versionDir, 'manifest.json'));
   } finally {
-    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
-    if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true });
-    releaseManagedCliLock(lock);
+    try {
+      if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
+      if (tempRoot) {
+        removeManagedCliTempRoot(tempRoot, tempRootIdentity, { allowMissing: true });
+      }
+    } finally {
+      releaseManagedCliLock(lock);
+    }
   }
 }
 
