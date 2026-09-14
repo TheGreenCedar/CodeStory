@@ -1040,6 +1040,9 @@ pub(crate) fn emit_scip_artifacts_from_store_incremental(
             if row.node_kind == Some(NodeKind::UNKNOWN as i64) {
                 continue;
             }
+            if row.display_name.trim().is_empty() {
+                continue;
+            }
             let Some(file_path) = row.file_path.as_deref().map(normalize_scip_path) else {
                 continue;
             };
@@ -2718,6 +2721,172 @@ mod tests {
         assert!(
             !index.is_fresh_for(&revision, "generation-b"),
             "the published artifact must be refused for a different generation"
+        );
+    }
+
+    #[test]
+    fn scip_emit_omits_blank_symbols_without_mutating_core_or_named_relationships() {
+        let project = TempDir::new().expect("project");
+        let storage_path = adjacency_fixture_store(&project);
+        let mut storage = Store::open(&storage_path).expect("reopen store");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(5),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: String::new(),
+                    qualified_name: Some(String::new()),
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(70),
+                    start_col: Some(0),
+                    end_line: Some(70),
+                    end_col: Some(0),
+                },
+                Node {
+                    id: NodeId(6),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: " \t".into(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(71),
+                    start_col: Some(0),
+                    end_line: Some(71),
+                    end_col: Some(0),
+                },
+            ])
+            .expect("insert blank annotations");
+        let core_before = storage
+            .get_canonical_search_symbol_detail_batch_after(None, usize::MAX)
+            .expect("core before emit");
+        assert_eq!(core_before.len(), 6);
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
+            .expect("blank identities are not SCIP evidence")
+            .expect("named symbols still produce a revision");
+        let index = load_scip_symbols(&scip_dir)
+            .expect("load scip")
+            .expect("named SCIP artifact");
+
+        assert_eq!(
+            index
+                .symbols
+                .iter()
+                .map(|symbol| symbol.node_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("2"), Some("3"), Some("4")],
+            "only named source symbols enter the SCIP artifact"
+        );
+        let references = index
+            .proofs
+            .iter()
+            .filter(|proof| proof.is_reference())
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].node_id.as_deref(), Some("2"));
+        assert_eq!(references[0].target_node_id.as_deref(), Some("4"));
+
+        let storage = Store::open(&storage_path).expect("reopen core after emit");
+        assert_eq!(
+            storage
+                .get_canonical_search_symbol_detail_batch_after(None, usize::MAX)
+                .expect("core after emit"),
+            core_before,
+            "SCIP admission must not rewrite or remove core nodes"
+        );
+    }
+
+    #[test]
+    fn scip_emit_all_blank_symbols_crossing_page_boundary_produces_no_artifact() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        let file_node_id = NodeId(1);
+        storage
+            .insert_file(&FileInfo {
+                id: file_node_id.0,
+                path: project.path().join("blank.json"),
+                language: "json".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 4_100,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: file_node_id,
+                kind: NodeKind::FILE,
+                serialized_name: "blank.json".into(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: None,
+                start_line: Some(1),
+                start_col: Some(0),
+                end_line: Some(4_100),
+                end_col: Some(0),
+            }])
+            .expect("insert file node");
+        let annotations = (0..4_100_i64)
+            .map(|index| Node {
+                id: NodeId(index + 2),
+                kind: NodeKind::ANNOTATION,
+                serialized_name: if index % 2 == 0 {
+                    String::new()
+                } else {
+                    "  ".into()
+                },
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(file_node_id),
+                start_line: Some((index + 1) as u32),
+                start_col: Some(0),
+                end_line: Some((index + 1) as u32),
+                end_col: Some(0),
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&annotations)
+            .expect("insert paginated blank annotations");
+        assert_eq!(storage.get_canonical_search_symbol_count().unwrap(), 4_101);
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        let outcome = emit_scip_artifacts_from_store_incremental(
+            &storage_path,
+            &scip_dir,
+            "generation-a",
+            None,
+            || Ok(()),
+        )
+        .expect("all blank identities produce no SCIP evidence");
+
+        assert_eq!(
+            outcome,
+            ScipIncrementalOutcome {
+                revision: None,
+                retained_records: 0,
+                inserted_records: 0,
+                removed_records: 0,
+                reordered_records: 0,
+                cloned: false,
+                direct_reference: false,
+            }
+        );
+        assert!(!scip_symbols_component_path(&scip_dir).exists());
+        assert!(!scip_dir.join("revision.txt").exists());
+        assert!(!scip_dir.join(SCIP_INDEX_FILE).exists());
+        assert_eq!(
+            Store::open(&storage_path)
+                .expect("reopen core")
+                .get_canonical_search_symbol_count()
+                .expect("count core after emit"),
+            4_101,
+            "pagination and filtering must not change the canonical core count"
         );
     }
 
