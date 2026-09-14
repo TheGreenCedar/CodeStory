@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Route navigation keeps declarations with matching HTTP methods and paths
+separate, preserving links to each declaration’s own file and handler.
+
 Index dry runs inspect the selected project and cache without requiring a prior
 project open, while remaining read-only.
 
