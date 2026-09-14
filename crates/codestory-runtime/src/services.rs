@@ -3,12 +3,12 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
-    GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessDto,
-    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
-    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenProjectRequest,
-    ProjectSummary, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    GroundingBudgetDto, GroundingSnapshotDto, IncrementalPlanProbeOutcomeDto, IndexDryRunDto,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode,
+    IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto,
     UpdateBookmarkRequest,
 };
@@ -1600,6 +1600,25 @@ impl ActivationService {
         let complete_incremental_source_inventory = precomputed_core_probe
             .as_ref()
             .is_some_and(|probe| probe.has_complete_source_inventory());
+        // The incremental probe reports a missing search generation only after
+        // proving a complete inventory, an empty source plan, and a current
+        // complete core contract. Repair that derived generation against the
+        // exact immutable core. Source aliases still prevent an unsealed
+        // short-circuit and take the full retrieval freshness path below.
+        let search_repair_only = has_complete_core
+            && precomputed_core_probe.as_ref().is_some_and(|probe| {
+                probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
+                    && probe.files_to_index == 0
+                    && probe.files_to_remove == 0
+                    && probe.publication.as_ref().is_some_and(|publication| {
+                        let publication =
+                            crate::index_commit::index_publication_dto(publication.clone());
+                        summary
+                            .as_ref()
+                            .and_then(|summary| summary.publication.as_ref())
+                            == Some(&publication)
+                    })
+            });
         let preflight_ms =
             u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1609,7 +1628,7 @@ impl ActivationService {
         let core_stale = !has_complete_core
             || precomputed_core_probe
                 .as_ref()
-                .is_none_or(|probe| !probe.short_circuited());
+                .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
         if core_stale {
             let mode = if !has_complete_core {
                 IndexMode::Full
@@ -1641,7 +1660,7 @@ impl ActivationService {
                     && summary.stats.fatal_error_count == 0
                     && precomputed_core_probe
                         .as_ref()
-                        .is_some_and(|probe| probe.short_circuited())
+                        .is_some_and(|probe| probe.short_circuited() || search_repair_only)
             }),
         };
         let core_refresh_ms =
@@ -5400,23 +5419,124 @@ pub(crate) mod activation_tests {
             ActivationCapabilityState::Ready
         );
         let current = Store::database_index_publication(&storage_path)
-            .expect("read repaired publication")
-            .expect("repaired complete publication");
-        assert_eq!(current.generation, previous.generation + 1);
+            .expect("read retained publication")
+            .expect("retained complete publication");
         assert_eq!(
-            current.mode,
-            codestory_store::IndexPublicationMode::Incremental
+            current, previous,
+            "search repair must retain the exact core"
         );
-        let current_search = search_index_path_for_publication(&storage_path, Some(&current))
+        let current_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("repaired search generation path");
         assert!(
-            read_search_generation_completion(&current_search, &current.generation_id).is_some(),
-            "activation must publish a completion marker for the repaired generation"
+            read_search_generation_completion(&current_search, &previous.generation_id).is_some(),
+            "activation must publish a completion marker for the retained generation"
         );
         runtime
             .project_service()
             .open_project_with_storage_path(project.path().to_path_buf(), storage_path)
             .expect("the strict reader must admit the repaired generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_repairs_missing_search_for_unchanged_core_with_source_alias_without_republishing_core()
+     {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("source.rs"),
+            "pub fn linked_source() -> i32 { 1 }\n",
+        )
+        .expect("write alias target");
+        symlink("source.rs", project.path().join("linked.rs"))
+            .expect("create in-project source alias");
+        fs::write(
+            project.path().join("codestory_project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "same-core search repair",
+                "version": 1,
+                "source_groups": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "language": "Rust",
+                    "standard": "Default",
+                    "source_paths": ["linked.rs"],
+                    "exclude_patterns": [],
+                    "include_paths": [],
+                    "defines": {},
+                    "language_specific": "Other"
+                }]
+            }))
+            .expect("serialize project manifest"),
+        )
+        .expect("write project manifest");
+
+        let seeding_runtime = Runtime::new();
+        seeding_runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let previous = Store::database_index_publication(&storage_path)
+            .expect("read core publication")
+            .expect("complete core publication");
+        let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+            .expect("core publication layout");
+        let previous_database = layout
+            .resolve_generation_database(&previous.generation_id)
+            .expect("resolve immutable core generation");
+        let previous_database_bytes = fs::read(&previous_database).expect("read immutable core");
+        let previous_pointer_bytes =
+            fs::read(layout.publication_path()).expect("read core publication pointer");
+        let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
+            .expect("search generation path");
+        fs::remove_dir_all(&previous_search).expect("remove completed search generation");
+
+        let runtime = Runtime::new();
+        let error = runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("the unit-test runtime has no managed embedding server");
+
+        assert_eq!(error.code, "project_unavailable", "{error:?}");
+        let snapshot = runtime.activation_service().snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready
+        );
+        let current = Store::database_index_publication(&storage_path)
+            .expect("read core publication after search repair")
+            .expect("complete core publication after search repair");
+        assert_eq!(
+            current, previous,
+            "search repair must not republish the core"
+        );
+        assert_eq!(
+            fs::read(&previous_database).expect("reread immutable core"),
+            previous_database_bytes,
+            "search repair must not mutate the immutable core database"
+        );
+        assert_eq!(
+            fs::read(layout.publication_path()).expect("reread core publication pointer"),
+            previous_pointer_bytes,
+            "search repair must not rewrite the core publication pointer"
+        );
+        assert!(
+            read_search_generation_completion(&previous_search, &previous.generation_id).is_some(),
+            "activation must publish search completion for the unchanged core generation"
+        );
     }
 
     #[test]
