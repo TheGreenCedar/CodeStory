@@ -350,9 +350,6 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             &import_bindings,
             &package_owner_specs,
         );
-        let method_receiver_name = method_receiver_bindings
-            .keys()
-            .find(|receiver_name| !receiver_name.contains('.'));
         let mut local_binding_callsites = HashSet::new();
         collect_go_local_composite_receiver_call_specs(
             callable,
@@ -363,7 +360,6 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             },
             &import_bindings,
             &file_scope_names,
-            method_receiver_name.map(String::as_str),
             &mut local_binding_callsites,
             &mut edges,
         );
@@ -414,12 +410,14 @@ fn collect_go_local_composite_receiver_call_specs(
     call_source: ManualReceiverSource<'_>,
     import_bindings: &HashMap<String, String>,
     file_scope_names: &HashSet<String>,
-    method_receiver_name: Option<&str>,
     local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
+    let method_receiver_name = callable
+        .child_by_field_name("receiver")
+        .and_then(|receiver| go_receiver_variable_name(receiver, source));
     let builtin_new_unshadowed = !import_bindings.contains_key("new")
         && !file_scope_names.contains("new")
         && !go_callable_declares_name(callable, "new", source);
@@ -578,7 +576,7 @@ fn collect_go_local_composite_receiver_call_specs(
         // Go type outside that closure. Keep nested closure calls fail closed,
         // and keep real local shadow intervals above, without erasing the
         // enclosing receiver's owner for the rest of the method.
-        if method_receiver_name == Some(name.as_str()) {
+        if method_receiver_name.as_deref() == Some(name.as_str()) {
             intervals.push(GoNavigationBindingInterval {
                 name,
                 start_byte: capture_start,
