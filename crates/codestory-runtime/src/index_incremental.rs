@@ -439,6 +439,11 @@ fn evaluate_incremental_plan_probe(
     if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none() {
         return IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
     }
+    // An empty plan is not a freshness receipt until every admitted source has
+    // a generic seal. Selected source aliases deliberately cannot produce one.
+    if probe.source_seals.is_none() {
+        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+    }
     IncrementalPlanProbeOutcomeDto::ShortCircuited
 }
 
@@ -1058,10 +1063,7 @@ fn prepare_incremental_refresh(
                     .policy_exclusions
                     .take()
                     .expect("retained exclusions were checked above"),
-                probe
-                    .source_seals
-                    .take()
-                    .expect("retained source seals were checked above"),
+                probe.source_seals.take(),
                 std::mem::take(&mut probe.scheduled_paths),
             )
         } else {
@@ -1075,11 +1077,10 @@ fn prepare_incremental_refresh(
             wall.discovery_and_scheduling = wall
                 .discovery_and_scheduling
                 .saturating_add(discovery_started.elapsed());
-            let source_seals = ArtifactSeal::observe_all(&plan.3).map_err(|error| {
-                ApiError::internal(format!(
-                    "Failed to seal complete incremental source inventory: {error}"
-                ))
-            })?;
+            // Source aliases are valid core inputs but cannot produce generic
+            // artifact seals. Keep the core plan and omit only the optional
+            // bounded retrieval transition that consumes these seals.
+            let source_seals = ArtifactSeal::observe_all(&plan.3).ok();
             (plan.0, plan.1, source_seals, plan.2)
         };
     wall.scheduled_paths = scheduled_paths;
@@ -1118,6 +1119,9 @@ fn prepare_incremental_refresh(
         })
         .filter(|file_ids| file_ids.len() == execution_plan.files_to_index.len());
     let retrieval_refresh_receipt = previous_publication.as_ref().and_then(|previous| {
+        // Without complete generic seals, retrieval receives no bounded receipt
+        // and uses its existing complete source preparation and alias fence.
+        let source_seals = source_seals.as_ref()?;
         if stats.graph_projection_changed
             || !execution_plan.files_to_remove.is_empty()
             || execution_plan.files_to_index.is_empty()
