@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Index dry runs inspect the selected project and cache without requiring a prior
+project open, while remaining read-only.
+
 Go method navigation keeps the declared receiver when a nested closure captures
 it, preserving direct calls elsewhere in the method.
 
