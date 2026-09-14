@@ -6328,6 +6328,50 @@ fn test_text_only_sveltekit_page_indexes_file_convention_route() -> Result<()> {
 }
 
 #[test]
+fn text_only_framework_routes_are_owned_by_their_declaration_file() -> Result<()> {
+    let temp = tempdir()?;
+    let left_dir = temp.path().join("left/src/routes/shared");
+    let right_dir = temp.path().join("right/src/routes/shared");
+    std::fs::create_dir_all(&left_dir)?;
+    std::fs::create_dir_all(&right_dir)?;
+    let left_path = left_dir.join("+page.svelte");
+    let right_path = right_dir.join("+page.svelte");
+    std::fs::write(&left_path, "<h1>Left</h1>\n")?;
+    std::fs::write(&right_path, "<h1>Right</h1>\n")?;
+
+    let left = index_text_only_file(&left_path)?;
+    let right = index_text_only_file(&right_path)?;
+    let left_route = left
+        .nodes
+        .iter()
+        .find(|node| {
+            node.serialized_name == "GET /shared (sveltekit route; confidence=file_convention)"
+        })
+        .expect("left text-only route");
+    let right_route = right
+        .nodes
+        .iter()
+        .find(|node| {
+            node.serialized_name == "GET /shared (sveltekit route; confidence=file_convention)"
+        })
+        .expect("right text-only route");
+
+    assert_ne!(left_route.id, right_route.id);
+    assert_ne!(
+        left_route.canonical_id.as_deref(),
+        right_route.canonical_id.as_deref()
+    );
+    for (storage, route) in [(&left, left_route), (&right, right_route)] {
+        let file_id = NodeId(storage.files[0].id);
+        assert_eq!(route.file_node_id, Some(file_id));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == file_id && edge.target == route.id
+        }));
+    }
+    Ok(())
+}
+
+#[test]
 fn test_text_only_svelte_tauri_invoke_indexes_uncertain_command_edge() -> Result<()> {
     let temp = tempdir()?;
     let path = temp.path().join("App.svelte");
@@ -7291,8 +7335,10 @@ fn test_nextjs_file_route_metadata_preserves_raw_path_params_and_convention() {
     assert_eq!(route.confidence, "file_convention");
     assert_eq!(route.source_convention, "file_convention");
 
-    let canonical_id = framework_route_canonical_id(route);
+    let canonical_id = framework_route_canonical_id(NodeId(42), route);
     assert!(canonical_id.starts_with("route_endpoint:"));
+    assert!(canonical_id.contains(r#""file_node_id":42"#));
+    assert!(canonical_id.contains(&format!(r#""line":{}"#, route.line)));
     assert!(canonical_id.contains(r#""framework":"nextjs""#));
     assert!(canonical_id.contains(r#""raw_path":"/api/users/[id]""#));
     assert!(canonical_id.contains(r#""params":["id"]"#));

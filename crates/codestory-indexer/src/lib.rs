@@ -4422,6 +4422,14 @@ pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String,
     (file_node, file_identity, file_id)
 }
 
+fn rebase_framework_route_canonical_id(canonical_id: &str, file_id: NodeId) -> Option<String> {
+    let raw = canonical_id.strip_prefix("route_endpoint:")?;
+    let mut metadata = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let declaration = metadata.get_mut("declaration")?.as_object_mut()?;
+    declaration.insert("file_node_id".to_string(), serde_json::json!(file_id.0));
+    Some(format!("route_endpoint:{metadata}"))
+}
+
 fn rebase_cached_index_artifact(
     mut artifact: CachedIndexArtifact,
     full_path: &Path,
@@ -4431,20 +4439,26 @@ fn rebase_cached_index_artifact(
 ) -> CachedIndexArtifact {
     let file_name = full_path.to_string_lossy().to_string();
     let file_identity = WorkspaceIndexer::file_identity_path(full_path);
+    let rebased_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
     for node in &mut artifact.nodes {
         if node.kind == NodeKind::FILE {
             node.serialized_name = file_name.clone();
             node.qualified_name = None;
             node.canonical_id = None;
+        } else if let Some(canonical_id) = node
+            .canonical_id
+            .as_deref()
+            .and_then(|value| rebase_framework_route_canonical_id(value, rebased_file_id))
+        {
+            node.canonical_id = Some(canonical_id);
         }
     }
 
     let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
     let (nodes, id_remap) = canonicalize_nodes(&file_identity, artifact.nodes, &HashMap::new());
-    let fallback_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
     let new_file_id = old_file_id
         .and_then(|file_id| id_remap.get(&file_id).copied())
-        .unwrap_or(fallback_file_id);
+        .unwrap_or(rebased_file_id);
     let final_node_ids = nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
 
     artifact.nodes = nodes;
@@ -14199,10 +14213,14 @@ fn framework_route_label(route: &FrameworkRoute) -> String {
     )
 }
 
-fn framework_route_canonical_id(route: &FrameworkRoute) -> String {
+fn framework_route_canonical_id(file_id: NodeId, route: &FrameworkRoute) -> String {
     format!(
         "route_endpoint:{}",
         serde_json::json!({
+            "declaration": {
+                "file_node_id": file_id.0,
+                "line": route.line,
+            },
             "kind": "framework_route",
             "framework": route.framework,
             "method": route.method.as_str(),
@@ -14241,15 +14259,16 @@ fn route_params(path: &str) -> Vec<String> {
 
 fn framework_route_node(file_id: NodeId, route: &FrameworkRoute) -> Node {
     let label = framework_route_label(route);
+    let canonical_id = framework_route_canonical_id(file_id, route);
     Node {
-        id: NodeId(generate_id(&framework_route_canonical_id(route))),
+        id: NodeId(generate_id(&canonical_id)),
         kind: NodeKind::FUNCTION,
         serialized_name: label.clone(),
         qualified_name: Some(format!(
             "framework::{}::{} {}",
             route.framework, route.method, route.path
         )),
-        canonical_id: Some(framework_route_canonical_id(route)),
+        canonical_id: Some(canonical_id),
         file_node_id: Some(file_id),
         start_line: Some(route.line),
         start_col: Some(1),
@@ -17043,5 +17062,82 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.direct_exports[0].declaration, new_owner);
         assert!(!file.export_poison_all);
         assert_eq!(file.poisoned_export_names, ["unrelated"]);
+    }
+
+    #[test]
+    fn rebases_cached_framework_route_declaration_identity() -> Result<()> {
+        let source = r#"from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/shared")
+async def handler():
+    return "ok"
+"#;
+        let indexed = index_file(
+            Path::new("/tmp/original/routes.py"),
+            source,
+            &get_language_for_ext("py").expect("python config"),
+            None,
+            None,
+        )?;
+        let old_route_id = indexed
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("original route")
+            .id;
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: indexed.files,
+            nodes: indexed.nodes,
+            edges: indexed.edges,
+            occurrences: indexed.occurrences,
+            component_access: indexed.component_access,
+            callable_projection_states: indexed.callable_projection_states,
+            impl_anchor_node_ids: indexed.impl_anchor_node_ids,
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        };
+
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            Path::new("/tmp/rebased/routes.py"),
+            source,
+            "python",
+            index_feature_flags(),
+        );
+        let file_id = rebased
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FILE)
+            .expect("rebased file")
+            .id;
+        let route = rebased
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("rebased route");
+        let handler = rebased
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "handler")
+            .expect("rebased handler");
+
+        assert_ne!(route.id, old_route_id);
+        assert_eq!(route.file_node_id, Some(file_id));
+        let canonical_id = route.canonical_id.as_deref().expect("route canonical id");
+        assert!(canonical_id.contains(&format!(r#""file_node_id":{}"#, file_id.0)));
+        assert!(canonical_id.contains(r#""line":4"#));
+        assert!(rebased.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == file_id && edge.target == route.id
+        }));
+        assert!(rebased.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL && edge.source == route.id && edge.target == handler.id
+        }));
+        Ok(())
     }
 }
