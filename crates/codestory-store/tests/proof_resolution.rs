@@ -986,7 +986,11 @@ fn schema_33_migration_creates_no_synthetic_proof_publication() {
     let path = temp.path().join("codestory.db");
     let store = Store::open(&path).expect("store");
 
-    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 33);
+    let stored_version: u32 = store
+        .get_connection()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read migrated schema version");
+    assert_eq!(stored_version, codestory_store::CURRENT_SCHEMA_VERSION);
     assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
     assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
 }
@@ -1033,7 +1037,11 @@ fn schema_33_migration_preserves_legacy_fact_and_publication_seals() {
     drop(legacy);
 
     let store = Store::open(&path).expect("atomically migrate schema-32 proof rows");
-    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 33);
+    let stored_version: u32 = store
+        .get_connection()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read migrated schema version");
+    assert_eq!(stored_version, codestory_store::CURRENT_SCHEMA_VERSION);
     assert_eq!(
         store.get_proof_resolution_facts().unwrap(),
         vec![expected_fact]

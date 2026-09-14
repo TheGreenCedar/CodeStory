@@ -134,6 +134,18 @@ fn sqlite_index_exists(storage: &Storage, index_name: &str) -> Result<bool, Stor
         .map_err(StorageError::from)
 }
 
+fn sqlite_index_sql(storage: &Storage, index_name: &str) -> Result<Option<String>, StorageError> {
+    storage
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StorageError::from)
+}
+
 fn create_versioned_observation_fixture(path: &Path, version: u32) {
     let connection = Connection::open(path).expect("create observation fixture");
     connection
@@ -334,6 +346,433 @@ fn canonical_annotation_anchor_lookup_rejects_zero_bind_limit() -> Result<(), St
             .contains("cannot support canonical-ID lookup"),
         "unexpected error: {error}"
     );
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_lookup_preserves_exact_strings_collisions_and_limit_one()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let shared_suffix = "s".repeat(32);
+    let unicode_suffix = "🦀".repeat(8);
+    assert_eq!(
+        unicode_suffix.len(),
+        32,
+        "suffix must be exactly 32 UTF-8 bytes"
+    );
+    let left = format!("{}left:{shared_suffix}", "long-prefix-".repeat(12));
+    let right = format!("{}right:{shared_suffix}", "other-prefix-".repeat(12));
+    let unicode_left = format!("日本語-left:{unicode_suffix}");
+    let unicode_right = format!("NFC-café-right:{unicode_suffix}");
+    let nul = format!("nul\0{shared_suffix}");
+    let upper = "CaseSensitive".to_string();
+    let lower = "casesensitive".to_string();
+    let composed = "caf\u{e9}".to_string();
+    let decomposed = "cafe\u{301}".to_string();
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "left-late".to_string(),
+            canonical_id: Some(left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "left-early".to_string(),
+            canonical_id: Some(left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "right".to_string(),
+            canonical_id: Some(right.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(110),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unicode-left".to_string(),
+            canonical_id: Some(unicode_left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(120),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unicode-right".to_string(),
+            canonical_id: Some(unicode_right.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "empty".to_string(),
+            canonical_id: Some(String::new()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(50),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "null".to_string(),
+            canonical_id: None,
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(60),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nul".to_string(),
+            canonical_id: Some(nul.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(70),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "upper".to_string(),
+            canonical_id: Some(upper.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(80),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "lower".to_string(),
+            canonical_id: Some(lower.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(90),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "composed".to_string(),
+            canonical_id: Some(composed.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "decomposed".to_string(),
+            canonical_id: Some(decomposed.clone()),
+            ..Default::default()
+        },
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)?;
+    assert!(previous_limit >= 1);
+    let lookup = storage.node_ids_by_canonical_ids(&[
+        right.clone(),
+        left.clone(),
+        unicode_right.clone(),
+        unicode_left.clone(),
+        String::new(),
+        "missing".to_string(),
+        nul.clone(),
+        left.clone(),
+        upper.clone(),
+        lower.clone(),
+        composed.clone(),
+        decomposed.clone(),
+    ])?;
+    assert_eq!(
+        lookup,
+        BTreeMap::from([
+            (String::new(), vec![NodeId(40)]),
+            (composed, vec![NodeId(90)]),
+            (decomposed, vec![NodeId(100)]),
+            (left, vec![NodeId(10), NodeId(30)]),
+            (lower, vec![NodeId(80)]),
+            ("missing".to_string(), Vec::new()),
+            (nul, vec![NodeId(60)]),
+            (right, vec![NodeId(20)]),
+            (unicode_left, vec![NodeId(110)]),
+            (unicode_right, vec![NodeId(120)]),
+            (upper, vec![NodeId(70)]),
+        ])
+    );
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_index_shape_and_query_plan_are_exact() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    let index_sql = sqlite_index_sql(&storage, "idx_node_canonical_suffix")?
+        .expect("canonical suffix index SQL");
+    assert!(
+        index_sql.contains("COALESCE(substr(CAST(canonical_id AS BLOB), -32), X'')"),
+        "canonical suffix index was {index_sql}"
+    );
+
+    let plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT canonical_id, id
+             FROM node
+             WHERE COALESCE(substr(CAST(canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+               AND canonical_id = ?1
+             ORDER BY id ASC",
+        )?
+        .query_map(["rust:function:shared"], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("USING INDEX idx_node_canonical_suffix")),
+        "canonical suffix lookup plan was {plan:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_schema_33_migration_preserves_rows_and_replaces_index()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("canonical-suffix-v33-migration");
+    let before = {
+        let mut storage = Storage::open(&path)?;
+        storage.insert_nodes_batch(&[
+            Node {
+                id: NodeId(10),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".to_string(),
+                canonical_id: Some("shared".to_string()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(20),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "second".to_string(),
+                canonical_id: Some("shared".to_string()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(30),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "empty".to_string(),
+                canonical_id: Some(String::new()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(40),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "null".to_string(),
+                canonical_id: None,
+                ..Default::default()
+            },
+        ])?;
+        storage.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_node_canonical_suffix;
+                 CREATE INDEX IF NOT EXISTS idx_node_canonical_id ON node(canonical_id);",
+        )?;
+        storage.set_schema_version(33)?;
+        storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.canonical_id))
+            .collect::<Vec<_>>()
+    };
+
+    let migrated = Storage::open(&path)?;
+    assert_eq!(migrated.schema_version()?, 34);
+    assert!(sqlite_index_exists(&migrated, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&migrated, "idx_node_canonical_id")?);
+    assert_eq!(
+        migrated
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.canonical_id))
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(
+        migrated.node_ids_by_canonical_ids(&["shared".to_string(), String::new()])?,
+        BTreeMap::from([
+            (String::new(), vec![NodeId(30)]),
+            ("shared".to_string(), vec![NodeId(10), NodeId(20)]),
+        ])
+    );
+    drop(migrated);
+
+    let replayed = Storage::open(&path)?;
+    assert_eq!(replayed.schema_version()?, SCHEMA_VERSION);
+    assert!(sqlite_index_exists(&replayed, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&replayed, "idx_node_canonical_id")?);
+    drop(replayed);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_migration_rolls_back_index_and_version_together() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage.conn.execute_batch(
+        "DROP INDEX idx_node_canonical_suffix;
+         CREATE INDEX idx_node_canonical_id ON node(canonical_id);
+         PRAGMA user_version = 33;",
+    )?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::CreateIndex {
+                index_name: "idx_node_canonical_suffix",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+
+    super::schema::migrate_v34_canonical_suffix_index(&storage.conn, true, true)
+        .expect_err("denied replacement index must roll back the migration");
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    assert_eq!(storage.schema_version()?, 33);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_migration_respects_deferred_and_incomplete_fences() -> Result<(), StorageError>
+{
+    let deferred_path = unique_temp_db_path("canonical-suffix-deferred");
+    {
+        let storage = Storage::open(&deferred_path)?;
+        storage.conn.execute_batch(
+            "DROP INDEX idx_node_canonical_suffix;
+             CREATE INDEX idx_node_canonical_id ON node(canonical_id);
+             PRAGMA user_version = 33;",
+        )?;
+    }
+    let deferred = Storage::open_build(&deferred_path)?;
+    assert_eq!(deferred.schema_version()?, SCHEMA_VERSION);
+    assert!(!sqlite_index_exists(&deferred, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(
+        &deferred,
+        "idx_node_canonical_suffix"
+    )?);
+    deferred.create_deferred_secondary_indexes()?;
+    assert!(sqlite_index_exists(&deferred, "idx_node_canonical_suffix")?);
+    drop(deferred);
+    cleanup_sqlite_sidecars(&deferred_path)?;
+
+    let incomplete_path = unique_temp_db_path("canonical-suffix-incomplete");
+    {
+        let storage = Storage::open(&incomplete_path)?;
+        storage.conn.execute_batch(
+            "DROP INDEX idx_node_canonical_suffix;
+             CREATE INDEX idx_node_canonical_id ON node(canonical_id);",
+        )?;
+        storage.begin_incremental_run()?;
+    }
+    let incomplete = Storage::open(&incomplete_path)?;
+    assert_eq!(
+        incomplete.schema_version()?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(!sqlite_index_exists(&incomplete, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(
+        &incomplete,
+        "idx_node_canonical_suffix"
+    )?);
+    incomplete.finish_incremental_run()?;
+    assert_eq!(incomplete.schema_version()?, SCHEMA_VERSION);
+    drop(incomplete);
+    cleanup_sqlite_sidecars(&incomplete_path)?;
+    Ok(())
+}
+
+#[test]
+fn schema_33_journal_less_recovery_authenticates_every_feature_identity() -> Result<(), StorageError>
+{
+    for corruption in [
+        None,
+        Some("source"),
+        Some("structural"),
+        Some("proof"),
+        Some("missing-source"),
+        Some("missing-structural"),
+        Some("missing-proof"),
+    ] {
+        let label = corruption.unwrap_or("valid");
+        let path = unique_temp_db_path(&format!("schema-33-recovery-{label}"));
+        seed_promotion_file(&path, 1, "old.rs")?;
+        {
+            let mut storage = Storage::open(&path)?;
+            let publication = storage
+                .get_complete_index_publication()?
+                .expect("seeded publication");
+            storage.replace_proof_resolution_projection(
+                &publication,
+                &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                    adapter_roster: vec![
+                        codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                            language: "rust".to_string(),
+                            adapter_version: "test".to_string(),
+                        },
+                    ],
+                    facts: Vec::new(),
+                    funnel: Vec::new(),
+                },
+            )?;
+            storage.finalize_staged_snapshot()?;
+            storage.set_schema_version(33)?;
+        }
+        if let Some(corruption) = corruption {
+            let conn = Connection::open(&path)?;
+            match corruption {
+                "source" => conn.execute(
+                    "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "structural" => conn.execute(
+                    "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "proof" => conn.execute(
+                    "UPDATE proof_resolution_publication SET fact_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "missing-source" => {
+                    conn.execute("DELETE FROM source_policy_exclusion_publication", [])?
+                }
+                "missing-structural" => {
+                    conn.execute("DELETE FROM structural_text_unit_publication", [])?
+                }
+                "missing-proof" => {
+                    conn.execute_batch(
+                        "DROP TABLE proof_resolution_fact;
+                         DROP TABLE proof_resolution_publication;",
+                    )?;
+                    0
+                }
+                _ => unreachable!(),
+            };
+        }
+        let publication =
+            read_recovery_database_identity(&path, RecoveryDatabaseContract::LegacyBackup)?
+                .expect("schema-33 publication identity");
+        let result = read_journal_less_recovery_auxiliary_identities(
+            &path,
+            &publication,
+            33,
+            "legacy backup",
+        );
+        match corruption {
+            None => {
+                let identities = result?;
+                assert!(identities.source_policy.is_some());
+                assert!(identities.structural_text.is_some());
+                assert!(identities.proof_resolution.is_some());
+            }
+            Some(_) => assert!(result.is_err(), "{label} corruption must fail recovery"),
+        }
+        cleanup_sqlite_sidecars(&path)?;
+    }
     Ok(())
 }
 
@@ -1986,24 +2425,26 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
 #[test]
 fn annotation_anchor_and_error_indexes_are_created_and_used() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
-    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
     assert!(sqlite_index_exists(&storage, "idx_error_file")?);
 
     let canonical_plan = storage
         .conn
         .prepare(
             "EXPLAIN QUERY PLAN
-             SELECT canonical_id, id
-             FROM node
-             WHERE canonical_id IN ('rust:function:shared')
-             ORDER BY canonical_id ASC, id ASC",
+             SELECT n.id
+             FROM node AS n
+             WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST('rust:function:shared' AS BLOB), -32), X'')
+               AND n.canonical_id = 'rust:function:shared'
+             ORDER BY n.id ASC",
         )?
         .query_map([], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     assert!(
         canonical_plan
             .iter()
-            .any(|line| line.contains("idx_node_canonical_id")),
+            .any(|line| line.contains("idx_node_canonical_suffix")),
         "canonical lookup plan was {canonical_plan:?}"
     );
 
@@ -2047,9 +2488,9 @@ fn error_file_index_is_available_before_deferred_build_indexes() -> Result<(), S
     let storage = Storage::open_build(&path)?;
 
     assert!(sqlite_index_exists(&storage, "idx_error_file")?);
-    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
     storage.create_deferred_secondary_indexes()?;
-    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
 
     drop(storage);
     cleanup_sqlite_sidecars(&path)?;
@@ -11920,7 +12361,7 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 33);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 34);
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");
