@@ -1978,13 +1978,12 @@ fn affected_test_impacts(
                 continue;
             }
             if package_roots.contains(&package_root(project_root, &relative)) {
-                record(
-                    &relative,
+                by_file.entry(relative).or_insert((
+                    0,
                     1,
                     "bounded".to_string(),
-                    0,
                     "focused test hint: indexed test in the same package as a changed source file",
-                );
+                ));
             }
         }
     }

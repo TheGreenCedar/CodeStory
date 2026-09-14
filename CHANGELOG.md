@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Affected test hints preserve graph-backed distances, confidence and reasons
+when the same tests also qualify as package-level suggestions.
+
 Project preparation can reuse a complete source index when its retrieval
 publication has not yet been built.
 
