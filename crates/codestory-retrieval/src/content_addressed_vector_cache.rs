@@ -64,6 +64,40 @@ pub(crate) struct VectorCacheBatchInput<'a> {
     pub text: &'a str,
 }
 
+pub(crate) struct StagedVectorBatch {
+    cache_key: String,
+    vectors: Vec<Vec<f32>>,
+    allocation_bytes: usize,
+}
+
+impl StagedVectorBatch {
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
+    }
+
+    pub(crate) fn into_vectors_for(self, cache_key: &str) -> Result<Vec<Vec<f32>>> {
+        if self.cache_key != cache_key {
+            bail!("staged vector batch key changed before reuse");
+        }
+        Ok(self.vectors)
+    }
+
+    pub(crate) fn into_vectors(self) -> Vec<Vec<f32>> {
+        self.vectors
+    }
+}
+
+pub(crate) enum VectorCacheBatchLookup {
+    Hit(StagedVectorBatch),
+    Absent,
+    Invalid,
+}
+
+pub(crate) enum VectorCacheStagingLookup {
+    Lookup(VectorCacheBatchLookup),
+    BudgetExceeded,
+}
+
 pub(crate) struct ContentAddressedVectorCache {
     connection: Connection,
     _scope_lease: VectorCacheScopeLease,
@@ -110,6 +144,35 @@ impl ContentAddressedVectorCache {
             max_payload_bytes,
             max_database_bytes,
             CACHE_MAX_AGGREGATE_DATABASE_BYTES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test_with_batch_capacity(
+        runtime: &SidecarRuntimeConfig,
+        artifact_scope_id: &str,
+        producer_compatibility_identity: &str,
+        embedding_dim: usize,
+        vectors_per_batch: usize,
+        batch_capacity: usize,
+    ) -> Result<Self> {
+        let vector_bytes = vectors_per_batch
+            .checked_mul(embedding_dim)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .context("test vector batch size overflow")?;
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES
+            .checked_add(u64::try_from(vector_bytes).context("test vector batch too large")?)
+            .context("test vector batch weight overflow")?;
+        let max_payload_bytes = row_weight
+            .checked_mul(u64::try_from(batch_capacity).context("test batch capacity overflow")?)
+            .context("test vector cache payload overflow")?;
+        Self::open_with_limits(
+            runtime,
+            artifact_scope_id,
+            producer_compatibility_identity,
+            embedding_dim,
+            max_payload_bytes,
+            1024 * 1024,
         )
     }
 
@@ -351,6 +414,16 @@ impl ContentAddressedVectorCache {
         &mut self,
         batch: &[VectorCacheBatchInput<'_>],
     ) -> Result<Option<Vec<Vec<f32>>>> {
+        match self.load_batch_detailed(batch)? {
+            VectorCacheBatchLookup::Hit(hit) => Ok(Some(hit.vectors)),
+            VectorCacheBatchLookup::Absent | VectorCacheBatchLookup::Invalid => Ok(None),
+        }
+    }
+
+    pub(crate) fn load_batch_detailed(
+        &mut self,
+        batch: &[VectorCacheBatchInput<'_>],
+    ) -> Result<VectorCacheBatchLookup> {
         let cache_key = self.cache_key(batch)?;
         let transaction = self
             .connection
@@ -359,7 +432,7 @@ impl ContentAddressedVectorCache {
         let Some(row) = row else {
             transaction.commit()?;
             self.misses = self.misses.saturating_add(1);
-            return Ok(None);
+            return Ok(VectorCacheBatchLookup::Absent);
         };
         match decode_cached_vectors(
             &cache_key,
@@ -372,7 +445,11 @@ impl ContentAddressedVectorCache {
                 touch_vector_batch(&transaction, &cache_key)?;
                 transaction.commit()?;
                 self.hits = self.hits.saturating_add(1);
-                Ok(Some(vectors))
+                Ok(VectorCacheBatchLookup::Hit(StagedVectorBatch {
+                    cache_key,
+                    vectors,
+                    allocation_bytes: 0,
+                }))
             }
             Err(_) => {
                 transaction.execute(
@@ -381,9 +458,86 @@ impl ContentAddressedVectorCache {
                 )?;
                 transaction.commit()?;
                 self.misses = self.misses.saturating_add(1);
-                Ok(None)
+                Ok(VectorCacheBatchLookup::Invalid)
             }
         }
+    }
+
+    pub(crate) fn inspect_batch_for_staging(
+        &mut self,
+        batch: &[VectorCacheBatchInput<'_>],
+        maximum_allocation_bytes: usize,
+    ) -> Result<VectorCacheStagingLookup> {
+        let cache_key = self.cache_key(batch)?;
+        let allocation_bytes =
+            staged_vector_allocation_bytes(batch.len(), self.embedding_dim, cache_key.capacity())?;
+        if allocation_bytes > maximum_allocation_bytes {
+            return Ok(VectorCacheStagingLookup::BudgetExceeded);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = read_cached_batch_from_transaction(&transaction, &cache_key)?;
+        let Some(row) = row else {
+            transaction.commit()?;
+            return Ok(VectorCacheStagingLookup::Lookup(
+                VectorCacheBatchLookup::Absent,
+            ));
+        };
+        let lookup = match decode_cached_vectors(
+            &cache_key,
+            row,
+            batch.len(),
+            self.embedding_dim,
+            &self.contract_sha256,
+        ) {
+            Ok(vectors) => VectorCacheBatchLookup::Hit(StagedVectorBatch {
+                cache_key,
+                vectors,
+                allocation_bytes,
+            }),
+            Err(_) => VectorCacheBatchLookup::Invalid,
+        };
+        transaction.commit()?;
+        Ok(VectorCacheStagingLookup::Lookup(lookup))
+    }
+
+    pub(crate) fn batch_cache_key(&self, batch: &[VectorCacheBatchInput<'_>]) -> Result<String> {
+        self.cache_key(batch)
+    }
+
+    pub(crate) fn maximum_staging_allocation_bytes(&self) -> Result<usize> {
+        usize::try_from(self.max_payload_bytes).context("vector staging limit overflow")
+    }
+
+    pub(crate) fn has_retained_batches(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM vector_batch_cache LIMIT 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_batch_digest_for_test(
+        &mut self,
+        batch: &[VectorCacheBatchInput<'_>],
+    ) -> Result<()> {
+        let cache_key = self.cache_key(batch)?;
+        self.connection.execute(
+            "UPDATE vector_batch_cache SET vectors_sha256 = ?2 WHERE cache_key = ?1",
+            params![cache_key, "0".repeat(64)],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_batch_table_for_test(&mut self) -> Result<()> {
+        self.connection
+            .execute("DROP TABLE vector_batch_cache", [])?;
+        Ok(())
     }
 
     pub(crate) fn publish_batch(
@@ -1546,6 +1700,24 @@ fn decode_cached_vectors(
     Ok(vectors)
 }
 
+fn staged_vector_allocation_bytes(
+    vector_count: usize,
+    embedding_dim: usize,
+    cache_key_bytes: usize,
+) -> Result<usize> {
+    let vector_payload = vector_count
+        .checked_mul(embedding_dim)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+        .context("staged vector payload size overflow")?;
+    let row_overhead = vector_count
+        .checked_mul(std::mem::size_of::<Vec<f32>>())
+        .context("staged vector row overhead overflow")?;
+    cache_key_bytes
+        .checked_add(vector_payload)
+        .and_then(|bytes| bytes.checked_add(row_overhead))
+        .context("staged vector allocation size overflow")
+}
+
 fn insert_vector_batch(
     transaction: &Transaction<'_>,
     cache_key: &str,
@@ -2046,6 +2218,68 @@ mod tests {
     }
 
     #[test]
+    fn staging_inspection_distinguishes_invalid_without_authorizing_it() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let rows = [("node-1", "doc-1", "same text")];
+        let batch = inputs(&rows);
+        let mut owner =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("open cache");
+        owner
+            .publish_batch(&batch, &[vec![1.0, 0.0]])
+            .expect("publish");
+        let key = owner.cache_key(&batch).expect("cache key");
+        owner
+            .connection
+            .execute(
+                "UPDATE vector_batch_cache SET vectors_sha256 = ?2 WHERE cache_key = ?1",
+                params![key, "0".repeat(64)],
+            )
+            .expect("corrupt row");
+
+        assert!(matches!(
+            owner
+                .inspect_batch_for_staging(&batch, usize::MAX)
+                .expect("inspect corrupt row"),
+            VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Invalid)
+        ));
+        assert_eq!(owner.activity(), (0, 0));
+        let retained_before_normal_load = owner
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM vector_batch_cache WHERE cache_key = ?1",
+                params![key],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count inspected row");
+        assert_eq!(retained_before_normal_load, 1);
+        assert!(matches!(
+            owner.load_batch_detailed(&batch).expect("load corrupt row"),
+            VectorCacheBatchLookup::Invalid
+        ));
+        assert_eq!(owner.activity(), (0, 1));
+        let retained_after_normal_load = owner
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM vector_batch_cache WHERE cache_key = ?1",
+                params![key],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count removed row");
+        assert_eq!(retained_after_normal_load, 0);
+        assert!(matches!(
+            owner.load_batch_detailed(&batch).expect("load absent row"),
+            VectorCacheBatchLookup::Absent
+        ));
+        owner
+            .connection
+            .execute("DROP TABLE vector_batch_cache", [])
+            .expect("remove cache table");
+        assert!(owner.inspect_batch_for_staging(&batch, usize::MAX).is_err());
+    }
+
+    #[test]
     fn invalid_vectors_never_enter_the_cache() {
         let cache = TempDir::new().expect("cache root");
         let selected_runtime = runtime(&cache, 128);
@@ -2099,6 +2333,123 @@ mod tests {
         assert!(owner.load_batch(&b).expect("evicted b").is_none());
         assert!(owner.load_batch(&c).expect("retained c").is_some());
         assert!(owner.accounted_payload_bytes().expect("payload") <= row_weight * 2);
+    }
+
+    #[test]
+    fn staging_inspection_is_bounded_and_does_not_touch_lru_or_activity() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let mut owner = ContentAddressedVectorCache::open_with_limits(
+            &selected_runtime,
+            "scope-a",
+            "producer-a",
+            2,
+            row_weight * 2,
+            1024 * 1024,
+        )
+        .expect("open bounded cache");
+        let a_rows = [("a", "doc-a", "a")];
+        let b_rows = [("b", "doc-b", "b")];
+        let c_rows = [("c", "doc-c", "c")];
+        let a = inputs(&a_rows);
+        let b = inputs(&b_rows);
+        let c = inputs(&c_rows);
+        owner
+            .publish_batch(&a, &[vec![1.0, 0.0]])
+            .expect("publish a");
+        owner
+            .publish_batch(&b, &[vec![0.0, 1.0]])
+            .expect("publish b");
+
+        let wrong_key = match owner
+            .inspect_batch_for_staging(&a, usize::MAX)
+            .expect("inspect a")
+        {
+            VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Hit(hit)) => hit,
+            _ => panic!("a must be available for staging"),
+        };
+        assert!(wrong_key.into_vectors_for("not-the-a-key").is_err());
+        let staged_a = match owner
+            .inspect_batch_for_staging(&a, usize::MAX)
+            .expect("inspect a again")
+        {
+            VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Hit(hit)) => hit,
+            _ => panic!("a must remain available for staging"),
+        };
+        let allocation_bytes = staged_a.allocation_bytes();
+        let a_key = owner.batch_cache_key(&a).expect("a cache key");
+        let staged_vectors = staged_a
+            .into_vectors_for(&a_key)
+            .expect("staged key remains exact");
+        assert_eq!(staged_vectors[0][0].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(owner.activity(), (0, 0));
+        assert!(matches!(
+            owner
+                .inspect_batch_for_staging(&b, allocation_bytes - 1)
+                .expect("bounded inspect b"),
+            VectorCacheStagingLookup::BudgetExceeded
+        ));
+        assert_eq!(owner.activity(), (0, 0));
+
+        owner
+            .publish_batch(&c, &[vec![-1.0, 0.0]])
+            .expect("publish c");
+        assert!(owner.load_batch(&a).expect("oldest a").is_none());
+        assert!(owner.load_batch(&b).expect("retained b").is_some());
+        assert!(owner.load_batch(&c).expect("retained c").is_some());
+    }
+
+    #[test]
+    fn staging_budget_rejects_rows_rotated_by_a_shared_scope_writer() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let open = || {
+            ContentAddressedVectorCache::open_with_limits(
+                &selected_runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                row_weight * 2,
+                1024 * 1024,
+            )
+            .expect("open shared bounded cache")
+        };
+        let a_rows = [("a", "doc-a", "a")];
+        let b_rows = [("b", "doc-b", "b")];
+        let c_rows = [("c", "doc-c", "c")];
+        let a = inputs(&a_rows);
+        let b = inputs(&b_rows);
+        let c = inputs(&c_rows);
+        let mut writer = open();
+        writer
+            .publish_batch(&a, &[vec![1.0, 0.0]])
+            .expect("publish a");
+        writer
+            .publish_batch(&b, &[vec![0.0, 1.0]])
+            .expect("publish b");
+        let mut reader = open();
+        let staged_a = match reader
+            .inspect_batch_for_staging(&a, usize::MAX)
+            .expect("inspect a")
+        {
+            VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Hit(hit)) => hit,
+            _ => panic!("a must be available for staging"),
+        };
+        let remaining = staged_a.allocation_bytes() - 1;
+
+        writer
+            .publish_batch(&c, &[vec![-1.0, 0.0]])
+            .expect("rotate c through shared scope");
+        assert!(matches!(
+            reader
+                .inspect_batch_for_staging(&c, remaining)
+                .expect("bounded inspect c"),
+            VectorCacheStagingLookup::BudgetExceeded
+        ));
+        assert_eq!(reader.activity(), (0, 0));
+        assert!(reader.accounted_payload_bytes().expect("payload") <= row_weight * 2);
     }
 
     #[test]

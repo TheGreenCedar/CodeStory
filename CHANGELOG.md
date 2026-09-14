@@ -27,6 +27,9 @@ Vector caching preserves reusable embedding batches when separate symbols share
 one source span, while keeping complete anchor coverage when identity is missing
 or ambiguous.
 
+Dense index rebuilds retain later cached batches before earlier missing work can
+evict them, reducing repeated embedding work when resuming a compatible build.
+
 Fresh project preparation reclaims oversized retained SQLite journal storage
 after active transactions and readers release it.
 

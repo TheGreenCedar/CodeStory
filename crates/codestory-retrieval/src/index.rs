@@ -1,5 +1,8 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
-use crate::content_addressed_vector_cache::{ContentAddressedVectorCache, VectorCacheBatchInput};
+use crate::content_addressed_vector_cache::{
+    ContentAddressedVectorCache, StagedVectorBatch, VectorCacheBatchInput, VectorCacheBatchLookup,
+    VectorCacheStagingLookup,
+};
 use crate::embedded_vector::{
     AttestedSemanticPoint, CurrentVectorAnchor, EmbeddedVectorIndex, ExpectedVectorAnchor,
     SemanticPoint, VectorEvidenceContract, VectorGenerationManifest,
@@ -1911,6 +1914,20 @@ fn ensure_semantic_index(
             dense_anchor_canonical_ids.as_ref(),
             &mut content_vector_cache,
         );
+        let embed_batch_size = retention.runtime.retrieval.llm_doc_embed_batch_size.max(1);
+        let maximum_staging_allocation_bytes = content_vector_cache
+            .as_ref()
+            .map(ContentAddressedVectorCache::maximum_staging_allocation_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let mut staged_batches = preload_dense_anchor_batches(
+            &ordered_anchors,
+            embed_batch_size,
+            &reusable_vectors,
+            maximum_staging_allocation_bytes,
+            cancelled,
+            &mut content_vector_cache,
+        )?;
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1924,26 +1941,20 @@ fn ensure_semantic_index(
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
-                    for batch in ordered_anchors
-                        .chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    for (batch_index, batch) in ordered_anchors.chunks(embed_batch_size).enumerate()
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
-                        let missing = batch
-                            .iter()
-                            .filter(|cached| {
-                                let anchor = cached.anchor;
-                                !reusable_vectors.contains_key(&(
-                                    anchor.node_id.0.to_string(),
-                                    anchor.document_hash.clone(),
-                                ))
-                            })
-                            .map(|cached| (*cached).clone())
-                            .collect::<Vec<_>>();
+                        let missing = missing_dense_anchor_batch(batch, &reusable_vectors);
+                        let staged = staged_batches
+                            .as_mut()
+                            .and_then(|batches| batches.get_mut(batch_index))
+                            .and_then(Option::take);
                         let vectors = resolve_dense_anchor_batch(
                             &missing,
                             &client,
                             cancelled,
                             &mut content_vector_cache,
+                            staged,
                             "embed pinned dense anchor batch",
                         )?;
                         ensure_retrieval_index_not_cancelled(
@@ -2079,6 +2090,112 @@ fn ensure_semantic_index(
 struct CacheableDenseAnchor<'a> {
     anchor: &'a DenseAnchorInput,
     identity: String,
+}
+
+fn missing_dense_anchor_batch<'a>(
+    batch: &[CacheableDenseAnchor<'a>],
+    reusable_vectors: &HashMap<(String, String), Vec<f32>>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    batch
+        .iter()
+        .filter(|cached| {
+            let anchor = cached.anchor;
+            !reusable_vectors
+                .contains_key(&(anchor.node_id.0.to_string(), anchor.document_hash.clone()))
+        })
+        .cloned()
+        .collect()
+}
+
+fn dense_anchor_cache_batch<'a>(
+    batch: &'a [CacheableDenseAnchor<'_>],
+) -> Vec<VectorCacheBatchInput<'a>> {
+    batch
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect()
+}
+
+fn preload_dense_anchor_batches<'a>(
+    ordered_anchors: &[CacheableDenseAnchor<'a>],
+    batch_size: usize,
+    reusable_vectors: &HashMap<(String, String), Vec<f32>>,
+    maximum_allocation_bytes: usize,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Result<Option<Vec<Option<StagedVectorBatch>>>> {
+    if content_vector_cache.is_none() {
+        return Ok(None);
+    }
+    match content_vector_cache
+        .as_ref()
+        .expect("cache availability checked above")
+        .has_retained_batches()
+    {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache staging probe failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return Ok(None);
+        }
+    }
+    let batch_size = batch_size.max(1);
+    let batch_count = ordered_anchors.chunks(batch_size).len();
+    let slot_bytes = batch_count
+        .checked_mul(std::mem::size_of::<Option<StagedVectorBatch>>())
+        .context("dense vector staging slot size overflow")?;
+    if slot_bytes > maximum_allocation_bytes {
+        return Ok(None);
+    }
+    let mut remaining_allocation_bytes = maximum_allocation_bytes - slot_bytes;
+    let mut staged = Vec::with_capacity(batch_count);
+    for batch in ordered_anchors.chunks(batch_size) {
+        ensure_retrieval_index_not_cancelled(cancelled, "preloading embedding batch")?;
+        let missing = missing_dense_anchor_batch(batch, reusable_vectors);
+        if missing.is_empty() {
+            staged.push(None);
+            continue;
+        }
+        let cache_batch = dense_anchor_cache_batch(&missing);
+        let cache_started = Instant::now();
+        let inspected = content_vector_cache
+            .as_mut()
+            .expect("cache availability checked above")
+            .inspect_batch_for_staging(&cache_batch, remaining_allocation_bytes);
+        record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+        match inspected {
+            Ok(VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Hit(hit))) => {
+                remaining_allocation_bytes = remaining_allocation_bytes
+                    .checked_sub(hit.allocation_bytes())
+                    .expect("staging inspection enforced the remaining allocation bound");
+                staged.push(Some(hit));
+            }
+            Ok(VectorCacheStagingLookup::Lookup(
+                VectorCacheBatchLookup::Absent | VectorCacheBatchLookup::Invalid,
+            )) => staged.push(None),
+            Ok(VectorCacheStagingLookup::BudgetExceeded) => {
+                staged.resize_with(batch_count, || None);
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "content-addressed vector cache staging failed; continuing without staged reuse"
+                );
+                *content_vector_cache = None;
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(staged))
 }
 
 fn canonical_dense_anchor_order<'a>(
@@ -2260,6 +2377,7 @@ fn produce_missing_dense_anchors(
             &client,
             cancelled,
             content_vector_cache,
+            None,
             "embed changed dense anchor batch",
         )?;
         ensure_retrieval_index_not_cancelled(
@@ -2299,28 +2417,29 @@ fn resolve_dense_anchor_batch(
     client: &crate::embeddings::ProductEmbeddingClient,
     cancelled: &AtomicBool,
     content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    staged: Option<StagedVectorBatch>,
     embedding_context: &'static str,
 ) -> Result<Vec<Vec<f32>>> {
     if batch.is_empty() {
         return Ok(Vec::new());
     }
-    let cache_batch = batch
-        .iter()
-        .map(|cached| VectorCacheBatchInput {
-            anchor_identity: &cached.identity,
-            document_hash: &cached.anchor.document_hash,
-            text: &cached.anchor.text,
-        })
-        .collect::<Vec<_>>();
+    let cache_batch = dense_anchor_cache_batch(batch);
     let cache_started = Instant::now();
     let cached = match content_vector_cache.as_mut() {
-        Some(cache) => cache.load_batch(&cache_batch),
-        None => Ok(None),
+        Some(cache) => cache.load_batch_detailed(&cache_batch),
+        None => Ok(VectorCacheBatchLookup::Absent),
     };
     record_finalize_phase_timing("vector content cache", cache_started.elapsed());
     match cached {
-        Ok(Some(vectors)) => return Ok(vectors),
-        Ok(None) => {}
+        Ok(VectorCacheBatchLookup::Hit(hit)) => return Ok(hit.into_vectors()),
+        Ok(VectorCacheBatchLookup::Absent) => {
+            if let (Some(cache), Some(staged)) = (content_vector_cache.as_ref(), staged) {
+                ensure_retrieval_index_not_cancelled(cancelled, "reusing staged embedding batch")?;
+                let cache_key = cache.batch_cache_key(&cache_batch)?;
+                return staged.into_vectors_for(&cache_key);
+            }
+        }
+        Ok(VectorCacheBatchLookup::Invalid) => {}
         Err(error) => {
             warn!(
                 error = %format!("{error:#}"),
@@ -4070,6 +4189,344 @@ mod tests {
             .expect("exact cache hit after remap");
         assert_eq!(reused, exact_vectors);
         assert_eq!(reused[0][1].to_bits(), (-0.0_f32).to_bits());
+    }
+
+    #[test]
+    fn dense_anchor_staged_hits_survive_eviction_before_canonical_visit() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (a, a_canonical) = dense_anchor_identity_fixture(1, "python:function:pkg.a", 10);
+        let (b, b_canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let (c, c_canonical) = dense_anchor_identity_fixture(3, "python:function:pkg.c", 30);
+        let ordered = vec![
+            CacheableDenseAnchor {
+                anchor: &a,
+                identity: current_dense_anchor_identity_for_canonical(&a, &a_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &b,
+                identity: current_dense_anchor_identity_for_canonical(&b, &b_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &c,
+                identity: current_dense_anchor_identity_for_canonical(&c, &c_canonical),
+            },
+        ];
+        let a_vectors = vec![vec![1.0, -0.0]];
+        let b_vectors = vec![vec![0.0, 1.0]];
+        let c_vectors = vec![vec![-1.0, 0.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                2,
+            )
+            .expect("open bounded cache"),
+        );
+        for (batch, vectors) in [
+            (&ordered[0..1], a_vectors.as_slice()),
+            (&ordered[1..2], b_vectors.as_slice()),
+            (&ordered[2..3], c_vectors.as_slice()),
+        ] {
+            content_vector_cache
+                .as_mut()
+                .expect("cache")
+                .publish_batch(&dense_anchor_cache_batch(batch), vectors)
+                .expect("seed exact batch");
+        }
+
+        let reusable_vectors = HashMap::new();
+        let maximum_allocation_bytes = content_vector_cache
+            .as_ref()
+            .expect("cache")
+            .maximum_staging_allocation_bytes()
+            .expect("staging limit");
+        let cancelled = AtomicBool::new(false);
+        let mut staged = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            maximum_allocation_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )?
+        .expect("staging plan");
+        assert!(staged[0].is_none());
+        assert!(staged[1].is_some());
+        assert!(staged[2].is_some());
+        let slot_bytes = std::mem::size_of::<Option<StagedVectorBatch>>() * staged.len();
+        let staged_allocation_bytes = staged
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(StagedVectorBatch::allocation_bytes)
+            .sum::<usize>();
+        assert!(slot_bytes + staged_allocation_bytes <= maximum_allocation_bytes);
+
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&dense_anchor_cache_batch(&ordered[0..1]), &a_vectors)
+            .expect("publish resumed a");
+        let client = crate::embeddings::ProductEmbeddingClient::new(&runtime);
+        let resolved_b = resolve_dense_anchor_batch(
+            &ordered[1..2],
+            &client,
+            &cancelled,
+            &mut content_vector_cache,
+            staged[1].take(),
+            "unexpected b embedding",
+        )?;
+        let resolved_c = resolve_dense_anchor_batch(
+            &ordered[2..3],
+            &client,
+            &cancelled,
+            &mut content_vector_cache,
+            staged[2].take(),
+            "unexpected c embedding",
+        )?;
+        assert_eq!(resolved_b.len(), 1);
+        assert_eq!(resolved_c.len(), 1);
+        for (observed, expected) in resolved_b[0].iter().zip(&b_vectors[0]) {
+            assert_eq!(observed.to_bits(), expected.to_bits());
+        }
+        for (observed, expected) in resolved_c[0].iter().zip(&c_vectors[0]) {
+            assert_eq!(observed.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            content_vector_cache.as_ref().expect("cache").activity(),
+            (1, 1)
+        );
+
+        let overflow = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            slot_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )?
+        .expect("bounded staging plan");
+        assert!(overflow.iter().all(Option::is_none));
+
+        let cancelled = AtomicBool::new(true);
+        let error = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            maximum_allocation_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )
+        .err()
+        .expect("cancelled staging must fail closed");
+        assert!(error.to_string().contains("cancel"));
+        Ok(())
+    }
+
+    fn stage_only_dense_anchor_batch(
+        ordered: &[CacheableDenseAnchor<'_>],
+        cancelled: &AtomicBool,
+        content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    ) -> Result<StagedVectorBatch> {
+        let maximum_allocation_bytes = content_vector_cache
+            .as_ref()
+            .expect("cache")
+            .maximum_staging_allocation_bytes()?;
+        let mut staged = preload_dense_anchor_batches(
+            ordered,
+            1,
+            &HashMap::new(),
+            maximum_allocation_bytes,
+            cancelled,
+            content_vector_cache,
+        )?
+        .expect("staging plan");
+        staged
+            .pop()
+            .flatten()
+            .context("expected staged vector batch")
+    }
+
+    #[test]
+    fn dense_anchor_resolver_rejects_staged_vectors_after_row_corruption() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (anchor, canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [CacheableDenseAnchor {
+            anchor: &anchor,
+            identity: current_dense_anchor_identity_for_canonical(&anchor, &canonical),
+        }];
+        let exact_vectors = vec![vec![0.0, 1.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let cache_batch = dense_anchor_cache_batch(&ordered);
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&cache_batch, &exact_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered, &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .corrupt_batch_digest_for_test(&cache_batch)?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered,
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "cancelled fresh embedding after corrupt cache row",
+        );
+        assert!(
+            visitor_result.is_err(),
+            "staged vectors reached the visitor"
+        );
+        let error = format!("{:#}", visitor_result.unwrap_err());
+        assert!(
+            error.contains("embedding_server_transport_unavailable"),
+            "unexpected fresh-path error: {error}"
+        );
+        assert!(matches!(
+            content_vector_cache
+                .as_mut()
+                .expect("cache remains enabled after invalid row")
+                .load_batch_detailed(&cache_batch)?,
+            VectorCacheBatchLookup::Absent
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dense_anchor_resolver_rejects_staged_vectors_after_lookup_error() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (anchor, canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [CacheableDenseAnchor {
+            anchor: &anchor,
+            identity: current_dense_anchor_identity_for_canonical(&anchor, &canonical),
+        }];
+        let exact_vectors = vec![vec![0.0, 1.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let cache_batch = dense_anchor_cache_batch(&ordered);
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&cache_batch, &exact_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered, &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .remove_batch_table_for_test()?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered,
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "cancelled fresh embedding after cache lookup error",
+        );
+        assert!(
+            visitor_result.is_err(),
+            "staged vectors reached the visitor"
+        );
+        let error = format!("{:#}", visitor_result.unwrap_err());
+        assert!(
+            error.contains("embedding_server_transport_unavailable"),
+            "unexpected fresh-path error: {error}"
+        );
+        assert!(
+            content_vector_cache.is_none(),
+            "lookup error did not disable cache reuse"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_anchor_resolver_cancellation_precedes_staged_absent_reuse() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (a, a_canonical) = dense_anchor_identity_fixture(1, "python:function:pkg.a", 10);
+        let (b, b_canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [
+            CacheableDenseAnchor {
+                anchor: &a,
+                identity: current_dense_anchor_identity_for_canonical(&a, &a_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &b,
+                identity: current_dense_anchor_identity_for_canonical(&b, &b_canonical),
+            },
+        ];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let b_vectors = vec![vec![0.0, 1.0]];
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&dense_anchor_cache_batch(&ordered[1..2]), &b_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered[1..2], &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(
+                &dense_anchor_cache_batch(&ordered[0..1]),
+                &[vec![1.0, -0.0]],
+            )?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered[1..2],
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "native embedding must remain unreachable",
+        );
+        let error = visitor_result.expect_err("cancelled staged vectors reached the visitor");
+        assert!(error.to_string().contains("reusing staged embedding batch"));
+        assert_eq!(
+            content_vector_cache.as_ref().expect("cache").activity(),
+            (0, 1)
+        );
+        Ok(())
     }
 
     #[test]
