@@ -1766,6 +1766,24 @@ fn load_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
     Ok(index)
 }
 
+fn restore_scip_record_order<T>(mut records: Vec<(u64, T)>, kind: &str) -> Result<Vec<T>> {
+    records.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    for (expected, (actual, _)) in records.iter().enumerate() {
+        let expected = u64::try_from(expected).context("scip record count overflow")?;
+        if *actual != expected {
+            bail!(
+                "scip {kind} record ordinal is not contiguous: expected {expected}, found {actual}"
+            );
+        }
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve(records.len())
+        .with_context(|| format!("reserve ordered scip {kind} records"))?;
+    ordered.extend(records.into_iter().map(|(_, record)| record));
+    Ok(ordered)
+}
+
 fn read_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
     let connection = Connection::open_with_flags(
         sqlite_open_path(path),
@@ -1799,30 +1817,63 @@ fn read_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
     if scip_component_digest(&connection)? != expected_digest {
         bail!("scip component digest mismatch");
     }
-    let mut symbols = Vec::new();
-    let mut proofs = Vec::new();
+    let (record_count, order_count, joined_count) = connection.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM records),
+             (SELECT COUNT(*) FROM record_order),
+             (SELECT COUNT(*)
+                FROM records r JOIN record_order o ON o.record_key = r.record_key)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    if record_count != order_count || record_count != joined_count {
+        bail!(
+            "scip component record/order cardinality mismatch: records {record_count}, order {order_count}, joined {joined_count}"
+        );
+    }
+    let mut ordered_symbols = Vec::<(u64, ScipSymbolRecord)>::new();
+    let mut ordered_proofs = Vec::<(u64, ScipProofRecord)>::new();
     let mut statement = connection.prepare(
-        "SELECT r.kind, r.record_sha256, r.record_json
+        "SELECT r.kind, r.record_sha256, r.record_json, o.ordinal
          FROM records r
-         JOIN record_order o ON o.record_key = r.record_key
-         ORDER BY CASE r.kind WHEN 'symbol' THEN 0 ELSE 1 END, o.ordinal",
+         JOIN record_order o ON o.record_key = r.record_key",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let kind = row.get::<_, String>(0)?;
         let expected_hash = row.get::<_, String>(1)?;
         let json = row.get::<_, String>(2)?;
+        let ordinal = u64::try_from(row.get::<_, i64>(3)?)
+            .context("scip component record ordinal is invalid")?;
         if sha256_text(&json) != expected_hash {
             bail!("scip component record digest mismatch");
         }
         match kind.as_str() {
-            "symbol" => symbols.push(serde_json::from_str(&json)?),
-            "proof" => proofs.push(serde_json::from_str(&json)?),
+            "symbol" => {
+                ordered_symbols
+                    .try_reserve(1)
+                    .context("reserve observed scip symbol record")?;
+                ordered_symbols.push((ordinal, serde_json::from_str(&json)?));
+            }
+            "proof" => {
+                ordered_proofs
+                    .try_reserve(1)
+                    .context("reserve observed scip proof record")?;
+                ordered_proofs.push((ordinal, serde_json::from_str(&json)?));
+            }
             _ => bail!("scip component contains an unknown record kind"),
         }
     }
-    if i64::try_from(symbols.len()).unwrap_or(i64::MAX) != symbol_count
-        || i64::try_from(proofs.len()).unwrap_or(i64::MAX) != proof_count
+    let symbols = restore_scip_record_order(ordered_symbols, "symbol")?;
+    let proofs = restore_scip_record_order(ordered_proofs, "proof")?;
+    if i64::try_from(symbols.len()).context("scip symbol cardinality overflow")? != symbol_count
+        || i64::try_from(proofs.len()).context("scip proof cardinality overflow")? != proof_count
     {
         bail!("scip component record cardinality mismatch");
     }
@@ -1967,6 +2018,171 @@ mod tests {
             symbols,
             proofs,
         }
+    }
+
+    fn explicitly_ordered_component(generation: &str) -> ScipSymbolsIndex {
+        let symbols = vec![
+            component_symbol("20", "src/twenty.rs", "twenty"),
+            component_symbol("3", "src/three.rs", "three"),
+            component_symbol("11", "src/eleven.rs", "eleven"),
+        ];
+        let proofs = symbols
+            .iter()
+            .map(ScipProofRecord::definition)
+            .collect::<Vec<_>>();
+        let revision = scip_revision_for_symbols(&symbols, &[]);
+        ScipSymbolsIndex {
+            generation: generation.into(),
+            revision: revision.clone(),
+            contract: ScipProofAdapterContract::graph_projection(&revision),
+            symbols,
+            proofs,
+        }
+    }
+
+    fn write_component_fixture(root: &Path, index: &ScipSymbolsIndex) -> PathBuf {
+        std::fs::create_dir_all(root).expect("component fixture directory");
+        let path = root.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let rows = scip_component_rows(index).expect("component fixture rows");
+        write_scip_component(&path, index, &rows).expect("write component fixture");
+        path
+    }
+
+    fn authenticate_component_rows(connection: &Connection) {
+        let digest = scip_component_digest(connection).expect("digest mutated component rows");
+        connection
+            .execute(
+                "UPDATE metadata SET component_sha256 = ?1 WHERE singleton = 1",
+                [digest],
+            )
+            .expect("authenticate mutated component rows");
+    }
+
+    #[test]
+    fn scip_component_loader_preserves_explicit_record_order() {
+        let root = TempDir::new().expect("tempdir");
+        let expected = explicitly_ordered_component("generation-ordered");
+        let path = write_component_fixture(root.path(), &expected);
+
+        let loaded = load_scip_symbols_database(&path).expect("load ordered component");
+
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded
+                .symbols
+                .iter()
+                .map(|symbol| symbol.node_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("20"), Some("3"), Some("11")],
+            "record_key order must not replace the authenticated ordinal order"
+        );
+    }
+
+    #[test]
+    fn scip_component_loader_rejects_authenticated_invalid_ordinals_and_counts() {
+        let root = TempDir::new().expect("tempdir");
+        let expected = explicitly_ordered_component("generation-hostile-order");
+        let pristine = write_component_fixture(&root.path().join("pristine"), &expected);
+        let cases = [
+            (
+                "duplicate",
+                "UPDATE record_order SET ordinal = 0 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "duplicate-proof",
+                "UPDATE record_order SET ordinal = 0 WHERE record_key = (
+                     SELECT r.record_key
+                     FROM records r JOIN record_order o ON o.record_key = r.record_key
+                     WHERE r.kind = 'proof' AND o.ordinal = 1
+                 )",
+                true,
+                "ordinal",
+            ),
+            (
+                "gapped",
+                "UPDATE record_order SET ordinal = 3 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "negative",
+                "UPDATE record_order SET ordinal = -1 WHERE record_key = 'symbol:3'",
+                false,
+                "ordinal",
+            ),
+            (
+                "out-of-range",
+                "UPDATE record_order SET ordinal = 9223372036854775807 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "record-without-order",
+                "DELETE FROM record_order WHERE record_key = 'symbol:3'",
+                true,
+                "cardinality",
+            ),
+            (
+                "orphan-order",
+                "INSERT INTO record_order(record_key, ordinal) VALUES ('orphan:record', 0)",
+                true,
+                "cardinality",
+            ),
+            (
+                "unknown-kind",
+                "UPDATE records SET kind = 'unknown' WHERE record_key = 'symbol:3'",
+                false,
+                "unknown record kind",
+            ),
+            (
+                "negative-metadata-count",
+                "UPDATE metadata SET symbol_count = -1 WHERE singleton = 1",
+                false,
+                "cardinality",
+            ),
+            (
+                "untrusted-metadata-count",
+                "UPDATE metadata SET symbol_count = 9223372036854775807 WHERE singleton = 1",
+                false,
+                "cardinality",
+            ),
+        ];
+        let mut admitted = Vec::new();
+
+        for (name, mutation, authenticate_rows, expected_error) in cases {
+            let case_dir = root.path().join(name);
+            std::fs::create_dir_all(&case_dir).expect("hostile case directory");
+            let path = case_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+            std::fs::copy(&pristine, &path).expect("copy pristine component");
+            let connection = Connection::open(sqlite_open_path(&path)).expect("open hostile case");
+            if name == "orphan-order" {
+                connection
+                    .execute_batch("PRAGMA foreign_keys=OFF;")
+                    .expect("allow construction of orphan-order fixture");
+            }
+            connection
+                .execute(mutation, [])
+                .expect("mutate hostile case");
+            if authenticate_rows {
+                authenticate_component_rows(&connection);
+            }
+            drop(connection);
+
+            match load_scip_symbols_database(&path) {
+                Ok(_) => admitted.push(name),
+                Err(error) => assert!(
+                    format!("{error:#}").contains(expected_error),
+                    "{name} failed at the wrong boundary: {error:#}"
+                ),
+            }
+        }
+
+        assert!(
+            admitted.is_empty(),
+            "loader admitted invalid authenticated component order/count cases: {admitted:?}"
+        );
     }
 
     #[test]

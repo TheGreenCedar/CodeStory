@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Loading precise source evidence uses less temporary disk and rejects malformed
+record ordering.
+
 Project preparation no longer fails when source data contains empty or
 whitespace-only property names.
 
