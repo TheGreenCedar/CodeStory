@@ -1552,10 +1552,36 @@ impl ActivationService {
             .controller
             .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
         {
-            Ok(()) => Some(self.controller.open_project_summary_with_storage_path(
-                project_root.clone(),
-                storage_path.clone(),
-            )?),
+            Ok(()) => {
+                let layout =
+                    codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                        .map_err(|error| {
+                            ApiError::internal(format!(
+                                "Failed to resolve core publication layout for activation: {error}"
+                            ))
+                        })?;
+                let has_generation_pointer =
+                    layout.read_pointer().is_ok_and(|pointer| pointer.is_some());
+                let retrieval_pointer_is_absent = matches!(
+                    std::fs::symlink_metadata(layout.retrieval_publication_path()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                let summary = if has_generation_pointer && retrieval_pointer_is_absent {
+                    // A complete core may legitimately predate its first retrieval
+                    // publication. Full activation owns advancing that state, but
+                    // the ordinary summary remains a strict observational read.
+                    self.controller.open_core_read_only_with_storage_path(
+                        project_root.clone(),
+                        storage_path.clone(),
+                    )?
+                } else {
+                    self.controller.open_project_summary_with_storage_path(
+                        project_root.clone(),
+                        storage_path.clone(),
+                    )?
+                };
+                Some(summary)
+            }
             Err(error)
                 if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
             {
@@ -3481,6 +3507,51 @@ pub(crate) mod activation_tests {
         }
     }
 
+    fn complete_core_without_retrieval_pointer_fixture()
+    -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn retained_core_fixture() {}\n",
+        )
+        .expect("write retained-core fixture");
+
+        let seeding_runtime = Runtime::new();
+        seeding_runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("bind retained-core fixture");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete retained core");
+        assert!(
+            Store::database_index_publication(&storage_path)
+                .expect("read retained core publication")
+                .is_some(),
+            "fixture must retain a complete core publication"
+        );
+
+        let retrieval_pointer =
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("resolve core publication layout")
+                .retrieval_publication_path();
+        if retrieval_pointer.exists() {
+            fs::remove_file(&retrieval_pointer).expect("remove retrieval publication pointer");
+        }
+        assert!(
+            !retrieval_pointer.exists(),
+            "fixture must start without a retrieval publication pointer"
+        );
+
+        (project, cache, storage_path, retrieval_pointer)
+    }
+
     fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
             let mut children = fs::read_dir(path)
@@ -4470,6 +4541,162 @@ pub(crate) mod activation_tests {
             .expect("activation worker test gate poisoned") = true;
         changed.notify_all();
         service.cancel_and_wait();
+    }
+
+    #[test]
+    fn full_activation_admits_complete_core_with_physically_missing_retrieval_pointer() {
+        let (project, _cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let runtime = Runtime::new();
+        let service = runtime.activation_service();
+        service.arm_preparation_seams_for_test();
+
+        let error = service
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("the deterministic seam must stop activation before native preparation");
+
+        assert_eq!(
+            error.code, "project_unavailable",
+            "activation must reach the deterministic pre-native seam: {error:?}"
+        );
+        assert_eq!(
+            error.message, "test preparation seam was invoked again: native embedding preparation",
+            "activation must not fail while observing the absent retrieval pointer: {error:?}"
+        );
+        assert_eq!(
+            service.preparation_counts_for_test(),
+            (1, 0),
+            "activation must admit the retained core and stop before native work"
+        );
+        assert!(
+            !retrieval_pointer.exists(),
+            "activation planning must not materialize a retrieval pointer"
+        );
+    }
+
+    #[test]
+    fn missing_retrieval_pointer_remains_an_observational_error() {
+        let (project, _cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let runtime = Runtime::new();
+        runtime
+            .project_service()
+            .open_core_read_only_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("bind only the complete core");
+
+        let error = runtime
+            .search_service()
+            .retrieval_state()
+            .expect_err("ordinary retrieval observation must fail on a missing pointer");
+
+        assert_eq!(error.code, "internal");
+        assert!(
+            error
+                .message
+                .contains("Retrieval publication pointer is unavailable"),
+            "observation must preserve the missing-pointer error: {error:?}"
+        );
+        assert!(
+            !retrieval_pointer.exists(),
+            "ordinary observation must not materialize a retrieval pointer"
+        );
+    }
+
+    #[test]
+    fn full_activation_does_not_bypass_corrupt_retrieval_pointer() {
+        let (project, _cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let corrupt = b"not a retrieval publication database";
+        fs::write(&retrieval_pointer, corrupt).expect("write corrupt retrieval pointer");
+        let runtime = Runtime::new();
+        let service = runtime.activation_service();
+        service.arm_preparation_seams_for_test();
+
+        let error = service
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("a corrupt retrieval pointer must fail closed");
+
+        assert_eq!(
+            error.code, "project_unavailable",
+            "corrupt pointer must retain the activation error wrapper: {error:?}"
+        );
+        assert!(
+            error
+                .message
+                .contains("Failed to query retrieval index manifest"),
+            "corruption must remain an observational manifest failure: {error:?}"
+        );
+        assert_eq!(
+            service.preparation_counts_for_test(),
+            (0, 0),
+            "corruption must fail before native or retrieval preparation"
+        );
+        assert_eq!(
+            fs::read(&retrieval_pointer).expect("read corrupt retrieval pointer"),
+            corrupt,
+            "failed activation must not repair or replace corrupt pointer bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_activation_does_not_treat_dangling_retrieval_pointer_symlink_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let (project, _cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let target = project.path().join("absent-retrieval-pointer.sqlite3");
+        symlink(&target, &retrieval_pointer).expect("link retrieval pointer outside core layout");
+        assert!(
+            !retrieval_pointer.exists(),
+            "the hostile symlink must be dangling according to following metadata"
+        );
+        assert!(
+            fs::symlink_metadata(&retrieval_pointer).is_ok(),
+            "nofollow metadata must still observe the hostile pointer entry"
+        );
+        let runtime = Runtime::new();
+        let service = runtime.activation_service();
+        service.arm_preparation_seams_for_test();
+
+        let error = service
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("a symlinked retrieval pointer must fail closed");
+
+        assert_eq!(
+            error.code, "project_unavailable",
+            "dangling pointer must retain the activation error wrapper: {error:?}"
+        );
+        assert!(
+            error
+                .message
+                .contains("Retrieval publication pointer is not a regular file"),
+            "the pointer must be rejected before following the symlink: {error:?}"
+        );
+        assert_eq!(
+            service.preparation_counts_for_test(),
+            (0, 0),
+            "a symlink must fail before native or retrieval preparation"
+        );
+        assert!(
+            fs::symlink_metadata(&retrieval_pointer).is_ok(),
+            "failed activation must leave the dangling pointer entry unchanged"
+        );
     }
 
     #[test]

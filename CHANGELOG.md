@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Project preparation can reuse a complete source index when its retrieval
+publication has not yet been built.
+
 Route navigation keeps declarations with matching HTTP methods and paths
 separate, preserving links to each declaration’s own file and handler.
 
