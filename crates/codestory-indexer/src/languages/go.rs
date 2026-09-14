@@ -344,6 +344,15 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             name: &source_name,
             span: ts_node_graph_span(callable),
         };
+        let method_receiver_bindings = collect_go_method_receiver_bindings(
+            callable,
+            source,
+            &import_bindings,
+            &package_owner_specs,
+        );
+        let method_receiver_name = method_receiver_bindings
+            .keys()
+            .find(|receiver_name| !receiver_name.contains('.'));
         let mut local_binding_callsites = HashSet::new();
         collect_go_local_composite_receiver_call_specs(
             callable,
@@ -354,14 +363,9 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             },
             &import_bindings,
             &file_scope_names,
+            method_receiver_name.map(String::as_str),
             &mut local_binding_callsites,
             &mut edges,
-        );
-        let method_receiver_bindings = collect_go_method_receiver_bindings(
-            callable,
-            source,
-            &import_bindings,
-            &package_owner_specs,
         );
         let mut receiver_types = method_receiver_bindings
             .iter()
@@ -410,6 +414,7 @@ fn collect_go_local_composite_receiver_call_specs(
     call_source: ManualReceiverSource<'_>,
     import_bindings: &HashMap<String, String>,
     file_scope_names: &HashSet<String>,
+    method_receiver_name: Option<&str>,
     local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
@@ -560,12 +565,29 @@ fn collect_go_local_composite_receiver_call_specs(
             }
             _ => {}
         }
-        if !go_navigation_node_is_captured(node, callable) || node.kind() != "identifier" {
+        if node.kind() != "identifier" {
             return;
         }
+        let Some((capture_start, capture_end)) = go_navigation_capture_span(node, callable) else {
+            return;
+        };
         let Some(name) = normalized_receiver_variable(node, source) else {
             return;
         };
+        // Capturing a statically declared method receiver does not change its
+        // Go type outside that closure. Keep nested closure calls fail closed,
+        // and keep real local shadow intervals above, without erasing the
+        // enclosing receiver's owner for the rest of the method.
+        if method_receiver_name == Some(name.as_str()) {
+            intervals.push(GoNavigationBindingInterval {
+                name,
+                start_byte: capture_start,
+                end_byte: capture_end,
+                scope_depth: usize::MAX,
+                owner: None,
+            });
+            return;
+        }
         intervals.push(GoNavigationBindingInterval {
             name,
             start_byte: callable.start_byte(),
@@ -819,16 +841,17 @@ fn go_navigation_special_names(surface: &str) -> Vec<String> {
         .collect()
 }
 
-fn go_navigation_node_is_captured(mut node: TsNode<'_>, callable: TsNode<'_>) -> bool {
-    let mut crossed_closure = false;
+fn go_navigation_capture_span(
+    mut node: TsNode<'_>,
+    callable: TsNode<'_>,
+) -> Option<(usize, usize)> {
     while node.id() != callable.id() {
-        crossed_closure |= node.kind() == "func_literal";
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        node = parent;
+        if node.kind() == "func_literal" {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        node = node.parent()?;
     }
-    crossed_closure
+    None
 }
 
 fn go_expression_list_items(node: TsNode<'_>) -> Vec<TsNode<'_>> {

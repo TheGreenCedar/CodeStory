@@ -5,6 +5,7 @@ use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, Resolut
 use codestory_store::Store as Storage;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
 
 const PYTHON_SOURCE: &str =
@@ -244,7 +245,13 @@ fn rich_fixture_cases() -> Vec<RichFixtureCase> {
 
 fn index_files(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let dir = tempdir()?;
-    let root = dir.path();
+    index_files_at_root(dir.path(), files)
+}
+
+fn index_files_at_root(
+    root: &Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let mut files_to_index = Vec::with_capacity(files.len());
     for (filename, contents) in files {
         let file_path = root.join(filename);
@@ -2865,6 +2872,234 @@ func orchestrate() {
         "Run",
         "project/external/workflow.go",
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_go_method_receiver_capture_does_not_erase_direct_receiver_owner() -> anyhow::Result<()> {
+    let service_source = r#"package service
+
+type Server struct{}
+type OtherServer struct{}
+
+func (s *Server) serveHTTP() {}
+func (s *OtherServer) serveHTTP() {}
+
+func (s *Server) direct() {
+    s.serveHTTP()
+}
+
+func (s *Server) captured() {
+    s.serveHTTP()
+    defer func() {
+        _ = s
+    }()
+    s.serveHTTP()
+}
+
+func (s *Server) shadowed() {
+    if true {
+        s := OtherServer{}
+        s.serveHTTP()
+    }
+    s.serveHTTP()
+}
+
+func (s *Server) closureLocalShadow() {
+    defer func() {
+        s := OtherServer{}
+        s.serveHTTP()
+    }()
+    s.serveHTTP()
+}
+
+func ownerless(s any) {
+    s.serveHTTP()
+}
+
+func (s *Server) nestedReceiverCall() {
+    defer func() {
+        s.serveHTTP()
+    }()
+    s.serveHTTP()
+}
+"#;
+    let foreign_source = r#"package foreign
+
+type Server struct{}
+
+func (s *Server) serveHTTP() {}
+"#;
+    let dir = tempdir()?;
+    let (nodes, edges) = index_files_at_root(
+        dir.path(),
+        &[
+            ("service.go", service_source),
+            ("foreign/server.go", foreign_source),
+        ],
+    )?;
+    let expected_service_path = dir.path().join("service.go");
+
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go direct method receiver control",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "direct",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go method receiver survives calls before and after capture",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "captured",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 2,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go block-local shadow resolves to its actual owner",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "shadowed",
+            owner_name: "OtherServer",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go method receiver resumes after block-local shadow",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "shadowed",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go closure-local shadow does not erase outer method receiver",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "closureLocalShadow",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go nested receiver call stays closed while the outer receiver resumes",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "nestedReceiverCall",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "go closure-local shadow is not attributed to the enclosing method",
+        &nodes,
+        &edges,
+        "closureLocalShadow",
+        "OtherServer",
+        "serveHTTP",
+        "service.go",
+    );
+    for caller_name in [
+        "direct",
+        "captured",
+        "shadowed",
+        "closureLocalShadow",
+        "nestedReceiverCall",
+    ] {
+        assert_no_resolved_call_to_method_owner_in_file(
+            "go same-named foreign method does not capture direct receiver calls",
+            &nodes,
+            &edges,
+            caller_name,
+            "Server",
+            "serveHTTP",
+            "foreign/server.go",
+        );
+    }
+    for owner_name in ["Server", "OtherServer"] {
+        assert_no_resolved_call_to_method_owner(
+            "go ownerless receiver remains unresolved",
+            &nodes,
+            &edges,
+            "ownerless",
+            owner_name,
+            "serveHTTP",
+        );
+    }
+
+    for (caller_name, line, owner_name) in [
+        ("direct", 10, "Server"),
+        ("captured", 14, "Server"),
+        ("captured", 18, "Server"),
+        ("shadowed", 24, "OtherServer"),
+        ("shadowed", 26, "Server"),
+        ("closureLocalShadow", 34, "Server"),
+        ("nestedReceiverCall", 45, "Server"),
+    ] {
+        let callsite = call_edges_from_caller_at_line(&nodes, &edges, caller_name, line);
+        assert_eq!(
+            callsite.len(),
+            1,
+            "expected one callsite for {caller_name} line {line}: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        let node_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let target = callsite[0]
+            .resolved_target
+            .and_then(|target_id| node_by_id.get(&target_id).copied())
+            .expect("direct receiver call must have a resolved target");
+        assert!(
+            is_matching_owned_method(&target.serialized_name, owner_name, "serveHTTP"),
+            "wrong target for {caller_name} line {line}: {}",
+            target.serialized_name
+        );
+        assert_eq!(
+            file_path_for_node(&node_by_id, target).map(Path::new),
+            Some(expected_service_path.as_path())
+        );
+        let observed_line = callsite[0]
+            .callsite_identity
+            .as_deref()
+            .and_then(|identity| identity.split('|').next())
+            .and_then(|coordinates| coordinates.split(':').nth(1))
+            .and_then(|line| line.parse::<u32>().ok());
+        assert_eq!(observed_line, Some(line));
+    }
+    let ownerless = call_edges_from_caller_at_line(&nodes, &edges, "ownerless", 38);
+    assert_eq!(ownerless.len(), 1);
+    assert!(ownerless[0].resolved_target.is_none());
+    let nested_shadow = call_edges_from_caller_at_line(&nodes, &edges, "closureLocalShadow", 32);
+    assert_eq!(nested_shadow.len(), 1);
+    assert!(nested_shadow[0].resolved_target.is_none());
+    let nested_receiver = call_edges_from_caller_at_line(&nodes, &edges, "nestedReceiverCall", 43);
+    assert_eq!(nested_receiver.len(), 1);
+    assert!(nested_receiver[0].resolved_target.is_none());
 
     Ok(())
 }
