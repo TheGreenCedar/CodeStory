@@ -4410,9 +4410,9 @@ mod tests {
             let error = preadmit_packet_descriptor_queries(&fixture.controller, &[], Some(0))
                 .expect_err("zero remaining allowance must expire before readiness");
             assert_eq!(error.code, "cache_busy");
-            assert!(
-                error.message.contains("deadline exceeded"),
-                "unexpected deadline error: {error:?}"
+            assert_eq!(
+                error.message,
+                "retrieval stopped: reason=deadline phase=deferred_full_readiness"
             );
         });
     }
