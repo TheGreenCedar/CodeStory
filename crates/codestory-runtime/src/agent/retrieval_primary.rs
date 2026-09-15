@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
 const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
@@ -912,12 +912,25 @@ pub(crate) fn preadmit_packet_descriptor_queries(
     let session = active_packet_proof_session().ok_or_else(|| {
         ApiError::internal("packet descriptor admission requires an active packet session")
     })?;
+    let readiness_budget_ms = latency_budget_ms
+        .map(u64::from)
+        .unwrap_or(DEFAULT_PACKET_BATCH_BUDGET_MS)
+        .min(MAX_PACKET_BATCH_BUDGET_MS);
+    let descriptor_budget_ms = sidecar_packet_batch_budget_ms(latency_budget_ms);
+    let request_cancelled = crate::services::active_public_operation_cancellation()
+        .unwrap_or_else(codestory_retrieval::cancellation_flag);
+    let readiness_deadline = Instant::now()
+        .checked_add(Duration::from_millis(readiness_budget_ms))
+        .expect("bounded packet descriptor deadline");
     if queries.is_empty() || session.remaining_hydration_slots() == 0 {
         session.seal_retrieval_admission();
         if let Some(pinned) = active_pinned_retrieval_read(controller) {
             pinned
                 .session
-                .validate_full_readiness()
+                .validate_full_readiness_with_control(
+                    readiness_deadline,
+                    Arc::clone(&request_cancelled),
+                )
                 .map_err(map_pinned_query_error)?;
         }
         return Ok(());
@@ -948,7 +961,7 @@ pub(crate) fn preadmit_packet_descriptor_queries(
     }
 
     with_pinned_retrieval_read(controller, |pinned| {
-        let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
+        let per_query_budget = descriptor_budget_ms
             .checked_div(queries.len().max(1) as u64)
             .unwrap_or(100)
             .max(100);
@@ -967,13 +980,13 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                     .session
                     .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
                         &batch_items,
-                        crate::services::active_public_operation_cancellation(),
+                        Some(Arc::clone(&request_cancelled)),
                         cache,
                     );
             }
             pinned.session.execute_packet_descriptor_batch_with_cache(
                 &batch_items,
-                crate::services::active_public_operation_cancellation(),
+                Some(Arc::clone(&request_cancelled)),
                 cache,
             )
         })
@@ -1028,7 +1041,10 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         // this point would violate the descriptor-first boundary.
         pinned
             .session
-            .validate_full_readiness()
+            .validate_full_readiness_with_control(
+                readiness_deadline,
+                Arc::clone(&request_cancelled),
+            )
             .map_err(map_pinned_query_error)?;
         Ok(())
     })
@@ -4210,6 +4226,29 @@ mod tests {
             PacketAdmissionDecision::CountBudgetExceeded,
             "the sealed session must not admit a late lower-scoring query candidate"
         );
+    }
+
+    #[test]
+    fn packet_descriptor_zero_remaining_budget_expires_before_readiness() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = pinned_operation_fixture();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            let error = preadmit_packet_descriptor_queries(&fixture.controller, &[], Some(0))
+                .expect_err("zero remaining allowance must expire before readiness");
+            assert_eq!(error.code, "cache_busy");
+            assert!(
+                error.message.contains("deadline exceeded"),
+                "unexpected deadline error: {error:?}"
+            );
+        });
     }
 
     #[test]

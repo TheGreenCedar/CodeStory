@@ -283,7 +283,8 @@ impl PinnedQuerySession {
             transaction_active: true,
         };
         if validate_full_readiness {
-            session.validate_full_readiness_with_identity(&producer_compatibility_identity)?;
+            session
+                .validate_full_readiness_with_identity(&producer_compatibility_identity, None)?;
         }
         Ok(session)
     }
@@ -299,13 +300,47 @@ impl PinnedQuerySession {
                 u32::try_from(crate::embeddings::semantic_vector_dim())
                     .context("embedding dimension exceeds evidence contract")?,
             )?;
-        self.validate_full_readiness_with_identity(&producer_compatibility_identity)
+        self.validate_full_readiness_with_identity(&producer_compatibility_identity, None)
+    }
+
+    /// Compatibility seam for carrying the retrieval request's existing
+    /// deadline and cancellation state through deferred packet readiness.
+    fn validate_full_readiness_with_context(&self, context: &SearchExecutionContext) -> Result<()> {
+        context.check_cancelled()?;
+        let producer_compatibility_identity =
+            crate::embedded_vector::vector_producer_compatibility_identity(
+                &self.embedding_device,
+                self._embedding_residency.identity(),
+                u32::try_from(crate::embeddings::semantic_vector_dim())
+                    .context("embedding dimension exceeds evidence contract")?,
+            )?;
+        context.check_cancelled()?;
+        self.validate_full_readiness_with_identity(&producer_compatibility_identity, Some(context))
+    }
+
+    /// Validate deferred packet readiness under the descriptor phase's
+    /// existing absolute deadline and request cancellation flag.
+    pub fn validate_full_readiness_with_control(
+        &self,
+        deadline: Instant,
+        request_cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let context = SearchExecutionContext::new(
+            deadline,
+            request_cancelled,
+            Arc::new(AtomicBool::new(false)),
+        );
+        self.validate_full_readiness_with_context(&context)
     }
 
     fn validate_full_readiness_with_identity(
         &self,
         producer_compatibility_identity: &str,
+        context: Option<&SearchExecutionContext>,
     ) -> Result<()> {
+        if let Some(context) = context {
+            context.check_cancelled()?;
+        }
         if self.full_readiness_validated.get() {
             return Ok(());
         }
@@ -321,11 +356,17 @@ impl PinnedQuerySession {
                 self.project_id
             );
         }
+        if let Some(context) = context {
+            context.check_cancelled()?;
+        }
         let core_publication = self
             .storage
             .get_complete_index_publication()
             .context("load pinned core publication for vector validation")?
             .context("pinned retrieval query requires a complete core publication")?;
+        if let Some(context) = context {
+            context.check_cancelled()?;
+        }
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &self.runtime.layout,
             &self.storage,
@@ -337,6 +378,9 @@ impl PinnedQuerySession {
             self._embedding_residency.identity(),
         )
         .context("validate attested vector generation")?;
+        if let Some(context) = context {
+            context.check_cancelled()?;
+        }
         self.full_readiness_validated.set(true);
         Ok(())
     }
@@ -1473,6 +1517,14 @@ mod tests {
             first_session.publication_identity().core_generation_id,
             first_core.generation_id
         );
+        let live_context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        first_session
+            .validate_full_readiness_with_context(&live_context)
+            .expect("live context must preserve an already validated session");
         drop(first_session);
 
         let mut store = Store::open(&storage_path).expect("open identity-only writer");
@@ -1586,6 +1638,112 @@ mod tests {
                 .contains("retrieval sidecar manifest is unavailable"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn packet_descriptor_full_readiness_refuses_expired_or_cancelled_context_before_validation() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+
+        let writer = Store::open(&storage_path).expect("open hostile writer");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = X'FF' WHERE id = 1", [])
+            .expect("poison full file projection");
+        drop(writer);
+
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("descriptor pin must not decode repository file rows");
+        let expired = SearchExecutionContext::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("expired deadline"),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let expired_error = session
+            .validate_full_readiness_with_context(&expired)
+            .expect_err("expired readiness must stop before strict validation");
+        assert!(
+            expired_error.to_string().contains("deadline"),
+            "expired readiness reached strict validation: {expired_error:#}"
+        );
+        assert!(!session.full_readiness_validated.get());
+
+        let cancelled = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let cancelled_error = session
+            .validate_full_readiness_with_context(&cancelled)
+            .expect_err("cancelled readiness must stop before strict validation");
+        assert!(
+            cancelled_error.to_string().contains("cancelled"),
+            "cancelled readiness reached strict validation: {cancelled_error:#}"
+        );
+        assert!(!session.full_readiness_validated.get());
+
+        let live = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let ordinary_error = session
+            .validate_full_readiness_with_context(&live)
+            .expect_err("live readiness must still inspect the poisoned inventory");
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("retrieval sidecar manifest is unavailable"),
+            "ordinary validation did not preserve the strict failure: {ordinary_error:#}"
+        );
+        assert!(!session.full_readiness_validated.get());
     }
 
     #[test]
