@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
@@ -32,6 +32,160 @@ thread_local! {
     static ACTIVE_PACKET_LATENCY_BUDGET: Cell<Option<PacketLatencyBudget>> = const {
         Cell::new(None)
     };
+    static ACTIVE_PACKET_ENTRY_OBSERVATION: Cell<Option<PacketEntryObservation>> = const {
+        Cell::new(None)
+    };
+}
+
+static NEXT_PACKET_ENTRY_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PacketEntryObservation {
+    id: u64,
+    target_ms: u64,
+    phase_mask: u64,
+    activation_branch_mask: u64,
+    activation_join_count: u64,
+    activation_join_ms: u64,
+    ready_probe_count: u64,
+    ready_probe_total_ms: u64,
+    post_probe_join_count: u64,
+    project_selection_started_ms: u64,
+    project_selection_completed_ms: u64,
+    activation_started_ms: u64,
+    ready_probe_started_ms: u64,
+    ready_probe_configuration_ms: u64,
+    ready_probe_retrieval_ms: u64,
+    ready_probe_core_ms: u64,
+    ready_probe_source_ms: u64,
+    ready_probe_completed_ms: u64,
+    post_probe_join_ms: u64,
+    activation_returned_ms: u64,
+    source_scope_started_ms: u64,
+    source_scope_completed_ms: u64,
+    public_admission_check_ms: u64,
+}
+
+/// Fixed request-side boundaries retained by the active packet allowance.
+///
+/// The diagnostic receipt contains only numeric timings and branch flags. It
+/// never records a project path, query, source text, or request payload.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum PacketEntryObservationPhase {
+    ProjectSelectionStarted = 0,
+    ProjectSelectionCompleted = 1,
+    ActivationStarted = 2,
+    ActivationJoinedRunning = 3,
+    ActivationReadyProbeStarted = 4,
+    ReadyProbeConfigurationCompleted = 5,
+    ReadyProbeRetrievalCompleted = 6,
+    ReadyProbeCoreCompleted = 7,
+    ReadyProbeSourceCompleted = 8,
+    ActivationReadyProbeCompleted = 9,
+    ActivationPostProbeJoin = 10,
+    ActivationStartedWorker = 11,
+    ActivationReturned = 12,
+    SourceScopeStarted = 13,
+    SourceScopeCompleted = 14,
+    PublicAdmissionCheck = 15,
+}
+
+/// Record one request-side boundary against the active packet allowance.
+/// Non-packet callers have no active observation and pay only a TLS lookup.
+#[doc(hidden)]
+pub fn observe_packet_entry_phase(phase: PacketEntryObservationPhase) {
+    let Some(packet_latency) = active_packet_latency_budget() else {
+        return;
+    };
+    let elapsed_ms = clamp_u128_to_u32(packet_latency.started_at.elapsed().as_millis()) as u64;
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        let Some(mut observation) = active.get() else {
+            return;
+        };
+        let bit = 1_u64 << (phase as u8);
+        let was_recorded = observation.phase_mask & bit != 0;
+        observation.phase_mask |= bit;
+        match phase {
+            PacketEntryObservationPhase::ProjectSelectionStarted => {
+                if !was_recorded {
+                    observation.project_selection_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ProjectSelectionCompleted => {
+                if !was_recorded {
+                    observation.project_selection_completed_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationStarted => {
+                if !was_recorded {
+                    observation.activation_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationJoinedRunning => {
+                observation.activation_branch_mask |= 1;
+                observation.activation_join_count =
+                    observation.activation_join_count.saturating_add(1);
+                if !was_recorded {
+                    observation.activation_join_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationReadyProbeStarted => {
+                observation.activation_branch_mask |= 2;
+                observation.ready_probe_count = observation.ready_probe_count.saturating_add(1);
+                observation.ready_probe_started_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeConfigurationCompleted => {
+                observation.ready_probe_configuration_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeRetrievalCompleted => {
+                observation.ready_probe_retrieval_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeCoreCompleted => {
+                observation.ready_probe_core_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeSourceCompleted => {
+                observation.ready_probe_source_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationReadyProbeCompleted => {
+                observation.ready_probe_total_ms = observation
+                    .ready_probe_total_ms
+                    .saturating_add(elapsed_ms.saturating_sub(observation.ready_probe_started_ms));
+                observation.ready_probe_completed_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationPostProbeJoin => {
+                observation.activation_branch_mask |= 4;
+                observation.post_probe_join_count =
+                    observation.post_probe_join_count.saturating_add(1);
+                observation.post_probe_join_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationStartedWorker => {
+                observation.activation_branch_mask |= 8;
+            }
+            PacketEntryObservationPhase::ActivationReturned => {
+                if !was_recorded {
+                    observation.activation_returned_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::SourceScopeStarted => {
+                if !was_recorded {
+                    observation.source_scope_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::SourceScopeCompleted => {
+                if !was_recorded {
+                    observation.source_scope_completed_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::PublicAdmissionCheck => {
+                if !was_recorded {
+                    observation.public_admission_check_ms = elapsed_ms;
+                }
+            }
+        }
+        active.set(Some(observation));
+    });
 }
 
 /// Restores the packet allowance that was active before this synchronous scope.
@@ -40,12 +194,48 @@ thread_local! {
 #[doc(hidden)]
 pub struct PacketLatencyScopeGuard {
     previous: Option<PacketLatencyBudget>,
+    owns_observation: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Drop for PacketLatencyScopeGuard {
     fn drop(&mut self) {
+        let total_elapsed_ms = active_packet_latency_budget()
+            .map(|budget| clamp_u128_to_u32(budget.started_at.elapsed().as_millis()) as u64)
+            .unwrap_or(0);
         ACTIVE_PACKET_LATENCY_BUDGET.with(|active| active.set(self.previous));
+        if self.owns_observation {
+            let observation = ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| active.take());
+            if let Some(observation) = observation {
+                tracing::warn!(
+                    packet_entry_observation_id = observation.id,
+                    target_ms = observation.target_ms,
+                    total_elapsed_ms,
+                    phase_mask = observation.phase_mask,
+                    activation_branch_mask = observation.activation_branch_mask,
+                    activation_join_count = observation.activation_join_count,
+                    activation_join_ms = observation.activation_join_ms,
+                    ready_probe_count = observation.ready_probe_count,
+                    ready_probe_total_ms = observation.ready_probe_total_ms,
+                    post_probe_join_count = observation.post_probe_join_count,
+                    project_selection_started_ms = observation.project_selection_started_ms,
+                    project_selection_completed_ms = observation.project_selection_completed_ms,
+                    activation_started_ms = observation.activation_started_ms,
+                    ready_probe_started_ms = observation.ready_probe_started_ms,
+                    ready_probe_configuration_ms = observation.ready_probe_configuration_ms,
+                    ready_probe_retrieval_ms = observation.ready_probe_retrieval_ms,
+                    ready_probe_core_ms = observation.ready_probe_core_ms,
+                    ready_probe_source_ms = observation.ready_probe_source_ms,
+                    ready_probe_completed_ms = observation.ready_probe_completed_ms,
+                    post_probe_join_ms = observation.post_probe_join_ms,
+                    activation_returned_ms = observation.activation_returned_ms,
+                    source_scope_started_ms = observation.source_scope_started_ms,
+                    source_scope_completed_ms = observation.source_scope_completed_ms,
+                    public_admission_check_ms = observation.public_admission_check_ms,
+                    "packet entry observation"
+                );
+            }
+        }
     }
 }
 
@@ -57,11 +247,21 @@ impl Drop for PacketLatencyScopeGuard {
 pub fn enter_packet_latency_scope(requested_ms: Option<u32>) -> PacketLatencyScopeGuard {
     ACTIVE_PACKET_LATENCY_BUDGET.with(|active| {
         let previous = active.get();
-        active.set(Some(
-            previous.unwrap_or_else(|| PacketLatencyBudget::new(requested_ms)),
-        ));
+        let budget = previous.unwrap_or_else(|| PacketLatencyBudget::new(requested_ms));
+        active.set(Some(budget));
+        let owns_observation = previous.is_none();
+        if owns_observation {
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(|observation| {
+                observation.set(Some(PacketEntryObservation {
+                    id: NEXT_PACKET_ENTRY_OBSERVATION_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                    target_ms: clamp_u128_to_u32(budget.target_ms) as u64,
+                    ..PacketEntryObservation::default()
+                }));
+            });
+        }
         PacketLatencyScopeGuard {
             previous,
+            owns_observation,
             _thread_bound: PhantomData,
         }
     })
@@ -185,6 +385,41 @@ mod packet_latency_budget_tests {
                 .target_ms,
             DEFAULT_SLA_TARGET_MS as u128
         );
+    }
+
+    #[test]
+    fn packet_entry_observation_is_outer_scope_correlated_and_nonpacket_safe() {
+        observe_packet_entry_phase(PacketEntryObservationPhase::ProjectSelectionStarted);
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+
+        {
+            let _outer = enter_packet_latency_scope(Some(2_000));
+            observe_packet_entry_phase(PacketEntryObservationPhase::ProjectSelectionStarted);
+            let first = ACTIVE_PACKET_ENTRY_OBSERVATION
+                .with(Cell::get)
+                .expect("outer packet observation");
+            assert_ne!(first.id, 0);
+
+            {
+                let _nested = enter_packet_latency_scope(Some(120_000));
+                observe_packet_entry_phase(PacketEntryObservationPhase::ActivationJoinedRunning);
+                let nested = ACTIVE_PACKET_ENTRY_OBSERVATION
+                    .with(Cell::get)
+                    .expect("nested packet observation");
+                assert_eq!(nested.id, first.id);
+                assert_eq!(nested.target_ms, 2_000);
+                assert_eq!(nested.activation_join_count, 1);
+            }
+
+            assert_eq!(
+                ACTIVE_PACKET_ENTRY_OBSERVATION
+                    .with(Cell::get)
+                    .expect("restored packet observation")
+                    .id,
+                first.id
+            );
+        }
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
     }
 }
 

@@ -1739,6 +1739,9 @@ fn handle_stdio_request(
             } else {
                 None
             };
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
             if let Err(error) = session.select_tool_project(&request) {
                 let message = error.to_string();
                 let code = if message.starts_with("project_required:") {
@@ -1755,6 +1758,9 @@ fn handle_stdio_request(
                 });
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
             }
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionCompleted,
+            );
             let revision = session.protocol_v3.negotiated_revision();
             let diagnostics_registry = Arc::clone(&session.diagnostics_v3);
             let (runtime, state) = session.active_project_mut();
@@ -1776,6 +1782,9 @@ fn handle_stdio_request(
                 // Exact proof and affected share complete-core admission: a warm
                 // complete publication stays observational, while cold/fenced
                 // state starts managed preparation and returns preparing+retry.
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationStarted,
+                );
                 let activation = if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
                         &runtime.project_root,
@@ -1792,6 +1801,9 @@ fn handle_stdio_request(
                         )
                         .map(|_| ())
                 };
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationReturned,
+                );
                 if let Err(error) = activation {
                     state.status_cache = None;
                     let operation = runtime.activation.snapshot();

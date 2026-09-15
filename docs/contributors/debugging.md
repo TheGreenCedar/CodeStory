@@ -203,6 +203,21 @@ only typed payload metadata and its code location. An embedding-server
 fail-stop makes one best-effort marker attempt in a fixed bounded slot and
 aborts after a short fixed deadline even if the cache filesystem stalls.
 
+Packet entry emits one bounded numeric timing record when its outer allowance
+scope exits. Pair `packet_entry_observation_id` with the process correlation ID;
+nested calls reuse the outer record. The phase mask distinguishes an unreached
+boundary from one reached within the first millisecond. Entry timestamps share
+the allowance clock, and the first source-scope and admission-check observations
+remain intact across nested calls. Repeated ready probes retain a count and
+cumulative duration; their subphase timestamps describe the last probe.
+Activation return means the call returned, including an error, so use the public
+response to determine its outcome. The retrieval-probe bucket combines live
+embedding identity and manifest observation.
+
+The record excludes its own diagnostic write and is not a hard deadline or a
+success receipt. No question text, source content or project path is retained.
+Ordinary non-packet operations produce no packet-entry record.
+
 `CODESTORY_LOG=error` narrows tracing records to errors.
 `CODESTORY_LOG=off` suppresses ordinary tracing records, but command failures,
 panics, and fail-stop markers remain available. Launcher status diagnostics

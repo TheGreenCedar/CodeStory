@@ -978,6 +978,9 @@ impl ActivationService {
                         .operation_id
                         .clone();
                     drop(state);
+                    crate::agent::packet_batch::observe_packet_entry_phase(
+                        crate::agent::packet_batch::PacketEntryObservationPhase::ActivationJoinedRunning,
+                    );
                     return self.wait_for_activation(
                         &target,
                         &operation_id,
@@ -1005,7 +1008,13 @@ impl ActivationService {
             };
 
             if let Some((candidate_snapshot, candidate_lease)) = ready_candidate {
+                crate::agent::packet_batch::observe_packet_entry_phase(
+                    crate::agent::packet_batch::PacketEntryObservationPhase::ActivationReadyProbeStarted,
+                );
                 let probe = self.probe_ready_lease(storage_path, &candidate_lease);
+                crate::agent::packet_batch::observe_packet_entry_phase(
+                    crate::agent::packet_batch::PacketEntryObservationPhase::ActivationReadyProbeCompleted,
+                );
                 if request_cancelled.load(Ordering::Acquire) {
                     return Err(ApiError::new(
                         "cancelled",
@@ -1038,6 +1047,9 @@ impl ActivationService {
                         .operation_id
                         .clone();
                     drop(state);
+                    crate::agent::packet_batch::observe_packet_entry_phase(
+                        crate::agent::packet_batch::PacketEntryObservationPhase::ActivationPostProbeJoin,
+                    );
                     return self.wait_for_activation(
                         &target,
                         &operation_id,
@@ -1072,6 +1084,9 @@ impl ActivationService {
                         joined: false,
                     });
                 }
+                crate::agent::packet_batch::observe_packet_entry_phase(
+                    crate::agent::packet_batch::PacketEntryObservationPhase::ActivationStartedWorker,
+                );
                 break self.begin_activation_locked(
                     &mut state,
                     &target,
@@ -1108,6 +1123,9 @@ impl ActivationService {
                     .operation_id
                     .clone();
                 drop(state);
+                crate::agent::packet_batch::observe_packet_entry_phase(
+                    crate::agent::packet_batch::PacketEntryObservationPhase::ActivationJoinedRunning,
+                );
                 return self.wait_for_activation(
                     &target,
                     &operation_id,
@@ -1126,6 +1144,9 @@ impl ActivationService {
                 drop(state);
                 continue;
             }
+            crate::agent::packet_batch::observe_packet_entry_phase(
+                crate::agent::packet_batch::PacketEntryObservationPhase::ActivationStartedWorker,
+            );
             break self.begin_activation_locked(
                 &mut state,
                 &target,
@@ -1201,6 +1222,9 @@ impl ActivationService {
     fn probe_ready_lease(&self, storage_path: &Path, lease: &ReadyLease) -> ReadyLeaseProbe {
         let configuration_matches = self.controller.runtime_configuration_id().ok().as_ref()
             == Some(&lease.configuration_id);
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::ReadyProbeConfigurationCompleted,
+        );
         let retrieval_identity =
             codestory_retrieval::observe_ready_retrieval_identity_for_project_id(
                 storage_path,
@@ -1209,13 +1233,22 @@ impl ActivationService {
             )
             .ok()
             .flatten();
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::ReadyProbeRetrievalCompleted,
+        );
         let retrieval_matches =
             ready_retrieval_identity_matches(retrieval_identity.as_ref(), &lease.retrieval);
         let retained_core_publication =
             self.retained_core_publication(storage_path).unwrap_or(None);
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::ReadyProbeCoreCompleted,
+        );
         let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
         let source_matches =
             self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref());
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::ReadyProbeSourceCompleted,
+        );
         ReadyLeaseProbe {
             admissible: configuration_matches
                 && lease.source.is_admissible_snapshot()
@@ -2308,7 +2341,13 @@ impl PublicOperationService {
         // this scope owns only the operation's counters. The post-build check
         // below still drops stored-file verdicts and re-derives them from
         // content, so same-mtime drift and torn reads win over reuse.
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::SourceScopeStarted,
+        );
         let _source_freshness_scope = self.source_freshness_scope();
+        crate::agent::packet_batch::observe_packet_entry_phase(
+            crate::agent::packet_batch::PacketEntryObservationPhase::SourceScopeCompleted,
+        );
         for attempt in 1..=2 {
             if cancelled.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -2316,6 +2355,9 @@ impl PublicOperationService {
                     format!("request cancelled before {operation}"),
                 ));
             }
+            crate::agent::packet_batch::observe_packet_entry_phase(
+                crate::agent::packet_batch::PacketEntryObservationPhase::PublicAdmissionCheck,
+            );
             self.ensure_packet_latency_remaining(operation, "public packet admission")?;
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self
