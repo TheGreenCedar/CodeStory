@@ -147,6 +147,54 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
 }
 
 #[test]
+fn full_refresh_verifies_sql_with_literal_escape() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let source_path = workspace.path().join("fixtures/terminal.sql");
+    fs::create_dir_all(source_path.parent().expect("fixture parent")).unwrap();
+    let source = concat!(
+        "-- café terminal fixture\n",
+        "CREATE TABLE items(note TEXT);\n",
+        "INSERT INTO items VALUES ('\x1b[31mred\x1b[0m');\n",
+    );
+    fs::write(&source_path, source.as_bytes()).unwrap();
+    let storage_path = cache.path().join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .unwrap();
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("valid UTF-8 SQL containing ESC must remain verified source");
+
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let file = storage.get_file_by_path(&source_path).unwrap().unwrap();
+    assert!(file.complete);
+    let inventory = storage.files().inventory().unwrap();
+    let observed = inventory.iter().find(|entry| entry.id == file.id).unwrap();
+    use sha2::{Digest, Sha256};
+    let expected_content_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+    assert_eq!(
+        observed.content_hash.as_deref(),
+        Some(expected_content_hash.as_str())
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source.as_bytes());
+    let gaps = crate::stored_file_coverage_diagnostics(workspace.path(), &storage).unwrap();
+    assert!(gaps.iter().all(|gap| gap.path != "fixtures/terminal.sql"));
+    assert!(
+        storage
+            .get_structural_text_projection_file_ids()
+            .unwrap()
+            .contains(&file.id)
+    );
+}
+
+#[test]
 fn malformed_source_publication_rejects_drift_and_preserves_previous_on_faults() {
     let _env = hybrid_test_env();
     for mode in [IndexMode::Full, IndexMode::Incremental] {

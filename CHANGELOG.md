@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Indexing accepts valid UTF-8 source containing terminal escape bytes while
+preserving the original bytes. Markdown snippets show those escapes as `\x1b`
+instead of passing them through to the terminal.
+
 Retrieval errors now explain the observed cancellation reason and operation
 stage or readiness-validation checkpoint when that information is available.
 
