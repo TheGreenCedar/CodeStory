@@ -5,8 +5,9 @@
 Fallback retrieval preserves the active search deadline and cancellation limits
 when prepared results are unavailable.
 
-Packet retrieval shares one latency allowance across its stages and stops
-starting retrieval work when that allowance runs out.
+Packet retrieval stops starting another stage when its latency allowance runs
+out. Cancellation and deadline checks also apply between mandatory readiness
+checks, without interrupting validation already in progress.
 
 Loading precise source evidence uses less temporary disk and rejects malformed
 record ordering.
