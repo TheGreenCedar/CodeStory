@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Fresh semantic indexes use less disk while existing indexes remain readable.
+
 Precise source evidence stores repeated names and paths once, reducing disk use
 while keeping existing indexes readable.
 

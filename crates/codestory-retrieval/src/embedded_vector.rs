@@ -1452,7 +1452,7 @@ fn write_database(
              dense_reason TEXT,
              vector BLOB NOT NULL,
              vector_sha256 TEXT NOT NULL
-         ) WITHOUT ROWID;
+         );
          CREATE TRIGGER vectors_vector_update_guard
          AFTER UPDATE OF vector ON vectors
          BEGIN
@@ -2716,6 +2716,81 @@ mod tests {
         }
     }
 
+    fn recreate_without_rowid_vector_database(source: &Path, destination: &Path) {
+        let parent = destination.parent().expect("legacy vector parent");
+        std::fs::create_dir_all(parent).expect("create legacy vector parent");
+        let connection = Connection::open(destination).expect("create legacy vector database");
+        let source = source.to_string_lossy().into_owned();
+        connection
+            .execute("ATTACH DATABASE ?1 AS source", [source])
+            .expect("attach fresh vector database");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=OFF;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE metadata (
+                     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     generation TEXT NOT NULL,
+                     input_hash TEXT NOT NULL,
+                     embedding_backend TEXT NOT NULL,
+                     embedding_dim INTEGER NOT NULL,
+                     point_count INTEGER NOT NULL,
+                     producer_identity TEXT NOT NULL,
+                     evidence_contract_identity TEXT NOT NULL,
+                     vector_digest TEXT NOT NULL,
+                     component_schema_version INTEGER NOT NULL,
+                     component_sha256 TEXT NOT NULL
+                 );
+                 CREATE TABLE vectors (
+                     node_id TEXT PRIMARY KEY NOT NULL,
+                     document_hash TEXT NOT NULL,
+                     display_name TEXT NOT NULL,
+                     file_path TEXT,
+                     file_role TEXT,
+                     dense_reason TEXT,
+                     vector BLOB NOT NULL,
+                     vector_sha256 TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TRIGGER vectors_vector_update_guard
+                 AFTER UPDATE OF vector ON vectors
+                 BEGIN
+                     UPDATE vectors SET vector_sha256 = 'invalid' WHERE node_id = NEW.node_id;
+                 END;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO metadata SELECT * FROM source.metadata;
+                 INSERT INTO vectors SELECT * FROM source.vectors ORDER BY node_id;
+                 COMMIT;
+                 PRAGMA optimize;",
+            )
+            .expect("recreate legacy vector database");
+        connection
+            .execute_batch("DETACH DATABASE source")
+            .expect("detach fresh vector database");
+        drop(connection);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(destination)
+            .expect("open legacy vector database for sync")
+            .sync_all()
+            .expect("sync legacy vector database");
+    }
+
+    fn sqlite_page_bytes(path: &Path) -> u64 {
+        let connection = open_read_only(path).expect("open vector database for page count");
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page size");
+        let page_count = connection
+            .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page count");
+        let page_size = u64::try_from(page_size).expect("positive vector page size");
+        let page_count = u64::try_from(page_count).expect("nonnegative vector page count");
+        page_size
+            .checked_mul(page_count)
+            .expect("vector page bytes")
+    }
+
     fn dense_manifest(
         core_generation_id: &str,
         core_run_id: &str,
@@ -3806,6 +3881,137 @@ mod tests {
                 "unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn rowid_vector_storage_preserves_old_layout_reuse_and_reduces_large_vector_pages() {
+        const POINT_COUNT: usize = 512;
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let dimension = crate::embeddings::RETRIEVAL_EMBEDDING_DIM;
+        let mut evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            dimension as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            dimension,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = (0..POINT_COUNT)
+            .map(|index| ExpectedVectorAnchor {
+                node_id: format!("node-{index:04}"),
+                document_hash: format!("document-{index:04}"),
+            })
+            .collect::<Vec<_>>();
+        let fresh_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "fresh",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                for (index, anchor) in expected.iter().enumerate() {
+                    let mut vector = vec![0.0_f32; dimension];
+                    vector[index % dimension] = 1.0;
+                    visit(attested_point(
+                        &anchor.node_id,
+                        &anchor.document_hash,
+                        vector,
+                    ))?;
+                }
+                Ok(())
+            },
+        )
+        .expect("build fresh large-vector component");
+        let fresh_path = index_path(&layout, "fresh");
+        let previous_path = index_path(&layout, "previous");
+        recreate_without_rowid_vector_database(&fresh_path, &previous_path);
+        let previous_attestation = validate_database(
+            &previous_path,
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected_anchor_map(&expected).expect("expected anchors"),
+            None,
+        )
+        .expect("validate previous physical layout");
+        assert_eq!(
+            fresh_attestation.component_sha256, previous_attestation.component_sha256,
+            "physical layout must not change the canonical vector component"
+        );
+        let previous_bytes = std::fs::read(&previous_path).expect("read previous layout");
+        evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "previous",
+            &VectorGenerationManifest::new(evidence.clone(), previous_attestation)
+                .expect("previous manifest"),
+        )
+        .expect("publish previous manifest");
+        let current_anchors = expected
+            .iter()
+            .map(|anchor| {
+                current_anchor(
+                    &anchor.node_id,
+                    &anchor.document_hash,
+                    &format!("symbol_{}", anchor.node_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outcome = crate::copy_on_write::with_clone_disabled(|| {
+            EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                AttestedVectorPublication {
+                    layout: &layout,
+                    collection: "current",
+                    generation: "generation-v2",
+                    input_hash: "input-v2",
+                    contract: &contract,
+                    expected_anchors: &expected,
+                },
+                "previous",
+                &evidence,
+                &current_anchors,
+                || Ok(()),
+                |_, _| panic!("unchanged old-layout vectors must not be produced again"),
+            )
+        })
+        .expect("reuse old-layout vectors")
+        .expect("direct-reference outcome");
+        assert!(outcome.1.direct_reference);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&index_path(&layout, "current"))
+                .expect("current identity")
+        );
+        assert_eq!(
+            std::fs::read(&previous_path).expect("previous after reuse"),
+            previous_bytes
+        );
+
+        let fresh_page_bytes = sqlite_page_bytes(&fresh_path);
+        let previous_page_bytes = sqlite_page_bytes(&previous_path);
+        assert!(
+            fresh_page_bytes.saturating_mul(10) <= previous_page_bytes.saturating_mul(9),
+            "fresh rowid layout must reduce large-vector pages by at least 10%: fresh={fresh_page_bytes}, previous={previous_page_bytes}"
+        );
     }
 
     #[test]
