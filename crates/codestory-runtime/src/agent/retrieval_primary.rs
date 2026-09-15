@@ -2328,10 +2328,8 @@ fn candidate_is_unindexed_lexical_artifact(
     storage: &Store,
     project_root: &Path,
     candidate: &CandidateHit,
-    resolution_label: &str,
 ) -> bool {
-    if resolution_label != "node_unresolved"
-        || candidate.source != CandidateSource::Lexical
+    if candidate.source != CandidateSource::Lexical
         || candidate.node_id.is_some()
         || candidate.symbol_name.is_some()
         || candidate.qualified_name.is_some()
@@ -2922,14 +2920,15 @@ fn resolve_sidecar_candidates_in_storage(
         } else {
             None
         };
-        if let (Some(identity_scope), Some(descriptor)) =
+        let descriptor_was_preadmitted = if let (Some(identity_scope), Some(descriptor)) =
             (identity_scope.as_ref(), descriptor.as_ref())
         {
             // The descriptor batch sealed the packet-wide session before this
             // hydration path began. A candidate missing from that admitted set
             // is rejected before even a path lookup or node read.
             match identity_scope.admit_descriptor(descriptor) {
-                PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
+                PacketAdmissionDecision::AlreadyAdmitted => true,
+                PacketAdmissionDecision::Admitted => false,
                 PacketAdmissionDecision::CountBudgetExceeded => {
                     unresolved_candidates.push((candidate, "candidate_count_exceeded"));
                     continue;
@@ -2939,7 +2938,9 @@ fn resolve_sidecar_candidates_in_storage(
                     continue;
                 }
             }
-        }
+        } else {
+            false
+        };
         let node_id = if let Some(descriptor) = descriptor.as_ref() {
             descriptor
                 .stable_identity
@@ -2964,7 +2965,11 @@ fn resolve_sidecar_candidates_in_storage(
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         };
         let Some(node_id) = node_id else {
-            let label = if path_resolvable {
+            let admitted_unindexed_lexical_artifact = descriptor_was_preadmitted
+                && candidate_is_unindexed_lexical_artifact(storage, project_root, candidate);
+            let label = if admitted_unindexed_lexical_artifact {
+                "node_unresolved"
+            } else if path_resolvable {
                 if identity_scope.is_some() {
                     "stable_identity_missing"
                 } else {
@@ -3008,7 +3013,8 @@ fn resolve_sidecar_candidates_in_storage(
         && unresolved_candidate_count == candidates.len()
         && attempted_candidate_indices.len() == candidates.len()
         && unresolved_candidates.iter().all(|(candidate, label)| {
-            candidate_is_unindexed_lexical_artifact(storage, project_root, candidate, label)
+            *label == "node_unresolved"
+                && candidate_is_unindexed_lexical_artifact(storage, project_root, candidate)
         });
     let blocking_unresolved_candidate_count = if unindexed_lexical_artifacts_only {
         0
@@ -3139,7 +3145,8 @@ mod tests {
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};
     use codestory_contracts::api::{
-        NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
+        AgentPacketRequestDto, NodeId, NodeKind as ApiNodeKind, PacketBudgetModeDto,
+        PacketDispositionKindDto, SearchHitOrigin, SearchTargetDto,
     };
     use codestory_retrieval::{
         CandidateHit, CandidateSource, QueryTrace, RetrievalCacheKey, RetrievalStageKind,
@@ -3213,6 +3220,59 @@ mod tests {
             state.project_root = Some(project.path().to_path_buf());
             state.storage_path = Some(storage_path.clone());
         }
+        PinnedOperationFixture {
+            _project: project,
+            _storage: storage,
+            _retrieval_cache: retrieval_cache,
+            storage_path,
+            controller,
+        }
+    }
+
+    fn public_packet_fixture_with_unindexed_lexical_artifact() -> PinnedOperationFixture {
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
+        let storage_path = storage.path().join("codestory.db");
+        std::fs::write(
+            project.path().join("metadata.rs"),
+            "// public packet freshness anchor\n",
+        )
+        .expect("write indexed freshness anchor");
+        std::fs::write(
+            project.path().join("LICENSE"),
+            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
+        )
+        .expect("write unindexed lexical artifact");
+        let mut runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Agent,
+            )
+        });
+        runtime.embedding.allow_cpu = true;
+        let controller = AppController::new_with_config(runtime.clone());
+        controller
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("bind public packet fixture");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(
+                codestory_contracts::api::IndexMode::Full,
+            )
+            .expect("publish public-ready complete core");
+        let manifest =
+            publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+                .expect("publish public-ready retrieval fixture");
+        assert_eq!(
+            manifest.dense_projection_count,
+            Some(0),
+            "public packet fixture must stay zero-dense and must not execute embeddings"
+        );
+
         PinnedOperationFixture {
             _project: project,
             _storage: storage,
@@ -4397,6 +4457,201 @@ mod tests {
                 "the retained result must authenticate the packet's exact publication"
             );
         });
+    }
+
+    #[test]
+    fn preadmitted_license_descriptor_preserves_the_internal_artifact_classification() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
+        let project_root = fixture._project.path();
+        let core = Store::open_read_only(&fixture.storage_path).expect("open pinned core");
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        let query =
+            "Which role is assumed by the control plane, and which is used by worker nodes?";
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries(&fixture.controller, &[query.to_string()], None)
+                .expect("preadmit LICENSE descriptor query");
+            let publication = pinned.session.publication_identity().clone();
+            let retained = session
+                .descriptor_result(query, true, &publication)
+                .expect("retain exact preadmitted query result");
+            assert_eq!(retained.query, query);
+            assert_eq!(retained.publication_identity.as_ref(), Some(&publication));
+            assert_eq!(retained.hits.len(), 1);
+            let candidate = &retained.hits[0];
+            assert_eq!(candidate.file_path, "LICENSE");
+            assert_eq!(candidate.source, CandidateSource::Lexical);
+            assert!(candidate.node_id.is_none());
+            assert!(candidate.symbol_name.is_none());
+            assert!(candidate.qualified_name.is_none());
+            assert!(candidate.target.is_none());
+            assert!(candidate.packet_descriptor().is_some());
+            assert!(candidate_is_unindexed_lexical_artifact(
+                &core,
+                project_root,
+                candidate,
+            ));
+
+            let (resolved_result, resolution) =
+                run_and_resolve_sidecar_query(&fixture.controller, query, 4, None)
+                    .expect("resolve the preadmitted LICENSE descriptor result");
+            assert_eq!(
+                resolved_result.publication_identity.as_ref(),
+                Some(&publication)
+            );
+            assert_eq!(resolved_result.hits.len(), 1);
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                1
+            );
+            assert!(resolution.resolved_hits.is_empty());
+            assert!(resolution.packet_hits.is_empty());
+            assert_eq!(resolution.unresolved_candidate_count, 1);
+            assert_eq!(resolution.blocking_unresolved_candidate_count, 0);
+            assert_eq!(resolution.attempted_candidate_indices, HashSet::from([0]));
+            assert!(
+                resolution.unindexed_lexical_artifacts_only,
+                "successful descriptor admission must preserve the narrow unindexed-artifact classification"
+            );
+        });
+    }
+
+    #[test]
+    fn packet_admission_rejects_hostile_unindexed_artifact_shapes() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = pinned_operation_fixture();
+        let project_root = fixture._project.path();
+        std::fs::create_dir_all(project_root.join("src")).expect("create source directory");
+        std::fs::write(project_root.join("LICENSE"), "license text\n")
+            .expect("write extensionless artifact");
+        std::fs::write(
+            project_root.join("src/unindexed.rs"),
+            "pub fn unindexed() {}\n",
+        )
+        .expect("write parser-routed source");
+        let outside = tempfile::tempdir().expect("outside root");
+        let outside_file = outside.path().join("FOREIGN");
+        std::fs::write(&outside_file, "foreign text\n").expect("write foreign file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, project_root.join("ESCAPE"))
+            .expect("create escaping symlink");
+        let storage = Store::open_read_only(&fixture.storage_path).expect("open pinned core");
+        let candidate = |path: String, source: CandidateSource| {
+            let mut candidate = CandidateHit::with_source(path, None, 0.8, source);
+            candidate.source_bytes_upper_bound = Some(64);
+            candidate
+        };
+
+        let regular_artifact = candidate("LICENSE".into(), CandidateSource::Lexical);
+        {
+            let session = Rc::new(PacketProofSession::new());
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            let outcome = resolve_sidecar_candidates_in_storage(
+                &storage,
+                &HashMap::new(),
+                project_root,
+                std::slice::from_ref(&regular_artifact),
+                1,
+            )
+            .expect("resolve freshly admitted artifact descriptor");
+            assert_eq!(session.receipts().len(), 1);
+            assert_eq!(outcome.blocking_unresolved_candidate_count, 1);
+            assert!(!outcome.unindexed_lexical_artifacts_only);
+        }
+        {
+            let session = Rc::new(PacketProofSession::new());
+            session.seal_retrieval_admission();
+            let _guard = install_packet_proof_session(session);
+            let outcome = resolve_sidecar_candidates_in_storage(
+                &storage,
+                &HashMap::new(),
+                project_root,
+                &[regular_artifact],
+                1,
+            )
+            .expect("reject sealed-unadmitted artifact descriptor");
+            assert_eq!(outcome.blocking_unresolved_candidate_count, 1);
+            assert!(!outcome.unindexed_lexical_artifacts_only);
+        }
+
+        let mut rows = vec![
+            (
+                "parser-routed source",
+                true,
+                candidate("src/unindexed.rs".into(), CandidateSource::Lexical),
+            ),
+            (
+                "missing path",
+                true,
+                candidate("MISSING".into(), CandidateSource::Lexical),
+            ),
+            (
+                "foreign path",
+                false,
+                candidate(
+                    outside_file.to_string_lossy().into_owned(),
+                    CandidateSource::Lexical,
+                ),
+            ),
+        ];
+        #[cfg(unix)]
+        rows.push((
+            "escaping symlink",
+            true,
+            candidate("ESCAPE".into(), CandidateSource::Lexical),
+        ));
+        let mut targeted = candidate("LICENSE".into(), CandidateSource::Lexical);
+        targeted.target = Some(SearchTargetDto::FileRange {
+            file_path: "LICENSE".into(),
+            start_byte: 0,
+            end_byte: 7,
+        });
+        rows.push(("target-bearing artifact", true, targeted));
+        let mut symbol = candidate("LICENSE".into(), CandidateSource::Lexical);
+        symbol.symbol_name = Some("license".into());
+        rows.push(("symbol-bearing artifact", true, symbol));
+        let mut semantic = candidate("LICENSE".into(), CandidateSource::Semantic);
+        semantic.node_id = Some("999999".into());
+        rows.push(("semantic candidate", true, semantic));
+        let mut malformed = candidate("LICENSE".into(), CandidateSource::Lexical);
+        malformed.node_id = Some("not-an-id".into());
+        rows.push(("malformed node identity", false, malformed));
+
+        for (name, preadmitted, candidate) in rows {
+            assert_eq!(
+                candidate.packet_descriptor().is_some(),
+                preadmitted,
+                "{name} descriptor eligibility"
+            );
+            let session = Rc::new(PacketProofSession::new());
+            admit_packet_candidate_descriptors(&session, [&candidate]);
+            assert_eq!(
+                session.receipts().len(),
+                if preadmitted { 1 } else { 0 },
+                "{name} preadmission receipt"
+            );
+            let _guard = install_packet_proof_session(session);
+            let outcome = resolve_sidecar_candidates_in_storage(
+                &storage,
+                &HashMap::new(),
+                project_root,
+                &[candidate],
+                1,
+            )
+            .unwrap_or_else(|error| panic!("{name} resolution failed: {error:?}"));
+            assert!(outcome.resolved_hits.is_empty(), "{name}");
+            assert_eq!(outcome.unresolved_candidate_count, 1, "{name}");
+            assert_eq!(outcome.blocking_unresolved_candidate_count, 1, "{name}");
+            assert!(!outcome.unindexed_lexical_artifacts_only, "{name}");
+        }
     }
 
     #[test]
@@ -6062,6 +6317,79 @@ mod tests {
         assert_eq!(
             sidecar_result_rejection_reason(&unresolved, &[]).as_deref(),
             Some("sidecar retrieval candidates did not resolve to indexed symbols")
+        );
+    }
+
+    #[test]
+    fn browser_packet_serves_unindexed_lexical_artifact_without_evidence() {
+        let question =
+            "Which role is assumed by the control plane, and which is used by worker nodes?";
+        let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
+        let project_root = fixture._project.path();
+        assert!(project_root.join("LICENSE").is_file());
+        assert!(!codestory_workspace::has_supported_source_route(Path::new(
+            "LICENSE"
+        )));
+        let core = Store::open_read_only(&fixture.storage_path).expect("open pinned core");
+        assert!(
+            candidate_lookup_paths(project_root, "LICENSE")
+                .into_iter()
+                .all(|path| matches!(core.get_file_by_path(&path), Ok(None))),
+            "LICENSE must be lexical-only and absent from every core lookup spelling"
+        );
+        drop(core);
+        let browser = fixture.controller.browser_service();
+
+        let packet = browser
+            .packet(AgentPacketRequestDto {
+                question: question.into(),
+                budget: PacketBudgetModeDto::Compact,
+                probes: Vec::new(),
+                latency_budget_ms: Some(30_000),
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "public packet must classify a real unindexed lexical artifact as an empty diagnostic result, got {}: {}",
+                    error.code, error.message
+                )
+            });
+
+        assert!(packet.support.is_empty());
+        assert!(packet.answer.citations.is_empty());
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .retrieval_publication
+                .is_some()
+        );
+        assert_eq!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::NotEstablished
+        );
+        assert_eq!(
+            packet.disposition.reason.as_deref(),
+            Some("no bounded repository evidence was retained")
+        );
+        assert!(packet.disposition.drill.is_none());
+        assert!(packet.disposition.omission_receipts.is_empty());
+        let shadow = packet
+            .answer
+            .retrieval_trace
+            .retrieval_shadow
+            .expect("public packet must retain aggregate sidecar diagnostics");
+        assert_eq!(shadow.retrieval_mode, "full");
+        assert_eq!(shadow.candidate_count, 1);
+        assert_eq!(shadow.resolved_hit_count, 0);
+        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert!(shadow.diagnostic_only);
+        assert!(
+            shadow.candidates.is_empty(),
+            "compact packet budgeting may omit verbose candidate rows while preserving aggregate diagnostics"
         );
     }
 

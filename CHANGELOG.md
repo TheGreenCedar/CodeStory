@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-Search reports no indexed evidence when its only matches are verified project
-files outside source indexing, instead of failing to resolve them as symbols.
+Search and packet requests report no indexed evidence when their only matches
+are verified project files outside source indexing, instead of failing to
+resolve them as symbols.
 
 Nested packet requests reuse their active publication instead of repeating
 admission and snapshot setup. Cancellation, deadlines and source-change checks
