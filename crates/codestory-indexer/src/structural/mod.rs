@@ -96,7 +96,7 @@ pub(crate) fn decode_structural_source(
     if bytes.contains(&0)
         || bytes
             .iter()
-            .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20))
+            .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20 && *byte != 0x1b))
     {
         return Err(StructuralCollectionError::Binary);
     }
@@ -480,6 +480,60 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn structural_decoder_accepts_escape_losslessly_and_preserves_hash_identity() {
+        let source = concat!(
+            "-- café terminal fixture\n",
+            "CREATE TABLE items(note TEXT);\n",
+            "INSERT INTO items VALUES ('\x1b[31mred\x1b[0m');\n",
+        );
+        let bytes = source.as_bytes().to_vec();
+
+        assert_eq!(
+            decode_structural_source(bytes.clone()).expect("valid UTF-8 ESC source"),
+            source
+        );
+        assert!(matches!(
+            decode_structural_source(b"SELECT 'nul\0byte';".to_vec()),
+            Err(StructuralCollectionError::Binary)
+        ));
+        for rejected_control in
+            (0_u8..=0x1f).filter(|byte| (*byte < 0x09 || *byte > 0x0d) && *byte != 0x1b)
+        {
+            let rejected = vec![b'S', b'E', b'L', b'E', b'C', b'T', b' ', rejected_control];
+            assert!(
+                matches!(
+                    decode_structural_source(rejected),
+                    Err(StructuralCollectionError::Binary)
+                ),
+                "control byte 0x{rejected_control:02x} must remain rejected"
+            );
+        }
+        assert!(matches!(
+            decode_structural_source(vec![0xff, 0xfe]),
+            Err(StructuralCollectionError::Binary)
+        ));
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("terminal.sql");
+        std::fs::write(&path, &bytes).expect("write SQL fixture");
+        let storage = index_structural_file(&path).expect("index SQL fixture containing ESC");
+        let expected_source_hash = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(storage.file_content_hashes.len(), 1);
+        assert_eq!(
+            storage.file_content_hashes[0].content_hash,
+            expected_source_hash
+        );
+        assert!(!storage.structural_text_units.is_empty());
+        assert!(
+            storage
+                .structural_text_units
+                .iter()
+                .all(|unit| unit.source_content_hash == expected_source_hash)
+        );
+        assert_eq!(std::fs::read(&path).expect("read SQL fixture"), bytes);
     }
 
     #[test]

@@ -3635,12 +3635,14 @@ pub(crate) fn render_snippet_markdown(
         }
     }
     append_verification_targets(&mut markdown, "verification_targets", verification_targets);
-    let fence = snippet_fence(&context.snippet);
+    markdown = markdown.replace('\u{1b}', "\\x1b");
+    let display_snippet = context.snippet.replace('\u{1b}', "\\x1b");
+    let fence = snippet_fence(&display_snippet);
     let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
     let snippet = if colorize {
-        ansi_highlight_snippet(&context.path, &context.snippet)
+        ansi_highlight_snippet(&context.path, &display_snippet)
     } else {
-        context.snippet.clone()
+        display_snippet
     };
     let _ = writeln!(markdown, "{snippet}");
     let _ = writeln!(markdown, "{fence}");
@@ -5429,6 +5431,67 @@ mod tests {
         ] {
             assert_eq!(snippet_language(path), expected, "{path}");
         }
+    }
+
+    #[test]
+    fn snippet_markdown_escapes_source_escape_without_changing_plain_text() {
+        let original_snippet =
+            "-- café\nSELECT '\u{1b}[31mred\u{1b}[0m'; -- \u{1b}]0;owned\u{1b}\\".to_string();
+        let mut node = sample_node_details("terminal-fixture", "terminal_fixture");
+        node.display_name = "terminal\u{1b}[2Jfixture".to_string();
+        node.serialized_name = node.display_name.clone();
+        let context = SnippetContextDto {
+            node,
+            path: "C:/repo/db/\u{1b}]0;header\u{1b}\\terminal.sql".to_string(),
+            line: 1,
+            snippet: original_snippet.clone(),
+            scope: codestory_contracts::api::SnippetScopeDto::LineContext,
+            requested_context: 8,
+            snippet_truncated: false,
+            max_snippet_bytes: Some(512),
+            range_source: None,
+            fallback_reason: None,
+            truncation_guidance: None,
+        };
+        let serialized_before = serde_json::to_vec(&context).unwrap();
+
+        let markdown = render_snippet_markdown(
+            Path::new("C:/repo"),
+            &sample_resolved_target(),
+            &context,
+            false,
+            &[],
+        );
+
+        assert!(!markdown.contains('\u{1b}'), "{markdown:?}");
+        assert!(markdown.contains(r"SELECT '\x1b[31mred\x1b[0m';"));
+        assert!(markdown.contains("-- café"));
+        assert!(markdown.contains(r"terminal\x1b[2Jfixture"));
+        assert!(markdown.contains(r"\x1b]0;header\x1b/terminal.sql"));
+        assert_eq!(context.snippet, original_snippet);
+
+        let colorized = render_snippet_markdown(
+            Path::new("C:/repo"),
+            &sample_resolved_target(),
+            &context,
+            true,
+            &[],
+        );
+        assert!(colorized.contains("\u{1b}[32m"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}[31m"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}[2J"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}]0;owned"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}]0;header"), "{colorized:?}");
+        assert!(colorized.contains(r"\x1b[31mred\x1b[0m"));
+        assert!(colorized.contains(r"\x1b]0;owned\x1b\"));
+
+        let serialized_after = serde_json::to_vec(&context).unwrap();
+        assert_eq!(serialized_after, serialized_before);
+        assert!(!serialized_after.contains(&0x1b));
+        let round_trip: SnippetContextDto = serde_json::from_slice(&serialized_after).unwrap();
+        assert_eq!(round_trip.snippet, context.snippet);
+        assert_eq!(round_trip.node.display_name, context.node.display_name);
+        assert_eq!(round_trip.path, context.path);
     }
 
     #[test]
