@@ -20,8 +20,10 @@ use codestory_indexer::CancellationToken;
 use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -121,6 +123,29 @@ fn run_before_retrieval_pin_test_hook() {}
 thread_local! {
     static ACTIVE_PUBLIC_OPERATION_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> =
         const { RefCell::new(None) };
+    static ACTIVE_PUBLIC_OPERATION_OWNER: RefCell<Option<ActivePublicOperationOwner>> =
+        const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct ActivePublicOperationOwner {
+    controller_identity: usize,
+    operation: String,
+    cancelled: Arc<AtomicBool>,
+    publication: ActivePublicOperationPublication,
+}
+
+struct ActivePublicOperationOwnerGuard {
+    previous: Option<ActivePublicOperationOwner>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for ActivePublicOperationOwnerGuard {
+    fn drop(&mut self) {
+        ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
 }
 
 struct ActivePublicOperationCancellationGuard {
@@ -147,6 +172,27 @@ fn with_public_operation_cancellation<T>(
     // only tolerable while the request's own cancellation can end the wait, so
     // the flag becomes the ambient one for every bounded acquisition below.
     codestory_contracts::bounded_locks::with_thread_cancellation(cancelled, build)
+}
+
+fn with_public_operation_owner<T>(
+    controller_identity: usize,
+    operation: &str,
+    publication: ActivePublicOperationPublication,
+    cancelled: Arc<AtomicBool>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let owner = ActivePublicOperationOwner {
+        controller_identity,
+        operation: operation.to_owned(),
+        cancelled: Arc::clone(&cancelled),
+        publication,
+    };
+    let previous = ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| active.replace(Some(owner)));
+    let _guard = ActivePublicOperationOwnerGuard {
+        previous,
+        _thread_bound: PhantomData,
+    };
+    with_public_operation_cancellation(cancelled, build)
 }
 
 pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> {
@@ -2295,6 +2341,64 @@ impl PublicOperationService {
         })
     }
 
+    /// Execute a browser packet directly under an already active packet
+    /// operation when the browser and its requested publications are exactly
+    /// the ones owned by that operation. The outer owner retains publication
+    /// retry, source revalidation, and response projection responsibility.
+    pub(crate) fn with_active_packet_owner<T>(
+        &self,
+        request: &AgentPacketRequestDto,
+        build: impl FnOnce() -> Result<T, ApiError>,
+    ) -> Option<Result<T, ApiError>> {
+        let owner = ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| active.borrow().clone())?;
+        if owner.operation != "packet" || owner.controller_identity != self.controller.identity() {
+            return None;
+        }
+        let active_cancellation = active_public_operation_cancellation()?;
+        if !Arc::ptr_eq(&active_cancellation, &owner.cancelled) {
+            return None;
+        }
+        let active_budget = crate::agent::packet_batch::active_packet_latency_budget()?;
+        let active_publication = self.active_publication()?;
+        if active_publication != owner.publication
+            || active_publication.retrieval_publication.is_none()
+            || request
+                .core_generation_id
+                .as_deref()
+                .is_some_and(|generation| {
+                    generation != active_publication.core_publication.generation_id.as_str()
+                })
+            || request
+                .retrieval_generation
+                .as_deref()
+                .is_some_and(|generation| {
+                    active_publication
+                        .retrieval_publication
+                        .as_ref()
+                        .is_none_or(|publication| {
+                            publication.retrieval_generation.as_str() != generation
+                        })
+                })
+        {
+            return None;
+        }
+        if owner.cancelled.load(Ordering::Acquire) {
+            return Some(Err(ApiError::new(
+                "cancelled",
+                "request cancelled before packet",
+            )));
+        }
+        if active_budget.remaining_for_handoff().is_none() {
+            return Some(Err(
+                crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                    &self.controller,
+                    "packet latency budget exhausted before public packet admission",
+                ),
+            ));
+        }
+        Some(build())
+    }
+
     pub(crate) fn focused_source_matches_current(
         &self,
         source: &codestory_contracts::api::FocusedSourceEvidenceDto,
@@ -2406,7 +2510,15 @@ impl PublicOperationService {
                         crate::agent::packet_batch::observe_packet_operation_span(
                             crate::agent::packet_batch::PacketOperationObservationSpan::BuildCallback,
                         );
-                    let value = with_public_operation_cancellation(
+                    let active_publication = self.active_publication().ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "active publication unavailable while running {operation}"
+                        ))
+                    })?;
+                    let value = with_public_operation_owner(
+                        self.controller.identity(),
+                        operation,
+                        active_publication,
                         Arc::clone(&cancelled),
                         &mut build,
                     );
@@ -4206,6 +4318,403 @@ pub(crate) mod activation_tests {
             core_generation_id: None,
             retrieval_generation: None,
         }
+    }
+
+    #[test]
+    fn packet_public_owner_reuses_outer_for_browser_and_projection() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let before = service
+                    .active_publication()
+                    .expect("outer packet owns its core and retrieval publication");
+                let packet = browser.packet(request.clone())?;
+                let after = service
+                    .active_publication()
+                    .expect("browser packet preserves the outer publication pins");
+                assert_eq!(after, before, "browser packet changed the outer pins");
+                let projection =
+                    crate::project_packet_v3(&service, "test", &request, &packet, |candidate| {
+                        serde_json::to_vec(candidate)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    })?;
+                Ok((projection, before))
+            })
+            .expect("outer packet execution and projection");
+
+        assert_eq!(
+            outer.core_publication.as_ref(),
+            Some(&outer.value.1.core_publication),
+            "projection must retain the outer core identity"
+        );
+        assert_eq!(
+            outer.retrieval_publication.as_ref(),
+            outer.value.1.retrieval_publication.as_ref(),
+            "projection must retain the outer retrieval identity"
+        );
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after the projected packet");
+        let outer_sequence = outer
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        let next_sequence = next
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        assert_eq!(
+            next_sequence,
+            outer_sequence + 1,
+            "the browser packet must reuse the outer public owner instead of consuming a second operation identity"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_direct_browser_keeps_an_independent_owner() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        assert!(
+            service.active_publication().is_none(),
+            "direct browser control must begin without borrowed pins"
+        );
+        let before = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation before direct browser packet");
+        browser
+            .packet(warm_packet_request())
+            .expect("direct browser packet owns its normal public operation");
+        assert!(
+            service.active_publication().is_none(),
+            "direct browser operation must restore its publication scope"
+        );
+        let after = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after direct browser packet");
+        let before_sequence = before
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        let after_sequence = after
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        assert_eq!(
+            after_sequence,
+            before_sequence + 2,
+            "a direct browser packet must consume exactly one independently owned public operation"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_rejects_an_unrelated_operation() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("context", Arc::new(AtomicBool::new(false)), || {
+                browser.packet(request.clone()).map(|_| ())
+            })
+            .expect("context operation and independent browser packet");
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after context");
+        let outer_sequence = outer
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        let next_sequence = next
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        assert_eq!(
+            next_sequence,
+            outer_sequence + 2,
+            "a non-packet outer operation must not lend its public owner to a browser packet"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_rejects_a_different_controller() {
+        let outer_fixture = ready_activation_fixture();
+        let other_fixture = ready_activation_fixture();
+        let outer_service = outer_fixture.runtime.public_operation_service();
+        let other_service = other_fixture.runtime.public_operation_service();
+        let other_browser = other_fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let before = other_service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("other controller operation before packet");
+        outer_service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                other_browser.packet(request.clone()).map(|_| ())
+            })
+            .expect("outer packet and independently owned other-controller packet");
+        let after = other_service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("other controller operation after packet");
+        let before_sequence = before
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        let after_sequence = after
+            .operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence");
+        assert_eq!(
+            after_sequence,
+            before_sequence + 2,
+            "a packet owner from another controller must not authorize direct execution"
+        );
+    }
+
+    fn public_operation_sequence(operation_id: &str) -> u64 {
+        operation_id
+            .strip_prefix("public-")
+            .expect("public operation id")
+            .parse::<u64>()
+            .expect("numeric public operation sequence")
+    }
+
+    #[test]
+    fn packet_public_owner_rejects_requested_core_generation_mismatch() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let mut request = warm_packet_request();
+        request.core_generation_id = Some("different-core-generation".to_owned());
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let packet = browser
+                    .packet(request.clone())
+                    .expect("independent packet reaches the existing projection guard");
+                let error =
+                    crate::project_packet_v3(&service, "test", &request, &packet, |_| Ok(0))
+                        .expect_err("mismatched core generation must not produce a projection");
+                assert_eq!(error.code, "internal");
+                assert!(
+                    error.message.contains("RequestedCoreGenerationMismatch"),
+                    "unexpected existing core-generation error: {error:?}"
+                );
+                Ok(())
+            })
+            .expect("outer packet survives a rejected nested request");
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after mismatched packet");
+        assert_eq!(
+            public_operation_sequence(&next.operation_id),
+            public_operation_sequence(&outer.operation_id) + 2,
+            "a mismatched core generation must use the independent fail-closed path"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_rejects_requested_retrieval_generation_mismatch() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let mut request = warm_packet_request();
+        request.retrieval_generation = Some("different-retrieval-generation".to_owned());
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let packet = browser
+                    .packet(request.clone())
+                    .expect("independent packet reaches the existing projection guard");
+                let error =
+                    crate::project_packet_v3(&service, "test", &request, &packet, |_| Ok(0))
+                        .expect_err(
+                            "mismatched retrieval generation must not produce a projection",
+                        );
+                assert_eq!(error.code, "internal");
+                assert!(
+                    error
+                        .message
+                        .contains("RequestedRetrievalGenerationMismatch"),
+                    "unexpected existing retrieval-generation error: {error:?}"
+                );
+                Ok(())
+            })
+            .expect("outer packet survives a rejected nested request");
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after mismatched packet");
+        assert_eq!(
+            public_operation_sequence(&next.operation_id),
+            public_operation_sequence(&outer.operation_id) + 2,
+            "a mismatched retrieval generation must use the independent fail-closed path"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_accepts_matching_explicit_generations() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let mut request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let publication = service
+                    .active_publication()
+                    .expect("outer packet publication");
+                request.core_generation_id =
+                    Some(publication.core_publication.generation_id.clone());
+                request.retrieval_generation = Some(
+                    publication
+                        .retrieval_publication
+                        .as_ref()
+                        .expect("outer retrieval publication")
+                        .retrieval_generation
+                        .clone(),
+                );
+                let packet = browser.packet(request.clone())?;
+                crate::project_packet_v3(&service, "test", &request, &packet, |_| Ok(0))?;
+                Ok(())
+            })
+            .expect("matching explicit generations reuse the outer owner");
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after matching packet");
+        assert_eq!(
+            public_operation_sequence(&next.operation_id),
+            public_operation_sequence(&outer.operation_id) + 1,
+            "matching explicit generations must not consume a nested public owner"
+        );
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn packet_public_owner_reuses_outer_for_benchmark_packet() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let outer = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let execution = browser.packet_for_benchmark(request.clone(), true)?;
+                assert!(!execution.packet.packet_id.is_empty());
+                assert!(execution.retrieval_proof.is_object());
+                Ok(())
+            })
+            .expect("benchmark packet reuses the outer owner");
+        let next = service
+            .run_with_cancel("graph", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("operation after benchmark packet");
+        assert_eq!(
+            public_operation_sequence(&next.operation_id),
+            public_operation_sequence(&outer.operation_id) + 1,
+            "benchmark packet must not consume a nested public owner"
+        );
+    }
+
+    #[test]
+    fn packet_public_owner_preserves_cancellation_precedence() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        service
+            .run_with_cancel("packet", Arc::clone(&cancelled), || {
+                cancelled.store(true, Ordering::Release);
+                let error = browser
+                    .packet(request.clone())
+                    .expect_err("borrowed packet observes outer cancellation");
+                cancelled.store(false, Ordering::Release);
+                assert_eq!(error.code, "cancelled");
+                assert_eq!(error.message, "request cancelled before packet");
+                Ok(())
+            })
+            .expect("outer packet completes after the test releases cancellation");
+    }
+
+    #[test]
+    fn packet_public_owner_refuses_an_expired_inherited_allowance() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let mut request = warm_packet_request();
+        request.latency_budget_ms = Some(2_000);
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                std::thread::sleep(Duration::from_millis(2_100));
+                let error = browser
+                    .packet(request.clone())
+                    .expect_err("borrowed packet refuses an expired allowance");
+                assert_eq!(error.code, "retrieval_unavailable");
+                assert!(
+                    error
+                        .message
+                        .contains("packet latency budget exhausted before public packet admission"),
+                    "unexpected expired-allowance error: {error:?}"
+                );
+                Ok(())
+            })
+            .expect("outer owner retains its post-build checks");
+    }
+
+    #[test]
+    fn packet_public_owner_restores_scoped_state_after_unwind() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _ =
+                service.run_with_cancel::<()>("packet", Arc::new(AtomicBool::new(false)), || {
+                    panic!("exercise active packet owner unwind restoration")
+                });
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| active.borrow().is_none()),
+            "packet owner must not outlive an unwound build callback"
+        );
+        assert!(
+            active_public_operation_cancellation().is_none(),
+            "packet owner unwind must restore the ambient cancellation scope"
+        );
     }
 
     #[test]

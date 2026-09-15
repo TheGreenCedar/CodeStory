@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nested packet requests reuse their active publication instead of repeating
+admission and snapshot setup. Cancellation, deadlines and source-change checks
+still apply to the complete response.
+
 Large fresh semantic indexes use less disk while existing indexes remain readable.
 
 Precise source evidence stores repeated names and paths once, reducing disk use
