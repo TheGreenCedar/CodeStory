@@ -678,6 +678,100 @@ mod tests {
     }
 
     #[test]
+    fn packet_entry_observation_emits_one_typed_outer_scope_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-correlation".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        tracing::subscriber::with_default(subscriber, || {
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+            let _outer = codestory_runtime::enter_packet_latency_scope(Some(2_000));
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+            {
+                let _nested = codestory_runtime::enter_packet_latency_scope(Some(120_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationJoinedRunning,
+                );
+            }
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(rows.len(), 1, "only the outer packet scope emits a receipt");
+        let fields = &rows[0]["fields"];
+        assert!(
+            fields["packet_entry_observation_id"]
+                .as_u64()
+                .is_some_and(|id| id > 0)
+        );
+        assert_eq!(fields["target_ms"], 2_000);
+        assert_eq!(fields["activation_join_count"], 1);
+        assert_ne!(fields["phase_mask"], 0);
+        assert_eq!(fields["message"], REDACTED);
+        assert_eq!(rows[0]["correlation_id"], "packet-entry-correlation");
+        Ok(())
+    }
+
+    #[test]
+    fn packet_entry_observation_unwind_isolates_the_next_outer_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-unwind".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        tracing::subscriber::with_default(subscriber, || {
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _first = codestory_runtime::enter_packet_latency_scope(Some(2_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+                );
+                panic!("exercise packet observation unwind cleanup");
+            }));
+            assert!(unwind.is_err());
+
+            {
+                let _second = codestory_runtime::enter_packet_latency_scope(Some(4_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationJoinedRunning,
+                );
+            }
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(
+            rows.len(),
+            2,
+            "nonpacket observation must not emit a receipt"
+        );
+        let first = &rows[0]["fields"];
+        let second = &rows[1]["fields"];
+        assert_eq!(first["target_ms"], 2_000);
+        assert_eq!(first["phase_mask"], 1);
+        assert_eq!(second["target_ms"], 4_000);
+        assert_eq!(second["phase_mask"], 1_u64 << 3);
+        assert_eq!(second["activation_join_count"], 1);
+        assert_ne!(
+            first["packet_entry_observation_id"], second["packet_entry_observation_id"],
+            "each outer packet scope needs a distinct request sequence"
+        );
+        assert_eq!(second["project_selection_completed_ms"], 0);
+        Ok(())
+    }
+
+    #[test]
     fn command_failure_drops_unlabeled_private_text_without_a_digest() -> Result<()> {
         let record = command_failure_record(&anyhow::anyhow!("unlabeled private query"));
         let encoded = serde_json::to_string(&record)?;

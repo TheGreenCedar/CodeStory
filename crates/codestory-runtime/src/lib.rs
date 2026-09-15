@@ -420,7 +420,10 @@ pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRun
     )
 }
 #[doc(hidden)]
-pub use agent::packet_batch::{PacketLatencyScopeGuard, enter_packet_latency_scope};
+pub use agent::packet_batch::{
+    PacketEntryObservationPhase, PacketLatencyScopeGuard, enter_packet_latency_scope,
+    observe_packet_entry_phase,
+};
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
