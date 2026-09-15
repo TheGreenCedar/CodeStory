@@ -27,9 +27,9 @@ use codestory_contracts::graph::{
 use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
     CandidateGraphDirection, CandidateHit, CandidateSource, PinnedQuerySession, QueryBatchItem,
-    QueryRequest, QueryResult, QueryTrace, SidecarProfile,
+    QueryRequest, QueryResult, QueryTrace, SidecarProfile, deferred_full_readiness_stop_message,
     execute_retrieval_query_with_cache_for_runtime, is_phantom_sidecar_hit,
-    is_retrieval_publication_changed, sidecar_project_id_for_root,
+    is_retrieval_publication_changed, retrieval_stop_message, sidecar_project_id_for_root,
     strict_descriptor_sidecar_status_for_runtime, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
@@ -353,10 +353,30 @@ impl PinnedRetrievalRead {
 }
 
 fn map_pinned_query_error(error: AnyhowError) -> ApiError {
+    map_pinned_query_error_at(error, PinnedRetrievalStopBoundary::Unknown)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedRetrievalStopBoundary {
+    Unknown,
+    DeferredFullReadiness,
+}
+
+fn map_pinned_query_error_at(
+    error: AnyhowError,
+    boundary: PinnedRetrievalStopBoundary,
+) -> ApiError {
     if let Some(error) = crate::services::embedding_api_error(&error) {
         error
     } else if is_retrieval_publication_changed(&error) {
         ApiError::new("publication_changed", error.to_string())
+    } else if let Some(message) = match boundary {
+        PinnedRetrievalStopBoundary::Unknown => retrieval_stop_message(&error),
+        PinnedRetrievalStopBoundary::DeferredFullReadiness => {
+            deferred_full_readiness_stop_message(&error)
+        }
+    } {
+        ApiError::new("cache_busy", message)
     } else {
         ApiError::new("cache_busy", error.to_string())
     }
@@ -951,7 +971,12 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                     readiness_deadline,
                     Arc::clone(&request_cancelled),
                 )
-                .map_err(map_pinned_query_error)?;
+                .map_err(|error| {
+                    map_pinned_query_error_at(
+                        error,
+                        PinnedRetrievalStopBoundary::DeferredFullReadiness,
+                    )
+                })?;
         }
         return Ok(());
     }
@@ -1065,7 +1090,9 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                 readiness_deadline,
                 Arc::clone(&request_cancelled),
             )
-            .map_err(map_pinned_query_error)?;
+            .map_err(|error| {
+                map_pinned_query_error_at(error, PinnedRetrievalStopBoundary::DeferredFullReadiness)
+            })?;
         Ok(())
     })
 }

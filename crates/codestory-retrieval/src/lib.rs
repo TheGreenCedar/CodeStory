@@ -384,6 +384,8 @@ pub use sidecar::{
     sidecar_status, strict_descriptor_sidecar_status_for_runtime, strict_sidecar_status,
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
-pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
+pub use sidecar_search::{
+    LiveSidecarSearch, SidecarSearch, deferred_full_readiness_stop_message, retrieval_stop_message,
+};
 
 pub use codestory_store::RetrievalIndexManifest;

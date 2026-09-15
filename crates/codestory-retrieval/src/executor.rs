@@ -433,22 +433,23 @@ impl<'a> QueryExecutor<'a> {
         payload: CandidatePayloadMode,
     ) -> Result<Vec<CandidateHit>> {
         let query = &features.raw_query;
+        let context = context.clone().with_stage_boundary(stage.kind.label());
         match stage.kind {
             RetrievalStageKind::Stage0ScipAnchor => {
-                sidecars.scip_anchor_with_context(query, stage.top_k, context)
+                sidecars.scip_anchor_with_context(query, stage.top_k, &context)
             }
             RetrievalStageKind::Stage1Lexical => {
                 if payload.is_descriptor() {
-                    sidecars.lexical_descriptor_search_with_context(query, stage.top_k, context)
+                    sidecars.lexical_descriptor_search_with_context(query, stage.top_k, &context)
                 } else {
-                    sidecars.lexical_search_with_context(query, stage.top_k, context)
+                    sidecars.lexical_search_with_context(query, stage.top_k, &context)
                 }
             }
             RetrievalStageKind::Stage1bSemantic => {
-                sidecars.semantic_search_with_context(query, stage.top_k, context)
+                sidecars.semantic_search_with_context(query, stage.top_k, &context)
             }
             RetrievalStageKind::Stage2ScipExpand => {
-                sidecars.scip_expand_with_context(anchors, stage.top_k, context)
+                sidecars.scip_expand_with_context(anchors, stage.top_k, &context)
             }
             RetrievalStageKind::Stage3RepoTextFallback => {
                 bail!("repo-text diagnostic stage is unsupported in mandatory sidecar retrieval")
@@ -3050,6 +3051,36 @@ mod tests {
                     _ => false,
                 }
         }));
+    }
+
+    #[test]
+    fn entered_stage_is_preserved_on_typed_stop_error() {
+        let stage = PlannedStage {
+            kind: RetrievalStageKind::Stage1bSemantic,
+            budget_ms: 250,
+            top_k: 8,
+        };
+        let request_cancelled = Arc::new(AtomicBool::new(false));
+        let stage_cancelled = Arc::new(AtomicBool::new(true));
+        let context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(1),
+            request_cancelled,
+            stage_cancelled,
+        );
+        let error = QueryExecutor::run_stage(
+            &MockSidecarSearch::default(),
+            &stage,
+            &classify_query("explain semantic retrieval"),
+            &[],
+            &context,
+            CandidatePayloadMode::DescriptorOnly,
+        )
+        .expect_err("entered semantic stage must preserve its stop boundary");
+
+        assert_eq!(
+            error.to_string(),
+            "retrieval stopped: reason=stage_cancelled stage=stage1b_semantic"
+        );
     }
 
     #[test]

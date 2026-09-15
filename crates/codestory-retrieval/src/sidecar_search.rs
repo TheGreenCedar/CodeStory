@@ -11,12 +11,96 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalStopReason {
+    RequestCancelled,
+    StageCancelled,
+    Deadline,
+}
+
+impl RetrievalStopReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RequestCancelled => "request_cancelled",
+            Self::StageCancelled => "stage_cancelled",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalStopBoundary {
+    Unknown,
+    Stage(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetrievalStopError {
+    reason: RetrievalStopReason,
+    boundary: RetrievalStopBoundary,
+}
+
+impl RetrievalStopError {
+    fn message(self, unknown_boundary: Option<&str>) -> String {
+        match self.boundary {
+            RetrievalStopBoundary::Unknown => unknown_boundary.map_or_else(
+                || {
+                    format!(
+                        "retrieval stopped: reason={} boundary=unknown",
+                        self.reason.label()
+                    )
+                },
+                |phase| {
+                    format!(
+                        "retrieval stopped: reason={} phase={phase}",
+                        self.reason.label()
+                    )
+                },
+            ),
+            RetrievalStopBoundary::Stage(stage) => {
+                format!(
+                    "retrieval stopped: reason={} stage={stage}",
+                    self.reason.label()
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RetrievalStopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message(None))
+    }
+}
+
+impl std::error::Error for RetrievalStopError {}
+
+fn retrieval_stop_message_with_unknown_phase(
+    error: &anyhow::Error,
+    unknown_phase: Option<&'static str>,
+) -> Option<String> {
+    error
+        .downcast_ref::<RetrievalStopError>()
+        .map(|stop| stop.message(unknown_phase))
+}
+
+/// Preserve a typed retrieval stop through anyhow context while leaving unrelated errors alone.
+pub fn retrieval_stop_message(error: &anyhow::Error) -> Option<String> {
+    retrieval_stop_message_with_unknown_phase(error, None)
+}
+
+/// Name deferred full-readiness only when its runtime call boundary was entered.
+pub fn deferred_full_readiness_stop_message(error: &anyhow::Error) -> Option<String> {
+    retrieval_stop_message_with_unknown_phase(error, Some("deferred_full_readiness"))
+}
+
 /// Request-scoped deadline and cancellation state shared by retrieval stages and sidecar I/O.
 #[derive(Debug, Clone)]
 pub struct SearchExecutionContext {
     deadline: Instant,
     request_cancelled: Arc<AtomicBool>,
     stage_cancelled: Arc<AtomicBool>,
+    boundary: RetrievalStopBoundary,
 }
 
 impl SearchExecutionContext {
@@ -29,18 +113,38 @@ impl SearchExecutionContext {
             deadline,
             request_cancelled,
             stage_cancelled,
+            boundary: RetrievalStopBoundary::Unknown,
+        }
+    }
+
+    pub(crate) fn with_stage_boundary(mut self, stage: &'static str) -> Self {
+        self.boundary = RetrievalStopBoundary::Stage(stage);
+        self
+    }
+
+    fn stop_reason(&self) -> Option<RetrievalStopReason> {
+        if self.request_cancelled.load(Ordering::Acquire) {
+            Some(RetrievalStopReason::RequestCancelled)
+        } else if self.stage_cancelled.load(Ordering::Acquire) {
+            Some(RetrievalStopReason::StageCancelled)
+        } else if Instant::now() >= self.deadline {
+            Some(RetrievalStopReason::Deadline)
+        } else {
+            None
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.request_cancelled.load(Ordering::Acquire)
-            || self.stage_cancelled.load(Ordering::Acquire)
-            || Instant::now() >= self.deadline
+        self.stop_reason().is_some()
     }
 
     pub fn check_cancelled(&self) -> Result<()> {
-        if self.is_cancelled() {
-            anyhow::bail!("retrieval stage cancelled or deadline exceeded");
+        if let Some(reason) = self.stop_reason() {
+            return Err(RetrievalStopError {
+                reason,
+                boundary: self.boundary,
+            }
+            .into());
         }
         Ok(())
     }
@@ -526,6 +630,58 @@ mod tests {
             full_retrieval_allowed: true,
             degraded_reason: None,
         }
+    }
+
+    #[test]
+    fn search_context_preserves_the_observed_stop_predicate() {
+        let future = Instant::now() + Duration::from_secs(1);
+        let request = Arc::new(AtomicBool::new(true));
+        let stage = Arc::new(AtomicBool::new(true));
+        let error = SearchExecutionContext::new(future, request, stage)
+            .check_cancelled()
+            .expect_err("request cancellation must stop retrieval");
+        assert_eq!(
+            error.to_string(),
+            "retrieval stopped: reason=request_cancelled boundary=unknown"
+        );
+
+        let request = Arc::new(AtomicBool::new(false));
+        let stage = Arc::new(AtomicBool::new(true));
+        let error = SearchExecutionContext::new(future, request, stage)
+            .check_cancelled()
+            .expect_err("stage cancellation must stop retrieval");
+        assert_eq!(
+            error.to_string(),
+            "retrieval stopped: reason=stage_cancelled boundary=unknown"
+        );
+
+        let request = Arc::new(AtomicBool::new(false));
+        let stage = Arc::new(AtomicBool::new(false));
+        let error = SearchExecutionContext::new(Instant::now(), request, stage)
+            .check_cancelled()
+            .expect_err("expired deadline must stop retrieval");
+        assert_eq!(
+            error.to_string(),
+            "retrieval stopped: reason=deadline boundary=unknown"
+        );
+    }
+
+    #[test]
+    fn zero_timeout_allowance_does_not_invent_an_expired_deadline() {
+        let context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let error = context
+            .timeout(Duration::ZERO)
+            .expect_err("a zero caller allowance cannot produce a usable timeout");
+
+        assert_eq!(error.to_string(), "retrieval stage deadline exceeded");
+        assert!(
+            retrieval_stop_message(&error).is_none(),
+            "zero caller allowance is not an observed stop predicate"
+        );
     }
 
     #[test]
