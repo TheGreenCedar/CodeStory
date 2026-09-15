@@ -163,6 +163,12 @@ impl ReadOnlyBrowserService {
     }
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        if let Some(result) = self
+            .public_operation
+            .with_active_packet_owner(&req, || self.controller.agent_packet(req.clone()))
+        {
+            return result;
+        }
         let _latency_scope = crate::enter_packet_latency_scope(req.latency_budget_ms);
         self.run_public("packet", || self.controller.agent_packet(req.clone()))
     }
@@ -176,6 +182,23 @@ impl ReadOnlyBrowserService {
         req: AgentPacketRequestDto,
         include_dense_semantic: bool,
     ) -> Result<BenchmarkPacketExecution, ApiError> {
+        if let Some(result) = self.public_operation.with_active_packet_owner(&req, || {
+            let execution = self
+                .controller
+                .agent_packet_for_benchmark(req.clone(), include_dense_semantic)?;
+            Ok(BenchmarkPacketExecution {
+                packet: execution.packet,
+                retrieval_proof: serde_json::to_value(execution.retrieval_proof).map_err(
+                    |error| {
+                        ApiError::internal(format!(
+                            "serialize benchmark packet retrieval proof: {error}"
+                        ))
+                    },
+                )?,
+            })
+        }) {
+            return result;
+        }
         let _latency_scope = crate::enter_packet_latency_scope(req.latency_budget_ms);
         self.run_public("packet", || {
             let execution = self
