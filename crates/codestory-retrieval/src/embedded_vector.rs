@@ -1427,7 +1427,8 @@ fn write_database(
     let persistence_started = Instant::now();
     connection
         .execute_batch(
-            "PRAGMA journal_mode=OFF;
+            "PRAGMA page_size=16384;
+         PRAGMA journal_mode=OFF;
          PRAGMA synchronous=FULL;
          CREATE TABLE metadata (
              singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -2716,7 +2717,13 @@ mod tests {
         }
     }
 
-    fn recreate_without_rowid_vector_database(source: &Path, destination: &Path) {
+    fn recreate_vector_database(
+        source: &Path,
+        destination: &Path,
+        page_size: u64,
+        without_rowid: bool,
+    ) {
+        assert!(matches!(page_size, 4096 | 16384));
         let parent = destination.parent().expect("legacy vector parent");
         std::fs::create_dir_all(parent).expect("create legacy vector parent");
         let connection = Connection::open(destination).expect("create legacy vector database");
@@ -2724,9 +2731,11 @@ mod tests {
         connection
             .execute("ATTACH DATABASE ?1 AS source", [source])
             .expect("attach fresh vector database");
+        let rowid_suffix = if without_rowid { " WITHOUT ROWID" } else { "" };
         connection
-            .execute_batch(
-                "PRAGMA journal_mode=OFF;
+            .execute_batch(&format!(
+                "PRAGMA page_size={page_size};
+                 PRAGMA journal_mode=OFF;
                  PRAGMA synchronous=FULL;
                  CREATE TABLE metadata (
                      singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -2751,7 +2760,7 @@ mod tests {
                      dense_reason TEXT,
                      vector BLOB NOT NULL,
                      vector_sha256 TEXT NOT NULL
-                 ) WITHOUT ROWID;
+                 ){rowid_suffix};
                  CREATE TRIGGER vectors_vector_update_guard
                  AFTER UPDATE OF vector ON vectors
                  BEGIN
@@ -2761,8 +2770,8 @@ mod tests {
                  INSERT INTO metadata SELECT * FROM source.metadata;
                  INSERT INTO vectors SELECT * FROM source.vectors ORDER BY node_id;
                  COMMIT;
-                 PRAGMA optimize;",
-            )
+                 PRAGMA optimize;"
+            ))
             .expect("recreate legacy vector database");
         connection
             .execute_batch("DETACH DATABASE source")
@@ -2774,6 +2783,14 @@ mod tests {
             .expect("open legacy vector database for sync")
             .sync_all()
             .expect("sync legacy vector database");
+    }
+
+    fn recreate_without_rowid_vector_database(source: &Path, destination: &Path) {
+        recreate_vector_database(source, destination, 4096, true);
+    }
+
+    fn recreate_four_kib_rowid_vector_database(source: &Path, destination: &Path) {
+        recreate_vector_database(source, destination, 4096, false);
     }
 
     fn sqlite_page_bytes(path: &Path) -> u64 {
@@ -2789,6 +2806,14 @@ mod tests {
         page_size
             .checked_mul(page_count)
             .expect("vector page bytes")
+    }
+
+    fn sqlite_page_size(path: &Path) -> u64 {
+        let connection = open_read_only(path).expect("open vector database for page size");
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page size");
+        u64::try_from(page_size).expect("positive vector page size")
     }
 
     fn dense_manifest(
@@ -3884,7 +3909,7 @@ mod tests {
     }
 
     #[test]
-    fn rowid_vector_storage_preserves_old_layout_reuse_and_reduces_large_vector_pages() {
+    fn fresh_semantic_page_density_preserves_legacy_and_four_kib_reuse() {
         const POINT_COUNT: usize = 512;
         let root = tempdir().expect("tempdir");
         let layout = layout(root.path());
@@ -3935,8 +3960,24 @@ mod tests {
         )
         .expect("build fresh large-vector component");
         let fresh_path = index_path(&layout, "fresh");
+        let legacy_path = index_path(&layout, "legacy");
+        recreate_without_rowid_vector_database(&fresh_path, &legacy_path);
+        let legacy_attestation = validate_database(
+            &legacy_path,
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected_anchor_map(&expected).expect("legacy expected anchors"),
+            None,
+        )
+        .expect("validate legacy physical layout");
+        assert_eq!(
+            fresh_attestation.component_sha256, legacy_attestation.component_sha256,
+            "legacy layout must retain the canonical vector component"
+        );
+
         let previous_path = index_path(&layout, "previous");
-        recreate_without_rowid_vector_database(&fresh_path, &previous_path);
+        recreate_four_kib_rowid_vector_database(&fresh_path, &previous_path);
         let previous_attestation = validate_database(
             &previous_path,
             "generation-v1",
@@ -3948,7 +3989,7 @@ mod tests {
         .expect("validate previous physical layout");
         assert_eq!(
             fresh_attestation.component_sha256, previous_attestation.component_sha256,
-            "physical layout must not change the canonical vector component"
+            "page geometry must not change the canonical vector component"
         );
         let previous_bytes = std::fs::read(&previous_path).expect("read previous layout");
         evidence.publication = EmbeddingVectorPublicationIdentityDto {
@@ -4009,9 +4050,11 @@ mod tests {
         let fresh_page_bytes = sqlite_page_bytes(&fresh_path);
         let previous_page_bytes = sqlite_page_bytes(&previous_path);
         assert!(
-            fresh_page_bytes.saturating_mul(10) <= previous_page_bytes.saturating_mul(9),
-            "fresh rowid layout must reduce large-vector pages by at least 10%: fresh={fresh_page_bytes}, previous={previous_page_bytes}"
+            fresh_page_bytes.saturating_mul(20) <= previous_page_bytes.saturating_mul(17),
+            "fresh page geometry must reduce a four-KiB large-vector baseline by at least 15%: fresh={fresh_page_bytes}, previous={previous_page_bytes}"
         );
+        assert_eq!(sqlite_page_size(&fresh_path), 16 * 1024);
+        assert_eq!(sqlite_page_size(&previous_path), 4 * 1024);
     }
 
     #[test]
