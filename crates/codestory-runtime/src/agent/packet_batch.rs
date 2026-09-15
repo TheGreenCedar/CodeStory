@@ -73,6 +73,10 @@ struct PacketEntryObservation {
     attempt_started_count: u64,
     retry_publication_changed_count: u64,
     retry_cache_busy_count: u64,
+    descriptor_preadmission_observed_count: u64,
+    descriptor_preadmission_query_count: u64,
+    descriptor_health_resolution_wall_ms: u64,
+    descriptor_query_batch_wall_ms: u64,
     complete_core_snapshot: PacketOperationSpanObservation,
     uncached_freshness: PacketOperationSpanObservation,
     retrieval_pin: PacketOperationSpanObservation,
@@ -135,6 +139,25 @@ fn update_packet_operation_observation(update: impl FnOnce(&mut PacketEntryObser
             update(&mut observation);
             active.set(Some(observation));
         }
+    });
+}
+
+pub(crate) fn observe_packet_descriptor_preadmission(
+    query_count: u64,
+    health_resolution_wall_ms: u64,
+    query_batch_wall_ms: u64,
+) {
+    if query_count == 0 {
+        return;
+    }
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_preadmission_observed_count != 0 {
+            return;
+        }
+        observation.descriptor_preadmission_observed_count = 1;
+        observation.descriptor_preadmission_query_count = query_count;
+        observation.descriptor_health_resolution_wall_ms = health_resolution_wall_ms;
+        observation.descriptor_query_batch_wall_ms = query_batch_wall_ms;
     });
 }
 
@@ -463,6 +486,13 @@ impl Drop for PacketLatencyScopeGuard {
                     attempt_started_count = observation.attempt_started_count,
                     retry_publication_changed_count = observation.retry_publication_changed_count,
                     retry_cache_busy_count = observation.retry_cache_busy_count,
+                    descriptor_preadmission_observed_count =
+                        observation.descriptor_preadmission_observed_count,
+                    descriptor_preadmission_query_count =
+                        observation.descriptor_preadmission_query_count,
+                    descriptor_health_resolution_wall_ms =
+                        observation.descriptor_health_resolution_wall_ms,
+                    descriptor_query_batch_wall_ms = observation.descriptor_query_batch_wall_ms,
                     complete_core_snapshot_started_count =
                         observation.complete_core_snapshot.started_count,
                     complete_core_snapshot_succeeded_count =
@@ -539,6 +569,10 @@ pub(crate) struct PacketOperationObservationTestSnapshot {
     pub(crate) attempt_started_count: u64,
     pub(crate) retry_publication_changed_count: u64,
     pub(crate) retry_cache_busy_count: u64,
+    pub(crate) descriptor_preadmission_observed_count: u64,
+    pub(crate) descriptor_preadmission_query_count: u64,
+    pub(crate) descriptor_health_resolution_wall_ms: u64,
+    pub(crate) descriptor_query_batch_wall_ms: u64,
     pub(crate) complete_core_snapshot_started_count: u64,
     pub(crate) complete_core_snapshot_succeeded_count: u64,
     pub(crate) uncached_freshness_started_count: u64,
@@ -570,6 +604,13 @@ pub(crate) fn packet_operation_observation_for_test()
                 attempt_started_count: observation.attempt_started_count,
                 retry_publication_changed_count: observation.retry_publication_changed_count,
                 retry_cache_busy_count: observation.retry_cache_busy_count,
+                descriptor_preadmission_observed_count: observation
+                    .descriptor_preadmission_observed_count,
+                descriptor_preadmission_query_count: observation
+                    .descriptor_preadmission_query_count,
+                descriptor_health_resolution_wall_ms: observation
+                    .descriptor_health_resolution_wall_ms,
+                descriptor_query_batch_wall_ms: observation.descriptor_query_batch_wall_ms,
                 complete_core_snapshot_started_count: observation
                     .complete_core_snapshot
                     .started_count,
@@ -753,6 +794,47 @@ mod packet_latency_budget_tests {
     }
 
     #[test]
+    fn packet_descriptor_preadmission_observation_is_owned_initial_only_and_drop_safe() {
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+        {
+            let _latency = enter_packet_latency_scope(Some(2_000));
+            observe_packet_descriptor_preadmission(0, 3, 5);
+            let empty = packet_operation_observation_for_test()
+                .expect("outer packet observation exists before product work");
+            assert_eq!(empty.descriptor_preadmission_observed_count, 0);
+
+            {
+                let _nonpacket = enter_packet_public_operation_observation("search");
+                observe_packet_descriptor_preadmission(7, 11, 13);
+            }
+            let nonpacket = packet_operation_observation_for_test()
+                .expect("non-packet operation leaves the packet receipt active");
+            assert_eq!(nonpacket.descriptor_preadmission_observed_count, 0);
+
+            {
+                let _packet = enter_packet_public_operation_observation("packet");
+                observe_packet_descriptor_preadmission(2, 17, 19);
+                {
+                    let _nested = enter_packet_public_operation_observation("packet");
+                    observe_packet_descriptor_preadmission(9, 23, 29);
+                }
+                observe_packet_descriptor_preadmission(4, 31, 37);
+            }
+
+            let observed = packet_operation_observation_for_test()
+                .expect("initial descriptor observation survives operation exit");
+            assert_eq!(observed.descriptor_preadmission_observed_count, 1);
+            assert_eq!(observed.descriptor_preadmission_query_count, 2);
+            assert_eq!(observed.descriptor_health_resolution_wall_ms, 17);
+            assert_eq!(observed.descriptor_query_batch_wall_ms, 19);
+        }
+        assert!(
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
+            "outer latency-scope drop must clear the descriptor observation"
+        );
+    }
+
+    #[test]
     fn packet_operation_observation_is_owned_by_the_outer_packet_operation() {
         let _latency = enter_packet_latency_scope(Some(2_000));
         let unwind = catch_unwind(AssertUnwindSafe(|| {
@@ -784,6 +866,8 @@ mod packet_latency_budget_tests {
         assert_eq!(observation.public_admission_refused_count, 0);
         assert_eq!(observation.attempt_started_count, 1);
         assert_eq!(observation.retry_cache_busy_count, 0);
+        assert_eq!(observation.descriptor_preadmission_observed_count, 0);
+        assert_eq!(observation.descriptor_preadmission_query_count, 0);
         assert_eq!(observation.build_callback_started_count, 1);
         assert_eq!(observation.build_callback_succeeded_count, 1);
 
