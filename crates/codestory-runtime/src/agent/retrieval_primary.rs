@@ -4412,7 +4412,7 @@ mod tests {
             assert_eq!(error.code, "cache_busy");
             assert_eq!(
                 error.message,
-                "retrieval stopped: reason=deadline phase=deferred_full_readiness"
+                "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry"
             );
         });
     }

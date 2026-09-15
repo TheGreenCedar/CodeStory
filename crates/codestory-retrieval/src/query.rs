@@ -306,7 +306,10 @@ impl PinnedQuerySession {
     /// Compatibility seam for carrying the retrieval request's existing
     /// deadline and cancellation state through deferred packet readiness.
     fn validate_full_readiness_with_context(&self, context: &SearchExecutionContext) -> Result<()> {
-        context.check_cancelled()?;
+        context
+            .clone()
+            .with_stage_boundary("deferred_full_readiness_entry")
+            .check_cancelled()?;
         let producer_compatibility_identity =
             crate::embedded_vector::vector_producer_compatibility_identity(
                 &self.embedding_device,
@@ -314,7 +317,10 @@ impl PinnedQuerySession {
                 u32::try_from(crate::embeddings::semantic_vector_dim())
                     .context("embedding dimension exceeds evidence contract")?,
             )?;
-        context.check_cancelled()?;
+        context
+            .clone()
+            .with_stage_boundary("deferred_full_readiness_after_producer_identity")
+            .check_cancelled()?;
         self.validate_full_readiness_with_identity(&producer_compatibility_identity, Some(context))
     }
 
@@ -339,7 +345,12 @@ impl PinnedQuerySession {
         context: Option<&SearchExecutionContext>,
     ) -> Result<()> {
         if let Some(context) = context {
-            context.check_cancelled()?;
+            context
+                .clone()
+                .with_stage_boundary(
+                    "deferred_full_readiness_before_cached_success_or_strict_validation",
+                )
+                .check_cancelled()?;
         }
         if self.full_readiness_validated.get() {
             return Ok(());
@@ -357,7 +368,10 @@ impl PinnedQuerySession {
             );
         }
         if let Some(context) = context {
-            context.check_cancelled()?;
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_strict_validation")
+                .check_cancelled()?;
         }
         let core_publication = self
             .storage
@@ -365,7 +379,10 @@ impl PinnedQuerySession {
             .context("load pinned core publication for vector validation")?
             .context("pinned retrieval query requires a complete core publication")?;
         if let Some(context) = context {
-            context.check_cancelled()?;
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_core_publication")
+                .check_cancelled()?;
         }
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &self.runtime.layout,
@@ -379,7 +396,10 @@ impl PinnedQuerySession {
         )
         .context("validate attested vector generation")?;
         if let Some(context) = context {
-            context.check_cancelled()?;
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_vector_validation")
+                .check_cancelled()?;
         }
         self.full_readiness_validated.set(true);
         Ok(())
@@ -1709,9 +1729,10 @@ mod tests {
         let expired_error = session
             .validate_full_readiness_with_context(&expired)
             .expect_err("expired readiness must stop before strict validation");
-        assert!(
-            expired_error.to_string().contains("deadline"),
-            "expired readiness reached strict validation: {expired_error:#}"
+        assert_eq!(
+            expired_error.to_string(),
+            "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry",
+            "expired readiness reached work after the entry checkpoint"
         );
         assert!(!session.full_readiness_validated.get());
 
@@ -1723,9 +1744,10 @@ mod tests {
         let cancelled_error = session
             .validate_full_readiness_with_context(&cancelled)
             .expect_err("cancelled readiness must stop before strict validation");
-        assert!(
-            cancelled_error.to_string().contains("cancelled"),
-            "cancelled readiness reached strict validation: {cancelled_error:#}"
+        assert_eq!(
+            cancelled_error.to_string(),
+            "retrieval stopped: reason=request_cancelled stage=deferred_full_readiness_entry",
+            "cancelled readiness reached work after the entry checkpoint"
         );
         assert!(!session.full_readiness_validated.get());
 
