@@ -10,12 +10,15 @@ use codestory_contracts::validation_receipts::{
 use codestory_store::FileRole;
 use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
+use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
+use rusqlite::limits::Limit;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(test))]
@@ -29,6 +32,11 @@ const LEXICAL_COMPONENT_SET_FILE: &str = "lexical-component-set.json";
 const LEXICAL_COMPONENT_SET_SCHEMA_VERSION: u32 = 1;
 const LEXICAL_STATE_FILE: &str = "lexical-state.sqlite3";
 const LEXICAL_STATE_SCHEMA_VERSION: i32 = 2;
+const LEXICAL_DATABASE_SCHEMA_V2: i32 = 2;
+const LEXICAL_DATABASE_SCHEMA_V3: i32 = 3;
+const LEXICAL_CONTENT_CODEC_RAW: i64 = 0;
+const LEXICAL_CONTENT_CODEC_ZLIB: i64 = 1;
+const LEXICAL_ZLIB_MAX_EXPANSION_RATIO: u64 = 1_024;
 const LEXICAL_DELTA_FILE_PREFIX: &str = "lexical-delta-";
 const LEXICAL_DELTA_COMPACTION_COUNT: usize = 8;
 const LEXICAL_DELTA_COMPACTION_PERCENT: u64 = 10;
@@ -2093,14 +2101,24 @@ fn search_lexical_index_on_connection(
     // candidates within lexical lanes; an unmatched rare term must not veto
     // the documented two-of-three or forty-percent admission contracts.
     let required_match_count = required_lexical_match_count(tokens.len());
+    let representation = lexical_database_representation(connection)?;
 
-    let exact_candidates = query_exact_candidates(connection, query, candidate_limit, payload)?;
+    let exact_candidates = query_exact_candidates(
+        connection,
+        query,
+        candidate_limit,
+        payload,
+        representation,
+        cancelled,
+    )?;
     let path_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
         payload,
+        representation,
+        cancelled,
     )?;
     let content_candidates = query_fts_candidates(
         connection,
@@ -2108,6 +2126,8 @@ fn search_lexical_index_on_connection(
         candidate_limit,
         LexicalCandidateOrder::Content,
         payload,
+        representation,
+        cancelled,
     )?;
     let mut symbol_candidates = query_fts_candidates(
         connection,
@@ -2115,6 +2135,8 @@ fn search_lexical_index_on_connection(
         candidate_limit,
         LexicalCandidateOrder::SymbolDocument,
         payload,
+        representation,
+        cancelled,
     )?;
     rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
 
@@ -2241,12 +2263,51 @@ struct LexicalCandidate {
     normalized_content: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LexicalDatabaseRepresentation {
+    schema_version: i32,
+    decoded_byte_limit: u64,
+}
+
+fn row_lexical_content(
+    row: &rusqlite::Row<'_>,
+    schema_version: i32,
+    content_index: usize,
+    codec_index: usize,
+    decoded_length_index: usize,
+    decoded_byte_limit: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> rusqlite::Result<String> {
+    if schema_version == LEXICAL_DATABASE_SCHEMA_V2 {
+        return row.get(content_index);
+    }
+    let encoded: Vec<u8> = row.get(content_index)?;
+    let codec: i64 = row.get(codec_index)?;
+    let decoded_length: i64 = row.get(decoded_length_index)?;
+    decode_lexical_content(
+        codec,
+        decoded_length,
+        &encoded,
+        decoded_byte_limit,
+        cancelled,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            content_index,
+            rusqlite::types::Type::Blob,
+            error.into(),
+        )
+    })
+}
+
 fn query_fts_candidates(
     connection: &Connection,
     fts_query: &str,
     candidate_limit: usize,
     order: LexicalCandidateOrder,
     payload: LexicalHitPayload,
+    representation: LexicalDatabaseRepresentation,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<LexicalCandidate>> {
     let scoped_query = match order {
         LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
@@ -2255,6 +2316,18 @@ fn query_fts_candidates(
         }
     };
     let sql = match (order, payload) {
+        (LexicalCandidateOrder::Path, LexicalHitPayload::Full)
+            if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
+        {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line,
+                    d.content_codec, d.content_decoded_bytes
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
         (LexicalCandidateOrder::Path, LexicalHitPayload::Full) => {
             "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
@@ -2264,12 +2337,36 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
         }
+        (LexicalCandidateOrder::Content, LexicalHitPayload::Full)
+            if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
+        {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line,
+                    d.content_codec, d.content_decoded_bytes
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
         (LexicalCandidateOrder::Content, LexicalHitPayload::Full) => {
             "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full)
+            if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
+        {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line,
+                    d.content_codec, d.content_decoded_bytes
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
         }
@@ -2314,7 +2411,19 @@ fn query_fts_candidates(
     let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
             path: row.get(1)?,
-            content: row.get(2)?,
+            content: if payload == LexicalHitPayload::Full {
+                row_lexical_content(
+                    row,
+                    representation.schema_version,
+                    2,
+                    9,
+                    10,
+                    representation.decoded_byte_limit,
+                    cancelled,
+                )?
+            } else {
+                String::new()
+            },
             source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     5,
@@ -2342,6 +2451,8 @@ fn query_exact_candidates(
     query: &str,
     candidate_limit: usize,
     payload: LexicalHitPayload,
+    representation: LexicalDatabaseRepresentation,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<LexicalCandidate>> {
     let mut needles = quoted_query_tokens(query);
     let intent = crate::query_features::classify_query(query).intent;
@@ -2357,6 +2468,19 @@ fn query_exact_candidates(
 
     let mut candidates = Vec::new();
     let sql = match payload {
+        LexicalHitPayload::Full if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 => {
+            "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+                d.source, d.node_id, d.symbol_name, d.start_line,
+                d.content_codec, d.content_decoded_bytes
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2"
+        }
         LexicalHitPayload::Full => {
             "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
                 d.source, d.node_id, d.symbol_name, d.start_line
@@ -2387,7 +2511,19 @@ fn query_exact_candidates(
         let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
             let document = LexicalDocument {
                 path: row.get(1)?,
-                content: row.get(2)?,
+                content: if payload == LexicalHitPayload::Full {
+                    row_lexical_content(
+                        row,
+                        representation.schema_version,
+                        2,
+                        9,
+                        10,
+                        representation.decoded_byte_limit,
+                        cancelled,
+                    )?
+                } else {
+                    String::new()
+                },
                 source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(
                     |error| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -2983,7 +3119,7 @@ where
         "PRAGMA journal_mode = OFF;
          PRAGMA synchronous = FULL;
          PRAGMA temp_store = MEMORY;
-         PRAGMA user_version = 2;
+         PRAGMA user_version = 3;
          CREATE TABLE lexical_metadata (
              id INTEGER PRIMARY KEY CHECK (id = 1),
              version TEXT NOT NULL,
@@ -3000,7 +3136,9 @@ where
              document_key TEXT NOT NULL UNIQUE,
              document_hash TEXT NOT NULL,
              path TEXT NOT NULL,
-             content TEXT NOT NULL,
+             content BLOB NOT NULL,
+             content_codec INTEGER NOT NULL,
+             content_decoded_bytes INTEGER NOT NULL,
              source TEXT NOT NULL,
              node_id TEXT,
              symbol_name TEXT,
@@ -3008,15 +3146,16 @@ where
          );
          CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);",
     )?;
+    let decoded_byte_limit = sqlite_value_length_limit(&connection)?;
     let transaction = connection.transaction()?;
     let mut document_hashes = BTreeMap::new();
     let mut stable_ids = HashMap::new();
     let actual = {
         let mut insert_document = transaction.prepare(
             "INSERT INTO lexical_documents
-             (id, document_key, document_hash, path, content, source, node_id, symbol_name,
-              start_line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, document_key, document_hash, path, content, content_codec,
+              content_decoded_bytes, source, node_id, symbol_name, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let mut insert_fts = transaction
             .prepare("INSERT INTO lexical_fts(rowid, path, content) VALUES (?1, ?2, ?3)")?;
@@ -3035,12 +3174,16 @@ where
                     "lexical document identity collision between {previous:?} and {document_key:?}"
                 );
             }
+            let (content_codec, content_decoded_bytes, encoded_content) =
+                encode_lexical_content(&document.content, decoded_byte_limit)?;
             insert_document.execute(params![
                 id,
                 document_key,
                 document_hash,
                 document.path,
-                document.content,
+                encoded_content,
+                content_codec,
+                content_decoded_bytes,
                 document.source.provenance_label(),
                 document.node_id,
                 document.symbol_name,
@@ -3194,6 +3337,8 @@ fn verify_open_database_contents(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
     let metadata = read_open_database_metadata(connection, cancelled)?;
+    let schema_version = lexical_database_schema_version(connection)?;
+    let decoded_byte_limit = sqlite_value_length_limit(connection)?;
     let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     if check != "ok" {
         bail!("lexical SQLite shard failed quick_check: {check}");
@@ -3215,12 +3360,21 @@ fn verify_open_database_contents(
             "lexical SQLite shard FTS row count mismatch: documents={actual_count}, fts={fts_count}"
         );
     }
-    let mut rows = connection.prepare(
-        "SELECT d.path, d.content, f.path, f.content
+    let sql = if schema_version == LEXICAL_DATABASE_SCHEMA_V3 {
+        "SELECT d.id, d.document_key, d.document_hash, d.path, d.content, d.source,
+                d.node_id, d.symbol_name, d.start_line, f.path, f.content,
+                d.content_codec, d.content_decoded_bytes
          FROM lexical_documents d
          LEFT JOIN lexical_fts f ON f.rowid = d.id
-         ORDER BY d.id",
-    )?;
+         ORDER BY d.id"
+    } else {
+        "SELECT d.id, d.document_key, d.document_hash, d.path, d.content, d.source,
+                d.node_id, d.symbol_name, d.start_line, f.path, f.content, NULL, NULL
+         FROM lexical_documents d
+         LEFT JOIN lexical_fts f ON f.rowid = d.id
+         ORDER BY d.id"
+    };
+    let mut rows = connection.prepare(sql)?;
     let mut rows = rows.query([])?;
     let mut row_index = 0_usize;
     while let Some(row) = rows.next()? {
@@ -3228,12 +3382,36 @@ fn verify_open_database_contents(
             bail!("lexical validation cancelled");
         }
         row_index += 1;
-        let path: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let fts_path: Option<String> = row.get(2)?;
-        let fts_content: Option<String> = row.get(3)?;
-        if fts_path != Some(normalize_lexical_text(&path))
-            || fts_content != Some(normalize_lexical_text(&content))
+        let id: i64 = row.get(0)?;
+        let document_key: String = row.get(1)?;
+        let document_hash: String = row.get(2)?;
+        let source_value: String = row.get(5)?;
+        let document = LexicalDocument {
+            path: row.get(3)?,
+            content: row_lexical_content(
+                row,
+                schema_version,
+                4,
+                11,
+                12,
+                decoded_byte_limit,
+                cancelled,
+            )?,
+            source: LexicalDocumentSource::parse(&source_value)?,
+            node_id: row.get(6)?,
+            symbol_name: row.get(7)?,
+            start_line: row.get(8)?,
+        };
+        let fts_path: Option<String> = row.get(9)?;
+        let fts_content: Option<String> = row.get(10)?;
+        if lexical_document_key(&document)? != document_key
+            || lexical_document_hash(&document) != document_hash
+            || stable_lexical_document_id(&document_key) != id
+        {
+            bail!("lexical SQLite shard document identity is invalid");
+        }
+        if fts_path != Some(normalize_lexical_text(&document.path))
+            || fts_content != Some(normalize_lexical_text(&document.content))
         {
             bail!("lexical SQLite shard FTS rows do not match immutable documents");
         }
@@ -3281,10 +3459,7 @@ fn read_open_database_metadata(
     if cancelled() {
         bail!("lexical search cancelled");
     }
-    let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version != 2 {
-        bail!("lexical SQLite shard schema version is not current");
-    }
+    lexical_database_schema_version(connection)?;
     let required_tables: u32 = connection.query_row(
         "SELECT count(*) FROM sqlite_master
          WHERE type IN ('table', 'view')
@@ -3342,6 +3517,31 @@ fn read_open_database_metadata(
         bail!("lexical SQLite shard metadata binding is invalid");
     }
     Ok(metadata)
+}
+
+fn lexical_database_schema_version(connection: &Connection) -> Result<i32> {
+    let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if !matches!(
+        schema_version,
+        LEXICAL_DATABASE_SCHEMA_V2 | LEXICAL_DATABASE_SCHEMA_V3
+    ) {
+        bail!("lexical SQLite shard schema version is unsupported");
+    }
+    Ok(schema_version)
+}
+
+fn sqlite_value_length_limit(connection: &Connection) -> Result<u64> {
+    u64::try_from(connection.limit(Limit::SQLITE_LIMIT_LENGTH)?)
+        .context("SQLite value-length limit is negative")
+}
+
+fn lexical_database_representation(
+    connection: &Connection,
+) -> Result<LexicalDatabaseRepresentation> {
+    Ok(LexicalDatabaseRepresentation {
+        schema_version: lexical_database_schema_version(connection)?,
+        decoded_byte_limit: sqlite_value_length_limit(connection)?,
+    })
 }
 
 /// The caller-dependent half: never receipted, always re-checked.
@@ -3919,6 +4119,99 @@ fn normalize_lexical_text(value: &str) -> String {
     normalized
 }
 
+fn encode_lexical_content(content: &str, decoded_byte_limit: u64) -> Result<(i64, i64, Vec<u8>)> {
+    if content.len() as u64 > decoded_byte_limit {
+        bail!("lexical content exceeds the SQLite value-length limit");
+    }
+    let decoded_bytes = i64::try_from(content.len()).context("lexical content length overflow")?;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(content.as_bytes())?;
+    let compressed = encoder.finish()?;
+    let expansion_bound = u64::try_from(compressed.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(LEXICAL_ZLIB_MAX_EXPANSION_RATIO);
+    if compressed.len() < content.len() && content.len() as u64 <= expansion_bound {
+        Ok((LEXICAL_CONTENT_CODEC_ZLIB, decoded_bytes, compressed))
+    } else {
+        Ok((
+            LEXICAL_CONTENT_CODEC_RAW,
+            decoded_bytes,
+            content.as_bytes().to_vec(),
+        ))
+    }
+}
+
+fn decode_lexical_content(
+    codec: i64,
+    decoded_bytes: i64,
+    encoded: &[u8],
+    decoded_byte_limit: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
+    let decoded_bytes = u64::try_from(decoded_bytes)
+        .context("lexical content declared decoded length is negative")?;
+    if decoded_bytes > decoded_byte_limit {
+        bail!("lexical content exceeds the SQLite value-length limit");
+    }
+    let bytes = match codec {
+        LEXICAL_CONTENT_CODEC_RAW => {
+            if encoded.len() as u64 != decoded_bytes {
+                bail!("raw lexical content length does not match its declaration");
+            }
+            encoded.to_vec()
+        }
+        LEXICAL_CONTENT_CODEC_ZLIB => {
+            let expansion_bound = u64::try_from(encoded.len())
+                .unwrap_or(u64::MAX)
+                .checked_mul(LEXICAL_ZLIB_MAX_EXPANSION_RATIO)
+                .context("lexical compressed-content expansion bound overflow")?;
+            if encoded.is_empty() || decoded_bytes > expansion_bound {
+                bail!("compressed lexical content exceeds its bounded expansion ratio");
+            }
+            let mut decoder = Decompress::new(true);
+            let mut output = Vec::new();
+            let mut chunk = [0_u8; 16 * 1_024];
+            let mut input_offset = 0_usize;
+            loop {
+                if cancelled() {
+                    bail!("lexical search cancelled");
+                }
+                let before_in = decoder.total_in();
+                let before_out = decoder.total_out();
+                let status = decoder
+                    .decompress(&encoded[input_offset..], &mut chunk, FlushDecompress::None)
+                    .context("decompress lexical content")?;
+                let consumed = usize::try_from(decoder.total_in() - before_in)
+                    .context("lexical compressed input length overflow")?;
+                let produced = usize::try_from(decoder.total_out() - before_out)
+                    .context("lexical decoded output length overflow")?;
+                input_offset = input_offset
+                    .checked_add(consumed)
+                    .context("lexical compressed input offset overflow")?;
+                output.extend_from_slice(&chunk[..produced]);
+                if output.len() as u64 > decoded_bytes {
+                    bail!("decoded lexical content exceeds its declared length");
+                }
+                if status == Status::StreamEnd {
+                    break;
+                }
+                if consumed == 0 && produced == 0 {
+                    bail!("compressed lexical content is truncated");
+                }
+            }
+            if output.len() as u64 != decoded_bytes {
+                bail!("decoded lexical content length does not match its declaration");
+            }
+            if input_offset != encoded.len() {
+                bail!("compressed lexical content contains trailing data");
+            }
+            output
+        }
+        _ => bail!("lexical content uses an unknown codec"),
+    };
+    String::from_utf8(bytes).context("decoded lexical content is not UTF-8")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LexicalSourceToken {
     normalized: String,
@@ -4324,6 +4617,113 @@ mod tests {
             symbol_name: None,
             start_line: None,
         }
+    }
+
+    fn write_v2_allocation_reference(
+        path: &Path,
+        project_id: &str,
+        sidecar_input_hash: &str,
+        document: &LexicalDocument,
+    ) -> u64 {
+        let connection = Connection::open(path).expect("create V2 allocation reference");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = OFF;
+                 PRAGMA synchronous = FULL;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA user_version = 2;
+                 CREATE TABLE lexical_metadata (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     version TEXT NOT NULL,
+                     project_id TEXT NOT NULL,
+                     sidecar_input_hash TEXT NOT NULL,
+                     lexical_hash TEXT NOT NULL,
+                     file_count INTEGER NOT NULL,
+                     coverage_json TEXT NOT NULL,
+                     binding_sha256 TEXT NOT NULL,
+                     indexed_at_epoch_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE lexical_documents (
+                     id INTEGER PRIMARY KEY,
+                     document_key TEXT NOT NULL UNIQUE,
+                     document_hash TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     node_id TEXT,
+                     symbol_name TEXT,
+                     start_line INTEGER
+                 );
+                 CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);",
+            )
+            .expect("create V2 reference schema");
+        let document_key = lexical_document_key(document).expect("document key");
+        let id = stable_lexical_document_id(&document_key);
+        let coverage = LexicalCoverage {
+            discovered_files: 1,
+            indexed_files: 1,
+            ..LexicalCoverage::default()
+        };
+        let fingerprint = prepared_lexical_fingerprint(std::slice::from_ref(document), &coverage)
+            .expect("V2 reference fingerprint");
+        let coverage_json = serde_json::to_string(&coverage).expect("V2 reference coverage");
+        let binding = metadata_binding(
+            project_id,
+            sidecar_input_hash,
+            &fingerprint.hash,
+            fingerprint.file_count,
+            &coverage_json,
+        );
+        connection
+            .execute(
+                "INSERT INTO lexical_metadata
+                 (id, version, project_id, sidecar_input_hash, lexical_hash, file_count,
+                  coverage_json, binding_sha256, indexed_at_epoch_ms)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                params![
+                    LEXICAL_INDEX_VERSION,
+                    project_id,
+                    sidecar_input_hash,
+                    fingerprint.hash,
+                    fingerprint.file_count,
+                    coverage_json,
+                    binding,
+                ],
+            )
+            .expect("insert V2 reference metadata");
+        connection
+            .execute(
+                "INSERT INTO lexical_documents
+                 (id, document_key, document_hash, path, content, source, node_id, symbol_name,
+                  start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
+                params![
+                    id,
+                    document_key,
+                    lexical_document_hash(document),
+                    document.path,
+                    document.content,
+                    document.source.provenance_label(),
+                ],
+            )
+            .expect("insert V2 reference document");
+        connection
+            .execute(
+                "INSERT INTO lexical_fts(rowid, path, content) VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    normalize_lexical_text(&document.path),
+                    normalize_lexical_text(&document.content),
+                ],
+            )
+            .expect("insert V2 reference FTS row");
+        connection
+            .execute_batch("PRAGMA optimize;")
+            .expect("optimize V2 reference");
+        drop(connection);
+        std::fs::metadata(path)
+            .expect("V2 reference metadata")
+            .len()
     }
 
     #[test]
@@ -4773,6 +5173,141 @@ mod tests {
     }
 
     #[test]
+    fn lexical_content_codec_is_lossless_and_rejects_hostile_envelopes() {
+        let content = "lossless payload ".repeat(4_096);
+        let (codec, decoded_bytes, encoded) =
+            encode_lexical_content(&content, content.len() as u64)
+                .expect("encode compressible content");
+        let decode = |codec, decoded_bytes, encoded: &[u8]| {
+            decode_lexical_content(codec, decoded_bytes, encoded, content.len() as u64, &|| {
+                false
+            })
+        };
+        assert_eq!(codec, LEXICAL_CONTENT_CODEC_ZLIB);
+        assert!(encoded.len() < content.len());
+        assert_eq!(
+            decode(codec, decoded_bytes, &encoded).expect("decode content"),
+            content
+        );
+
+        assert!(decode(99, decoded_bytes, &encoded).is_err());
+        assert!(decode(codec, decoded_bytes - 1, &encoded).is_err());
+        assert!(decode(codec, decoded_bytes + 1, &encoded).is_err());
+        assert!(decode(codec, decoded_bytes, &encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b"trailing");
+        assert!(decode(codec, decoded_bytes, &trailing).is_err());
+        assert!(decode(LEXICAL_CONTENT_CODEC_RAW, 1, &[0x80]).is_err());
+        assert!(decode(LEXICAL_CONTENT_CODEC_RAW, 2, b"x").is_err());
+        assert!(decode(LEXICAL_CONTENT_CODEC_ZLIB, i64::MAX, &encoded).is_err());
+    }
+
+    #[test]
+    fn v2_raw_content_remains_queryable_through_the_shared_component_reader() {
+        let root = TempDir::new().expect("tempdir");
+        let document = source_document("src/legacy.rs", "fn legacyrawneedle() {}\n");
+        let reference_path = root.path().join("legacy-v2.sqlite3");
+        write_v2_allocation_reference(&reference_path, "legacy-v2", "input", &document);
+        let connection = open_read_only(&reference_path).expect("open V2 database");
+
+        let hits = search_lexical_index_on_connection(
+            &connection,
+            "legacyrawneedle",
+            1,
+            1,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::Full,
+        )
+        .expect("query V2 raw content");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, document.path);
+        assert_eq!(
+            hits[0].source_excerpt.as_deref(),
+            Some(document.content.trim())
+        );
+    }
+
+    #[test]
+    fn unchanged_v2_component_is_directly_reused_without_rewrite() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("data");
+        let previous_shard = shard_dir_for(&data, "previous");
+        std::fs::create_dir_all(&previous_shard).expect("create previous shard");
+        let previous_path = previous_shard.join(LEXICAL_INDEX_FILE);
+        let document = source_document("src/legacy.rs", "fn legacyrawneedle() {}\n");
+        write_v2_allocation_reference(&previous_path, "previous", "input-v1", &document);
+        let metadata =
+            verify_lexical_database_contents(&previous_path).expect("verify V2 database");
+        publish_lexical_component_envelope(
+            &previous_shard,
+            &LexicalComponentEnvelope::new("previous", "input-v1", &metadata),
+        )
+        .expect("publish V2 envelope");
+        crate::copy_on_write::make_file_immutable(&previous_path).expect("seal V2 database");
+        let previous_identity =
+            codestory_workspace::workspace_path_identity(&previous_path).expect("V2 identity");
+        let prepared = prepared_documents(vec![document]);
+
+        let (_, work) = build_prepared_lexical_shard(
+            &data,
+            "current",
+            &prepared,
+            "input-v2",
+            Some("previous"),
+            || Ok(()),
+        )
+        .expect("reuse unchanged V2 component");
+
+        assert!(work.expect("incremental work").direct_reference);
+        let current_path = shard_dir_for(&data, "current").join(LEXICAL_INDEX_FILE);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&current_path)
+                .expect("reused current identity"),
+            previous_identity,
+        );
+        let schema: i32 = open_read_only(&current_path)
+            .expect("open reused V2 component")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read reused schema");
+        assert_eq!(schema, LEXICAL_DATABASE_SCHEMA_V2);
+
+        let changed = prepared_documents(vec![source_document(
+            "src/legacy.rs",
+            "fn changedv3needle() {}\n",
+        )]);
+        build_prepared_lexical_shard(
+            &data,
+            "changed",
+            &changed,
+            "input-v3",
+            Some("current"),
+            || Ok(()),
+        )
+        .expect("append V3 delta to V2 base");
+        let changed_shard = shard_dir_for(&data, "changed");
+        let components =
+            read_lexical_component_set(&changed_shard, Some("changed"), Some("input-v3"))
+                .expect("read mixed component set")
+                .expect("mixed component set");
+        assert_eq!(components.deltas.len(), 1);
+        let delta_schema: i32 =
+            open_read_only(&changed_shard.join(&components.deltas[0].component.file_name))
+                .expect("open V3 delta")
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read delta schema");
+        assert_eq!(delta_schema, LEXICAL_DATABASE_SCHEMA_V3);
+        assert_eq!(
+            search_lexical_index(&changed_shard, "input-v3", "changedv3needle", 1)
+                .expect("search mixed V2/V3 components")
+                .first()
+                .map(|hit| hit.path.as_str()),
+            Some("src/legacy.rs"),
+        );
+    }
+
+    #[test]
     fn sqlite_fts_search_keeps_existing_scoring_and_project_isolation() {
         let project_a = TempDir::new().expect("project a");
         let project_b = TempDir::new().expect("project b");
@@ -4821,11 +5356,123 @@ mod tests {
     }
 
     #[test]
+    fn fresh_shard_compresses_raw_content_without_changing_search_or_fts() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("data");
+        let mut content = String::with_capacity(600_000);
+        content.push_str("fn unrelated_entry() {}\n");
+        for _ in 0..12_000 {
+            content.push_str("let repeated_allocation_payload = stable_value;\n");
+        }
+        let tail_line = "fn tailcompressionneedle() {}";
+        content.push_str(tail_line);
+        content.push('\n');
+        let tail_start = content
+            .find("tailcompressionneedle")
+            .expect("tail token byte offset");
+        let document = source_document("src/compressible.rs", &content);
+        let prepared = prepared_documents(vec![document.clone()]);
+        build_prepared_lexical_shard(&data, "compressed", &prepared, "input", None, || Ok(()))
+            .expect("build fresh lexical shard");
+        let shard = shard_dir_for(&data, "compressed");
+
+        let full = search_lexical_index(&shard, "input", "tailcompressionneedle", 1)
+            .expect("full search decodes the stored source");
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].path, document.path);
+        assert_eq!(full[0].source_excerpt.as_deref(), Some(tail_line));
+        assert_eq!(
+            full[0].target,
+            Some(SearchTargetDto::FileRange {
+                file_path: document.path.clone(),
+                start_byte: tail_start as u32,
+                end_byte: (tail_start + "tailcompressionneedle".len()) as u32,
+            })
+        );
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "tailcompressionneedle",
+            1,
+            || false,
+        )
+        .expect("descriptor search uses FTS and metadata");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].path, document.path);
+        assert_eq!(descriptors[0].source_excerpt, None);
+        assert_eq!(descriptors[0].target, None);
+
+        let index_path = shard.join(LEXICAL_INDEX_FILE);
+        let connection = open_read_only(&index_path).expect("open fresh lexical database");
+        let schema_version: i32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema version");
+        let (storage_type, stored_bytes): (String, i64) = connection
+            .query_row(
+                "SELECT typeof(content), length(content) FROM lexical_documents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read encoded document representation");
+        let stored_bytes = u64::try_from(stored_bytes).expect("nonnegative stored byte length");
+        let has_decoded_length: bool = connection
+            .prepare("PRAGMA table_info(lexical_documents)")
+            .expect("inspect document schema")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read document columns")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect document columns")
+            .iter()
+            .any(|column| column == "content_decoded_bytes");
+        let decoded_bytes = if has_decoded_length {
+            let decoded_bytes: i64 = connection
+                .query_row(
+                    "SELECT content_decoded_bytes FROM lexical_documents",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read declared decoded length");
+            u64::try_from(decoded_bytes).expect("nonnegative decoded byte length")
+        } else {
+            content.len() as u64
+        };
+        let normalized: String = connection
+            .query_row("SELECT content FROM lexical_fts", [], |row| row.get(0))
+            .expect("read contentful FTS witness");
+        drop(connection);
+        assert_eq!(normalized, normalize_lexical_text(&content));
+        assert_eq!(decoded_bytes, content.len() as u64);
+
+        let product_bytes = std::fs::metadata(&index_path)
+            .expect("fresh lexical database metadata")
+            .len();
+        let reference_path = root.path().join("v2-allocation-reference.sqlite3");
+        let v2_bytes = write_v2_allocation_reference(
+            &reference_path,
+            "allocation-reference",
+            "input",
+            &document,
+        );
+        assert!(
+            schema_version == 3
+                && has_decoded_length
+                && storage_type == "blob"
+                && stored_bytes < decoded_bytes
+                && product_bytes < v2_bytes,
+            "fresh shards must use smaller V3 encoded storage: schema={schema_version}, \
+             storage_type={storage_type}, stored_bytes={stored_bytes}, \
+             has_decoded_length={has_decoded_length}, decoded_bytes={decoded_bytes}, \
+             product_bytes={product_bytes}, v2_bytes={v2_bytes}",
+        );
+    }
+
+    #[test]
     fn descriptor_search_never_materializes_the_stored_source_body() {
         let connection = Connection::open_in_memory().expect("in-memory lexical database");
         connection
             .execute_batch(
-                "CREATE TABLE lexical_documents (
+                "PRAGMA user_version = 2;
+                 CREATE TABLE lexical_documents (
                      id INTEGER PRIMARY KEY,
                      path TEXT NOT NULL,
                      content TEXT NOT NULL,

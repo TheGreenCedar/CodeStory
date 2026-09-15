@@ -12,6 +12,9 @@ still apply to the complete response.
 
 Large fresh semantic indexes use less disk while existing indexes remain readable.
 
+Lexical indexes compress retained raw source while preserving existing search,
+ranking and source evidence. Existing lexical indexes remain readable.
+
 Precise source evidence stores repeated names and paths once, reducing disk use
 while keeping existing indexes readable.
 

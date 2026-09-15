@@ -21,6 +21,7 @@ codestory-llama-sys = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 directories = { workspace = true }
+flate2 = "=1.1.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
