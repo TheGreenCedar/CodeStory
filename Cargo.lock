@@ -675,6 +675,7 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "directories",
+ "flate2",
  "libc",
  "rusqlite",
  "serde",
