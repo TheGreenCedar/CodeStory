@@ -719,6 +719,10 @@ mod tests {
         assert_eq!(fields["attempt_started_count"], 0);
         assert_eq!(fields["retry_publication_changed_count"], 0);
         assert_eq!(fields["retry_cache_busy_count"], 0);
+        assert_eq!(fields["descriptor_preadmission_observed_count"], 0);
+        assert_eq!(fields["descriptor_preadmission_query_count"], 0);
+        assert_eq!(fields["descriptor_health_resolution_wall_ms"], 0);
+        assert_eq!(fields["descriptor_query_batch_wall_ms"], 0);
         assert_eq!(fields["complete_core_snapshot_started_count"], 0);
         assert_eq!(fields["complete_core_snapshot_succeeded_count"], 0);
         assert_eq!(fields["complete_core_snapshot_ms"], 0);

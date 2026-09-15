@@ -1023,19 +1023,29 @@ pub(crate) fn preadmit_packet_descriptor_queries(
             if !include_dense_semantic {
                 return pinned
                     .session
-                    .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
+                    .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
                         &batch_items,
                         Some(Arc::clone(&request_cancelled)),
                         cache,
                     );
             }
-            pinned.session.execute_packet_descriptor_batch_with_cache(
-                &batch_items,
-                Some(Arc::clone(&request_cancelled)),
-                cache,
-            )
+            pinned
+                .session
+                .execute_packet_descriptor_batch_with_observation_and_cache(
+                    &batch_items,
+                    Some(Arc::clone(&request_cancelled)),
+                    cache,
+                )
         })
         .map_err(map_pinned_query_error)?;
+        let (query_results, descriptor_observation) = query_results;
+        if let Some(observation) = descriptor_observation {
+            super::packet_batch::observe_packet_descriptor_preadmission(
+                observation.query_count,
+                observation.health_resolution_wall_ms,
+                observation.query_batch_wall_ms,
+            );
+        }
         #[cfg(any(test, feature = "benchmark-support"))]
         for result in &query_results {
             session.record_descriptor_trace(&result.trace);

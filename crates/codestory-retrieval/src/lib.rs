@@ -355,9 +355,10 @@ pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,
 };
 pub use query::{
-    PinnedQuerySession, QueryBatchItem, QueryBatchRequest, QueryRequest,
-    RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged, execute_retrieval_query,
-    execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
+    PacketDescriptorBatchObservation, PinnedQuerySession, QueryBatchItem, QueryBatchRequest,
+    QueryRequest, RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged,
+    execute_retrieval_query, execute_retrieval_query_with_cache,
+    execute_retrieval_query_with_cache_for_runtime,
     execute_strict_retrieval_query_batch_with_cache,
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,

@@ -123,6 +123,18 @@ pub struct QueryBatchItem<'a> {
     pub budget_ms: Option<u64>,
 }
 
+/// Numeric wall-time observation for one successful packet descriptor batch.
+///
+/// The observation deliberately excludes query text, candidates, paths, and
+/// health details. An empty or failed batch does not produce one.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketDescriptorBatchObservation {
+    pub query_count: u64,
+    pub health_resolution_wall_ms: u64,
+    pub query_batch_wall_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryBatchRequest<'a> {
     pub project_root: &'a Path,
@@ -566,7 +578,22 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<Vec<QueryResult>> {
-        self.execute_packet_descriptor_batch_with_cache_policy(queries, cancelled, cache, true)
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, true, false,
+        )
+        .map(|(results, _)| results)
+    }
+
+    #[doc(hidden)]
+    pub fn execute_packet_descriptor_batch_with_observation_and_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, true, true,
+        )
     }
 
     #[cfg(feature = "benchmark-support")]
@@ -576,7 +603,23 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<Vec<QueryResult>> {
-        self.execute_packet_descriptor_batch_with_cache_policy(queries, cancelled, cache, false)
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, false, false,
+        )
+        .map(|(results, _)| results)
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[doc(hidden)]
+    pub fn execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, false, true,
+        )
     }
 
     fn execute_packet_descriptor_batch_with_cache_policy(
@@ -585,21 +628,25 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
         include_dense_semantic: bool,
-    ) -> Result<Vec<QueryResult>> {
+        observe_wall_intervals: bool,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let cancelled = cancelled.unwrap_or_else(cancellation_flag);
         if cancelled.load(Ordering::Acquire) {
             bail!("retrieval query batch cancelled before preflight");
         }
         cache.scope_to_publication(&self.publication_identity);
+        let health_started_at = observe_wall_intervals.then(Instant::now);
         let (mode, degraded_reason) = resolve_descriptor_batch_mode(
             self.sidecars.as_ref(),
             Some(&self.manifest),
             &self.embedding_device,
             &self.runtime,
         );
+        let health_resolution_wall_ms =
+            health_started_at.map(|started_at| duration_millis_ceil(started_at.elapsed()));
         if mode != RetrievalDegradedMode::Full {
             bail!(
                 "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
@@ -607,6 +654,7 @@ impl PinnedQuerySession {
                 degraded_reason.as_deref().unwrap_or("unknown")
             );
         }
+        let query_batch_started_at = observe_wall_intervals.then(Instant::now);
         let mut results = execute_strict_retrieval_descriptor_batch_against_sidecars(
             Arc::clone(&self.sidecars),
             Some(self.manifest.clone()),
@@ -618,11 +666,20 @@ impl PinnedQuerySession {
             strict_batch_worker_limit(queries.len()),
             include_dense_semantic,
         )?;
+        let query_batch_wall_ms =
+            query_batch_started_at.map(|started_at| duration_millis_ceil(started_at.elapsed()));
         for result in &mut results {
             sanitize_packet_candidate_descriptors(&mut result.hits);
             result.publication_identity = Some(self.publication_identity.clone());
         }
-        Ok(results)
+        let observation = health_resolution_wall_ms.zip(query_batch_wall_ms).map(
+            |(health_resolution_wall_ms, query_batch_wall_ms)| PacketDescriptorBatchObservation {
+                query_count: u64::try_from(queries.len()).unwrap_or(u64::MAX),
+                health_resolution_wall_ms,
+                query_batch_wall_ms,
+            },
+        );
+        Ok((results, observation))
     }
 
     fn enrich_and_rerank_candidates(&self, result: &mut QueryResult) -> Result<()> {
@@ -1658,6 +1715,103 @@ mod tests {
                 .contains("retrieval sidecar manifest is unavailable"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[cfg(all(feature = "test-support", feature = "benchmark-support"))]
+    #[test]
+    fn packet_descriptor_batch_wall_observation_covers_success_empty_and_error() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("begin descriptor session");
+        let mut cache = RetrievalCache::new();
+
+        let (empty_results, empty_observation) = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &[],
+                None,
+                &mut cache,
+            )
+            .expect("empty descriptor batch");
+        assert!(empty_results.is_empty());
+        assert_eq!(empty_observation, None);
+
+        let queries = [QueryBatchItem {
+            query: "visible",
+            budget_ms: Some(500),
+        }];
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &queries,
+                Some(cancelled),
+                &mut cache,
+            )
+            .expect_err("cancelled descriptor batch must preserve its preflight error");
+        assert_eq!(
+            error.to_string(),
+            "retrieval query batch cancelled before preflight"
+        );
+
+        let (results, observation) = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &queries,
+                None,
+                &mut cache,
+            )
+            .expect("successful observed descriptor batch");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query, "visible");
+        assert_eq!(
+            results[0].publication_identity.as_ref(),
+            Some(session.publication_identity())
+        );
+        let observation = observation.expect("successful non-empty batch observation");
+        assert_eq!(observation.query_count, 1);
     }
 
     #[cfg(feature = "test-support")]
