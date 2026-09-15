@@ -2530,7 +2530,8 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
         || compatibility_extension_matches_source_group(&extension, language)
 }
 
-fn has_supported_source_route(path: &Path) -> bool {
+/// Return whether a path has an indexable parser or companion-source route.
+pub fn has_supported_source_route(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
