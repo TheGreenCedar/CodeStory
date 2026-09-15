@@ -35,6 +35,8 @@ thread_local! {
     static ACTIVE_PACKET_ENTRY_OBSERVATION: Cell<Option<PacketEntryObservation>> = const {
         Cell::new(None)
     };
+    static PACKET_PUBLIC_OPERATION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static PACKET_PUBLIC_OPERATION_OWNER_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 static NEXT_PACKET_ENTRY_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -64,6 +66,228 @@ struct PacketEntryObservation {
     source_scope_started_ms: u64,
     source_scope_completed_ms: u64,
     public_admission_check_ms: u64,
+    public_admission_reached_count: u64,
+    public_admission_passed_count: u64,
+    public_admission_refused_count: u64,
+    last_public_admission_ms: u64,
+    attempt_started_count: u64,
+    retry_publication_changed_count: u64,
+    retry_cache_busy_count: u64,
+    complete_core_snapshot: PacketOperationSpanObservation,
+    uncached_freshness: PacketOperationSpanObservation,
+    retrieval_pin: PacketOperationSpanObservation,
+    build_callback: PacketOperationSpanObservation,
+    post_build_freshness: PacketOperationSpanObservation,
+    pin_begin: PacketOperationSpanObservation,
+    pin_revalidation: PacketOperationSpanObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PacketOperationSpanObservation {
+    started_count: u64,
+    succeeded_count: u64,
+    total_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PacketOperationObservationSpan {
+    CompleteCoreSnapshot,
+    UncachedFreshness,
+    RetrievalPin,
+    BuildCallback,
+    PostBuildFreshness,
+    PinBegin,
+    PinRevalidation,
+}
+
+fn packet_operation_span_mut(
+    observation: &mut PacketEntryObservation,
+    span: PacketOperationObservationSpan,
+) -> &mut PacketOperationSpanObservation {
+    match span {
+        PacketOperationObservationSpan::CompleteCoreSnapshot => {
+            &mut observation.complete_core_snapshot
+        }
+        PacketOperationObservationSpan::UncachedFreshness => &mut observation.uncached_freshness,
+        PacketOperationObservationSpan::RetrievalPin => &mut observation.retrieval_pin,
+        PacketOperationObservationSpan::BuildCallback => &mut observation.build_callback,
+        PacketOperationObservationSpan::PostBuildFreshness => &mut observation.post_build_freshness,
+        PacketOperationObservationSpan::PinBegin => &mut observation.pin_begin,
+        PacketOperationObservationSpan::PinRevalidation => &mut observation.pin_revalidation,
+    }
+}
+
+fn packet_operation_observation_is_owned() -> bool {
+    PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| {
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| {
+            let depth = depth.get();
+            depth != 0 && owner.get() == depth
+        })
+    })
+}
+
+fn update_packet_operation_observation(update: impl FnOnce(&mut PacketEntryObservation)) {
+    if !packet_operation_observation_is_owned() {
+        return;
+    }
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        if let Some(mut observation) = active.get() {
+            update(&mut observation);
+            active.set(Some(observation));
+        }
+    });
+}
+
+pub(crate) struct PacketPublicOperationObservationGuard {
+    previous_depth: u32,
+    previous_owner_depth: u32,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for PacketPublicOperationObservationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| owner.set(self.previous_owner_depth));
+        PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| depth.set(self.previous_depth));
+    }
+}
+
+pub(crate) fn enter_packet_public_operation_observation(
+    operation: &str,
+) -> PacketPublicOperationObservationGuard {
+    let active = ACTIVE_PACKET_ENTRY_OBSERVATION.with(|observation| observation.get().is_some());
+    if !active {
+        return PacketPublicOperationObservationGuard {
+            previous_depth: 0,
+            previous_owner_depth: 0,
+            active: false,
+            _thread_bound: PhantomData,
+        };
+    }
+    let previous_depth = PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| {
+        let previous = depth.get();
+        depth.set(previous.saturating_add(1));
+        previous
+    });
+    let previous_owner_depth = PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(Cell::get);
+    if operation == "packet" && previous_owner_depth == 0 {
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| owner.set(previous_depth + 1));
+    }
+    PacketPublicOperationObservationGuard {
+        previous_depth,
+        previous_owner_depth,
+        active: true,
+        _thread_bound: PhantomData,
+    }
+}
+
+pub(crate) fn observe_packet_public_admission_reached() {
+    let elapsed_ms = active_packet_latency_budget()
+        .map(|budget| clamp_u128_to_u32(budget.started_at.elapsed().as_millis()) as u64)
+        .unwrap_or(0);
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_reached_count =
+            observation.public_admission_reached_count.saturating_add(1);
+        if observation.public_admission_reached_count == 1 {
+            observation.public_admission_check_ms = elapsed_ms;
+        }
+        observation.last_public_admission_ms = elapsed_ms;
+    });
+}
+
+pub(crate) fn observe_packet_public_admission_passed() {
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_passed_count =
+            observation.public_admission_passed_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_public_admission_refused() {
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_refused_count =
+            observation.public_admission_refused_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_attempt_started() {
+    update_packet_operation_observation(|observation| {
+        observation.attempt_started_count = observation.attempt_started_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_retry_cause(code: &str) {
+    update_packet_operation_observation(|observation| match code {
+        "publication_changed" => {
+            observation.retry_publication_changed_count = observation
+                .retry_publication_changed_count
+                .saturating_add(1);
+        }
+        "cache_busy" => {
+            observation.retry_cache_busy_count =
+                observation.retry_cache_busy_count.saturating_add(1);
+        }
+        _ => {}
+    });
+}
+
+pub(crate) struct PacketOperationObservationSpanGuard {
+    span: PacketOperationObservationSpan,
+    started_at: Option<Instant>,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl PacketOperationObservationSpanGuard {
+    pub(crate) fn finish_success(&mut self) {
+        if self.active {
+            self.finish(true);
+        }
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        let Some(started_at) = self.started_at.take() else {
+            self.active = false;
+            return;
+        };
+        let elapsed_ms = clamp_u128_to_u32(started_at.elapsed().as_millis()) as u64;
+        update_packet_operation_observation(|observation| {
+            let span = packet_operation_span_mut(observation, self.span);
+            span.total_ms = span.total_ms.saturating_add(elapsed_ms);
+            if succeeded {
+                span.succeeded_count = span.succeeded_count.saturating_add(1);
+            }
+        });
+        self.active = false;
+    }
+}
+
+impl Drop for PacketOperationObservationSpanGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.finish(false);
+        }
+    }
+}
+
+pub(crate) fn observe_packet_operation_span(
+    span: PacketOperationObservationSpan,
+) -> PacketOperationObservationSpanGuard {
+    let active = packet_operation_observation_is_owned();
+    if active {
+        update_packet_operation_observation(|observation| {
+            let span = packet_operation_span_mut(observation, span);
+            span.started_count = span.started_count.saturating_add(1);
+        });
+    }
+    PacketOperationObservationSpanGuard {
+        span,
+        started_at: active.then(Instant::now),
+        active,
+        _thread_bound: PhantomData,
+    }
 }
 
 /// Fixed request-side boundaries retained by the active packet allowance.
@@ -232,6 +456,39 @@ impl Drop for PacketLatencyScopeGuard {
                     source_scope_started_ms = observation.source_scope_started_ms,
                     source_scope_completed_ms = observation.source_scope_completed_ms,
                     public_admission_check_ms = observation.public_admission_check_ms,
+                    last_public_admission_ms = observation.last_public_admission_ms,
+                    public_admission_reached_count = observation.public_admission_reached_count,
+                    public_admission_passed_count = observation.public_admission_passed_count,
+                    public_admission_refused_count = observation.public_admission_refused_count,
+                    attempt_started_count = observation.attempt_started_count,
+                    retry_publication_changed_count = observation.retry_publication_changed_count,
+                    retry_cache_busy_count = observation.retry_cache_busy_count,
+                    complete_core_snapshot_started_count =
+                        observation.complete_core_snapshot.started_count,
+                    complete_core_snapshot_succeeded_count =
+                        observation.complete_core_snapshot.succeeded_count,
+                    complete_core_snapshot_ms = observation.complete_core_snapshot.total_ms,
+                    uncached_freshness_started_count = observation.uncached_freshness.started_count,
+                    uncached_freshness_succeeded_count =
+                        observation.uncached_freshness.succeeded_count,
+                    uncached_freshness_ms = observation.uncached_freshness.total_ms,
+                    retrieval_pin_started_count = observation.retrieval_pin.started_count,
+                    retrieval_pin_succeeded_count = observation.retrieval_pin.succeeded_count,
+                    retrieval_pin_ms = observation.retrieval_pin.total_ms,
+                    build_callback_started_count = observation.build_callback.started_count,
+                    build_callback_succeeded_count = observation.build_callback.succeeded_count,
+                    build_callback_ms = observation.build_callback.total_ms,
+                    post_build_freshness_started_count =
+                        observation.post_build_freshness.started_count,
+                    post_build_freshness_succeeded_count =
+                        observation.post_build_freshness.succeeded_count,
+                    post_build_freshness_ms = observation.post_build_freshness.total_ms,
+                    pin_begin_started_count = observation.pin_begin.started_count,
+                    pin_begin_succeeded_count = observation.pin_begin.succeeded_count,
+                    pin_begin_ms = observation.pin_begin.total_ms,
+                    pin_revalidation_started_count = observation.pin_revalidation.started_count,
+                    pin_revalidation_succeeded_count = observation.pin_revalidation.succeeded_count,
+                    pin_revalidation_ms = observation.pin_revalidation.total_ms,
                     "packet entry observation"
                 );
             }
@@ -269,6 +526,72 @@ pub fn enter_packet_latency_scope(requested_ms: Option<u32>) -> PacketLatencySco
 
 pub(crate) fn active_packet_latency_budget() -> Option<PacketLatencyBudget> {
     ACTIVE_PACKET_LATENCY_BUDGET.with(Cell::get)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PacketOperationObservationTestSnapshot {
+    pub(crate) public_admission_reached_count: u64,
+    pub(crate) public_admission_passed_count: u64,
+    pub(crate) public_admission_refused_count: u64,
+    pub(crate) first_public_admission_ms: u64,
+    pub(crate) last_public_admission_ms: u64,
+    pub(crate) attempt_started_count: u64,
+    pub(crate) retry_publication_changed_count: u64,
+    pub(crate) retry_cache_busy_count: u64,
+    pub(crate) complete_core_snapshot_started_count: u64,
+    pub(crate) complete_core_snapshot_succeeded_count: u64,
+    pub(crate) uncached_freshness_started_count: u64,
+    pub(crate) uncached_freshness_succeeded_count: u64,
+    pub(crate) retrieval_pin_started_count: u64,
+    pub(crate) retrieval_pin_succeeded_count: u64,
+    pub(crate) build_callback_started_count: u64,
+    pub(crate) build_callback_succeeded_count: u64,
+    pub(crate) post_build_freshness_started_count: u64,
+    pub(crate) post_build_freshness_succeeded_count: u64,
+    pub(crate) pin_begin_started_count: u64,
+    pub(crate) pin_begin_succeeded_count: u64,
+    pub(crate) pin_revalidation_started_count: u64,
+    pub(crate) pin_revalidation_succeeded_count: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn packet_operation_observation_for_test()
+-> Option<PacketOperationObservationTestSnapshot> {
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        active
+            .get()
+            .map(|observation| PacketOperationObservationTestSnapshot {
+                public_admission_reached_count: observation.public_admission_reached_count,
+                public_admission_passed_count: observation.public_admission_passed_count,
+                public_admission_refused_count: observation.public_admission_refused_count,
+                first_public_admission_ms: observation.public_admission_check_ms,
+                last_public_admission_ms: observation.last_public_admission_ms,
+                attempt_started_count: observation.attempt_started_count,
+                retry_publication_changed_count: observation.retry_publication_changed_count,
+                retry_cache_busy_count: observation.retry_cache_busy_count,
+                complete_core_snapshot_started_count: observation
+                    .complete_core_snapshot
+                    .started_count,
+                complete_core_snapshot_succeeded_count: observation
+                    .complete_core_snapshot
+                    .succeeded_count,
+                uncached_freshness_started_count: observation.uncached_freshness.started_count,
+                uncached_freshness_succeeded_count: observation.uncached_freshness.succeeded_count,
+                retrieval_pin_started_count: observation.retrieval_pin.started_count,
+                retrieval_pin_succeeded_count: observation.retrieval_pin.succeeded_count,
+                build_callback_started_count: observation.build_callback.started_count,
+                build_callback_succeeded_count: observation.build_callback.succeeded_count,
+                post_build_freshness_started_count: observation.post_build_freshness.started_count,
+                post_build_freshness_succeeded_count: observation
+                    .post_build_freshness
+                    .succeeded_count,
+                pin_begin_started_count: observation.pin_begin.started_count,
+                pin_begin_succeeded_count: observation.pin_begin.succeeded_count,
+                pin_revalidation_started_count: observation.pin_revalidation.started_count,
+                pin_revalidation_succeeded_count: observation.pin_revalidation.succeeded_count,
+            })
+    })
 }
 
 impl PacketLatencyBudget {
@@ -390,6 +713,13 @@ mod packet_latency_budget_tests {
     #[test]
     fn packet_entry_observation_is_outer_scope_correlated_and_nonpacket_safe() {
         observe_packet_entry_phase(PacketEntryObservationPhase::ProjectSelectionStarted);
+        observe_packet_public_admission_reached();
+        observe_packet_public_admission_passed();
+        observe_packet_attempt_started();
+        observe_packet_retry_cause("publication_changed");
+        drop(observe_packet_operation_span(
+            PacketOperationObservationSpan::BuildCallback,
+        ));
         assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
 
         {
@@ -420,6 +750,50 @@ mod packet_latency_budget_tests {
             );
         }
         assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn packet_operation_observation_is_owned_by_the_outer_packet_operation() {
+        let _latency = enter_packet_latency_scope(Some(2_000));
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _outer = enter_packet_public_operation_observation("packet");
+            observe_packet_public_admission_reached();
+            observe_packet_public_admission_passed();
+            observe_packet_attempt_started();
+            {
+                let _nested = enter_packet_public_operation_observation("packet");
+                observe_packet_public_admission_reached();
+                observe_packet_public_admission_refused();
+                observe_packet_attempt_started();
+                observe_packet_retry_cause("cache_busy");
+                let mut nested =
+                    observe_packet_operation_span(PacketOperationObservationSpan::BuildCallback);
+                nested.finish_success();
+            }
+            let mut outer =
+                observe_packet_operation_span(PacketOperationObservationSpan::BuildCallback);
+            outer.finish_success();
+            panic!("exercise packet operation observation unwind");
+        }));
+        assert!(unwind.is_err());
+
+        let observation = packet_operation_observation_for_test()
+            .expect("outer packet entry observation survives operation unwind");
+        assert_eq!(observation.public_admission_reached_count, 1);
+        assert_eq!(observation.public_admission_passed_count, 1);
+        assert_eq!(observation.public_admission_refused_count, 0);
+        assert_eq!(observation.attempt_started_count, 1);
+        assert_eq!(observation.retry_cache_busy_count, 0);
+        assert_eq!(observation.build_callback_started_count, 1);
+        assert_eq!(observation.build_callback_succeeded_count, 1);
+
+        {
+            let _next = enter_packet_public_operation_observation("packet");
+            observe_packet_public_admission_reached();
+        }
+        let observation = packet_operation_observation_for_test()
+            .expect("same outer entry observation remains active");
+        assert_eq!(observation.public_admission_reached_count, 2);
     }
 }
 

@@ -214,6 +214,19 @@ Activation return means the call returned, including an error, so use the public
 response to determine its outcome. The retrieval-probe bucket combines live
 embedding identity and manifest observation.
 
+Public-operation fields distinguish admission checks reached, passed and
+refused, attempts started, and the two existing
+whole-operation retry causes. The first and last admission timestamps expose a
+second check without replacing the first. Each operation span has started and
+succeeded counts because a zero duration can mean either sub-millisecond work or
+an unreached boundary. Span durations are cumulative. The core snapshot duration
+covers the complete snapshot call, including its callback and post-callback
+publication validation; `retrieval_pin_ms` likewise includes its build callback
+and final pin revalidation. Those inclusive durations overlap the named inner
+spans. Freshness, build callback, pin begin and pin revalidation durations cover
+their named calls. Nested public operations do not add a second outer attempt
+or retry decision.
+
 The record excludes its own diagnostic write and is not a hard deadline or a
 success receipt. No question text, source content or project path is retained.
 Ordinary non-packet operations produce no packet-entry record.

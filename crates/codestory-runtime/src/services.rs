@@ -2333,6 +2333,8 @@ impl PublicOperationService {
                 format!("request cancelled before {operation}"),
             ));
         }
+        let _packet_operation_observation =
+            crate::agent::packet_batch::enter_packet_public_operation_observation(operation);
         let operation_id = format!(
             "public-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
@@ -2358,11 +2360,32 @@ impl PublicOperationService {
             crate::agent::packet_batch::observe_packet_entry_phase(
                 crate::agent::packet_batch::PacketEntryObservationPhase::PublicAdmissionCheck,
             );
-            self.ensure_packet_latency_remaining(operation, "public packet admission")?;
+            crate::agent::packet_batch::observe_packet_public_admission_reached();
+            match self.ensure_packet_latency_remaining(operation, "public packet admission") {
+                Ok(()) => {
+                    crate::agent::packet_batch::observe_packet_public_admission_passed();
+                }
+                Err(error) => {
+                    crate::agent::packet_batch::observe_packet_public_admission_refused();
+                    return Err(error);
+                }
+            }
+            crate::agent::packet_batch::observe_packet_attempt_started();
+            let mut complete_core_span = crate::agent::packet_batch::observe_packet_operation_span(
+                crate::agent::packet_batch::PacketOperationObservationSpan::CompleteCoreSnapshot,
+            );
             let result = self.controller.with_complete_core_snapshot(|publication| {
+                let mut freshness_span =
+                    crate::agent::packet_batch::observe_packet_operation_span(
+                        crate::agent::packet_batch::PacketOperationObservationSpan::UncachedFreshness,
+                    );
                 let freshness = self
                     .controller
-                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
+                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot);
+                if freshness.is_ok() {
+                    freshness_span.finish_success();
+                }
+                let freshness = freshness?;
                 if !index_freshness_admits_operation(&freshness) {
                     codestory_workspace::invalidate_lease_memoized_values();
                     if !self.retained_core_allows(operation, publication) {
@@ -2379,8 +2402,18 @@ impl PublicOperationService {
                             format!("request cancelled before {operation}"),
                         ));
                     }
-                    let value =
-                        with_public_operation_cancellation(Arc::clone(&cancelled), &mut build)?;
+                    let mut build_span =
+                        crate::agent::packet_batch::observe_packet_operation_span(
+                            crate::agent::packet_batch::PacketOperationObservationSpan::BuildCallback,
+                        );
+                    let value = with_public_operation_cancellation(
+                        Arc::clone(&cancelled),
+                        &mut build,
+                    );
+                    if value.is_ok() {
+                        build_span.finish_success();
+                    }
+                    let value = value?;
                     if cancelled.load(Ordering::Acquire) {
                         return Err(ApiError::new(
                             "cancelled",
@@ -2396,9 +2429,17 @@ impl PublicOperationService {
                     // a window of its own: the memo drop makes the scan see
                     // drift that landed before it started, and the observer
                     // makes it refuse drift that lands while it runs.
+                    let mut freshness_span =
+                        crate::agent::packet_batch::observe_packet_operation_span(
+                            crate::agent::packet_batch::PacketOperationObservationSpan::PostBuildFreshness,
+                        );
                     let after = self.controller.index_freshness_reverified(
                         FreshnessObservationPolicy::ObserveSourceRoot,
-                    )?;
+                    );
+                    if after.is_ok() {
+                        freshness_span.finish_success();
+                    }
+                    let after = after?;
                     if !index_freshness_admits_operation(&after) {
                         codestory_workspace::invalidate_lease_memoized_values();
                         if !self.retained_core_allows(operation, publication) {
@@ -2419,12 +2460,20 @@ impl PublicOperationService {
                         ));
                     }
                     self.ensure_packet_latency_remaining(operation, "retrieval pin admission")?;
-                    crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
+                    let mut retrieval_pin_span =
+                        crate::agent::packet_batch::observe_packet_operation_span(
+                            crate::agent::packet_batch::PacketOperationObservationSpan::RetrievalPin,
+                        );
+                    let result = crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
                         &self.controller,
                         &publication.generation_id,
                         &publication.run_id,
                         run,
-                    )?
+                    );
+                    if result.is_ok() {
+                        retrieval_pin_span.finish_success();
+                    }
+                    result?
                 } else {
                     (run()?, None)
                 };
@@ -2434,6 +2483,9 @@ impl PublicOperationService {
                     retrieval_publication,
                 ))
             });
+            if result.is_ok() {
+                complete_core_span.finish_success();
+            }
             match result {
                 Ok((value, core_publication, retrieval_publication)) => {
                     return Ok(PublicOperation {
@@ -2448,6 +2500,7 @@ impl PublicOperationService {
                     if attempt == 1
                         && matches!(error.code.as_str(), "publication_changed" | "cache_busy") =>
                 {
+                    crate::agent::packet_batch::observe_packet_retry_cause(&error.code);
                     tracing::debug!(operation, "retrying pinned public operation");
                 }
                 Err(error) => return Err(error),
@@ -4235,6 +4288,127 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "retry must consume the original allowance: {error:?}"
         );
+        let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
+            .expect("active packet operation observation");
+        assert_eq!(observation.public_admission_reached_count, 2);
+        assert_eq!(observation.public_admission_passed_count, 1);
+        assert_eq!(observation.public_admission_refused_count, 1);
+        assert_eq!(observation.attempt_started_count, 1);
+        assert_eq!(observation.retry_publication_changed_count, 1);
+        assert_eq!(observation.retry_cache_busy_count, 0);
+        assert!(
+            observation.last_public_admission_ms > observation.first_public_admission_ms,
+            "the refused retry admission must retain a later elapsed boundary: {observation:?}"
+        );
+        assert_eq!(observation.complete_core_snapshot_started_count, 1);
+        assert_eq!(observation.complete_core_snapshot_succeeded_count, 0);
+        assert_eq!(observation.uncached_freshness_started_count, 1);
+        assert_eq!(observation.uncached_freshness_succeeded_count, 1);
+        assert_eq!(observation.retrieval_pin_started_count, 1);
+        assert_eq!(observation.retrieval_pin_succeeded_count, 0);
+        assert_eq!(observation.build_callback_started_count, 1);
+        assert_eq!(observation.build_callback_succeeded_count, 0);
+        assert_eq!(observation.post_build_freshness_started_count, 0);
+        assert_eq!(observation.post_build_freshness_succeeded_count, 0);
+        assert_eq!(observation.pin_begin_started_count, 1);
+        assert_eq!(observation.pin_begin_succeeded_count, 1);
+        assert_eq!(observation.pin_revalidation_started_count, 0);
+        assert_eq!(observation.pin_revalidation_succeeded_count, 0);
+    }
+
+    #[test]
+    fn packet_cache_busy_retry_records_the_outer_decision_before_refusal() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let _scope = crate::enter_packet_latency_scope(Some(2_000));
+        let mut builds = 0;
+        let error = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                builds += 1;
+                assert_eq!(builds, 1, "expired retry reached packet execution");
+                std::thread::sleep(Duration::from_millis(2_250));
+                Err::<(), _>(ApiError::new("cache_busy", "injected cache contention"))
+            })
+            .expect_err("spent cache-busy retry must refuse");
+        assert!(
+            error
+                .message
+                .contains("packet latency budget exhausted before public packet admission"),
+            "retry must preserve the existing admission error: {error:?}"
+        );
+        let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
+            .expect("active packet operation observation");
+        assert_eq!(observation.public_admission_reached_count, 2);
+        assert_eq!(observation.public_admission_passed_count, 1);
+        assert_eq!(observation.public_admission_refused_count, 1);
+        assert_eq!(observation.attempt_started_count, 1);
+        assert_eq!(observation.retry_publication_changed_count, 0);
+        assert_eq!(observation.retry_cache_busy_count, 1);
+    }
+
+    #[test]
+    fn packet_first_admission_refusal_records_no_attempt_or_retry() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let _scope = crate::enter_packet_latency_scope(Some(1_000));
+        std::thread::sleep(Duration::from_millis(1_050));
+
+        let error = service
+            .run_with_cancel(
+                "packet",
+                Arc::new(AtomicBool::new(false)),
+                || -> Result<(), ApiError> {
+                    panic!("refused first admission reached packet execution")
+                },
+            )
+            .expect_err("spent first admission must refuse");
+        assert!(
+            error
+                .message
+                .contains("packet latency budget exhausted before public packet admission"),
+            "first refusal must preserve the existing admission error: {error:?}"
+        );
+        let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
+            .expect("active packet operation observation");
+        assert_eq!(observation.public_admission_reached_count, 1);
+        assert_eq!(observation.public_admission_passed_count, 0);
+        assert_eq!(observation.public_admission_refused_count, 1);
+        assert_eq!(observation.attempt_started_count, 0);
+        assert_eq!(observation.retry_publication_changed_count, 0);
+        assert_eq!(observation.retry_cache_busy_count, 0);
+    }
+
+    #[test]
+    fn packet_nonretryable_failure_records_one_admitted_attempt() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let _scope = crate::enter_packet_latency_scope(Some(30_000));
+
+        let error = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                Err::<(), _>(ApiError::new(
+                    "project_unavailable",
+                    "injected terminal error",
+                ))
+            })
+            .expect_err("nonretryable packet failure must propagate");
+        assert_eq!(error.code, "project_unavailable");
+        let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
+            .expect("active packet operation observation");
+        assert_eq!(observation.public_admission_reached_count, 1);
+        assert_eq!(observation.public_admission_passed_count, 1);
+        assert_eq!(observation.public_admission_refused_count, 0);
+        assert_eq!(observation.attempt_started_count, 1);
+        assert_eq!(observation.retry_publication_changed_count, 0);
+        assert_eq!(observation.retry_cache_busy_count, 0);
+        assert_eq!(observation.complete_core_snapshot_started_count, 1);
+        assert_eq!(observation.complete_core_snapshot_succeeded_count, 0);
+        assert_eq!(observation.uncached_freshness_started_count, 1);
+        assert_eq!(observation.uncached_freshness_succeeded_count, 1);
+        assert_eq!(observation.retrieval_pin_started_count, 1);
+        assert_eq!(observation.retrieval_pin_succeeded_count, 0);
+        assert_eq!(observation.build_callback_started_count, 1);
+        assert_eq!(observation.build_callback_succeeded_count, 0);
     }
 
     /// The first packet on a ready lease performs exactly one fingerprint pass.
