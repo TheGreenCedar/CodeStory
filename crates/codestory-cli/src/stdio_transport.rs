@@ -1719,6 +1719,26 @@ fn handle_stdio_request(
                     ));
                 }
             };
+            let _packet_latency_scope = if name == "packet" {
+                let latency_budget_ms = match stdio_packet_latency_budget(&request) {
+                    Ok(latency_budget_ms) => latency_budget_ms,
+                    Err(error) => {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            stdio_tool_call_error_v3(&serde_json::json!({
+                                "code": "invalid_argument",
+                                "message": error.to_string(),
+                                "tool": name,
+                            })),
+                        ));
+                    }
+                };
+                Some(codestory_runtime::enter_packet_latency_scope(
+                    latency_budget_ms,
+                ))
+            } else {
+                None
+            };
             if let Err(error) = session.select_tool_project(&request) {
                 let message = error.to_string();
                 let code = if message.starts_with("project_required:") {
@@ -12633,6 +12653,149 @@ version = "0.11.20"
             crate::runtime::runtime_context_construction_count_for_test(),
             context_constructions,
             "the second broad tool must not construct another runtime context"
+        );
+    }
+
+    #[test]
+    fn packet_entry_does_not_renew_spent_allowance_before_descriptor_execution() {
+        fn call_until_ready(session: &mut StdioServerSession, project: &Path) -> serde_json::Value {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            for attempt in 0..20 {
+                let response = handle_stdio_message(
+                    session,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("packet-entry-ready-{attempt}"),
+                        "method": "tools/call",
+                        "params": {
+                            "name": "packet",
+                            "arguments": {
+                                "project": project,
+                                "question": "Where is PACKET_ENTRY_DEADLINE_ANCHOR?"
+                            }
+                        }
+                    })
+                    .to_string(),
+                    &Arc::new(AtomicBool::new(false)),
+                )
+                .expect("packet response");
+                let content = &response["result"]["structuredContent"];
+                if content.get("code") == Some(&json!("codestory_preparing")) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "packet fixture did not become ready: {content}"
+                    );
+                    std::thread::sleep(Duration::from_millis(
+                        content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                    ));
+                    continue;
+                }
+                return response;
+            }
+            panic!("packet fixture did not converge within the bounded retry count")
+        }
+
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("metadata.rs"),
+            "// PACKET_ENTRY_DEADLINE_ANCHOR\n",
+        )
+        .expect("write packet entry fixture");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run packet entry git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "codestory-tests@example.com"]);
+        git(&["config", "user.name", "CodeStory Tests"]);
+        git(&["add", "metadata.rs"]);
+        git(&["commit", "-qm", "packet entry fixture"]);
+
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select packet entry project");
+        let active = session.active_project.as_ref().expect("active project");
+        active
+            .runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish packet entry core");
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &active.runtime.project_root,
+            &active.runtime.storage_path,
+            active.runtime.sidecar.as_raw_config_for_test(),
+        )
+        .expect("publish packet entry retrieval fixture");
+        active
+            .runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
+
+        let ready = call_until_ready(&mut session, project.path());
+        assert_ne!(
+            ready.pointer("/result/isError"),
+            Some(&json!(true)),
+            "control packet must establish the ready lease: {ready}"
+        );
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_in_call = Arc::clone(&hook_ran);
+        codestory_runtime::set_before_retrieval_pin_test_hook(move || {
+            hook_ran_in_call.store(true, std::sync::atomic::Ordering::Release);
+            std::thread::sleep(Duration::from_millis(2_250));
+        });
+        let response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "packet-entry-spent-allowance",
+                "method": "tools/call",
+                "params": {
+                    "name": "packet",
+                    "arguments": {
+                        "project": project.path(),
+                        "question": "Where is PACKET_ENTRY_DEADLINE_ANCHOR?",
+                        "latency_budget_ms": 2_000
+                    }
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("spent packet response");
+        assert!(
+            hook_ran.load(std::sync::atomic::Ordering::Acquire),
+            "the causal admission delay must run before interpreting the packet result"
+        );
+        assert_eq!(
+            response.pointer("/result/isError"),
+            Some(&json!(true)),
+            "a packet must stop before descriptor execution after its entry allowance is spent: {response}"
+        );
+        let error = response
+            .pointer("/result/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.contains("packet latency budget exhausted"),
+            "spent entry allowance must fail before fresh descriptor execution: {response}"
         );
     }
 
