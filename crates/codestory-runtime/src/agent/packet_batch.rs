@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
+const MIN_PACKET_HANDOFF_MS: u128 = 1_000;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -42,8 +43,9 @@ impl PacketLatencyBudget {
         self.elapsed_ms() >= self.target_ms
     }
 
-    pub(crate) fn remaining_ms(&self) -> u32 {
-        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(1_000))
+    pub(crate) fn remaining_for_handoff(self) -> Option<u32> {
+        let remaining_ms = self.target_ms.saturating_sub(self.elapsed_ms());
+        (remaining_ms >= MIN_PACKET_HANDOFF_MS).then(|| clamp_u128_to_u32(remaining_ms))
     }
 
     pub(crate) fn apply_to_trace(self, answer: &mut AgentAnswerDto) {
@@ -51,6 +53,53 @@ impl PacketLatencyBudget {
         if (answer.retrieval_trace.total_latency_ms as u128) > self.target_ms || self.exhausted() {
             answer.retrieval_trace.sla_missed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod packet_latency_budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn packet_budget_handoff_charges_elapsed_work_and_refuses_an_exhausted_floor() {
+        let partially_spent = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(700))
+                .expect("backdate packet start"),
+            target_ms: 2_000,
+        };
+        let remaining = partially_spent
+            .remaining_for_handoff()
+            .expect("partially spent packet allowance");
+        assert!(
+            (1_250..=1_300).contains(&remaining),
+            "descriptor elapsed time must reduce the downstream allowance: {remaining}"
+        );
+
+        let below_retrieval_minimum = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(700))
+                .expect("backdate sub-minimum packet start"),
+            target_ms: 1_000,
+        };
+        assert_eq!(
+            below_retrieval_minimum.remaining_for_handoff(),
+            None,
+            "a sub-minimum remainder must stop before downstream retrieval instead of granting a fresh 1000 ms phase"
+        );
+
+        let exhausted = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(1_001))
+                .expect("backdate exhausted packet start"),
+            target_ms: 1_000,
+        };
+        assert_eq!(
+            exhausted.remaining_for_handoff(),
+            None,
+            "an exhausted packet must stop before a downstream stage instead of renewing the 1000 ms floor"
+        );
     }
 }
 
@@ -85,7 +134,7 @@ pub(crate) fn run_packet_planned_subqueries(
     if pending.is_empty() {
         return Ok(());
     }
-    if packet_latency.exhausted() {
+    let Some(remaining_ms) = packet_latency.remaining_for_handoff() else {
         answer.retrieval_trace.sla_missed = true;
         answer
             .retrieval_trace
@@ -95,7 +144,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 pending.len()
             )));
         return Ok(());
-    }
+    };
 
     let per_query_limit = packet_subquery_hit_limit(limits);
     let stage_carry_limit = packet_stage_citation_carry_limit(limits);
@@ -113,19 +162,18 @@ pub(crate) fn run_packet_planned_subqueries(
         )));
 
     let started_at = Instant::now();
-    let outcome =
-        match controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms())) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                answer
-                    .retrieval_trace
-                    .annotations
-                    .push(RetrievalAnnotationDto::gap(format!(
-                        "packet_fused_subquery_batch_failed error={error:?}"
-                    )));
-                return Err(error);
-            }
-        };
+    let outcome = match controller.search_packet_fused_batch(&batch, Some(remaining_ms)) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::gap(format!(
+                    "packet_fused_subquery_batch_failed error={error:?}"
+                )));
+            return Err(error);
+        }
+    };
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace
@@ -153,16 +201,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 "packet fused retry was cancelled before dispatch",
             ));
         }
-        if packet_latency.exhausted() {
-            // The retry never ran, so those queries contributed no evidence.
-            answer
-                .retrieval_trace
-                .annotations
-                .push(RetrievalAnnotationDto::gap(format!(
-                    "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
-                    retry_pending.len()
-                )));
-        } else {
+        if let Some(remaining_ms) = packet_latency.remaining_for_handoff() {
             answer
                 .retrieval_trace
                 .annotations
@@ -176,7 +215,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 .collect::<Vec<_>>();
             let retry_started_at = Instant::now();
             let retry_outcome = controller
-                .search_packet_fused_batch(&retry_batch, Some(packet_latency.remaining_ms()))
+                .search_packet_fused_batch(&retry_batch, Some(remaining_ms))
                 .map_err(|error| {
                     answer
                         .retrieval_trace
@@ -217,6 +256,15 @@ pub(crate) fn run_packet_planned_subqueries(
                         retry_outcome.retryable_queries.len()
                     )));
             }
+        } else {
+            // The retry never ran, so those queries contributed no evidence.
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::gap(format!(
+                    "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
+                    retry_pending.len()
+                )));
         }
     }
 
