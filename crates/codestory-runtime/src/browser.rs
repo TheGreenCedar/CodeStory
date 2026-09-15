@@ -163,6 +163,7 @@ impl ReadOnlyBrowserService {
     }
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        let _latency_scope = crate::enter_packet_latency_scope(req.latency_budget_ms);
         self.run_public("packet", || self.controller.agent_packet(req.clone()))
     }
 
@@ -175,6 +176,7 @@ impl ReadOnlyBrowserService {
         req: AgentPacketRequestDto,
         include_dense_semantic: bool,
     ) -> Result<BenchmarkPacketExecution, ApiError> {
+        let _latency_scope = crate::enter_packet_latency_scope(req.latency_budget_ms);
         self.run_public("packet", || {
             let execution = self
                 .controller

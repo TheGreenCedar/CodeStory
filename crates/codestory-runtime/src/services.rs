@@ -2219,6 +2219,27 @@ impl PublicOperationService {
             })
     }
 
+    fn ensure_packet_latency_remaining(
+        &self,
+        operation: &str,
+        phase: &str,
+    ) -> Result<(), ApiError> {
+        if operation != "packet" {
+            return Ok(());
+        }
+        let Some(packet_latency) = crate::agent::packet_batch::active_packet_latency_budget()
+        else {
+            return Ok(());
+        };
+        packet_latency.remaining_for_handoff().ok_or_else(|| {
+            crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                &self.controller,
+                format!("packet latency budget exhausted before {phase}"),
+            )
+        })?;
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn retrieval_primary_enabled_for_test(&self) -> bool {
@@ -2289,6 +2310,13 @@ impl PublicOperationService {
         // content, so same-mtime drift and torn reads win over reuse.
         let _source_freshness_scope = self.source_freshness_scope();
         for attempt in 1..=2 {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ApiError::new(
+                    "cancelled",
+                    format!("request cancelled before {operation}"),
+                ));
+            }
+            self.ensure_packet_latency_remaining(operation, "public packet admission")?;
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self
                     .controller
@@ -2342,6 +2370,13 @@ impl PublicOperationService {
                 };
                 let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
                     run_before_retrieval_pin_test_hook();
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            format!("request cancelled before {operation}"),
+                        ));
+                    }
+                    self.ensure_packet_latency_remaining(operation, "retrieval pin admission")?;
                     crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
                         &self.controller,
                         &publication.generation_id,
@@ -3085,6 +3120,7 @@ impl AgentService {
     }
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        let _latency_scope = crate::enter_packet_latency_scope(req.latency_budget_ms);
         let cancelled = active_public_operation_cancellation()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         self.public_operation
@@ -4085,6 +4121,9 @@ pub(crate) mod activation_tests {
         let observed = Arc::new(AtomicBool::new(false));
         let observed_in_hook = Arc::clone(&observed);
         set_before_retrieval_pin_test_hook(move || {
+            let packet_latency = crate::agent::packet_batch::active_packet_latency_budget()
+                .expect("exported agent packet allowance");
+            assert_eq!(packet_latency.target_ms, 30_000);
             assert!(
                 controller.active_core_publication().is_some(),
                 "retrieval began outside the exported service's core snapshot"
@@ -4101,6 +4140,61 @@ pub(crate) mod activation_tests {
         );
     }
 
+    #[test]
+    fn cancelled_packet_wins_over_expired_budget_after_pre_pin_hook() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_in_hook = Arc::clone(&cancelled);
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_in_hook = Arc::clone(&hook_ran);
+        let _latency_scope = crate::enter_packet_latency_scope(Some(2_000));
+        set_before_retrieval_pin_test_hook(move || {
+            hook_ran_in_hook.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(2_250));
+            cancel_in_hook.store(true, Ordering::Release);
+        });
+
+        let error = service
+            .run_with_cancel("packet", cancelled, || -> Result<(), ApiError> {
+                panic!("cancelled admission reached packet execution")
+            })
+            .expect_err("cancelled packet admission must fail");
+
+        assert!(hook_ran.load(Ordering::Acquire), "pre-pin hook did not run");
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(error.message, "request cancelled before packet");
+    }
+
+    #[test]
+    fn packet_publication_retry_keeps_the_spent_entry_allowance() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let _scope = crate::enter_packet_latency_scope(Some(2_000));
+        let mut builds = 0;
+        let error = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                builds += 1;
+                assert_eq!(
+                    builds, 1,
+                    "expired publication retry reached packet execution"
+                );
+                std::thread::sleep(Duration::from_millis(2_250));
+                Err::<(), _>(ApiError::new(
+                    "publication_changed",
+                    "injected publication drift",
+                ))
+            })
+            .expect_err("spent publication retry must refuse");
+        assert_eq!(builds, 1, "first attempt must reach the injected drift");
+        assert!(
+            error
+                .message
+                .contains("packet latency budget exhausted before public packet admission"),
+            "retry must consume the original allowance: {error:?}"
+        );
+    }
+
     /// The first packet on a ready lease performs exactly one fingerprint pass.
     /// A later wrapper on that same lease reuses the opaque fingerprint, while
     /// replacing the lease memo forces exactly one new pass.
@@ -4108,6 +4202,11 @@ pub(crate) mod activation_tests {
     fn a_warm_packet_performs_one_fingerprint_pass_per_ready_lease() {
         let fixture = ready_activation_fixture();
         let browser = fixture.runtime.browser_service();
+        set_before_retrieval_pin_test_hook(|| {
+            let allowance = crate::agent::packet_batch::active_packet_latency_budget()
+                .expect("direct browser entry must own an allowance before pinning");
+            assert_eq!(allowance.target_ms, 30_000);
+        });
 
         let flat = browser
             .packet(warm_packet_request())

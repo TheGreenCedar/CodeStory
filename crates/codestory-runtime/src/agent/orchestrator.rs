@@ -371,7 +371,7 @@ fn agent_packet_with_session(
     let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
     controller.begin_packet_retrieval();
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
-    let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
+    let packet_latency = PacketLatencyBudget::inherited_or_new(req.latency_budget_ms);
 
     if !req.option_ids.is_empty() && req.parent_packet_id.is_none() {
         return Err(ApiError::invalid_argument(

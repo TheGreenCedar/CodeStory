@@ -13,7 +13,10 @@ use codestory_contracts::api::{
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
     PacketSidecarQueryDiagnosticDto, RetrievalAnnotationDto,
 };
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
@@ -25,6 +28,49 @@ pub(crate) struct PacketLatencyBudget {
     pub(crate) target_ms: u128,
 }
 
+thread_local! {
+    static ACTIVE_PACKET_LATENCY_BUDGET: Cell<Option<PacketLatencyBudget>> = const {
+        Cell::new(None)
+    };
+}
+
+/// Restores the packet allowance that was active before this synchronous scope.
+///
+/// The guard is deliberately thread-bound because it restores thread-local state.
+#[doc(hidden)]
+pub struct PacketLatencyScopeGuard {
+    previous: Option<PacketLatencyBudget>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for PacketLatencyScopeGuard {
+    fn drop(&mut self) {
+        ACTIVE_PACKET_LATENCY_BUDGET.with(|active| active.set(self.previous));
+    }
+}
+
+/// Start one packet allowance unless an outer packet entry already owns it.
+///
+/// Nested public-operation wrappers inherit the outer start instant. This is a
+/// runtime integration surface for adapters; the request DTO remains unchanged.
+#[doc(hidden)]
+pub fn enter_packet_latency_scope(requested_ms: Option<u32>) -> PacketLatencyScopeGuard {
+    ACTIVE_PACKET_LATENCY_BUDGET.with(|active| {
+        let previous = active.get();
+        active.set(Some(
+            previous.unwrap_or_else(|| PacketLatencyBudget::new(requested_ms)),
+        ));
+        PacketLatencyScopeGuard {
+            previous,
+            _thread_bound: PhantomData,
+        }
+    })
+}
+
+pub(crate) fn active_packet_latency_budget() -> Option<PacketLatencyBudget> {
+    ACTIVE_PACKET_LATENCY_BUDGET.with(Cell::get)
+}
+
 impl PacketLatencyBudget {
     pub(crate) fn new(requested_ms: Option<u32>) -> Self {
         Self {
@@ -33,6 +79,10 @@ impl PacketLatencyBudget {
                 .unwrap_or(DEFAULT_SLA_TARGET_MS)
                 .clamp(1_000, 120_000) as u128,
         }
+    }
+
+    pub(crate) fn inherited_or_new(requested_ms: Option<u32>) -> Self {
+        active_packet_latency_budget().unwrap_or_else(|| Self::new(requested_ms))
     }
 
     fn elapsed_ms(&self) -> u128 {
@@ -59,6 +109,7 @@ impl PacketLatencyBudget {
 #[cfg(test)]
 mod packet_latency_budget_tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
 
     #[test]
@@ -99,6 +150,40 @@ mod packet_latency_budget_tests {
             exhausted.remaining_for_handoff(),
             None,
             "an exhausted packet must stop before a downstream stage instead of renewing the 1000 ms floor"
+        );
+    }
+
+    #[test]
+    fn packet_latency_scope_inherits_outer_identity_and_restores_after_unwind() {
+        assert!(active_packet_latency_budget().is_none());
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _outer = enter_packet_latency_scope(Some(2_000));
+            let outer = active_packet_latency_budget().expect("outer packet allowance");
+            assert_eq!(outer.target_ms, 2_000);
+
+            {
+                let _inner = enter_packet_latency_scope(Some(120_000));
+                let inherited = active_packet_latency_budget().expect("inherited allowance");
+                assert_eq!(inherited.started_at, outer.started_at);
+                assert_eq!(inherited.target_ms, outer.target_ms);
+            }
+            let restored = active_packet_latency_budget().expect("restored outer allowance");
+            assert_eq!(restored.started_at, outer.started_at);
+            assert_eq!(restored.target_ms, outer.target_ms);
+            panic!("exercise packet allowance unwind cleanup");
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            active_packet_latency_budget().is_none(),
+            "unwind must restore the prior thread-local packet allowance"
+        );
+
+        let _independent = enter_packet_latency_scope(None);
+        assert_eq!(
+            active_packet_latency_budget()
+                .expect("independent packet allowance")
+                .target_ms,
+            DEFAULT_SLA_TARGET_MS as u128
         );
     }
 }

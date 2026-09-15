@@ -13,6 +13,8 @@ when prepared results are unavailable.
 Packet retrieval stops starting another stage when its latency allowance runs
 out. Cancellation and deadline checks also apply between mandatory readiness
 checks, without interrupting validation already in progress.
+MCP packet requests include activation and publication checks in their latency
+allowance, so those steps cannot grant retrieval a fresh budget.
 
 Loading precise source evidence uses less temporary disk and rejects malformed
 record ordering.
