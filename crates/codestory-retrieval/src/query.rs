@@ -1119,7 +1119,14 @@ impl SidecarSearch for PreparedBatchSidecars {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.check_cancelled()?;
-        let hits = self.lexical_search(query, limit)?;
+        let hits = if let Some(prepared) = self.prepared_lexical.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            hits
+        } else {
+            self.inner
+                .lexical_search_with_context(query, limit, context)?
+        };
         context.check_cancelled()?;
         Ok(hits)
     }
@@ -1140,7 +1147,14 @@ impl SidecarSearch for PreparedBatchSidecars {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.check_cancelled()?;
-        let hits = self.semantic_search(query, limit)?;
+        let hits = if let Some(prepared) = self.prepared_semantic.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            hits
+        } else {
+            self.inner
+                .semantic_search_with_context(query, limit, context)?
+        };
         context.check_cancelled()?;
         Ok(hits)
     }
@@ -1344,6 +1358,7 @@ mod tests {
     use crate::test_support::retrieval_manifest_fixture;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1933,6 +1948,232 @@ mod tests {
                 .iter()
                 .any(|hit| hit.file_path.starts_with("src/prepared-"))
         }));
+    }
+
+    #[test]
+    fn prepared_batch_sidecars_preserve_context_on_partial_prefetch_misses() {
+        struct ContextRecordingSidecars {
+            ordinary_lexical_calls: AtomicUsize,
+            contextual_lexical_calls: AtomicUsize,
+            ordinary_semantic_calls: AtomicUsize,
+            contextual_semantic_calls: AtomicUsize,
+            semantic_batch_calls: AtomicUsize,
+            expected_context_address: AtomicUsize,
+            contextual_calls: Mutex<Vec<(String, usize)>>,
+            delegate_stage_cancelled: Arc<AtomicBool>,
+        }
+
+        impl SidecarSearch for ContextRecordingSidecars {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.ordinary_lexical_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/ordinary-lexical-{query}.rs"),
+                    0.5,
+                )])
+            }
+
+            fn lexical_search_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                assert_eq!(
+                    std::ptr::from_ref(context).addr(),
+                    self.expected_context_address.load(Ordering::SeqCst),
+                    "prepared cache miss must preserve the original context object"
+                );
+                context.timeout(Duration::from_secs(1))?;
+                self.contextual_lexical_calls.fetch_add(1, Ordering::SeqCst);
+                self.contextual_calls
+                    .lock()
+                    .expect("record contextual lexical call")
+                    .push((format!("lexical:{query}"), limit));
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/contextual-lexical-{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn lexical_search_batch(
+                &self,
+                queries: &[(String, usize)],
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                Ok(Some(
+                    queries
+                        .iter()
+                        .map(|(query, _)| {
+                            vec![
+                                CandidateHit::lexical_stub(
+                                    format!("src/prepared-first-{query}.rs"),
+                                    1.0,
+                                ),
+                                CandidateHit::lexical_stub(
+                                    format!("src/prepared-second-{query}.rs"),
+                                    0.9,
+                                ),
+                            ]
+                        })
+                        .collect(),
+                ))
+            }
+
+            fn semantic_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.ordinary_semantic_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/ordinary-semantic-{query}.rs"),
+                    0.5,
+                )])
+            }
+
+            fn semantic_search_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                assert_eq!(
+                    std::ptr::from_ref(context).addr(),
+                    self.expected_context_address.load(Ordering::SeqCst),
+                    "prepared cache miss must preserve the original context object"
+                );
+                self.contextual_semantic_calls
+                    .fetch_add(1, Ordering::SeqCst);
+                self.contextual_calls
+                    .lock()
+                    .expect("record contextual semantic call")
+                    .push((format!("semantic:{query}"), limit));
+                if query == "cancel during semantic miss" {
+                    self.delegate_stage_cancelled.store(true, Ordering::Release);
+                    context.check_cancelled()?;
+                }
+                context.timeout(Duration::from_secs(1))?;
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/contextual-semantic-{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn semantic_search_batch(
+                &self,
+                _queries: &[String],
+                _limit: usize,
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                self.semantic_batch_calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("simulated semantic prefetch failure")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let request_cancelled = Arc::new(AtomicBool::new(false));
+        let delegate_stage_cancelled = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(ContextRecordingSidecars {
+            ordinary_lexical_calls: AtomicUsize::new(0),
+            contextual_lexical_calls: AtomicUsize::new(0),
+            ordinary_semantic_calls: AtomicUsize::new(0),
+            contextual_semantic_calls: AtomicUsize::new(0),
+            semantic_batch_calls: AtomicUsize::new(0),
+            expected_context_address: AtomicUsize::new(0),
+            contextual_calls: Mutex::new(Vec::new()),
+            delegate_stage_cancelled: Arc::clone(&delegate_stage_cancelled),
+        });
+        let misses = vec![
+            (0, "alpha behavior".to_string(), Some(1_000)),
+            (1, "beta behavior".to_string(), Some(1_000)),
+        ];
+        let (prepared, _) = prepare_batched_sidecars(
+            inner.clone(),
+            Some(&manifest_for("testproj", "partial-context", 2)),
+            &misses,
+            &request_cancelled,
+        );
+        let context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&request_cancelled),
+            Arc::clone(&delegate_stage_cancelled),
+        );
+        inner
+            .expected_context_address
+            .store(std::ptr::from_ref(&context).addr(), Ordering::SeqCst);
+        assert_eq!(inner.semantic_batch_calls.load(Ordering::SeqCst), 1);
+
+        let prepared_hit = prepared
+            .lexical_search_with_context("alpha behavior", 1, &context)
+            .expect("prepared lexical hit");
+        assert_eq!(prepared_hit.len(), 1);
+        assert_eq!(
+            prepared_hit[0].file_path,
+            "src/prepared-first-alpha behavior.rs"
+        );
+        assert_eq!(inner.ordinary_lexical_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_lexical_calls.load(Ordering::SeqCst), 0);
+
+        let lexical_miss = prepared
+            .lexical_search_with_context("gamma behavior", 7, &context)
+            .expect("contextual lexical miss");
+        let semantic_miss = prepared
+            .semantic_search_with_context("gamma behavior", 9, &context)
+            .expect("contextual semantic miss");
+        assert_eq!(
+            lexical_miss[0].file_path,
+            "src/contextual-lexical-gamma behavior.rs"
+        );
+        assert_eq!(
+            semantic_miss[0].file_path,
+            "src/contextual-semantic-gamma behavior.rs"
+        );
+        assert_eq!(inner.ordinary_lexical_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.ordinary_semantic_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_semantic_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *inner
+                .contextual_calls
+                .lock()
+                .expect("read contextual calls"),
+            [
+                ("lexical:gamma behavior".to_string(), 7),
+                ("semantic:gamma behavior".to_string(), 9),
+            ]
+        );
+
+        request_cancelled.store(true, Ordering::Release);
+        let calls_before_cancelled_hit = inner.contextual_calls.lock().unwrap().len();
+        assert!(
+            prepared
+                .lexical_search_with_context("alpha behavior", 1, &context)
+                .is_err()
+        );
+        assert!(
+            prepared
+                .semantic_search_with_context("delta behavior", 1, &context)
+                .is_err()
+        );
+        assert_eq!(
+            inner.contextual_calls.lock().unwrap().len(),
+            calls_before_cancelled_hit
+        );
+
+        request_cancelled.store(false, Ordering::Release);
+        let cancellation = prepared
+            .semantic_search_with_context("cancel during semantic miss", 3, &context)
+            .expect_err("delegate cancellation must propagate");
+        assert!(cancellation.to_string().contains("cancelled"));
+        assert_eq!(inner.ordinary_semantic_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_semantic_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
