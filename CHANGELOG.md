@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Precise source evidence stores repeated names and paths once, reducing disk use
+while keeping existing indexes readable.
+
 Fallback retrieval preserves the active search deadline and cancellation limits
 when prepared results are unavailable.
 
