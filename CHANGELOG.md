@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Fallback retrieval preserves the active search deadline and cancellation limits
+when prepared results are unavailable.
+
 Packet retrieval shares one latency allowance across its stages and stops
 starting retrieval work when that allowance runs out.
 
