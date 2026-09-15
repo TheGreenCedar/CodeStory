@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Retrieval errors now explain the observed cancellation reason and operation
+stage or validation phase when that information is available.
+
 Search and packet requests report no indexed evidence when their only matches
 are verified project files outside source indexing, instead of failing to
 resolve them as symbols.
