@@ -1296,16 +1296,24 @@ fn sidecar_primary_search_outcome_from_resolution(
     query_result: QueryResult,
     resolution: SidecarCandidateResolutionOutcome,
 ) -> SidecarPrimarySearchOutcome {
+    let can_serve_unindexed_lexical_artifacts = resolution.unindexed_lexical_artifacts_only
+        && sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode)
+        && sidecar_blocking_cancel_reason(&query_result).is_none();
     let resolved_hits = resolution.resolved_hits.clone();
-    let shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
+    let mut shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
         controller,
         query_result.clone(),
         &resolution,
         &resolved_hits,
         &resolved_hits,
     );
+    if can_serve_unindexed_lexical_artifacts {
+        shadow.diagnostic_only = true;
+    }
 
-    if let Some(reason) = sidecar_primary_result_rejection_reason(&query_result, &resolved_hits) {
+    if let Some(reason) = sidecar_primary_result_rejection_reason(&query_result, &resolved_hits)
+        && !can_serve_unindexed_lexical_artifacts
+    {
         let diagnostic = sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
         let reason = format!("{reason}; {diagnostic}");
         return SidecarPrimarySearchOutcome::Rejected { shadow, reason };
@@ -1363,6 +1371,7 @@ pub(crate) struct SidecarCandidateResolutionOutcome {
     unresolved_candidate_count: usize,
     blocking_unresolved_candidate_count: usize,
     attempted_candidate_indices: HashSet<usize>,
+    unindexed_lexical_artifacts_only: bool,
 }
 
 fn packet_sidecar_query_diagnostic(
@@ -2315,6 +2324,44 @@ fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
         })
 }
 
+fn candidate_is_unindexed_lexical_artifact(
+    storage: &Store,
+    project_root: &Path,
+    candidate: &CandidateHit,
+    resolution_label: &str,
+) -> bool {
+    if resolution_label != "node_unresolved"
+        || candidate.source != CandidateSource::Lexical
+        || candidate.node_id.is_some()
+        || candidate.symbol_name.is_some()
+        || candidate.qualified_name.is_some()
+        || candidate.target.is_some()
+    {
+        return false;
+    }
+
+    let normalized = normalize_repo_relative_path(project_root, &candidate.file_path);
+    if normalized.trim().is_empty() {
+        return false;
+    }
+    let source_rooted = source_root_candidate_path(&normalized);
+    let existing_outside_core_route = std::iter::once(normalized.as_str())
+        .chain(source_rooted.as_deref())
+        .any(|path| {
+            matches!(
+                codestory_workspace::resolve_project_relative_path(project_root, Path::new(path)),
+                Ok(codestory_workspace::ProjectRelativePathResolution::Existing {
+                    relative,
+                    ..
+                }) if !codestory_workspace::has_supported_source_route(&relative)
+            )
+        });
+    existing_outside_core_route
+        && candidate_lookup_paths(project_root, &normalized)
+            .into_iter()
+            .all(|path| matches!(storage.get_file_by_path(&path), Ok(None)))
+}
+
 /// Stable-partition resolvable candidates ahead of unresolvable ones.
 ///
 /// `path_resolvable` stats the filesystem, so it is decorated once per surviving
@@ -2956,12 +3003,23 @@ fn resolve_sidecar_candidates_in_storage(
 
     let has_resolved_hit = !hits.is_empty();
     let unresolved_candidate_count = unresolved_candidates.len();
-    let blocking_unresolved_candidate_count = unresolved_candidates
-        .iter()
-        .filter(|(candidate, label)| {
-            !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
-        })
-        .count();
+    let unindexed_lexical_artifacts_only = !candidates.is_empty()
+        && hits.is_empty()
+        && unresolved_candidate_count == candidates.len()
+        && attempted_candidate_indices.len() == candidates.len()
+        && unresolved_candidates.iter().all(|(candidate, label)| {
+            candidate_is_unindexed_lexical_artifact(storage, project_root, candidate, label)
+        });
+    let blocking_unresolved_candidate_count = if unindexed_lexical_artifacts_only {
+        0
+    } else {
+        unresolved_candidates
+            .iter()
+            .filter(|(candidate, label)| {
+                !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
+            })
+            .count()
+    };
 
     Ok(SidecarCandidateResolutionOutcome {
         resolved_hits: hits,
@@ -2969,6 +3027,7 @@ fn resolve_sidecar_candidates_in_storage(
         unresolved_candidate_count,
         blocking_unresolved_candidate_count,
         attempted_candidate_indices,
+        unindexed_lexical_artifacts_only,
     })
 }
 
@@ -4773,6 +4832,7 @@ mod tests {
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
+            unindexed_lexical_artifacts_only: false,
         };
 
         let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1, 3);
@@ -4830,6 +4890,7 @@ mod tests {
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::new(),
+            unindexed_lexical_artifacts_only: false,
         }
     }
 
@@ -5583,6 +5644,7 @@ mod tests {
                 unresolved_candidate_count: 0,
                 blocking_unresolved_candidate_count: 0,
                 attempted_candidate_indices: HashSet::new(),
+                unindexed_lexical_artifacts_only: false,
             })
         };
         let controller = AppController::new();
@@ -6004,6 +6066,287 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_primary_serves_only_unindexed_lexical_artifacts_outside_core_routes() {
+        use codestory_retrieval::{CandidateSource, classify_query};
+
+        let fixture = pinned_operation_fixture();
+        let project_root = fixture._project.path();
+        std::fs::create_dir_all(project_root.join("src")).expect("create source directory");
+        std::fs::write(project_root.join("LICENSE"), "license text\n")
+            .expect("write extensionless artifact");
+        std::fs::write(project_root.join("src/missing.rs"), "pub fn missing() {}\n")
+            .expect("write parser-routed source");
+        let controller = &fixture.controller;
+
+        let full_result = |query: &str, candidate: CandidateHit| QueryResult {
+            publication_identity: None,
+            query: query.to_string(),
+            features: classify_query(query),
+            hits: vec![candidate],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let assert_rejected = |result: QueryResult, expected_resolutions: &[&str]| {
+            match sidecar_primary_search_outcome_from_query_result(controller, result, 5) {
+                SidecarPrimarySearchOutcome::Rejected { shadow, .. } => assert_eq!(
+                    shadow
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.resolution.as_deref().unwrap_or("unlabeled"))
+                        .collect::<Vec<_>>(),
+                    expected_resolutions
+                ),
+                _ => panic!("candidate matrix row must stay rejected"),
+            }
+        };
+
+        let artifact_candidate =
+            CandidateHit::with_source("LICENSE", None, 0.8, CandidateSource::Lexical);
+        assert!(artifact_candidate.target.is_none());
+        let artifact_result = full_result("license", artifact_candidate);
+        let artifact_resolution =
+            resolve_sidecar_candidates_for_test(controller, &artifact_result.hits, 5)
+                .expect("resolve lexical artifact");
+        let artifact_diagnostic =
+            packet_sidecar_query_diagnostic(&artifact_result, &artifact_resolution, 1, 1, 2);
+        let artifact_outcome =
+            sidecar_primary_search_outcome_from_query_result(controller, artifact_result, 5);
+        let supported_source_result = full_result(
+            "missing",
+            CandidateHit::with_source("src/missing.rs", None, 0.8, CandidateSource::Lexical),
+        );
+        let supported_source_resolution =
+            resolve_sidecar_candidates_for_test(controller, &supported_source_result.hits, 5)
+                .expect("resolve parser-routed source");
+        let supported_source_diagnostic = packet_sidecar_query_diagnostic(
+            &supported_source_result,
+            &supported_source_resolution,
+            1,
+            1,
+            2,
+        );
+        assert_eq!(supported_source_diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(
+            supported_source_diagnostic.blocking_unresolved_candidate_count,
+            1
+        );
+        assert_rejected(supported_source_result, &["node_unresolved"]);
+
+        let semantic_result = full_result(
+            "handler",
+            CandidateHit::with_source(
+                "handler",
+                Some("handler".into()),
+                0.8,
+                CandidateSource::Semantic,
+            ),
+        );
+        let semantic_resolution =
+            resolve_sidecar_candidates_for_test(controller, &semantic_result.hits, 5)
+                .expect("resolve bare semantic anchor");
+        let semantic_diagnostic =
+            packet_sidecar_query_diagnostic(&semantic_result, &semantic_resolution, 1, 1, 2);
+        assert_eq!(semantic_diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(semantic_diagnostic.blocking_unresolved_candidate_count, 0);
+        assert_rejected(semantic_result, &["path_unresolvable"]);
+
+        assert_rejected(
+            full_result(
+                "license symbol",
+                CandidateHit::with_source(
+                    "LICENSE",
+                    Some("license".into()),
+                    0.8,
+                    CandidateSource::Lexical,
+                ),
+            ),
+            &["node_unresolved"],
+        );
+
+        let mut targeted_artifact =
+            CandidateHit::with_source("LICENSE", None, 0.8, CandidateSource::Lexical);
+        targeted_artifact.target = Some(SearchTargetDto::FileRange {
+            file_path: "LICENSE".into(),
+            start_byte: 0,
+            end_byte: 7,
+        });
+        assert_rejected(
+            full_result("license target", targeted_artifact),
+            &["node_unresolved"],
+        );
+
+        assert_rejected(
+            full_result(
+                "missing artifact",
+                CandidateHit::with_source("NOTICE", None, 0.8, CandidateSource::Lexical),
+            ),
+            &["path_unresolvable"],
+        );
+
+        let foreign = tempfile::tempdir().expect("foreign project");
+        let foreign_artifact = foreign.path().join("LICENSE");
+        std::fs::write(&foreign_artifact, "foreign license\n").expect("write foreign artifact");
+        assert_rejected(
+            full_result(
+                "foreign artifact",
+                CandidateHit::with_source(
+                    foreign_artifact.to_string_lossy(),
+                    None,
+                    0.8,
+                    CandidateSource::Lexical,
+                ),
+            ),
+            &["path_unresolvable"],
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink(&foreign_artifact, project_root.join("ESCAPING_LICENSE"))
+                .expect("create escaping symlink");
+            assert_rejected(
+                full_result(
+                    "escaping artifact",
+                    CandidateHit::with_source(
+                        "ESCAPING_LICENSE",
+                        None,
+                        0.8,
+                        CandidateSource::Lexical,
+                    ),
+                ),
+                &["path_unresolvable"],
+            );
+        }
+
+        let mut mixed_result = full_result(
+            "mixed artifacts",
+            CandidateHit::with_source("LICENSE", None, 0.8, CandidateSource::Lexical),
+        );
+        mixed_result.hits.push(CandidateHit::with_source(
+            "src/missing.rs",
+            None,
+            0.7,
+            CandidateSource::Lexical,
+        ));
+        assert_rejected(mixed_result, &["node_unresolved", "node_unresolved"]);
+
+        let mut unavailable_mode = full_result(
+            "license unavailable",
+            CandidateHit::with_source("LICENSE", None, 0.8, CandidateSource::Lexical),
+        );
+        unavailable_mode.trace.retrieval_mode = "no_semantic".into();
+        unavailable_mode.trace.degraded_reason = Some("fixture unavailable".into());
+        assert_rejected(unavailable_mode, &["node_unresolved"]);
+
+        let mut cancelled = full_result(
+            "license cancelled",
+            CandidateHit::with_source("LICENSE", None, 0.8, CandidateSource::Lexical),
+        );
+        cancelled.trace.cancel_reason = Some("deadline".into());
+        assert_rejected(cancelled, &["node_unresolved"]);
+
+        assert_eq!(artifact_diagnostic.resolved_hit_count, 0);
+        assert_eq!(artifact_diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(artifact_diagnostic.blocking_unresolved_candidate_count, 0);
+
+        match artifact_outcome {
+            SidecarPrimarySearchOutcome::Served {
+                hits,
+                packet_hits,
+                scored_hits,
+                shadow,
+            } => {
+                assert!(
+                    hits.is_empty(),
+                    "artifact must not fabricate search evidence"
+                );
+                assert!(
+                    packet_hits.is_empty(),
+                    "artifact must not fabricate packet evidence"
+                );
+                assert!(
+                    scored_hits.is_empty(),
+                    "artifact must not fabricate scored evidence"
+                );
+                assert_eq!(shadow.candidate_count, 1);
+                assert_eq!(shadow.resolved_hit_count, 0);
+                assert_eq!(shadow.unresolved_candidate_count, 1);
+                assert!(shadow.diagnostic_only);
+                assert_eq!(shadow.candidates.len(), 1);
+                assert_eq!(shadow.candidates[0].file_path, "LICENSE");
+                assert_eq!(shadow.candidates[0].symbol_name, None);
+                assert_eq!(
+                    shadow.candidates[0].resolution.as_deref(),
+                    Some("node_unresolved")
+                );
+                assert_eq!(
+                    shadow.candidates[0].loss_reason.as_deref(),
+                    Some("node_unresolved")
+                );
+            }
+            SidecarPrimarySearchOutcome::Rejected { reason, shadow } => panic!(
+                "an in-root lexical artifact outside core routing should serve no useful evidence; reason={reason}; shadow={shadow:?}"
+            ),
+            SidecarPrimarySearchOutcome::Unavailable { reason } => {
+                panic!("artifact resolution should remain available: {reason}")
+            }
+            SidecarPrimarySearchOutcome::Retryable { error } => {
+                panic!("artifact resolution should not retry: {error:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_primary_serves_empty_full_result_without_artifact_diagnostic() {
+        use codestory_retrieval::classify_query;
+
+        let fixture = pinned_operation_fixture();
+        let outcome = sidecar_primary_search_outcome_from_query_result(
+            &fixture.controller,
+            QueryResult {
+                publication_identity: None,
+                query: "unmatched".into(),
+                features: classify_query("unmatched"),
+                hits: Vec::new(),
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 500,
+                    elapsed_ms: 1,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    stages: Vec::new(),
+                },
+            },
+            5,
+        );
+
+        match outcome {
+            SidecarPrimarySearchOutcome::Served {
+                hits,
+                packet_hits,
+                shadow,
+                ..
+            } => {
+                assert!(hits.is_empty());
+                assert!(packet_hits.is_empty());
+                assert_eq!(shadow.candidate_count, 0);
+                assert_eq!(shadow.unresolved_candidate_count, 0);
+                assert!(!shadow.diagnostic_only);
+            }
+            _ => panic!("an ordinary empty full result must remain served"),
+        }
+    }
+
+    #[test]
     fn sidecar_result_rejects_blocking_cancel_reasons_even_with_resolved_hits() {
         use codestory_retrieval::{CandidateSource, classify_query};
 
@@ -6095,6 +6438,7 @@ mod tests {
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::new(),
+            unindexed_lexical_artifacts_only: false,
         };
         let empty_diagnostic =
             packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0, 1);
@@ -6133,6 +6477,7 @@ mod tests {
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
+            unindexed_lexical_artifacts_only: false,
         };
         let unresolved_diagnostic =
             packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0, 1);
@@ -6177,6 +6522,7 @@ mod tests {
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::from([0]),
+            unindexed_lexical_artifacts_only: false,
         };
         let cancelled_diagnostic =
             packet_sidecar_query_diagnostic(&cancelled, &cancelled_resolution, 100, 1, 101);
