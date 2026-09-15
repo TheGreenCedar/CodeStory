@@ -287,25 +287,38 @@ impl PinnedRetrievalRead {
         controller: &AppController,
         scope: PinnedRetrievalScope,
     ) -> Result<Self, ApiError> {
-        let project_root = controller.require_project_root()?;
-        let storage_path = controller.require_storage_path()?;
-        let session = match scope {
-            PinnedRetrievalScope::Full => {
-                PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
+        let mut span = super::packet_batch::observe_packet_operation_span(
+            super::packet_batch::PacketOperationObservationSpan::PinBegin,
+        );
+        let result = (|| {
+            let project_root = controller.require_project_root()?;
+            let storage_path = controller.require_storage_path()?;
+            let session = match scope {
+                PinnedRetrievalScope::Full => PinnedQuerySession::begin(
+                    &project_root,
+                    &storage_path,
+                    &controller.runtime_config,
+                ),
+                PinnedRetrievalScope::PacketDescriptor => {
+                    PinnedQuerySession::begin_packet_descriptor(
+                        &project_root,
+                        &storage_path,
+                        &controller.runtime_config,
+                    )
+                }
             }
-            PinnedRetrievalScope::PacketDescriptor => PinnedQuerySession::begin_packet_descriptor(
-                &project_root,
-                &storage_path,
-                &controller.runtime_config,
-            ),
+            .map_err(map_pinned_query_error)?;
+            Ok(Self {
+                session,
+                project_root,
+                storage_path,
+                node_names: RefCell::new(None),
+            })
+        })();
+        if result.is_ok() {
+            span.finish_success();
         }
-        .map_err(map_pinned_query_error)?;
-        Ok(Self {
-            session,
-            project_root,
-            storage_path,
-            node_names: RefCell::new(None),
-        })
+        result
     }
 
     fn canonical_node_names(
@@ -328,7 +341,14 @@ impl PinnedRetrievalRead {
     }
 
     fn revalidate(&self) -> Result<(), ApiError> {
-        self.session.revalidate().map_err(map_pinned_query_error)
+        let mut span = super::packet_batch::observe_packet_operation_span(
+            super::packet_batch::PacketOperationObservationSpan::PinRevalidation,
+        );
+        let result = self.session.revalidate().map_err(map_pinned_query_error);
+        if result.is_ok() {
+            span.finish_success();
+        }
+        result
     }
 }
 
