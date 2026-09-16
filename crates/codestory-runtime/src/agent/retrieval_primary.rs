@@ -1135,6 +1135,13 @@ fn admit_packet_candidate_descriptors<'a>(
             .total_cmp(&left.retrieval_score.value)
             .then_with(|| left.stable_identity.cmp(&right.stable_identity))
     });
+    let mut ranked_identities = Vec::new();
+    let mut ranked_seen = HashSet::new();
+    for descriptor in &descriptors {
+        if ranked_seen.insert(descriptor.stable_identity.clone()) {
+            ranked_identities.push(descriptor.stable_identity.clone());
+        }
+    }
     let mut seen = HashSet::new();
     for descriptor in descriptors {
         if !seen.insert(descriptor.stable_identity.clone()) {
@@ -1152,6 +1159,15 @@ fn admit_packet_candidate_descriptors<'a>(
         }
     }
     session.seal_retrieval_admission();
+    let admitted_identities = session
+        .receipts()
+        .into_iter()
+        .map(|receipt| receipt.stable_identity)
+        .collect::<Vec<_>>();
+    super::packet_batch::observe_packet_raf_ranked_admitted(
+        &ranked_identities,
+        &admitted_identities,
+    );
 }
 
 pub(crate) fn run_and_resolve_sidecar_query(
@@ -4402,6 +4418,64 @@ mod tests {
             PacketAdmissionDecision::CountBudgetExceeded,
             "the sealed session must not admit a late lower-scoring query candidate"
         );
+    }
+
+    #[test]
+    fn descriptor_admission_records_private_raf_copresence_observation() {
+        use crate::agent::packet_batch::{
+            enter_packet_latency_scope, enter_packet_public_operation_observation,
+            packet_operation_observation_for_test, raf_identity_digest_for_test,
+        };
+        use crate::agent::packet_candidate::PacketProofSession;
+
+        let session = PacketProofSession::new();
+        let mut low = CandidateHit::with_source(
+            "src/low.rs",
+            Some("Low".to_string()),
+            0.1,
+            CandidateSource::Lexical,
+        );
+        low.node_id = Some("1".to_string());
+        low.source_bytes_upper_bound = Some(64);
+        let mut high = CandidateHit::with_source(
+            "src/high.rs",
+            Some("High".to_string()),
+            0.9,
+            CandidateSource::Semantic,
+        );
+        high.node_id = Some("2".to_string());
+        high.source_bytes_upper_bound = Some(64);
+
+        let _latency = enter_packet_latency_scope(Some(2_000));
+        {
+            let _packet = enter_packet_public_operation_observation("packet");
+            admit_packet_candidate_descriptors(&session, [&low, &high]);
+        }
+
+        let observed = packet_operation_observation_for_test()
+            .expect("owned packet observation retains raf digests");
+        assert_eq!(observed.raf_ranked_admitted_observed_count, 1);
+        assert_eq!(observed.raf_ranked_pool_count, 2);
+        assert_eq!(observed.raf_ranked_recorded_count, 2);
+        assert_eq!(observed.raf_admitted_count, 2);
+        assert_eq!(
+            observed.raf_ranked_identity_digests,
+            [
+                raf_identity_digest_for_test("node:2"),
+                raf_identity_digest_for_test("node:1"),
+            ]
+            .join(",")
+        );
+        assert_eq!(
+            observed.raf_admitted_identity_digests,
+            [
+                raf_identity_digest_for_test("node:2"),
+                raf_identity_digest_for_test("node:1"),
+            ]
+            .join(",")
+        );
+        assert_eq!(session.receipts()[0].stable_identity, "node:2");
+        assert_eq!(session.receipts()[1].stable_identity, "node:1");
     }
 
     #[test]
