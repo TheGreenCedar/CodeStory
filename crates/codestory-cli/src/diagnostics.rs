@@ -424,7 +424,11 @@ impl Visit for DiagnosticVisitor {
         self.insert_typed(field, Value::from(value));
     }
 
-    fn record_str(&mut self, field: &Field, _value: &str) {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if is_raf_identity_digest_field(field.name()) && is_raf_identity_digest_list(value) {
+            self.insert_typed(field, Value::from(value));
+            return;
+        }
         self.insert_redacted(field);
     }
 
@@ -466,6 +470,27 @@ fn safe_diagnostic_token(value: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')))
     .then_some(value)
+}
+
+fn is_raf_identity_digest_field(name: &str) -> bool {
+    matches!(
+        name,
+        "raf_ranked_identity_digests"
+            | "raf_admitted_identity_digests"
+            | "raf_final_identity_digests"
+    )
+}
+
+fn is_raf_identity_digest_list(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    value.split(',').all(|part| {
+        part.len() == 16
+            && part
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 fn bounded_text(value: &str) -> String {
@@ -723,6 +748,16 @@ mod tests {
         assert_eq!(fields["descriptor_preadmission_query_count"], 0);
         assert_eq!(fields["descriptor_health_resolution_wall_ms"], 0);
         assert_eq!(fields["descriptor_query_batch_wall_ms"], 0);
+        assert_eq!(fields["raf_ranked_admitted_observed_count"], 0);
+        assert_eq!(fields["raf_ranked_pool_count"], 0);
+        assert_eq!(fields["raf_ranked_recorded_count"], 0);
+        assert_eq!(fields["raf_admitted_count"], 0);
+        assert_eq!(fields["raf_final_observed_count"], 0);
+        assert_eq!(fields["raf_final_support_count"], 0);
+        assert_eq!(fields["raf_final_recorded_count"], 0);
+        assert_eq!(fields["raf_ranked_identity_digests"], "");
+        assert_eq!(fields["raf_admitted_identity_digests"], "");
+        assert_eq!(fields["raf_final_identity_digests"], "");
         assert_eq!(fields["complete_core_snapshot_started_count"], 0);
         assert_eq!(fields["complete_core_snapshot_succeeded_count"], 0);
         assert_eq!(fields["complete_core_snapshot_ms"], 0);
@@ -747,6 +782,40 @@ mod tests {
         assert_ne!(fields["phase_mask"], 0);
         assert_eq!(fields["message"], REDACTED);
         assert_eq!(rows[0]["correlation_id"], "packet-entry-correlation");
+        Ok(())
+    }
+
+    #[test]
+    fn packet_entry_raf_identity_digest_lists_survive_diagnostic_redaction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-raf".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        let ranked = "0123456789abcdef,fedcba9876543210";
+        let admitted = "0123456789abcdef";
+        let final_support = "0123456789abcdef,aaaaaaaaaaaaaaaa";
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                raf_ranked_identity_digests = ranked,
+                raf_admitted_identity_digests = admitted,
+                raf_final_identity_digests = final_support,
+                query = "must stay redacted",
+                "packet entry observation"
+            );
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(rows.len(), 1);
+        let fields = &rows[0]["fields"];
+        assert_eq!(fields["raf_ranked_identity_digests"], ranked);
+        assert_eq!(fields["raf_admitted_identity_digests"], admitted);
+        assert_eq!(fields["raf_final_identity_digests"], final_support);
+        assert_eq!(fields["query"], "[redacted]");
+        assert_eq!(fields["message"], REDACTED);
         Ok(())
     }
 

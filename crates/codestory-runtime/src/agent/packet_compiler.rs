@@ -109,6 +109,9 @@ pub(crate) fn apply_frozen_packet_compilation(
     frozen: FrozenPacketCompilationV1,
 ) {
     packet.support = frozen.product.support;
+    crate::agent::packet_batch::observe_packet_raf_final_support(
+        &final_support_identities_for_observation(&packet.support),
+    );
     packet.disposition = classify_packet_disposition(
         packet,
         request,
@@ -116,6 +119,45 @@ pub(crate) fn apply_frozen_packet_compilation(
         frozen.publication.core_generation_id,
         frozen.publication.retrieval_generation,
     );
+}
+
+fn final_support_identities_for_observation(support: &[SupportUnitDto]) -> Vec<String> {
+    let mut identities = Vec::new();
+    let mut seen = BTreeSet::new();
+    for unit in support {
+        let Some(identity) = final_support_stable_identity(unit) else {
+            continue;
+        };
+        if seen.insert(identity.clone()) {
+            identities.push(identity);
+        }
+    }
+    identities
+}
+
+fn final_support_stable_identity(unit: &SupportUnitDto) -> Option<String> {
+    match unit.kind {
+        SupportUnitKindDto::SymbolLocation => unit
+            .id
+            .strip_prefix("symbol:")
+            .map(str::to_string)
+            .or_else(|| {
+                unit.symbol_id
+                    .as_ref()
+                    .map(|symbol_id| format!("node:{symbol_id}"))
+            }),
+        SupportUnitKindDto::SourceRange => unit
+            .symbol_id
+            .as_ref()
+            .map(|symbol_id| format!("node:{symbol_id}"))
+            .or_else(|| {
+                unit.path
+                    .as_ref()
+                    .filter(|path| !path.trim().is_empty())
+                    .map(|path| format!("path:{path}"))
+            }),
+        SupportUnitKindDto::TypedGraphEdge | SupportUnitKindDto::CompleteQueryNegative => None,
+    }
 }
 
 fn hydrate_admitted_sources(

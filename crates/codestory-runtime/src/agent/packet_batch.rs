@@ -13,7 +13,8 @@ use codestory_contracts::api::{
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
     PacketSidecarQueryDiagnosticDto, RetrievalAnnotationDto,
 };
-use std::cell::Cell;
+use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -22,6 +23,11 @@ use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
 const MIN_PACKET_HANDOFF_MS: u128 = 1_000;
+/// Bound the ranked-pool digests retained on the private packet-entry receipt.
+/// All admitted identities are always retained even when they fall outside the
+/// top-N prefix, matching the telemetry-first co-presence design.
+const RAF_RANKED_RECORD_CAP: usize = 48;
+const RAF_IDENTITY_DIGEST_HEX_LEN: usize = 16;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -35,8 +41,18 @@ thread_local! {
     static ACTIVE_PACKET_ENTRY_OBSERVATION: Cell<Option<PacketEntryObservation>> = const {
         Cell::new(None)
     };
+    static ACTIVE_RAF_COPRESENCE_DIGESTS: RefCell<Option<RafCopresenceDigestSets>> = const {
+        RefCell::new(None)
+    };
     static PACKET_PUBLIC_OPERATION_DEPTH: Cell<u32> = const { Cell::new(0) };
     static PACKET_PUBLIC_OPERATION_OWNER_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[derive(Debug, Clone, Default)]
+struct RafCopresenceDigestSets {
+    ranked_identity_digests: String,
+    admitted_identity_digests: String,
+    final_identity_digests: String,
 }
 
 static NEXT_PACKET_ENTRY_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -77,6 +93,13 @@ struct PacketEntryObservation {
     descriptor_preadmission_query_count: u64,
     descriptor_health_resolution_wall_ms: u64,
     descriptor_query_batch_wall_ms: u64,
+    raf_ranked_admitted_observed_count: u64,
+    raf_ranked_pool_count: u64,
+    raf_ranked_recorded_count: u64,
+    raf_admitted_count: u64,
+    raf_final_observed_count: u64,
+    raf_final_support_count: u64,
+    raf_final_recorded_count: u64,
     complete_core_snapshot: PacketOperationSpanObservation,
     uncached_freshness: PacketOperationSpanObservation,
     retrieval_pin: PacketOperationSpanObservation,
@@ -159,6 +182,118 @@ pub(crate) fn observe_packet_descriptor_preadmission(
         observation.descriptor_health_resolution_wall_ms = health_resolution_wall_ms;
         observation.descriptor_query_batch_wall_ms = query_batch_wall_ms;
     });
+}
+
+/// Retain private ranked/admitted identity digests for offline co-presence analysis.
+///
+/// Digests are SHA-256 prefixes of stable packet identities only. Prompt text,
+/// paths, scores, and public DTOs stay out of this observation. First owned
+/// packet observation wins; nested or non-packet callers cannot overwrite.
+pub(crate) fn observe_packet_raf_ranked_admitted(
+    ranked_identities: &[String],
+    admitted_identities: &[String],
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_ranked_admitted_observed_count != 0 {
+            return;
+        }
+        let recorded = capped_raf_ranked_identities(ranked_identities, admitted_identities);
+        observation.raf_ranked_admitted_observed_count = 1;
+        observation.raf_ranked_pool_count =
+            u64::try_from(ranked_identities.len()).unwrap_or(u64::MAX);
+        observation.raf_ranked_recorded_count =
+            u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        observation.raf_admitted_count =
+            u64::try_from(admitted_identities.len()).unwrap_or(u64::MAX);
+        ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+            if let Some(sets) = slot.borrow_mut().as_mut() {
+                sets.ranked_identity_digests = join_raf_identity_digests(&recorded);
+                sets.admitted_identity_digests = join_raf_identity_digests(admitted_identities);
+            }
+        });
+    });
+}
+
+/// Retain private final-support identity digests after compile/projection.
+///
+/// Joins the earlier ranked/admitted observation on the same packet-entry
+/// receipt. First write wins; callers without an owned packet observation are
+/// ignored.
+pub(crate) fn observe_packet_raf_final_support(final_identities: &[String]) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_final_observed_count != 0 {
+            return;
+        }
+        let mut recorded = Vec::new();
+        let mut seen = HashSet::new();
+        for identity in final_identities {
+            if identity.is_empty() || !seen.insert(identity.as_str()) {
+                continue;
+            }
+            recorded.push(identity.clone());
+        }
+        observation.raf_final_observed_count = 1;
+        observation.raf_final_support_count =
+            u64::try_from(final_identities.len()).unwrap_or(u64::MAX);
+        observation.raf_final_recorded_count =
+            u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+            if let Some(sets) = slot.borrow_mut().as_mut() {
+                sets.final_identity_digests = join_raf_identity_digests(&recorded);
+            }
+        });
+    });
+}
+
+fn capped_raf_ranked_identities(
+    ranked_identities: &[String],
+    admitted_identities: &[String],
+) -> Vec<String> {
+    let mut recorded = Vec::new();
+    let mut included = HashSet::new();
+    for identity in ranked_identities.iter().take(RAF_RANKED_RECORD_CAP) {
+        if identity.is_empty() || !included.insert(identity.as_str()) {
+            continue;
+        }
+        recorded.push(identity.clone());
+    }
+    let admitted: HashSet<&str> = admitted_identities
+        .iter()
+        .map(String::as_str)
+        .filter(|identity| !identity.is_empty())
+        .collect();
+    for identity in ranked_identities {
+        if !admitted.contains(identity.as_str()) {
+            continue;
+        }
+        if !included.insert(identity.as_str()) {
+            continue;
+        }
+        recorded.push(identity.clone());
+    }
+    recorded
+}
+
+fn raf_identity_digest(stable_identity: &str) -> String {
+    let digest = Sha256::digest(stable_identity.as_bytes());
+    let mut out = String::with_capacity(RAF_IDENTITY_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(RAF_IDENTITY_DIGEST_HEX_LEN / 2) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn join_raf_identity_digests(identities: &[String]) -> String {
+    identities
+        .iter()
+        .map(|identity| raf_identity_digest(identity))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+pub(crate) fn raf_identity_digest_for_test(stable_identity: &str) -> String {
+    raf_identity_digest(stable_identity)
 }
 
 pub(crate) struct PacketPublicOperationObservationGuard {
@@ -453,7 +588,9 @@ impl Drop for PacketLatencyScopeGuard {
         ACTIVE_PACKET_LATENCY_BUDGET.with(|active| active.set(self.previous));
         if self.owns_observation {
             let observation = ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| active.take());
+            let digests = ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow_mut().take());
             if let Some(observation) = observation {
+                let digests = digests.unwrap_or_default();
                 tracing::warn!(
                     packet_entry_observation_id = observation.id,
                     target_ms = observation.target_ms,
@@ -493,6 +630,19 @@ impl Drop for PacketLatencyScopeGuard {
                     descriptor_health_resolution_wall_ms =
                         observation.descriptor_health_resolution_wall_ms,
                     descriptor_query_batch_wall_ms = observation.descriptor_query_batch_wall_ms,
+                    raf_ranked_admitted_observed_count =
+                        observation.raf_ranked_admitted_observed_count,
+                    raf_ranked_pool_count = observation.raf_ranked_pool_count,
+                    raf_ranked_recorded_count = observation.raf_ranked_recorded_count,
+                    raf_admitted_count = observation.raf_admitted_count,
+                    raf_final_observed_count = observation.raf_final_observed_count,
+                    raf_final_support_count = observation.raf_final_support_count,
+                    raf_final_recorded_count = observation.raf_final_recorded_count,
+                    raf_ranked_identity_digests =
+                        digests.ranked_identity_digests.as_str(),
+                    raf_admitted_identity_digests =
+                        digests.admitted_identity_digests.as_str(),
+                    raf_final_identity_digests = digests.final_identity_digests.as_str(),
                     complete_core_snapshot_started_count =
                         observation.complete_core_snapshot.started_count,
                     complete_core_snapshot_succeeded_count =
@@ -545,6 +695,9 @@ pub fn enter_packet_latency_scope(requested_ms: Option<u32>) -> PacketLatencySco
                     ..PacketEntryObservation::default()
                 }));
             });
+            ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+                *slot.borrow_mut() = Some(RafCopresenceDigestSets::default());
+            });
         }
         PacketLatencyScopeGuard {
             previous,
@@ -559,7 +712,7 @@ pub(crate) fn active_packet_latency_budget() -> Option<PacketLatencyBudget> {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PacketOperationObservationTestSnapshot {
     pub(crate) public_admission_reached_count: u64,
     pub(crate) public_admission_passed_count: u64,
@@ -573,6 +726,16 @@ pub(crate) struct PacketOperationObservationTestSnapshot {
     pub(crate) descriptor_preadmission_query_count: u64,
     pub(crate) descriptor_health_resolution_wall_ms: u64,
     pub(crate) descriptor_query_batch_wall_ms: u64,
+    pub(crate) raf_ranked_admitted_observed_count: u64,
+    pub(crate) raf_ranked_pool_count: u64,
+    pub(crate) raf_ranked_recorded_count: u64,
+    pub(crate) raf_admitted_count: u64,
+    pub(crate) raf_final_observed_count: u64,
+    pub(crate) raf_final_support_count: u64,
+    pub(crate) raf_final_recorded_count: u64,
+    pub(crate) raf_ranked_identity_digests: String,
+    pub(crate) raf_admitted_identity_digests: String,
+    pub(crate) raf_final_identity_digests: String,
     pub(crate) complete_core_snapshot_started_count: u64,
     pub(crate) complete_core_snapshot_succeeded_count: u64,
     pub(crate) uncached_freshness_started_count: u64,
@@ -593,9 +756,11 @@ pub(crate) struct PacketOperationObservationTestSnapshot {
 pub(crate) fn packet_operation_observation_for_test()
 -> Option<PacketOperationObservationTestSnapshot> {
     ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
-        active
-            .get()
-            .map(|observation| PacketOperationObservationTestSnapshot {
+        active.get().map(|observation| {
+            let digests = ACTIVE_RAF_COPRESENCE_DIGESTS
+                .with(|slot| slot.borrow().clone())
+                .unwrap_or_default();
+            PacketOperationObservationTestSnapshot {
                 public_admission_reached_count: observation.public_admission_reached_count,
                 public_admission_passed_count: observation.public_admission_passed_count,
                 public_admission_refused_count: observation.public_admission_refused_count,
@@ -606,11 +771,20 @@ pub(crate) fn packet_operation_observation_for_test()
                 retry_cache_busy_count: observation.retry_cache_busy_count,
                 descriptor_preadmission_observed_count: observation
                     .descriptor_preadmission_observed_count,
-                descriptor_preadmission_query_count: observation
-                    .descriptor_preadmission_query_count,
+                descriptor_preadmission_query_count: observation.descriptor_preadmission_query_count,
                 descriptor_health_resolution_wall_ms: observation
                     .descriptor_health_resolution_wall_ms,
                 descriptor_query_batch_wall_ms: observation.descriptor_query_batch_wall_ms,
+                raf_ranked_admitted_observed_count: observation.raf_ranked_admitted_observed_count,
+                raf_ranked_pool_count: observation.raf_ranked_pool_count,
+                raf_ranked_recorded_count: observation.raf_ranked_recorded_count,
+                raf_admitted_count: observation.raf_admitted_count,
+                raf_final_observed_count: observation.raf_final_observed_count,
+                raf_final_support_count: observation.raf_final_support_count,
+                raf_final_recorded_count: observation.raf_final_recorded_count,
+                raf_ranked_identity_digests: digests.ranked_identity_digests,
+                raf_admitted_identity_digests: digests.admitted_identity_digests,
+                raf_final_identity_digests: digests.final_identity_digests,
                 complete_core_snapshot_started_count: observation
                     .complete_core_snapshot
                     .started_count,
@@ -631,7 +805,8 @@ pub(crate) fn packet_operation_observation_for_test()
                 pin_begin_succeeded_count: observation.pin_begin.succeeded_count,
                 pin_revalidation_started_count: observation.pin_revalidation.started_count,
                 pin_revalidation_succeeded_count: observation.pin_revalidation.succeeded_count,
-            })
+            }
+        })
     })
 }
 
@@ -835,6 +1010,103 @@ mod packet_latency_budget_tests {
     }
 
     #[test]
+    fn packet_raf_copresence_observation_is_owned_initial_only_and_drop_safe() {
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+        assert!(ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow().is_none()));
+        {
+            let _latency = enter_packet_latency_scope(Some(2_000));
+            observe_packet_raf_ranked_admitted(
+                &[String::from("node:1"), String::from("node:2")],
+                &[String::from("node:1")],
+            );
+            let without_owner = packet_operation_observation_for_test()
+                .expect("outer packet observation exists before product work");
+            assert_eq!(without_owner.raf_ranked_admitted_observed_count, 0);
+            assert!(without_owner.raf_ranked_identity_digests.is_empty());
+
+            {
+                let _nonpacket = enter_packet_public_operation_observation("search");
+                observe_packet_raf_ranked_admitted(
+                    &[String::from("node:9")],
+                    &[String::from("node:9")],
+                );
+                observe_packet_raf_final_support(&[String::from("node:9")]);
+            }
+            let nonpacket = packet_operation_observation_for_test()
+                .expect("non-packet operation leaves the packet receipt active");
+            assert_eq!(nonpacket.raf_ranked_admitted_observed_count, 0);
+            assert_eq!(nonpacket.raf_final_observed_count, 0);
+
+            {
+                let _packet = enter_packet_public_operation_observation("packet");
+                observe_packet_raf_ranked_admitted(
+                    &[
+                        String::from("node:high"),
+                        String::from("node:low"),
+                        String::from("node:extra"),
+                    ],
+                    &[String::from("node:high")],
+                );
+                {
+                    let _nested = enter_packet_public_operation_observation("packet");
+                    observe_packet_raf_ranked_admitted(
+                        &[String::from("node:overwrite")],
+                        &[String::from("node:overwrite")],
+                    );
+                    observe_packet_raf_final_support(&[String::from("node:overwrite")]);
+                }
+                observe_packet_raf_final_support(&[
+                    String::from("node:high"),
+                    String::from("node:missing"),
+                ]);
+                observe_packet_raf_ranked_admitted(
+                    &[String::from("node:later")],
+                    &[String::from("node:later")],
+                );
+            }
+
+            let observed = packet_operation_observation_for_test()
+                .expect("initial raf observation survives operation exit");
+            assert_eq!(observed.raf_ranked_admitted_observed_count, 1);
+            assert_eq!(observed.raf_ranked_pool_count, 3);
+            assert_eq!(observed.raf_ranked_recorded_count, 3);
+            assert_eq!(observed.raf_admitted_count, 1);
+            assert_eq!(observed.raf_final_observed_count, 1);
+            assert_eq!(observed.raf_final_support_count, 2);
+            assert_eq!(observed.raf_final_recorded_count, 2);
+            assert_eq!(
+                observed.raf_ranked_identity_digests,
+                [
+                    raf_identity_digest_for_test("node:high"),
+                    raf_identity_digest_for_test("node:low"),
+                    raf_identity_digest_for_test("node:extra"),
+                ]
+                .join(",")
+            );
+            assert_eq!(
+                observed.raf_admitted_identity_digests,
+                raf_identity_digest_for_test("node:high")
+            );
+            assert_eq!(
+                observed.raf_final_identity_digests,
+                [
+                    raf_identity_digest_for_test("node:high"),
+                    raf_identity_digest_for_test("node:missing"),
+                ]
+                .join(",")
+            );
+        }
+        assert!(
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
+            "outer latency-scope drop must clear the raf observation"
+        );
+        assert!(
+            ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow().is_none()),
+            "outer latency-scope drop must clear private identity digests"
+        );
+    }
+
+    #[test]
     fn packet_operation_observation_is_owned_by_the_outer_packet_operation() {
         let _latency = enter_packet_latency_scope(Some(2_000));
         let unwind = catch_unwind(AssertUnwindSafe(|| {
@@ -868,6 +1140,8 @@ mod packet_latency_budget_tests {
         assert_eq!(observation.retry_cache_busy_count, 0);
         assert_eq!(observation.descriptor_preadmission_observed_count, 0);
         assert_eq!(observation.descriptor_preadmission_query_count, 0);
+        assert_eq!(observation.raf_ranked_admitted_observed_count, 0);
+        assert_eq!(observation.raf_final_observed_count, 0);
         assert_eq!(observation.build_callback_started_count, 1);
         assert_eq!(observation.build_callback_succeeded_count, 1);
 
