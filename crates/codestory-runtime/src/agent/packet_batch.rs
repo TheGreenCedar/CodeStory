@@ -201,8 +201,7 @@ pub(crate) fn observe_packet_raf_ranked_admitted(
         observation.raf_ranked_admitted_observed_count = 1;
         observation.raf_ranked_pool_count =
             u64::try_from(ranked_identities.len()).unwrap_or(u64::MAX);
-        observation.raf_ranked_recorded_count =
-            u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        observation.raf_ranked_recorded_count = u64::try_from(recorded.len()).unwrap_or(u64::MAX);
         observation.raf_admitted_count =
             u64::try_from(admitted_identities.len()).unwrap_or(u64::MAX);
         ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
@@ -235,8 +234,7 @@ pub(crate) fn observe_packet_raf_final_support(final_identities: &[String]) {
         observation.raf_final_observed_count = 1;
         observation.raf_final_support_count =
             u64::try_from(final_identities.len()).unwrap_or(u64::MAX);
-        observation.raf_final_recorded_count =
-            u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        observation.raf_final_recorded_count = u64::try_from(recorded.len()).unwrap_or(u64::MAX);
         ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
             if let Some(sets) = slot.borrow_mut().as_mut() {
                 sets.final_identity_digests = join_raf_identity_digests(&recorded);
@@ -638,10 +636,8 @@ impl Drop for PacketLatencyScopeGuard {
                     raf_final_observed_count = observation.raf_final_observed_count,
                     raf_final_support_count = observation.raf_final_support_count,
                     raf_final_recorded_count = observation.raf_final_recorded_count,
-                    raf_ranked_identity_digests =
-                        digests.ranked_identity_digests.as_str(),
-                    raf_admitted_identity_digests =
-                        digests.admitted_identity_digests.as_str(),
+                    raf_ranked_identity_digests = digests.ranked_identity_digests.as_str(),
+                    raf_admitted_identity_digests = digests.admitted_identity_digests.as_str(),
                     raf_final_identity_digests = digests.final_identity_digests.as_str(),
                     complete_core_snapshot_started_count =
                         observation.complete_core_snapshot.started_count,
@@ -771,7 +767,8 @@ pub(crate) fn packet_operation_observation_for_test()
                 retry_cache_busy_count: observation.retry_cache_busy_count,
                 descriptor_preadmission_observed_count: observation
                     .descriptor_preadmission_observed_count,
-                descriptor_preadmission_query_count: observation.descriptor_preadmission_query_count,
+                descriptor_preadmission_query_count: observation
+                    .descriptor_preadmission_query_count,
                 descriptor_health_resolution_wall_ms: observation
                     .descriptor_health_resolution_wall_ms,
                 descriptor_query_batch_wall_ms: observation.descriptor_query_batch_wall_ms,
