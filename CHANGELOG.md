@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Activation finalization builds lexical, dense-vector, and SCIP graph sidecars
+concurrently and verifies staged SCIP components by digest, so large
+repositories are more likely to leave `publication@75` under the frozen
+preparation budget after dense embed completes.
+
 Packet descriptor preadmission keeps lexical recall near the dense calibration
 window instead of scanning the full fusion pool, so large-repository packets
 are less likely to exhaust the frozen latency budget before handoff.

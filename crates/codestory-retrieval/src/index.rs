@@ -51,6 +51,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -1284,47 +1285,96 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
-        ensure_lexical_generation(
-            &layout,
-            &generation,
-            &prepared_lexical,
-            &sidecar_input.hash,
-            previous_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_generation.as_deref()),
-            cancelled,
-            lexical_ready,
-        )
-    })?;
+    // Lexical shards, dense vectors, and SCIP graph artifacts are independent once
+    // the pinned core + sidecar fingerprint are fixed. Keycloak-class cores spend
+    // ~40s on SCIP alone after embed; overlapping the three under publication@75
+    // is what keeps the frozen 180s prep budget reachable.
+    progress("lexical sidecar");
+    progress("graph artifact");
+    let previous_sidecar_generation = previous_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_generation.as_deref());
+    let previous_scip_dir =
+        previous_sidecar_generation.map(|previous| layout.scip_project_dir(previous));
+    let mut graph_manifest = manifest.clone();
+    let (lexical_outcome, _semantic_point_count, graph_revision) = thread::scope(|scope| {
+        let lexical_handle = scope.spawn(|| {
+            FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+            let started = Instant::now();
+            let result = ensure_lexical_generation(
+                &layout,
+                &generation,
+                &prepared_lexical,
+                &sidecar_input.hash,
+                previous_sidecar_generation,
+                cancelled,
+                lexical_ready,
+            );
+            let work = finish_finalize_component_work();
+            (result, started.elapsed(), work)
+        });
+        let graph_handle = scope.spawn(|| {
+            FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+            let started = Instant::now();
+            let result = ensure_scip_artifacts(
+                storage_path,
+                &scip_dir,
+                &project_id,
+                &generation,
+                previous_scip_dir.clone(),
+                previous_manifest.as_ref(),
+                &sidecar_input,
+                cancelled,
+                scip_ready,
+                &mut graph_manifest,
+            );
+            let work = finish_finalize_component_work();
+            let revision = graph_manifest.scip_revision.clone();
+            (result, started.elapsed(), work, revision)
+        });
 
-    let _semantic_point_count = ensure_semantic_index(
-        storage_path,
-        &project_id,
-        &semantic_generation,
-        semantic_ready_points,
-        &retention_context,
-        cancelled,
-        &mut progress,
-    )?;
-
-    with_finalize_progress(&mut progress, "graph artifact", || {
-        ensure_scip_artifacts(
+        let semantic_point_count = ensure_semantic_index(
             storage_path,
-            &scip_dir,
             &project_id,
-            &generation,
-            previous_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_generation.as_deref())
-                .map(|previous| layout.scip_project_dir(previous)),
-            previous_manifest.as_ref(),
-            &sidecar_input,
+            &semantic_generation,
+            semantic_ready_points,
+            &retention_context,
             cancelled,
-            scip_ready,
-            &mut manifest,
-        )
+            &mut progress,
+        );
+
+        let (lexical_result, lexical_elapsed, lexical_work) =
+            lexical_handle.join().unwrap_or_else(|_| {
+                (
+                    Err(anyhow::anyhow!("lexical sidecar worker panicked")),
+                    Duration::ZERO,
+                    Vec::new(),
+                )
+            });
+        let (graph_result, graph_elapsed, graph_work, graph_revision) =
+            graph_handle.join().unwrap_or_else(|_| {
+                (
+                    Err(anyhow::anyhow!("graph artifact worker panicked")),
+                    Duration::ZERO,
+                    Vec::new(),
+                    None,
+                )
+            });
+
+        record_finalize_phase_timing("lexical sidecar", lexical_elapsed);
+        record_finalize_phase_timing("graph artifact", graph_elapsed);
+        FINALIZE_COMPONENT_WORK.with(|state| {
+            let mut work = state.borrow_mut();
+            work.extend(lexical_work);
+            work.extend(graph_work);
+        });
+
+        let lexical_outcome = lexical_result?;
+        graph_result?;
+        let semantic_point_count = semantic_point_count?;
+        Ok::<_, anyhow::Error>((lexical_outcome, semantic_point_count, graph_revision))
     })?;
+    manifest.scip_revision = graph_revision.or(manifest.scip_revision);
     update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?;
 
     manifest.lexical_version = lexical_outcome.version;
@@ -5423,11 +5473,11 @@ mod tests {
             &*phases.borrow(),
             &[
                 "lexical sidecar",
-                "embedded vectors",
                 "graph artifact",
+                "embedded vectors",
                 "manifest write",
             ],
-            "missing predecessor admission must run every deterministic component and reach the existing commit fence"
+            "concurrent finalize announces lexical+graph before embed work, then reaches the existing commit fence"
         );
         assert!(
             rendered.contains(
@@ -7454,10 +7504,11 @@ mod tests {
     ///
     /// The reuse branch returns before the first phase, so an empty phase list
     /// *is* the reuse decision as the product renders it: no lexical, semantic,
-    /// or graph work was scheduled. Every rebuild announces `lexical sidecar`
-    /// first. Both passes stop at the publication fence in this environment —
-    /// there is no per-user embedding server — which is downstream of the
-    /// decision under test and identical for both legs.
+    /// or graph work was scheduled. Rebuilds announce `lexical sidecar` first,
+    /// then `graph artifact` alongside embed work under concurrent finalize.
+    /// Both passes stop at the publication fence in this environment — there is
+    /// no per-user embedding server — which is downstream of the decision under
+    /// test and identical for both legs.
     #[cfg(feature = "test-support")]
     fn finalize_phases(fixture: &PublishedGeneration) -> (Vec<&'static str>, String) {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
