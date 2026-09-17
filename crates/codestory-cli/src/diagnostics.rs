@@ -748,6 +748,16 @@ mod tests {
         assert_eq!(fields["descriptor_preadmission_query_count"], 0);
         assert_eq!(fields["descriptor_health_resolution_wall_ms"], 0);
         assert_eq!(fields["descriptor_query_batch_wall_ms"], 0);
+        assert_eq!(fields["descriptor_query_plan_wall_ms"], 0);
+        assert_eq!(fields["descriptor_lexical_wall_ms"], 0);
+        assert_eq!(fields["descriptor_dense_semantic_wall_ms"], 0);
+        assert_eq!(fields["descriptor_admission_seal_wall_ms"], 0);
+        assert_eq!(fields["descriptor_deferred_readiness_wall_ms"], 0);
+        assert_eq!(fields["descriptor_remaining_before_handoff_ms"], 0);
+        assert_eq!(
+            fields["descriptor_preadmit_runtime_phases_observed_count"],
+            0
+        );
         assert_eq!(fields["raf_ranked_admitted_observed_count"], 0);
         assert_eq!(fields["raf_ranked_pool_count"], 0);
         assert_eq!(fields["raf_ranked_recorded_count"], 0);

@@ -963,8 +963,11 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         .checked_add(Duration::from_millis(readiness_budget_ms))
         .expect("bounded packet descriptor deadline");
     if queries.is_empty() || session.remaining_hydration_slots() == 0 {
+        let seal_started = Instant::now();
         session.seal_retrieval_admission();
-        if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
+        let readiness_started = Instant::now();
+        let readiness = if let Some(pinned) = active_pinned_retrieval_read(controller) {
             pinned
                 .session
                 .validate_full_readiness_with_control(
@@ -976,8 +979,17 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                         error,
                         PinnedRetrievalStopBoundary::DeferredFullReadiness,
                     )
-                })?;
-        }
+                })
+        } else {
+            Ok(())
+        };
+        let deferred_readiness_wall_ms = packet_descriptor_phase_wall_ms(readiness_started);
+        super::packet_batch::observe_packet_descriptor_preadmit_runtime_phases(
+            0,
+            admission_seal_wall_ms,
+            deferred_readiness_wall_ms,
+        );
+        readiness?;
         return Ok(());
     }
     if !sidecar_descriptor_retrieval_enabled(controller) {
@@ -1006,6 +1018,7 @@ pub(crate) fn preadmit_packet_descriptor_queries(
     }
 
     with_pinned_retrieval_read(controller, |pinned| {
+        let query_plan_started = Instant::now();
         let per_query_budget = descriptor_budget_ms
             .checked_div(queries.len().max(1) as u64)
             .unwrap_or(100)
@@ -1017,6 +1030,7 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                 budget_ms: Some(per_query_budget),
             })
             .collect::<Vec<_>>();
+        let query_plan_wall_ms = packet_descriptor_phase_wall_ms(query_plan_started);
         let include_dense_semantic = session.includes_dense_semantic();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
             #[cfg(feature = "benchmark-support")]
@@ -1039,13 +1053,6 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         })
         .map_err(map_pinned_query_error)?;
         let (query_results, descriptor_observation) = query_results;
-        if let Some(observation) = descriptor_observation {
-            super::packet_batch::observe_packet_descriptor_preadmission(
-                observation.query_count,
-                observation.health_resolution_wall_ms,
-                observation.query_batch_wall_ms,
-            );
-        }
         #[cfg(any(test, feature = "benchmark-support"))]
         for result in &query_results {
             session.record_descriptor_trace(&result.trace);
@@ -1086,15 +1093,18 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                     ))
                 })?;
         }
+        let seal_started = Instant::now();
         admit_packet_candidate_descriptors(
             &session,
             query_results.iter().flat_map(|result| result.hits.iter()),
         );
+        let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
         // The repository-wide freshness and core/vector attestation checks are
         // intentionally deferred until the one packet admission session is
         // sealed. They may inspect repository records, so running them before
         // this point would violate the descriptor-first boundary.
-        pinned
+        let readiness_started = Instant::now();
+        let readiness = pinned
             .session
             .validate_full_readiness_with_control(
                 readiness_deadline,
@@ -1102,9 +1112,29 @@ pub(crate) fn preadmit_packet_descriptor_queries(
             )
             .map_err(|error| {
                 map_pinned_query_error_at(error, PinnedRetrievalStopBoundary::DeferredFullReadiness)
-            })?;
+            });
+        let deferred_readiness_wall_ms = packet_descriptor_phase_wall_ms(readiness_started);
+        if let Some(observation) = descriptor_observation {
+            super::packet_batch::observe_packet_descriptor_preadmission(
+                observation.query_count,
+                observation.health_resolution_wall_ms,
+                observation.query_batch_wall_ms,
+                query_plan_wall_ms,
+                observation.lexical_wall_ms,
+                observation.dense_semantic_wall_ms,
+                admission_seal_wall_ms,
+                deferred_readiness_wall_ms,
+            );
+        }
+        readiness?;
         Ok(())
     })
+}
+
+fn packet_descriptor_phase_wall_ms(started_at: Instant) -> u64 {
+    let elapsed = started_at.elapsed();
+    let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    millis.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
 }
 
 fn admit_packet_candidate_descriptors<'a>(
@@ -4480,6 +4510,10 @@ mod tests {
 
     #[test]
     fn packet_descriptor_zero_remaining_budget_expires_before_readiness() {
+        use crate::agent::packet_batch::{
+            enter_packet_latency_scope, enter_packet_public_operation_observation,
+            packet_operation_observation_for_test,
+        };
         use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
 
         let fixture = pinned_operation_fixture();
@@ -4490,6 +4524,8 @@ mod tests {
         let session = Rc::new(PacketProofSession::new());
 
         with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _latency = enter_packet_latency_scope(Some(1_000));
+            let _packet = enter_packet_public_operation_observation("packet");
             let _guard = install_packet_proof_session(Rc::clone(&session));
             let error = preadmit_packet_descriptor_queries(&fixture.controller, &[], Some(0))
                 .expect_err("zero remaining allowance must expire before readiness");
@@ -4498,6 +4534,59 @@ mod tests {
                 error.message,
                 "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry"
             );
+            let observed = packet_operation_observation_for_test()
+                .expect("zero-budget empty path still records runtime phase walls");
+            assert_eq!(observed.descriptor_preadmission_observed_count, 0);
+            assert_eq!(
+                observed.descriptor_preadmit_runtime_phases_observed_count,
+                1
+            );
+            assert_eq!(observed.descriptor_query_batch_wall_ms, 0);
+            assert_eq!(observed.descriptor_lexical_wall_ms, 0);
+            assert_eq!(observed.descriptor_dense_semantic_wall_ms, 0);
+        });
+    }
+
+    #[test]
+    fn packet_descriptor_subphase_walls_populate_on_successful_preadmit() {
+        use crate::agent::packet_batch::{
+            enter_packet_latency_scope, enter_packet_public_operation_observation,
+            observe_packet_descriptor_remaining_before_handoff,
+            packet_operation_observation_for_test,
+        };
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let fixture = pinned_operation_fixture();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        let query = "renamed lattice transition";
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _latency = enter_packet_latency_scope(Some(18_000));
+            let _packet = enter_packet_public_operation_observation("packet");
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries(&fixture.controller, &[query.to_string()], None)
+                .expect("successful descriptor preadmission");
+            observe_packet_descriptor_remaining_before_handoff(12_000);
+
+            let observed = packet_operation_observation_for_test()
+                .expect("owned packet observation retains descriptor sub-phase walls");
+            assert_eq!(observed.descriptor_preadmission_observed_count, 1);
+            assert_eq!(observed.descriptor_preadmission_query_count, 1);
+            assert_eq!(
+                observed.descriptor_preadmit_runtime_phases_observed_count,
+                0
+            );
+            assert!(
+                observed.descriptor_query_batch_wall_ms > 0
+                    || observed.descriptor_lexical_wall_ms > 0
+                    || observed.descriptor_health_resolution_wall_ms > 0,
+                "successful preadmit must retain at least one measured descriptor wall"
+            );
+            assert_eq!(observed.descriptor_remaining_before_handoff_ms, 12_000);
         });
     }
 
