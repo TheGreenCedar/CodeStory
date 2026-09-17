@@ -886,6 +886,42 @@ fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
 }
 
 #[test]
+fn package_callable_lib_marker_skips_python_stdlib_layout() {
+    assert!(
+        !semantic_file_is_package_callable_surface(Some("Lib/os.py")),
+        "CPython-style Lib/ must not be a package-callable surface"
+    );
+    assert!(
+        !semantic_file_is_package_callable_surface(Some("lib/pathlib.py")),
+        "case-insensitive lib/ must not densify every Python callable"
+    );
+    assert!(
+        semantic_file_is_package_callable_surface(Some("pkg/util.py")),
+        "explicit pkg/ remains a Python package-callable surface"
+    );
+    assert!(
+        semantic_file_is_package_callable_surface(Some("lib/application.rb")),
+        "Ruby lib/ package surfaces stay intact"
+    );
+
+    let node = semantic_policy_node(13, NodeKind::FUNCTION, "getcwd", 1);
+    let path = "Lib/os.py";
+    let context = semantic_policy_context(path, &node);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "getcwd",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: getcwd\n",
+            Some(AccessKind::Private),
+        ),
+        None,
+        "private Lib/ callables must not enter dense via the lib package marker"
+    );
+}
+
+#[test]
 fn semantic_projection_v3_reserves_independent_identity_source_and_graph_budgets() {
     assert_eq!(semantic_doc_field_budgets(128), [32, 48, 48]);
     assert_eq!(semantic_doc_field_budgets(16), [4, 6, 6]);
