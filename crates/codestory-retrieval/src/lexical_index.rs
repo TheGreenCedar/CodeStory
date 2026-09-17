@@ -2655,7 +2655,7 @@ fn populate_descriptor_token_matches_fail_closed(
                 if matched.len() >= required_match_count {
                     break;
                 }
-                if matched.iter().any(|existing| *existing == token.as_str()) {
+                if matched.contains(&token.as_str()) {
                     continue;
                 }
                 if content.contains(token.as_str()) {
