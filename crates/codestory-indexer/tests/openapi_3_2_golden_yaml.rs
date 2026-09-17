@@ -45,9 +45,8 @@ fn openapi_3_2_golden_yaml_produces_endpoint_projection_without_collector_failur
     fs::write(&full, golden_bytes())?;
 
     let mut storage = Storage::new_in_memory()?;
-    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_source_index_policy(
-        codestory_contracts::workspace::SourceIndexPolicy::default(),
-    );
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+        .with_source_index_policy(codestory_contracts::workspace::SourceIndexPolicy::default());
     let event_bus = EventBus::new();
     let refresh_info = codestory_workspace::RefreshInfo {
         mode: codestory_workspace::BuildMode::Incremental,
