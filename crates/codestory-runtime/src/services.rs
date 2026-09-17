@@ -4220,11 +4220,10 @@ pub(crate) mod activation_tests {
 
     /// One public operation derives source freshness before and after the
     /// build, and the MCP transport wraps the same request in a second public
-    /// operation. The pre-build derivations all ask about the same instant, so
-    /// they share one content pass; every post-build derivation asks whether
-    /// the source moved *since*, so it re-reads content. Four derivations
-    /// therefore cost three passes over the indexed files, not four and not
-    /// one.
+    /// operation. An observer-coherent ready lease may skip pre-build content
+    /// hashes; every post-build derivation still re-reads content so it can see
+    /// drift the lease snapshot could not have seen. Nested under one scope,
+    /// that is one post-build pass by the time the inner response is assembled.
     #[test]
     fn a_warm_public_operation_shares_one_pre_build_content_pass() {
         let fixture = ready_activation_fixture();
@@ -4260,23 +4259,21 @@ pub(crate) mod activation_tests {
         // four freshness derivations have run: the outer pre-build check, the
         // nested operation's pre-build check, and the nested operation's
         // post-build check. The outer post-build check runs after the response
-        // is built.
+        // is built. Both pre-build checks reuse the coherent ready lease.
         let counts = observed.expect("a public operation arms the source freshness scope");
         assert_eq!(
             counts.content_hash_reads,
-            u64::from(indexed_files) * 2,
-            "the two pre-build derivations share one pass; the post-build check \
-             re-reads content because it must see drift the pre-build pass could \
-             not have seen"
+            u64::from(indexed_files),
+            "coherent ready-lease pre-build skips content hashes; only the nested \
+             post-build check re-reads content"
         );
         assert_eq!(
-            counts.verdict_reuses,
-            u64::from(indexed_files),
-            "the nested pre-build derivation must reuse the outer pre-build pass"
+            counts.verdict_reuses, 0,
+            "lease-snapshot pre-build must not count as memoized content verdict reuse"
         );
         let telemetry = observed_telemetry.expect("the operation publishes its pass counters");
-        assert_eq!(telemetry.content_hash_reads, indexed_files * 2);
-        assert_eq!(telemetry.verdict_reuses, indexed_files);
+        assert_eq!(telemetry.content_hash_reads, indexed_files);
+        assert_eq!(telemetry.verdict_reuses, 0);
     }
 
     /// Issue #1700 requires the operation-scoped freshness memo to leave
@@ -4342,34 +4339,65 @@ pub(crate) mod activation_tests {
         );
     }
 
-    /// A second operation on one ready lease begins from the clean verdicts
-    /// re-established by the first operation's post-build guard.
+    /// A coherent ready lease skips pre-build content hashes. The post-build
+    /// guard still content-rehashes, and the next public operation again skips
+    /// pre-build via that lease rather than paying another cold content scan.
     #[test]
     fn the_next_public_operation_reuses_the_ready_lease_verdicts() {
         let fixture = ready_activation_fixture();
+        let indexed_files = u64::from(
+            fixture
+                .runtime
+                .activation_service()
+                .controller
+                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)
+                .expect("observe indexed inventory")
+                .indexed_file_count,
+        );
+        assert!(
+            indexed_files > 0,
+            "the fixture must publish at least one indexed file"
+        );
         let service = fixture.runtime.public_operation_service();
-        let mut first = None;
+        let mut first_during_build = None;
+        let mut after_first_post_build = None;
+        let mut second_during_build = None;
         service
             .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
-                first = codestory_workspace::source_freshness_counts();
+                service.run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                    first_during_build = codestory_workspace::source_freshness_counts();
+                    Ok(())
+                })?;
+                after_first_post_build = codestory_workspace::source_freshness_counts();
+                service.run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                    second_during_build = codestory_workspace::source_freshness_counts();
+                    Ok(())
+                })?;
                 Ok(())
             })
-            .expect("first operation");
-        let mut second = None;
-        service
-            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
-                second = codestory_workspace::source_freshness_counts();
-                Ok(())
-            })
-            .expect("second operation");
+            .expect("ready-lease operations");
 
-        let first = first.expect("first scope");
-        let second = second.expect("second scope");
-        assert!(first.content_hash_reads > 0);
-        assert_eq!(second.content_hash_reads, 0);
+        let first_during_build = first_during_build.expect("first build scope");
         assert_eq!(
-            second.verdict_reuses, first.content_hash_reads,
-            "the second operation must reuse the verdicts left by the first post-build guard"
+            first_during_build.content_hash_reads, 0,
+            "observer-coherent ready lease must skip pre-build content hashes"
+        );
+
+        let after_first_post_build = after_first_post_build.expect("after first post-build");
+        assert_eq!(
+            after_first_post_build.content_hash_reads, indexed_files,
+            "post-build must still content-rehash even when pre-build reused the lease"
+        );
+
+        let second_during_build = second_during_build.expect("second build scope");
+        assert_eq!(
+            second_during_build.content_hash_reads, after_first_post_build.content_hash_reads,
+            "the next operation must reuse the coherent ready lease and not add another \
+             pre-build content pass"
+        );
+        assert_eq!(
+            second_during_build.verdict_reuses, 0,
+            "lease-snapshot pre-build must not count as memoized content verdict reuse"
         );
         assert_eq!(
             codestory_workspace::source_freshness_counts(),
