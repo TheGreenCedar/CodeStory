@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Activation validation proves SCIP graph readiness from the sealed component
+envelope (marker, revision, cardinality) instead of loading the full query
+view, and the first packet after a coherent ready lease reuses that lease's
+source snapshot instead of a cold content rescan, so Keycloak-class projects
+are more likely to leave `validation@90` under the frozen preparation budget.
+
 Activation finalization builds lexical, dense-vector, and SCIP graph sidecars
 concurrently and verifies staged SCIP components by digest, so large
 repositories are more likely to leave `publication@75` under the frozen

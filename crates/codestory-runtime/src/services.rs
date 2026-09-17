@@ -738,6 +738,52 @@ impl ActivationService {
         .flatten()
     }
 
+    /// Return the ready-lease source snapshot when its observer epoch is still
+    /// coherent, so the first public operation after activation need not pay a
+    /// cold content scan that validation deliberately skipped via observer receipt.
+    fn admitted_source_freshness_if_observer_coherent(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Option<IndexFreshnessDto> {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        let lease = {
+            let state = self
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator poisoned");
+            (state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&requested))
+                && state
+                    .current
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.state == ActivationState::Ready))
+            .then(|| state.ready_lease.clone())
+            .flatten()?
+        };
+        if !lease.source.is_admissible_snapshot() {
+            return None;
+        }
+        if !self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref()) {
+            return None;
+        }
+        Some(IndexFreshnessDto {
+            status: lease.source.status,
+            changed_file_count: lease.source.changed_file_count,
+            new_file_count: lease.source.new_file_count,
+            removed_file_count: lease.source.removed_file_count,
+            checked_file_count: lease.source.checked_file_count,
+            indexed_file_count: lease.source.indexed_file_count,
+            duration_ms: 0,
+            reason: lease.source.gap.clone(),
+            not_checked_cause: lease.source.not_checked_cause,
+            samples: Vec::new(),
+        })
+    }
+
     fn target_for_request(&self, project_root: &Path, storage_path: &Path) -> ActivationTarget {
         let requested = ActivationTarget::new(project_root, storage_path);
         if let Some(target) = self
@@ -2483,9 +2529,24 @@ impl PublicOperationService {
                     crate::agent::packet_batch::observe_packet_operation_span(
                         crate::agent::packet_batch::PacketOperationObservationSpan::UncachedFreshness,
                     );
-                let freshness = self
-                    .controller
-                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot);
+                // When activation minted the ready lease from a coherent observer
+                // receipt, the lease probe already falsifies source drift without
+                // another content walk. Re-scanning here burned ~4s on Keycloak
+                // after validation@90 and blew the remaining 18s packet floor.
+                let freshness = if let Some(lease_freshness) =
+                    self.activation.as_ref().and_then(|activation| {
+                        let project_root = self.controller.require_project_root().ok()?;
+                        let storage_path = self.controller.require_storage_path().ok()?;
+                        activation.admitted_source_freshness_if_observer_coherent(
+                            &project_root,
+                            &storage_path,
+                        )
+                    }) {
+                    Ok(lease_freshness)
+                } else {
+                    self.controller
+                        .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
+                };
                 if freshness.is_ok() {
                     freshness_span.finish_success();
                 }

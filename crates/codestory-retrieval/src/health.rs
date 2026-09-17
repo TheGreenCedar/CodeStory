@@ -513,20 +513,11 @@ fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
     else {
         return false;
     };
-    crate::scip_index::scip_symbols_component_path(project_dir).is_file()
-        // `index.scip` is parsed and bound to this generation's revision.
-        // Existence alone let a corrupt-but-present marker publish clean.
-        && crate::scip_index::parse_scip_index_marker(project_dir, &revision).is_ok()
-        && project_dir.join("revision.txt").is_file()
-        && !project_dir
-            .join(crate::scip_index::SCIP_STUB_MARKER_FILE)
-            .is_file()
-        && crate::scip_index::load_fresh_scip_query_view(project_dir, &revision, generation)
-            .ok()
-            .flatten()
-            .is_some_and(|view| {
-                view.generation() == generation && view.symbol_count() > 0
-            })
+    // Full sidecar health must not build the query adjacency view. Keycloak-class
+    // SCIP components are tens of MB / hundreds of thousands of rows; loading them
+    // during validation@90 burned multi-second wall after #2291 made graph present.
+    // Publish already digest-bound the component; health re-checks the envelope.
+    crate::scip_index::scip_component_admits_graph_health(project_dir, &revision, generation)
 }
 
 pub fn probe_sidecar_health(
