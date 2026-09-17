@@ -1,5 +1,8 @@
 use crate::agent::citation::{evidence_edge_ids_for_node, to_citation_from_hit};
-use crate::agent::packet_batch::{PacketLatencyBudget, run_packet_planned_subqueries};
+use crate::agent::packet_batch::{
+    PacketLatencyBudget, observe_packet_descriptor_remaining_before_handoff,
+    run_packet_planned_subqueries,
+};
 use crate::agent::packet_budget::{
     apply_packet_budget, enforce_packet_output_budget, packet_budget_limits,
 };
@@ -411,11 +414,12 @@ fn agent_packet_with_session(
         &descriptor_queries,
         Some(descriptor_budget_ms),
     )?;
-    packet_remaining_for_handoff(
+    let remaining_before_handoff = packet_remaining_for_handoff(
         controller,
         packet_latency,
         "exact probe citation resolution",
     )?;
+    observe_packet_descriptor_remaining_before_handoff(u64::from(remaining_before_handoff));
     let exact_probe_citations =
         exact_packet_probe_citations(controller, &plan.probe_resolutions, &question, true);
     let downstream_budget_ms =

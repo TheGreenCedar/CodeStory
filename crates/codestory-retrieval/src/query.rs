@@ -17,6 +17,7 @@ use crate::health::{
 };
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode, derive_descriptor_mode};
+use crate::planner::RetrievalStageKind;
 use crate::query_features::{QueryLookupMode, classify_query};
 use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
@@ -127,12 +128,19 @@ pub struct QueryBatchItem<'a> {
 ///
 /// The observation deliberately excludes query text, candidates, paths, and
 /// health details. An empty or failed batch does not produce one.
+///
+/// `lexical_wall_ms` / `dense_semantic_wall_ms` are the maximum per-query stage
+/// elapsed times from the descriptor plan (Stage1 lexical / Stage1b semantic).
+/// They attribute cost inside `query_batch_wall_ms` and are not required to
+/// partition that enclosing wall.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketDescriptorBatchObservation {
     pub query_count: u64,
     pub health_resolution_wall_ms: u64,
     pub query_batch_wall_ms: u64,
+    pub lexical_wall_ms: u64,
+    pub dense_semantic_wall_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -668,6 +676,11 @@ impl PinnedQuerySession {
         )?;
         let query_batch_wall_ms =
             query_batch_started_at.map(|started_at| duration_millis_ceil(started_at.elapsed()));
+        let lexical_wall_ms = observe_wall_intervals
+            .then(|| max_descriptor_stage_elapsed_ms(&results, RetrievalStageKind::Stage1Lexical));
+        let dense_semantic_wall_ms = observe_wall_intervals.then(|| {
+            max_descriptor_stage_elapsed_ms(&results, RetrievalStageKind::Stage1bSemantic)
+        });
         for result in &mut results {
             sanitize_packet_candidate_descriptors(&mut result.hits);
             result.publication_identity = Some(self.publication_identity.clone());
@@ -677,6 +690,8 @@ impl PinnedQuerySession {
                 query_count: u64::try_from(queries.len()).unwrap_or(u64::MAX),
                 health_resolution_wall_ms,
                 query_batch_wall_ms,
+                lexical_wall_ms: lexical_wall_ms.unwrap_or(0),
+                dense_semantic_wall_ms: dense_semantic_wall_ms.unwrap_or(0),
             },
         );
         Ok((results, observation))
@@ -1199,6 +1214,16 @@ fn duration_millis_ceil(duration: Duration) -> u64 {
     millis.saturating_add(u64::from(
         !duration.subsec_nanos().is_multiple_of(1_000_000),
     ))
+}
+
+fn max_descriptor_stage_elapsed_ms(results: &[QueryResult], kind: RetrievalStageKind) -> u64 {
+    results
+        .iter()
+        .flat_map(|result| result.trace.stages.iter())
+        .filter(|stage| stage.stage == kind)
+        .map(|stage| stage.elapsed_ms)
+        .max()
+        .unwrap_or(0)
 }
 
 struct PreparedBatchSidecars {
@@ -1812,6 +1837,10 @@ mod tests {
         );
         let observation = observation.expect("successful non-empty batch observation");
         assert_eq!(observation.query_count, 1);
+        assert!(
+            observation.query_batch_wall_ms >= observation.lexical_wall_ms,
+            "lexical stage attribution must stay inside the enclosing query-batch wall"
+        );
     }
 
     #[cfg(feature = "test-support")]

@@ -93,6 +93,13 @@ struct PacketEntryObservation {
     descriptor_preadmission_query_count: u64,
     descriptor_health_resolution_wall_ms: u64,
     descriptor_query_batch_wall_ms: u64,
+    descriptor_query_plan_wall_ms: u64,
+    descriptor_lexical_wall_ms: u64,
+    descriptor_dense_semantic_wall_ms: u64,
+    descriptor_admission_seal_wall_ms: u64,
+    descriptor_deferred_readiness_wall_ms: u64,
+    descriptor_remaining_before_handoff_ms: u64,
+    descriptor_preadmit_runtime_phases_observed_count: u64,
     raf_ranked_admitted_observed_count: u64,
     raf_ranked_pool_count: u64,
     raf_ranked_recorded_count: u64,
@@ -169,6 +176,11 @@ pub(crate) fn observe_packet_descriptor_preadmission(
     query_count: u64,
     health_resolution_wall_ms: u64,
     query_batch_wall_ms: u64,
+    query_plan_wall_ms: u64,
+    lexical_wall_ms: u64,
+    dense_semantic_wall_ms: u64,
+    admission_seal_wall_ms: u64,
+    deferred_readiness_wall_ms: u64,
 ) {
     if query_count == 0 {
         return;
@@ -181,6 +193,46 @@ pub(crate) fn observe_packet_descriptor_preadmission(
         observation.descriptor_preadmission_query_count = query_count;
         observation.descriptor_health_resolution_wall_ms = health_resolution_wall_ms;
         observation.descriptor_query_batch_wall_ms = query_batch_wall_ms;
+        observation.descriptor_query_plan_wall_ms = query_plan_wall_ms;
+        observation.descriptor_lexical_wall_ms = lexical_wall_ms;
+        observation.descriptor_dense_semantic_wall_ms = dense_semantic_wall_ms;
+        observation.descriptor_admission_seal_wall_ms = admission_seal_wall_ms;
+        observation.descriptor_deferred_readiness_wall_ms = deferred_readiness_wall_ms;
+    });
+}
+
+/// Record ordered runtime sub-phase walls when the descriptor batch itself did
+/// not produce a complete `#2272` observation (empty queries / zero slots).
+///
+/// First owned write wins. Does not set `descriptor_preadmission_observed_count`.
+pub(crate) fn observe_packet_descriptor_preadmit_runtime_phases(
+    query_plan_wall_ms: u64,
+    admission_seal_wall_ms: u64,
+    deferred_readiness_wall_ms: u64,
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_preadmit_runtime_phases_observed_count != 0
+            || observation.descriptor_preadmission_observed_count != 0
+        {
+            return;
+        }
+        observation.descriptor_preadmit_runtime_phases_observed_count = 1;
+        observation.descriptor_query_plan_wall_ms = query_plan_wall_ms;
+        observation.descriptor_admission_seal_wall_ms = admission_seal_wall_ms;
+        observation.descriptor_deferred_readiness_wall_ms = deferred_readiness_wall_ms;
+    });
+}
+
+/// Record remaining packet-entry budget after descriptor preadmission, before the
+/// next orchestrator handoff (`exact probe citation resolution`).
+///
+/// First owned write wins. Empty/cancel paths may leave this at zero.
+pub(crate) fn observe_packet_descriptor_remaining_before_handoff(remaining_ms: u64) {
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_remaining_before_handoff_ms != 0 {
+            return;
+        }
+        observation.descriptor_remaining_before_handoff_ms = remaining_ms;
     });
 }
 
@@ -628,6 +680,18 @@ impl Drop for PacketLatencyScopeGuard {
                     descriptor_health_resolution_wall_ms =
                         observation.descriptor_health_resolution_wall_ms,
                     descriptor_query_batch_wall_ms = observation.descriptor_query_batch_wall_ms,
+                    descriptor_query_plan_wall_ms = observation.descriptor_query_plan_wall_ms,
+                    descriptor_lexical_wall_ms = observation.descriptor_lexical_wall_ms,
+                    descriptor_dense_semantic_wall_ms =
+                        observation.descriptor_dense_semantic_wall_ms,
+                    descriptor_admission_seal_wall_ms =
+                        observation.descriptor_admission_seal_wall_ms,
+                    descriptor_deferred_readiness_wall_ms =
+                        observation.descriptor_deferred_readiness_wall_ms,
+                    descriptor_remaining_before_handoff_ms =
+                        observation.descriptor_remaining_before_handoff_ms,
+                    descriptor_preadmit_runtime_phases_observed_count =
+                        observation.descriptor_preadmit_runtime_phases_observed_count,
                     raf_ranked_admitted_observed_count =
                         observation.raf_ranked_admitted_observed_count,
                     raf_ranked_pool_count = observation.raf_ranked_pool_count,
@@ -722,6 +786,13 @@ pub(crate) struct PacketOperationObservationTestSnapshot {
     pub(crate) descriptor_preadmission_query_count: u64,
     pub(crate) descriptor_health_resolution_wall_ms: u64,
     pub(crate) descriptor_query_batch_wall_ms: u64,
+    pub(crate) descriptor_query_plan_wall_ms: u64,
+    pub(crate) descriptor_lexical_wall_ms: u64,
+    pub(crate) descriptor_dense_semantic_wall_ms: u64,
+    pub(crate) descriptor_admission_seal_wall_ms: u64,
+    pub(crate) descriptor_deferred_readiness_wall_ms: u64,
+    pub(crate) descriptor_remaining_before_handoff_ms: u64,
+    pub(crate) descriptor_preadmit_runtime_phases_observed_count: u64,
     pub(crate) raf_ranked_admitted_observed_count: u64,
     pub(crate) raf_ranked_pool_count: u64,
     pub(crate) raf_ranked_recorded_count: u64,
@@ -772,6 +843,16 @@ pub(crate) fn packet_operation_observation_for_test()
                 descriptor_health_resolution_wall_ms: observation
                     .descriptor_health_resolution_wall_ms,
                 descriptor_query_batch_wall_ms: observation.descriptor_query_batch_wall_ms,
+                descriptor_query_plan_wall_ms: observation.descriptor_query_plan_wall_ms,
+                descriptor_lexical_wall_ms: observation.descriptor_lexical_wall_ms,
+                descriptor_dense_semantic_wall_ms: observation.descriptor_dense_semantic_wall_ms,
+                descriptor_admission_seal_wall_ms: observation.descriptor_admission_seal_wall_ms,
+                descriptor_deferred_readiness_wall_ms: observation
+                    .descriptor_deferred_readiness_wall_ms,
+                descriptor_remaining_before_handoff_ms: observation
+                    .descriptor_remaining_before_handoff_ms,
+                descriptor_preadmit_runtime_phases_observed_count: observation
+                    .descriptor_preadmit_runtime_phases_observed_count,
                 raf_ranked_admitted_observed_count: observation.raf_ranked_admitted_observed_count,
                 raf_ranked_pool_count: observation.raf_ranked_pool_count,
                 raf_ranked_recorded_count: observation.raf_ranked_recorded_count,
@@ -970,14 +1051,14 @@ mod packet_latency_budget_tests {
         assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
         {
             let _latency = enter_packet_latency_scope(Some(2_000));
-            observe_packet_descriptor_preadmission(0, 3, 5);
+            observe_packet_descriptor_preadmission(0, 3, 5, 1, 2, 3, 4, 5);
             let empty = packet_operation_observation_for_test()
                 .expect("outer packet observation exists before product work");
             assert_eq!(empty.descriptor_preadmission_observed_count, 0);
 
             {
                 let _nonpacket = enter_packet_public_operation_observation("search");
-                observe_packet_descriptor_preadmission(7, 11, 13);
+                observe_packet_descriptor_preadmission(7, 11, 13, 1, 2, 3, 4, 5);
             }
             let nonpacket = packet_operation_observation_for_test()
                 .expect("non-packet operation leaves the packet receipt active");
@@ -985,12 +1066,12 @@ mod packet_latency_budget_tests {
 
             {
                 let _packet = enter_packet_public_operation_observation("packet");
-                observe_packet_descriptor_preadmission(2, 17, 19);
+                observe_packet_descriptor_preadmission(2, 17, 19, 3, 7, 11, 13, 17);
                 {
                     let _nested = enter_packet_public_operation_observation("packet");
-                    observe_packet_descriptor_preadmission(9, 23, 29);
+                    observe_packet_descriptor_preadmission(9, 23, 29, 31, 37, 41, 43, 47);
                 }
-                observe_packet_descriptor_preadmission(4, 31, 37);
+                observe_packet_descriptor_preadmission(4, 31, 37, 53, 59, 61, 67, 71);
             }
 
             let observed = packet_operation_observation_for_test()
@@ -999,6 +1080,11 @@ mod packet_latency_budget_tests {
             assert_eq!(observed.descriptor_preadmission_query_count, 2);
             assert_eq!(observed.descriptor_health_resolution_wall_ms, 17);
             assert_eq!(observed.descriptor_query_batch_wall_ms, 19);
+            assert_eq!(observed.descriptor_query_plan_wall_ms, 3);
+            assert_eq!(observed.descriptor_lexical_wall_ms, 7);
+            assert_eq!(observed.descriptor_dense_semantic_wall_ms, 11);
+            assert_eq!(observed.descriptor_admission_seal_wall_ms, 13);
+            assert_eq!(observed.descriptor_deferred_readiness_wall_ms, 17);
         }
         assert!(
             ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
