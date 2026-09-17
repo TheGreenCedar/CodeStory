@@ -2400,10 +2400,15 @@ fn load_scip_symbols_database_for_generation(
 /// query view.
 ///
 /// Activation validation and Full sidecar health only need to know the graph
-/// lane is real (non-stub, marker-bound, non-empty, cardinality-consistent).
-/// Loading [`ScipQueryView`] materializes every symbol/proof into adjacency
-/// maps and dominated Keycloak-class `validation@90` after publication started
-/// emitting real SCIP. Query execution still uses [`load_fresh_scip_query_view`].
+/// lane is real (non-stub, marker-bound, non-empty symbols and proofs, fresh
+/// contract). Loading [`ScipQueryView`] materializes every symbol/proof into
+/// adjacency maps and dominated Keycloak-class `validation@90` after publication
+/// started emitting real SCIP. Query execution still uses
+/// [`load_fresh_scip_query_view`].
+///
+/// JSON fixture components are admitted by deserializing the index envelope only
+/// (no adjacency build). Sealed SQLite components use metadata + cardinality
+/// counts without loading row payloads into a query view.
 pub(crate) fn scip_component_admits_graph_health(
     project_dir: &Path,
     expected_revision: &str,
@@ -2429,11 +2434,39 @@ pub(crate) fn scip_component_admits_graph_health(
     {
         return false;
     }
-    let Ok(schema) = scip_component_schema(&path) else {
+    let component_is_json =
+        path.file_name().and_then(|name| name.to_str()) == Some(SCIP_SYMBOLS_FILE);
+    if component_is_json {
+        return scip_json_component_admits_graph_health(&path, expected_revision, generation);
+    }
+    scip_sqlite_component_admits_graph_health(&path, expected_revision)
+}
+
+fn scip_json_component_admits_graph_health(
+    path: &Path,
+    expected_revision: &str,
+    generation: &str,
+) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_str::<ScipSymbolsIndex>(&body) else {
+        return false;
+    };
+    // JSON adjacency fixtures stamp generation inside the artifact.
+    index.generation == generation
+        && index.revision == expected_revision
+        && !index.symbols.is_empty()
+        && index.has_required_proof_records()
+        && index.contract.is_fresh_for(expected_revision)
+}
+
+fn scip_sqlite_component_admits_graph_health(path: &Path, expected_revision: &str) -> bool {
+    let Ok(schema) = scip_component_schema(path) else {
         return false;
     };
     let Ok(connection) = Connection::open_with_flags(
-        sqlite_open_path(&path),
+        sqlite_open_path(path),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) else {
         return false;
@@ -2446,8 +2479,8 @@ pub(crate) fn scip_component_admits_graph_health(
     if check != "ok" {
         return false;
     }
-    let Ok((meta_generation, revision, contract_json, symbol_count, proof_count)) =
-        connection.query_row(
+    let Ok((_meta_generation, revision, contract_json, symbol_count, proof_count)) = connection
+        .query_row(
             "SELECT generation, revision, contract_json, symbol_count, proof_count
              FROM metadata WHERE singleton = 1",
             [],
@@ -2492,19 +2525,7 @@ pub(crate) fn scip_component_admits_graph_health(
     }) else {
         return false;
     };
-    if observed_symbols != symbol_count || observed_proofs != proof_count {
-        return false;
-    }
-    // JSON adjacency fixtures stamp generation inside the artifact. Sealed
-    // SQLite components may be hard-linked across graph-equivalent generations
-    // and remapped by the request generation instead.
-    let component_is_json =
-        path.file_name().and_then(|name| name.to_str()) == Some(SCIP_SYMBOLS_FILE);
-    if component_is_json && meta_generation != generation {
-        return false;
-    }
-    let _ = meta_generation;
-    true
+    observed_symbols == symbol_count && observed_proofs == proof_count
 }
 
 pub(crate) fn load_fresh_scip_query_view(
@@ -2975,8 +2996,7 @@ mod tests {
             Connection::open(sqlite_open_path(&component_path)).expect("open component");
         let mut stale_contract = ScipProofAdapterContract::graph_projection(&index.revision);
         stale_contract.freshness = "stale".into();
-        let stale_json =
-            serde_json::to_string(&stale_contract).expect("serialize stale contract");
+        let stale_json = serde_json::to_string(&stale_contract).expect("serialize stale contract");
         connection
             .execute(
                 "UPDATE metadata SET contract_json = ?1 WHERE singleton = 1",
@@ -3005,6 +3025,52 @@ mod tests {
         assert!(
             !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
             "cardinality drift must refuse graph health"
+        );
+
+        // JSON fixture components (zero-dense pinned query) must admit without a
+        // query-view build, and still refuse zero-proof / stale-contract envelopes.
+        let json_dir = root.path().join("scip-json");
+        std::fs::create_dir_all(&json_dir).expect("json scip dir");
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&index).expect("serialize json index"),
+        )
+        .expect("write json component");
+        std::fs::write(
+            json_dir.join("revision.txt"),
+            format!("{}\n", index.revision),
+        )
+        .expect("json revision");
+        write_scip_index_marker(&json_dir, &index.revision).expect("json marker");
+        assert!(
+            scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json fixture with symbols and proofs must admit graph health"
+        );
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-remapped"),
+            "json fixtures stamp generation and must refuse remap"
+        );
+        let mut zero_proof = index.clone();
+        zero_proof.proofs.clear();
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&zero_proof).expect("serialize zero-proof json"),
+        )
+        .expect("write zero-proof json");
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json zero proofs must refuse graph health"
+        );
+        let mut stale = index.clone();
+        stale.contract.freshness = "stale".into();
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&stale).expect("serialize stale json"),
+        )
+        .expect("write stale json");
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json stale contract must refuse graph health"
         );
     }
 
