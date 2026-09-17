@@ -2429,6 +2429,16 @@ export function draftSourcePolicyViolations(
   add(violations, compilerSave?.if === draftCompilerSaveCondition, "draft compiler cache must save only on a successful run that missed its primary key");
   add(violations, compilerSaveWith.path === draftCompilerCachePath && compilerSaveWith.key === draftCompilerSaveKey, "draft compiler cache save must publish the restored primary key path");
 
+  const retrievalInstall = namedStep(retrievalJob, "Install Rust stable");
+  add(
+    violations,
+    sameStrings(nonCommentLines(retrievalInstall?.run), [
+      "rustup toolchain install 1.97.1 --profile minimal",
+      "rustup default 1.97.1",
+    ]),
+    "retrieval cache producer must pin the same draft Rust 1.97.1 toolchain",
+  );
+
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
   const retrievalRestoreWith = object(retrievalRestore?.with);
   add(
