@@ -1700,6 +1700,17 @@ const draftStepSequence = [
     keys: ["name", "if", "uses", "continue-on-error", "with"],
   },
 ];
+// Shared pin for draft CI and the retrieval cache-seed producer. Keep both
+// workflows on this exact release so draft restore-keys can hit base-branch seeds.
+const draftPinnedRustToolchain = "1.97.1";
+const draftRustInstallCommands = [
+  `rustup toolchain install ${draftPinnedRustToolchain} --profile minimal --component clippy --component rustfmt`,
+  `rustup default ${draftPinnedRustToolchain}`,
+];
+const retrievalRustInstallCommands = [
+  `rustup toolchain install ${draftPinnedRustToolchain} --profile minimal`,
+  `rustup default ${draftPinnedRustToolchain}`,
+];
 const draftRunCommands = new Map([
   ["Configure bounded compiler cache", [
     "{",
@@ -1711,10 +1722,7 @@ const draftRunCommands = new Map([
     'echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"',
     '} >> "$GITHUB_ENV"',
   ]],
-  ["Install Rust stable", [
-    "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
-    "rustup default 1.97.1",
-  ]],
+  ["Install Rust stable", draftRustInstallCommands],
   ["Install Linux Vulkan build dependencies", [
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
   ]],
@@ -2432,11 +2440,8 @@ export function draftSourcePolicyViolations(
   const retrievalInstall = namedStep(retrievalJob, "Install Rust stable");
   add(
     violations,
-    sameStrings(nonCommentLines(retrievalInstall?.run), [
-      "rustup toolchain install 1.97.1 --profile minimal",
-      "rustup default 1.97.1",
-    ]),
-    "retrieval cache producer must pin the same draft Rust 1.97.1 toolchain",
+    sameStrings(nonCommentLines(retrievalInstall?.run), retrievalRustInstallCommands),
+    `retrieval cache producer must pin the same draft Rust ${draftPinnedRustToolchain} toolchain`,
   );
 
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
