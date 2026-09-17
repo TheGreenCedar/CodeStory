@@ -2329,7 +2329,16 @@ pub(super) fn dense_anchor_score(
 pub(super) fn dense_anchor_is_central(
     graph_context: &SemanticDocGraphContext,
     node_id: GraphNodeId,
+    kind: codestory_contracts::graph::NodeKind,
 ) -> bool {
+    // Callables with many edges are common on JVM/protobuf-class graphs and
+    // previously forced Keycloak-scale finalize to embed ~9k METHOD hubs alone
+    // during publication@75. Dense centrality is reserved for type-like public
+    // kinds; callables stay lexical/graph discoverable unless another reason
+    // admits them.
+    if !dense_anchor_public_kind(kind) {
+        return false;
+    }
     let centrality = graph_context
         .centrality
         .get(&node_id)
@@ -2593,12 +2602,15 @@ fn base_dense_anchor_reason_for_node(
     let file_role = file_path
         .map(retrieval_file_role_from_path)
         .unwrap_or(RetrievalFileRole::Source);
-    let central = dense_anchor_is_central(graph_context, node.id);
+    let central = dense_anchor_is_central(graph_context, node.id, node.kind);
 
     if file_role == RetrievalFileRole::Docs {
         return Some(DenseAnchorReason::UnstructuredDoc);
     }
-    if file_role.is_non_primary() && !central {
+    // Non-primary roles (test/vendor/generated) must stay sparse even when the
+    // graph degree is high. E3 Keycloak measured 3886 test-role centrals that
+    // still entered the publication@75 embed set via the old centrality escape.
+    if file_role.is_non_primary() {
         return None;
     }
     if semantic_file_is_entrypoint(file_path, display_name) {
@@ -2676,14 +2688,17 @@ pub(super) fn dense_anchor_reason_for_node_with_flow_neighbors(
     })
 }
 
-fn dense_anchor_reason_is_flow_seed(reason: Option<DenseAnchorReason>) -> bool {
+pub(super) fn dense_anchor_reason_is_flow_seed(reason: Option<DenseAnchorReason>) -> bool {
+    // Central hubs must not seed flow expansion: on Keycloak-class graphs each
+    // central seed admitted up to FLOW_NEIGHBORS_PER_SEED callables and the
+    // E3 corpus planned 7129 flow_neighbor embeds after #2285. Flow fills gaps
+    // around intentional API/entrypoint/documented seeds only.
     matches!(
         reason,
         Some(
             DenseAnchorReason::Entrypoint
                 | DenseAnchorReason::PublicApi
                 | DenseAnchorReason::DocumentedNontrivial
-                | DenseAnchorReason::CentralGraphNode
         )
     )
 }

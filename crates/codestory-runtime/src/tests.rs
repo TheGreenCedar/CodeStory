@@ -81,9 +81,9 @@ use crate::semantic_projection::{
     LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
     SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats,
     build_component_report_docs_with_policy, build_llm_symbol_doc_text_with_policy,
-    dense_anchor_reason_for_node_with_flow_neighbors, flow_neighbor_edge_is_eligible,
-    retain_bounded_flow_neighbor_candidate, route_endpoint_is_parser_backed,
-    semantic_component_key_for_path, semantic_doc_field_budgets,
+    dense_anchor_reason_for_node_with_flow_neighbors, dense_anchor_reason_is_flow_seed,
+    flow_neighbor_edge_is_eligible, retain_bounded_flow_neighbor_candidate,
+    route_endpoint_is_parser_backed, semantic_component_key_for_path, semantic_doc_field_budgets,
     semantic_file_is_package_callable_surface, semantic_file_is_public_surface,
     semantic_graph_dependent_file_ids_by_seed, semantic_projection_source_policy_compatibility,
 };
@@ -1070,7 +1070,8 @@ fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
 #[test]
 fn dense_policy_only_embeds_high_signal_central_nodes() {
     let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
-    let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
+    let central_callable = semantic_policy_node(16, NodeKind::FUNCTION, "central_fn", 1);
+    let central_type = semantic_policy_node(17, NodeKind::CLASS, "CentralType", 1);
     let mut context = semantic_policy_context("src/internal/graph.rs", &ordinary);
     context.centrality.insert(
         ordinary.id,
@@ -1080,22 +1081,24 @@ fn dense_policy_only_embeds_high_signal_central_nodes() {
             edge_count: 4,
         },
     );
-    context.child_labels.insert(
-        central.id,
-        (0..6).map(|index| format!("child_{index}")).collect(),
-    );
-    context.referenced_labels.insert(
-        central.id,
-        (0..6).map(|index| format!("ref_{index}")).collect(),
-    );
-    context.centrality.insert(
-        central.id,
-        DenseAnchorCentrality {
-            child_count: 0,
-            related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
-            edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
-        },
-    );
+    for node_id in [central_callable.id, central_type.id] {
+        context.child_labels.insert(
+            node_id,
+            (0..6).map(|index| format!("child_{index}")).collect(),
+        );
+        context.referenced_labels.insert(
+            node_id,
+            (0..6).map(|index| format!("ref_{index}")).collect(),
+        );
+        context.centrality.insert(
+            node_id,
+            DenseAnchorCentrality {
+                child_count: 0,
+                related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+                edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+            },
+        );
+    }
 
     assert_eq!(
         dense_anchor_reason_for_node(
@@ -1111,30 +1114,82 @@ fn dense_policy_only_embeds_high_signal_central_nodes() {
     assert_eq!(
         dense_anchor_reason_for_node(
             &context,
-            &central,
-            "central",
+            &central_callable,
+            "central_fn",
             Some("src/internal/graph.rs"),
-            "semantic_doc_version: 4\nsymbol: central\nkind: FUNCTION\n",
+            "semantic_doc_version: 4\nsymbol: central_fn\nkind: FUNCTION\n",
+            Some(AccessKind::Private),
+        ),
+        None,
+        "high-degree callables must stay sparse; centrality is type-like only"
+    );
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &central_type,
+            "CentralType",
+            Some("src/internal/graph.rs"),
+            "semantic_doc_version: 4\nsymbol: CentralType\nkind: CLASS\n",
             Some(AccessKind::Private),
         ),
         Some(DenseAnchorReason::CentralGraphNode)
     );
-    assert_eq!(
-        context
-            .child_labels
-            .get(&central.id)
-            .expect("bounded child labels")
-            .len(),
-        6
+    assert!(!dense_anchor_is_central(
+        &context,
+        central_callable.id,
+        central_callable.kind
+    ));
+    assert!(dense_anchor_is_central(
+        &context,
+        central_type.id,
+        central_type.kind
+    ));
+}
+
+#[test]
+fn dense_policy_does_not_let_centrality_override_test_roles() {
+    let hub = semantic_policy_node(42, NodeKind::CLASS, "TestHub", 1);
+    let mut context = semantic_policy_context("tests/hub.rs", &hub);
+    context.centrality.insert(
+        hub.id,
+        DenseAnchorCentrality {
+            child_count: 0,
+            related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+            edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+        },
     );
+    assert!(dense_anchor_is_central(&context, hub.id, hub.kind));
     assert_eq!(
-        context
-            .referenced_labels
-            .get(&central.id)
-            .expect("bounded related labels")
-            .len(),
-        6
+        dense_anchor_reason_for_node(
+            &context,
+            &hub,
+            "TestHub",
+            Some("tests/hub.rs"),
+            "semantic_doc_version: 4\nsymbol: TestHub\nkind: CLASS\n",
+            Some(AccessKind::Public),
+        ),
+        None,
+        "test-role types must not become dense via centrality"
     );
+}
+
+#[test]
+fn dense_policy_does_not_seed_flow_from_central_hubs() {
+    assert!(dense_anchor_reason_is_flow_seed(Some(
+        DenseAnchorReason::PublicApi
+    )));
+    assert!(dense_anchor_reason_is_flow_seed(Some(
+        DenseAnchorReason::Entrypoint
+    )));
+    assert!(dense_anchor_reason_is_flow_seed(Some(
+        DenseAnchorReason::DocumentedNontrivial
+    )));
+    assert!(!dense_anchor_reason_is_flow_seed(Some(
+        DenseAnchorReason::CentralGraphNode
+    )));
+    assert!(!dense_anchor_reason_is_flow_seed(Some(
+        DenseAnchorReason::FlowNeighbor
+    )));
 }
 
 #[test]
@@ -6813,7 +6868,7 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
             edge_count: INCIDENT_EDGE_COUNT as usize,
         })
     );
-    assert!(dense_anchor_is_central(&streamed, hub.id));
+    assert!(!dense_anchor_is_central(&streamed, hub.id, hub.kind));
     assert!(
         !streamed
             .referenced_labels
