@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Packet descriptor preadmission keeps lexical recall near the dense calibration
+window instead of scanning the full fusion pool, so large-repository packets
+are less likely to exhaust the frozen latency budget before handoff.
+
 Indexing accepts valid UTF-8 source containing terminal escape bytes while
 preserving the original bytes. Markdown snippets show those escapes as `\x1b`
 instead of passing them through to the terminal.
