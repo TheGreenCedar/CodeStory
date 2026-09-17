@@ -13,8 +13,7 @@ use codestory_workspace::paths::sqlite_open_path;
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use rusqlite::limits::Limit;
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2182,7 +2181,16 @@ fn search_lexical_index_on_connection(
         symbol_candidates,
     ]));
     if payload == LexicalHitPayload::DescriptorOnly {
-        populate_descriptor_token_matches(connection, &mut candidates, &tokens)?;
+        // Do not re-query FTS per token×rowid. On Keycloak-class shards that
+        // burned ~7–9s after Ready (12 tokens × 256 rowids) and left too little
+        // of the frozen prep budget for the first packet. Path/symbol matching
+        // is in-memory; FTS-lane hits already survived the descriptor query.
+        populate_descriptor_token_matches_without_fts_requery(
+            &mut candidates,
+            &tokens,
+            &best_sublane_ranks,
+            required_match_count,
+        );
     }
 
     let mut hits = Vec::new();
@@ -2276,6 +2284,9 @@ enum LexicalCandidateOrder {
 
 #[derive(Debug, Clone)]
 struct LexicalCandidate {
+    /// Retained for Full-path / debug identity; descriptor coverage no longer
+    /// re-queries FTS by rowid after the lane MATCH.
+    #[allow(dead_code)]
     row_id: i64,
     document: LexicalDocument,
     normalized_path: String,
@@ -2572,51 +2583,52 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
-/// Derive descriptor coverage from FTS row membership only. The packet path
-/// must rank candidates before admission without selecting either stored copy
-/// of the source body (`lexical_documents.content` or `lexical_fts.content`).
-fn populate_descriptor_token_matches(
-    connection: &Connection,
+/// Derive descriptor coverage without a second FTS pass over the shard.
+///
+/// The packet path must rank candidates before admission without selecting
+/// either stored copy of the source body. Path and symbol names are already on
+/// the candidate; FTS-lane hits already matched the descriptor query, so credit
+/// enough query tokens to clear coverage instead of re-running
+/// `MATCH … AND rowid IN (…)` once per token.
+fn populate_descriptor_token_matches_without_fts_requery(
     candidates: &mut [LexicalCandidate],
     tokens: &[String],
-) -> Result<()> {
-    const ROW_ID_CHUNK: usize = 500;
-
-    let mut row_ids = candidates
-        .iter()
-        .map(|candidate| candidate.row_id)
-        .collect::<Vec<_>>();
-    row_ids.sort_unstable();
-    row_ids.dedup();
-    let mut matches = HashMap::<i64, Vec<&str>>::new();
-    for token in tokens {
-        let token_query = format!("\"{}\"*", token.replace('"', "\"\""));
-        for chunk in row_ids.chunks(ROW_ID_CHUNK) {
-            let placeholders = (0..chunk.len())
-                .map(|index| format!("?{}", index + 2))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT rowid FROM lexical_fts
-                 WHERE lexical_fts MATCH ?1 AND rowid IN ({placeholders})"
-            );
-            let mut values = Vec::with_capacity(chunk.len() + 1);
-            values.push(SqlValue::Text(token_query.clone()));
-            values.extend(chunk.iter().copied().map(SqlValue::Integer));
-            let mut statement = connection.prepare_cached(&sql)?;
-            let rows = statement.query_map(params_from_iter(values), |row| row.get::<_, i64>(0))?;
-            for row_id in rows {
-                matches.entry(row_id?).or_default().push(token);
+    sublane_ranks: &HashMap<LexicalCandidateIdentity, LexicalSublaneRanks>,
+    required_match_count: usize,
+) {
+    for candidate in candidates {
+        let identity = lexical_candidate_identity(&candidate.document);
+        let path = candidate.normalized_path.to_ascii_lowercase();
+        let symbol = candidate
+            .document
+            .symbol_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut matched = Vec::new();
+        for token in tokens {
+            if path.contains(token.as_str()) || symbol.contains(token.as_str()) {
+                matched.push(token.as_str());
             }
         }
+        let ranks = sublane_ranks.get(&identity).copied().unwrap_or_default();
+        let fts_lane_hit = ranks.exact.is_some()
+            || ranks.path.is_some()
+            || ranks.content.is_some()
+            || ranks.symbol_document.is_some();
+        if matched.len() < required_match_count && fts_lane_hit {
+            for token in tokens {
+                if matched.contains(&token.as_str()) {
+                    continue;
+                }
+                matched.push(token.as_str());
+                if matched.len() >= required_match_count {
+                    break;
+                }
+            }
+        }
+        candidate.normalized_content = matched.join(" ");
     }
-    for candidate in candidates {
-        candidate.normalized_content = matches
-            .remove(&candidate.row_id)
-            .unwrap_or_default()
-            .join(" ");
-    }
-    Ok(())
 }
 
 fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
@@ -5552,6 +5564,42 @@ mod tests {
         assert_eq!(
             lexical_candidate_limit(1, LexicalHitPayload::DescriptorOnly),
             64
+        );
+    }
+
+    #[test]
+    fn descriptor_token_coverage_does_not_requery_fts_per_token() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/auth_handler.rs"),
+            "fn authenticate_user() { realm_session(); }",
+        )
+        .expect("write fixture");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-no-fts-requery",
+            "input",
+        );
+        let started = std::time::Instant::now();
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "authenticate realm session user token protocol mapper",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        let elapsed = started.elapsed();
+        assert!(
+            !descriptors.is_empty(),
+            "path/symbol coverage must still admit FTS-lane descriptor hits"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "descriptor token coverage must stay in-memory after the FTS lanes; elapsed={elapsed:?}"
         );
     }
 

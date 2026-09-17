@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Packet descriptor lexical coverage matches path and symbol names in memory and
+credits FTS-lane hits without a second per-token FTS pass, so Keycloak-class
+first packets after `validation@90` no longer spend multi-second FTS re-queries
+inside the remaining frozen preparation budget.
+
 Activation validation proves SCIP graph readiness from the sealed component
 envelope (marker, revision, non-empty symbols and proofs, and a fresh proof
 adapter contract) instead of loading the full query view, and the first packet
