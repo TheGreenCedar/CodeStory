@@ -1342,13 +1342,6 @@ fn verify_staged_scip_component(
         )
         .context("read staged scip component metadata")?;
     drop(connection);
-    if generation != index.generation {
-        bail!(
-            "staged scip component generation mismatch: {} != {}",
-            generation,
-            index.generation
-        );
-    }
     if revision != index.revision {
         bail!(
             "staged scip component revision mismatch: {} != {}",
@@ -1368,6 +1361,10 @@ fn verify_staged_scip_component(
     if stored_digest != expected_digest {
         bail!("staged scip component digest mismatch");
     }
+    // Generation may differ under hard-link reuse: identical graph bytes are
+    // remapped by the publication envelope (`load_scip_symbols_database_for_generation`),
+    // so content-bind digests + revision, not the stamped metadata generation.
+    let _ = generation;
     match schema {
         2 => {
             // Reconstruct records from on-disk v2 tables and re-hash. Metadata
@@ -1380,6 +1377,13 @@ fn verify_staged_scip_component(
             let observed_digest = scip_component_digest_from_rows(&observed_rows)?;
             if observed_digest != expected_digest {
                 bail!("staged scip component content digest mismatch");
+            }
+            if decoded.index.revision != index.revision {
+                bail!(
+                    "staged scip component content revision mismatch: {} != {}",
+                    decoded.index.revision,
+                    index.revision
+                );
             }
         }
         1 => {
@@ -2840,6 +2844,36 @@ mod tests {
         assert!(
             rendered.contains("digest mismatch") || rendered.contains("content-bind"),
             "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn staged_scip_verify_allows_generation_remap_for_identical_hard_linked_component() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "alpha")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let mut current = previous.clone();
+        current.generation = "generation-v2".into();
+        let work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+        })
+        .expect("generation-only churn must reuse identical component bytes");
+        assert!(work.direct_reference);
+        assert_eq!(
+            load_scip_symbols_database_for_generation(
+                &current_dir.join(SCIP_SYMBOLS_DATABASE_FILE),
+                "generation-v2",
+            )
+            .expect("remap envelope"),
+            current
         );
     }
 
