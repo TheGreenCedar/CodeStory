@@ -2446,22 +2446,31 @@ pub(crate) fn scip_component_admits_graph_health(
     if check != "ok" {
         return false;
     }
-    let Ok((meta_generation, revision, symbol_count, proof_count)) = connection.query_row(
-        "SELECT generation, revision, symbol_count, proof_count
-         FROM metadata WHERE singleton = 1",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        },
-    ) else {
+    let Ok((meta_generation, revision, contract_json, symbol_count, proof_count)) =
+        connection.query_row(
+            "SELECT generation, revision, contract_json, symbol_count, proof_count
+             FROM metadata WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+    else {
         return false;
     };
-    if revision != expected_revision || symbol_count <= 0 || proof_count < 0 {
+    if revision != expected_revision || symbol_count <= 0 || proof_count <= 0 {
+        return false;
+    }
+    let Ok(contract) = serde_json::from_str::<ScipProofAdapterContract>(&contract_json) else {
+        return false;
+    };
+    if !contract.is_fresh_for(expected_revision) {
         return false;
     }
     let Ok((observed_symbols, observed_proofs)) = (match schema {
@@ -2939,6 +2948,49 @@ mod tests {
         let _ = std::fs::remove_file(project_dir.join(SCIP_STUB_MARKER_FILE));
 
         let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        crate::copy_on_write::make_file_owner_writable(&component_path)
+            .expect("make component writable for zero-proof tamper");
+        let connection =
+            Connection::open(sqlite_open_path(&component_path)).expect("open component");
+        connection
+            .execute(
+                "UPDATE metadata SET proof_count = 0 WHERE singleton = 1",
+                [],
+            )
+            .expect("clear proof_count");
+        connection
+            .execute("DELETE FROM proof_records", [])
+            .expect("delete proof rows");
+        drop(connection);
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "zero proofs must refuse graph health"
+        );
+
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(()))
+            .expect("republish after zero-proof tamper");
+        crate::copy_on_write::make_file_owner_writable(&component_path)
+            .expect("make component writable for contract tamper");
+        let connection =
+            Connection::open(sqlite_open_path(&component_path)).expect("open component");
+        let mut stale_contract = ScipProofAdapterContract::graph_projection(&index.revision);
+        stale_contract.freshness = "stale".into();
+        let stale_json =
+            serde_json::to_string(&stale_contract).expect("serialize stale contract");
+        connection
+            .execute(
+                "UPDATE metadata SET contract_json = ?1 WHERE singleton = 1",
+                [stale_json],
+            )
+            .expect("break contract freshness");
+        drop(connection);
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "stale contract_json must refuse graph health"
+        );
+
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(()))
+            .expect("republish after contract tamper");
         crate::copy_on_write::make_file_owner_writable(&component_path)
             .expect("make component writable for cardinality tamper");
         let connection =

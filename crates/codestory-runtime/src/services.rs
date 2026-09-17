@@ -741,6 +741,10 @@ impl ActivationService {
     /// Return the ready-lease source snapshot when its observer epoch is still
     /// coherent, so the first public operation after activation need not pay a
     /// cold content scan that validation deliberately skipped via observer receipt.
+    ///
+    /// Coherence matches [`Self::ready_lease_evidence`]: a missing observer is
+    /// `unproven` and must fall through to a content scan. Only an explicit
+    /// `Some(recorded)` epoch that still equals the armed observer is coherent.
     fn admitted_source_freshness_if_observer_coherent(
         &self,
         project_root: &Path,
@@ -767,7 +771,13 @@ impl ActivationService {
         if !lease.source.is_admissible_snapshot() {
             return None;
         }
-        if !self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref()) {
+        let recorded = lease.source_observer.as_ref()?;
+        if self
+            .controller
+            .observed_source_epoch_if_armed(project_root)
+            .as_ref()
+            != Some(recorded)
+        {
             return None;
         }
         Some(IndexFreshnessDto {
@@ -5344,6 +5354,85 @@ pub(crate) mod activation_tests {
                 .probe_ready_lease(&fixture.storage_path, &unobservable)
                 .admissible,
             "a host the observer cannot watch keeps exactly the EV-7 answer it had before"
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_falls_through_when_observer_is_unproven() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut unproven = fixture.lease.clone();
+            unproven.source_observer = None;
+            state.ready_lease = Some(unproven);
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "None observer is unproven and must fall through to a content scan"
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_reuses_when_observer_epoch_is_coherent() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let reused = service
+            .admitted_source_freshness_if_observer_coherent(
+                fixture.project.path(),
+                &fixture.storage_path,
+            )
+            .expect("coherent Some observer must reuse the ready-lease snapshot");
+        assert_eq!(reused.status, fixture.lease.source.status);
+        assert_eq!(
+            reused.indexed_file_count,
+            fixture.lease.source.indexed_file_count
+        );
+        assert_eq!(
+            reused.not_checked_cause,
+            fixture.lease.source.not_checked_cause
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_falls_through_when_observer_epoch_is_stale() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut stale = fixture.lease.clone();
+            let recorded = stale
+                .source_observer
+                .as_ref()
+                .expect("fixture lease records an observer");
+            stale.source_observer = Some(ObservedSourceEpoch {
+                session_id: recorded.session_id.clone(),
+                backend: recorded.backend,
+                epoch: recorded.epoch.wrapping_add(1),
+            });
+            state.ready_lease = Some(stale);
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "stale Some observer must fall through to a content scan"
         );
     }
 
