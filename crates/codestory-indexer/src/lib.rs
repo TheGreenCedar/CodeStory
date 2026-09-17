@@ -9353,6 +9353,10 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
     // Keep SQLite variable bindings well under the default limit while still
     // batching enough ids to avoid per-row commits on large repositories.
     const ID_CHUNK: usize = 400;
+    // One binding per bare name (reused across exact / `.` / `::` predicates on
+    // serialized_name and qualified_name) plus six fixed kind/prefix params —
+    // stay under SQLite's default 999-variable limit.
+    const NAME_CHUNK: usize = 120;
 
     let conn = storage.get_connection();
     let mut pending = Vec::new();
@@ -9387,10 +9391,11 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
         return Ok(());
     }
 
-    // Declaration candidates by bare name (the last segment of the qualified
-    // name, so nested types match too). Only load names referenced by pending
-    // edges — a full node scan here was a major @20 dwell on multi-language
-    // cores (hundreds of thousands of non-declaration rows).
+    // Declaration candidates by bare name (short_member_name of serialized or
+    // qualified identity, so owner-qualified nested types like Outer.Inner
+    // still match a pending bare `Inner`). Only load names referenced by
+    // pending edges — a full node scan here was a major @20 dwell on
+    // multi-language cores.
     let mut needed_names: HashSet<String> = HashSet::new();
     for (_, _, _, canonical_id) in &pending {
         let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
@@ -9407,21 +9412,8 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
     let mut declarations_by_name: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     if !needed_names.is_empty() {
         let names: Vec<String> = needed_names.into_iter().collect();
-        for chunk in names.chunks(ID_CHUNK) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let ref_idx = chunk.len() + 5;
-            let pending_idx = chunk.len() + 6;
-            let sql = format!(
-                "SELECT id, qualified_name, serialized_name FROM node
-                 WHERE kind IN (?1, ?2, ?3, ?4)
-                   AND serialized_name IN ({placeholders})
-                   AND qualified_name LIKE '%.%'
-                   AND (canonical_id IS NULL
-                        OR (canonical_id NOT LIKE ?{ref_idx}
-                            AND canonical_id NOT LIKE ?{pending_idx}))"
-            );
+        for chunk in names.chunks(NAME_CHUNK) {
+            let mut name_predicates = Vec::with_capacity(chunk.len());
             let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 6);
             params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::CLASS as i32,
@@ -9435,15 +9427,38 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::ENUM as i32,
             )));
-            for name in chunk {
+            for (offset, name) in chunk.iter().enumerate() {
+                // Reuse one bound value per bare name across exact / `.` /
+                // `::` matches on both serialized_name and qualified_name.
+                let base = offset + 5;
+                name_predicates.push(format!(
+                    "(serialized_name = ?{base}
+                      OR serialized_name LIKE '%.' || ?{base}
+                      OR serialized_name LIKE '%::' || ?{base}
+                      OR qualified_name = ?{base}
+                      OR qualified_name LIKE '%.' || ?{base}
+                      OR qualified_name LIKE '%::' || ?{base})"
+                ));
                 params.push(rusqlite::types::Value::Text(name.clone()));
             }
+            let ref_idx = chunk.len() + 5;
+            let pending_idx = ref_idx + 1;
             params.push(rusqlite::types::Value::Text(format!(
                 "{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"
             )));
             params.push(rusqlite::types::Value::Text(format!(
                 "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"
             )));
+            let sql = format!(
+                "SELECT id, qualified_name, serialized_name FROM node
+                 WHERE kind IN (?1, ?2, ?3, ?4)
+                   AND (qualified_name LIKE '%.%' OR qualified_name LIKE '%::%')
+                   AND ({})
+                   AND (canonical_id IS NULL
+                        OR (canonical_id NOT LIKE ?{ref_idx}
+                            AND canonical_id NOT LIKE ?{pending_idx}))",
+                name_predicates.join(" OR "),
+            );
             let mut statement = conn.prepare(&sql)?;
             let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
                 Ok((
@@ -9455,15 +9470,21 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             for row in rows {
                 let (id, qualified, serialized) = row?;
                 let Some(qualified) = qualified else { continue };
-                // Prefer the qualified bare name so nested types match the
-                // original finalize keying (last segment), falling back to
-                // serialized_name when needed.
-                let name = qualified
-                    .rsplit('.')
-                    .next()
-                    .map(str::to_string)
-                    .or(serialized);
-                let Some(name) = name else { continue };
+                // Key by short_member_name so Outer.Inner / Outer::Inner land
+                // under the same bare pending target the edge carried.
+                let name = short_member_name(&qualified).to_string();
+                let name = if name.is_empty() {
+                    serialized
+                        .as_deref()
+                        .map(short_member_name)
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    name
+                };
+                if name.is_empty() {
+                    continue;
+                }
                 declarations_by_name
                     .entry(name)
                     .or_default()

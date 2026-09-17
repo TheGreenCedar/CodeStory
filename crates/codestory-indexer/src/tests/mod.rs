@@ -7947,3 +7947,78 @@ fn type_usage_finalize_cleans_orphans_without_scanning_all_nodes() -> Result<()>
     assert_eq!(unresolved_type_usage, 0);
     Ok(())
 }
+
+#[test]
+fn type_usage_finalize_resolves_owner_qualified_nested_type_by_bare_name() -> Result<()> {
+    // Challenge counterexample: declaration serialized_name is `Outer.Inner`
+    // while the pending bare target is `Inner`. Exact `serialized_name IN`
+    // miss-closed; short_member_name / `.`/`::` suffix matching must resolve.
+    let mut storage = Storage::new_in_memory()?;
+
+    let declaration_id = NodeId(1);
+    let source_id = NodeId(2);
+    let pending_id = NodeId(3);
+    storage.insert_nodes_batch(&[
+        Node {
+            id: declaration_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Outer.Inner".to_string(),
+            qualified_name: Some("Acme.App.Outer.Inner".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: source_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Owner".to_string(),
+            qualified_name: Some("Acme.App.Owner".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: pending_id,
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "Inner".to_string(),
+            canonical_id: Some(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Inner"
+            )),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(10),
+        source: source_id,
+        target: pending_id,
+        kind: EdgeKind::TYPE_USAGE,
+        ..Default::default()
+    }])?;
+
+    finalize_pending_type_usage_edges(&mut storage)?;
+
+    let conn = storage.get_connection();
+    let resolved_target: Option<i64> = conn.query_row(
+        "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+        rusqlite::params![10i64],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        resolved_target,
+        Some(declaration_id.0),
+        "bare pending Inner must resolve to owner-qualified Outer.Inner"
+    );
+    let certainty: String = conn.query_row(
+        "SELECT certainty FROM edge WHERE id = ?1",
+        rusqlite::params![10i64],
+        |row| row.get(0),
+    )?;
+    assert_eq!(certainty, "certain");
+
+    let pending_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node WHERE id = ?1",
+        rusqlite::params![pending_id.0],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        pending_nodes, 1,
+        "resolved pending reference node must remain while the edge targets it"
+    );
+    Ok(())
+}
