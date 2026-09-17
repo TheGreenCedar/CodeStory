@@ -5776,6 +5776,10 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
     ["shortened producer timeout", job => {
       job["timeout-minutes"] = 30;
     }],
+    ["rolling retrieval Rust toolchain", job => {
+      const step = draftStep(job, "Install Rust stable");
+      step.run = step.run.replaceAll("1.97.1", "stable");
+    }],
     ["incompatible retrieval path", job => {
       draftStep(job, "Restore Cargo registry, git sources, and build output").with.path = "~/.cargo/registry\ntarget/retrieval\n";
     }],
