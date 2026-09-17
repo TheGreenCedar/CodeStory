@@ -2181,16 +2181,14 @@ fn search_lexical_index_on_connection(
         symbol_candidates,
     ]));
     if payload == LexicalHitPayload::DescriptorOnly {
-        // Do not re-query FTS per token×rowid. On Keycloak-class shards that
-        // burned ~7–9s after Ready (12 tokens × 256 rowids) and left too little
-        // of the frozen prep budget for the first packet. Path/symbol matching
-        // is in-memory; FTS-lane hits already survived the descriptor query.
-        populate_descriptor_token_matches_without_fts_requery(
-            &mut candidates,
-            &tokens,
-            &best_sublane_ranks,
-            required_match_count,
-        );
+        // DescriptorOnly never loads document bodies, so content-token
+        // membership cannot be proven here. Coverage is path/symbol only:
+        // the two-of-three / ~40% gate still runs, but only over tokens those
+        // fields establish. Do not invent tokens for FTS-lane survivors — a
+        // one-token OR hit must not clear a multi-token gate. Avoiding the
+        // old per-token×rowid FTS re-query also keeps Keycloak-class first
+        // packets inside the remaining prep budget after Ready.
+        populate_descriptor_token_matches_from_path_and_symbol(&mut candidates, &tokens);
     }
 
     let mut hits = Vec::new();
@@ -2583,21 +2581,19 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
-/// Derive descriptor coverage without a second FTS pass over the shard.
+/// Prove descriptor token coverage from path and symbol names only.
 ///
-/// The packet path must rank candidates before admission without selecting
-/// either stored copy of the source body. Path and symbol names are already on
-/// the candidate; FTS-lane hits already matched the descriptor query, so credit
-/// enough query tokens to clear coverage instead of re-running
-/// `MATCH … AND rowid IN (…)` once per token.
-fn populate_descriptor_token_matches_without_fts_requery(
+/// DescriptorOnly must not select stored document bodies, so it cannot claim
+/// content-token membership. Matched tokens are written into
+/// `normalized_content` solely so [`lexical_token_match`] can see symbol hits
+/// (path hits are also counted via `normalized_path`). The existing
+/// `required_match_count` gate stays fail-closed: FTS-lane survival alone does
+/// not clear two-of-three / ~40% coverage.
+fn populate_descriptor_token_matches_from_path_and_symbol(
     candidates: &mut [LexicalCandidate],
     tokens: &[String],
-    sublane_ranks: &HashMap<LexicalCandidateIdentity, LexicalSublaneRanks>,
-    required_match_count: usize,
 ) {
     for candidate in candidates {
-        let identity = lexical_candidate_identity(&candidate.document);
         let path = candidate.normalized_path.to_ascii_lowercase();
         let symbol = candidate
             .document
@@ -2609,22 +2605,6 @@ fn populate_descriptor_token_matches_without_fts_requery(
         for token in tokens {
             if path.contains(token.as_str()) || symbol.contains(token.as_str()) {
                 matched.push(token.as_str());
-            }
-        }
-        let ranks = sublane_ranks.get(&identity).copied().unwrap_or_default();
-        let fts_lane_hit = ranks.exact.is_some()
-            || ranks.path.is_some()
-            || ranks.content.is_some()
-            || ranks.symbol_document.is_some();
-        if matched.len() < required_match_count && fts_lane_hit {
-            for token in tokens {
-                if matched.contains(&token.as_str()) {
-                    continue;
-                }
-                matched.push(token.as_str());
-                if matched.len() >= required_match_count {
-                    break;
-                }
             }
         }
         candidate.normalized_content = matched.join(" ");
@@ -5568,38 +5548,76 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_token_coverage_does_not_requery_fts_per_token() {
+    fn descriptor_path_symbol_multi_token_admits_without_fts_requery() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
         std::fs::write(
-            project.path().join("src/auth_handler.rs"),
-            "fn authenticate_user() { realm_session(); }",
+            project.path().join("src/alpha_beta_handler.rs"),
+            "fn alpha_beta_handler() { unrelated_body_only(); }",
         )
-        .expect("write fixture");
+        .expect("write path/symbol multi-token fixture");
         let data = TempDir::new().expect("data");
         let shard = build(
             project.path(),
             data.path(),
-            "descriptor-no-fts-requery",
+            "descriptor-path-symbol-admit",
             "input",
         );
         let started = std::time::Instant::now();
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
-            "authenticate realm session user token protocol mapper",
+            "alpha beta gamma",
             64,
             || false,
         )
         .expect("descriptor search");
         let elapsed = started.elapsed();
         assert!(
-            !descriptors.is_empty(),
-            "path/symbol coverage must still admit FTS-lane descriptor hits"
+            descriptors.iter().any(|hit| {
+                hit.path.contains("alpha_beta_handler")
+                    || hit.symbol_name.as_deref() == Some("alpha_beta_handler")
+            }),
+            "path/symbol must honestly clear the two-of-three gate for alpha+beta: {descriptors:?}"
         );
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "descriptor token coverage must stay in-memory after the FTS lanes; elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_one_token_or_survivor_does_not_clear_multi_token_coverage() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        // Content FTS can still retrieve this on "alpha", but path/symbol prove
+        // none of the query tokens — fail-closed coverage must refuse admit.
+        std::fs::write(
+            project.path().join("src/lonely_fixture.rs"),
+            "fn lonely_fixture() { let _ = \"alpha only in body text\"; }",
+        )
+        .expect("write one-token content survivor");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-anti-fail-open",
+            "input",
+        );
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "alpha beta gamma",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        assert!(
+            descriptors.iter().all(|hit| {
+                !hit.path.contains("lonely_fixture")
+                    && hit.symbol_name.as_deref() != Some("lonely_fixture")
+            }),
+            "a one-token OR FTS survivor must not invent beta/gamma to clear coverage: {descriptors:?}"
         );
     }
 
