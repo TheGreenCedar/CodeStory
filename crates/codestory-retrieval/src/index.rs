@@ -5473,11 +5473,11 @@ mod tests {
             &*phases.borrow(),
             &[
                 "lexical sidecar",
-                "embedded vectors",
                 "graph artifact",
+                "embedded vectors",
                 "manifest write",
             ],
-            "missing predecessor admission must run every deterministic component and reach the existing commit fence"
+            "concurrent finalize announces lexical+graph before embed work, then reaches the existing commit fence"
         );
         assert!(
             rendered.contains(
@@ -7504,10 +7504,11 @@ mod tests {
     ///
     /// The reuse branch returns before the first phase, so an empty phase list
     /// *is* the reuse decision as the product renders it: no lexical, semantic,
-    /// or graph work was scheduled. Every rebuild announces `lexical sidecar`
-    /// first. Both passes stop at the publication fence in this environment —
-    /// there is no per-user embedding server — which is downstream of the
-    /// decision under test and identical for both legs.
+    /// or graph work was scheduled. Rebuilds announce `lexical sidecar` first,
+    /// then `graph artifact` alongside embed work under concurrent finalize.
+    /// Both passes stop at the publication fence in this environment — there is
+    /// no per-user embedding server — which is downstream of the decision under
+    /// test and identical for both legs.
     #[cfg(feature = "test-support")]
     fn finalize_phases(fixture: &PublishedGeneration) -> (Vec<&'static str>, String) {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
