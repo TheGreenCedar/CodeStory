@@ -50,6 +50,10 @@ const LEGACY_STUB_MARKER: &str = ".zoekt-stub";
 /// Product scans use the active cap recorded with that publication.
 pub(crate) const MAX_FILE_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 const MAX_CANDIDATES: usize = 4_096;
+/// Upper bound on per-lane FTS rows for packet descriptor lexical search.
+/// Full retrieval keeps [`MAX_CANDIDATES`]; descriptors only need a modest
+/// pool before the ≤16-identity admission seal.
+const DESCRIPTOR_MAX_CANDIDATES: usize = 256;
 const COVERAGE_PATH_SAMPLE: usize = 32;
 
 /// How many published lexical generations may hold a sealed health receipt at
@@ -1935,7 +1939,10 @@ fn search_lexical_component_set(
     }
 
     let logical_count = component_set.file_count as usize;
-    let component_limit = MAX_CANDIDATES;
+    let component_limit = match payload {
+        LexicalHitPayload::DescriptorOnly => lexical_candidate_limit(limit, payload),
+        LexicalHitPayload::Full => MAX_CANDIDATES,
+    };
     let base_hits = search_lexical_component(
         shard_dir,
         &component_set.base,
@@ -2044,6 +2051,18 @@ fn lexical_hit_identity(hit: &LexicalHit) -> LexicalCandidateIdentity {
     )
 }
 
+fn lexical_candidate_limit(limit: usize, payload: LexicalHitPayload) -> usize {
+    match payload {
+        LexicalHitPayload::DescriptorOnly => {
+            // Avoid the full-path `limit * 64` expansion: descriptor callers may
+            // still pass the ordinary fusion window, but packet admission only
+            // seals a tiny identity set.
+            limit.saturating_mul(4).clamp(64, DESCRIPTOR_MAX_CANDIDATES)
+        }
+        LexicalHitPayload::Full => limit.saturating_mul(64).clamp(256, MAX_CANDIDATES),
+    }
+}
+
 fn search_lexical_index_on_connection(
     connection: &Connection,
     query: &str,
@@ -2068,7 +2087,7 @@ fn search_lexical_index_on_connection(
         .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let candidate_limit = limit.saturating_mul(64).clamp(256, MAX_CANDIDATES);
+    let candidate_limit = lexical_candidate_limit(limit, payload);
 
     let mandatory_tokens = quoted_query_tokens(query);
     let mut token_frequencies = Vec::with_capacity(tokens.len());
@@ -5516,6 +5535,60 @@ mod tests {
             .is_err(),
             "the hostile stored body must fail if a query tries to materialize it"
         );
+    }
+
+    #[test]
+    fn descriptor_lexical_candidate_limit_stays_below_full_fusion_pool() {
+        assert!(DESCRIPTOR_MAX_CANDIDATES < MAX_CANDIDATES);
+        assert_eq!(
+            lexical_candidate_limit(MAX_CANDIDATES, LexicalHitPayload::DescriptorOnly),
+            DESCRIPTOR_MAX_CANDIDATES,
+            "descriptor search must not expand the ordinary fusion window into a full FTS scan"
+        );
+        assert_eq!(
+            lexical_candidate_limit(MAX_CANDIDATES, LexicalHitPayload::Full),
+            MAX_CANDIDATES
+        );
+        assert_eq!(
+            lexical_candidate_limit(1, LexicalHitPayload::DescriptorOnly),
+            64
+        );
+    }
+
+    #[test]
+    fn descriptor_search_caps_hits_even_when_callers_pass_full_fusion_window() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        for index in 0..320 {
+            std::fs::write(
+                project
+                    .path()
+                    .join(format!("src/common_token_fixture_{index}.rs")),
+                format!("fn common_token_fixture_{index}() {{ common_token(); }}"),
+            )
+            .expect("write fixture source");
+        }
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "descriptor-bound", "input");
+
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "common_token",
+            MAX_CANDIDATES,
+            || false,
+        )
+        .expect("descriptor search with hostile full-window limit");
+        assert!(
+            descriptors.len() <= DESCRIPTOR_MAX_CANDIDATES,
+            "descriptor hits={} must stay within the bounded FTS pool",
+            descriptors.len()
+        );
+        assert!(
+            !descriptors.is_empty(),
+            "bounded descriptor search must still return matching identities"
+        );
+        assert!(descriptors.iter().all(|hit| hit.source_excerpt.is_none()));
     }
 
     #[test]

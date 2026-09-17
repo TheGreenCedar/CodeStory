@@ -270,6 +270,13 @@ impl<'a> QueryExecutor<'a> {
                     RetrievalStageKind::Stage0ScipAnchor | RetrievalStageKind::Stage2ScipExpand
                 )
             });
+            for stage in &mut plan.stages {
+                if stage.kind == RetrievalStageKind::Stage1Lexical {
+                    stage.top_k = stage
+                        .top_k
+                        .min(crate::planner::DESCRIPTOR_LEXICAL_FUSION_WINDOW);
+                }
+            }
         }
         if !include_dense_semantic {
             debug_assert!(payload.is_descriptor());
@@ -1513,6 +1520,92 @@ mod tests {
                 .stages
                 .iter()
                 .all(|stage| { stage.stage != RetrievalStageKind::Stage1bSemantic })
+        );
+    }
+
+    #[test]
+    fn packet_descriptor_lexical_stage_uses_bounded_fusion_window() {
+        struct LimitProbe {
+            lexical_limits: Mutex<Vec<usize>>,
+        }
+
+        impl SidecarSearch for LimitProbe {
+            fn lexical_search(&self, _query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+                self.lexical_limits.lock().expect("limits").push(limit);
+                Ok(vec![CandidateHit::with_source(
+                    "src/bounded.rs",
+                    Some("BoundedDescriptor".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                )])
+            }
+
+            fn lexical_descriptor_search_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                self.lexical_search_with_context(query, limit, context)
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let probe = Arc::new(LimitProbe {
+            lexical_limits: Mutex::new(Vec::new()),
+        });
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::clone(&probe) as Arc<dyn SidecarSearch>,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor
+            .execute_packet_descriptors(
+                "explain how bounded descriptor lexical fusion should stay cheap",
+                Some(18_000),
+            )
+            .expect("descriptor query");
+
+        let limits = probe.lexical_limits.lock().expect("limits");
+        assert_eq!(
+            limits.as_slice(),
+            &[crate::planner::DESCRIPTOR_LEXICAL_FUSION_WINDOW],
+            "descriptor lexical must clamp the fusion window even under a full packet budget"
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/bounded.rs")
+        );
+        assert!(
+            result
+                .trace
+                .stages
+                .iter()
+                .any(|stage| stage.stage == RetrievalStageKind::Stage1Lexical),
+            "descriptor path must still run the lexical stage: {:?}",
+            result.trace.stages
         );
     }
 
