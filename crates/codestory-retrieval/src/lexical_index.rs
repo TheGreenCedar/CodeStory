@@ -13,7 +13,6 @@ use codestory_workspace::paths::sqlite_open_path;
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use rusqlite::limits::Limit;
-use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2182,7 +2181,17 @@ fn search_lexical_index_on_connection(
         symbol_candidates,
     ]));
     if payload == LexicalHitPayload::DescriptorOnly {
-        populate_descriptor_token_matches(connection, &mut candidates, &tokens)?;
+        // Keep the two-of-three / ~40% gate fail-closed: never invent tokens
+        // for FTS-lane survivors, and never re-run per-token MATCH×rowid
+        // (Keycloak-class cost). Path/symbol are proven in memory; content
+        // tokens that still matter are proven by one batched FTS-body read
+        // for under-covered survivors only.
+        populate_descriptor_token_matches_fail_closed(
+            connection,
+            &mut candidates,
+            &tokens,
+            required_match_count,
+        )?;
     }
 
     let mut hits = Vec::new();
@@ -2276,6 +2285,9 @@ enum LexicalCandidateOrder {
 
 #[derive(Debug, Clone)]
 struct LexicalCandidate {
+    /// Retained for Full-path / debug identity; descriptor coverage no longer
+    /// re-queries FTS by rowid after the lane MATCH.
+    #[allow(dead_code)]
     row_id: i64,
     document: LexicalDocument,
     normalized_path: String,
@@ -2572,46 +2584,89 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
-/// Derive descriptor coverage from FTS row membership only. The packet path
-/// must rank candidates before admission without selecting either stored copy
-/// of the source body (`lexical_documents.content` or `lexical_fts.content`).
-fn populate_descriptor_token_matches(
+/// Prove descriptor token coverage without fail-open FTS-lane credit.
+///
+/// 1. Path and symbol names are matched in memory.
+/// 2. Survivors still below [`required_lexical_match_count`] get one batched
+///    `lexical_fts` body read; membership is substring-proven per token.
+/// 3. Matched tokens (not bodies) are written into `normalized_content` so
+///    [`lexical_token_match`] can count symbol and content hits.
+///
+/// This intentionally replaces the old per-token `MATCH … AND rowid IN (…)`
+/// loop. FTS-lane survival alone never clears the gate.
+fn populate_descriptor_token_matches_fail_closed(
     connection: &Connection,
     candidates: &mut [LexicalCandidate],
     tokens: &[String],
+    required_match_count: usize,
 ) -> Result<()> {
     const ROW_ID_CHUNK: usize = 500;
 
-    let mut row_ids = candidates
+    let mut matched_by_row = HashMap::<i64, Vec<&str>>::with_capacity(candidates.len());
+    for candidate in candidates.iter() {
+        let path = candidate.normalized_path.to_ascii_lowercase();
+        let symbol = candidate
+            .document
+            .symbol_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut matched = Vec::new();
+        for token in tokens {
+            if path.contains(token.as_str()) || symbol.contains(token.as_str()) {
+                matched.push(token.as_str());
+            }
+        }
+        matched_by_row.insert(candidate.row_id, matched);
+    }
+
+    let mut needs_content = candidates
         .iter()
+        .filter(|candidate| {
+            matched_by_row
+                .get(&candidate.row_id)
+                .map(|matched| matched.len() < required_match_count)
+                .unwrap_or(true)
+        })
         .map(|candidate| candidate.row_id)
         .collect::<Vec<_>>();
-    row_ids.sort_unstable();
-    row_ids.dedup();
-    let mut matches = HashMap::<i64, Vec<&str>>::new();
-    for token in tokens {
-        let token_query = format!("\"{}\"*", token.replace('"', "\"\""));
-        for chunk in row_ids.chunks(ROW_ID_CHUNK) {
-            let placeholders = (0..chunk.len())
-                .map(|index| format!("?{}", index + 2))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT rowid FROM lexical_fts
-                 WHERE lexical_fts MATCH ?1 AND rowid IN ({placeholders})"
-            );
-            let mut values = Vec::with_capacity(chunk.len() + 1);
-            values.push(SqlValue::Text(token_query.clone()));
-            values.extend(chunk.iter().copied().map(SqlValue::Integer));
-            let mut statement = connection.prepare_cached(&sql)?;
-            let rows = statement.query_map(params_from_iter(values), |row| row.get::<_, i64>(0))?;
-            for row_id in rows {
-                matches.entry(row_id?).or_default().push(token);
+    needs_content.sort_unstable();
+    needs_content.dedup();
+
+    for chunk in needs_content.chunks(ROW_ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT rowid, lower(content) FROM lexical_fts WHERE rowid IN ({placeholders})"
+        );
+        let mut statement = connection.prepare_cached(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter().copied()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, content) = row?;
+            let matched = matched_by_row.entry(row_id).or_default();
+            for token in tokens {
+                if matched.len() >= required_match_count {
+                    break;
+                }
+                if matched.contains(&token.as_str()) {
+                    continue;
+                }
+                if content.contains(token.as_str()) {
+                    matched.push(token.as_str());
+                }
             }
         }
     }
+
     for candidate in candidates {
-        candidate.normalized_content = matches
+        candidate.normalized_content = matched_by_row
             .remove(&candidate.row_id)
             .unwrap_or_default()
             .join(" ");
@@ -5552,6 +5607,109 @@ mod tests {
         assert_eq!(
             lexical_candidate_limit(1, LexicalHitPayload::DescriptorOnly),
             64
+        );
+    }
+
+    #[test]
+    fn descriptor_path_symbol_multi_token_admits_without_fts_requery() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/alpha_beta_handler.rs"),
+            "fn alpha_beta_handler() { unrelated_body_only(); }",
+        )
+        .expect("write path/symbol multi-token fixture");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-path-symbol-admit",
+            "input",
+        );
+        let started = std::time::Instant::now();
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "alpha beta gamma",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        let elapsed = started.elapsed();
+        assert!(
+            descriptors.iter().any(|hit| {
+                hit.path.contains("alpha_beta_handler")
+                    || hit.symbol_name.as_deref() == Some("alpha_beta_handler")
+            }),
+            "path/symbol must honestly clear the two-of-three gate for alpha+beta: {descriptors:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "descriptor token coverage must not re-query FTS per token; elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_content_multi_token_admits_via_batched_body_proof() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("LICENSE"),
+            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
+        )
+        .expect("write content-only multi-token artifact");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-content-batched-proof",
+            "input",
+        );
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "Which role is assumed by the control plane, and which is used by worker nodes?",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        assert!(
+            descriptors.iter().any(|hit| hit.path == "LICENSE"),
+            "honest batched content proof must admit LICENSE without path/symbol tokens: {descriptors:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_one_token_or_survivor_does_not_clear_multi_token_coverage() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        // Content FTS can still retrieve this on "alpha", but only one query
+        // token is honestly present — fail-closed coverage must refuse admit.
+        std::fs::write(
+            project.path().join("src/lonely_fixture.rs"),
+            "fn lonely_fixture() { let _ = \"alpha only in body text\"; }",
+        )
+        .expect("write one-token content survivor");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-anti-fail-open",
+            "input",
+        );
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "alpha beta gamma",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        assert!(
+            descriptors.iter().all(|hit| {
+                !hit.path.contains("lonely_fixture")
+                    && hit.symbol_name.as_deref() != Some("lonely_fixture")
+            }),
+            "a one-token OR FTS survivor must not invent beta/gamma to clear coverage: {descriptors:?}"
         );
     }
 

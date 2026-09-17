@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Packet descriptor lexical coverage keeps the two-of-three / ~40% gate
+fail-closed: path and symbol tokens are matched in memory, and any remaining
+content tokens are proven by one batched FTS-body read for under-covered
+survivors only—never by inventing tokens for an OR-lane hit or by re-running
+per-token `MATCH … AND rowid IN (…)` queries that burned Keycloak-class
+first-packet budget after `validation@90`.
+
 Activation validation proves SCIP graph readiness from the sealed component
 envelope (marker, revision, non-empty symbols and proofs, and a fresh proof
 adapter contract) instead of loading the full query view, and the first packet
