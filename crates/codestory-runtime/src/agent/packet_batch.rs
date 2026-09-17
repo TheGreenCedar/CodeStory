@@ -172,6 +172,7 @@ fn update_packet_operation_observation(update: impl FnOnce(&mut PacketEntryObser
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_packet_descriptor_preadmission(
     query_count: u64,
     health_resolution_wall_ms: u64,
