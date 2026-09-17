@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-Packet descriptor lexical coverage proves query tokens from path and symbol
-names in memory without a second per-token FTS pass or inventing unmatched
-tokens for FTS-lane survivors, so Keycloak-class first packets after
-`validation@90` keep the two-of-three / ~40% gate fail-closed while staying
-inside the remaining frozen preparation budget.
+Packet descriptor lexical coverage keeps the two-of-three / ~40% gate
+fail-closed: path and symbol tokens are matched in memory, and any remaining
+content tokens are proven by one batched FTS-body read for under-covered
+survivors only—never by inventing tokens for an OR-lane hit or by re-running
+per-token `MATCH … AND rowid IN (…)` queries that burned Keycloak-class
+first-packet budget after `validation@90`.
 
 Activation validation proves SCIP graph readiness from the sealed component
 envelope (marker, revision, non-empty symbols and proofs, and a fresh proof

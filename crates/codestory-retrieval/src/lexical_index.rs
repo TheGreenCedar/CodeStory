@@ -13,7 +13,7 @@ use codestory_workspace::paths::sqlite_open_path;
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2181,14 +2181,17 @@ fn search_lexical_index_on_connection(
         symbol_candidates,
     ]));
     if payload == LexicalHitPayload::DescriptorOnly {
-        // DescriptorOnly never loads document bodies, so content-token
-        // membership cannot be proven here. Coverage is path/symbol only:
-        // the two-of-three / ~40% gate still runs, but only over tokens those
-        // fields establish. Do not invent tokens for FTS-lane survivors — a
-        // one-token OR hit must not clear a multi-token gate. Avoiding the
-        // old per-token×rowid FTS re-query also keeps Keycloak-class first
-        // packets inside the remaining prep budget after Ready.
-        populate_descriptor_token_matches_from_path_and_symbol(&mut candidates, &tokens);
+        // Keep the two-of-three / ~40% gate fail-closed: never invent tokens
+        // for FTS-lane survivors, and never re-run per-token MATCH×rowid
+        // (Keycloak-class cost). Path/symbol are proven in memory; content
+        // tokens that still matter are proven by one batched FTS-body read
+        // for under-covered survivors only.
+        populate_descriptor_token_matches_fail_closed(
+            connection,
+            &mut candidates,
+            &tokens,
+            required_match_count,
+        )?;
     }
 
     let mut hits = Vec::new();
@@ -2581,19 +2584,26 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
-/// Prove descriptor token coverage from path and symbol names only.
+/// Prove descriptor token coverage without fail-open FTS-lane credit.
 ///
-/// DescriptorOnly must not select stored document bodies, so it cannot claim
-/// content-token membership. Matched tokens are written into
-/// `normalized_content` solely so [`lexical_token_match`] can see symbol hits
-/// (path hits are also counted via `normalized_path`). The existing
-/// `required_match_count` gate stays fail-closed: FTS-lane survival alone does
-/// not clear two-of-three / ~40% coverage.
-fn populate_descriptor_token_matches_from_path_and_symbol(
+/// 1. Path and symbol names are matched in memory.
+/// 2. Survivors still below [`required_lexical_match_count`] get one batched
+///    `lexical_fts` body read; membership is substring-proven per token.
+/// 3. Matched tokens (not bodies) are written into `normalized_content` so
+///    [`lexical_token_match`] can count symbol and content hits.
+///
+/// This intentionally replaces the old per-token `MATCH … AND rowid IN (…)`
+/// loop. FTS-lane survival alone never clears the gate.
+fn populate_descriptor_token_matches_fail_closed(
+    connection: &Connection,
     candidates: &mut [LexicalCandidate],
     tokens: &[String],
-) {
-    for candidate in candidates {
+    required_match_count: usize,
+) -> Result<()> {
+    const ROW_ID_CHUNK: usize = 500;
+
+    let mut matched_by_row = HashMap::<i64, Vec<&str>>::with_capacity(candidates.len());
+    for candidate in candidates.iter() {
         let path = candidate.normalized_path.to_ascii_lowercase();
         let symbol = candidate
             .document
@@ -2607,8 +2617,61 @@ fn populate_descriptor_token_matches_from_path_and_symbol(
                 matched.push(token.as_str());
             }
         }
-        candidate.normalized_content = matched.join(" ");
+        matched_by_row.insert(candidate.row_id, matched);
     }
+
+    let mut needs_content = candidates
+        .iter()
+        .filter(|candidate| {
+            matched_by_row
+                .get(&candidate.row_id)
+                .map(|matched| matched.len() < required_match_count)
+                .unwrap_or(true)
+        })
+        .map(|candidate| candidate.row_id)
+        .collect::<Vec<_>>();
+    needs_content.sort_unstable();
+    needs_content.dedup();
+
+    for chunk in needs_content.chunks(ROW_ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT rowid, lower(content) FROM lexical_fts WHERE rowid IN ({placeholders})"
+        );
+        let mut statement = connection.prepare_cached(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter().copied()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, content) = row?;
+            let matched = matched_by_row.entry(row_id).or_default();
+            for token in tokens {
+                if matched.len() >= required_match_count {
+                    break;
+                }
+                if matched.iter().any(|existing| *existing == token.as_str()) {
+                    continue;
+                }
+                if content.contains(token.as_str()) {
+                    matched.push(token.as_str());
+                }
+            }
+        }
+    }
+
+    for candidate in candidates {
+        candidate.normalized_content = matched_by_row
+            .remove(&candidate.row_id)
+            .unwrap_or_default()
+            .join(" ");
+    }
+    Ok(())
 }
 
 fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
@@ -5582,7 +5645,36 @@ mod tests {
         );
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "descriptor token coverage must stay in-memory after the FTS lanes; elapsed={elapsed:?}"
+            "descriptor token coverage must not re-query FTS per token; elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_content_multi_token_admits_via_batched_body_proof() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("LICENSE"),
+            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
+        )
+        .expect("write content-only multi-token artifact");
+        let data = TempDir::new().expect("data");
+        let shard = build(
+            project.path(),
+            data.path(),
+            "descriptor-content-batched-proof",
+            "input",
+        );
+        let descriptors = search_lexical_index_descriptors_with_cancel(
+            &shard,
+            "input",
+            "Which role is assumed by the control plane, and which is used by worker nodes?",
+            64,
+            || false,
+        )
+        .expect("descriptor search");
+        assert!(
+            descriptors.iter().any(|hit| hit.path == "LICENSE"),
+            "honest batched content proof must admit LICENSE without path/symbol tokens: {descriptors:?}"
         );
     }
 
@@ -5590,8 +5682,8 @@ mod tests {
     fn descriptor_one_token_or_survivor_does_not_clear_multi_token_coverage() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
-        // Content FTS can still retrieve this on "alpha", but path/symbol prove
-        // none of the query tokens — fail-closed coverage must refuse admit.
+        // Content FTS can still retrieve this on "alpha", but only one query
+        // token is honestly present — fail-closed coverage must refuse admit.
         std::fs::write(
             project.path().join("src/lonely_fixture.rs"),
             "fn lonely_fixture() { let _ = \"alpha only in body text\"; }",
