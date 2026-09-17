@@ -1610,6 +1610,81 @@ mod tests {
     }
 
     #[test]
+    fn full_retrieval_lexical_stage_keeps_full_fusion_window() {
+        // Hostile: if DESCRIPTOR_LEXICAL_FUSION_WINDOW clamping leaks out of the
+        // descriptor branch, Full execute() would silently request 64 while
+        // planner + descriptor-only tests stay green.
+        struct LimitProbe {
+            lexical_limits: Mutex<Vec<usize>>,
+        }
+
+        impl SidecarSearch for LimitProbe {
+            fn lexical_search(&self, _query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+                self.lexical_limits.lock().expect("limits").push(limit);
+                Ok(vec![CandidateHit::with_source(
+                    "src/full_fusion.rs",
+                    Some("FullFusion".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                )])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let probe = Arc::new(LimitProbe {
+            lexical_limits: Mutex::new(Vec::new()),
+        });
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::clone(&probe) as Arc<dyn SidecarSearch>,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor
+            .execute(
+                "explain how full retrieval lexical fusion must stay at the ordinary window",
+                Some(18_000),
+            )
+            .expect("full query");
+
+        let limits = probe.lexical_limits.lock().expect("limits");
+        assert_eq!(
+            limits.as_slice(),
+            &[crate::planner::LEXICAL_FUSION_WINDOW],
+            "Full execute() must still request LEXICAL_FUSION_WINDOW (4096), not the descriptor bound"
+        );
+        assert_ne!(
+            crate::planner::LEXICAL_FUSION_WINDOW,
+            crate::planner::DESCRIPTOR_LEXICAL_FUSION_WINDOW
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/full_fusion.rs")
+        );
+    }
+
+    #[test]
     fn executor_caches_only_complete_query_results() {
         let mock = Arc::new(MockSidecarSearch {
             lexical: Mutex::new(HashMap::from([(
