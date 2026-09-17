@@ -1016,6 +1016,8 @@ pub struct IncrementalIndexingStats {
     pub flush_component_access_ms: u64,
     pub flush_callable_projection_ms: u64,
     pub edge_resolution_ms: u64,
+    /// Wall time for post-flush same-root TYPE_USAGE finalize (not resolution).
+    pub type_usage_finalize_ms: u64,
     pub error_flush_ms: u64,
     pub cleanup_ms: u64,
     pub unresolved_calls_start: usize,
@@ -2025,7 +2027,11 @@ impl WorkspaceIndexer {
         // 3.4 Complete the pending same-root TYPE_USAGE channel now that all
         // of the run's declarations are flushed (producer-side, not part of
         // the resolution pipeline; see `finalize_pending_type_usage_edges`).
+        let type_usage_finalize_started = Instant::now();
         finalize_pending_type_usage_edges(storage)?;
+        stats.type_usage_finalize_ms = stats
+            .type_usage_finalize_ms
+            .saturating_add(duration_ms_u64(type_usage_finalize_started.elapsed()));
 
         // 3.5 Resolve call/import edges post-pass
         let (resolution_scope_file_ids, expanded_resolution_scope_files) =
@@ -9344,11 +9350,15 @@ fn append_manual_type_usage_edges(
 /// certainty-gated check and are re-finalized (or removed with their file)
 /// by the next run.
 fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
+    // Keep SQLite variable bindings well under the default limit while still
+    // batching enough ids to avoid per-row commits on large repositories.
+    const ID_CHUNK: usize = 400;
+
     let conn = storage.get_connection();
     let mut pending = Vec::new();
     {
         let mut statement = conn.prepare(
-            "SELECT e.id, e.source_node_id, n.canonical_id
+            "SELECT e.id, e.source_node_id, e.target_node_id, n.canonical_id
              FROM edge e
              JOIN node n ON n.id = e.target_node_id
              WHERE e.kind = ?1
@@ -9364,7 +9374,8 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )?;
@@ -9377,51 +9388,104 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
     }
 
     // Declaration candidates by bare name (the last segment of the qualified
-    // name, so nested types match too).
+    // name, so nested types match too). Only load names referenced by pending
+    // edges — a full node scan here was a major @20 dwell on multi-language
+    // cores (hundreds of thousands of non-declaration rows).
+    let mut needed_names: HashSet<String> = HashSet::new();
+    for (_, _, _, canonical_id) in &pending {
+        let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
+            continue;
+        };
+        let mut parts = suffix.rsplitn(3, ':');
+        if let Some(target_name) = parts.next()
+            && !target_name.is_empty()
+        {
+            needed_names.insert(target_name.to_string());
+        }
+    }
+
     let mut declarations_by_name: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-    {
-        let mut statement = conn.prepare(
-            "SELECT id, qualified_name FROM node
-             WHERE kind IN (?1, ?2, ?3, ?4)
-               AND qualified_name LIKE '%.%'
-               AND (canonical_id IS NULL
-                    OR (canonical_id NOT LIKE ?5 AND canonical_id NOT LIKE ?6))",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![
+    if !needed_names.is_empty() {
+        let names: Vec<String> = needed_names.into_iter().collect();
+        for chunk in names.chunks(ID_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ref_idx = chunk.len() + 5;
+            let pending_idx = chunk.len() + 6;
+            let sql = format!(
+                "SELECT id, qualified_name, serialized_name FROM node
+                 WHERE kind IN (?1, ?2, ?3, ?4)
+                   AND serialized_name IN ({placeholders})
+                   AND qualified_name LIKE '%.%'
+                   AND (canonical_id IS NULL
+                        OR (canonical_id NOT LIKE ?{ref_idx}
+                            AND canonical_id NOT LIKE ?{pending_idx}))"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 6);
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::CLASS as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::STRUCT as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::INTERFACE as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::ENUM as i32,
-                format!("{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"),
-                format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"),
-            ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-        )?;
-        for row in rows {
-            let (id, qualified) = row?;
-            let Some(qualified) = qualified else { continue };
-            let Some(name) = qualified.rsplit('.').next() else {
-                continue;
-            };
-            declarations_by_name
-                .entry(name.to_string())
-                .or_default()
-                .push((id, qualified.clone()));
+            )));
+            for name in chunk {
+                params.push(rusqlite::types::Value::Text(name.clone()));
+            }
+            params.push(rusqlite::types::Value::Text(format!(
+                "{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"
+            )));
+            params.push(rusqlite::types::Value::Text(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"
+            )));
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, qualified, serialized) = row?;
+                let Some(qualified) = qualified else { continue };
+                // Prefer the qualified bare name so nested types match the
+                // original finalize keying (last segment), falling back to
+                // serialized_name when needed.
+                let name = qualified
+                    .rsplit('.')
+                    .next()
+                    .map(str::to_string)
+                    .or(serialized);
+                let Some(name) = name else { continue };
+                declarations_by_name
+                    .entry(name)
+                    .or_default()
+                    .push((id, qualified));
+            }
         }
     }
 
     let mut resolutions: Vec<(i64, i64)> = Vec::new();
-    let mut removals: Vec<i64> = Vec::new();
-    for (edge_id, source_node_id, canonical_id) in pending {
+    // Failed-closed edges carry their pending reference target so orphan
+    // cleanup can delete by known ids instead of scanning every node row.
+    let mut removals: Vec<(i64, i64)> = Vec::new();
+    for (edge_id, source_node_id, target_node_id, canonical_id) in pending {
         let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
+            removals.push((edge_id, target_node_id));
             continue;
         };
         // Suffix is `{file}:{referencing_namespace}:{bare_name}`; identifiers
         // and namespaces never contain `:`, so parse from the right.
         let mut parts = suffix.rsplitn(3, ':');
         let (Some(target_name), Some(referencing_namespace)) = (parts.next(), parts.next()) else {
-            removals.push(edge_id);
+            removals.push((edge_id, target_node_id));
             continue;
         };
         let Some(referencing_root) = referencing_namespace
@@ -9429,7 +9493,7 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             .next()
             .filter(|root| !root.is_empty())
         else {
-            removals.push(edge_id);
+            removals.push((edge_id, target_node_id));
             continue;
         };
         let mut candidates = declarations_by_name
@@ -9448,44 +9512,91 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             [declaration_id] if *declaration_id != source_node_id => {
                 resolutions.push((edge_id, *declaration_id));
             }
-            _ => removals.push(edge_id),
+            _ => removals.push((edge_id, target_node_id)),
         }
     }
 
+    let orphan_candidates: Vec<i64> = {
+        let mut ids = removals
+            .iter()
+            .map(|(_, target_node_id)| *target_node_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    let tx = conn.unchecked_transaction()?;
     {
-        let mut resolve = conn.prepare(
+        let mut resolve = tx.prepare(
             "UPDATE edge SET resolved_target_node_id = ?2, certainty = 'certain' WHERE id = ?1",
         )?;
         for (edge_id, declaration_id) in &resolutions {
             resolve.execute(rusqlite::params![edge_id, declaration_id])?;
         }
-        let mut remove = conn.prepare("DELETE FROM edge WHERE id = ?1")?;
-        for edge_id in &removals {
+        let mut remove = tx.prepare("DELETE FROM edge WHERE id = ?1")?;
+        for (edge_id, _) in &removals {
             remove.execute(rusqlite::params![edge_id])?;
         }
     }
 
-    // Pending reference nodes nothing references any more (their edge failed
-    // closed) leave with their occurrences.
-    let orphan_filter = "canonical_id LIKE ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM edge e
-                   WHERE e.source_node_id = node.id
-                      OR e.target_node_id = node.id
-                      OR e.resolved_source_node_id = node.id
-                      OR e.resolved_target_node_id = node.id
-               )";
-    conn.execute(
-        &format!(
-            "DELETE FROM occurrence WHERE element_id IN
-             (SELECT id FROM node WHERE {orphan_filter})"
-        ),
-        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
-    )?;
-    conn.execute(
-        &format!("DELETE FROM node WHERE {orphan_filter}"),
-        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
-    )?;
+    let mut still_referenced = HashSet::new();
+    for chunk in orphan_candidates.chunks(ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT source_node_id FROM edge WHERE source_node_id IN ({placeholders})
+             UNION
+             SELECT target_node_id FROM edge WHERE target_node_id IN ({placeholders})
+             UNION
+             SELECT resolved_source_node_id FROM edge
+             WHERE resolved_source_node_id IN ({placeholders})
+             UNION
+             SELECT resolved_target_node_id FROM edge
+             WHERE resolved_target_node_id IN ({placeholders})"
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(
+            chunk
+                .iter()
+                .copied()
+                .chain(chunk.iter().copied())
+                .chain(chunk.iter().copied())
+                .chain(chunk.iter().copied()),
+        );
+        let rows = statement.query_map(params, |row| row.get::<_, Option<i64>>(0))?;
+        for row in rows {
+            if let Some(node_id) = row? {
+                still_referenced.insert(node_id);
+            }
+        }
+    }
+
+    let orphans: Vec<i64> = orphan_candidates
+        .into_iter()
+        .filter(|node_id| !still_referenced.contains(node_id))
+        .collect();
+    for chunk in orphans.chunks(ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let occurrence_sql = format!("DELETE FROM occurrence WHERE element_id IN ({placeholders})");
+        let node_sql = format!("DELETE FROM node WHERE id IN ({placeholders})");
+        tx.execute(
+            &occurrence_sql,
+            rusqlite::params_from_iter(chunk.iter().copied()),
+        )?;
+        tx.execute(&node_sql, rusqlite::params_from_iter(chunk.iter().copied()))?;
+    }
+
+    tx.commit()?;
     Ok(())
 }
 

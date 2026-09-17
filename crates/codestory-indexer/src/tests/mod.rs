@@ -7829,3 +7829,121 @@ fn removal_affected_callers_join_an_already_scoped_incremental_run() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn type_usage_finalize_cleans_orphans_without_scanning_all_nodes() -> Result<()> {
+    // Regression for activation @20 dwell: orphan cleanup used
+    // `DELETE ... WHERE canonical_id LIKE 'type_ref_pending:%' AND NOT EXISTS (...)`,
+    // which scanned every node row on large multi-language cores (protobuf-class).
+    let mut storage = Storage::new_in_memory()?;
+    let noise_nodes = 25_000usize;
+    let pending_count = 1_200usize;
+
+    let mut nodes = Vec::with_capacity(noise_nodes + pending_count + 8);
+    for index in 0..noise_nodes {
+        let id = NodeId(i64::try_from(index + 1).expect("noise id"));
+        nodes.push(Node {
+            id,
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("noise_{index}"),
+            qualified_name: Some(format!("Noise.Lib.Fn{index}")),
+            ..Default::default()
+        });
+    }
+
+    let declaration_id = NodeId(i64::try_from(noise_nodes + 1).expect("decl id"));
+    nodes.push(Node {
+        id: declaration_id,
+        kind: NodeKind::CLASS,
+        serialized_name: "Widget".to_string(),
+        qualified_name: Some("Acme.Widgets.Widget".to_string()),
+        ..Default::default()
+    });
+
+    let source_id = NodeId(i64::try_from(noise_nodes + 2).expect("source id"));
+    nodes.push(Node {
+        id: source_id,
+        kind: NodeKind::CLASS,
+        serialized_name: "Owner".to_string(),
+        qualified_name: Some("Acme.App.Owner".to_string()),
+        ..Default::default()
+    });
+
+    let mut edges = Vec::with_capacity(pending_count + 1);
+    let resolve_pending_id = NodeId(i64::try_from(noise_nodes + 3).expect("resolve pending"));
+    nodes.push(Node {
+        id: resolve_pending_id,
+        kind: NodeKind::UNKNOWN,
+        serialized_name: "Widget".to_string(),
+        canonical_id: Some(format!(
+            "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Widget"
+        )),
+        ..Default::default()
+    });
+    edges.push(Edge {
+        id: EdgeId(1),
+        source: source_id,
+        target: resolve_pending_id,
+        kind: EdgeKind::TYPE_USAGE,
+        ..Default::default()
+    });
+
+    let pending_base = noise_nodes + 10;
+    for index in 0..pending_count {
+        let pending_id = NodeId(i64::try_from(pending_base + index).expect("pending id"));
+        nodes.push(Node {
+            id: pending_id,
+            kind: NodeKind::UNKNOWN,
+            serialized_name: format!("Missing{index}"),
+            canonical_id: Some(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Missing{index}"
+            )),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(i64::try_from(index + 2).expect("edge id")),
+            source: source_id,
+            target: pending_id,
+            kind: EdgeKind::TYPE_USAGE,
+            ..Default::default()
+        });
+    }
+
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let started = Instant::now();
+    finalize_pending_type_usage_edges(&mut storage)?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed.as_secs() < 3,
+        "TYPE_USAGE finalize must stay sub-second-class with {noise_nodes} noise nodes; took {elapsed:?}"
+    );
+
+    let conn = storage.get_connection();
+    let remaining_pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node WHERE canonical_id LIKE ?1",
+        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
+        |row| row.get(0),
+    )?;
+    // The uniquely resolved pending reference node remains because the edge
+    // still targets it; failed-closed pendings must be gone.
+    assert_eq!(remaining_pending, 1);
+
+    let resolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edge
+         WHERE kind = ?1 AND resolved_target_node_id = ?2",
+        rusqlite::params![EdgeKind::TYPE_USAGE as i32, declaration_id.0],
+        |row| row.get(0),
+    )?;
+    assert_eq!(resolved, 1);
+
+    let unresolved_type_usage: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edge
+         WHERE kind = ?1 AND resolved_target_node_id IS NULL",
+        rusqlite::params![EdgeKind::TYPE_USAGE as i32],
+        |row| row.get(0),
+    )?;
+    assert_eq!(unresolved_type_usage, 0);
+    Ok(())
+}
