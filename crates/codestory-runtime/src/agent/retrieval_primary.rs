@@ -1134,9 +1134,7 @@ pub(crate) fn preadmit_packet_descriptor_queries(
 fn packet_descriptor_phase_wall_ms(started_at: Instant) -> u64 {
     let elapsed = started_at.elapsed();
     let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-    millis.saturating_add(u64::from(
-        !elapsed.subsec_nanos().is_multiple_of(1_000_000),
-    ))
+    millis.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
 }
 
 fn admit_packet_candidate_descriptors<'a>(
@@ -4539,7 +4537,10 @@ mod tests {
             let observed = packet_operation_observation_for_test()
                 .expect("zero-budget empty path still records runtime phase walls");
             assert_eq!(observed.descriptor_preadmission_observed_count, 0);
-            assert_eq!(observed.descriptor_preadmit_runtime_phases_observed_count, 1);
+            assert_eq!(
+                observed.descriptor_preadmit_runtime_phases_observed_count,
+                1
+            );
             assert_eq!(observed.descriptor_query_batch_wall_ms, 0);
             assert_eq!(observed.descriptor_lexical_wall_ms, 0);
             assert_eq!(observed.descriptor_dense_semantic_wall_ms, 0);
@@ -4575,7 +4576,10 @@ mod tests {
                 .expect("owned packet observation retains descriptor sub-phase walls");
             assert_eq!(observed.descriptor_preadmission_observed_count, 1);
             assert_eq!(observed.descriptor_preadmission_query_count, 1);
-            assert_eq!(observed.descriptor_preadmit_runtime_phases_observed_count, 0);
+            assert_eq!(
+                observed.descriptor_preadmit_runtime_phases_observed_count,
+                0
+            );
             assert!(
                 observed.descriptor_query_batch_wall_ms > 0
                     || observed.descriptor_lexical_wall_ms > 0

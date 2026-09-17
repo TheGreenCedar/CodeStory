@@ -754,7 +754,10 @@ mod tests {
         assert_eq!(fields["descriptor_admission_seal_wall_ms"], 0);
         assert_eq!(fields["descriptor_deferred_readiness_wall_ms"], 0);
         assert_eq!(fields["descriptor_remaining_before_handoff_ms"], 0);
-        assert_eq!(fields["descriptor_preadmit_runtime_phases_observed_count"], 0);
+        assert_eq!(
+            fields["descriptor_preadmit_runtime_phases_observed_count"],
+            0
+        );
         assert_eq!(fields["raf_ranked_admitted_observed_count"], 0);
         assert_eq!(fields["raf_ranked_pool_count"], 0);
         assert_eq!(fields["raf_ranked_recorded_count"], 0);
