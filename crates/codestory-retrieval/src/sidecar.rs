@@ -306,10 +306,20 @@ fn status_with_runtime(
                 .context("load core publication for retrieval evidence status")?
                 .context("retrieval evidence status requires a complete core publication")
                 .and_then(|publication| {
+                    // Prefer the sealed receipt keyed by the immutable generation
+                    // database. Activation validation@90 used to pass None and
+                    // re-scan every dense-anchor row after finalize had already
+                    // sealed the same publication.
+                    let core_database_path =
+                        codestory_store::resolve_core_generation_database_path(
+                            path,
+                            &publication.generation_id,
+                        )
+                        .ok();
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
                         &storage,
-                        None,
+                        core_database_path.as_deref(),
                         manifest,
                         &publication,
                         &runtime,

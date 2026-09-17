@@ -738,6 +738,62 @@ impl ActivationService {
         .flatten()
     }
 
+    /// Return the ready-lease source snapshot when its observer epoch is still
+    /// coherent, so the first public operation after activation need not pay a
+    /// cold content scan that validation deliberately skipped via observer receipt.
+    ///
+    /// Coherence matches [`Self::ready_lease_evidence`]: a missing observer is
+    /// `unproven` and must fall through to a content scan. Only an explicit
+    /// `Some(recorded)` epoch that still equals the armed observer is coherent.
+    fn admitted_source_freshness_if_observer_coherent(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Option<IndexFreshnessDto> {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        let lease = {
+            let state = self
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator poisoned");
+            (state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&requested))
+                && state
+                    .current
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.state == ActivationState::Ready))
+            .then(|| state.ready_lease.clone())
+            .flatten()?
+        };
+        if !lease.source.is_admissible_snapshot() {
+            return None;
+        }
+        let recorded = lease.source_observer.as_ref()?;
+        if self
+            .controller
+            .observed_source_epoch_if_armed(project_root)
+            .as_ref()
+            != Some(recorded)
+        {
+            return None;
+        }
+        Some(IndexFreshnessDto {
+            status: lease.source.status,
+            changed_file_count: lease.source.changed_file_count,
+            new_file_count: lease.source.new_file_count,
+            removed_file_count: lease.source.removed_file_count,
+            checked_file_count: lease.source.checked_file_count,
+            indexed_file_count: lease.source.indexed_file_count,
+            duration_ms: 0,
+            reason: lease.source.gap.clone(),
+            not_checked_cause: lease.source.not_checked_cause,
+            samples: Vec::new(),
+        })
+    }
+
     fn target_for_request(&self, project_root: &Path, storage_path: &Path) -> ActivationTarget {
         let requested = ActivationTarget::new(project_root, storage_path);
         if let Some(target) = self
@@ -2483,9 +2539,24 @@ impl PublicOperationService {
                     crate::agent::packet_batch::observe_packet_operation_span(
                         crate::agent::packet_batch::PacketOperationObservationSpan::UncachedFreshness,
                     );
-                let freshness = self
-                    .controller
-                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot);
+                // When activation minted the ready lease from a coherent observer
+                // receipt, the lease probe already falsifies source drift without
+                // another content walk. Re-scanning here burned ~4s on Keycloak
+                // after validation@90 and blew the remaining 18s packet floor.
+                let freshness = if let Some(lease_freshness) =
+                    self.activation.as_ref().and_then(|activation| {
+                        let project_root = self.controller.require_project_root().ok()?;
+                        let storage_path = self.controller.require_storage_path().ok()?;
+                        activation.admitted_source_freshness_if_observer_coherent(
+                            &project_root,
+                            &storage_path,
+                        )
+                    }) {
+                    Ok(lease_freshness)
+                } else {
+                    self.controller
+                        .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
+                };
                 if freshness.is_ok() {
                     freshness_span.finish_success();
                 }
@@ -4149,11 +4220,10 @@ pub(crate) mod activation_tests {
 
     /// One public operation derives source freshness before and after the
     /// build, and the MCP transport wraps the same request in a second public
-    /// operation. The pre-build derivations all ask about the same instant, so
-    /// they share one content pass; every post-build derivation asks whether
-    /// the source moved *since*, so it re-reads content. Four derivations
-    /// therefore cost three passes over the indexed files, not four and not
-    /// one.
+    /// operation. An observer-coherent ready lease may skip pre-build content
+    /// hashes; every post-build derivation still re-reads content so it can see
+    /// drift the lease snapshot could not have seen. Nested under one scope,
+    /// that is one post-build pass by the time the inner response is assembled.
     #[test]
     fn a_warm_public_operation_shares_one_pre_build_content_pass() {
         let fixture = ready_activation_fixture();
@@ -4189,23 +4259,21 @@ pub(crate) mod activation_tests {
         // four freshness derivations have run: the outer pre-build check, the
         // nested operation's pre-build check, and the nested operation's
         // post-build check. The outer post-build check runs after the response
-        // is built.
+        // is built. Both pre-build checks reuse the coherent ready lease.
         let counts = observed.expect("a public operation arms the source freshness scope");
         assert_eq!(
             counts.content_hash_reads,
-            u64::from(indexed_files) * 2,
-            "the two pre-build derivations share one pass; the post-build check \
-             re-reads content because it must see drift the pre-build pass could \
-             not have seen"
+            u64::from(indexed_files),
+            "coherent ready-lease pre-build skips content hashes; only the nested \
+             post-build check re-reads content"
         );
         assert_eq!(
-            counts.verdict_reuses,
-            u64::from(indexed_files),
-            "the nested pre-build derivation must reuse the outer pre-build pass"
+            counts.verdict_reuses, 0,
+            "lease-snapshot pre-build must not count as memoized content verdict reuse"
         );
         let telemetry = observed_telemetry.expect("the operation publishes its pass counters");
-        assert_eq!(telemetry.content_hash_reads, indexed_files * 2);
-        assert_eq!(telemetry.verdict_reuses, indexed_files);
+        assert_eq!(telemetry.content_hash_reads, indexed_files);
+        assert_eq!(telemetry.verdict_reuses, 0);
     }
 
     /// Issue #1700 requires the operation-scoped freshness memo to leave
@@ -4271,34 +4339,65 @@ pub(crate) mod activation_tests {
         );
     }
 
-    /// A second operation on one ready lease begins from the clean verdicts
-    /// re-established by the first operation's post-build guard.
+    /// A coherent ready lease skips pre-build content hashes. The post-build
+    /// guard still content-rehashes, and the next public operation again skips
+    /// pre-build via that lease rather than paying another cold content scan.
     #[test]
     fn the_next_public_operation_reuses_the_ready_lease_verdicts() {
         let fixture = ready_activation_fixture();
+        let indexed_files = u64::from(
+            fixture
+                .runtime
+                .activation_service()
+                .controller
+                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)
+                .expect("observe indexed inventory")
+                .indexed_file_count,
+        );
+        assert!(
+            indexed_files > 0,
+            "the fixture must publish at least one indexed file"
+        );
         let service = fixture.runtime.public_operation_service();
-        let mut first = None;
+        let mut first_during_build = None;
+        let mut after_first_post_build = None;
+        let mut second_during_build = None;
         service
             .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
-                first = codestory_workspace::source_freshness_counts();
+                service.run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                    first_during_build = codestory_workspace::source_freshness_counts();
+                    Ok(())
+                })?;
+                after_first_post_build = codestory_workspace::source_freshness_counts();
+                service.run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                    second_during_build = codestory_workspace::source_freshness_counts();
+                    Ok(())
+                })?;
                 Ok(())
             })
-            .expect("first operation");
-        let mut second = None;
-        service
-            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
-                second = codestory_workspace::source_freshness_counts();
-                Ok(())
-            })
-            .expect("second operation");
+            .expect("ready-lease operations");
 
-        let first = first.expect("first scope");
-        let second = second.expect("second scope");
-        assert!(first.content_hash_reads > 0);
-        assert_eq!(second.content_hash_reads, 0);
+        let first_during_build = first_during_build.expect("first build scope");
         assert_eq!(
-            second.verdict_reuses, first.content_hash_reads,
-            "the second operation must reuse the verdicts left by the first post-build guard"
+            first_during_build.content_hash_reads, 0,
+            "observer-coherent ready lease must skip pre-build content hashes"
+        );
+
+        let after_first_post_build = after_first_post_build.expect("after first post-build");
+        assert_eq!(
+            after_first_post_build.content_hash_reads, indexed_files,
+            "post-build must still content-rehash even when pre-build reused the lease"
+        );
+
+        let second_during_build = second_during_build.expect("second build scope");
+        assert_eq!(
+            second_during_build.content_hash_reads, after_first_post_build.content_hash_reads,
+            "the next operation must reuse the coherent ready lease and not add another \
+             pre-build content pass"
+        );
+        assert_eq!(
+            second_during_build.verdict_reuses, 0,
+            "lease-snapshot pre-build must not count as memoized content verdict reuse"
         );
         assert_eq!(
             codestory_workspace::source_freshness_counts(),
@@ -5283,6 +5382,85 @@ pub(crate) mod activation_tests {
                 .probe_ready_lease(&fixture.storage_path, &unobservable)
                 .admissible,
             "a host the observer cannot watch keeps exactly the EV-7 answer it had before"
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_falls_through_when_observer_is_unproven() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut unproven = fixture.lease.clone();
+            unproven.source_observer = None;
+            state.ready_lease = Some(unproven);
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "None observer is unproven and must fall through to a content scan"
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_reuses_when_observer_epoch_is_coherent() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let reused = service
+            .admitted_source_freshness_if_observer_coherent(
+                fixture.project.path(),
+                &fixture.storage_path,
+            )
+            .expect("coherent Some observer must reuse the ready-lease snapshot");
+        assert_eq!(reused.status, fixture.lease.source.status);
+        assert_eq!(
+            reused.indexed_file_count,
+            fixture.lease.source.indexed_file_count
+        );
+        assert_eq!(
+            reused.not_checked_cause,
+            fixture.lease.source.not_checked_cause
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_falls_through_when_observer_epoch_is_stale() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut stale = fixture.lease.clone();
+            let recorded = stale
+                .source_observer
+                .as_ref()
+                .expect("fixture lease records an observer");
+            stale.source_observer = Some(ObservedSourceEpoch {
+                session_id: recorded.session_id.clone(),
+                backend: recorded.backend,
+                epoch: recorded.epoch.wrapping_add(1),
+            });
+            state.ready_lease = Some(stale);
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "stale Some observer must fall through to a content scan"
         );
     }
 
