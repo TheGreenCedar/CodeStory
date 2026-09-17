@@ -84,8 +84,8 @@ use crate::semantic_projection::{
     dense_anchor_reason_for_node_with_flow_neighbors, flow_neighbor_edge_is_eligible,
     retain_bounded_flow_neighbor_candidate, route_endpoint_is_parser_backed,
     semantic_component_key_for_path, semantic_doc_field_budgets,
-    semantic_file_is_package_callable_surface, semantic_graph_dependent_file_ids_by_seed,
-    semantic_projection_source_policy_compatibility,
+    semantic_file_is_package_callable_surface, semantic_file_is_public_surface,
+    semantic_graph_dependent_file_ids_by_seed, semantic_projection_source_policy_compatibility,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
@@ -732,8 +732,119 @@ fn dense_policy_skips_private_trivial_helpers() {
 }
 
 #[test]
+fn dense_policy_does_not_treat_the_generic_src_directory_as_a_public_api() {
+    let path = "src/networking.c";
+    let node = semantic_policy_node(11, NodeKind::FUNCTION, "process_command", 1);
+    let context = semantic_policy_context(path, &node);
+
+    assert!(!semantic_file_is_package_callable_surface(Some(path)));
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "process_command",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: process_command\n",
+            None,
+        ),
+        None,
+        "ordinary implementation callables remain available to lexical and graph retrieval"
+    );
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "process_command",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: process_command\n",
+            Some(AccessKind::Public),
+        ),
+        None,
+        "access metadata alone does not turn a generic source directory into a package surface"
+    );
+
+    let entrypoint = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
+    let entrypoint_context = semantic_policy_context("src/main.c", &entrypoint);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &entrypoint_context,
+            &entrypoint,
+            "main",
+            Some("src/main.c"),
+            "semantic_doc_version: 9\nsymbol: main\n",
+            None,
+        ),
+        Some(DenseAnchorReason::Entrypoint),
+        "the entrypoint policy remains independent of package-surface selection"
+    );
+
+    let preprocessor_definition = semantic_policy_node(13, NodeKind::ANNOTATION, "REDIS_STATIC", 1);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &preprocessor_definition,
+            "REDIS_STATIC",
+            Some("src/server.h"),
+            "semantic_doc_version: 9\nsymbol: REDIS_STATIC\n",
+            Some(AccessKind::Public),
+        ),
+        None,
+        "C preprocessor definitions are not public APIs merely because C has no private access"
+    );
+
+    let java_annotation = semantic_policy_node(14, NodeKind::ANNOTATION, "StableApi", 1);
+    let java_path = "app/src/main/java/com/acme/StableApi.java";
+    let java_context = semantic_policy_context(java_path, &java_annotation);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &java_context,
+            &java_annotation,
+            "StableApi",
+            Some(java_path),
+            "semantic_doc_version: 9\nsymbol: StableApi\n",
+            Some(AccessKind::Public),
+        ),
+        Some(DenseAnchorReason::PublicApi),
+        "public JVM annotation declarations remain dense"
+    );
+}
+
+#[test]
+fn dense_policy_does_not_treat_the_entire_jvm_tree_as_a_public_surface() {
+    let path = "server/src/main/java/org/acme/internal/Helper.java";
+    let class_node = semantic_policy_node(21, NodeKind::CLASS, "Helper", 1);
+    let context = semantic_policy_context(path, &class_node);
+
+    assert!(!semantic_file_is_public_surface(Some(path)));
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &class_node,
+            "Helper",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: Helper\n",
+            Some(AccessKind::Private),
+        ),
+        None,
+        "private JVM types under src/main/java are not dense merely by tree layout"
+    );
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &class_node,
+            "Helper",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: Helper\n",
+            Some(AccessKind::Public),
+        ),
+        Some(DenseAnchorReason::PublicApi),
+        "public JVM types still qualify through access metadata"
+    );
+}
+
+#[test]
 fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
-    for path in ["lib/application.js", "src/server.js"] {
+    for path in ["lib/application.js"] {
         assert!(semantic_file_is_package_callable_surface(Some(path)));
 
         let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
@@ -751,6 +862,11 @@ fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
             "top-level package callable surface {path}"
         );
     }
+
+    assert!(
+        !semantic_file_is_package_callable_surface(Some("src/server.js")),
+        "generic src/ is not a package callable surface"
+    );
 
     let test_path = "test/lib/application.js";
     let test_node = semantic_policy_node(12, NodeKind::FUNCTION, "handle", 1);
