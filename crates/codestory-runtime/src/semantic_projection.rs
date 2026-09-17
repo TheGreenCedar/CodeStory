@@ -2497,8 +2497,6 @@ pub(super) fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
         || normalized.contains("/controllers/")
         || normalized.starts_with("components/")
         || normalized.contains("/components/")
-        || normalized.contains("/src/main/java/")
-        || normalized.contains("/src/main/kotlin/")
 }
 
 pub(super) fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -2507,7 +2505,6 @@ pub(super) fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKin
         codestory_contracts::graph::NodeKind::STRUCT
             | codestory_contracts::graph::NodeKind::CLASS
             | codestory_contracts::graph::NodeKind::INTERFACE
-            | codestory_contracts::graph::NodeKind::ANNOTATION
             | codestory_contracts::graph::NodeKind::UNION
             | codestory_contracts::graph::NodeKind::ENUM
             | codestory_contracts::graph::NodeKind::TYPEDEF
@@ -2546,11 +2543,15 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     // production and what the widened generalization lint now refuses. Those
     // files still qualify through the markers below whenever the repository
     // actually lays them out as a package surface.
+    // Deliberately omit the generic `src` segment. Treating every callable under
+    // `src/` as dense public API (restored by #2094 for coverage) makes cold
+    // retrieval finalize embed 40k–100k+ anchors on Keycloak/protobuf-class
+    // roots and stalls activation at publication@75 for the full frozen 180s
+    // prep window. Package-surface markers stay the explicit layout roots.
     normalized.split('/').any(|segment| {
         matches!(
             segment,
             "lib"
-                | "src"
                 | "pkg"
                 | "packages"
                 | "routes"
@@ -2560,6 +2561,15 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
                 | "sources"
         )
     })
+}
+
+fn semantic_file_is_jvm_source(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    file_name.ends_with(".java") || file_name.ends_with(".kt") || file_name.ends_with(".kts")
 }
 
 pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
@@ -2600,6 +2610,16 @@ fn base_dense_anchor_reason_for_node(
     if dense_anchor_public_kind(node.kind)
         && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
             || semantic_file_is_public_surface(file_path))
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    // Annotations are not in dense_anchor_public_kind: C preprocessor
+    // definitions share the ANNOTATION kind and must not become dense merely
+    // because C has no private access. JVM annotation declarations still
+    // qualify when access is public/protected.
+    if node.kind == codestory_contracts::graph::NodeKind::ANNOTATION
+        && matches!(access, Some(AccessKind::Public | AccessKind::Protected))
+        && semantic_file_is_jvm_source(file_path)
     {
         return Some(DenseAnchorReason::PublicApi);
     }
