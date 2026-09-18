@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Rust indexing no longer aborts on `let` bindings to `async ||` / `async move ||`
+closures (meilisearch-class and surrealdb-class sources). Those bindings stay
+function nodes instead of colliding with the local-variable stanza and failing
+closed as `source_collector_failure`.
+
 OpenAPI/Swagger schema indexing keeps endpoint graph nodes file-owned when
 sibling fixtures share the same method and path, so repos with multiple API
 specs (localstack-class `tests/aws/files/*.json`, kratos-class
