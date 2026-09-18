@@ -1199,12 +1199,23 @@ impl WorkspaceDiscovery {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
+                        if let Some(skipped) = non_source_symlink_walk_skip(&walk.path, &error) {
+                            // Helm U08 / dep-fs fixtures: dangling or device
+                            // symlinks are observed and skipped; they must not
+                            // demote a otherwise-complete inventory to Partial.
+                            warnings.push(skipped);
+                            continue;
+                        }
                         record_walk_error(&mut issues, &walk.path, &error);
                         continue;
                     }
                 };
                 if let Some(error) = entry.error() {
-                    record_walk_error(&mut issues, entry.path(), error);
+                    if let Some(skipped) = non_source_symlink_walk_skip(entry.path(), error) {
+                        warnings.push(skipped);
+                    } else {
+                        record_walk_error(&mut issues, entry.path(), error);
+                    }
                 }
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     continue;
@@ -1734,9 +1745,52 @@ fn record_walk_error(
     error: &ignore::Error,
 ) {
     issues.push(WorkspaceInventoryIssue {
-        path: source_root.to_path_buf(),
+        path: ignore_error_path(error)
+            .unwrap_or(source_root)
+            .to_path_buf(),
         message: error.to_string(),
     });
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::Partial(errors) if errors.len() == 1 => ignore_error_path(&errors[0]),
+        _ => None,
+    }
+}
+
+/// When `follow_links` hits a dangling symlink or a non-regular target (for
+/// example helm chart fixtures that link to `/dev/null`, or intentional
+/// broken-symlink test fixtures), discovery has observed the path and must
+/// not treat the walk error as proof the inventory is incomplete.
+fn non_source_symlink_walk_skip(
+    fallback_path: &Path,
+    error: &ignore::Error,
+) -> Option<WorkspaceInventoryIssue> {
+    let path = ignore_error_path(error).unwrap_or(fallback_path);
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_symlink() {
+        return None;
+    }
+    match fs::metadata(path) {
+        Err(_) => Some(WorkspaceInventoryIssue {
+            path: path.to_path_buf(),
+            message: format!(
+                "skipped dangling symlink during discovery follow; not admitted as source ({error})"
+            ),
+        }),
+        Ok(target) if target.is_file() || target.is_dir() => None,
+        Ok(_) => Some(WorkspaceInventoryIssue {
+            path: path.to_path_buf(),
+            message: format!(
+                "skipped non-regular symlink target during discovery follow; not admitted as source ({error})"
+            ),
+        }),
+    }
 }
 
 fn inventory_failure_message(inventory: &WorkspaceFileInventory) -> String {
@@ -5193,6 +5247,106 @@ mod tests {
 
         let files = WorkspaceDiscovery.source_files(&manifest)?;
         assert_eq!(files, vec![shared.join("shared.ts")]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_and_device_symlinks_do_not_demote_inventory_to_partial() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return Ok(());
+        }
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("internal/third_party/dep/fs/testdata/symlinks"))?;
+        fs::create_dir_all(root.join("pkg/chartutil/testdata/frobnitz_with_dev_null"))?;
+        fs::write(root.join("main.go"), "package main\n")?;
+        // Helm U08 shape: intentional /dev/null chart fixture + broken symlink fixtures.
+        symlink(
+            "/dev/null",
+            root.join("pkg/chartutil/testdata/frobnitz_with_dev_null/null"),
+        )?;
+        symlink(
+            "nowhere-real",
+            root.join("internal/third_party/dep/fs/testdata/symlinks/invalid-symlink"),
+        )?;
+        symlink(
+            "C:\\this\\path\\does\\not\\exist",
+            root.join("internal/third_party/dep/fs/testdata/symlinks/windows-file-symlink"),
+        )?;
+        for args in [
+            ["init"][..].as_ref(),
+            ["config", "user.email", "codestory@example.invalid"][..].as_ref(),
+            ["config", "user.name", "CodeStory Test"][..].as_ref(),
+            ["add", "-A"][..].as_ref(),
+            ["commit", "-m", "init"][..].as_ref(),
+        ] {
+            let status = Command::new("git").args(args).current_dir(&root).status()?;
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+        eprintln!(
+            "outcome={:?} issues={:#?} files={}",
+            inventory.outcome,
+            inventory.issues,
+            inventory.files.len()
+        );
+        assert_eq!(
+            inventory.outcome,
+            WorkspaceInventoryOutcome::Complete,
+            "{inventory:?}"
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+        assert!(
+            inventory.warnings.len() >= 2,
+            "dangling symlink fixtures should surface as warnings: {inventory:?}"
+        );
+        assert!(
+            inventory.files.iter().any(|path| path.ends_with("main.go")),
+            "{inventory:?}"
+        );
+        assert!(
+            inventory.files.iter().all(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("null")
+                    && path.file_name().and_then(|name| name.to_str()) != Some("invalid-symlink")
+                    && path.file_name().and_then(|name| name.to_str())
+                        != Some("windows-file-symlink")
+            }),
+            "non-regular symlink fixtures must not be admitted: {inventory:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_helm_u08_tree_inventory_is_complete_when_present() -> Result<()> {
+        let Ok(pin) = std::env::var("CODESTORY_U08_HELM_PIN") else {
+            return Ok(());
+        };
+        let root = PathBuf::from(pin);
+        if !root.join(".git").exists() {
+            return Ok(());
+        }
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+        eprintln!(
+            "helm pin outcome={:?} issues={} warnings={} files={}",
+            inventory.outcome,
+            inventory.issues.len(),
+            inventory.warnings.len(),
+            inventory.files.len()
+        );
+        assert_eq!(
+            inventory.outcome,
+            WorkspaceInventoryOutcome::Complete,
+            "{inventory:?}"
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
         Ok(())
     }
 
