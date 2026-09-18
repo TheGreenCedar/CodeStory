@@ -2953,7 +2953,7 @@ fn java_same_package_dependency_closure_excludes_interface_only_files() -> anyho
     };
     let expected = ["p/Caller.java", "p/Lib.java", "p/Unused.java"]
         .into_iter()
-        .map(|suffix| file_id(suffix))
+        .map(&file_id)
         .collect::<BTreeSet<_>>();
     let observed = fact
         .provenance

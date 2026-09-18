@@ -333,7 +333,7 @@ mod tests {
                 .map(|stage| stage.top_k),
             Some(LEXICAL_FUSION_WINDOW)
         );
-        assert!(DESCRIPTOR_LEXICAL_FUSION_WINDOW < LEXICAL_FUSION_WINDOW);
+        const { assert!(DESCRIPTOR_LEXICAL_FUSION_WINDOW < LEXICAL_FUSION_WINDOW) };
         assert_eq!(
             DESCRIPTOR_LEXICAL_FUSION_WINDOW,
             SEMANTIC_CALIBRATION_WINDOW
