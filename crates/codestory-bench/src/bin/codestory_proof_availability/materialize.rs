@@ -351,7 +351,9 @@ fn materialize_indexed_with_registry(
                 .join(&path_file.repository_id);
             let project_root = resolve_workspace(&checkout_root, &path_file.workspace)?;
             revalidate_repository(path_file, &checkout_root, &project_root, &hooks)?;
-            let database_path = database_root.join(format!("{}.sqlite3", path_file.repository_id));
+            let database_dir = database_root.join(&path_file.repository_id);
+            create_private_directory(&database_dir)?;
+            let database_path = database_dir.join("codestory.db");
             let runtime =
                 core_only_runtime(&project_root, &destinations.cache.real_path.join("runtime"));
             runtime
@@ -406,7 +408,6 @@ fn materialize_indexed_with_registry(
                 bail!("proof_availability_retrieval_publication_forbidden")
             }
             drop(store);
-            let database_sha256 = sha256(&fs::read(&database_path)?);
             let store = codestory_store::Store::open_observational(&database_path)
                 .context("reopen materialized proof store observationally")?;
             let publication_after = store
@@ -416,6 +417,9 @@ fn materialize_indexed_with_registry(
             if publication_before != publication_after {
                 bail!("proof_availability_mixed_core_generation")
             }
+            let resolved_database = codestory_store::resolve_core_database_path(&database_path)
+                .context("resolve published core generation for materialization digest")?;
+            let database_sha256 = sha256(&fs::read(&resolved_database)?);
             projects.push(ProjectMaterializationEvidenceV1 {
                 repository_id: path_file.repository_id.clone(),
                 source_head: path_file.commit.clone(),
@@ -887,7 +891,10 @@ fn validate_operational_environment_with_identity(
             &repository.checkout_root,
             &repository.project_root,
         )?;
-        if sha256(&fs::read(&repository.database_path)?) != project.database_sha256 {
+        let resolved_database =
+            codestory_store::resolve_core_database_path(&repository.database_path)
+                .context("resolve published core generation for materialization digest check")?;
+        if sha256(&fs::read(&resolved_database)?) != project.database_sha256 {
             bail!("proof_availability_database_mismatch")
         }
         let schema = codestory_store::Store::database_schema_version_observational(
@@ -2837,10 +2844,14 @@ mod tests {
             .to_string()
             .contains("core_publication_mismatch")
         );
-        let database = &descriptor.repositories[0].database_path;
-        let mut bytes = fs::read(database).unwrap();
+        let database =
+            codestory_store::resolve_core_database_path(&descriptor.repositories[0].database_path)
+                .expect("resolve active generation for digest tamper");
+        codestory_store::make_file_owner_writable(&database)
+            .expect("unlock immutable generation for digest tamper");
+        let mut bytes = fs::read(&database).unwrap();
         bytes.push(0);
-        fs::write(database, bytes).unwrap();
+        fs::write(&database, bytes).unwrap();
         assert!(
             validate_operational_environment_with_identity(
                 &loaded,

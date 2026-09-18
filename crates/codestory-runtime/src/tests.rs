@@ -3497,7 +3497,7 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
 }
 
 #[test]
-fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_preserves_previous_core()
+fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_retains_malformed_jsonc()
 {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");
@@ -3542,13 +3542,24 @@ fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_preser
     fs::write(&config_path, "{ \"compilerOptions\": , }").expect("write malformed JSONC");
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("malformed JSONC must reject a later full refresh");
-    assert_eq!(
-        Storage::open(&storage_path)
-            .expect("open preserved storage")
-            .get_complete_index_publication()
-            .expect("read preserved publication"),
-        Some(baseline)
+        .expect("verified malformed JSONC must publish without blocking full refresh");
+    let storage = Storage::open_read_only(&storage_path).expect("open retained storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read retained publication")
+        .expect("complete retained publication");
+    assert_ne!(
+        publication, baseline,
+        "malformed JSONC retention must publish a replacement generation"
+    );
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .expect("coverage diagnostics")
+            .iter()
+            .any(|gap| gap.path.ends_with("tsconfig.json")
+                && gap.reason == FileCoverageReason::Malformed
+                && gap.verified_source),
+        "malformed JSONC must remain a verified incomplete coverage gap"
     );
 }
 

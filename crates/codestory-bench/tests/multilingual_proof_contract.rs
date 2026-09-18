@@ -216,8 +216,8 @@ fn structural_and_embedded_routes_snapshot_real_nodes_edges_and_anchors() -> any
     assert!(required_structural.is_subset(&emitted_structural));
     assert_eq!(
         observation.len(),
-        16,
-        "eleven structural profiles and five embedded parser routes must execute"
+        17,
+        "twelve structural profiles and five embedded parser routes must execute"
     );
     assert!(
         observation
