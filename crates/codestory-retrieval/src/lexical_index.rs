@@ -5594,7 +5594,7 @@ mod tests {
 
     #[test]
     fn descriptor_lexical_candidate_limit_stays_below_full_fusion_pool() {
-        assert!(DESCRIPTOR_MAX_CANDIDATES < MAX_CANDIDATES);
+        const { assert!(DESCRIPTOR_MAX_CANDIDATES < MAX_CANDIDATES) };
         assert_eq!(
             lexical_candidate_limit(MAX_CANDIDATES, LexicalHitPayload::DescriptorOnly),
             DESCRIPTOR_MAX_CANDIDATES,

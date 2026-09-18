@@ -844,24 +844,23 @@ fn dense_policy_does_not_treat_the_entire_jvm_tree_as_a_public_surface() {
 
 #[test]
 fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
-    for path in ["lib/application.js"] {
-        assert!(semantic_file_is_package_callable_surface(Some(path)));
+    let path = "lib/application.js";
+    assert!(semantic_file_is_package_callable_surface(Some(path)));
 
-        let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
-        let context = semantic_policy_context(path, &node);
-        assert_eq!(
-            dense_anchor_reason_for_node(
-                &context,
-                &node,
-                "handle",
-                Some(path),
-                "semantic_doc_version: 9\nsymbol: handle\n",
-                Some(AccessKind::Private),
-            ),
-            Some(DenseAnchorReason::PublicApi),
-            "top-level package callable surface {path}"
-        );
-    }
+    let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
+    let context = semantic_policy_context(path, &node);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "handle",
+            Some(path),
+            "semantic_doc_version: 9\nsymbol: handle\n",
+            Some(AccessKind::Private),
+        ),
+        Some(DenseAnchorReason::PublicApi),
+        "top-level package callable surface {path}"
+    );
 
     assert!(
         !semantic_file_is_package_callable_surface(Some("src/server.js")),
