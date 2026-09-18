@@ -3786,11 +3786,13 @@ fn compute_sidecar_input_fingerprint_with_lexical_fingerprint(
     hash_part(&mut hasher, &graph_projection.graph_artifact_hash);
 
     let publication = core_publication.context("complete core publication for sidecar hash")?;
-    let core_database_path = codestory_store::resolve_core_generation_database_path(
-        storage_path,
-        &publication.generation_id,
-    )
-    .context("resolve immutable core for dense-anchor hash")?;
+    // Seal against the active generation file the observational store already
+    // pinned. Resolving only by SQLite `generation_id` breaks when a first
+    // publish used rehydrate naming while the sealed publication id stayed on
+    // the staged identity; status fingerprint must still observe the live
+    // generation without inventing a legacy flat database.
+    let core_database_path = codestory_store::resolve_core_database_path(storage_path)
+        .context("resolve immutable core for dense-anchor hash")?;
     let dense_validation = storage
         .validate_dense_anchor_publication_sealed(&core_database_path, &publication)
         .context("validate dense-anchor publication for sidecar hash")?;

@@ -309,13 +309,10 @@ fn status_with_runtime(
                     // Prefer the sealed receipt keyed by the immutable generation
                     // database. Activation validation@90 used to pass None and
                     // re-scan every dense-anchor row after finalize had already
-                    // sealed the same publication.
-                    let core_database_path =
-                        codestory_store::resolve_core_generation_database_path(
-                            path,
-                            &publication.generation_id,
-                        )
-                        .ok();
+                    // sealed the same publication. Use the active generation
+                    // path (not SQLite generation_id alone) so generation-only
+                    // publications stay observable without a legacy flat DB.
+                    let core_database_path = codestory_store::resolve_core_database_path(path).ok();
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
                         &storage,
@@ -594,14 +591,11 @@ mod tests {
         let project = TempDir::new().expect("project");
         let cache = TempDir::new().expect("cache");
         let storage_path = cache.path().join("codestory.db");
-        let stage =
-            codestory_store::SnapshotStore::staged_path(&storage_path).expect("staged path");
-        crate::test_support::publish_empty_complete_core_fixture(project.path(), &stage)
-            .expect("complete staged core");
-        codestory_store::CorePublishTransaction::begin_from_stage(&storage_path, stage)
-            .expect("publication transaction")
-            .commit_rehydrate(&storage_path)
-            .expect("publish generation");
+        crate::test_support::publish_empty_complete_generation_only_core_fixture(
+            project.path(),
+            &storage_path,
+        )
+        .expect("complete generation-only core");
         let runtime = SidecarRuntimeConfig::local();
         let project_id =
             sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
@@ -611,6 +605,22 @@ mod tests {
             .upsert_retrieval_index_manifest(&manifest)
             .expect("publish retrieval manifest");
         assert!(!storage_path.exists());
+        let generation =
+            codestory_store::resolve_core_database_path(&storage_path).expect("active generation");
+        let publication = Store::open_observational(&storage_path)
+            .expect("observational publication")
+            .get_complete_index_publication()
+            .expect("load publication")
+            .expect("complete publication");
+        assert_eq!(
+            generation,
+            codestory_store::resolve_core_generation_database_path(
+                &storage_path,
+                &publication.generation_id,
+            )
+            .expect("publication id must resolve to the active generation file"),
+            "generation-only fixtures must keep SQLite publication id and filesystem generation aligned"
+        );
 
         for strict in [false, true] {
             let report = status_with_runtime(
@@ -635,8 +645,6 @@ mod tests {
             );
         }
 
-        let generation =
-            codestory_store::resolve_core_database_path(&storage_path).expect("active generation");
         std::fs::remove_file(&generation).expect("remove active generation");
         for strict in [false, true] {
             assert!(
