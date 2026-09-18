@@ -312,8 +312,7 @@ fn status_with_runtime(
                     // sealed the same publication. Use the active generation
                     // path (not SQLite generation_id alone) so generation-only
                     // publications stay observable without a legacy flat DB.
-                    let core_database_path =
-                        codestory_store::resolve_core_database_path(path).ok();
+                    let core_database_path = codestory_store::resolve_core_database_path(path).ok();
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
                         &storage,
