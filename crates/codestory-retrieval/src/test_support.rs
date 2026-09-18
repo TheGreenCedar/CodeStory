@@ -63,6 +63,39 @@ pub fn publish_empty_complete_core_fixture(project_root: &Path, storage_path: &P
     publish_complete_core_fixture(&mut storage, project_root, &publication)
 }
 
+/// Publish the empty complete core as a generation-only layout.
+///
+/// Installs under the sealed SQLite generation id via `commit_pointer`. Do not
+/// use `commit_rehydrate` here: rehydrate renames the filesystem generation
+/// while leaving the SQLite publication id unchanged, so strict readiness that
+/// resolves by publication id fails with ENOENT (workspace nextest enables
+/// `test-support` and reaches that path; focused lib tests without the feature
+/// short-circuit on an unreachable embedding probe and mask the mismatch).
+pub fn publish_empty_complete_generation_only_core_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+) -> Result<()> {
+    let stage = SnapshotStore::staged_path(storage_path).context("stage generation-only core")?;
+    publish_empty_complete_core_fixture(project_root, &stage)?;
+    let logical_bytes = std::fs::metadata(&stage)
+        .context("read staged generation-only core size")?
+        .len()
+        .max(1);
+    codestory_store::CorePublishTransaction::begin_from_stage(storage_path, stage)
+        .context("begin generation-only publish")?
+        .commit_pointer(
+            codestory_contracts::core_publication::CoreGenerationIdentityV1 {
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "operation-oracle-run".into(),
+                logical_bytes,
+                published_at_epoch_ms: 1,
+            },
+            None,
+        )
+        .context("publish generation-only core under its sealed identity")?;
+    Ok(())
+}
+
 pub fn retrieval_manifest_fixture(
     project_id: &str,
     sidecar_input_hash: &str,
