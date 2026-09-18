@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Dense selection no longer treats a `lib` path segment as a package-callable
+surface for Python sources, so CPython-class stdlib trees (`Lib/`) stop forcing
+tens of thousands of ordinary callables into cold retrieval finalize. Ruby/JS
+`lib/` layouts and other package markers stay unchanged; projects are more
+likely to leave `publication@75` under the frozen preparation budget.
+
 Packet descriptor lexical coverage keeps the two-of-three / ~40% gate
 fail-closed: path and symbol tokens are matched in memory, and any remaining
 content tokens are proven by one batched FTS-body read for under-covered

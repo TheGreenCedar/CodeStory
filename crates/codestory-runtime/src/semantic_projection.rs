@@ -2557,18 +2557,19 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     // retrieval finalize embed 40k–100k+ anchors on Keycloak/protobuf-class
     // roots and stalls activation at publication@75 for the full frozen 180s
     // prep window. Package-surface markers stay the explicit layout roots.
-    normalized.split('/').any(|segment| {
-        matches!(
-            segment,
-            "lib"
-                | "pkg"
-                | "packages"
-                | "routes"
-                | "router"
-                | "controllers"
-                | "middleware"
-                | "sources"
-        )
+    //
+    // Also omit `lib` for `.py` files. Case-insensitive `lib` matched CPython's
+    // top-level stdlib `Lib/` and selected ~22k callables as dense public_api,
+    // so publication@75 embed could not finish under the same frozen 180s prep
+    // that Keycloak (~7k anchors) clears. Ruby/JS/`lib/` and non-`lib` Python
+    // markers (`pkg`, `packages`, …) stay intact; Python callables still enter
+    // dense via entrypoint/central/documented/public-surface paths.
+    let python_source = file_name.ends_with(".py");
+    normalized.split('/').any(|segment| match segment {
+        "lib" if python_source => false,
+        "lib" | "pkg" | "packages" | "routes" | "router" | "controllers" | "middleware"
+        | "sources" => true,
+        _ => false,
     })
 }
 
