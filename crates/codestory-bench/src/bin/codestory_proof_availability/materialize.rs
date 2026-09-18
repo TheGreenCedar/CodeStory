@@ -417,10 +417,8 @@ fn materialize_indexed_with_registry(
             if publication_before != publication_after {
                 bail!("proof_availability_mixed_core_generation")
             }
-            let resolved_database =
-                codestory_store::resolve_core_database_path(&database_path).context(
-                    "resolve published core generation for materialization digest",
-                )?;
+            let resolved_database = codestory_store::resolve_core_database_path(&database_path)
+                .context("resolve published core generation for materialization digest")?;
             let database_sha256 = sha256(&fs::read(&resolved_database)?);
             projects.push(ProjectMaterializationEvidenceV1 {
                 repository_id: path_file.repository_id.clone(),
@@ -893,10 +891,9 @@ fn validate_operational_environment_with_identity(
             &repository.checkout_root,
             &repository.project_root,
         )?;
-        let resolved_database = codestory_store::resolve_core_database_path(
-            &repository.database_path,
-        )
-        .context("resolve published core generation for materialization digest check")?;
+        let resolved_database =
+            codestory_store::resolve_core_database_path(&repository.database_path)
+                .context("resolve published core generation for materialization digest check")?;
         if sha256(&fs::read(&resolved_database)?) != project.database_sha256 {
             bail!("proof_availability_database_mismatch")
         }
@@ -2847,10 +2844,9 @@ mod tests {
             .to_string()
             .contains("core_publication_mismatch")
         );
-        let database = codestory_store::resolve_core_database_path(
-            &descriptor.repositories[0].database_path,
-        )
-        .expect("resolve active generation for digest tamper");
+        let database =
+            codestory_store::resolve_core_database_path(&descriptor.repositories[0].database_path)
+                .expect("resolve active generation for digest tamper");
         codestory_store::make_file_owner_writable(&database)
             .expect("unlock immutable generation for digest tamper");
         let mut bytes = fs::read(&database).unwrap();

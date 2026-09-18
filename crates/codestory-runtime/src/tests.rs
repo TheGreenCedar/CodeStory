@@ -3497,7 +3497,8 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
 }
 
 #[test]
-fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_retains_malformed_jsonc() {
+fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_retains_malformed_jsonc()
+{
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");
     let config_path = workspace.path().join("tsconfig.json");
