@@ -59,7 +59,9 @@ fn rust_async_closure_let_bindings_index_without_duplicate_variable() -> Result<
         "async_move_closure",
     ] {
         assert!(
-            function_names.iter().any(|candidate| candidate.contains(name)),
+            function_names
+                .iter()
+                .any(|candidate| candidate.contains(name)),
             "expected FUNCTION node for {name}, got {function_names:?}"
         );
     }
@@ -71,7 +73,9 @@ fn rust_async_closure_let_bindings_index_without_duplicate_variable() -> Result<
         .map(|node| node.serialized_name.as_str())
         .collect();
     assert!(
-        variable_names.iter().any(|candidate| candidate.contains("plain")),
+        variable_names
+            .iter()
+            .any(|candidate| candidate.contains("plain")),
         "expected VARIABLE node for plain let, got {variable_names:?}"
     );
     for name in [
@@ -83,7 +87,8 @@ fn rust_async_closure_let_bindings_index_without_duplicate_variable() -> Result<
         assert!(
             variable_names
                 .iter()
-                .all(|candidate| !candidate.ends_with(name) && !candidate.contains(&format!("::{name}"))),
+                .all(|candidate| !candidate.ends_with(name)
+                    && !candidate.contains(&format!("::{name}"))),
             "closure binding {name} must not also be VARIABLE, got {variable_names:?}"
         );
     }
