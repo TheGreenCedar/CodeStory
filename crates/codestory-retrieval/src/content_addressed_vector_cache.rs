@@ -1684,12 +1684,10 @@ fn decode_cached_vectors(
     let mut vectors = Vec::with_capacity(expected_count);
     for (index, vector_bytes) in row.bytes.chunks_exact(embedding_dim * 4).enumerate() {
         let vector = vector_bytes
-            .chunks_exact(4)
-            .map(|chunk| {
-                f32::from_bits(u32::from_le_bytes(
-                    chunk.try_into().expect("four-byte vector component"),
-                ))
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
             .collect::<Vec<_>>();
         crate::embedded_vector::validate_vector(
             &format!("content-cache:{cache_key}:{index}"),
