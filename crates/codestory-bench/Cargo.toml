@@ -10,7 +10,7 @@ codestory-cli = { workspace = true, features = ["proof-qualification-support"] }
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
 codestory-retrieval = { workspace = true }
-codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }
+codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 tempfile = { workspace = true }
@@ -28,6 +28,7 @@ path = "src/bin/codestory_proof_availability.rs"
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
+codestory-runtime = { workspace = true, features = ["benchmark-support"] }
 criterion = { workspace = true }
 uuid = { workspace = true }
 

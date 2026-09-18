@@ -201,16 +201,16 @@ test("qualification product dependencies use only the reviewed feature topology"
       "runtime qualification feature missing",
       replaceManifestFragment(
         source,
-        'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }',
-        'codestory-runtime = { workspace = true, features = ["benchmark-support"] }',
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        "codestory-runtime = { workspace = true }",
       ),
     ],
     [
       "runtime feature widened",
       replaceManifestFragment(
         source,
-        'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }',
-        'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support", "extra-support"] }',
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support", "extra-support"] }',
       ),
     ],
     [
@@ -233,8 +233,8 @@ test("qualification product dependencies use only the reviewed feature topology"
       "runtime dependency attributes widened",
       replaceManifestFragment(
         source,
-        'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }',
-        'codestory-runtime = { workspace = true, default-features = false, features = ["benchmark-support", "proof-qualification-support"] }',
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-runtime = { workspace = true, default-features = false, features = ["proof-qualification-support"] }',
       ),
     ],
   ];
@@ -246,21 +246,10 @@ test("qualification product dependencies use only the reviewed feature topology"
     );
   }
 
-  const reorderedRuntimeFeatures = replaceManifestFragment(
-    source,
-    '["benchmark-support", "proof-qualification-support"]',
-    '["proof-qualification-support", "benchmark-support"]',
-  );
-  assert.deepEqual(
-    benchmarkDependencyIsolationViolations(reorderedRuntimeFeatures),
-    [],
-    "TOML feature ordering has no policy meaning",
-  );
-
   const reorderedRuntimeAttributes = replaceManifestFragment(
     source,
-    'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }',
-    'codestory-runtime = { features = ["benchmark-support", "proof-qualification-support"], workspace = true }',
+    'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+    'codestory-runtime = { features = ["proof-qualification-support"], workspace = true }',
   );
   assert.deepEqual(
     benchmarkDependencyIsolationViolations(reorderedRuntimeAttributes),
@@ -374,8 +363,26 @@ test("benchmark-only dependencies remain dev-only in qualification mode", () => 
   );
   assertIsolationViolation(
     retrievalBenchmarkInProduct,
-    /benchmark-only retrieval support must remain dev-only/u,
+    /benchmark-only runtime and retrieval support must remain dev-only|product dependencies must not enable benchmark-support/u,
     "retrieval benchmark-support moved to product dependencies",
+  );
+
+  const runtimeBenchmark =
+    'codestory-runtime = { workspace = true, features = ["benchmark-support"] }\n';
+  const withoutRuntimeBenchmarkDevDependency = replaceManifestFragment(
+    source,
+    runtimeBenchmark,
+    "",
+  );
+  const runtimeBenchmarkInProduct = replaceManifestFragment(
+    withoutRuntimeBenchmarkDevDependency,
+    'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }\n',
+    'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }\n',
+  );
+  assertIsolationViolation(
+    runtimeBenchmarkInProduct,
+    /qualification dependencies must use the exact reviewed feature topology|product dependencies must not enable benchmark-support/u,
+    "runtime benchmark-support moved to product dependencies",
   );
 
   const storeBenchmarkSupport = replaceManifestFragment(
@@ -385,7 +392,7 @@ test("benchmark-only dependencies remain dev-only in qualification mode", () => 
   );
   assertIsolationViolation(
     storeBenchmarkSupport,
-    /only runtime qualification fixtures may enable benchmark-support/u,
+    /product dependencies must not enable benchmark-support or test-support/u,
     "unreviewed product dependency enables benchmark-support",
   );
   const obscuredStoreBenchmarkSupport = replaceManifestFragment(
@@ -395,7 +402,7 @@ test("benchmark-only dependencies remain dev-only in qualification mode", () => 
   );
   assertIsolationViolation(
     obscuredStoreBenchmarkSupport,
-    /only runtime qualification fixtures may enable benchmark-support/u,
+    /product dependencies must not enable benchmark-support or test-support/u,
     "extra dependency attributes cannot hide benchmark-support",
   );
 });
@@ -483,7 +490,7 @@ test("test-support never enters codestory-bench product dependencies", () => {
   );
   assertIsolationViolation(
     testSupportInProduct,
-    /product dependencies must never enable test-support/u,
+    /product dependencies must not enable benchmark-support or test-support/u,
     "retrieval test-support",
   );
 
@@ -494,7 +501,7 @@ test("test-support never enters codestory-bench product dependencies", () => {
   );
   assertIsolationViolation(
     agentTestSupport,
-    /product dependencies must never enable test-support/u,
+    /product dependencies must not enable benchmark-support or test-support/u,
     "agent test-support",
   );
 

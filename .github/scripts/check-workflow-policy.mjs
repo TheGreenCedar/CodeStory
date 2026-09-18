@@ -333,7 +333,7 @@ export function benchmarkDependencyIsolationViolations(source) {
       ...ordinaryProductDependencies.map((name) => [name, { workspace: true }]),
       ["codestory-runtime", {
         workspace: true,
-        features: [benchmarkSupport, proofQualificationSupport],
+        features: [proofQualificationSupport],
       }],
     ];
     add(
@@ -371,7 +371,7 @@ export function benchmarkDependencyIsolationViolations(source) {
         })
         && dependencyMatches(dependencies, "codestory-runtime", {
           workspace: true,
-          features: [benchmarkSupport, proofQualificationSupport],
+          features: [proofQualificationSupport],
         })
         && qualificationFeatureOwners.length === 2
         && ["codestory-cli", "codestory-runtime"]
@@ -394,23 +394,22 @@ export function benchmarkDependencyIsolationViolations(source) {
         && dependencyMatches(devDependencies, "codestory-retrieval", {
           workspace: true,
           features: [benchmarkSupport],
+        })
+        && dependencyMatches(dependencies, "codestory-runtime", {
+          workspace: true,
+          features: [proofQualificationSupport],
+        })
+        && dependencyMatches(devDependencies, "codestory-runtime", {
+          workspace: true,
+          features: [benchmarkSupport],
         }),
-      "codestory-bench benchmark-only retrieval support must remain dev-only",
-    );
-    const benchmarkSupportOwners = dependencyFeatureOwnerRecords(
-      dependencies,
-      benchmarkSupport,
+      "codestory-bench benchmark-only runtime and retrieval support must remain dev-only",
     );
     add(
       violations,
-      benchmarkSupportOwners.length === 1
-        && benchmarkSupportOwners[0].name === "codestory-runtime",
-      "codestory-bench only runtime qualification fixtures may enable benchmark-support in product dependencies",
-    );
-    add(
-      violations,
-      dependencyFeatureOwnerRecords(dependencies, "test-support").length === 0,
-      "codestory-bench product dependencies must never enable test-support",
+      dependencyFeatureOwnerRecords(dependencies, benchmarkSupport).length === 0
+        && dependencyFeatureOwnerRecords(dependencies, "test-support").length === 0,
+      "codestory-bench product dependencies must not enable benchmark-support or test-support",
     );
     return violations;
   }
