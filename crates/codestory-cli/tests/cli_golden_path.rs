@@ -2322,8 +2322,32 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
                 && item["claim_label"] == "parser-backed graph, fidelity-gated")),
         "files JSON should include language counts with support tiers: {files:#}"
     );
+    assert_eq!(
+        files["summary"]["framework_route_coverage_included"],
+        serde_json::json!(false),
+        "default files JSON should omit the framework route catalog: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["framework_route_coverage"],
+        serde_json::json!([]),
+        "default files JSON should omit the framework route catalog: {files:#}"
+    );
+    let files_with_routes = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--role",
+            "test",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--include-framework-coverage",
+        ],
+    );
     assert!(
-        files["summary"]["framework_route_coverage"]
+        files_with_routes["summary"]["framework_route_coverage"]
             .as_array()
             .is_some_and(
                 |items| items.iter().any(|item| item["framework"] == "express"
@@ -2336,7 +2360,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
                     && items.iter().any(|item| item["framework"] == "gin"
                         && item["handler_link_support"] == "not_claimed_text_only")
             ),
-        "files JSON should include framework route coverage matrix: {files:#}"
+        "opt-in files JSON should include framework route coverage matrix: {files_with_routes:#}"
     );
     assert!(
         files["files"]
@@ -2396,6 +2420,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             "none",
             "--format",
             "markdown",
+            "--include-framework-coverage",
         ],
     );
     assert!(

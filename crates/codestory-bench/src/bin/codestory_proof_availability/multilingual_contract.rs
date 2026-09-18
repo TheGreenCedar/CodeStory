@@ -251,6 +251,11 @@ const STRUCTURAL_FIXTURES: &[(&str, &str, &str)] = &[
         "{\n  // fixture\n  \"compilerOptions\": { \"strict\": true }\n}",
     ),
     (
+        "terraform",
+        "main.tf",
+        "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"fixture\"\n}\n",
+    ),
+    (
         "shell",
         "scripts/fixture.zsh",
         "fixture() {\n  echo fixture\n}\nfixture\n",

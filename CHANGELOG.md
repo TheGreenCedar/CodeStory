@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Explicit full refresh can recover an incomplete incremental fence that has no
+complete publication identity, without promoting that incomplete predecessor as
+a rollback generation. Incomplete images that still carry a complete publication
+continue to fail closed.
+
 Workspace discovery no longer demotes a complete inventory to Partial when
 `follow_links` hits dangling symlink fixtures or non-regular targets (helm-class
 `frobnitz_with_dev_null` → `/dev/null` and intentional broken-symlink testdata).

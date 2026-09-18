@@ -1539,10 +1539,25 @@ fn read_recovery_database_identity(
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
             if contract == RecoveryDatabaseContract::CurrentPromotion =>
         {
-            Err(promotion_error(format!(
-                "SQLite predecessor {} is incomplete and cannot become a rollback generation",
-                path.display()
-            )))
+            // Incomplete images must never become rollback generations. A
+            // complete publication identity under the incomplete fence fails
+            // closed. An incomplete fence without a complete publication is
+            // not a rollback candidate — treat it as absent so an explicit
+            // full rebuild can replace it.
+            if has_incomplete_incremental_marker(&conn)? {
+                match read_index_publication(&conn)? {
+                    Some(_) => Err(promotion_error(format!(
+                        "SQLite predecessor {} is incomplete and cannot become a rollback generation",
+                        path.display()
+                    ))),
+                    None => Ok(None),
+                }
+            } else {
+                Err(promotion_error(format!(
+                    "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
+                    path.display()
+                )))
+            }
         }
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
