@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+OpenAPI/Swagger schema indexing keeps endpoint graph nodes file-owned when
+sibling fixtures share the same method and path, so repos with multiple API
+specs (localstack-class `tests/aws/files/*.json`, kratos-class
+`.schema/openapi.json` + `spec/swagger.json`) can complete full refresh instead
+of failing closed as `source_collector_failure`.
+
 Dense selection no longer treats a `lib` path segment as a package-callable
 surface for Python sources, so CPython-class stdlib trees (`Lib/`) stop forcing
 tens of thousands of ordinary callables into cold retrieval finalize. Ruby/JS

@@ -12770,7 +12770,7 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
         if !seen.insert((endpoint.method.clone(), endpoint.path.clone())) {
             continue;
         }
-        let node_id = schema_endpoint_node_id(&endpoint.method, &endpoint.path);
+        let node_id = schema_endpoint_node_id(file_id, &endpoint.method, &endpoint.path);
         let label = schema_endpoint_label(&endpoint.method, &endpoint.path);
         local_storage.nodes.push(Node {
             id: node_id,
@@ -12938,9 +12938,14 @@ fn schema_endpoint_label(method: &str, path: &str) -> String {
     )
 }
 
-fn schema_endpoint_node_id(method: &str, path: &str) -> NodeId {
+fn schema_endpoint_node_id(file_id: NodeId, method: &str, path: &str) -> NodeId {
+    // Endpoint node ids must be file-owned. A global method+path hash collides when
+    // sibling OpenAPI/Swagger fixtures share routes (U03 localstack tests/aws/files,
+    // U06 kratos openapi+swagger); INSERT OR REPLACE then rebinds file_node_id and
+    // full-refresh coverage reports collector_failure with verified_source.
     NodeId(generate_id(&format!(
-        "openapi:endpoint:{}",
+        "openapi:endpoint:{}:{}",
+        file_id.0,
         schema_endpoint_label(method, path)
     )))
 }
@@ -14894,7 +14899,7 @@ fn append_schema_endpoint_call_edges(
     }
 
     for call in collect_api_endpoint_calls(source) {
-        let target = schema_endpoint_node_id(&call.method, &call.path);
+        let target = schema_endpoint_node_id(file_id, &call.method, &call.path);
         let target_label = schema_endpoint_label(&call.method, &call.path);
         let source_id =
             enclosing_callable_node_id(sinks.unique_nodes, call.line).unwrap_or(file_id);

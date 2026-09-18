@@ -6086,7 +6086,10 @@ fn test_openapi_schema_indexes_endpoint_symbols() -> Result<()> {
 }"#;
     let storage = index_openapi_schema_file(Path::new("openapi.json"), schema)?
         .expect("schema should be indexed");
-    let endpoint_id = schema_endpoint_node_id("GET", "/api/users");
+    let file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(
+        Path::new("openapi.json"),
+    ));
+    let endpoint_id = schema_endpoint_node_id(file_id, "GET", "/api/users");
     assert!(storage.nodes.iter().any(|node| {
         node.id == endpoint_id
             && node.kind == NodeKind::FUNCTION
@@ -7498,8 +7501,11 @@ export async function createUser() {
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
-    let get_endpoint = schema_endpoint_node_id("GET", "/api/users");
-    let post_endpoint = schema_endpoint_node_id("POST", "/api/users");
+    // Call-site stubs keep a stable openapi:endpoint canonical_id; canonicalize
+    // rebinds the node id from that preserved id (not the pre-canonical file-owned
+    // hash used by dedicated OpenAPI schema projections).
+    let get_endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
+    let post_endpoint = NodeId(generate_id("openapi:endpoint:POST /api/users"));
     let node_by_id = result
         .nodes
         .iter()
@@ -7541,7 +7547,7 @@ export function handler() {}
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("routes.ts"), code, &language_config, None, None)?;
-    let endpoint = schema_endpoint_node_id("GET", "/api/users");
+    let endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
 
     assert!(
         result.nodes.iter().all(|node| node.id != endpoint),
@@ -7566,7 +7572,7 @@ export function handler() {
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
-    let endpoint = schema_endpoint_node_id("GET", "/api/users");
+    let endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
 
     assert!(
         result.nodes.iter().all(|node| node.id != endpoint),
