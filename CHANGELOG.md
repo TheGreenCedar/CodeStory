@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Workspace discovery no longer demotes a complete inventory to Partial when
+`follow_links` hits dangling symlink fixtures or non-regular targets (helm-class
+`frobnitz_with_dev_null` → `/dev/null` and intentional broken-symlink testdata).
+Those paths stay out of the admitted source set and surface as warnings, so full
+refresh can proceed instead of failing closed as `source_discovery_incomplete`.
+
 Rust indexing no longer aborts on `let` bindings to `async ||` / `async move ||`
 closures (meilisearch-class and surrealdb-class sources). Those bindings stay
 function nodes instead of colliding with the local-variable stanza and failing
