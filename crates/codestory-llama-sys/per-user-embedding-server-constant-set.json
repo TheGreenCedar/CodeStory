@@ -1,12 +1,24 @@
 {
   "calibration_required_values": {
-    "capacity_retry_policy": null,
-    "connect_timeout_ms": null,
-    "election_backoff_policy": null,
-    "hard_native_no_progress_ms": null,
-    "request_deadlines_ms": null,
-    "spawn_convergence_timeout_ms": null,
-    "watchdog_cadence_ms": null
+    "capacity_retry_policy": {
+      "retry_after_ms": 40,
+      "retry_class": "after_capacity_change",
+      "retry_condition_source": "named_condition_from_typed_capacity_response"
+    },
+    "connect_timeout_ms": 2000,
+    "election_backoff_policy": {
+      "initial_backoff_ms": 7,
+      "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
+      "maximum_backoff_ms": 114
+    },
+    "hard_native_no_progress_ms": 385431,
+    "request_deadlines_ms": {
+      "bulk_replay_success_budget_ms": 144537,
+      "bulk_request_deadline_ms": 564239,
+      "query_request_deadline_ms": 10000
+    },
+    "spawn_convergence_timeout_ms": 15000,
+    "watchdog_cadence_ms": 19271
   },
   "draft_values": {
     "bulk_replay_success_budget_ms": 180000,
@@ -31,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "86e38df002f68e31e09bb2f035ce7c77c4f749d7487aa576670e037d07ab952e",
+    "calibration_freeze_digest": "459c340225c1091eff4fc6dea20f924ee74b9c511de44c5087f31393f8a5a5da",
+    "input_constant_set_sha256": "e9c8b3e1345806181659fb0669ad6b5896c11dd93975ba4f7260954943cf4d32",
+    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
+    "protocol_sha256": "69688d108bd571f9a3b3b68492991c13d676fc8f944b90718d196ea4d67b297f",
+    "run_artifact_sha256s": [
+      "11a7c3569c0624284c3c8a6e9a3d7c3b3986ad94a962501d897a6767388d10d6",
+      "4aca212e1829b3315953bae05ca720e5c7aa2852ecf3e63e2c5ae01af9306458",
+      "d247e401f826c982447f189881c4fcc4874ae3da1d85f47427b79b2030ea8a86"
+    ],
+    "selected_at": "github-actions-run:35405501839:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "0b48b0ad865c412841da55164ed60dadbe560273",
+    "selection_source_tree": "4266cb777fdf3601a2506f8afe9cf44590733b57"
+  },
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
       "existing_owner_connect": 125,
@@ -54,5 +81,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
