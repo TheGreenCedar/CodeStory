@@ -4522,6 +4522,9 @@ function validatePackagedProof(workflows, violations, graph) {
     "CXX=clang++-13",
     "LIBCLANG_PATH=/usr/lib/llvm-13/lib",
     "-mavxvnni -mavx512bf16 -mamx-tile -mamx-int8",
+    "snapshot.debian.org/archive/debian/20260518T000000Z",
+    "snapshot.debian.org/archive/debian-security/20260518T000000Z",
+    'Acquire::Check-Valid-Until "false"',
   ]) {
     add(
       violations,
