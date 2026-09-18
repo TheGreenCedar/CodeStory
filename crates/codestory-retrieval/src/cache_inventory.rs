@@ -238,7 +238,7 @@ impl InventoryState {
             }
             let apparent_bytes = metadata.len();
             let allocated_bytes = allocated_file_bytes(&metadata);
-            match native_file_identity(&metadata) {
+            match native_file_identity(&path) {
                 Ok(identity) => {
                     self.record_file(&relative, apparent_bytes, allocated_bytes, identity)
                 }
@@ -545,26 +545,11 @@ fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
     CacheInventoryKind::Unknown
 }
 
-fn native_file_identity(metadata: &std::fs::Metadata) -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        Ok(format!(
-            "{}:{}",
-            metadata.volume_serial_number(),
-            metadata.file_index().unwrap_or(0)
-        ))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        anyhow::bail!("native file identity is unsupported on this platform")
-    }
+fn native_file_identity(path: &Path) -> Result<String> {
+    // Windows package lanes reject unstable MetadataExt::volume_serial_number /
+    // file_index (`windows_by_handle`); workspace identity uses the stable Win32 path.
+    codestory_workspace::workspace_path_identity_token(path)?
+        .ok_or_else(|| anyhow::anyhow!("native file identity requires an existing path"))
 }
 
 #[cfg(test)]
