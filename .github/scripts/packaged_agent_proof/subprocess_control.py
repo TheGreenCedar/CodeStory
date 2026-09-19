@@ -147,6 +147,59 @@ _READINESS_KIND_STATES = frozenset(
         ("updating", "updating"),
     )
 )
+_LEGACY_SEARCH_RETRIEVAL_STATES = frozenset(("ready", "degraded"))
+_SCHEMA3_SEARCH_RETRIEVAL_STATES = frozenset(("full", "degraded"))
+_SEARCH_CONVERGED_RETRIEVAL_STATES = frozenset(("ready", "full"))
+
+
+def is_schema3_search_projection(state: dict) -> bool:
+    """True when the payload is the agent evidence projection (schema_version 3)."""
+
+    return state.get("schema_version") == 3
+
+
+def search_retrieval_state(state: dict, *, query: object) -> str:
+    """Validate an MCP search projection and return its retrieval.state.
+
+    Legacy installed-host proofs echoed ``query`` / ``hits`` with
+    ``retrieval.state∈{ready,degraded}``. Live schema-3 search returns an
+    evidence envelope (``kind`` / ``evidence`` / ``retrieval.state∈{full,degraded}``)
+    and omits those legacy fields. Accept either shape; never treat
+    ``unavailable`` (or other non-ready states) as convergence.
+    """
+
+    if is_schema3_search_projection(state):
+        require(
+            state.get("kind") == "complete",
+            f"MCP search did not return a complete schema-3 evidence projection: {state!r}",
+        )
+        require(
+            isinstance(state.get("evidence"), list),
+            f"MCP search returned non-array evidence: {state!r}",
+        )
+        retrieval = state.get("retrieval")
+        require(
+            isinstance(retrieval, dict)
+            and retrieval.get("state") in _SCHEMA3_SEARCH_RETRIEVAL_STATES,
+            f"MCP search did not return the ready installed retrieval projection: {state!r}",
+        )
+        return retrieval["state"]
+
+    require(
+        isinstance(query, str) and state.get("query") == query,
+        f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+    )
+    require(
+        isinstance(state.get("hits"), list),
+        f"MCP search returned non-array hits: {state!r}",
+    )
+    retrieval = state.get("retrieval")
+    require(
+        isinstance(retrieval, dict)
+        and retrieval.get("state") in _LEGACY_SEARCH_RETRIEVAL_STATES,
+        f"MCP search did not return the ready installed retrieval projection: {state!r}",
+    )
+    return retrieval["state"]
 
 
 def tool_result_envelope(result: dict, *, name: str, attempt: int) -> dict:
@@ -473,27 +526,17 @@ class McpProcess:
             total_attempts += attempts
             self.tool_attempt_counts[request_id] = total_attempts
             state = response["result"]["structuredContent"]
-            query = arguments.get("query")
-            require(
-                isinstance(query, str) and state.get("query") == query,
-                f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+            retrieval_state = search_retrieval_state(
+                state, query=arguments.get("query")
             )
-            require(
-                isinstance(state.get("hits"), list),
-                f"MCP search returned non-array hits: {state!r}",
-            )
-            retrieval = state.get("retrieval")
-            require(
-                isinstance(retrieval, dict)
-                and retrieval.get("state") in ("ready", "degraded"),
-                f"MCP search did not return the ready installed retrieval projection: {state!r}",
-            )
-            if retrieval.get("state") == "ready":
+            if retrieval_state in _SEARCH_CONVERGED_RETRIEVAL_STATES:
                 return response, total_attempts
             # The projection reports the real retrieval state, so a fresh install
             # answers lexically while the semantic sidecar is still publishing.
             # That degraded window is convergence, not failure: keep asking until
             # the shared deadline, and let a host that never converges fail loud.
+            # Schema-3 uses retrieval.state=full once hybrid is published; degraded
+            # still means "keep polling", never "pass".
             remaining = deadline - time.monotonic()
             require(
                 remaining > 0,
