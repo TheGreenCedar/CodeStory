@@ -895,6 +895,240 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 }
 
 #[test]
+fn core_exact_search_is_invariant_to_absolute_project_root() {
+    struct Fixture {
+        controller: AppController,
+        storage_path: PathBuf,
+        source_path: PathBuf,
+    }
+
+    fn fixture(root: &Path) -> Fixture {
+        let source_path = root.join("src").join("module-entry.ts");
+        fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source directory");
+        fs::write(
+            &source_path,
+            "export function renderFailurePanel() {}\nexport function resume() {}\n",
+        )
+        .expect("write source fixture");
+        let external_source = root
+            .parent()
+            .expect("workspace root")
+            .join("external-render-failure-panel.ts");
+        fs::write(&external_source, "export const external = true\n")
+            .expect("write external source fixture");
+
+        #[cfg(unix)]
+        let alias_source = {
+            use std::os::unix::fs::symlink;
+
+            let alias_root = root.with_file_name(format!(
+                "{}-alias",
+                root.file_name()
+                    .expect("project directory name")
+                    .to_string_lossy()
+            ));
+            symlink(root, &alias_root).expect("create native project alias");
+            Some(alias_root.join("src").join("module-entry.ts"))
+        };
+        #[cfg(not(unix))]
+        let alias_source: Option<PathBuf> = None;
+
+        let storage_path = root.join("codestory.db");
+        {
+            let mut storage = Storage::open(&storage_path).expect("open storage");
+            let absolute_source = source_path.to_string_lossy().to_string();
+            let external_source = external_source.to_string_lossy().to_string();
+            let mut nodes = vec![
+                Node {
+                    id: CoreNodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: absolute_source.clone(),
+                    qualified_name: Some(absolute_source),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "renderFailurePanel".to_string(),
+                    qualified_name: Some("ui::renderFailurePanel".to_string()),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(12),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "resume".to_string(),
+                    qualified_name: Some("service::Session::resume".to_string()),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(13),
+                    kind: NodeKind::FILE,
+                    serialized_name: external_source.clone(),
+                    qualified_name: Some(external_source),
+                    file_node_id: Some(CoreNodeId(13)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            ];
+            if let Some(alias_source) = alias_source {
+                let alias_source = alias_source.to_string_lossy().to_string();
+                nodes.push(Node {
+                    id: CoreNodeId(14),
+                    kind: NodeKind::FILE,
+                    serialized_name: alias_source.clone(),
+                    qualified_name: Some(alias_source),
+                    file_node_id: Some(CoreNodeId(14)),
+                    start_line: Some(1),
+                    ..Default::default()
+                });
+            }
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert core nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(root.to_path_buf(), storage_path.clone())
+            .expect("open project");
+        Fixture {
+            controller,
+            storage_path,
+            source_path,
+        }
+    }
+
+    fn search(controller: &AppController, query: &str) -> Vec<SearchHit> {
+        controller
+            .search_results(SearchRequest {
+                query: query.to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("search complete core")
+            .hits
+    }
+
+    let workspace = tempdir().expect("create workspace");
+    let matching_root = workspace.path().join("render-failure-panel-root");
+    let neutral_root = workspace.path().join("neutral-root");
+    let matching = fixture(&matching_root);
+    let neutral = fixture(&neutral_root);
+
+    for fixture in [&matching, &neutral] {
+        let file_hits = search(&fixture.controller, "src/module-entry.ts");
+        assert!(
+            file_hits.iter().any(|hit| {
+                hit.node_id == NodeId("10".to_string())
+                    && hit.kind == codestory_contracts::api::NodeKind::FILE
+                    && hit.file_path.as_deref() == Some("src/module-entry.ts")
+            }),
+            "project-relative file lookup must remain available: {file_hits:#?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            file_hits
+                .iter()
+                .any(|hit| hit.node_id == NodeId("14".to_string())),
+            "native aliases inside the selected project must normalize to the same relative lookup: {file_hits:#?}"
+        );
+
+        let absolute_file_hits = search(
+            &fixture.controller,
+            fixture.source_path.to_string_lossy().as_ref(),
+        );
+        assert!(
+            absolute_file_hits
+                .iter()
+                .any(|hit| hit.node_id == NodeId("10".to_string())),
+            "explicit in-project absolute-file lookup must remain available: {absolute_file_hits:#?}"
+        );
+
+        let external_hits = search(&fixture.controller, "external-render-failure-panel.ts");
+        assert!(
+            external_hits
+                .iter()
+                .all(|hit| hit.node_id != NodeId("13".to_string())),
+            "external absolute FILE identities must not participate in project search: {external_hits:#?}"
+        );
+
+        let qualified_hits = search(&fixture.controller, "service::Session::resume");
+        assert_eq!(
+            qualified_hits.first().map(|hit| hit.node_id.clone()),
+            Some(NodeId("12".to_string())),
+            "ordinary qualified-symbol lookup must retain its exact result"
+        );
+        assert_eq!(
+            qualified_hits.first().map(|hit| hit.display_name.as_str()),
+            Some("service::Session::resume"),
+            "non-FILE qualified labels must remain untouched"
+        );
+
+        let stored = Storage::open_read_only(&fixture.storage_path)
+            .expect("open stored core")
+            .get_node(CoreNodeId(10))
+            .expect("read stored FILE node")
+            .expect("stored FILE node");
+        assert_eq!(
+            stored.serialized_name.as_str(),
+            fixture.source_path.to_string_lossy().as_ref(),
+            "search labels must not rewrite stored FILE identity"
+        );
+        assert_eq!(
+            stored.qualified_name.as_deref(),
+            Some(fixture.source_path.to_string_lossy().as_ref()),
+            "search labels must not rewrite stored FILE qualified identity"
+        );
+        assert!(
+            !search_index_generation_root(&fixture.storage_path).exists(),
+            "core-only search must not create a retrieval/search generation"
+        );
+    }
+
+    let matching_result = matching
+        .controller
+        .search_results(SearchRequest {
+            query: "renderFailurePanel".to_string(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .expect("search complete core");
+    assert_eq!(matching_result.retrieval.mode, RetrievalModeDto::Symbolic);
+    assert!(matching_result.retrieval_publication.is_none());
+    let matching_hits = matching_result.hits;
+    let neutral_hits = search(&neutral.controller, "renderFailurePanel");
+    assert_eq!(
+        matching_hits.first().map(|hit| hit.node_id.clone()),
+        Some(NodeId("11".to_string())),
+        "the exact symbol must remain first"
+    );
+    assert_eq!(
+        matching_hits
+            .iter()
+            .map(|hit| hit.node_id.clone())
+            .collect::<Vec<_>>(),
+        neutral_hits
+            .iter()
+            .map(|hit| hit.node_id.clone())
+            .collect::<Vec<_>>(),
+        "absolute checkout spelling must not add fuzzy FILE results to an exact-symbol query"
+    );
+}
+
+#[test]
 fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
     let function = SearchHit {
         node_id: NodeId("function".to_string()),

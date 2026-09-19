@@ -329,20 +329,57 @@ impl AppController {
         max_results: usize,
     ) -> Result<Vec<SearchHit>, ApiError> {
         let storage = self.open_storage_read_only()?;
+        let project_root = self.require_project_root()?;
+        let absolute_file_query = Path::new(query.trim()).is_absolute();
+        let expected_rows = storage
+            .get_canonical_search_symbol_count()
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+            })?;
         let mut symbols = Vec::new();
-        let (node_names, _) = crate::load_canonical_search_symbols(
-            &storage,
-            crate::semantic_projection::SEARCH_SYMBOL_STREAM_BATCH_SIZE,
-            None,
-            |batch| {
-                symbols.extend(
-                    batch
-                        .into_iter()
-                        .map(|entry| (entry.node_id, entry.display_name)),
-                );
-                Ok(())
-            },
-        )?;
+        let mut node_names = HashMap::with_capacity(expected_rows as usize);
+        let mut after_node_id = None;
+        let mut stream_rows = 0_usize;
+        loop {
+            let batch = storage
+                .get_canonical_search_symbol_detail_batch_after(
+                    after_node_id,
+                    crate::semantic_projection::SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+                )
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to stream canonical search symbol details: {error}"
+                    ))
+                })?;
+            if batch.is_empty() {
+                break;
+            }
+            after_node_id = batch.last().map(|entry| entry.node_id);
+            stream_rows = stream_rows.saturating_add(batch.len());
+            for entry in batch {
+                let display_name =
+                    if entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64) {
+                        let path = Path::new(&entry.display_name);
+                        match codestory_workspace::workspace_relative_path(&project_root, path) {
+                            // Preserve an explicit absolute FILE lookup, but keep
+                            // checkout-root spelling out of ordinary fuzzy search.
+                            Some(_) if absolute_file_query => entry.display_name.clone(),
+                            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+                            None if path.is_absolute() => continue,
+                            None => entry.display_name.clone(),
+                        }
+                    } else {
+                        entry.display_name
+                    };
+                node_names.insert(entry.node_id, display_name.clone());
+                symbols.push((entry.node_id, display_name));
+            }
+        }
+        if stream_rows != expected_rows as usize {
+            return Err(ApiError::internal(format!(
+                "Canonical search symbol detail stream count changed: expected {expected_rows}, loaded {stream_rows}"
+            )));
+        }
         let matches = search_core_symbol_names_with_scores(&symbols, query);
         let names = node_names_for_ids(&node_names, matches.iter().map(|(id, _)| *id));
         let mut hits = matches
@@ -356,9 +393,14 @@ impl AppController {
                 hit
             })
             .collect::<Vec<_>>();
-        let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
+            compare_search_hits_with_project_root(
+                Some(project_root.as_path()),
+                query,
+                left,
+                right,
+                None,
+            )
         });
         hits.truncate(max_results.clamp(1, 50));
         Ok(hits)
