@@ -135,6 +135,102 @@ def extract_resource(
     raise ProofFailure(f"resource response did not contain {uri}")
 
 
+_READINESS_CODE_STATES = frozenset(
+    (
+        ("codestory_preparing", "preparing"),
+        ("codestory_updating", "updating"),
+    )
+)
+_READINESS_KIND_STATES = frozenset(
+    (
+        ("preparing", "preparing"),
+        ("updating", "updating"),
+    )
+)
+
+
+def tool_result_envelope(result: dict, *, name: str, attempt: int) -> dict:
+    """Resolve the tool payload for MCP 2024-11-05 text envelopes and structuredContent.
+
+    Protocol revisions that omit structuredContent on fail-open preparing still carry the
+    same JSON object in content[0].text. Callers must treat those as equivalent; parsing
+    here is not a readiness bypass for terminal failures.
+    """
+
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    content = result.get("content")
+    if isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict) and first.get("type") == "text":
+            text = first.get("text")
+            if isinstance(text, str) and text:
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ProofFailure(
+                        f"MCP {name} attempt {attempt} returned non-JSON text content: {result!r}"
+                    ) from exc
+                if isinstance(parsed, dict):
+                    return parsed
+    raise ProofFailure(
+        f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}"
+    )
+
+
+def is_readiness_retry_envelope(envelope: dict) -> bool:
+    return (envelope.get("code"), envelope.get("state")) in _READINESS_CODE_STATES or (
+        envelope.get("kind"),
+        envelope.get("state"),
+    ) in _READINESS_KIND_STATES
+
+
+def readiness_retry_after_ms(envelope: dict) -> int | None:
+    retry_after_ms = envelope.get("retry_after_ms")
+    if (
+        isinstance(retry_after_ms, int)
+        and not isinstance(retry_after_ms, bool)
+        and retry_after_ms >= 0
+    ):
+        return retry_after_ms
+    minimum_next = envelope.get("minimum_next")
+    if isinstance(minimum_next, dict):
+        after_ms = minimum_next.get("after_ms")
+        if (
+            isinstance(after_ms, int)
+            and not isinstance(after_ms, bool)
+            and after_ms >= 0
+        ):
+            return after_ms
+    return None
+
+
+def allows_same_request_retry(envelope: dict, tool_name: str) -> bool:
+    if envelope.get("retry_tool") == tool_name:
+        return True
+    minimum_next = envelope.get("minimum_next")
+    return (
+        isinstance(minimum_next, dict)
+        and minimum_next.get("kind") == "retry_same_request"
+    )
+
+
+def attach_structured_content(response: dict, envelope: dict) -> dict:
+    """Expose a parsed text envelope as structuredContent for proof callers."""
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return response
+    if isinstance(result.get("structuredContent"), dict):
+        return response
+    normalized = dict(response)
+    normalized_result = dict(result)
+    normalized_result["structuredContent"] = envelope
+    normalized["result"] = normalized_result
+    return normalized
+
+
 class McpProcess:
     def __init__(
         self,
@@ -319,16 +415,8 @@ class McpProcess:
                 isinstance(result, dict),
                 f"MCP {name} attempt {attempt} returned a non-object result: {result!r}",
             )
-            state = result.get("structuredContent")
-            require(
-                isinstance(state, dict),
-                f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}",
-            )
-            retryable = (state.get("code"), state.get("state")) in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            )
-            if retryable:
+            state = tool_result_envelope(result, name=name, attempt=attempt)
+            if is_readiness_retry_envelope(state):
                 self._wait_for_readiness_retry(
                     name,
                     attempt,
@@ -341,7 +429,7 @@ class McpProcess:
                     False,
                     f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
                 )
-            return response, attempt
+            return attach_structured_content(response, state), attempt
 
     def _wait_for_readiness_retry(
         self,
@@ -351,22 +439,16 @@ class McpProcess:
         deadline: float,
     ) -> None:
         require(
-            (state.get("code"), state.get("state"))
-            in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            ),
+            is_readiness_retry_envelope(state),
             f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
         )
         require(
-            state.get("retry_tool") == name,
+            allows_same_request_retry(state, name),
             f"MCP {name} attempt {attempt} returned the wrong retry tool: {state!r}",
         )
-        retry_after_ms = state.get("retry_after_ms")
+        retry_after_ms = readiness_retry_after_ms(state)
         require(
-            isinstance(retry_after_ms, int)
-            and not isinstance(retry_after_ms, bool)
-            and retry_after_ms >= 0,
+            retry_after_ms is not None,
             f"MCP {name} attempt {attempt} returned invalid retry_after_ms: {state!r}",
         )
         remaining = deadline - time.monotonic()

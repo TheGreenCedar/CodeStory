@@ -82,6 +82,134 @@ def _readiness_convergence_test(query: str, ready_retrieval: dict) -> None:
     )
 
 
+def _text_preparing_2024_11_05_convergence_test(
+    query: str, ready_retrieval: dict
+) -> None:
+    # Live MCP 2024-11-05 fail-open preparing omits structuredContent and puts the
+    # kind/state envelope in content[0].text. Qual Metal/Windows proofs rejected that
+    # shape before retrying; keep the structured code path covered above and prove the
+    # text envelope retries equivalently here.
+    preparing_envelope = {
+        "kind": "preparing",
+        "state": "preparing",
+        "retry_after_ms": 0,
+        "minimum_next": {"kind": "retry_same_request", "after_ms": 0},
+        "operation": {
+            "progress": 20,
+            "stage": "core_freshness",
+            "state": "updating",
+        },
+    }
+    preparing = {
+        "result": {
+            "isError": False,
+            "content": [
+                {"type": "text", "text": json.dumps(preparing_envelope)},
+            ],
+        }
+    }
+    ready = {
+        "result": {
+            "structuredContent": {
+                "query": query,
+                "hits": [],
+                "retrieval": ready_retrieval,
+            }
+        }
+    }
+    scripted = ScriptedMcpProcess([preparing, ready])
+    response, attempts = scripted.search_until_ready(
+        {"query": query}, "self-test-text-preparing"
+    )
+    require(
+        attempts == 2,
+        "2024-11-05 text preparing search did not converge on its second attempt",
+    )
+    require(
+        scripted.tool_attempt_counts.get("self-test-text-preparing") == 2,
+        "2024-11-05 text preparing attempt count was not retained",
+    )
+    require(
+        response["result"]["structuredContent"]["retrieval"] == ready_retrieval,
+        "2024-11-05 text preparing convergence lost the ready structured payload",
+    )
+
+    ground_preparing = {
+        "result": {
+            "isError": False,
+            "content": [
+                {"type": "text", "text": json.dumps(preparing_envelope)},
+            ],
+        }
+    }
+    ground_ready_payload = {
+        "project": "/self-test",
+        "state": "ready",
+        "budget": "strict",
+    }
+    ground_ready = {
+        "result": {
+            "isError": False,
+            "content": [
+                {"type": "text", "text": json.dumps(ground_ready_payload)},
+            ],
+        }
+    }
+    ground_host = ScriptedMcpProcess([ground_preparing, ground_ready])
+    ground_response, ground_attempts = ground_host.tool_until_ready(
+        "ground",
+        {"project": "/self-test", "budget": "strict"},
+        "self-test-text-ground",
+    )
+    require(
+        ground_attempts == 2,
+        "2024-11-05 text preparing ground did not converge on its second attempt",
+    )
+    require(
+        ground_response["result"]["structuredContent"] == ground_ready_payload,
+        "2024-11-05 text-only ready ground was not exposed as structuredContent",
+    )
+
+    # Terminal unavailable must still fail closed even when delivered as text only.
+    unavailable_envelope = {
+        "code": "codestory_unavailable",
+        "state": "unavailable",
+        "message": "hostile terminal response",
+    }
+    unavailable = ScriptedMcpProcess(
+        [
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(unavailable_envelope),
+                        }
+                    ],
+                }
+            }
+        ]
+    )
+    try:
+        unavailable.tool_until_ready(
+            "ground",
+            {"project": "/self-test", "budget": "strict"},
+            "self-test-text-unavailable",
+        )
+    except ProofFailure as exc:
+        require(
+            "codestory_unavailable" in str(exc),
+            f"text-only terminal MCP failure omitted its diagnostics: {exc}",
+        )
+    else:
+        raise ProofFailure("text-only terminal MCP unavailable response was retried")
+    require(
+        len(unavailable.calls) == 1,
+        "text-only terminal MCP unavailable response was retried",
+    )
+
+
 def _degraded_convergence_test(query: str, ready_retrieval: dict) -> None:
     # The truthful projection answers lexically while the semantic sidecar is
     # still publishing; that window must read as convergence, not failure.
@@ -201,6 +329,7 @@ def run_installation_self_tests() -> None:
     query = "scripted-search"
     ready_retrieval = _ready_retrieval_fixture()
     _readiness_convergence_test(query, ready_retrieval)
+    _text_preparing_2024_11_05_convergence_test(query, ready_retrieval)
     _degraded_convergence_test(query, ready_retrieval)
     _terminal_unavailable_test(query)
     _hostile_result_tests(query, ready_retrieval)
