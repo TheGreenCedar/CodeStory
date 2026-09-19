@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Core-only symbol search ranks project files by their project-relative paths, so
+moving a checkout no longer adds unrelated fuzzy results from its absolute root.
+Explicit in-project absolute-path lookup remains available.
+
 Java classes, interfaces, enums, records, and annotation declarations now keep
 their declared visibility during indexing, so semantic retrieval can recognize
 public APIs from that evidence.
