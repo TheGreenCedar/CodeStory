@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Windows core publication again opens the staged `codestory.db` with a
+write-capable handle before its durability sync, so `ground` / activation can
+finish `core_freshness` publish instead of failing with `Access is denied`
+(os error 5).
+
 Explicit full refresh can recover an incomplete incremental fence that has no
 complete publication identity, without promoting that incomplete predecessor as
 a rollback generation. Incomplete images that still carry a complete publication
