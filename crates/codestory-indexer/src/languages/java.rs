@@ -32,7 +32,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use tree_sitter::{Node as TsNode, Tree};
+use codestory_contracts::graph::{AccessKind, NodeKind};
+use tree_sitter::{Node as TsNode, Point, Tree};
 
 use super::LanguageExtraction;
 use crate::{
@@ -84,6 +85,50 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
 
 fn java_language() -> tree_sitter::Language {
     tree_sitter_java::LANGUAGE.into()
+}
+
+/// Returns the visibility declared on the exact Java type at `start_line` and
+/// `start_col`. Java type declarations without an access modifier have package
+/// visibility; nested types may also declare protected or private visibility.
+pub(crate) fn type_declaration_access(
+    tree: &Tree,
+    start_line: u32,
+    start_col: u32,
+    kind: NodeKind,
+) -> Option<AccessKind> {
+    let expected_syntax = match kind {
+        NodeKind::CLASS => &["class_declaration", "record_declaration"][..],
+        NodeKind::INTERFACE => &["interface_declaration"][..],
+        NodeKind::ENUM => &["enum_declaration"][..],
+        NodeKind::ANNOTATION => &["annotation_type_declaration"][..],
+        _ => return None,
+    };
+    let point = Point::new(
+        usize::try_from(start_line.checked_sub(1)?).ok()?,
+        usize::try_from(start_col.checked_sub(1)?).ok()?,
+    );
+    let mut declaration = tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)?;
+    while !expected_syntax.contains(&declaration.kind()) {
+        declaration = declaration.parent()?;
+    }
+    let mut cursor = declaration.walk();
+    let modifiers = declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers");
+    let declared_access = modifiers.and_then(|modifiers| {
+        let mut cursor = modifiers.walk();
+        modifiers.children(&mut cursor).find_map(|modifier| {
+            Some(match modifier.kind() {
+                "public" => AccessKind::Public,
+                "protected" => AccessKind::Protected,
+                "private" => AccessKind::Private,
+                _ => return None,
+            })
+        })
+    });
+    Some(declared_access.unwrap_or(AccessKind::Default))
 }
 
 /// Manual receiver-call edges for one parsed Java file.

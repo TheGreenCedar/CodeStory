@@ -1402,3 +1402,69 @@ private:
 
     Ok(())
 }
+
+#[test]
+fn test_java_public_type_visibility_is_captured() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "TypeVisibility.java",
+        r#"
+public class PublicClass {}
+class PackageClass {}
+public interface PublicInterface {}
+interface PackageInterface {}
+public enum PublicEnum { VALUE }
+enum PackageEnum { VALUE }
+public record PublicRecord(int value) {}
+record PackageRecord(int value) {}
+public @interface PublicAnnotation {}
+@interface PackageAnnotation {}
+@interface PublicMarker {}
+@PublicMarker class AnnotatedDefault {}
+@SuppressWarnings("public") class AnnotationStringDefault {}
+// public must not leak into the next declaration.
+class CommentDefault {}
+abstract public class OrderedPublic {}
+class Container {
+    protected interface ProtectedInterface {}
+    private enum PrivateEnum { VALUE }
+}
+class SameLine { public class Open {} private class Closed {} class Local {} }
+"#,
+    )])?;
+    let nodes = storage.get_nodes()?;
+
+    for (name, expected) in [
+        ("PublicClass", AccessKind::Public),
+        ("PackageClass", AccessKind::Default),
+        ("PublicInterface", AccessKind::Public),
+        ("PackageInterface", AccessKind::Default),
+        ("PublicEnum", AccessKind::Public),
+        ("PackageEnum", AccessKind::Default),
+        ("PublicRecord", AccessKind::Public),
+        ("PackageRecord", AccessKind::Default),
+        ("PublicAnnotation", AccessKind::Public),
+        ("PackageAnnotation", AccessKind::Default),
+        ("PublicMarker", AccessKind::Default),
+        ("AnnotatedDefault", AccessKind::Default),
+        ("AnnotationStringDefault", AccessKind::Default),
+        ("CommentDefault", AccessKind::Default),
+        ("OrderedPublic", AccessKind::Public),
+        ("ProtectedInterface", AccessKind::Protected),
+        ("PrivateEnum", AccessKind::Private),
+        ("SameLine.Open", AccessKind::Public),
+        ("SameLine.Closed", AccessKind::Private),
+        ("SameLine.Local", AccessKind::Default),
+    ] {
+        let node = nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} type node missing"));
+        assert_eq!(
+            storage.get_component_access(node.id)?,
+            Some(expected),
+            "Java type {name} must retain its declared visibility"
+        );
+    }
+
+    Ok(())
+}

@@ -181,6 +181,89 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
 }
 
 #[test]
+fn activation_rebuilds_release_java_visibility_projection() {
+    let project = tempfile::tempdir().expect("project");
+    let seed_cache = tempfile::tempdir().expect("seed cache");
+    let cache = tempfile::tempdir().expect("legacy cache");
+    fs::write(
+        project.path().join("PublicApi.java"),
+        "public class PublicApi {}\n",
+    )
+    .expect("write Java source");
+
+    let seed_path = seed_cache.path().join("codestory.db");
+    let runtime = Runtime::new();
+    runtime
+        .project_service()
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), seed_path.clone())
+        .expect("open seed");
+    runtime
+        .index_service()
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish seed");
+
+    let storage_path = cache.path().join("codestory.db");
+    fs::copy(
+        codestory_store::resolve_core_database_path(&seed_path).unwrap(),
+        &storage_path,
+    )
+    .expect("copy release core");
+    let mut permissions = fs::metadata(&storage_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o600);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(&storage_path, permissions).unwrap();
+    let connection = rusqlite::Connection::open(&storage_path).unwrap();
+    let removed = connection
+        .execute("DELETE FROM component_access", [])
+        .expect("remove projection absent from the release core");
+    assert!(removed > 0, "seed contains the current Java projection");
+    connection
+        .execute_batch("PRAGMA user_version = 31; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("stamp the release schema");
+    drop(connection);
+    let predecessor = fs::read(&storage_path).unwrap();
+
+    Runtime::new()
+        .activation_service()
+        .activate_core_only(
+            project.path(),
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("activation rebuilds the release Java projection");
+    assert_eq!(
+        fs::read(&storage_path).unwrap(),
+        predecessor,
+        "release rollback bytes remain unchanged"
+    );
+
+    let store = Store::open_read_only(&storage_path).unwrap();
+    let publication = store.get_complete_index_publication().unwrap().unwrap();
+    assert_eq!(
+        publication.mode,
+        codestory_store::IndexPublicationMode::Full
+    );
+    let public_api = store
+        .get_nodes()
+        .unwrap()
+        .into_iter()
+        .find(|node| {
+            node.kind == codestory_contracts::graph::NodeKind::CLASS
+                && node.serialized_name.ends_with("PublicApi")
+        })
+        .expect("rebuilt PublicApi class");
+    assert_eq!(
+        store.get_component_access(public_api.id).unwrap(),
+        Some(codestory_contracts::graph::AccessKind::Public)
+    );
+}
+
+#[test]
 fn activation_publishes_complete_terraform_structural_artifacts() {
     let project = tempfile::tempdir().expect("project");
     let cache = tempfile::tempdir().expect("cache");
