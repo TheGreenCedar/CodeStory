@@ -16239,6 +16239,23 @@ fn index_file_with_resolution_inputs(
                 )
             } else {
                 access_kind.or_else(|| {
+                    if language_config.language_name == "java"
+                        && matches!(
+                            kind,
+                            NodeKind::CLASS
+                                | NodeKind::INTERFACE
+                                | NodeKind::ENUM
+                                | NodeKind::ANNOTATION
+                        )
+                        && !matches!(
+                            canonical_role,
+                            CanonicalNodeRole::Definition
+                                | CanonicalNodeRole::Declaration
+                                | CanonicalNodeRole::ForwardDeclaration
+                        )
+                    {
+                        return None;
+                    }
                     infer_access_from_source(
                         language_config.language_name,
                         &tree,

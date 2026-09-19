@@ -87,9 +87,9 @@ fn java_language() -> tree_sitter::Language {
     tree_sitter_java::LANGUAGE.into()
 }
 
-/// Returns the visibility declared on the exact Java type at `start_line` and
-/// `start_col`. Java type declarations without an access modifier have package
-/// visibility; nested types may also declare protected or private visibility.
+/// Returns the declared visibility modifier for the exact Java type at
+/// `start_line` and `start_col`, or [`AccessKind::Default`] when that
+/// declaration has no explicit access modifier.
 pub(crate) fn type_declaration_access(
     tree: &Tree,
     start_line: u32,
