@@ -808,8 +808,13 @@ fn write_pointer_atomic(
 }
 
 pub(crate) fn sync_staging_database(path: &Path) -> Result<(), StorageError> {
+    // Windows `FlushFileBuffers` requires a writable handle. A read-only open
+    // fails with `Access is denied (os error 5)` — qualification
+    // 35411516456 / #2327 during `core_freshness` publish of staged
+    // `codestory.db`. Same class as disposable seal (#1365): open write, no
+    // create/truncate, then sync.
     OpenOptions::new()
-        .read(true)
+        .write(true)
         .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| core_path_error("sync staged generation", path, error))?;
@@ -942,6 +947,42 @@ mod tests {
             .expect("generation path");
         fs::create_dir_all(path.parent().expect("generation parent")).expect("create generation");
         fs::write(path, b"SQLite generation fixture").expect("seed generation");
+    }
+
+    #[test]
+    fn sync_staging_database_uses_a_write_capable_handle() {
+        // Regression: Windows Vulkan packaged proof
+        // (Actions 35411516456 / #2327) failed at core_freshness with
+        // `core_publication_io: Failed to sync staged generation …codestory.db:
+        // Access is denied. (os error 5)` because this path opened the staged
+        // database read-only before `sync_all`. Windows FlushFileBuffers
+        // rejects that handle; a write-capable open does not create or
+        // truncate the existing candidate.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let path = root.path().join("codestory.db");
+        fs::write(&path, b"SQLite staged generation fixture").expect("seed stage");
+
+        #[cfg(windows)]
+        {
+            let read_only = OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .expect("open staged generation read-only");
+            let error = read_only
+                .sync_all()
+                .expect_err("read-only sync_all must fail on Windows");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(5),
+                "expected Access is denied (os error 5), got {error}"
+            );
+        }
+
+        sync_staging_database(&path).expect("write-capable staged sync");
+        assert_eq!(
+            fs::read(&path).expect("reread staged generation"),
+            b"SQLite staged generation fixture"
+        );
     }
 
     #[test]
