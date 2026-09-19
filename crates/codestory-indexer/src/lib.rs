@@ -10913,8 +10913,17 @@ fn infer_access_from_source(
     source: &str,
     lines: &LineOffsets,
     start_line: u32,
+    start_col: u32,
     kind: NodeKind,
 ) -> Option<AccessKind> {
+    if language_name == "java"
+        && matches!(
+            kind,
+            NodeKind::CLASS | NodeKind::INTERFACE | NodeKind::ENUM | NodeKind::ANNOTATION
+        )
+    {
+        return languages::java::type_declaration_access(tree, start_line, start_col, kind);
+    }
     if !matches!(
         kind,
         NodeKind::METHOD
@@ -16230,12 +16239,30 @@ fn index_file_with_resolution_inputs(
                 )
             } else {
                 access_kind.or_else(|| {
+                    if language_config.language_name == "java"
+                        && matches!(
+                            kind,
+                            NodeKind::CLASS
+                                | NodeKind::INTERFACE
+                                | NodeKind::ENUM
+                                | NodeKind::ANNOTATION
+                        )
+                        && !matches!(
+                            canonical_role,
+                            CanonicalNodeRole::Definition
+                                | CanonicalNodeRole::Declaration
+                                | CanonicalNodeRole::ForwardDeclaration
+                        )
+                    {
+                        return None;
+                    }
                     infer_access_from_source(
                         language_config.language_name,
                         &tree,
                         source,
                         &line_offsets,
                         start_line,
+                        start_col_1,
                         kind,
                     )
                 })

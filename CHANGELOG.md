@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Java classes, interfaces, enums, records, and annotation declarations now keep
+their declared visibility during indexing, so semantic retrieval can recognize
+public APIs from that evidence.
+
 Windows core publication again opens the staged `codestory.db` with a
 write-capable handle before its durability sync, so `ground` / activation can
 finish `core_freshness` publish instead of failing with `Access is denied`

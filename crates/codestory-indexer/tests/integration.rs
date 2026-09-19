@@ -1402,3 +1402,284 @@ private:
 
     Ok(())
 }
+
+#[test]
+fn test_java_public_type_visibility_is_captured() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "TypeVisibility.java",
+        r#"
+public class PublicClass {}
+class PackageClass {}
+public interface PublicInterface {}
+interface PackageInterface {}
+public enum PublicEnum { VALUE }
+enum PackageEnum { VALUE }
+public record PublicRecord(int value) {}
+record PackageRecord(int value) {}
+public @interface PublicAnnotation {}
+@interface PackageAnnotation {}
+@interface PublicMarker {}
+@PublicMarker class AnnotatedDefault {}
+@SuppressWarnings("public") class AnnotationStringDefault {}
+@SuppressWarnings("""
+public class TextBlockDecoy {}
+""") class TextBlockDefault {}
+// public must not leak into the next declaration.
+class CommentDefault {}
+abstract public class OrderedPublic {}
+sealed
+public class SplitModifierPublic permits SplitModifierChild {}
+final class SplitModifierChild extends SplitModifierPublic {}
+public sealed class SealedPublic permits SealedChild {}
+final class SealedChild extends SealedPublic {}
+class Container {
+    protected interface ProtectedInterface {}
+    private enum PrivateEnum { VALUE }
+}
+class SameLine { public class Open {} private class Closed {} class Local {} }
+class MethodCarrier {
+    public void DeclaredPublicMethod() {}
+    private void DeclaredPrivateMethod() {}
+}
+class DefaultMethodCarrier {
+    void DeclaredDefaultMethod() {}
+}
+interface InterfaceMemberCarrier { void ImplicitInterfaceMethod(); }
+"#,
+    )])?;
+    let nodes = storage.get_nodes()?;
+
+    for (name, expected, kind) in [
+        ("PublicClass", AccessKind::Public, NodeKind::CLASS),
+        ("PackageClass", AccessKind::Default, NodeKind::CLASS),
+        ("PublicInterface", AccessKind::Public, NodeKind::INTERFACE),
+        ("PackageInterface", AccessKind::Default, NodeKind::INTERFACE),
+        ("PublicEnum", AccessKind::Public, NodeKind::ENUM),
+        ("PackageEnum", AccessKind::Default, NodeKind::ENUM),
+        ("PublicRecord", AccessKind::Public, NodeKind::CLASS),
+        ("PackageRecord", AccessKind::Default, NodeKind::CLASS),
+        ("PublicAnnotation", AccessKind::Public, NodeKind::ANNOTATION),
+        (
+            "PackageAnnotation",
+            AccessKind::Default,
+            NodeKind::ANNOTATION,
+        ),
+        ("PublicMarker", AccessKind::Default, NodeKind::ANNOTATION),
+        ("AnnotatedDefault", AccessKind::Default, NodeKind::CLASS),
+        (
+            "AnnotationStringDefault",
+            AccessKind::Default,
+            NodeKind::CLASS,
+        ),
+        ("TextBlockDefault", AccessKind::Default, NodeKind::CLASS),
+        ("CommentDefault", AccessKind::Default, NodeKind::CLASS),
+        ("OrderedPublic", AccessKind::Public, NodeKind::CLASS),
+        ("SplitModifierPublic", AccessKind::Public, NodeKind::CLASS),
+        ("SealedPublic", AccessKind::Public, NodeKind::CLASS),
+        (
+            "ProtectedInterface",
+            AccessKind::Protected,
+            NodeKind::INTERFACE,
+        ),
+        ("PrivateEnum", AccessKind::Private, NodeKind::ENUM),
+        ("SameLine.Open", AccessKind::Public, NodeKind::CLASS),
+        ("SameLine.Closed", AccessKind::Private, NodeKind::CLASS),
+        ("SameLine.Local", AccessKind::Default, NodeKind::CLASS),
+        ("DeclaredPublicMethod", AccessKind::Public, NodeKind::METHOD),
+        (
+            "DeclaredPrivateMethod",
+            AccessKind::Private,
+            NodeKind::METHOD,
+        ),
+        (
+            "DeclaredDefaultMethod",
+            AccessKind::Default,
+            NodeKind::METHOD,
+        ),
+        // Preserve the existing declared-keyword policy for interface members.
+        (
+            "ImplicitInterfaceMethod",
+            AccessKind::Default,
+            NodeKind::METHOD,
+        ),
+    ] {
+        let declaration_line = match name {
+            "PublicClass" => 2,
+            "PackageClass" => 3,
+            "PublicInterface" => 4,
+            "PackageInterface" => 5,
+            "PublicEnum" => 6,
+            "PackageEnum" => 7,
+            "PublicRecord" => 8,
+            "PackageRecord" => 9,
+            "PublicAnnotation" => 10,
+            "PackageAnnotation" => 11,
+            "PublicMarker" => 12,
+            "AnnotatedDefault" => 13,
+            "AnnotationStringDefault" => 14,
+            "TextBlockDefault" => 15,
+            "CommentDefault" => 19,
+            "OrderedPublic" => 20,
+            "SplitModifierPublic" => 21,
+            "SealedPublic" => 24,
+            "ProtectedInterface" => 27,
+            "PrivateEnum" => 28,
+            "SameLine.Open" | "SameLine.Closed" | "SameLine.Local" => 30,
+            "DeclaredPublicMethod" => 32,
+            "DeclaredPrivateMethod" => 33,
+            "DeclaredDefaultMethod" => 36,
+            "ImplicitInterfaceMethod" => 38,
+            _ => unreachable!("fixture declaration line for {name}"),
+        };
+        let declaration_occurrence = if kind == NodeKind::ANNOTATION {
+            OccurrenceKind::DECLARATION
+        } else {
+            OccurrenceKind::DEFINITION
+        };
+        let node = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(declaration_line)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                occurrence.kind == declaration_occurrence
+                                    && occurrence.location.start_line == declaration_line
+                            })
+                        })
+            })
+            .unwrap_or_else(|| {
+                panic!("{name} {kind:?} declaration at line {declaration_line} missing")
+            });
+        assert_eq!(
+            storage.get_component_access(node.id)?,
+            Some(expected),
+            "Java type {name} must retain its declared visibility"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_java_type_references_do_not_inherit_enclosing_declaration_visibility() -> anyhow::Result<()>
+{
+    let storage = index_project(&[(
+        "TypeReferenceVisibility.java",
+        r#"
+class ReferenceVisibility {
+    private class PrivateBase {}
+    public class PublicChild extends PrivateBase {}
+    private interface PrivateContract {}
+    public class PublicImplementation implements PrivateContract {}
+    private @interface PrivateMarker {}
+    @PrivateMarker public @interface PublicChildMarker {}
+}
+"#,
+    )])?;
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+
+    for (name, kind, declaration_line, declaration_occurrence, reference_line, relation) in [
+        (
+            "PrivateBase",
+            NodeKind::CLASS,
+            3,
+            OccurrenceKind::DEFINITION,
+            4,
+            EdgeKind::INHERITANCE,
+        ),
+        (
+            "PrivateContract",
+            NodeKind::INTERFACE,
+            5,
+            OccurrenceKind::DEFINITION,
+            6,
+            EdgeKind::INHERITANCE,
+        ),
+        (
+            "PrivateMarker",
+            NodeKind::ANNOTATION,
+            7,
+            OccurrenceKind::DECLARATION,
+            8,
+            EdgeKind::ANNOTATION_USAGE,
+        ),
+    ] {
+        let declaration = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(declaration_line)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                occurrence.kind == declaration_occurrence
+                                    && occurrence.location.start_line == declaration_line
+                            })
+                        })
+            })
+            .unwrap_or_else(|| panic!("{name} declaration at line {declaration_line} missing"));
+        assert_eq!(
+            storage.get_component_access(declaration.id)?,
+            Some(AccessKind::Private),
+            "{name} declaration must retain its private visibility"
+        );
+
+        let reference = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(reference_line)
+            })
+            .unwrap_or_else(|| panic!("{name} reference at line {reference_line} missing"));
+        assert_eq!(
+            storage.get_component_access(reference.id)?,
+            None,
+            "{name} reference must not inherit its enclosing declaration visibility"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.kind == relation && edge.target == reference.id),
+            "{name} reference must remain the target of its {relation:?} edge"
+        );
+    }
+
+    for (name, kind) in [
+        ("PublicChild", NodeKind::CLASS),
+        ("PublicImplementation", NodeKind::CLASS),
+        ("PublicChildMarker", NodeKind::ANNOTATION),
+    ] {
+        let node = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                matches!(
+                                    occurrence.kind,
+                                    OccurrenceKind::DEFINITION | OccurrenceKind::DECLARATION
+                                )
+                            })
+                        })
+            })
+            .unwrap_or_else(|| panic!("{name} {kind:?} definition node missing"));
+        assert_eq!(
+            storage.get_component_access(node.id)?,
+            Some(AccessKind::Public),
+            "{name} declaration must retain its public visibility"
+        );
+    }
+
+    Ok(())
+}
