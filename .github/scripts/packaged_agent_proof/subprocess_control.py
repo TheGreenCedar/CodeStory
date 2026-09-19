@@ -158,6 +158,78 @@ def is_schema3_search_projection(state: dict) -> bool:
     return state.get("schema_version") == 3
 
 
+def resolve_search_snippet_anchor(state: dict) -> dict:
+    """Resolve a snippet-capable node from legacy hits or schema-3 evidence.
+
+    Returns ``{"node_id": str, "snippet_link_uri": str | None}``.
+
+    Legacy installed-host proofs decorate resolvable hits with ``links`` that
+    include a ``rel=snippet`` continuation URI. Live schema-3 search returns
+    evidence rows with ``symbol_id`` and omits those links; callers then
+    synthesize the project-bound snippet URI from ``node_id``. Fail closed on
+    missing or malformed shapes rather than inventing an anchor.
+    """
+
+    require(
+        isinstance(state, dict),
+        f"MCP search returned a non-object projection for snippet anchoring: {state!r}",
+    )
+    if is_schema3_search_projection(state):
+        require(
+            state.get("kind") == "complete",
+            f"MCP search did not return a complete schema-3 evidence projection: {state!r}",
+        )
+        evidence = state.get("evidence")
+        require(
+            isinstance(evidence, list),
+            f"MCP search returned non-array evidence: {state!r}",
+        )
+        for row in evidence:
+            if not isinstance(row, dict):
+                continue
+            symbol_id = row.get("symbol_id")
+            if isinstance(symbol_id, str) and symbol_id:
+                return {"node_id": symbol_id, "snippet_link_uri": None}
+        raise ProofFailure(
+            "packaged search omitted resolvable schema-3 evidence with "
+            f"symbol_id: {state!r}"
+        )
+
+    hits = state.get("hits")
+    require(
+        isinstance(hits, list),
+        f"MCP search returned non-array hits: {state!r}",
+    )
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        node_id = hit.get("node_id")
+        links = hit.get("links")
+        if not (
+            isinstance(node_id, str)
+            and node_id
+            and isinstance(links, list)
+        ):
+            continue
+        snippet_uri = next(
+            (
+                link.get("uri")
+                for link in links
+                if isinstance(link, dict)
+                and link.get("rel") == "snippet"
+                and isinstance(link.get("uri"), str)
+                and link.get("uri")
+            ),
+            None,
+        )
+        if isinstance(snippet_uri, str):
+            return {"node_id": node_id, "snippet_link_uri": snippet_uri}
+    raise ProofFailure(
+        "packaged search omitted a resolvable hit with continuation links: "
+        f"{state!r}"
+    )
+
+
 def search_retrieval_state(state: dict, *, query: object) -> str:
     """Validate an MCP search projection and return its retrieval.state.
 
