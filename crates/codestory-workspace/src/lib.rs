@@ -1199,7 +1199,7 @@ impl WorkspaceDiscovery {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        if let Some(skipped) = non_source_symlink_walk_skip(&walk.path, &error) {
+                        if let Some(skipped) = non_source_symlink_walk_skip(&error) {
                             // Helm U08 / dep-fs fixtures: dangling or device
                             // symlinks are observed and skipped; they must not
                             // demote a otherwise-complete inventory to Partial.
@@ -1211,7 +1211,7 @@ impl WorkspaceDiscovery {
                     }
                 };
                 if let Some(error) = entry.error() {
-                    if let Some(skipped) = non_source_symlink_walk_skip(entry.path(), error) {
+                    if let Some(skipped) = non_source_symlink_walk_skip(error) {
                         warnings.push(skipped);
                     } else {
                         record_walk_error(&mut issues, entry.path(), error);
@@ -1763,26 +1763,48 @@ fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
     }
 }
 
+fn attributed_walk_io_error(error: &ignore::Error) -> Option<(&Path, &io::Error)> {
+    fn visit<'a>(
+        error: &'a ignore::Error,
+        path: Option<&'a Path>,
+    ) -> Option<(&'a Path, &'a io::Error)> {
+        match error {
+            ignore::Error::WithDepth { err, .. } => visit(err, path),
+            ignore::Error::WithPath {
+                path: error_path,
+                err,
+            } if path.is_none() => visit(err, Some(error_path)),
+            ignore::Error::Io(error) => Some((path?, error)),
+            _ => None,
+        }
+    }
+
+    visit(error, None)
+}
+
 /// When `follow_links` hits a dangling symlink or a non-regular target (for
 /// example helm chart fixtures that link to `/dev/null`, or intentional
 /// broken-symlink test fixtures), discovery has observed the path and must
 /// not treat the walk error as proof the inventory is incomplete.
-fn non_source_symlink_walk_skip(
-    fallback_path: &Path,
-    error: &ignore::Error,
-) -> Option<WorkspaceInventoryIssue> {
-    let path = ignore_error_path(error).unwrap_or(fallback_path);
+fn non_source_symlink_walk_skip(error: &ignore::Error) -> Option<WorkspaceInventoryIssue> {
+    let (path, walk_io_error) = attributed_walk_io_error(error)?;
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_symlink() {
         return None;
     }
     match fs::metadata(path) {
-        Err(_) => Some(WorkspaceInventoryIssue {
-            path: path.to_path_buf(),
-            message: format!(
-                "skipped dangling symlink during discovery follow; not admitted as source ({error})"
-            ),
-        }),
+        Err(target_error)
+            if walk_io_error.kind() == io::ErrorKind::NotFound
+                && target_error.kind() == io::ErrorKind::NotFound =>
+        {
+            Some(WorkspaceInventoryIssue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "skipped dangling symlink during discovery follow; not admitted as source ({error})"
+                ),
+            })
+        }
+        Err(_) => None,
         Ok(target) if target.is_file() || target.is_dir() => None,
         Ok(_) => Some(WorkspaceInventoryIssue {
             path: path.to_path_buf(),
@@ -4157,6 +4179,48 @@ mod tests {
         assert_eq!(outcome.plan.files_to_index, vec![observed]);
         assert!(outcome.plan.files_to_remove.is_empty());
         assert_eq!(outcome.inventory_issues.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_makes_inventory_partial_and_preserves_stored_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let observed = root.join("lib.rs");
+        let loop_path = root.join("loop.rs");
+        fs::write(&observed, "pub fn observed() {}\n")?;
+        symlink("loop.rs", &loop_path)?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert_eq!(inventory.issues.len(), 1, "{inventory:?}");
+        assert!(inventory.warnings.is_empty(), "{inventory:?}");
+        assert!(inventory.files.contains(&observed));
+
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 19,
+                path: loop_path,
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Partial
+        );
+        assert!(outcome.plan.files_to_remove.is_empty());
         Ok(())
     }
 

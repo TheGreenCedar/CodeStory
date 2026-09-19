@@ -17,6 +17,8 @@ Workspace discovery no longer demotes a complete inventory to Partial when
 `frobnitz_with_dev_null` → `/dev/null` and intentional broken-symlink testdata).
 Those paths stay out of the admitted source set and surface as warnings, so full
 refresh can proceed instead of failing closed as `source_discovery_incomplete`.
+Other symlink target inspection failures keep discovery incomplete and preserve
+the prior indexed inventory instead of authorizing deletion.
 
 Rust indexing no longer aborts on `let` bindings to `async ||` / `async move ||`
 closures (meilisearch-class and surrealdb-class sources). Those bindings stay
