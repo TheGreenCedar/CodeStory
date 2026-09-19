@@ -230,6 +230,57 @@ def resolve_search_snippet_anchor(state: dict) -> dict:
     )
 
 
+def resolve_quality_search_hits(payload: dict) -> list:
+    """Return ordered hits for publication quality ranking.
+
+    Legacy CLI ``SearchOutput`` exposes ``indexed_symbol_hits``. Live
+    agent-profile search emits schema-3 ``evidence`` rows and omits that
+    field. Accept either shape; fail closed on incomplete or non-array
+    projections rather than inventing hits.
+    """
+
+    require(
+        isinstance(payload, dict),
+        f"qualification search returned a non-object projection: {payload!r}",
+    )
+    if is_schema3_search_projection(payload):
+        require(
+            payload.get("kind") == "complete",
+            "qualification search did not return a complete schema-3 "
+            f"evidence projection: {payload!r}",
+        )
+        evidence = payload.get("evidence")
+        require(
+            isinstance(evidence, list),
+            f"qualification search returned non-array evidence: {payload!r}",
+        )
+        return evidence
+
+    hits = payload.get("indexed_symbol_hits")
+    require(
+        isinstance(hits, list),
+        "qualification search omitted indexed symbol hits",
+    )
+    return hits
+
+
+def quality_search_hit_matches(hit: object, expected: str) -> bool:
+    """True when a legacy or schema-3 hit carries ``expected`` for ranking.
+
+    Legacy rows match ``display_name``. Schema-3 evidence rows drop that
+    field and keep ``excerpt`` / ``path``; qualification anchors appear in
+    the pinned source window excerpt for indexed symbol hits.
+    """
+
+    if not isinstance(hit, dict) or not isinstance(expected, str) or not expected:
+        return False
+    for key in ("display_name", "excerpt", "path"):
+        value = hit.get(key)
+        if isinstance(value, str) and expected in value:
+            return True
+    return False
+
+
 def search_retrieval_state(state: dict, *, query: object) -> str:
     """Validate an MCP search projection and return its retrieval.state.
 
