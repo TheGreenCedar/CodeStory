@@ -64,9 +64,41 @@ pub(crate) fn install_process_diagnostics() {
 /// process records evidence and stops.
 fn install_activation_fail_stop_hook() {
     codestory_runtime::set_activation_fail_stop_hook(Some(Arc::new(|reason_code: &str| {
-        record_fail_stop(reason_code);
-        std::process::abort();
+        fail_stop_process(reason_code);
     })));
+}
+
+/// Record best-effort fail-stop evidence, then make this process observably gone.
+///
+/// On Windows, CRT `abort()` can stall inside Windows Error Reporting once
+/// native accelerator libraries are loaded. Packaged qualification waits for
+/// the exact PID to exit after an accepted `crash_server`, so fail-stop must
+/// terminate without CRT teardown. Unix keeps `abort()`.
+pub(crate) fn fail_stop_process(reason_code: &str) -> ! {
+    record_fail_stop(reason_code);
+    immediate_process_abort();
+}
+
+fn immediate_process_abort() -> ! {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // STATUS_FATAL_APP_EXIT — recognizable, non-success, and unused by the
+        // crash-exit waiter (which only needs the process object to end).
+        const FAIL_STOP_EXIT_CODE: u32 = 0x4000_0001;
+        unsafe {
+            let _ = TerminateProcess(GetCurrentProcess(), FAIL_STOP_EXIT_CODE);
+        }
+        // TerminateProcess is requested asynchronously for the calling thread
+        // until the kernel finishes tearing the process down.
+        loop {
+            std::thread::park();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::abort()
+    }
 }
 
 pub(crate) fn record_command_failure(error: &anyhow::Error) {
@@ -95,7 +127,7 @@ pub(crate) fn record_fail_stop(reason_code: &str) {
             "reason_code": reason_code,
         }));
         // Fail-stop evidence never waits for or appends to the rotating log.
-        // The caller aborts after the fixed outer deadline even when this
+        // The caller terminates after the fixed outer deadline even when this
         // best-effort marker attempt is stalled in the filesystem.
         let _ = sink.write_fail_stop_marker(&record);
     });

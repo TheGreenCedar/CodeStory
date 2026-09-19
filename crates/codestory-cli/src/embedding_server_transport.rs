@@ -686,16 +686,11 @@ impl codestory_retrieval::EmbeddingServerTransport for NativeEmbeddingServerTran
     }
 
     fn fail_stop(&self, reason_code: &str) {
-        fail_stop_process(reason_code);
+        // A spawned server can outlive the process that owns its stderr reader.
+        // Evidence recording stays best-effort inside diagnostics; termination
+        // itself never waits on a live stderr reader or a successful write.
+        crate::diagnostics::fail_stop_process(reason_code);
     }
-}
-
-fn fail_stop_process(reason_code: &str) -> ! {
-    // A spawned server can outlive the process that owns its stderr reader.
-    // The marker is best-effort, but the attempt is unconditional and abort is
-    // never contingent on a live stderr reader or a successful filesystem write.
-    crate::diagnostics::record_fail_stop(reason_code);
-    std::process::abort()
 }
 
 impl codestory_retrieval::EmbeddingServerListener for NativeEmbeddingListener {
@@ -4684,7 +4679,7 @@ mod tests {
             unsafe {
                 libc::close(libc::STDERR_FILENO);
             }
-            fail_stop_process("embedding_engine_stalled");
+            crate::diagnostics::fail_stop_process("embedding_engine_stalled");
         }
 
         let status = Command::new(std::env::current_exe().expect("current test executable"))
@@ -4696,6 +4691,57 @@ mod tests {
             .expect("run fail-stop child");
 
         assert_eq!(status.signal(), Some(libc::SIGABRT));
+    }
+
+    /// Packaged Windows Vulkan qualification waits ≤75s for the exact PID that
+    /// accepted `crash_server` to exit. CRT `abort()` has stalled past that
+    /// bound once native accelerator libraries are loaded; fail-stop must use
+    /// `TerminateProcess` and become observably gone promptly.
+    #[cfg(windows)]
+    #[test]
+    fn fail_stop_terminates_the_windows_process_promptly() {
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "CODESTORY_TEST_FAIL_STOP_PROMPT_EXIT";
+        const EXIT_BUDGET: Duration = Duration::from_secs(5);
+        if std::env::var_os(CHILD_ENV).is_some() {
+            crate::diagnostics::fail_stop_process("embedding_qualification_crash");
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(
+                "embedding_server_transport::tests::fail_stop_terminates_the_windows_process_promptly",
+            )
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .expect("spawn fail-stop child");
+        let started = Instant::now();
+        loop {
+            match child.try_wait().expect("poll fail-stop child") {
+                Some(status) => {
+                    assert!(
+                        !status.success(),
+                        "fail-stop must exit unsuccessfully, got {status}"
+                    );
+                    assert!(
+                        started.elapsed() < EXIT_BUDGET,
+                        "fail-stop child took {:?} to exit",
+                        started.elapsed()
+                    );
+                    return;
+                }
+                None if started.elapsed() >= EXIT_BUDGET => {
+                    let _ = child.kill();
+                    panic!(
+                        "fail-stop child remained live for {:?} after accepting fail-stop",
+                        started.elapsed()
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]
