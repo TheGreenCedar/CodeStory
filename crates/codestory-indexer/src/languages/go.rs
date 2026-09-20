@@ -74,6 +74,59 @@ use crate::{
 pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:go-selector-call";
 pub(crate) const PACKAGE_FUNCTION_CALLSITE_MARKER: &str = "syntax:go-package-function";
 pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-function:";
+pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoReturnPath {
+    pub module: String,
+    pub package_name: Option<String>,
+    pub function: String,
+    pub result_index: usize,
+    pub result_arity: usize,
+    pub methods: Vec<String>,
+}
+
+impl GoReturnPath {
+    fn owner_marker(&self) -> String {
+        format!(
+            "{RETURN_PATH_OWNER_PREFIX}{}\t{}\t{}\t{}\t{}\t{}",
+            self.module,
+            self.package_name.as_deref().unwrap_or_default(),
+            self.function,
+            self.result_index,
+            self.result_arity,
+            self.methods.join(",")
+        )
+    }
+
+    pub(crate) fn from_owner_marker(marker: &str) -> Option<Self> {
+        let encoded = marker.strip_prefix(RETURN_PATH_OWNER_PREFIX)?;
+        let mut parts = encoded.splitn(6, '\t');
+        let module = parts.next()?.to_string();
+        let package_name = parts
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let function = parts.next()?.to_string();
+        let result_index = parts.next()?.parse().ok()?;
+        let result_arity = parts.next()?.parse().ok()?;
+        let methods = parts
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .filter(|method| !method.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!module.is_empty() && !function.is_empty()).then_some(Self {
+            module,
+            package_name,
+            function,
+            result_index,
+            result_arity,
+            methods,
+        })
+    }
+}
 
 const GRAPH_QUERY: &str = include_str!("../../rules/go.scm");
 
@@ -353,16 +406,21 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             &import_bindings,
             &package_owner_specs,
         );
+        let resolution_context = GoCallableResolutionContext {
+            source,
+            import_bindings: &import_bindings,
+            return_imports: &package_imports,
+            file_scope_names: &file_scope_names,
+            callable_name_visibility: go_callable_name_visibility(callable, source),
+        };
         let mut local_binding_callsites = HashSet::new();
         collect_go_local_composite_receiver_call_specs(
             callable,
-            source,
             ManualReceiverSource {
                 name: call_source.name,
                 span: call_source.span,
             },
-            &import_bindings,
-            &file_scope_names,
+            &resolution_context,
             &mut local_binding_callsites,
             &mut edges,
         );
@@ -423,6 +481,37 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
 struct GoPackageImports {
     explicit: HashMap<String, String>,
     implicit: Vec<String>,
+}
+
+struct GoCallableResolutionContext<'a> {
+    source: &'a str,
+    import_bindings: &'a HashMap<String, String>,
+    return_imports: &'a GoPackageImports,
+    file_scope_names: &'a HashSet<String>,
+    callable_name_visibility: GoNameVisibilityIndex,
+}
+
+#[derive(Default)]
+struct GoNameVisibilityIndex {
+    names: HashMap<String, Vec<GoNameVisibilityPoint>>,
+}
+
+struct GoNameVisibilityPoint {
+    start_byte: usize,
+    prefix_max_end_byte: usize,
+}
+
+impl GoNameVisibilityIndex {
+    fn is_visible(&self, name: &str, at_byte: usize) -> bool {
+        let Some(points) = self.names.get(name) else {
+            return false;
+        };
+        let count = points.partition_point(|point| {
+            count_go_navigation_resolution_work(1);
+            point.start_byte <= at_byte
+        });
+        count > 0 && points[count - 1].prefix_max_end_byte > at_byte
+    }
 }
 
 fn collect_go_package_function_call_specs(
@@ -488,21 +577,18 @@ fn collect_go_package_function_call_specs(
 
 fn collect_go_local_composite_receiver_call_specs(
     callable: TsNode<'_>,
-    source: &str,
     call_source: ManualReceiverSource<'_>,
-    import_bindings: &HashMap<String, String>,
-    file_scope_names: &HashSet<String>,
+    context: &GoCallableResolutionContext<'_>,
     local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
+    let source = context.source;
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
+    let mut top_level_return_bindings = HashMap::<String, GoReturnPath>::new();
     let method_receiver_name = callable
         .child_by_field_name("receiver")
         .and_then(|receiver| go_receiver_variable_name(receiver, source));
-    let builtin_new_unshadowed = !import_bindings.contains_key("new")
-        && !file_scope_names.contains("new")
-        && !go_callable_declares_name(callable, "new", source);
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
         if !receiver_call_belongs_to_callable(node, callable) {
@@ -515,7 +601,7 @@ fn collect_go_local_composite_receiver_call_specs(
                 method_name,
             });
         }
-        let Some((scope_end, scope_depth)) = go_navigation_binding_scope(node, callable) else {
+        let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
             return;
         };
         match node.kind() {
@@ -528,18 +614,69 @@ fn collect_go_local_composite_receiver_call_specs(
                     .child_by_field_name("right")
                     .map(go_expression_list_items)
                     .unwrap_or_default();
+                let left_arity = left.len();
+                let tuple_result = right.len() == 1 && left_arity > 1;
+                let top_level_binding = go_binding_is_in_callable_outer_block(node, callable);
+                let builtin_new_unshadowed = !context.import_bindings.contains_key("new")
+                    && !context.file_scope_names.contains("new")
+                    && !context
+                        .callable_name_visibility
+                        .is_visible("new", node.start_byte());
                 for (index, left) in left.into_iter().enumerate() {
                     let Some(name) = normalized_receiver_variable(left, source) else {
                         continue;
                     };
-                    let owner = right.get(index).and_then(|value| {
-                        go_direct_composite_literal_owner(
-                            *value,
-                            source,
-                            import_bindings,
-                            builtin_new_unshadowed,
-                        )
-                    });
+                    let owner = if node.kind() == "assignment_statement" && !top_level_binding {
+                        None
+                    } else {
+                        right
+                            .get(index)
+                            .and_then(|value| {
+                                go_direct_composite_literal_owner(
+                                    *value,
+                                    source,
+                                    context.import_bindings,
+                                    builtin_new_unshadowed,
+                                )
+                            })
+                            .or_else(|| {
+                                let value = if tuple_result {
+                                    right.first()?
+                                } else {
+                                    right.get(index)?
+                                };
+                                go_return_path_from_expression(
+                                    *value,
+                                    context,
+                                    if tuple_result { index } else { 0 },
+                                    if tuple_result { left_arity } else { 1 },
+                                    0,
+                                )
+                                .map(|path| (path.owner_marker(), None))
+                                .or_else(|| {
+                                    top_level_binding
+                                        .then(|| {
+                                            go_return_path_from_bound_method(
+                                                *value,
+                                                source,
+                                                &top_level_return_bindings,
+                                            )
+                                        })
+                                        .flatten()
+                                        .map(|path| (path.owner_marker(), None))
+                                })
+                            })
+                    };
+                    if top_level_binding {
+                        if let Some(path) = owner
+                            .as_ref()
+                            .and_then(|(owner, _)| GoReturnPath::from_owner_marker(owner))
+                        {
+                            top_level_return_bindings.insert(name.clone(), path);
+                        } else {
+                            top_level_return_bindings.remove(&name);
+                        }
+                    }
                     intervals.push(GoNavigationBindingInterval {
                         name,
                         start_byte: node.end_byte(),
@@ -548,10 +685,12 @@ fn collect_go_local_composite_receiver_call_specs(
                         } else {
                             scope_end
                         },
-                        scope_depth: if node.kind() == "assignment_statement" {
-                            usize::MAX - 1
+                        binding_priority: if node.kind() == "assignment_statement"
+                            && owner.is_none()
+                        {
+                            GO_NAVIGATION_UNCERTAIN_ASSIGNMENT_PRIORITY
                         } else {
-                            scope_depth
+                            GO_NAVIGATION_DECLARATION_PRIORITY
                         },
                         owner,
                     });
@@ -563,7 +702,9 @@ fn collect_go_local_composite_receiver_call_specs(
                 };
                 let owner = trimmed_node_text(type_node, source)
                     .as_deref()
-                    .and_then(|raw_type| go_receiver_owner_from_type(raw_type, import_bindings));
+                    .and_then(|raw_type| {
+                        go_receiver_owner_from_type(raw_type, context.import_bindings)
+                    });
                 let mut cursor = node.walk();
                 for name_node in node
                     .named_children(&mut cursor)
@@ -576,7 +717,7 @@ fn collect_go_local_composite_receiver_call_specs(
                         name,
                         start_byte: node.end_byte(),
                         end_byte: scope_end,
-                        scope_depth,
+                        binding_priority: GO_NAVIGATION_DECLARATION_PRIORITY,
                         owner: owner.clone(),
                     });
                 }
@@ -587,13 +728,13 @@ fn collect_go_local_composite_receiver_call_specs(
                         name,
                         start_byte: node.end_byte(),
                         end_byte: scope_end,
-                        scope_depth,
+                        binding_priority: GO_NAVIGATION_DECLARATION_PRIORITY,
                         owner: None,
                     });
                 }
             }
             "range_clause" | "receive_statement" | "type_switch_guard" => {
-                if let Some((names, end_byte, depth)) =
+                if let Some((names, end_byte, priority)) =
                     go_navigation_special_binding(node, callable, source)
                 {
                     for name in names {
@@ -601,7 +742,7 @@ fn collect_go_local_composite_receiver_call_specs(
                             name,
                             start_byte: node.end_byte(),
                             end_byte,
-                            scope_depth: depth,
+                            binding_priority: priority,
                             owner: None,
                         });
                     }
@@ -620,7 +761,7 @@ fn collect_go_local_composite_receiver_call_specs(
                             name,
                             start_byte: node.start_byte(),
                             end_byte: node.end_byte(),
-                            scope_depth: scope_depth.saturating_add(1),
+                            binding_priority: GO_NAVIGATION_DECLARATION_PRIORITY,
                             owner: None,
                         });
                     }
@@ -638,7 +779,7 @@ fn collect_go_local_composite_receiver_call_specs(
                         name: name.to_string(),
                         start_byte: callable.start_byte(),
                         end_byte: callable.end_byte(),
-                        scope_depth: usize::MAX,
+                        binding_priority: GO_NAVIGATION_CAPTURE_PRIORITY,
                         owner: None,
                     });
                 }
@@ -663,7 +804,7 @@ fn collect_go_local_composite_receiver_call_specs(
                 name,
                 start_byte: capture_start,
                 end_byte: capture_end,
-                scope_depth: usize::MAX,
+                binding_priority: GO_NAVIGATION_CAPTURE_PRIORITY,
                 owner: None,
             });
             return;
@@ -672,7 +813,7 @@ fn collect_go_local_composite_receiver_call_specs(
             name,
             start_byte: callable.start_byte(),
             end_byte: callable.end_byte(),
-            scope_depth: usize::MAX,
+            binding_priority: GO_NAVIGATION_CAPTURE_PRIORITY,
             owner: None,
         });
     });
@@ -683,9 +824,21 @@ fn collect_go_local_composite_receiver_call_specs(
         &calls,
     );
     for call in calls {
-        let Some(owner) = decisions.get(&call.node.id()) else {
-            continue;
+        let inferred_from_expression = go_selector_receiver_node(call.node).and_then(|receiver| {
+            go_return_path_from_expression(receiver, context, 0, 1, 0)
+                .map(|path| (path.owner_marker(), None))
+        });
+        let decision = decisions.get(&call.node.id());
+        let (owner, handled) = match decision {
+            Some(owner) => (owner.clone(), true),
+            None => {
+                let handled = inferred_from_expression.is_some();
+                (inferred_from_expression, handled)
+            }
         };
+        if !handled {
+            continue;
+        }
         let method_col = member_call_method_col(call.node, source, &call.method_name);
         local_binding_callsites.insert(ReceiverCallSiteKey {
             receiver_name: call.receiver_name.clone(),
@@ -693,23 +846,24 @@ fn collect_go_local_composite_receiver_call_specs(
             line: Some(call.node.start_position().row as u32 + 1),
             method_col,
         });
-        if let Some((owner_name, owner_module)) = owner {
-            edges.push(ManualReceiverCallSpec {
-                source_name: call_source.name.to_string(),
-                source_span: call_source.span,
-                receiver_name: call.receiver_name,
-                owner_name: owner_name.clone(),
-                owner_module: owner_module.clone(),
-                method_name: call.method_name,
-                method_col,
-                line: Some(call.node.start_position().row as u32 + 1),
-                allow_global_fallback: false,
-                binding_marker: None,
-                required_callsite_marker: None,
-                class_anchored: false,
-                owner_is_syntactic: false,
-            });
-        }
+        let Some((owner_name, owner_module)) = owner else {
+            continue;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name: call.receiver_name,
+            owner_name,
+            owner_module,
+            method_name: call.method_name,
+            method_col,
+            line: Some(call.node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
+        });
     }
 }
 
@@ -723,9 +877,18 @@ struct GoNavigationBindingInterval {
     name: String,
     start_byte: usize,
     end_byte: usize,
-    scope_depth: usize,
+    binding_priority: usize,
     owner: OptionalReceiverOwnerBinding,
 }
+
+const GO_NAVIGATION_DECLARATION_PRIORITY: usize = 0;
+// Lexical declarations compete by their activation byte, so an inner header,
+// block, or case declaration shadows an outer one until its interval ends.
+// Writes and captures stay above declarations because they deliberately deny
+// stale owner inference when the assigned value or closure flow is uncertain.
+const GO_NAVIGATION_SPECIAL_WRITE_PRIORITY: usize = usize::MAX - 2;
+const GO_NAVIGATION_UNCERTAIN_ASSIGNMENT_PRIORITY: usize = usize::MAX - 1;
+const GO_NAVIGATION_CAPTURE_PRIORITY: usize = usize::MAX;
 
 #[derive(Clone, Copy)]
 enum GoNavigationEvent {
@@ -771,14 +934,14 @@ fn go_navigation_binding_decisions(
                 unreachable!()
             };
             let interval = &intervals[index];
-            if let Some(depths) = active.get_mut(&interval.name) {
-                if let Some(entries) = depths.get_mut(&interval.scope_depth) {
+            if let Some(priorities) = active.get_mut(&interval.name) {
+                if let Some(entries) = priorities.get_mut(&interval.binding_priority) {
                     entries.remove(&index);
                     if entries.is_empty() {
-                        depths.remove(&interval.scope_depth);
+                        priorities.remove(&interval.binding_priority);
                     }
                 }
-                if depths.is_empty() {
+                if priorities.is_empty() {
                     active.remove(&interval.name);
                 }
             }
@@ -796,7 +959,7 @@ fn go_navigation_binding_decisions(
             active
                 .entry(interval.name.clone())
                 .or_default()
-                .entry(interval.scope_depth)
+                .entry(interval.binding_priority)
                 .or_default()
                 .insert(index);
             count_go_navigation_resolution_work(1);
@@ -835,21 +998,44 @@ fn go_navigation_binding_decisions(
     decisions
 }
 
-fn go_navigation_binding_scope(
-    mut node: TsNode<'_>,
-    callable: TsNode<'_>,
-) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    loop {
-        if node.kind() == "block" {
-            return Some((node.end_byte(), depth.saturating_add(1)));
+fn go_navigation_binding_scope(node: TsNode<'_>, callable: TsNode<'_>) -> Option<usize> {
+    let container = go_nearest_navigation_lexical_container(node, callable)?;
+    Some(container.end_byte())
+}
+
+fn go_binding_is_in_callable_outer_block(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+    let Some(body) = callable.child_by_field_name("body") else {
+        return false;
+    };
+    go_nearest_navigation_lexical_container(node, callable)
+        .is_some_and(|container| container.kind() == "block" && container.id() == body.id())
+}
+
+fn go_nearest_navigation_lexical_container<'tree>(
+    mut node: TsNode<'tree>,
+    callable: TsNode<'tree>,
+) -> Option<TsNode<'tree>> {
+    while let Some(parent) = node.parent() {
+        count_go_navigation_resolution_work(1);
+        if matches!(
+            parent.kind(),
+            "block"
+                | "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "expression_case"
+                | "default_case"
+                | "communication_case"
+        ) {
+            return Some(parent);
         }
-        if node.id() == callable.id() {
-            return Some((callable.end_byte(), depth));
+        if parent.id() == callable.id() {
+            return Some(parent);
         }
-        node = node.parent()?;
-        depth = depth.saturating_add(usize::from(node.kind() == "block"));
+        node = parent;
     }
+    None
 }
 
 fn go_navigation_declared_names(node: TsNode<'_>, source: &str) -> Vec<String> {
@@ -897,11 +1083,9 @@ fn go_navigation_special_binding(
             callable.end_byte()
         },
         if declaration {
-            go_navigation_binding_scope(boundary, callable)?
-                .1
-                .saturating_add(1)
+            GO_NAVIGATION_DECLARATION_PRIORITY
         } else {
-            usize::MAX - 2
+            GO_NAVIGATION_SPECIAL_WRITE_PRIORITY
         },
     ))
 }
@@ -944,6 +1128,108 @@ fn go_expression_list_items(node: TsNode<'_>) -> Vec<TsNode<'_>> {
         items.push(child);
     }
     items
+}
+
+fn go_selector_receiver_node(call: TsNode<'_>) -> Option<TsNode<'_>> {
+    let function = call.child_by_field_name("function")?;
+    (function.kind() == "selector_expression")
+        .then(|| function.child_by_field_name("operand"))
+        .flatten()
+}
+
+fn go_return_path_from_expression(
+    expression: TsNode<'_>,
+    context: &GoCallableResolutionContext<'_>,
+    result_index: usize,
+    result_arity: usize,
+    depth: usize,
+) -> Option<GoReturnPath> {
+    if expression.kind() != "call_expression" || depth >= 64 {
+        return None;
+    }
+    let function = expression.child_by_field_name("function")?;
+    if function.kind() == "identifier" {
+        let name = trimmed_node_text(function, context.source)?;
+        if context
+            .callable_name_visibility
+            .is_visible(&name, function.start_byte())
+        {
+            return None;
+        }
+        return Some(GoReturnPath {
+            module: ".".to_string(),
+            package_name: None,
+            function: name,
+            result_index,
+            result_arity,
+            methods: Vec::new(),
+        });
+    }
+    if function.kind() != "selector_expression" {
+        return None;
+    }
+    let operand = function.child_by_field_name("operand")?;
+    let member = function
+        .child_by_field_name("field")
+        .and_then(|field| trimmed_node_text(field, context.source))?;
+    if operand.kind() == "identifier" {
+        let qualifier = trimmed_node_text(operand, context.source)?;
+        if context.file_scope_names.contains(&qualifier)
+            || context
+                .callable_name_visibility
+                .is_visible(&qualifier, operand.start_byte())
+        {
+            return None;
+        }
+        let (module, package_name) =
+            if let Some(module) = context.return_imports.explicit.get(&qualifier) {
+                (module.clone(), None)
+            } else if !context.return_imports.implicit.is_empty() {
+                (context.return_imports.implicit.join(","), Some(qualifier))
+            } else {
+                return None;
+            };
+        return Some(GoReturnPath {
+            module,
+            package_name,
+            function: member,
+            result_index,
+            result_arity,
+            methods: Vec::new(),
+        });
+    }
+    let mut path =
+        go_return_path_from_expression(operand, context, result_index, result_arity, depth + 1)?;
+    path.methods.push(member);
+    Some(path)
+}
+
+fn go_return_path_from_bound_method(
+    expression: TsNode<'_>,
+    source: &str,
+    bindings: &HashMap<String, GoReturnPath>,
+) -> Option<GoReturnPath> {
+    if expression.kind() != "call_expression" {
+        return None;
+    }
+    let function = expression.child_by_field_name("function")?;
+    if function.kind() != "selector_expression" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("operand")?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let receiver_name = trimmed_node_text(receiver, source)?;
+    let method = function
+        .child_by_field_name("field")
+        .and_then(|field| trimmed_node_text(field, source))?;
+    let mut path = bindings.get(&receiver_name)?.clone();
+    if path.methods.len() >= 64 {
+        return None;
+    }
+    path.methods.push(method);
+    Some(path)
 }
 
 fn go_direct_composite_literal_owner(
@@ -1014,51 +1300,104 @@ fn go_builtin_new_owner(
     go_composite_literal_owner_binding_from_type(&raw_type, import_bindings)
 }
 
-fn go_callable_declares_name(callable: TsNode<'_>, name: &str, source: &str) -> bool {
-    let mut shadowed = false;
+fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    let mut spans = HashMap::<String, Vec<(usize, usize)>>::new();
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
-        if shadowed {
-            return;
-        }
-        match node.kind() {
+        let (names, start_byte, end_byte) = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
+                let Some((start_byte, end_byte)) = go_parameter_visibility_span(node, callable)
+                else {
+                    return;
+                };
                 let type_start = node
                     .child_by_field_name("type")
                     .map(|type_node| type_node.start_byte())
                     .unwrap_or(usize::MAX);
                 let mut cursor = node.walk();
-                shadowed = node.named_children(&mut cursor).any(|child| {
-                    child.start_byte() < type_start
-                        && normalized_receiver_variable(child, source).as_deref() == Some(name)
-                });
+                let names = node
+                    .named_children(&mut cursor)
+                    .take_while(|child| child.start_byte() < type_start)
+                    .filter_map(|child| normalized_receiver_variable(child, source))
+                    .collect::<Vec<_>>();
+                (names, start_byte, end_byte)
             }
             "short_var_declaration" | "assignment_statement" => {
-                shadowed = node
+                let Some(end_byte) = go_navigation_binding_scope(node, callable) else {
+                    return;
+                };
+                let names = node
                     .child_by_field_name("left")
                     .map(go_expression_list_items)
                     .unwrap_or_default()
                     .into_iter()
-                    .any(|left| {
-                        normalized_receiver_variable(left, source).as_deref() == Some(name)
-                    });
+                    .filter_map(|left| normalized_receiver_variable(left, source))
+                    .collect::<Vec<_>>();
+                (names, node.end_byte(), end_byte)
             }
             "var_spec" | "const_spec" | "type_spec" => {
-                shadowed = go_navigation_declared_names(node, source)
-                    .iter()
-                    .any(|declared| declared == name);
+                let Some(end_byte) = go_navigation_binding_scope(node, callable) else {
+                    return;
+                };
+                (
+                    go_navigation_declared_names(node, source),
+                    node.end_byte(),
+                    end_byte,
+                )
             }
             "range_clause" | "receive_statement" | "type_switch_guard" => {
-                shadowed = trimmed_node_text(node, source)
-                    .map(|surface| go_navigation_special_names(&surface))
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|declared| declared == name);
+                let Some((names, end_byte, _)) =
+                    go_navigation_special_binding(node, callable, source)
+                else {
+                    return;
+                };
+                (names, node.end_byte(), end_byte)
             }
-            _ => {}
+            _ => return,
+        };
+        if start_byte >= end_byte {
+            return;
+        }
+        for name in names {
+            spans.entry(name).or_default().push((start_byte, end_byte));
         }
     });
-    shadowed
+    let names = spans
+        .into_iter()
+        .map(|(name, mut spans)| {
+            spans.sort_unstable_by(|left, right| {
+                count_go_navigation_resolution_work(1);
+                left.cmp(right)
+            });
+            debug_assert!(spans.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+            let mut prefix_max_end_byte = 0usize;
+            let points = spans
+                .into_iter()
+                .map(|(start_byte, end_byte)| {
+                    prefix_max_end_byte = prefix_max_end_byte.max(end_byte);
+                    GoNameVisibilityPoint {
+                        start_byte,
+                        prefix_max_end_byte,
+                    }
+                })
+                .collect();
+            (name, points)
+        })
+        .collect();
+    GoNameVisibilityIndex { names }
+}
+
+fn go_parameter_visibility_span(
+    mut node: TsNode<'_>,
+    callable: TsNode<'_>,
+) -> Option<(usize, usize)> {
+    loop {
+        if node.id() == callable.id() || node.kind() == "func_literal" {
+            let body = node.child_by_field_name("body")?;
+            return Some((body.start_byte(), body.end_byte()));
+        }
+        node = node.parent()?;
+    }
 }
 
 fn go_file_scope_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
@@ -1536,6 +1875,108 @@ fn selector_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     ))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GoReturnDeclaration {
+    pub function: String,
+    pub owner: Option<String>,
+    pub results: Vec<Option<String>>,
+}
+
+pub(crate) fn go_concrete_return_types(tree: &Tree, source: &str) -> HashSet<String> {
+    let mut concrete_types = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "type_spec" || node.child_by_field_name("type_parameters").is_some() {
+            return;
+        }
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        // A defined Go type may declare methods regardless of whether its
+        // underlying type is a struct, primitive, slice, map, or function.
+        // Aliases use a distinct `type_alias` node, while interfaces and
+        // parameterized declarations remain intentionally unsupported here.
+        if type_node.kind() == "interface_type" {
+            return;
+        }
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| trimmed_node_text(name, source))
+        {
+            concrete_types.insert(name);
+        }
+    });
+    concrete_types
+}
+
+pub(crate) fn go_return_declarations(tree: &Tree, source: &str) -> Vec<GoReturnDeclaration> {
+    let mut declarations = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if !matches!(node.kind(), "function_declaration" | "method_declaration")
+            || node.has_error()
+            || node.is_missing()
+            || node.child_by_field_name("type_parameters").is_some()
+        {
+            return;
+        }
+        let Some(function) = node
+            .child_by_field_name("name")
+            .and_then(|name| trimmed_node_text(name, source))
+        else {
+            return;
+        };
+        let owner = node
+            .child_by_field_name("receiver")
+            .and_then(|receiver| go_receiver_owner_name(receiver, source));
+        let results = node
+            .child_by_field_name("result")
+            .map(|result| go_declared_result_owners(result, source))
+            .unwrap_or_default();
+        declarations.push(GoReturnDeclaration {
+            function,
+            owner,
+            results,
+        });
+    });
+    declarations
+}
+
+fn go_declared_result_owners(result: TsNode<'_>, source: &str) -> Vec<Option<String>> {
+    if result.kind() != "parameter_list" {
+        return vec![go_concrete_result_owner(result, source)];
+    }
+    let mut results = Vec::new();
+    let mut cursor = result.walk();
+    for parameter in result.named_children(&mut cursor) {
+        if parameter.kind() != "parameter_declaration" {
+            results.push(None);
+            continue;
+        }
+        let Some(type_node) = parameter.child_by_field_name("type") else {
+            results.push(None);
+            continue;
+        };
+        let owner = go_concrete_result_owner(type_node, source);
+        let mut parameter_cursor = parameter.walk();
+        let named_count = parameter
+            .named_children(&mut parameter_cursor)
+            .filter(|child| child.end_byte() <= type_node.start_byte())
+            .filter(|child| matches!(child.kind(), "identifier" | "field_identifier"))
+            .count();
+        results.extend(std::iter::repeat_n(owner, named_count.max(1)));
+    }
+    results
+}
+
+fn go_concrete_result_owner(type_node: TsNode<'_>, source: &str) -> Option<String> {
+    let surface = trimmed_node_text(type_node, source)?;
+    let surface = surface.trim();
+    let owner = surface.strip_prefix('*').unwrap_or(surface).trim();
+    if owner.starts_with('*') || normalize_parameter_name(owner).as_deref() != Some(owner) {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
 #[cfg(test)]
 mod complexity_tests {
     use super::*;
@@ -1611,6 +2052,35 @@ mod complexity_tests {
         go_navigation_resolution_work()
     }
 
+    fn measured_factory_assignment_work(assignment_count: usize, imported: bool) -> usize {
+        let mut source = if imported {
+            String::from("package proof\nimport worker \"example.com/worker\"\nfunc caller() {\n")
+        } else {
+            String::from(
+                "package proof\ntype Worker struct{}\nfunc New() *Worker { return nil }\nfunc caller() {\n",
+            )
+        };
+        for index in 0..assignment_count {
+            let factory = if imported { "worker.New()" } else { "New()" };
+            source.push_str(&format!(
+                "  value{index} := {factory}\n  value{index}.Finish()\n"
+            ));
+        }
+        source.push_str("}\n");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar must load");
+        let tree = parser.parse(&source, None).expect("Go source must parse");
+        reset_go_navigation_resolution_work();
+        let specs = receiver_call_specs(&tree, &source);
+        assert!(
+            specs.len() >= assignment_count,
+            "each factory assignment must retain its receiver call"
+        );
+        go_navigation_resolution_work()
+    }
+
     #[test]
     fn receiver_binding_preparation_and_lookup_work_is_independently_linear() {
         let baseline = measured_receiver_work(32, 32);
@@ -1652,5 +2122,30 @@ mod complexity_tests {
             doubled <= baseline * 2 + 512,
             "complete Go receiver-call collection grew superlinearly: {baseline} -> {doubled}"
         );
+    }
+
+    fn assert_factory_assignment_work_is_linear(imported: bool) {
+        let work_32 = measured_factory_assignment_work(32, imported);
+        let work_64 = measured_factory_assignment_work(64, imported);
+        let work_128 = measured_factory_assignment_work(128, imported);
+        assert!(work_32 > 0, "Go factory return work was not counted");
+        assert!(
+            work_64 <= work_32 * 2 + 512,
+            "Go factory return work grew superlinearly at 64 assignments (imported={imported}): {work_32} -> {work_64}"
+        );
+        assert!(
+            work_128 <= work_64 * 2 + 512,
+            "Go factory return work grew superlinearly at 128 assignments (imported={imported}): {work_64} -> {work_128}"
+        );
+    }
+
+    #[test]
+    fn local_factory_assignment_return_inference_work_is_linear() {
+        assert_factory_assignment_work_is_linear(false);
+    }
+
+    #[test]
+    fn imported_factory_assignment_return_inference_work_is_linear() {
+        assert_factory_assignment_work_is_linear(true);
     }
 }

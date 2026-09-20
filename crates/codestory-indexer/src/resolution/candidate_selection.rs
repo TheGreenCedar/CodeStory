@@ -113,6 +113,24 @@ pub(super) fn compute_call_resolution(
     }
 
     if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && let Some(path) =
+            receiver_owner.and_then(crate::languages::go::GoReturnPath::from_owner_marker)
+    {
+        let selected =
+            pass.find_go_return_method_readonly(candidate_index, &path, *file_id, target_name);
+        if pass.flags.store_candidates
+            && let Some(candidate) = selected
+        {
+            candidate_ids.push(candidate);
+        }
+        let resolved = selected.map(|candidate| (candidate, pass.policy.call_same_file));
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, resolved, candidate_ids.as_slice())?,
+            strategy: selected.map(|_| ResolutionStrategy::CallGlobalUnique),
+        });
+    }
+
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && let Some((modules, require_package_name)) =
             go_package_function_imports(callsite_identity.as_deref())
     {
@@ -914,6 +932,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
+            go_context: None,
         }
     }
 
