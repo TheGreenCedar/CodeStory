@@ -24,6 +24,8 @@ pub(super) struct IndexingRunSummary {
     /// The run proved the published core already satisfied the request and
     /// wrote nothing, so no runtime cache rebuild or republication is owed.
     pub(super) unchanged_publication: bool,
+    /// Exact repository-tracking input used by the publication plan.
+    pub(super) repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
 }
 
 pub(super) fn incremental_plan_probe_timings(

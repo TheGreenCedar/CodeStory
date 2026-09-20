@@ -398,13 +398,15 @@ impl AppController {
     /// and a lease stamped `None` keeps exactly the EV-7 answer it had before.
     pub(crate) fn observed_source_epoch(&self, root: &Path) -> Option<ObservedSourceEpoch> {
         let session = self.source_observer_session(root)?;
-        if session.gap().is_some() {
-            return None;
-        }
+        let (repository_tracking_digest, coverage) = session
+            .observe_window(|| codestory_workspace::observe_repository_tracking_digest(root));
+        let repository_tracking_digest = repository_tracking_digest.ok()?;
+        let coverage = coverage.proven()?;
         Some(ObservedSourceEpoch {
-            session_id: session.identity().session_id().to_string(),
-            backend: session.identity().backend().id(),
-            epoch: session.epoch(),
+            session_id: coverage.identity().session_id().to_string(),
+            backend: coverage.identity().backend().id(),
+            epoch: coverage.sealed_epoch(),
+            repository_tracking_digest,
         })
     }
 
@@ -421,13 +423,15 @@ impl AppController {
             return None;
         }
         let session = state.session.as_ref()?;
-        if session.gap().is_some() {
-            return None;
-        }
+        let (repository_tracking_digest, coverage) = session
+            .observe_window(|| codestory_workspace::observe_repository_tracking_digest(root));
+        let repository_tracking_digest = repository_tracking_digest.ok()?;
+        let coverage = coverage.proven()?;
         Some(ObservedSourceEpoch {
-            session_id: session.identity().session_id().to_string(),
-            backend: session.identity().backend().id(),
-            epoch: session.epoch(),
+            session_id: coverage.identity().session_id().to_string(),
+            backend: coverage.identity().backend().id(),
+            epoch: coverage.sealed_epoch(),
+            repository_tracking_digest,
         })
     }
 

@@ -8,6 +8,7 @@
 //! read (index cookies, Linux fsmonitor) are not treated as redirects.
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -118,6 +119,118 @@ pub struct RepositoryMetadata {
     pub dirty: bool,
     pub tracked_paths: Vec<Vec<u8>>,
     pub issues: Vec<RepositoryMetadataIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryTrackingDigest {
+    NoRepository,
+    Present(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryTrackingObservation {
+    pub(crate) tracked_paths: Vec<Vec<u8>>,
+    pub(crate) digest: RepositoryTrackingDigest,
+}
+
+/// Observe the repository-tracking input that source discovery uses.
+///
+/// `RepositoryTrackingDigest::NoRepository` is the domain-separated no-repository state. An
+/// error is unknown and cannot back a freshness receipt.
+pub fn observe_repository_tracking_digest(project_root: &Path) -> Result<RepositoryTrackingDigest> {
+    observe_repository_tracking(project_root).map(|observation| observation.digest)
+}
+
+pub(crate) fn observe_repository_tracking(
+    project_root: &Path,
+) -> Result<RepositoryTrackingObservation> {
+    let dot_git = project_root.join(".git");
+    let metadata = match fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RepositoryTrackingObservation {
+                tracked_paths: Vec::new(),
+                digest: RepositoryTrackingDigest::NoRepository,
+            });
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dot_git.display())),
+    };
+    if metadata.is_dir() {
+        let mut has_repository_marker = false;
+        for marker in ["HEAD", "config", "index"] {
+            match fs::symlink_metadata(dot_git.join(marker)) {
+                Ok(_) => has_repository_marker = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspect repository marker {}",
+                            dot_git.join(marker).display()
+                        )
+                    });
+                }
+            }
+        }
+        if !has_repository_marker {
+            return Ok(RepositoryTrackingObservation {
+                tracked_paths: Vec::new(),
+                digest: RepositoryTrackingDigest::NoRepository,
+            });
+        }
+    }
+    let reader = RepositoryReader::open(project_root)?;
+    let tracked_paths = reader.tracked_paths()?;
+    let digest = repository_tracking_digest(&reader.metadata_roots, &tracked_paths)?;
+    Ok(RepositoryTrackingObservation {
+        tracked_paths,
+        digest: RepositoryTrackingDigest::Present(digest),
+    })
+}
+
+fn repository_tracking_digest(roots: &MetadataRoots, tracked_paths: &[Vec<u8>]) -> Result<String> {
+    fn frame(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    fn optional_frame(hasher: &mut Sha256, bytes: Option<&[u8]>) {
+        match bytes {
+            Some(bytes) => {
+                hasher.update([1]);
+                frame(hasher, bytes);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let git_dir_identity =
+        crate::repository_identity::workspace_path_identity_token(&roots.git_dir)?
+            .context("repository gitdir identity is unavailable")?;
+    let common_dir_identity =
+        crate::repository_identity::workspace_path_identity_token(&roots.common_dir)?
+            .context("repository common-dir identity is unavailable")?;
+    let mut hasher = Sha256::new();
+    frame(&mut hasher, b"codestory-repository-tracking-v1");
+    frame(&mut hasher, git_dir_identity.as_bytes());
+    frame(&mut hasher, common_dir_identity.as_bytes());
+    optional_frame(
+        &mut hasher,
+        roots
+            .git_dir_pointer
+            .as_ref()
+            .map(|pointer| pointer.expected_contents.as_slice()),
+    );
+    optional_frame(
+        &mut hasher,
+        roots
+            .common_dir_pointer
+            .as_ref()
+            .map(|pointer| pointer.expected_contents.as_slice()),
+    );
+    hasher.update((tracked_paths.len() as u64).to_be_bytes());
+    for path in tracked_paths {
+        frame(&mut hasher, path);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 impl RepositoryMetadata {
@@ -501,6 +614,19 @@ impl RepositoryReader {
             tracked_paths,
             issues,
         }
+    }
+
+    fn tracked_paths(&self) -> Result<Vec<Vec<u8>>> {
+        let index = self.repository.index_or_load_from_head_or_empty()?;
+        let mut paths = index
+            .entries()
+            .iter()
+            .map(|entry| entry.path(&index).to_vec())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        self.ensure_metadata_boundary_unchanged()?;
+        Ok(paths)
     }
 
     fn changes(&self, scope: RepositoryChangeScope) -> Result<Vec<RepositoryChange>> {

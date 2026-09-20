@@ -45,7 +45,8 @@ mod repository_hooks;
 mod repository_identity;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
-    RepositoryMetadataIssue, read_repository_changes, read_repository_metadata,
+    RepositoryMetadataIssue, RepositoryTrackingDigest, observe_repository_tracking_digest,
+    read_repository_changes, read_repository_metadata,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -319,6 +320,10 @@ pub struct WorkspaceFileInventory {
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
     pub warnings: Vec<WorkspaceInventoryIssue>,
+    /// Digest of the exact repository-tracked path set used by discovery.
+    /// `NoRepository` is distinct from `None`: the latter means metadata was
+    /// incomplete and cannot back a freshness receipt.
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 /// Complete discovery split into parser candidates and verified policy exclusions.
@@ -331,6 +336,7 @@ pub struct WorkspacePolicyFileInventory {
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
     pub warnings: Vec<WorkspaceInventoryIssue>,
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
@@ -355,6 +361,8 @@ pub struct WorkspacePolicyRefreshOutcome {
     /// incremental refresh does not rediscover the repository merely to seal
     /// inputs the core planner already enumerated.
     pub inventory_files: Vec<PathBuf>,
+    /// Repository-tracking input used by the same discovery pass.
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 #[derive(Debug, Clone)]
@@ -946,6 +954,7 @@ impl WorkspaceDiscovery {
         let inventory = self.source_inventory_inner(manifest, max_files)?;
         let admitted_file_count = inventory.files.len();
         let discovered_files = inventory.files.clone();
+        let repository_tracking_digest = inventory.repository_tracking_digest.clone();
         if !inventory.outcome.is_complete() {
             return Ok((
                 WorkspacePolicyFileInventory {
@@ -955,6 +964,7 @@ impl WorkspaceDiscovery {
                     outcome: inventory.outcome,
                     issues: inventory.issues,
                     warnings: inventory.warnings,
+                    repository_tracking_digest,
                 },
                 admitted_file_count,
             ));
@@ -1048,6 +1058,7 @@ impl WorkspaceDiscovery {
                 outcome,
                 issues,
                 warnings,
+                repository_tracking_digest,
             },
             admitted_file_count,
         ))
@@ -1059,7 +1070,7 @@ impl WorkspaceDiscovery {
         max_files: Option<usize>,
     ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
-        let (repository_tracked_paths, repository_metadata_issues) =
+        let (repository_tracked_paths, repository_metadata_issues, repository_tracking_digest) =
             repository_tracked_paths(&manifest.root_dir());
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
@@ -1082,6 +1093,7 @@ impl WorkspaceDiscovery {
                         ),
                     }],
                     warnings: Vec::new(),
+                    repository_tracking_digest,
                 });
             }
         };
@@ -1158,6 +1170,7 @@ impl WorkspaceDiscovery {
                             outcome: WorkspaceInventoryOutcome::Bounded,
                             issues,
                             warnings,
+                            repository_tracking_digest,
                         });
                     }
                     continue;
@@ -1251,6 +1264,7 @@ impl WorkspaceDiscovery {
                         outcome: WorkspaceInventoryOutcome::Bounded,
                         issues,
                         warnings,
+                        repository_tracking_digest,
                     });
                 }
             }
@@ -1295,6 +1309,7 @@ impl WorkspaceDiscovery {
                         outcome: WorkspaceInventoryOutcome::Bounded,
                         issues,
                         warnings,
+                        repository_tracking_digest,
                     });
                 }
                 if !walk_had_errors {
@@ -1333,6 +1348,7 @@ impl WorkspaceDiscovery {
             outcome,
             issues,
             warnings,
+            repository_tracking_digest,
         })
     }
 
@@ -1382,6 +1398,7 @@ impl WorkspaceDiscovery {
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
             inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1409,6 +1426,7 @@ impl WorkspaceDiscovery {
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
             inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1440,6 +1458,7 @@ impl WorkspaceDiscovery {
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
             inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1468,6 +1487,7 @@ impl WorkspaceDiscovery {
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
             inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1859,66 +1879,27 @@ fn push_discovered_file_within_limit(
 
 fn repository_tracked_paths(
     repository_root: &Path,
-) -> (Vec<PathBuf>, Vec<WorkspaceInventoryIssue>) {
-    let dot_git = repository_root.join(".git");
-    let dot_git_metadata = match fs::symlink_metadata(&dot_git) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new());
-        }
+) -> (
+    Vec<PathBuf>,
+    Vec<WorkspaceInventoryIssue>,
+    Option<RepositoryTrackingDigest>,
+) {
+    let observation = match repo_metadata::observe_repository_tracking(repository_root) {
+        Ok(observation) => observation,
         Err(error) => {
             return (
                 Vec::new(),
                 vec![WorkspaceInventoryIssue {
-                    path: dot_git,
-                    message: format!("repository metadata boundary could not be observed: {error}"),
+                    path: repository_root.join(".git"),
+                    message: format!("repository tracking metadata could not be observed: {error}"),
                 }],
+                None,
             );
         }
     };
-    if dot_git_metadata.is_dir() {
-        let mut has_repository_marker = false;
-        for marker in ["HEAD", "config", "index"] {
-            match fs::symlink_metadata(dot_git.join(marker)) {
-                Ok(_) => has_repository_marker = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return (
-                        Vec::new(),
-                        vec![WorkspaceInventoryIssue {
-                            path: dot_git.join(marker),
-                            message: format!(
-                                "repository metadata marker could not be observed: {error}"
-                            ),
-                        }],
-                    );
-                }
-            }
-        }
-        if !has_repository_marker {
-            return (Vec::new(), Vec::new());
-        }
-    }
-    let metadata = read_repository_metadata(repository_root);
-    let mut issues = metadata
-        .issues
-        .into_iter()
-        .filter(|issue| {
-            matches!(
-                issue.code.as_str(),
-                "repository_open_failed" | "index_unavailable" | "repository_metadata_changed"
-            )
-        })
-        .map(|issue| WorkspaceInventoryIssue {
-            path: issue.path,
-            message: format!(
-                "repository metadata observation {} was incomplete: {}",
-                issue.code, issue.message
-            ),
-        })
-        .collect::<Vec<_>>();
+    let mut issues = Vec::new();
     let mut paths = Vec::new();
-    for encoded_path in metadata.tracked_paths {
+    for encoded_path in observation.tracked_paths {
         let path = match repo_metadata::bytes_to_path(&encoded_path) {
             Ok(path) => path,
             Err(error) => {
@@ -1945,7 +1926,7 @@ fn repository_tracked_paths(
     }
     paths.sort();
     paths.dedup();
-    (paths, issues)
+    (paths, issues, Some(observation.digest))
 }
 
 /// Clamp one filesystem timestamp to CodeStory's signed Unix-millisecond contract.

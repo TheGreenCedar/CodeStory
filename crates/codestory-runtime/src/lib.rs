@@ -695,6 +695,7 @@ pub(crate) struct ObservedSourceEpoch {
     session_id: String,
     backend: &'static str,
     epoch: codestory_workspace::filesystem_observer::ObserverEpoch,
+    repository_tracking_digest: codestory_workspace::RepositoryTrackingDigest,
 }
 
 #[derive(Debug)]
