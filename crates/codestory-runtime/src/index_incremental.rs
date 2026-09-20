@@ -1212,6 +1212,7 @@ fn prepare_incremental_refresh(
             preparation.staged_mut(),
             &publication,
             cancel_token,
+            None,
         )?;
     }
     derived_timings.proof_projection_ms = clamp_u128_to_u32(proof_started.elapsed().as_millis());
@@ -1372,6 +1373,7 @@ fn run_incremental_indexing_common(
                 runtime,
                 source_index_policy,
                 annotations_owned,
+                None,
             );
         }
         IncrementalRefreshPreparation::Prepared(prepared) => prepared,

@@ -1812,7 +1812,24 @@ impl ActivationService {
                 IndexMode::Incremental
             };
             let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
-            let evidence = self
+            let failed_refresh_diagnostics = (mode == IndexMode::Full)
+                .then(|| self.controller.runtime_configuration_id().ok())
+                .flatten()
+                .map(|runtime_configuration_identity| {
+                    let target = ActivationTarget::new(&project_root, &storage_path);
+                    let (attempt, revision) = operation.attempt_and_revision();
+                    crate::index_full::FailedRefreshDiagnosticSink::new(
+                        crate::index_full::FailedRefreshDiagnosticSink::identity(
+                            operation.operation_id.clone(),
+                            attempt,
+                            revision,
+                            target.project_id,
+                            target.workspace_id,
+                            runtime_configuration_identity,
+                        ),
+                    )
+                });
+            let evidence_result = self
                 .controller
                 .run_indexing_blocking_with_cancel_for_activation(
                     mode,
@@ -1820,7 +1837,20 @@ impl ActivationService {
                     (mode == IndexMode::Incremental)
                         .then(|| precomputed_core_probe.take())
                         .flatten(),
-                )?;
+                    failed_refresh_diagnostics.as_ref(),
+                );
+            let evidence = match evidence_result {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Err(
+                        if let Some(diagnostics) = failed_refresh_diagnostics.as_ref() {
+                            diagnostics.attach_to_error(error, token.is_cancelled())
+                        } else {
+                            error
+                        },
+                    );
+                }
+            };
             tracing::debug!(
                 target: "codestory::activation",
                 phase_timings = ?evidence.phase_timings,
@@ -2879,6 +2909,18 @@ impl ActivationOperation {
             .as_ref()
             .filter(|snapshot| snapshot.operation_id == self.operation_id)
             .map_or(1, |snapshot| snapshot.attempt)
+    }
+
+    fn attempt_and_revision(&self) -> (u32, u64) {
+        self.service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned")
+            .current
+            .as_ref()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+            .map_or((1, 0), |snapshot| (snapshot.attempt, snapshot.revision))
     }
 
     pub fn ensure_not_cancelled(&self, boundary: &str) -> Result<(), ApiError> {

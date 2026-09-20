@@ -4,7 +4,7 @@ use crate::cache::{
     CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
     CachedInherentMethod, CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
     CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
-    CachedTopLevelDeclaration, decode_index_artifact,
+    CachedTopLevelDeclaration, decode_index_artifact, decoded_index_artifact_len,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -13275,10 +13275,38 @@ fn exact_call_edge_projection_updates(
     Ok(projections)
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProofResolutionProgress {
+    pub cache_entries_decoded: u64,
+    pub decoded_cache_bytes: u64,
+    pub source_reauthentication_files: u64,
+    pub source_reauthentication_bytes: u64,
+    pub projection_index_records_prepared: u64,
+    pub calls_resolved: u64,
+    pub dependency_ids_visited: u64,
+    pub correlation_inputs: u64,
+    pub correlation_results: u64,
+    pub facts_sealed: u64,
+    pub facts_persisted: u64,
+    pub proof_store_transaction_started: bool,
+    pub proof_store_transaction_completed: bool,
+}
+
 pub fn rematerialize_proof_resolution_projection(
     store: &mut Store,
     publication: &IndexPublicationRecord,
 ) -> Result<ProofResolutionPublication> {
+    rematerialize_proof_resolution_projection_with_progress(store, publication, &mut |_| {})
+}
+
+#[doc(hidden)]
+pub fn rematerialize_proof_resolution_projection_with_progress(
+    store: &mut Store,
+    publication: &IndexPublicationRecord,
+    progress_observer: &mut dyn FnMut(ProofResolutionProgress),
+) -> Result<ProofResolutionPublication> {
+    let mut progress = ProofResolutionProgress::default();
     let files = store.get_files()?;
     let file_by_id = files
         .iter()
@@ -13362,6 +13390,7 @@ pub fn rematerialize_proof_resolution_projection(
     let governed_cache_paths = PreparedGovernedCachePaths::prepare(&governed, &governed_identities);
     let mut records_by_id = HashMap::<i64, Vec<ResolutionCacheRecord>>::new();
     for entry in store.get_index_artifact_cache_entries()? {
+        let decoded_bytes = decoded_index_artifact_len(&entry.artifact_blob);
         let artifact: CachedIndexArtifact = match decode_index_artifact(&entry.artifact_blob) {
             Ok(artifact) => artifact,
             Err(error) => {
@@ -13374,6 +13403,10 @@ pub fn rematerialize_proof_resolution_projection(
                 continue;
             }
         };
+        progress.cache_entries_decoded = progress.cache_entries_decoded.saturating_add(1);
+        progress.decoded_cache_bytes = progress
+            .decoded_cache_bytes
+            .saturating_add(decoded_bytes.unwrap_or_default() as u64);
         let Some(file) = artifact.resolution_file else {
             if governed_cache_paths.contains(&entry.file_path)? {
                 return Err(anyhow!(
@@ -13507,6 +13540,11 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
+            progress.source_reauthentication_files =
+                progress.source_reauthentication_files.saturating_add(1);
+            progress.source_reauthentication_bytes = progress
+                .source_reauthentication_bytes
+                .saturating_add(source_bytes.len() as u64);
             if indexed_file.language == "bash" {
                 count_bash_resolution_work(
                     BashResolutionPhase::CacheReauthentication,
@@ -13559,6 +13597,7 @@ pub fn rematerialize_proof_resolution_projection(
         }
         records.push(record);
     }
+    progress_observer(progress);
     let mut linear_records = Vec::new();
     let mut records = records
         .into_iter()
@@ -13658,6 +13697,8 @@ pub fn rematerialize_proof_resolution_projection(
     let go_projection_index = GoProjectionIndex::prepare(&records)?;
     let java_kotlin_projection_index = JavaKotlinProjectionIndex::prepare(&records, &nodes);
     let python_projection_index = PythonProjectionIndex::prepare(&records, &record_by_path)?;
+    progress.projection_index_records_prepared = records.len() as u64;
+    progress_observer(progress);
     let claim_indexes = SyntaxClaimIndexes {
         files: &file_by_id,
         records: &record_by_path,
@@ -13670,6 +13711,8 @@ pub fn rematerialize_proof_resolution_projection(
         .into_iter()
         .map(|(source_record, input)| resolve_syntax_claim(&claim_indexes, source_record, input))
         .collect::<Result<Vec<_>>>()?;
+    progress.calls_resolved = claims.len() as u64;
+    progress_observer(progress);
     let bash_claim_count = claims
         .iter()
         .filter(|claim| claim.input.language == "bash")
@@ -13683,7 +13726,7 @@ pub fn rematerialize_proof_resolution_projection(
         );
     }
     enforce_go_exact_callable_ownership(&mut claims, &nodes);
-    enforce_exact_dependency_eligibility(
+    progress.dependency_ids_visited = enforce_exact_dependency_eligibility(
         &mut claims,
         &file_by_id,
         &node_by_id,
@@ -13692,6 +13735,7 @@ pub fn rematerialize_proof_resolution_projection(
         &record_by_file_id,
         &python_projection_index,
     )?;
+    progress_observer(progress);
     enforce_exact_evidence_corroboration(
         &mut claims,
         &node_by_id,
@@ -13784,6 +13828,10 @@ pub fn rematerialize_proof_resolution_projection(
             }
         })
         .collect::<Vec<_>>();
+    progress.correlation_inputs = progress
+        .correlation_inputs
+        .saturating_add(projection_syntax_inputs.len() as u64)
+        .saturating_add(projection_edge_inputs.len() as u64);
     let edge_projections = exact_call_edge_projection_updates(
         &projection_syntax_inputs,
         &projection_targets,
@@ -13791,6 +13839,10 @@ pub fn rematerialize_proof_resolution_projection(
         &projection_edges,
         &projection_raw_targets,
     )?;
+    progress.correlation_results = progress
+        .correlation_results
+        .saturating_add(edge_projections.len() as u64);
+    progress_observer(progress);
     store.project_exact_call_edge_resolutions(&edge_projections)?;
     edges = store.get_edges()?;
 
@@ -13851,11 +13903,19 @@ pub fn rematerialize_proof_resolution_projection(
             }
         })
         .collect::<Vec<_>>();
+    progress.correlation_inputs = progress
+        .correlation_inputs
+        .saturating_add(syntax_correlation_inputs.len() as u64)
+        .saturating_add(edge_correlation_inputs.len() as u64);
     let correlations =
         correlate_exact_syntax_callsites(&syntax_correlation_inputs, &edge_correlation_inputs)
             .into_iter()
             .map(|result| result.map(|edge_index| ordinary_edge_indices[edge_index]))
             .collect::<Vec<_>>();
+    progress.correlation_results = progress
+        .correlation_results
+        .saturating_add(correlations.len() as u64);
+    progress_observer(progress);
     let mut claim_correlations = vec![None; claims.len()];
     for (correlation_index, claim_index) in exact_claim_indices.iter().copied().enumerate() {
         claim_correlations[claim_index] = Some(correlations[correlation_index]);
@@ -13876,7 +13936,12 @@ pub fn rematerialize_proof_resolution_projection(
         )?);
     }
     let funnel = build_funnel(&facts);
-    store
+    progress.facts_sealed = facts.len() as u64;
+    progress_observer(progress);
+    progress.proof_store_transaction_started = true;
+    progress_observer(progress);
+    let fact_count = facts.len() as u64;
+    let publication = store
         .replace_proof_resolution_projection(
             publication,
             &ProofResolutionProjection {
@@ -13885,7 +13950,11 @@ pub fn rematerialize_proof_resolution_projection(
                 funnel,
             },
         )
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    progress.facts_persisted = fact_count;
+    progress.proof_store_transaction_completed = true;
+    progress_observer(progress);
+    Ok(publication)
 }
 
 #[derive(Clone, Copy)]
@@ -19142,7 +19211,8 @@ fn enforce_exact_dependency_eligibility(
     governed_files: &HashMap<i64, &codestory_store::FileInfo>,
     records: &HashMap<i64, &ResolutionCacheRecord>,
     python_index: &PythonProjectionIndex,
-) -> Result<()> {
+) -> Result<u64> {
+    let mut dependency_ids_visited = 0u64;
     for claim in claims
         .iter_mut()
         .filter(|claim| claim.status == ProofResolutionStatus::Exact)
@@ -19155,6 +19225,7 @@ fn enforce_exact_dependency_eligibility(
             .collect::<HashSet<_>>();
         expected_file_ids.insert(claim.input.callsite.file_id.0);
         for (node_id, expected_file_id) in &claim.exact_node_file_expectations {
+            dependency_ids_visited = dependency_ids_visited.saturating_add(1);
             expected_file_ids.insert(expected_file_id.0);
             let node = nodes.get(node_id).ok_or_else(|| {
                 anyhow!(
@@ -19197,6 +19268,7 @@ fn enforce_exact_dependency_eligibility(
             }
         }
         for file_id in expected_file_ids {
+            dependency_ids_visited = dependency_ids_visited.saturating_add(1);
             if claim.input.language == "python"
                 && !python_index.package_ancestry_by_file.contains_key(&file_id)
             {
@@ -19233,7 +19305,7 @@ fn enforce_exact_dependency_eligibility(
             claim.evidence_chain.clear();
         }
     }
-    Ok(())
+    Ok(dependency_ids_visited)
 }
 
 fn seal_resolved_claim(
@@ -20638,8 +20710,26 @@ mod java_kotlin_complexity_tests {
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
         };
-        rematerialize_proof_resolution_projection(&mut store, &publication)
-            .expect("rematerialize proof resolution");
+        let mut progress = Vec::new();
+        rematerialize_proof_resolution_projection_with_progress(
+            &mut store,
+            &publication,
+            &mut |snapshot| progress.push(snapshot),
+        )
+        .expect("rematerialize proof resolution");
+        assert!(progress.len() <= 9, "proof progress must stay bounded");
+        assert!(progress.windows(2).all(|snapshots| {
+            snapshots[0].cache_entries_decoded <= snapshots[1].cache_entries_decoded
+                && snapshots[0].calls_resolved <= snapshots[1].calls_resolved
+                && snapshots[0].dependency_ids_visited <= snapshots[1].dependency_ids_visited
+                && snapshots[0].facts_sealed <= snapshots[1].facts_sealed
+                && snapshots[0].facts_persisted <= snapshots[1].facts_persisted
+        }));
+        assert!(
+            progress
+                .last()
+                .is_some_and(|snapshot| snapshot.proof_store_transaction_completed)
+        );
         store
             .validate_proof_resolution_publication(&publication)
             .expect("replay proof resolution");
@@ -20647,6 +20737,12 @@ mod java_kotlin_complexity_tests {
             java_kotlin_resolution_work(),
             codestory_store::store_replay_work(),
         )
+    }
+
+    #[test]
+    fn proof_resolution_progress_is_bounded_monotonic_and_completes_with_store() {
+        let work = measured_csd_pipeline_work("csharp", "calls", 2);
+        assert!(work.0 > 0 && work.1 > 0);
     }
 
     fn source(language: &str, count: usize) -> String {
