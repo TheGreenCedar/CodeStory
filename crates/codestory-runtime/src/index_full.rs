@@ -319,7 +319,7 @@ impl FailedRefreshDiagnosticSink {
         state.snapshots.push(next);
     }
 
-    pub(crate) fn closeout(&self, cancellation_requested: bool) -> String {
+    pub(crate) fn closeout(&self, cancellation_requested: bool) -> Option<String> {
         if cancellation_requested {
             self.record_boundary(FailedRefreshBoundary::CancellationRequested);
         }
@@ -327,16 +327,12 @@ impl FailedRefreshDiagnosticSink {
         if proof_open {
             self.record_boundary(FailedRefreshBoundary::ProofUnfinishedAtCloseout);
         }
-        let Some(mut state) = self.state.try_lock() else {
-            return "diagnostics_unavailable".to_owned();
-        };
+        let mut state = self.state.try_lock()?;
         if state.unavailable {
-            return "diagnostics_unavailable".to_owned();
+            return None;
         }
         if state.terminal.is_none() {
-            let Some(identity) = state.identity.clone() else {
-                return "diagnostics_unavailable".to_owned();
-            };
+            let identity = state.identity.clone()?;
             state.sequence = state.sequence.saturating_add(1);
             state.terminal = Some(FailedRefreshTerminalRecord {
                 identity,
@@ -357,7 +353,7 @@ impl FailedRefreshDiagnosticSink {
             proof_snapshots: &state.snapshots,
             terminal: state.terminal.as_ref().expect("terminal initialized"),
         })
-        .unwrap_or_else(|_| "diagnostics_unavailable".to_owned())
+        .ok()
     }
 
     pub(crate) fn attach_to_error(
@@ -368,10 +364,11 @@ impl FailedRefreshDiagnosticSink {
         if error.code == "cancelled" {
             self.observe_cancellation();
         }
+        let Some(diagnostic) = self.closeout(cancellation_requested) else {
+            return error;
+        };
         error.message.push_str("\nfailed_refresh_diagnostic=");
-        error
-            .message
-            .push_str(&self.closeout(cancellation_requested));
+        error.message.push_str(&diagnostic);
         error
     }
 
@@ -1201,10 +1198,7 @@ mod failed_refresh_diagnostic_tests {
         let original = ApiError::new("source_coverage_incomplete", "coverage failed");
         let observed = sink.attach_to_error(original.clone(), false);
 
-        assert_eq!(observed.code, original.code);
-        assert_eq!(observed.details, original.details);
-        assert!(observed.message.starts_with(&original.message));
-        assert!(observed.message.ends_with("diagnostics_unavailable"));
+        assert_eq!(observed, original);
     }
 
     #[test]
@@ -1221,7 +1215,7 @@ mod failed_refresh_diagnostic_tests {
                 false,
             );
         }
-        let report = sink.closeout(false);
+        let report = sink.closeout(false).expect("diagnostic report");
         let terminal_sequence = sink
             .state
             .lock()
