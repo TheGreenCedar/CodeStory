@@ -113,6 +113,30 @@ pub(super) fn compute_call_resolution(
     }
 
     if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && let Some((modules, require_package_name)) =
+            go_package_function_imports(callsite_identity.as_deref())
+    {
+        let selected = receiver_owner.and_then(|package_name| {
+            pass.find_go_package_function_readonly(
+                candidate_index,
+                &modules,
+                require_package_name.then_some(package_name),
+                target_name,
+            )
+        });
+        if pass.flags.store_candidates
+            && let Some(candidate) = selected
+        {
+            candidate_ids.push(candidate);
+        }
+        let resolved = selected.map(|candidate| (candidate, pass.policy.call_same_file));
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, resolved, candidate_ids.as_slice())?,
+            strategy: selected.map(|_| ResolutionStrategy::CallGlobalUnique),
+        });
+    }
+
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
         let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;

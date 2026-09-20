@@ -132,6 +132,17 @@ Resolution is a post-flush pass because it depends on the stored graph state:
 - candidate selection prefers structural matches first and can use semantic candidate indexes as a fallback for supported languages
 - incremental runs scope the resolution pass to touched files; full refresh resolves across the full workspace
 
+Go package-call resolution consumes the stored hash of each required `go.mod`
+control and a bounded module-declaration subset. It combines the exact local
+module-relative package path with the indexed package clause, then resolves a
+static imported selector only when one local package and one `FUNCTION` match.
+Explicit aliases, implicit package names, malformed controls, duplicate local
+module ownership, and local shadowing are handled before selection; ambiguous or
+unverified ownership stays unresolved. A module-control change clears and
+recomputes only this package-function resolution class so unchanged Go callers
+cannot retain stale targets. This is local navigation evidence, not `go.work`,
+`replace`, external dependency, return-type, or closure type-flow resolution.
+
 This keeps parse and extract logic in the indexer while leaving persistence and snapshot ownership in the store.
 
 ## Extension Points

@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 29;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 30;
 const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
 const INDEX_ARTIFACT_ENCODING_HEADER_BYTES: usize = 16;
 const MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES: usize = 64 * 1024 * 1024;
