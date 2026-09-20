@@ -17264,6 +17264,450 @@ func Caller() { Run() }
 }
 
 #[test]
+fn test_go_imported_package_function_resolves_through_explicit_alias() -> anyhow::Result<()> {
+    let selected_package = r#"
+package selected
+func Target() {}
+"#;
+    let same_basename_decoy = r#"
+package selected
+func Target() {}
+"#;
+    let caller = r#"
+package caller
+import chosen "example.com/project/selected"
+func Caller() { chosen.Target() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n\ngo 1.24\n"),
+        ("selected/selected.go", selected_package),
+        (
+            "external/example.com/project/selected/selected.go",
+            same_basename_decoy,
+        ),
+        ("caller.go", caller),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let resolved_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            is_matching_name(&source.serialized_name, "Caller")
+                .then_some(edge.resolved_target)
+                .flatten()
+                .and_then(|target| node_by_id.get(&target).copied())
+        })
+        .filter(|target| {
+            target.kind == NodeKind::FUNCTION && is_matching_name(&target.serialized_name, "Target")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        resolved_targets.len(),
+        1,
+        "G10-imported-package-function: expected exactly one resolved Target FUNCTION. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        file_path_for_node(&node_by_id, resolved_targets[0])
+            .map(|path| {
+                let path = path.replace('\\', "/");
+                path.ends_with("/selected/selected.go")
+                    && !path.ends_with("/external/example.com/project/selected/selected.go")
+            })
+            .unwrap_or(false),
+        "G10-imported-package-function: the module declaration must bind example.com/project/selected to the local selected/selected.go, not the same-basename external suffix decoy. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_package_function_resolution_hostile_matrix() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("oddpath/target.go", "package declared\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport \"example.com/project/oddpath\"\nfunc Caller() { declared.Target() }\n",
+        ),
+    ])?;
+    let implicit_paths = resolved_function_paths(&nodes, &edges, "Caller", "Target");
+    assert_eq!(implicit_paths.len(), 1);
+    assert!(
+        implicit_paths[0]
+            .replace('\\', "/")
+            .ends_with("/oddpath/target.go"),
+        "implicit import binding must use the indexed package clause rather than the path basename: {implicit_paths:?}"
+    );
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            r#"package caller
+import chosen "example.com/project/selected"
+type local struct{}
+func (local) Target() {}
+func Parameter(chosen local) { chosen.Target() }
+func Local() { chosen := local{}; chosen.Target() }
+func Closure() { chosen := local{}; func() { chosen.Target() }() }
+"#,
+        ),
+    ])?;
+    for caller in ["Parameter", "Local"] {
+        assert!(
+            resolved_function_paths(&nodes, &edges, caller, "Target").is_empty(),
+            "{caller}: a local binding must shadow the imported package alias"
+        );
+        assert_resolved_call_kind(&nodes, &edges, caller, "Target", NodeKind::METHOD);
+    }
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "Closure", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\ntype Thing struct{}\nfunc (Thing) Target() {}\n",
+        ),
+        ("wrong/wrong.go", "package wrong\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "package selector resolution must select only a FUNCTION in the exact imported package"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module \"example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/+project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/+project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("nested/go.mod", "module\tbroken extra\n"),
+        (
+            "nested/selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/nested/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "a malformed nested go.mod must block fallback to the outer module"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("left/go.mod", "module example.com/shared\n"),
+        ("left/pkg/target.go", "package pkg\nfunc Target() {}\n"),
+        ("right/go.mod", "module example.com/shared\n"),
+        ("right/pkg/other.go", "package pkg\nfunc Other() {}\n"),
+        ("app/go.mod", "module example.com/app\n"),
+        (
+            "app/caller.go",
+            "package app\nimport shared \"example.com/shared/pkg\"\nfunc Caller() { shared.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "duplicate local ownership of one import path must remain ambiguous even when only one root defines the function"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+    Ok(())
+}
+
+#[test]
+fn test_go_module_control_change_reindexes_callers_and_clears_old_resolution() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    fs::create_dir_all(root.join("selected"))?;
+    fs::write(root.join(".gitignore"), "go.mod\n")?;
+    fs::write(root.join("go.mod"), "module example.com/project\n")?;
+    fs::write(
+        root.join("selected/selected.go"),
+        "package selected\nfunc Target() {}\n",
+    )?;
+    fs::write(
+        root.join("caller.go"),
+        "package caller\nimport chosen \"example.com/project/selected\"\ntype local struct{}\nfunc (local) Keep() {}\nfunc Caller() { chosen.Target() }\nfunc Local() { value := local{}; value.Keep() }\n",
+    )?;
+
+    let manifest = codestory_workspace::WorkspaceManifest::open(root.to_path_buf())?;
+    let initial = manifest.build_execution_outcome(&Default::default())?;
+    assert!(
+        initial.plan.files_to_index.contains(&root.join("go.mod")),
+        "an ignored go.mod ancestor is still a required control input"
+    );
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    indexer.run(&mut storage, &initial.plan, &event_bus, None)?;
+    assert_eq!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .len(),
+        1
+    );
+
+    fs::write(root.join("go.mod"), "module example.com/changed\n")?;
+    let legacy_changed = indexer.run_incremental(
+        &mut storage,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![root.join("go.mod")],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &event_bus,
+        None,
+    )?;
+    assert!(
+        legacy_changed.graph_projection_changed,
+        "clearing a stale package-call target must invalidate downstream graph snapshots"
+    );
+    assert!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .is_empty(),
+        "legacy control-only refresh must invalidate the old package claim"
+    );
+    assert_resolved_call_kind(
+        &storage.get_nodes()?,
+        &storage.get_edges()?,
+        "Local",
+        "Keep",
+        NodeKind::METHOD,
+    );
+
+    fs::write(root.join("go.mod"), "module example.com/project\n")?;
+    let restored = indexer.run_incremental(
+        &mut storage,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![root.join("go.mod")],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &event_bus,
+        None,
+    )?;
+    assert!(
+        restored.graph_projection_changed,
+        "restoring a package-call target must invalidate downstream graph snapshots"
+    );
+    assert_eq!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .len(),
+        1,
+        "restoring the verified module control must recompute the package call"
+    );
+
+    let refresh_inputs = codestory_workspace::RefreshInputs {
+        stored_files: storage.files().inventory()?,
+        policy_exclusions: Vec::new(),
+        inventory: Default::default(),
+    };
+    fs::remove_file(root.join("go.mod"))?;
+    let removed = manifest.build_execution_outcome(&refresh_inputs)?;
+    for source in [root.join("caller.go"), root.join("selected/selected.go")] {
+        assert!(
+            removed.plan.files_to_index.contains(&source),
+            "removing a module control must schedule every admitted Go source: {source:?}"
+        );
+    }
+    assert_eq!(removed.plan.files_to_remove.len(), 1);
+    indexer.run(&mut storage, &removed.plan, &event_bus, None)?;
+    assert!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .is_empty(),
+        "projection replacement after go.mod removal must clear the old resolved target"
+    );
+    assert_resolved_call_kind(
+        &storage.get_nodes()?,
+        &storage.get_edges()?,
+        "Local",
+        "Keep",
+        NodeKind::METHOD,
+    );
+    Ok(())
+}
+
+fn resolved_function_paths(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) -> Vec<String> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            is_matching_name(&source.serialized_name, caller_name)
+                .then_some(edge.resolved_target)
+                .flatten()
+                .and_then(|target| node_by_id.get(&target).copied())
+        })
+        .filter(|target| {
+            target.kind == NodeKind::FUNCTION
+                && is_matching_name(&target.serialized_name, target_name)
+        })
+        .filter_map(|target| file_path_for_node(&node_by_id, target).map(str::to_string))
+        .collect()
+}
+
+fn assert_unresolved_go_package_call(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, target_name))
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:go-package-function"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected one package selector CALL: {calls:?}"
+    );
+    assert_eq!(
+        calls[0].resolved_target, None,
+        "invalid package selector CALL must remain explicitly unresolved"
+    );
+}
+
+fn assert_unresolved_nonpackage_go_selector_call(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, target_name))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "expected one selector CALL: {calls:?}");
+    assert_eq!(calls[0].resolved_target, None);
+    assert!(
+        calls[0]
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("syntax:go-selector-call"))
+    );
+    assert!(
+        !calls[0]
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("syntax:go-package-function")),
+        "a captured local inside an unsupported function-literal scope must not become a package call"
+    );
+}
+
+fn assert_resolved_call_kind(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let matching = edges.iter().any(|edge| {
+        edge.kind == EdgeKind::CALL
+            && node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+            && edge
+                .resolved_target
+                .and_then(|target| node_by_id.get(&target).copied())
+                .is_some_and(|target| {
+                    target.kind == expected_kind
+                        && is_matching_name(&target.serialized_name, target_name)
+                })
+    });
+    assert!(
+        matching,
+        "{caller_name}: expected resolved {expected_kind:?} call"
+    );
+}
+
+#[test]
 fn test_go_imported_and_unowned_selector_controls_stay_in_place() -> anyhow::Result<()> {
     // G10: imported typed receiver with same-named methods elsewhere.
     let notifier_source = r#"
@@ -17438,5 +17882,19 @@ func Convert(k Key) string { return string(k) }
         "String",
     );
     assert_no_resolved_call_of_kind("G13-refresh", &nodes, &edges, "Convert", NodeKind::METHOD);
+    Ok(())
+}
+
+#[test]
+fn test_go_implicit_import_must_use_declared_package_name() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("oddpath/target.go", "package declared\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport \"example.com/project/oddpath\"\nfunc Caller() { wrong.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
     Ok(())
 }

@@ -993,6 +993,19 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
+            if is_go_module_control(&path) {
+                if metadata.len() > policy.byte_cap {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!(
+                            "Go module control exceeds the {} byte source limit",
+                            policy.byte_cap
+                        ),
+                    });
+                }
+                files.push(path);
+                continue;
+            }
             // Nothing is excluded below the smaller of the two caps, so a file
             // under it never pays for path normalization.
             if metadata.len() <= policy.minimum_byte_cap() {
@@ -1335,6 +1348,100 @@ impl WorkspaceDiscovery {
             }
         }
 
+        // Go package imports depend on the nearest go.mod on every admitted
+        // Go source's ancestor chain. Observe those control files explicitly:
+        // repository ignore and source-language filters must not hide a
+        // dependency which changes the meaning of otherwise unchanged source.
+        // Caller-owned discovery exclusions remain absolute barriers.
+        let go_sources = all_files
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut go_module_controls = HashSet::new();
+        let canonical_workspace_root = workspace_root.canonicalize().ok();
+        for source in go_sources {
+            let Some(canonical_root) = canonical_workspace_root.as_ref() else {
+                continue;
+            };
+            let Ok(canonical_source) = source.canonicalize() else {
+                continue;
+            };
+            let Ok(relative) = canonical_source.strip_prefix(canonical_root) else {
+                continue;
+            };
+            let mut directory = relative.parent();
+            while let Some(parent) = directory {
+                go_module_controls.insert(workspace_root.join(parent).join("go.mod"));
+                directory = parent.parent();
+            }
+        }
+        let mut go_module_controls = go_module_controls.into_iter().collect::<Vec<_>>();
+        go_module_controls.sort();
+        for control in go_module_controls {
+            if discovery_exclusions.directory_contains(&control) {
+                issues.push(WorkspaceInventoryIssue {
+                    path: control,
+                    message: "Go module control is inside a caller-owned discovery exclusion"
+                        .to_string(),
+                });
+                continue;
+            }
+            match discovery_exclusions.file_is_excluded(&control) {
+                Ok(true) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: "Go module control is a caller-owned discovery exclusion"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: format!("failed to observe Go module control exclusion: {error}"),
+                    });
+                    continue;
+                }
+            }
+            match fs::symlink_metadata(&control) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: "Go module control must be a regular non-symlink file".to_string(),
+                    });
+                }
+                Ok(_) => {
+                    if !push_discovered_file_within_limit(
+                        &mut all_files,
+                        &mut seen,
+                        control,
+                        &workspace_root,
+                        max_files,
+                    ) {
+                        all_files.sort();
+                        return Ok(WorkspaceFileInventory {
+                            files: all_files,
+                            outcome: WorkspaceInventoryOutcome::Bounded,
+                            issues,
+                            warnings,
+                            repository_tracking_digest,
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => issues.push(WorkspaceInventoryIssue {
+                    path: control,
+                    message: format!("failed to observe Go module control: {error}"),
+                }),
+            }
+        }
+
         all_files.sort();
         let outcome = if issues.is_empty() {
             WorkspaceInventoryOutcome::Complete
@@ -1624,15 +1731,34 @@ fn build_refresh_outcome_from_inventory(
         }
     }
 
+    let mut removed_go_module_control = false;
     if inventory_outcome.is_complete() {
         for (normalized_key, stored) in normalized_stored_map {
             if !current_file_keys.contains(&normalized_key) {
+                removed_go_module_control |= is_go_module_control(&stored.path);
                 files_to_remove.push(stored.id);
             }
         }
     }
     files_to_remove.sort_unstable();
     files_to_remove.dedup();
+
+    let go_module_control_changed =
+        removed_go_module_control || files_to_index.iter().any(|path| is_go_module_control(path));
+    if go_module_control_changed {
+        files_to_index.extend(
+            current_files
+                .iter()
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+                })
+                .cloned(),
+        );
+        files_to_index.sort();
+        files_to_index.dedup();
+    }
 
     Ok(WorkspaceRefreshOutcome {
         plan: RefreshPlan {
@@ -2635,12 +2761,19 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
 
 /// Return whether a path has an indexable parser or companion-source route.
 pub fn has_supported_source_route(path: &Path) -> bool {
+    if is_go_module_control(path) {
+        return true;
+    }
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
     let extension = codestory_contracts::language_support::normalize_extension(extension);
     codestory_contracts::language_support::language_support_profile_for_ext(&extension).is_some()
         || codestory_contracts::language_support::companion_extension_profile(&extension).is_some()
+}
+
+fn is_go_module_control(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "go.mod")
 }
 
 fn registry_extension_matches_source_group(extension: &str, language: &Language) -> bool {
@@ -3374,6 +3507,77 @@ mod tests {
         assert!(outcome.plan.files_to_index.is_empty());
         assert_eq!(outcome.plan.files_to_remove, vec![44]);
         assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn go_module_controls_bypass_ignore_and_schedule_all_go_sources_on_change_or_removal()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("pkg"))?;
+        fs::write(root.join(".gitignore"), "go.mod\n")?;
+        let module = root.join("go.mod");
+        let caller = root.join("caller.go");
+        let target = root.join("pkg/target.go");
+        fs::write(&module, "module example.com/project\n")?;
+        fs::write(&caller, "package caller\n")?;
+        fs::write(&target, "package pkg\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+        assert!(
+            inventory.files.contains(&module),
+            "gitignore must not hide an admitted Go source's module control"
+        );
+        let stored_files = inventory
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let metadata = fs::metadata(path)?;
+                let (content_hash, _) = current_content_identity(path)?;
+                Ok(StoredFileState {
+                    id: index as i64 + 1,
+                    path: path.clone(),
+                    modification_time: clamp_system_time_to_epoch_millis(metadata.modified()?),
+                    content_hash: Some(content_hash),
+                    indexed: true,
+                    complete: true,
+                    retry_required: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = RefreshInputs {
+            stored_files,
+            policy_exclusions: Vec::new(),
+            inventory: Default::default(),
+        };
+        assert!(
+            manifest
+                .build_execution_plan(&inputs)?
+                .files_to_index
+                .is_empty()
+        );
+
+        fs::write(&module, "module example.com/changed\n")?;
+        let changed = manifest.build_execution_plan(&inputs)?;
+        for source in [&caller, &target] {
+            assert!(changed.files_to_index.contains(source), "{source:?}");
+        }
+
+        fs::remove_file(&module)?;
+        let removed = manifest.build_execution_plan(&inputs)?;
+        for source in [&caller, &target] {
+            assert!(removed.files_to_index.contains(source), "{source:?}");
+        }
+        assert!(
+            inputs
+                .stored_files
+                .iter()
+                .find(|file| file.path == module)
+                .is_some_and(|file| removed.files_to_remove.contains(&file.id))
+        );
         Ok(())
     }
 
@@ -5732,5 +5936,77 @@ mod tests {
             ),
             1_234
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod go_module_control_review {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    #[test]
+    fn required_control_barriers_preserve_inventory_uncertainty() -> Result<()> {
+        for case in ["excluded", "symlink", "directory", "oversized"] {
+            let temp = tempdir()?;
+            let root = temp.path().join("repo");
+            fs::create_dir_all(root.join("nested/pkg"))?;
+            fs::write(root.join("go.mod"), "module example.com/root\n")?;
+            fs::write(
+                root.join("nested/pkg/target.go"),
+                "package pkg\nfunc Target() {}\n",
+            )?;
+            let control = root.join("nested/go.mod");
+            let mut manifest = WorkspaceManifest::open(root.clone())?;
+            match case {
+                "excluded" => {
+                    fs::write(&control, "module example.com/nested\n")?;
+                    manifest.exclude_discovery_files([control.clone()]);
+                }
+                "symlink" => {
+                    let outside = temp.path().join("outside.mod");
+                    fs::write(&outside, "module example.com/nested\n")?;
+                    symlink(outside, &control)?;
+                }
+                "directory" => fs::create_dir(&control)?,
+                "oversized" => fs::write(&control, "x".repeat(128))?,
+                _ => unreachable!(),
+            }
+            let inventory = WorkspaceDiscovery.source_inventory_with_policy(
+                &manifest,
+                64,
+                "review-go-control-v1",
+            )?;
+            assert!(!inventory.outcome.is_complete(), "{case}: {inventory:?}");
+            assert!(
+                inventory.issues.iter().any(|issue| issue.path == control),
+                "{case}: {inventory:?}"
+            );
+            let outcome = build_refresh_outcome_from_inventory(
+                &manifest,
+                &RefreshInputs {
+                    stored_files: vec![StoredFileState {
+                        id: 314,
+                        path: root.join("previous.go"),
+                        modification_time: 0,
+                        content_hash: Some("a".repeat(64)),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    }],
+                    policy_exclusions: Vec::new(),
+                    inventory: Default::default(),
+                },
+                inventory.files,
+                inventory.outcome,
+                inventory.issues,
+                inventory.warnings,
+            )?;
+            assert!(
+                outcome.plan.files_to_remove.is_empty(),
+                "{case}: incomplete discovery cannot prove deletion"
+            );
+        }
+        Ok(())
     }
 }

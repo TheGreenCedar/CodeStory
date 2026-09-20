@@ -20,8 +20,11 @@ use rayon::prelude::*;
 use rusqlite::OptionalExtension;
 use rusqlite::{limits::Limit, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Instant;
 
@@ -80,7 +83,7 @@ const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
 ///
 /// Bumped when import-candidate snapshots began excluding Go import occurrence
 /// placeholders from declaration-target indexes.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 8;
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -741,6 +744,173 @@ pub struct ResolutionPass {
     flags: ResolutionFlags,
     policy: ResolutionPolicy,
     semantic_resolvers: SemanticResolverRegistry,
+    go_context: Option<GoResolutionContext>,
+}
+
+#[derive(Debug)]
+struct GoPackageIdentity {
+    import_path: String,
+    package_name: String,
+}
+
+#[derive(Debug, Default)]
+struct GoResolutionContext {
+    packages_by_file_node_id: HashMap<i64, GoPackageIdentity>,
+    ambiguous_import_paths: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct GoModuleControl {
+    directory: PathBuf,
+    module_path: Option<String>,
+}
+
+impl GoResolutionContext {
+    fn load(root: &Path, storage: &Storage) -> Result<Self> {
+        let files = storage.get_files()?;
+        if !files
+            .iter()
+            .any(|file| matches!(file.language.as_str(), "go" | "go-module-control"))
+        {
+            return Ok(Self::default());
+        }
+        let Ok(canonical_root) = root.canonicalize() else {
+            return Ok(Self::default());
+        };
+        let mut controls = Vec::new();
+        for file in files
+            .iter()
+            .filter(|file| file.language == "go-module-control")
+        {
+            let path = &file.path;
+            let Ok(canonical_path) = path.canonicalize() else {
+                return Ok(Self::default());
+            };
+            if !canonical_path.starts_with(&canonical_root)
+                || fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+                    .unwrap_or(true)
+            {
+                return Ok(Self::default());
+            }
+            let expected_hash = storage.get_file_content_hash(file.id)?;
+            let module_path = expected_hash
+                .as_deref()
+                .and_then(|expected| verified_control_source(path, expected))
+                .and_then(|source| crate::languages::go::parse_module_path(&source));
+            if let Some(directory) = canonical_path.parent() {
+                controls.push(GoModuleControl {
+                    directory: directory.to_path_buf(),
+                    module_path,
+                });
+            }
+        }
+        controls.sort_by_key(|control| std::cmp::Reverse(control.directory.components().count()));
+
+        let mut package_names = HashMap::<i64, Option<String>>::new();
+        let conn = storage.get_connection();
+        let mut stmt = conn.prepare(
+            "SELECT package.file_node_id, package.serialized_name
+             FROM node AS package
+             WHERE package.kind = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM edge AS import_edge
+                   WHERE import_edge.kind = ?2
+                     AND import_edge.source_node_id = package.id
+                     AND import_edge.target_node_id = package.id
+               )",
+        )?;
+        let rows = stmt.query_map(
+            params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            let (Some(file_node_id), package_name) = row? else {
+                continue;
+            };
+            match package_names.entry(file_node_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(package_name));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+
+        let mut packages_by_file_node_id = HashMap::new();
+        let mut package_directories_by_import = HashMap::<String, HashSet<PathBuf>>::new();
+        for file in files.iter().filter(|file| file.language == "go") {
+            let Some(package_name) = package_names.get(&file.id).and_then(Clone::clone) else {
+                continue;
+            };
+            let Ok(canonical_file) = file.path.canonicalize() else {
+                continue;
+            };
+            if !canonical_file.starts_with(&canonical_root) {
+                continue;
+            }
+            let Some(control) = controls
+                .iter()
+                .find(|control| canonical_file.starts_with(&control.directory))
+            else {
+                continue;
+            };
+            let Some(module_path) = control.module_path.as_deref() else {
+                continue;
+            };
+            let Some(package_directory) = canonical_file.parent() else {
+                continue;
+            };
+            let Ok(relative_directory) = package_directory.strip_prefix(&control.directory) else {
+                continue;
+            };
+            let relative = relative_directory.to_string_lossy().replace('\\', "/");
+            let import_path = if relative.is_empty() {
+                module_path.to_string()
+            } else {
+                format!("{}/{relative}", module_path.trim_end_matches('/'))
+            };
+            package_directories_by_import
+                .entry(import_path.clone())
+                .or_default()
+                .insert(package_directory.to_path_buf());
+            packages_by_file_node_id.insert(
+                file.id,
+                GoPackageIdentity {
+                    import_path,
+                    package_name,
+                },
+            );
+        }
+        let ambiguous_import_paths = package_directories_by_import
+            .into_iter()
+            .filter_map(|(import_path, directories)| (directories.len() > 1).then_some(import_path))
+            .collect();
+        Ok(Self {
+            packages_by_file_node_id,
+            ambiguous_import_paths,
+        })
+    }
+}
+
+fn verified_control_source(path: &Path, expected_hash: &str) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if bytes.len() > 1024 * 1024
+        || before.len() != after.len()
+        || before.modified().ok()? != after.modified().ok()?
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -766,7 +936,68 @@ impl ResolutionPass {
             flags,
             policy,
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
+            go_context: None,
         }
+    }
+
+    pub(crate) fn for_workspace(root: &Path, storage: &Storage) -> Result<Self> {
+        let mut pass = Self::new();
+        pass.go_context = Some(GoResolutionContext::load(root, storage)?);
+        Ok(pass)
+    }
+
+    pub(crate) fn invalidate_go_package_function_resolutions(
+        &self,
+        storage: &Storage,
+    ) -> Result<usize> {
+        sql::invalidate_go_package_function_resolutions(storage.get_connection())
+    }
+
+    fn find_go_package_function_readonly(
+        &self,
+        candidates: &CandidateIndex,
+        modules: &[&str],
+        package_name: Option<&str>,
+        function_name: &str,
+    ) -> Option<i64> {
+        let context = self.go_context.as_ref()?;
+        let mut eligible_modules = modules
+            .iter()
+            .copied()
+            .filter(|module| !context.ambiguous_import_paths.contains(*module))
+            .filter(|module| {
+                context.packages_by_file_node_id.values().any(|package| {
+                    package.import_path == *module
+                        && package_name.is_none_or(|name| package.package_name == name)
+                })
+            })
+            .collect::<Vec<_>>();
+        eligible_modules.sort_unstable();
+        eligible_modules.dedup();
+        let [eligible_module] = eligible_modules.as_slice() else {
+            return None;
+        };
+        let mut matches = candidates
+            .exact_map
+            .get(function_name)
+            .into_iter()
+            .flatten()
+            .filter_map(|offset| candidates.nodes.get(*offset))
+            .filter(|node| {
+                node.kind == NodeKind::FUNCTION as i32
+                    && node.is_declaration
+                    && node.serialized_name == function_name
+            })
+            .filter_map(|node| {
+                let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
+                (package_name.is_none_or(|name| package.package_name == name)
+                    && *eligible_module == package.import_path)
+                    .then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
 
     /// Resolve all eligible unresolved edges in the store.
@@ -1547,6 +1778,22 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
             part.strip_prefix(crate::RECEIVER_MODULE_CALLSITE_PREFIX)
                 .filter(|module| !module.is_empty())
         })
+}
+
+fn go_package_function_imports(callsite_identity: Option<&str>) -> Option<(Vec<&str>, bool)> {
+    let parts = callsite_identity?.split('|').collect::<Vec<_>>();
+    if parts.contains(&crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER) {
+        return receiver_module_from_callsite(callsite_identity)
+            .map(|module| (vec![module], false));
+    }
+    let encoded = parts.iter().find_map(|part| {
+        part.strip_prefix(crate::languages::go::PACKAGE_FUNCTION_IMPORT_SET_PREFIX)
+    })?;
+    let modules = encoded
+        .split(',')
+        .filter(|module| !module.is_empty())
+        .collect::<Vec<_>>();
+    (!modules.is_empty()).then_some((modules, true))
 }
 
 fn requires_python_context_manager_self_return(callsite_identity: Option<&str>) -> bool {

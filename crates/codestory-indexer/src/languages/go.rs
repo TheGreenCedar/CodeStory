@@ -72,6 +72,8 @@ use crate::{
 
 /// Callsite marker written onto edges produced from Go selector-call syntax.
 pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:go-selector-call";
+pub(crate) const PACKAGE_FUNCTION_CALLSITE_MARKER: &str = "syntax:go-package-function";
+pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-function:";
 
 const GRAPH_QUERY: &str = include_str!("../../rules/go.scm");
 
@@ -327,6 +329,7 @@ fn go_exact_type_surface(raw: &str) -> Option<(Option<String>, String)> {
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
     let import_bindings = collect_go_import_bindings(source);
+    let package_imports = collect_go_package_imports(tree.root_node(), source);
     let package_owner_specs = go_package_type_specs_by_name(tree.root_node(), source);
     let file_scope_names = go_file_scope_names(tree.root_node(), source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
@@ -361,6 +364,18 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             &import_bindings,
             &file_scope_names,
             &mut local_binding_callsites,
+            &mut edges,
+        );
+        collect_go_package_function_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &package_imports,
+            &file_scope_names,
+            &local_binding_callsites,
             &mut edges,
         );
         let mut receiver_types = method_receiver_bindings
@@ -402,6 +417,73 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         edges.extend(parameter_specs);
     });
     edges
+}
+
+#[derive(Default)]
+struct GoPackageImports {
+    explicit: HashMap<String, String>,
+    implicit: Vec<String>,
+}
+
+fn collect_go_package_function_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imports: &GoPackageImports,
+    file_scope_names: &HashSet<String>,
+    local_binding_callsites: &HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some((receiver_name, method_name)) = selector_call(node, source) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        let key = ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        };
+        if local_binding_callsites.contains(&key) || file_scope_names.contains(&receiver_name) {
+            return;
+        }
+        let (owner_module, binding_marker) =
+            if let Some(module) = imports.explicit.get(&receiver_name) {
+                (
+                    Some(module.clone()),
+                    PACKAGE_FUNCTION_CALLSITE_MARKER.to_string(),
+                )
+            } else if imports.implicit.is_empty() {
+                return;
+            } else {
+                (
+                    None,
+                    format!(
+                        "{PACKAGE_FUNCTION_IMPORT_SET_PREFIX}{}",
+                        imports.implicit.join(",")
+                    ),
+                )
+            };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name: receiver_name.clone(),
+            owner_name: receiver_name,
+            owner_module,
+            method_name,
+            method_col,
+            line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+            binding_marker: Some(binding_marker),
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
+        });
+    });
 }
 
 fn collect_go_local_composite_receiver_call_specs(
@@ -1214,6 +1296,43 @@ fn collect_go_import_bindings(source: &str) -> HashMap<String, String> {
     bindings
 }
 
+fn collect_go_package_imports(root: TsNode<'_>, source: &str) -> GoPackageImports {
+    let mut imports = GoPackageImports::default();
+    let mut duplicate_explicit = HashSet::new();
+    walk_tree_nodes(root, &mut |node| {
+        if node.kind() != "import_spec" || node.has_error() || node.is_missing() {
+            return;
+        }
+        let Some(module) = node
+            .child_by_field_name("path")
+            .and_then(|path| trimmed_node_text(path, source))
+            .and_then(|path| go_import_module_name(&path))
+        else {
+            return;
+        };
+        let alias = node
+            .child_by_field_name("name")
+            .and_then(|name| trimmed_node_text(name, source));
+        match alias.as_deref() {
+            Some("." | "_") => {}
+            Some(alias) => {
+                if let Some(alias) = normalize_parameter_name(alias) {
+                    insert_unique_import_binding(
+                        &mut imports.explicit,
+                        &mut duplicate_explicit,
+                        alias,
+                        module,
+                    );
+                }
+            }
+            None => imports.implicit.push(module),
+        }
+    });
+    imports.implicit.sort();
+    imports.implicit.dedup();
+    imports
+}
+
 fn insert_unique_import_binding(
     bindings: &mut HashMap<String, String>,
     duplicates: &mut HashSet<String>,
@@ -1265,6 +1384,61 @@ fn go_default_import_local_name(module_name: &str) -> Option<String> {
         .rsplit('/')
         .next()
         .and_then(normalize_parameter_name)
+}
+
+pub(crate) fn parse_module_path(source: &str) -> Option<String> {
+    if source.contains("/*") || source.contains("*/") {
+        return None;
+    }
+    let mut module = None;
+    for raw_line in source.lines() {
+        let line = go_strip_line_comment(raw_line).trim();
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if !tokens.contains(&"module") {
+            continue;
+        }
+        if tokens.first().copied() != Some("module") || tokens.len() != 2 || module.is_some() {
+            return None;
+        }
+        let value = go_module_directive_path(tokens[1])?;
+        module = Some(value);
+    }
+    module
+}
+
+fn go_module_directive_path(token: &str) -> Option<String> {
+    let value = if let Some(value) = token.strip_prefix('"') {
+        let value = value.strip_suffix('"')?;
+        if value.contains(['"', '\\']) {
+            return None;
+        }
+        value
+    } else if let Some(value) = token.strip_prefix('`') {
+        let value = value.strip_suffix('`')?;
+        if value.contains('`') {
+            return None;
+        }
+        value
+    } else {
+        if token.contains(['"', '`']) {
+            return None;
+        }
+        token
+    };
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains(['(', ')', '|', ','])
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '~'))
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {

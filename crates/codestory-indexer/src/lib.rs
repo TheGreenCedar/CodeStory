@@ -1777,6 +1777,11 @@ impl WorkspaceIndexer {
     }
 
     /// Run an incremental plan built from legacy `RefreshInfo`.
+    ///
+    /// The caller owns freshness and dependency expansion on this compatibility
+    /// path. In particular, a caller that supplies a changed `go.mod` must also
+    /// schedule the admitted Go sources whose package ownership can change.
+    /// Workspace-built plans perform that expansion automatically.
     pub fn run_incremental(
         &self,
         storage: &mut Storage,
@@ -1822,6 +1827,21 @@ impl WorkspaceIndexer {
         cancel_token: Option<&CancellationToken>,
     ) -> Result<WorkspaceIndexingOutcome> {
         let plan = plan.clone();
+        let go_module_control_changed = plan
+            .files_to_index
+            .iter()
+            .any(|path| path.file_name().is_some_and(|name| name == "go.mod"))
+            || plan
+                .files_to_remove
+                .iter()
+                .try_fold(false, |changed, file_id| {
+                    if changed {
+                        return Ok::<_, codestory_store::StorageError>(true);
+                    }
+                    Ok(storage
+                        .get_file_by_id(*file_id)?
+                        .is_some_and(|file| file.language == "go-module-control"))
+                })?;
         event_bus.publish(Event::IndexingStarted {
             file_count: plan.files_to_index.len(),
         });
@@ -2049,13 +2069,21 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
-        if stats.graph_projection_changed
+        if (stats.graph_projection_changed || go_module_control_changed)
             && (had_edges
                 || expanded_resolution_scope_files > 0
-                || !removal_affected_caller_file_ids.is_empty())
+                || !removal_affected_caller_file_ids.is_empty()
+                || go_module_control_changed)
         {
-            let resolver = resolution::ResolutionPass::new();
-            let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
+            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let resolution_scope = if go_module_control_changed {
+                // Module ownership can change without a Go source byte changing,
+                // and legacy RefreshInfo callers may not have expanded their
+                // scope. Reset and recompute this narrow call class repository-wide.
+                let invalidated = resolver.invalidate_go_package_function_resolutions(storage)?;
+                stats.graph_projection_changed |= invalidated > 0;
+                None
+            } else if plan.mode == codestory_workspace::BuildMode::Incremental {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
             } else {
                 None
@@ -12289,6 +12317,9 @@ fn text_only_language_name(path: &Path) -> &'static str {
 /// public language-support registry because doing so would advertise a graph
 /// or source-proof claim that the indexer cannot make.
 fn companion_inventory_language(path: &Path) -> Option<&'static str> {
+    if path.file_name().is_some_and(|name| name == "go.mod") {
+        return Some("go-module-control");
+    }
     let extension = path.extension()?.to_str()?;
     let profile = codestory_contracts::language_support::companion_extension_profile(extension)?;
     profile
