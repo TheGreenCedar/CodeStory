@@ -1782,10 +1782,7 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
 
 fn go_package_function_imports(callsite_identity: Option<&str>) -> Option<(Vec<&str>, bool)> {
     let parts = callsite_identity?.split('|').collect::<Vec<_>>();
-    if parts
-        .iter()
-        .any(|part| *part == crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER)
-    {
+    if parts.contains(&crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER) {
         return receiver_module_from_callsite(callsite_identity)
             .map(|module| (vec![module], false));
     }

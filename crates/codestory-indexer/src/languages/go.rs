@@ -1394,15 +1394,13 @@ pub(crate) fn parse_module_path(source: &str) -> Option<String> {
     for raw_line in source.lines() {
         let line = go_strip_line_comment(raw_line).trim();
         let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if !tokens.iter().any(|token| *token == "module") {
+        if !tokens.contains(&"module") {
             continue;
         }
         if tokens.first().copied() != Some("module") || tokens.len() != 2 || module.is_some() {
             return None;
         }
-        let Some(value) = go_module_directive_path(tokens[1]) else {
-            return None;
-        };
+        let value = go_module_directive_path(tokens[1])?;
         module = Some(value);
     }
     module
