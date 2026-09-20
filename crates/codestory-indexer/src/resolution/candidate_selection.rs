@@ -667,17 +667,14 @@ pub(super) fn compute_import_resolution(
             }
         }
 
-        if !pass.flags.legacy_mode && fuzzy_selected.is_none() {
-            let fuzzy_candidate = if is_go_import {
-                candidate_index.find_unambiguous_fuzzy_readonly(&name.original, &name.ascii_lower)
-            } else {
+        if !pass.flags.legacy_mode
+            && fuzzy_selected.is_none()
+            && let Some(candidate) =
                 candidate_index.find_fuzzy_readonly(&name.original, &name.ascii_lower)
-            };
-            if let Some(candidate) = fuzzy_candidate {
-                fuzzy_stage.push(candidate);
-                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
-                    fuzzy_selected = Some(candidate);
-                }
+        {
+            fuzzy_stage.push(candidate);
+            if !candidate_index.is_same_file_candidate(candidate, *file_id) {
+                fuzzy_selected = Some(candidate);
             }
         }
 

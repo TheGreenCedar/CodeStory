@@ -147,7 +147,6 @@ struct CandidateIndex {
     global_unique_exact_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     global_owner_alias_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
-    unambiguous_fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     relative_import_cache: RwLock<HashMap<RelativeImportCacheKey, Option<i64>>>,
 }
 
@@ -2792,35 +2791,6 @@ impl CandidateIndex {
         })
     }
 
-    fn find_unambiguous_fuzzy_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
-        let key = (name.to_string(), name_ascii_lower.to_string());
-        self.cached_lookup(&self.unambiguous_fuzzy_cache, key, || {
-            if let Some(exact) = self.exact_map.get(name) {
-                return if exact.len() == 1 {
-                    Some(self.nodes[exact[0]].id)
-                } else {
-                    None
-                };
-            }
-
-            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
-                return if suffix.len() == 1 {
-                    Some(self.nodes[suffix[0]].id)
-                } else {
-                    None
-                };
-            }
-
-            let mut matches = self
-                .nodes
-                .iter()
-                .filter(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
-                .map(|node| node.id);
-            let candidate = matches.next()?;
-            matches.next().is_none().then_some(candidate)
-        })
-    }
-
     fn top_matches_readonly(&self, name: &str, name_ascii_lower: &str, limit: usize) -> Vec<i64> {
         let mut out = Vec::with_capacity(limit);
         let mut seen = HashSet::with_capacity(limit.saturating_mul(2));
@@ -4769,47 +4739,6 @@ mod tests {
                 .len(),
             1
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_candidate_index_fuzzy_cache_keeps_strict_and_permissive_policies_separate() -> Result<()>
-    {
-        let conn = Connection::open_in_memory()?;
-        create_node_table(&conn)?;
-        for (id, file_id, start_line) in [(10_i64, 101_i64, 1_i64), (11, 102, 2)] {
-            conn.execute(
-                "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    NodeKind::MODULE as i32,
-                    "Shared",
-                    "pkg::Shared",
-                    file_id,
-                    start_line
-                ],
-            )?;
-        }
-
-        let permissive_first = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
-        let permissive_then_strict = (
-            permissive_first.find_fuzzy_readonly("Shared", "shared"),
-            permissive_first.find_unambiguous_fuzzy_readonly("Shared", "shared"),
-        );
-
-        let strict_first = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
-        let strict_then_permissive = (
-            strict_first.find_unambiguous_fuzzy_readonly("Shared", "shared"),
-            strict_first.find_fuzzy_readonly("Shared", "shared"),
-        );
-
-        assert_eq!(
-            (permissive_then_strict, strict_then_permissive),
-            ((Some(10_i64), None), (None, Some(10_i64))),
-            "strict and permissive fuzzy policy results must be independent of cache call order"
-        );
-
         Ok(())
     }
 

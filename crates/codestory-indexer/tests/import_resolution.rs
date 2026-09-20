@@ -302,8 +302,9 @@ pub fn make_widget() -> Widget {
     Ok(())
 }
 
-fn go_import_occurrence_fixture() -> &'static [(&'static str, &'static str)] {
-    &[
+fn go_import_occurrence_fixture(external_peer_count: usize) -> Vec<(&'static str, &'static str)> {
+    assert!(matches!(external_peer_count, 2 | 3));
+    let mut files = vec![
         (
             "consumer_a/a.go",
             r#"
@@ -328,7 +329,9 @@ func contentTypeB() string {
 }
 "#,
         ),
-        (
+    ];
+    if external_peer_count == 3 {
+        files.push((
             "consumer_c/c.go",
             r#"
 package consumer_c
@@ -339,7 +342,9 @@ func contentTypeC() string {
     return mime.TypeByExtension(".js")
 }
 "#,
-        ),
+        ));
+    }
+    files.extend([
         (
             "internal/shared/shared.go",
             r#"
@@ -394,12 +399,14 @@ func run() string {
 }
 "#,
         ),
-    ]
+    ]);
+    files
 }
 
 fn assert_go_import_occurrence_resolution(
     nodes: &[codestory_contracts::graph::Node],
     edges: &[codestory_contracts::graph::Edge],
+    expected_external_peer_count: usize,
     require_internal_resolution: bool,
 ) -> anyhow::Result<()> {
     let nodes_by_id = nodes
@@ -418,7 +425,7 @@ fn assert_go_import_occurrence_resolution(
 
     assert_eq!(
         mime_import_edges.len(),
-        3,
+        expected_external_peer_count,
         "expected one raw mime import placeholder per consumer"
     );
     assert!(
@@ -488,14 +495,24 @@ fn assert_go_import_occurrence_resolution(
 
 #[test]
 fn test_go_peer_external_import_occurrences_do_not_resolve_to_each_other() -> anyhow::Result<()> {
-    let (nodes, edges) = index_workspace(go_import_occurrence_fixture())?;
-    assert_go_import_occurrence_resolution(&nodes, &edges, true)
+    let fixture = go_import_occurrence_fixture(3);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 3, true)
+}
+
+#[test]
+fn test_two_go_peer_external_import_occurrences_do_not_resolve_to_each_other() -> anyhow::Result<()>
+{
+    let fixture = go_import_occurrence_fixture(2);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 2, true)
 }
 
 #[test]
 fn test_go_import_occurrence_safety_when_internal_resolution_is_optional() -> anyhow::Result<()> {
-    let (nodes, edges) = index_workspace(go_import_occurrence_fixture())?;
-    assert_go_import_occurrence_resolution(&nodes, &edges, false)
+    let fixture = go_import_occurrence_fixture(3);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 3, false)
 }
 
 #[test]
