@@ -56,6 +56,12 @@ pub(crate) struct ActivationIndexingEvidence {
     pub(crate) phase_timings: IndexingPhaseTimings,
     pub(crate) publication: IndexPublicationDto,
     pub(crate) stats: StorageStatsDto,
+    pub(crate) repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
+}
+
+struct IndexingCompletion {
+    phase_timings: IndexingPhaseTimings,
+    repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
 }
 
 impl AppController {
@@ -559,6 +565,7 @@ impl AppController {
             cancel_token,
             None,
         )
+        .map(|completion| completion.phase_timings)
     }
 
     fn run_indexing_blocking_inner_with_probe(
@@ -567,7 +574,7 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
         precomputed_probe: Option<IncrementalPlanProbe>,
-    ) -> Result<IndexingPhaseTimings, ApiError> {
+    ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
             if s.is_indexing {
@@ -638,7 +645,7 @@ impl AppController {
         };
 
         match result {
-            Ok(summary) => self.finish_successful_indexing(
+            Ok(summary) => self.finish_successful_indexing_with_receipt(
                 summary,
                 &storage_path,
                 refresh_runtime_caches,
@@ -653,17 +660,37 @@ impl AppController {
 
     pub(crate) fn finish_successful_indexing(
         &self,
-        mut summary: IndexingRunSummary,
+        summary: IndexingRunSummary,
         storage_path: &Path,
         refresh_runtime_caches: bool,
         _cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.finish_successful_indexing_with_receipt(
+            summary,
+            storage_path,
+            refresh_runtime_caches,
+            _cancel_token,
+        )
+        .map(|completion| completion.phase_timings)
+    }
+
+    fn finish_successful_indexing_with_receipt(
+        &self,
+        mut summary: IndexingRunSummary,
+        storage_path: &Path,
+        refresh_runtime_caches: bool,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> Result<IndexingCompletion, ApiError> {
+        let repository_tracking_digest = summary.repository_tracking_digest.clone();
         if summary.unchanged_publication {
             // Nothing was staged or published, so the live publication and its
             // completed search generation are still the ones already pinned.
             // Rebuilding either would only reproduce what is on disk.
             self.state.lock().is_indexing = false;
-            return Ok(summary.phase_timings);
+            return Ok(IndexingCompletion {
+                phase_timings: summary.phase_timings,
+                repository_tracking_digest,
+            });
         }
         if refresh_runtime_caches {
             #[cfg(test)]
@@ -750,7 +777,10 @@ impl AppController {
                 "Annotation rebinding failed after core publication; annotations stay at their last recorded binding"
             );
         }
-        Ok(summary.phase_timings)
+        Ok(IndexingCompletion {
+            phase_timings: summary.phase_timings,
+            repository_tracking_digest,
+        })
     }
 
     fn recover_failed_indexing(&self, storage_path: &Path, refresh_runtime_caches: bool) {
@@ -967,7 +997,7 @@ impl AppController {
         cancel_token: &CancellationToken,
         precomputed_probe: Option<IncrementalPlanProbe>,
     ) -> Result<ActivationIndexingEvidence, ApiError> {
-        let phase_timings = self.run_indexing_blocking_inner_with_probe(
+        let completion = self.run_indexing_blocking_inner_with_probe(
             mode,
             true,
             Some(cancel_token),
@@ -1008,8 +1038,9 @@ impl AppController {
             })?
         };
         Ok(ActivationIndexingEvidence {
-            phase_timings,
+            phase_timings: completion.phase_timings,
             publication,
+            repository_tracking_digest: completion.repository_tracking_digest,
             stats: StorageStatsDto {
                 node_count: clamp_i64_to_u32(stats.node_count),
                 edge_count: clamp_i64_to_u32(stats.edge_count),

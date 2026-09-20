@@ -28,6 +28,12 @@ refresh can proceed instead of failing closed as `source_discovery_incomplete`.
 Other symlink target inspection failures keep discovery incomplete and preserve
 the prior indexed inventory instead of authorizing deletion.
 
+Synthetic workspace discovery keeps Git-tracked source beneath a directory
+named `build` while continuing to exclude untracked build output and other
+default output trees. Filesystem freshness watches `build` paths
+conservatively, so heavy output churn may trigger an extra rescan instead of
+hiding a tracked source change.
+
 Rust indexing no longer aborts on `let` bindings to `async ||` / `async move ||`
 closures (meilisearch-class and surrealdb-class sources). Those bindings stay
 function nodes instead of colliding with the local-variable stanza and failing

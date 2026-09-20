@@ -48,6 +48,8 @@ use codestory_workspace::{
     WorkspaceInventoryOutcome,
 };
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -286,7 +288,31 @@ pub(super) struct IncrementalPlanProbe {
     execution_plan: Option<RefreshExecutionPlan>,
     policy_exclusions: Option<Vec<OversizedSourceExclusionCandidate>>,
     source_seals: Option<Vec<ArtifactSeal>>,
+    repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
     scheduled_paths: Vec<IncrementalScheduledPathDto>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_RETAINED_INCREMENTAL_PLAN_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn arm_before_retained_incremental_plan_test_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_RETAINED_INCREMENTAL_PLAN_TEST_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_retained_incremental_plan_test_hook(probe: &mut IncrementalPlanProbe) {
+    let hook = BEFORE_RETAINED_INCREMENTAL_PLAN_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+        // The hostile mutation and the publication mismatch occur at one deterministic seam.
+        // This forces the staged pipeline to discard the precomputed plan and inventory again.
+        probe.publication = None;
+    }
 }
 
 impl IncrementalPlanProbe {
@@ -362,6 +388,7 @@ fn evaluate_incremental_plan_probe(
     };
     probe.files_to_index = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_index.len());
     probe.files_to_remove = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_remove.len());
+    probe.repository_tracking_digest = policy_refresh.repository_tracking_digest.clone();
     if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         return IncrementalPlanProbeOutcomeDto::InventoryIncomplete;
     }
@@ -468,6 +495,7 @@ pub(super) fn probe_incremental_plan(
         execution_plan: None,
         policy_exclusions: None,
         source_seals: None,
+        repository_tracking_digest: None,
         scheduled_paths: Vec::new(),
     };
     probe.outcome =
@@ -481,6 +509,7 @@ type IncrementalExecutionPlanParts = (
     Vec<OversizedSourceExclusionCandidate>,
     Vec<IncrementalScheduledPathDto>,
     Vec<PathBuf>,
+    Option<codestory_workspace::RepositoryTrackingDigest>,
 );
 
 fn incremental_execution_plan(
@@ -503,6 +532,7 @@ fn incremental_execution_plan(
             policy_refresh.policy_exclusions,
             scheduled_paths,
             policy_refresh.inventory_files,
+            policy_refresh.repository_tracking_digest,
         ));
     }
     let reason =
@@ -1048,41 +1078,50 @@ fn prepare_incremental_refresh(
             ))
         })?;
     wall.core_staging_and_mutation = staging_started.elapsed();
+    #[cfg(test)]
+    run_before_retained_incremental_plan_test_hook(&mut probe);
     let retained_plan_matches_stage = probe.publication.as_ref() == previous_publication.as_ref()
         && probe.execution_plan.is_some()
         && probe.policy_exclusions.is_some()
         && probe.source_seals.is_some();
-    let (execution_plan, mut policy_exclusions, source_seals, scheduled_paths) =
-        if retained_plan_matches_stage {
-            (
-                probe
-                    .execution_plan
-                    .take()
-                    .expect("retained plan was checked above"),
-                probe
-                    .policy_exclusions
-                    .take()
-                    .expect("retained exclusions were checked above"),
-                probe.source_seals.take(),
-                std::mem::take(&mut probe.scheduled_paths),
-            )
-        } else {
-            let discovery_started = Instant::now();
-            let plan = incremental_execution_plan(
-                preparation.staged_mut(),
-                root,
-                storage_path,
-                source_index_policy,
-            )?;
-            wall.discovery_and_scheduling = wall
-                .discovery_and_scheduling
-                .saturating_add(discovery_started.elapsed());
-            // Source aliases are valid core inputs but cannot produce generic
-            // artifact seals. Keep the core plan and omit only the optional
-            // bounded retrieval transition that consumes these seals.
-            let source_seals = ArtifactSeal::observe_all(&plan.3).ok();
-            (plan.0, plan.1, source_seals, plan.2)
-        };
+    let (
+        execution_plan,
+        mut policy_exclusions,
+        source_seals,
+        scheduled_paths,
+        repository_tracking_digest,
+    ) = if retained_plan_matches_stage {
+        (
+            probe
+                .execution_plan
+                .take()
+                .expect("retained plan was checked above"),
+            probe
+                .policy_exclusions
+                .take()
+                .expect("retained exclusions were checked above"),
+            probe.source_seals.take(),
+            std::mem::take(&mut probe.scheduled_paths),
+            probe.repository_tracking_digest.clone(),
+        )
+    } else {
+        let discovery_started = Instant::now();
+        let plan = incremental_execution_plan(
+            preparation.staged_mut(),
+            root,
+            storage_path,
+            source_index_policy,
+        )?;
+        wall.discovery_and_scheduling = wall
+            .discovery_and_scheduling
+            .saturating_add(discovery_started.elapsed());
+        // Source aliases are valid core inputs but cannot produce generic
+        // artifact seals. Keep the core plan and omit only the optional
+        // bounded retrieval transition that consumes these seals.
+        let source_seals = ArtifactSeal::observe_all(&plan.3).ok();
+        (plan.0, plan.1, source_seals, plan.2, plan.4)
+    };
+    probe.repository_tracking_digest = repository_tracking_digest;
     wall.scheduled_paths = scheduled_paths;
     let staging_started = Instant::now();
     let mut semantic_plan =
@@ -1460,6 +1499,7 @@ fn run_incremental_indexing_common(
         publication,
         prepared_search_state: Some(prepared_search_state),
         unchanged_publication: false,
+        repository_tracking_digest: probe.repository_tracking_digest.clone(),
     })
 }
 
@@ -1486,5 +1526,6 @@ fn unchanged_incremental_run_summary(
             .expect("a short-circuited refresh observed the complete core publication"),
         prepared_search_state: None,
         unchanged_publication: true,
+        repository_tracking_digest: probe.repository_tracking_digest.clone(),
     }
 }

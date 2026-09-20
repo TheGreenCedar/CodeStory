@@ -529,6 +529,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
                 publication: publication.clone(),
                 prepared_search_state: Some(prepared_search_state),
                 unchanged_publication: false,
+                repository_tracking_digest: None,
             },
             publication,
             prepared.stats.symbol_search_docs_written,

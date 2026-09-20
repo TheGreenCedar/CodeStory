@@ -43,8 +43,9 @@ use super::{
 use crate::affected::tests::{EnvGuard, assert_mandatory_retrieval_unavailable};
 use crate::graph_dto::AppGraphFeatureFlags;
 use crate::index_incremental::{
-    FULL_REFRESH_REQUIRED_ERROR_CODE, full_refresh_required_error, index_incremental,
-    spawn_progress_forwarder,
+    FULL_REFRESH_REQUIRED_ERROR_CODE, arm_before_retained_incremental_plan_test_hook,
+    full_refresh_required_error, index_incremental, index_incremental_for_runtime_with_probe,
+    probe_incremental_plan, spawn_progress_forwarder,
 };
 use crate::index_timings::{FullRefreshWallDurations, IndexingRunSummary};
 use crate::repo_text::{
@@ -90,6 +91,7 @@ use crate::semantic_projection::{
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
 use crate::snippets::bounded_markdown_snippet_from_path;
+use crate::test_support::git;
 use codestory_contracts::api::{
     ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
     CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
@@ -2716,6 +2718,66 @@ fn incremental_escalates_to_complete_build_when_core_cow_is_unavailable() {
         .expect("escalated publication");
     assert_eq!(published.mode, IndexPublicationMode::Full);
     assert_ne!(published.generation_id, baseline.generation_id);
+}
+
+#[test]
+fn staged_replan_replaces_the_precomputed_repository_tracking_witness() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path();
+    fs::create_dir_all(root.join("src")).expect("source directory");
+    fs::create_dir_all(root.join("build")).expect("build directory");
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n").expect("baseline source");
+    fs::write(root.join("build/X.java"), "class X {}\n").expect("excluded source");
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "CodeStory Test"]);
+    git(root, &["config", "user.email", "test@example.invalid"]);
+    git(root, &["add", "src/lib.rs"]);
+    git(root, &["commit", "--quiet", "-m", "fixture"]);
+
+    let storage_path = root.join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(root.to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("baseline full index");
+
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> i32 { 2 }\n")
+        .expect("ordinary incremental change");
+    let policy = SourceIndexPolicy::default();
+    let digest_a = codestory_workspace::observe_repository_tracking_digest(root)
+        .expect("precomputed tracking witness");
+    let probe = probe_incremental_plan(root, &storage_path, &policy);
+    assert!(probe.has_complete_source_inventory());
+    assert!(!probe.short_circuited());
+
+    let hook_root = root.to_path_buf();
+    arm_before_retained_incremental_plan_test_hook(move || {
+        git(&hook_root, &["add", "build/X.java"]);
+    });
+    let (events_tx, _events_rx) = unbounded();
+    let summary = index_incremental_for_runtime_with_probe(
+        root,
+        &storage_path,
+        &events_tx,
+        None,
+        &test_sidecar_runtime_from_env(),
+        &policy,
+        &crate::controller_bookmarks::AnnotationsOwned::assume_owned_for_test(),
+        Some(probe),
+    )
+    .expect("incremental refresh with staged replan");
+    let digest_b = codestory_workspace::observe_repository_tracking_digest(root)
+        .expect("replacement tracking witness");
+
+    assert_ne!(digest_a, digest_b, "the hook must produce tracking state B");
+    assert_eq!(
+        summary.repository_tracking_digest,
+        Some(digest_b),
+        "the final indexing summary must carry the replacement plan witness"
+    );
 }
 
 #[test]
@@ -7690,6 +7752,7 @@ fn empty_indexing_run_summary() -> IndexingRunSummary {
         },
         prepared_search_state: None,
         unchanged_publication: false,
+        repository_tracking_digest: None,
     }
 }
 

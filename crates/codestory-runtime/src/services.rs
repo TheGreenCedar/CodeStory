@@ -102,6 +102,47 @@ thread_local! {
         RefCell::new(None);
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_ACTIVATION_CORE_REFRESH_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+    static BEFORE_ACTIVATION_ENDPOINT_OBSERVER_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_after_activation_core_refresh_test_hook(hook: impl FnOnce() + 'static) {
+    AFTER_ACTIVATION_CORE_REFRESH_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_activation_core_refresh_test_hook() {
+    let hook = AFTER_ACTIVATION_CORE_REFRESH_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_activation_core_refresh_test_hook() {}
+
+#[cfg(test)]
+fn arm_before_activation_endpoint_observer_test_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_ACTIVATION_ENDPOINT_OBSERVER_TEST_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_activation_endpoint_observer_test_hook() {
+    let hook = BEFORE_ACTIVATION_ENDPOINT_OBSERVER_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_before_activation_endpoint_observer_test_hook() {}
+
 /// Install a one-shot hostile publication hook for deterministic pinning tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_before_retrieval_pin_test_hook(hook: impl FnOnce() + 'static) {
@@ -1786,10 +1827,14 @@ impl ActivationService {
                 "managed core refresh completed"
             );
             operation.ensure_not_cancelled("core publication validation")?;
-            refreshed_core = Some((evidence.publication, evidence.stats));
+            refreshed_core = Some((
+                evidence.publication,
+                evidence.stats,
+                evidence.repository_tracking_digest,
+            ));
         }
         let local_ready = match refreshed_core.as_ref() {
-            Some((_, stats)) => stats.node_count > 0 && stats.fatal_error_count == 0,
+            Some((_, stats, _)) => stats.node_count > 0 && stats.fatal_error_count == 0,
             None => summary.as_ref().is_some_and(|summary| {
                 has_complete_core
                     && summary.stats.fatal_error_count == 0
@@ -1815,7 +1860,7 @@ impl ActivationService {
         }
         let local_publication = refreshed_core
             .as_ref()
-            .map(|(publication, _)| publication.clone())
+            .map(|(publication, _, _)| publication.clone())
             .or_else(|| {
                 summary
                     .as_ref()
@@ -1823,6 +1868,7 @@ impl ActivationService {
             })
             .expect("fresh complete core has a publication identity");
         operation.set_local_publication(local_publication.clone());
+        run_after_activation_core_refresh_test_hook();
 
         if goal == ActivationGoal::CoreOnly {
             operation.set_capability(false, ActivationCapabilityState::Ready);
@@ -1905,22 +1951,31 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
+        run_before_activation_endpoint_observer_test_hook();
         let observer_after_publication = self
             .controller
             .observed_source_epoch_if_armed(&project_root);
-        let observed_refresh_file_count =
-            refreshed_core.as_ref().map(|(_, stats)| stats.file_count);
+        let observed_refresh_file_count = refreshed_core
+            .as_ref()
+            .map(|(_, stats, _)| stats.file_count);
+        let refresh_repository_tracking_digest = refreshed_core
+            .as_ref()
+            .and_then(|(_, _, digest)| digest.as_ref());
         let observed_source_freshness = source_freshness_from_observed_incremental_refresh(
             source_observer_before_probe.as_ref(),
             observer_after_publication.as_ref(),
             complete_incremental_source_inventory,
             observed_refresh_file_count,
+            refresh_repository_tracking_digest,
         );
         let source_validation_mode = if observed_source_freshness.is_some() {
             "observer_receipt"
         } else {
             "content_scan"
         };
+        let source_observer = observed_source_freshness
+            .as_ref()
+            .and_then(|_| observer_after_publication.clone());
         let source_freshness = if let Some(freshness) = observed_source_freshness {
             freshness
         } else {
@@ -1933,9 +1988,6 @@ impl ActivationService {
                 index_freshness_block_message("activation", &source_freshness),
             ));
         }
-        let source_observer = self
-            .controller
-            .observed_source_epoch_if_armed(&project_root);
         let core_publication = self
             .retained_core_publication(&storage_path)?
             .ok_or_else(|| {
@@ -1969,6 +2021,18 @@ impl ActivationService {
             return Err(ApiError::new(
                 "publication_changed",
                 "the revalidated core publication differs from the activated core",
+            ));
+        }
+        if let Some(admitted) = source_observer.as_ref()
+            && self
+                .controller
+                .observed_source_epoch_if_armed(&project_root)
+                .as_ref()
+                != Some(admitted)
+        {
+            return Err(ApiError::new(
+                "publication_changed",
+                "source or repository tracking changed before ready-lease publication",
             ));
         }
         operation.set_ready_lease(ReadyLease {
@@ -2048,9 +2112,18 @@ fn source_freshness_from_observed_incremental_refresh(
     after: Option<&ObservedSourceEpoch>,
     complete_inventory: bool,
     refreshed_file_count: Option<u32>,
+    inventory_repository_tracking_digest: Option<&codestory_workspace::RepositoryTrackingDigest>,
 ) -> Option<IndexFreshnessDto> {
     let file_count = refreshed_file_count?;
-    if !complete_inventory || before.is_none() || before != after {
+    let before = before?;
+    let after = after?;
+    let stable_filesystem_epoch = before.session_id == after.session_id
+        && before.backend == after.backend
+        && before.epoch == after.epoch;
+    if !complete_inventory
+        || !stable_filesystem_epoch
+        || inventory_repository_tracking_digest != Some(&after.repository_tracking_digest)
+    {
         return None;
     }
     Some(IndexFreshnessDto {
@@ -3507,6 +3580,7 @@ mod freshness_gate_tests {
             session_id: session_id.to_string(),
             backend: "injected",
             epoch,
+            repository_tracking_digest: codestory_workspace::RepositoryTrackingDigest::NoRepository,
         }
     }
 
@@ -3522,11 +3596,27 @@ mod freshness_gate_tests {
             Some(&same),
             true,
             Some(42),
+            Some(&same.repository_tracking_digest),
         )
         .expect("stable observer carries the complete refresh receipt");
         assert_eq!(fresh.status, IndexFreshnessStatusDto::Fresh);
         assert_eq!(fresh.checked_file_count, 42);
         assert_eq!(fresh.indexed_file_count, 42);
+
+        let different_tracking = codestory_workspace::RepositoryTrackingDigest::Present(
+            "different-tracking-snapshot".to_string(),
+        );
+        assert!(
+            source_freshness_from_observed_incremental_refresh(
+                Some(&before),
+                Some(&same),
+                true,
+                Some(42),
+                Some(&different_tracking),
+            )
+            .is_none(),
+            "endpoint ABA cannot admit an inventory built from a different tracking snapshot"
+        );
 
         for (after, complete, count) in [
             (Some(&advanced), true, Some(42)),
@@ -3541,6 +3631,7 @@ mod freshness_gate_tests {
                     after,
                     complete,
                     count,
+                    Some(&before.repository_tracking_digest),
                 )
                 .is_none(),
                 "changed, lost, incomplete, or refresh-free evidence must fall back to a scan",
@@ -3663,7 +3754,7 @@ pub(crate) mod activation_tests {
     use crate::search_publication::{
         read_search_generation_completion, search_index_path_for_publication,
     };
-    use crate::test_support::git;
+    use crate::test_support::{git, git_output};
     use std::fs;
     use std::path::Path;
 
@@ -5322,6 +5413,210 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn activation_endpoint_noproof_uses_content_scan_and_stamps_no_observer() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        service.use_published_retrieval_fixture_for_test();
+        fs::write(
+            fixture.project.path().join("metadata.rs"),
+            "// READY_LEASE_SOURCE_CHANGED\n",
+        )
+        .expect("change source before incremental activation");
+        let fixture_root = fixture.project.path().to_path_buf();
+        let fixture_storage = fixture.storage_path.clone();
+        let fixture_sidecar = fixture.sidecar.clone();
+        arm_after_activation_core_refresh_test_hook(move || {
+            codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+                &fixture_root,
+                &fixture_storage,
+                &fixture_sidecar,
+            )
+            .expect("republish authenticated retrieval fixture for refreshed core");
+        });
+
+        let coverage_available = Arc::new(AtomicBool::new(true));
+        let coverage_for_observer = Arc::clone(&coverage_available);
+        let session = crate::tests::freshness_observer_tests::scripted_session(
+            fixture.project.path(),
+            move |_| {
+                (!coverage_for_observer.load(Ordering::Acquire))
+                    .then(|| {
+                        codestory_workspace::filesystem_observer::ObservedFilesystemEvent::CoverageLost {
+                            detail: "injected activation endpoint loss".to_string(),
+                        }
+                    })
+                    .into_iter()
+                    .collect()
+            },
+        );
+        service
+            .controller
+            .install_source_observer_for_test(fixture.project.path(), Arc::new(session));
+        let coverage_for_hook = Arc::clone(&coverage_available);
+        arm_before_activation_endpoint_observer_test_hook(move || {
+            coverage_for_hook.store(false, Ordering::Release);
+        });
+        let activation_content_scan = Arc::new(AtomicBool::new(false));
+        let activation_scan_hook = Arc::clone(&activation_content_scan);
+        crate::index_freshness::arm_before_repository_tracking_revalidation_test_hook(move || {
+            activation_scan_hook.store(true, Ordering::Release);
+        });
+        let previous_publication = fixture.lease.core_publication.clone();
+        let target = ActivationTarget::new(fixture.project.path(), &fixture.storage_path);
+        let (operation_id, cancelled) = {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            service.begin_activation_locked(
+                &mut state,
+                &target,
+                Some(previous_publication.clone()),
+                ActivationGoal::Full,
+            )
+        };
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id: operation_id.clone(),
+            cancelled,
+        };
+
+        service
+            .activate_once(
+                &operation,
+                fixture.project.path().to_path_buf(),
+                fixture.storage_path.clone(),
+                ActivationGoal::Full,
+            )
+            .expect("content-scan fallback activation");
+        let completed = operation
+            .finish(None)
+            .expect("registered activation operation completes");
+        assert_eq!(completed.operation_id, operation_id);
+        assert_eq!(completed.state, ActivationState::Ready);
+        assert!(
+            activation_content_scan.load(Ordering::Acquire),
+            "endpoint NoProof must execute the content-scan validation path"
+        );
+        {
+            let state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let replacement = state.ready_lease.as_ref().expect("activation ready lease");
+            assert_ne!(
+                replacement.core_publication, previous_publication,
+                "the old fixture lease cannot satisfy the replacement activation"
+            );
+            assert_eq!(
+                replacement.source_observer, None,
+                "a content-scan fallback cannot mint an observer fast receipt"
+            );
+            assert_eq!(
+                state
+                    .current
+                    .as_ref()
+                    .map(|snapshot| &snapshot.operation_id),
+                Some(&operation_id),
+                "the replacement lease must belong to the registered activation operation"
+            );
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "the next admission must not reuse a lease minted without observer proof"
+        );
+
+        let subsequent_content_scan = Arc::new(AtomicBool::new(false));
+        let subsequent_scan_hook = Arc::clone(&subsequent_content_scan);
+        crate::index_freshness::arm_before_repository_tracking_revalidation_test_hook(move || {
+            subsequent_scan_hook.store(true, Ordering::Release);
+        });
+        fixture
+            .runtime
+            .public_operation_service()
+            .run_with_cancel("symbols", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("subsequent public admission");
+        assert!(
+            subsequent_content_scan.load(Ordering::Acquire),
+            "subsequent admission must pay the content scan again"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_runtime_receipt_rejects_the_old_tracking_state() {
+        let parent = tempfile::tempdir().expect("fixture parent");
+        let original = parent.path().join("original");
+        fs::create_dir(&original).expect("original worktree");
+        git(&original, &["init", "--quiet"]);
+        git(&original, &["config", "user.name", "CodeStory Test"]);
+        git(&original, &["config", "user.email", "test@example.invalid"]);
+        fs::write(original.join("lib.rs"), "pub fn published() {}\n").expect("published source");
+        git(&original, &["add", "lib.rs"]);
+        git(&original, &["commit", "--quiet", "-m", "fixture"]);
+        let linked = parent.path().join("linked");
+        git(
+            &original,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        fs::create_dir(linked.join("build")).expect("build directory");
+        fs::write(linked.join("build/X.java"), "class X {}\n").expect("excluded source");
+
+        let storage_path = parent.path().join("cache/codestory.db");
+        let runtime = Runtime::new();
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(linked.clone(), storage_path.clone())
+            .expect("bind linked worktree");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish linked worktree core");
+        let service = runtime.activation_service();
+        let session =
+            crate::tests::freshness_observer_tests::scripted_session(&linked, |_| Vec::new());
+        service
+            .controller
+            .install_source_observer_for_test(&linked, Arc::new(session));
+        let recorded = service
+            .controller
+            .observed_source_epoch(&linked)
+            .expect("record linked tracking state A");
+        let index =
+            PathBuf::from(git_output(&linked, &["rev-parse", "--absolute-git-dir"])).join("index");
+        assert!(!index.starts_with(&linked));
+
+        git(&linked, &["add", "build/X.java"]);
+        let current = service
+            .controller
+            .observed_source_epoch(&linked)
+            .expect("record linked tracking state B");
+
+        assert_eq!(recorded.session_id, current.session_id);
+        assert_eq!(recorded.epoch, current.epoch);
+        assert_ne!(
+            recorded.repository_tracking_digest,
+            current.repository_tracking_digest
+        );
+        assert!(
+            !service.ready_lease_source_observer_unchanged(Some(&recorded)),
+            "the runtime lease probe must reject state A after the linked index moves to B"
+        );
+    }
+
+    #[test]
     fn a_source_mutation_after_the_lease_was_minted_refuses_ready_reuse() {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.activation_service();
@@ -5450,6 +5745,7 @@ pub(crate) mod activation_tests {
                 session_id: recorded.session_id.clone(),
                 backend: recorded.backend,
                 epoch: recorded.epoch.wrapping_add(1),
+                repository_tracking_digest: recorded.repository_tracking_digest.clone(),
             });
             state.ready_lease = Some(stale);
         }
@@ -5461,6 +5757,38 @@ pub(crate) mod activation_tests {
                 )
                 .is_none(),
             "stale Some observer must fall through to a content scan"
+        );
+    }
+
+    #[test]
+    fn admitted_source_freshness_falls_through_when_tracking_snapshot_changes() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut stale = fixture.lease.clone();
+            let recorded = stale
+                .source_observer
+                .as_mut()
+                .expect("fixture lease records an observer");
+            recorded.repository_tracking_digest =
+                codestory_workspace::RepositoryTrackingDigest::Present(
+                    "different-tracking-snapshot".to_string(),
+                );
+            state.ready_lease = Some(stale);
+        }
+        assert!(
+            service
+                .admitted_source_freshness_if_observer_coherent(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                )
+                .is_none(),
+            "tracking drift must invalidate observer-coherent source reuse"
         );
     }
 
