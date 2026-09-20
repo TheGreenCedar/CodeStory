@@ -78,9 +78,9 @@ const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
 ];
 /// Version for cached resolution-support snapshots.
 ///
-/// Bumped when call-candidate snapshots gained stored node kind so Go
-/// ownerless bare-call eligibility can be reapplied after snapshot load.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 7;
+/// Bumped when import-candidate snapshots began excluding Go import occurrence
+/// placeholders from declaration-target indexes.
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -147,6 +147,7 @@ struct CandidateIndex {
     global_unique_exact_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     global_owner_alias_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
+    unambiguous_fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     relative_import_cache: RwLock<HashMap<RelativeImportCacheKey, Option<i64>>>,
 }
 
@@ -1631,6 +1632,8 @@ impl PreparedResolutionState {
         telemetry.support_snapshot_load_ms = duration_ms_u64(snapshot_load_started.elapsed());
 
         let conn = storage.get_connection();
+        let go_import_occurrence_node_ids =
+            CandidateIndex::load_go_import_occurrence_node_ids(conn)?;
         let call_candidate_started = Instant::now();
         let call_candidate_index = CandidateIndex::load_with_import_bindings(
             conn,
@@ -1651,6 +1654,7 @@ impl PreparedResolutionState {
                 NodeKind::PACKAGE as i32,
             ],
             semantic_candidate_kinds(EdgeKind::IMPORT),
+            &go_import_occurrence_node_ids,
         )?;
         telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
 
@@ -1661,8 +1665,11 @@ impl PreparedResolutionState {
             telemetry.call_semantic_index_ms = duration_ms_u64(call_semantic_started.elapsed());
 
             let import_semantic_started = Instant::now();
-            let import_semantic_index =
-                SemanticCandidateIndex::load(conn, semantic_candidate_kinds(EdgeKind::IMPORT))?;
+            let import_semantic_index = SemanticCandidateIndex::load_excluding(
+                conn,
+                semantic_candidate_kinds(EdgeKind::IMPORT),
+                &go_import_occurrence_node_ids,
+            )?;
             telemetry.import_semantic_index_ms = duration_ms_u64(import_semantic_started.elapsed());
             (call_semantic_index, import_semantic_index)
         } else {
@@ -1784,17 +1791,44 @@ impl CandidateIndex {
         conn: &rusqlite::Connection,
         kinds: &[i32],
         relative_import_kinds: &[i32],
+        excluded_node_ids: &HashSet<i64>,
     ) -> Result<Self> {
-        let nodes = Self::load_nodes(conn, kinds)?;
-        let relative_import_nodes = if relative_import_kinds.is_empty() {
+        let mut nodes = Self::load_nodes(conn, kinds)?;
+        nodes.retain(|node| !excluded_node_ids.contains(&node.id));
+        let mut relative_import_nodes = if relative_import_kinds.is_empty() {
             Vec::new()
         } else {
             Self::load_nodes(conn, relative_import_kinds)?
         };
+        relative_import_nodes.retain(|node| !excluded_node_ids.contains(&node.id));
         Ok(Self::from_primary_and_relative_nodes(
             nodes,
             relative_import_nodes,
         ))
+    }
+
+    fn load_go_import_occurrence_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT target.id, file_node.serialized_name
+             FROM edge AS import_edge
+             JOIN node AS target ON target.id = import_edge.target_node_id
+             JOIN node AS file_node ON file_node.id = target.file_node_id
+             WHERE import_edge.kind = ?1
+               AND import_edge.source_node_id = import_edge.target_node_id
+               AND target.kind = ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![EdgeKind::IMPORT as i32, NodeKind::MODULE as i32],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            let (node_id, file_path) = row?;
+            if semantic_language_bucket(Some(&file_path)) == Some("go") {
+                ids.insert(node_id);
+            }
+        }
+        Ok(ids)
     }
 
     fn load_import_binding_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
@@ -2755,6 +2789,35 @@ impl CandidateIndex {
                 .iter()
                 .find(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
                 .map(|node| node.id)
+        })
+    }
+
+    fn find_unambiguous_fuzzy_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
+        let key = (name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.unambiguous_fuzzy_cache, key, || {
+            if let Some(exact) = self.exact_map.get(name) {
+                return if exact.len() == 1 {
+                    Some(self.nodes[exact[0]].id)
+                } else {
+                    None
+                };
+            }
+
+            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
+                return if suffix.len() == 1 {
+                    Some(self.nodes[suffix[0]].id)
+                } else {
+                    None
+                };
+            }
+
+            let mut matches = self
+                .nodes
+                .iter()
+                .filter(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
+                .map(|node| node.id);
+            let candidate = matches.next()?;
+            matches.next().is_none().then_some(candidate)
         })
     }
 
@@ -4706,6 +4769,47 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_fuzzy_cache_keeps_strict_and_permissive_policies_separate() -> Result<()>
+    {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        for (id, file_id, start_line) in [(10_i64, 101_i64, 1_i64), (11, 102, 2)] {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    NodeKind::MODULE as i32,
+                    "Shared",
+                    "pkg::Shared",
+                    file_id,
+                    start_line
+                ],
+            )?;
+        }
+
+        let permissive_first = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        let permissive_then_strict = (
+            permissive_first.find_fuzzy_readonly("Shared", "shared"),
+            permissive_first.find_unambiguous_fuzzy_readonly("Shared", "shared"),
+        );
+
+        let strict_first = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        let strict_then_permissive = (
+            strict_first.find_unambiguous_fuzzy_readonly("Shared", "shared"),
+            strict_first.find_fuzzy_readonly("Shared", "shared"),
+        );
+
+        assert_eq!(
+            (permissive_then_strict, strict_then_permissive),
+            ((Some(10_i64), None), (None, Some(10_i64))),
+            "strict and permissive fuzzy policy results must be independent of cache call order"
+        );
+
         Ok(())
     }
 

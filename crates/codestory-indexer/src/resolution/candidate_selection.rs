@@ -580,23 +580,29 @@ pub(super) fn compute_import_resolution(
     let has_alias = import_alias_mismatch(source_name, target_name);
     let has_relative_import_binding =
         is_import_binding_name(source_name) && is_relative_import_module_name(target_name);
+    let is_go_import = semantic_language_bucket(caller_file_path.as_deref()) == Some("go");
     let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
     let name_candidates = import_name_candidates(target_name, pass.flags.legacy_mode)
         .into_iter()
         .map(PreparedName::new)
         .collect::<Vec<_>>();
 
-    let mut semantic_fallback: Option<(i64, f32)> = None;
+    let mut semantic_fallback = UnambiguousBestCandidate::default();
+    let mut first_best_semantic_fallback: Option<(i64, f32)> = None;
     let mut candidate_ids = OrderedCandidateIds::with_capacity(10);
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);
         }
-        consider_selected(
-            &mut semantic_fallback,
-            candidate.target_node_id,
-            candidate.confidence,
-        );
+        if is_go_import {
+            semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
+        } else {
+            consider_selected(
+                &mut first_best_semantic_fallback,
+                candidate.target_node_id,
+                candidate.confidence,
+            );
+        }
     }
 
     let mut same_file_stage = OrderedCandidateIds::default();
@@ -661,14 +667,17 @@ pub(super) fn compute_import_resolution(
             }
         }
 
-        if !pass.flags.legacy_mode
-            && fuzzy_selected.is_none()
-            && let Some(candidate) =
+        if !pass.flags.legacy_mode && fuzzy_selected.is_none() {
+            let fuzzy_candidate = if is_go_import {
+                candidate_index.find_unambiguous_fuzzy_readonly(&name.original, &name.ascii_lower)
+            } else {
                 candidate_index.find_fuzzy_readonly(&name.original, &name.ascii_lower)
-        {
-            fuzzy_stage.push(candidate);
-            if !candidate_index.is_same_file_candidate(candidate, *file_id) {
-                fuzzy_selected = Some(candidate);
+            };
+            if let Some(candidate) = fuzzy_candidate {
+                fuzzy_stage.push(candidate);
+                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
+                    fuzzy_selected = Some(candidate);
+                }
             }
         }
 
@@ -737,6 +746,11 @@ pub(super) fn compute_import_resolution(
         selected = None;
     }
 
+    let semantic_fallback = if is_go_import {
+        semantic_fallback.selected()
+    } else {
+        first_best_semantic_fallback
+    };
     if selected.is_none()
         && !(has_alias || has_relative_import_binding)
         && let Some((candidate, confidence)) = semantic_fallback

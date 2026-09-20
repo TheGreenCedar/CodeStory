@@ -92,6 +92,14 @@ pub struct SemanticCandidateIndex {
 
 impl SemanticCandidateIndex {
     pub fn load(conn: &Connection, kinds: &[i32]) -> Result<Self> {
+        Self::load_excluding(conn, kinds, &HashSet::new())
+    }
+
+    pub(crate) fn load_excluding(
+        conn: &Connection,
+        kinds: &[i32],
+        excluded_node_ids: &HashSet<i64>,
+    ) -> Result<Self> {
         let query = if kinds.is_empty() {
             "SELECT n.id, n.kind, n.serialized_name, n.qualified_name, n.file_node_id, file_node.serialized_name
              FROM node n
@@ -131,7 +139,10 @@ impl SemanticCandidateIndex {
 
         let mut nodes = Vec::new();
         for row in rows {
-            nodes.push(row?);
+            let node = row?;
+            if !excluded_node_ids.contains(&node.id) {
+                nodes.push(node);
+            }
         }
 
         Ok(Self::from_nodes(nodes))

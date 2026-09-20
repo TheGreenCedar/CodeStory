@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Go dependency and impact results no longer connect unrelated files merely
+because they import the same external package. Ambiguous package matches stay
+unresolved instead of selecting an arbitrary target.
+
 Core-only symbol search ranks project files by their project-relative paths, so
 moving a checkout no longer adds unrelated fuzzy results from its absolute root.
 Explicit in-project absolute-path lookup remains available.
