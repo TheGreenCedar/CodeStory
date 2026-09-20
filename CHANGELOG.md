@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+The grounding skill now tells agents to leave causes unresolved when available
+observations cannot distinguish them, name what would decide among them, and
+rank a cause only when evidence supports the distinction.
+
 Go dependency and impact results no longer connect unrelated files merely
 because they import the same external package. Ambiguous package matches stay
 unresolved instead of selecting an arbitrary target.
