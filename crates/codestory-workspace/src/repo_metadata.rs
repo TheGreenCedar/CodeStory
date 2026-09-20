@@ -2411,12 +2411,23 @@ mod tests {
         let inventory = manifest.source_inventory().expect("discover sources");
 
         assert_eq!(inventory.outcome, crate::WorkspaceInventoryOutcome::Partial);
+        assert_eq!(
+            inventory.repository_tracking_digest, None,
+            "unavailable tracking metadata cannot yield a freshness witness"
+        );
+        let issue = inventory
+            .issues
+            .iter()
+            .find(|issue| issue.path == project.path().join(".git"))
+            .expect("tracking failure must be attributed to repository metadata");
         assert!(
-            inventory.issues.iter().any(|issue| {
-                issue
-                    .message
-                    .contains("repository metadata observation repository_open_failed")
-            }),
+            issue
+                .message
+                .starts_with("repository tracking metadata could not be observed:"),
+            "{inventory:?}"
+        );
+        assert!(
+            issue.message.contains("parse repository local config"),
             "{inventory:?}"
         );
     }
