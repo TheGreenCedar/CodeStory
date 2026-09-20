@@ -139,8 +139,11 @@ treat a lead as inspected source.
   observations. Account for observations that change state; use independent
   setups when earlier actions or observations would affect later checks.
   Compare actual output with the conclusion. Keep conclusions within the tested
-  inputs, guards and environment. Report uncertainty when output cannot distinguish causes,
-  and distinguish source inference from observed execution or effective policy.
+  inputs, guards and environment. When available observations do not distinguish
+  plausible causes, leave the cause unresolved and name the observations that
+  would distinguish them. Rank a cause only when the available evidence
+  distinguishes it from the alternatives, and distinguish source inference from
+  observed execution or effective policy.
 
 ## Experimental packets
 
