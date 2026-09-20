@@ -27,6 +27,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Instant;
+use tree_sitter::Parser;
 
 mod candidate_selection;
 mod pipeline;
@@ -753,10 +754,22 @@ struct GoPackageIdentity {
     package_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GoReturnDeclarationKey {
+    import_path: String,
+    package_name: String,
+    owner: Option<String>,
+    function: String,
+}
+
+type GoReturnResults = Option<Vec<Option<String>>>;
+type GoReturnDeclarationCatalog = HashMap<GoReturnDeclarationKey, GoReturnResults>;
+
 #[derive(Debug, Default)]
 struct GoResolutionContext {
     packages_by_file_node_id: HashMap<i64, GoPackageIdentity>,
     ambiguous_import_paths: HashSet<String>,
+    return_declarations: GoReturnDeclarationCatalog,
 }
 
 #[derive(Debug)]
@@ -887,11 +900,140 @@ impl GoResolutionContext {
             .into_iter()
             .filter_map(|(import_path, directories)| (directories.len() > 1).then_some(import_path))
             .collect();
+        let return_declarations = load_go_return_declarations(
+            &files,
+            &packages_by_file_node_id,
+            &canonical_root,
+            storage,
+        );
         Ok(Self {
             packages_by_file_node_id,
             ambiguous_import_paths,
+            return_declarations,
         })
     }
+}
+
+fn load_go_return_declarations(
+    files: &[codestory_store::FileInfo],
+    packages: &HashMap<i64, GoPackageIdentity>,
+    canonical_root: &Path,
+    storage: &Storage,
+) -> GoReturnDeclarationCatalog {
+    const MAX_FILES: usize = 4_096;
+    const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+    let go_files = files
+        .iter()
+        .filter(|file| file.language == "go")
+        .collect::<Vec<_>>();
+    if go_files.len() > MAX_FILES {
+        return HashMap::new();
+    }
+    let mut total_bytes = 0usize;
+    let mut pending = Vec::new();
+    let mut concrete_types = HashMap::<(String, String), HashSet<String>>::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
+        return HashMap::new();
+    }
+    for file in go_files {
+        let Some(package) = packages.get(&file.id) else {
+            continue;
+        };
+        let Ok(canonical_path) = file.path.canonicalize() else {
+            return HashMap::new();
+        };
+        if !canonical_path.starts_with(canonical_root) {
+            return HashMap::new();
+        }
+        let Some(expected_hash) = storage.get_file_content_hash(file.id).ok().flatten() else {
+            return HashMap::new();
+        };
+        let Some(source) = verified_go_source(&file.path, &expected_hash, MAX_FILE_BYTES) else {
+            return HashMap::new();
+        };
+        total_bytes = total_bytes.saturating_add(source.len());
+        if total_bytes > MAX_TOTAL_BYTES {
+            return HashMap::new();
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            return HashMap::new();
+        };
+        concrete_types
+            .entry((package.import_path.clone(), package.package_name.clone()))
+            .or_default()
+            .extend(crate::languages::go::go_concrete_return_types(
+                &tree, &source,
+            ));
+        for declaration in crate::languages::go::go_return_declarations(&tree, &source) {
+            let key = GoReturnDeclarationKey {
+                import_path: package.import_path.clone(),
+                package_name: package.package_name.clone(),
+                owner: declaration.owner,
+                function: declaration.function,
+            };
+            pending.push((key, declaration.results));
+        }
+    }
+    let mut declarations = HashMap::new();
+    for (key, mut results) in pending {
+        let package_types =
+            concrete_types.get(&(key.import_path.clone(), key.package_name.clone()));
+        if key
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !package_types.is_some_and(|types| types.contains(owner)))
+        {
+            continue;
+        }
+        for result in &mut results {
+            if result
+                .as_ref()
+                .is_some_and(|owner| !package_types.is_some_and(|types| types.contains(owner)))
+            {
+                *result = None;
+            }
+        }
+        match declarations.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(results));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+    declarations
+}
+
+fn verified_go_source(path: &Path, expected_hash: &str, max_bytes: usize) -> Option<String> {
+    let path_metadata = fs::symlink_metadata(path).ok()?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if before.len() > max_bytes as u64 || !before.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if bytes.len() > max_bytes
+        || before.len() != after.len()
+        || before.modified().ok()? != after.modified().ok()?
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn verified_control_source(path: &Path, expected_hash: &str) -> Option<String> {
@@ -953,6 +1095,13 @@ impl ResolutionPass {
         sql::invalidate_go_package_function_resolutions(storage.get_connection())
     }
 
+    pub(crate) fn invalidate_go_return_method_resolutions(
+        &self,
+        storage: &Storage,
+    ) -> Result<usize> {
+        sql::invalidate_go_return_method_resolutions(storage.get_connection())
+    }
+
     fn find_go_package_function_readonly(
         &self,
         candidates: &CandidateIndex,
@@ -992,6 +1141,114 @@ impl ResolutionPass {
                 let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
                 (package_name.is_none_or(|name| package.package_name == name)
                     && *eligible_module == package.import_path)
+                    .then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    fn find_go_return_method_readonly(
+        &self,
+        candidates: &CandidateIndex,
+        path: &crate::languages::go::GoReturnPath,
+        caller_file_id: Option<i64>,
+        method_name: &str,
+    ) -> Option<i64> {
+        let context = self.go_context.as_ref()?;
+        let (module, required_package_name) = if path.module == "." {
+            let package = context.packages_by_file_node_id.get(&caller_file_id?)?;
+            (
+                package.import_path.clone(),
+                Some(package.package_name.clone()),
+            )
+        } else {
+            let mut eligible = path
+                .module
+                .split(',')
+                .filter(|module| !context.ambiguous_import_paths.contains(*module))
+                .filter(|module| {
+                    context.packages_by_file_node_id.values().any(|package| {
+                        package.import_path == *module
+                            && path
+                                .package_name
+                                .as_deref()
+                                .is_none_or(|name| package.package_name == name)
+                    })
+                })
+                .collect::<Vec<_>>();
+            eligible.sort_unstable();
+            eligible.dedup();
+            let [module] = eligible.as_slice() else {
+                return None;
+            };
+            ((*module).to_string(), path.package_name.clone())
+        };
+        if context.ambiguous_import_paths.contains(&module) {
+            return None;
+        }
+        let package_name = if let Some(package_name) = required_package_name {
+            package_name
+        } else {
+            let mut packages = context
+                .return_declarations
+                .keys()
+                .filter(|key| {
+                    key.import_path == module
+                        && key.owner.is_none()
+                        && key.function == path.function
+                })
+                .map(|key| key.package_name.as_str())
+                .collect::<Vec<_>>();
+            packages.sort_unstable();
+            packages.dedup();
+            let [package_name] = packages.as_slice() else {
+                return None;
+            };
+            (*package_name).to_string()
+        };
+        let initial = context
+            .return_declarations
+            .get(&GoReturnDeclarationKey {
+                import_path: module.clone(),
+                package_name: package_name.clone(),
+                owner: None,
+                function: path.function.clone(),
+            })?
+            .as_ref()?;
+        if initial.len() != path.result_arity {
+            return None;
+        }
+        let mut owner = initial.get(path.result_index)?.clone()?;
+        for hop in &path.methods {
+            let results = context
+                .return_declarations
+                .get(&GoReturnDeclarationKey {
+                    import_path: module.clone(),
+                    package_name: package_name.clone(),
+                    owner: Some(owner.clone()),
+                    function: hop.clone(),
+                })?
+                .as_ref()?;
+            if results.len() != 1 {
+                return None;
+            }
+            owner = results.first()?.clone()?;
+        }
+        let expected = format!("{owner}.{method_name}");
+        let mut matches = candidates
+            .owner_member_candidate_offsets(&owner, method_name)
+            .into_iter()
+            .filter_map(|offset| candidates.nodes.get(offset))
+            .filter(|node| {
+                node.kind == NodeKind::METHOD as i32
+                    && node.is_declaration
+                    && node.serialized_name == expected
+            })
+            .filter_map(|node| {
+                let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
+                (package.import_path == module && package.package_name == package_name)
                     .then_some(node.id)
             })
             .collect::<Vec<_>>();
@@ -4331,6 +4588,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let rows = vec![
             (
@@ -4381,6 +4639,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let rows = vec![(
             1_i64,
@@ -4432,6 +4691,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(false),
+            go_context: None,
         };
         let row = (
             1_i64,
@@ -4473,6 +4733,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let row = (
             2_i64,

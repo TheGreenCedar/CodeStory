@@ -1842,6 +1842,22 @@ impl WorkspaceIndexer {
                         .get_file_by_id(*file_id)?
                         .is_some_and(|file| file.language == "go-module-control"))
                 })?;
+        let go_return_inputs_changed = go_module_control_changed
+            || plan
+                .files_to_index
+                .iter()
+                .any(|path| path.extension().is_some_and(|extension| extension == "go"))
+            || plan
+                .files_to_remove
+                .iter()
+                .try_fold(false, |changed, file_id| {
+                    if changed {
+                        return Ok::<_, codestory_store::StorageError>(true);
+                    }
+                    Ok(storage
+                        .get_file_by_id(*file_id)?
+                        .is_some_and(|file| file.language == "go"))
+                })?;
         event_bus.publish(Event::IndexingStarted {
             file_count: plan.files_to_index.len(),
         });
@@ -2069,18 +2085,23 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
-        if (stats.graph_projection_changed || go_module_control_changed)
+        if (stats.graph_projection_changed || go_return_inputs_changed)
             && (had_edges
                 || expanded_resolution_scope_files > 0
                 || !removal_affected_caller_file_ids.is_empty()
-                || go_module_control_changed)
+                || go_return_inputs_changed)
         {
             let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
-            let resolution_scope = if go_module_control_changed {
-                // Module ownership can change without a Go source byte changing,
-                // and legacy RefreshInfo callers may not have expanded their
-                // scope. Reset and recompute this narrow call class repository-wide.
-                let invalidated = resolver.invalidate_go_package_function_resolutions(storage)?;
+            let resolution_scope = if go_return_inputs_changed {
+                // Factory signatures and module ownership can change without a
+                // caller source byte changing. Reset and recompute this narrow
+                // call class repository-wide.
+                let mut invalidated = resolver.invalidate_go_return_method_resolutions(storage)?;
+                if go_module_control_changed {
+                    invalidated = invalidated.saturating_add(
+                        resolver.invalidate_go_package_function_resolutions(storage)?,
+                    );
+                }
                 stats.graph_projection_changed |= invalidated > 0;
                 None
             } else if plan.mode == codestory_workspace::BuildMode::Incremental {

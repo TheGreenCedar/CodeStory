@@ -15,6 +15,9 @@ including explicit aliases and package names that differ from their directory.
 Module changes, malformed controls, and ambiguous local ownership leave those
 calls unresolved instead of retaining or guessing a target.
 
+Go navigation now follows concrete values returned by local factory functions
+into their receiver methods and refreshes those links when declarations change.
+
 Core-only symbol search ranks project files by their project-relative paths, so
 moving a checkout no longer adds unrelated fuzzy results from its absolute root.
 Explicit in-project absolute-path lookup remains available.
