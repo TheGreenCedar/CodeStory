@@ -518,6 +518,7 @@ impl AppController {
                             &controller.runtime_config,
                             &controller.source_index_policy,
                             &annotations_owned,
+                            None,
                         ),
                         IndexMode::Incremental => index_incremental_for_runtime(
                             &root,
@@ -564,6 +565,7 @@ impl AppController {
             refresh_runtime_caches,
             cancel_token,
             None,
+            None,
         )
         .map(|completion| completion.phase_timings)
     }
@@ -574,6 +576,7 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
         precomputed_probe: Option<IncrementalPlanProbe>,
+        failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -631,6 +634,7 @@ impl AppController {
                 &self.runtime_config,
                 &self.source_index_policy,
                 &annotations_owned,
+                failed_refresh_diagnostics,
             ),
             IndexMode::Incremental => index_incremental_for_runtime_with_probe(
                 &root,
@@ -996,12 +1000,14 @@ impl AppController {
         mode: IndexMode,
         cancel_token: &CancellationToken,
         precomputed_probe: Option<IncrementalPlanProbe>,
+        failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
     ) -> Result<ActivationIndexingEvidence, ApiError> {
         let completion = self.run_indexing_blocking_inner_with_probe(
             mode,
             true,
             Some(cancel_token),
             precomputed_probe,
+            failed_refresh_diagnostics,
         )?;
         let storage_path = self.require_storage_path()?;
         let storage = Store::open_read_only(&storage_path).map_err(|error| {

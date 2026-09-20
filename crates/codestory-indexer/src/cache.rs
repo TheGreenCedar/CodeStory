@@ -504,6 +504,16 @@ pub(crate) fn decode_index_artifact(blob: &[u8]) -> anyhow::Result<CachedIndexAr
         .map_err(|error| anyhow::anyhow!("compressed parser artifact JSON is invalid: {error}"))
 }
 
+pub(crate) fn decoded_index_artifact_len(blob: &[u8]) -> Option<usize> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return Some(blob.len());
+    };
+    let (raw_len, _) = encoded.split_at_checked(std::mem::size_of::<u64>())?;
+    usize::try_from(u64::from_le_bytes(raw_len.try_into().ok()?))
+        .ok()
+        .filter(|length| *length <= MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES)
+}
+
 #[cfg(test)]
 mod encoding_tests {
     use super::*;
@@ -545,6 +555,7 @@ mod encoding_tests {
             encoded.len(),
             raw.len()
         );
+        assert_eq!(decoded_index_artifact_len(&encoded), Some(raw.len()));
         let decoded = decode_index_artifact(&encoded)?;
         assert_eq!(serde_json::to_vec(&decoded)?, raw);
         Ok(())
@@ -554,6 +565,7 @@ mod encoding_tests {
     fn parser_artifact_decoder_accepts_legacy_and_raw_oversize_fallback() -> anyhow::Result<()> {
         let artifact = repeated_artifact();
         let raw = serde_json::to_vec(&artifact)?;
+        assert_eq!(decoded_index_artifact_len(&raw), Some(raw.len()));
         assert_eq!(serde_json::to_vec(&decode_index_artifact(&raw)?)?, raw);
 
         let encoded = encode_serialized_index_artifact(raw.clone(), raw.len() - 1);

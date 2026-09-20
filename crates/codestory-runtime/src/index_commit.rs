@@ -1,3 +1,4 @@
+use crate::index_full::{FailedRefreshBoundary, FailedRefreshDiagnosticSink};
 #[cfg(test)]
 use crate::publication::run_source_policy_before_revalidate_hook;
 #[cfg(test)]
@@ -123,15 +124,48 @@ pub(super) fn rematerialize_staged_proof_resolution_projection(
     staged: &mut StagedSnapshot,
     publication: &IndexPublicationRecord,
     cancel_token: Option<&CancellationToken>,
+    diagnostics: Option<&FailedRefreshDiagnosticSink>,
 ) -> Result<(), ApiError> {
-    ensure_indexing_active(cancel_token)?;
-    codestory_indexer::rematerialize_proof_resolution_projection(staged.store_mut(), publication)
-        .map_err(|error| {
-        ApiError::internal(format!(
+    if let Err(error) = ensure_indexing_active(cancel_token) {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.observe_cancellation();
+        }
+        return Err(error);
+    }
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_boundary(FailedRefreshBoundary::ProofBegin);
+    }
+    let result = if let Some(diagnostics) = diagnostics {
+        codestory_indexer::rematerialize_proof_resolution_projection_with_progress(
+            staged.store_mut(),
+            publication,
+            &mut |progress| {
+                diagnostics.record_proof_progress(
+                    progress,
+                    cancel_token.is_some_and(CancellationToken::is_cancelled),
+                );
+            },
+        )
+    } else {
+        codestory_indexer::rematerialize_proof_resolution_projection(
+            staged.store_mut(),
+            publication,
+        )
+    };
+    if let Err(error) = result {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_boundary(FailedRefreshBoundary::ProofError);
+        }
+        return Err(ApiError::internal(format!(
             "Failed to rematerialize complete proof resolution facts: {error}"
-        ))
-    })?;
-    ensure_indexing_active(cancel_token)?;
+        )));
+    }
+    if let Err(error) = ensure_indexing_active(cancel_token) {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.observe_cancellation();
+        }
+        return Err(error);
+    }
     staged
         .store_mut()
         .validate_proof_resolution_publication(publication)
@@ -140,6 +174,9 @@ pub(super) fn rematerialize_staged_proof_resolution_projection(
                 "Failed to validate complete proof resolution facts: {error}"
             ))
         })?;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_boundary(FailedRefreshBoundary::ProofEnd);
+    }
     Ok(())
 }
 
