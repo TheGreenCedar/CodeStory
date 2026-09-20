@@ -302,6 +302,219 @@ pub fn make_widget() -> Widget {
     Ok(())
 }
 
+fn go_import_occurrence_fixture(external_peer_count: usize) -> Vec<(&'static str, &'static str)> {
+    assert!(matches!(external_peer_count, 2 | 3));
+    let mut files = vec![
+        (
+            "consumer_a/a.go",
+            r#"
+package consumer_a
+
+import "mime"
+
+func contentTypeA() string {
+    return mime.TypeByExtension(".html")
+}
+"#,
+        ),
+        (
+            "consumer_b/b.go",
+            r#"
+package consumer_b
+
+import "mime"
+
+func contentTypeB() string {
+    return mime.TypeByExtension(".css")
+}
+"#,
+        ),
+    ];
+    if external_peer_count == 3 {
+        files.push((
+            "consumer_c/c.go",
+            r#"
+package consumer_c
+
+import "mime"
+
+func contentTypeC() string {
+    return mime.TypeByExtension(".js")
+}
+"#,
+        ));
+    }
+    files.extend([
+        (
+            "internal/shared/shared.go",
+            r#"
+package shared
+
+func Value() string {
+    return "shared"
+}
+"#,
+        ),
+        (
+            "cmd/app/main.go",
+            r#"
+package app
+
+import "example.com/acme/internal/shared"
+
+func run() string {
+    return shared.Value()
+}
+"#,
+        ),
+        (
+            "candidate_one/example.com/acme/ambiguous/ambiguous.go",
+            r#"
+package ambiguous
+
+func Value() string {
+    return "one"
+}
+"#,
+        ),
+        (
+            "candidate_two/example.com/acme/ambiguous/ambiguous.go",
+            r#"
+package ambiguous
+
+func Value() string {
+    return "two"
+}
+"#,
+        ),
+        (
+            "cmd/ambiguous/main.go",
+            r#"
+package main
+
+import "example.com/acme/ambiguous"
+
+func run() string {
+    return ambiguous.Value()
+}
+"#,
+        ),
+    ]);
+    files
+}
+
+fn assert_go_import_occurrence_resolution(
+    nodes: &[codestory_contracts::graph::Node],
+    edges: &[codestory_contracts::graph::Edge],
+    expected_external_peer_count: usize,
+    require_internal_resolution: bool,
+) -> anyhow::Result<()> {
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mime_import_edges = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter(|edge| {
+            nodes_by_id
+                .get(&edge.target)
+                .is_some_and(|target| target.serialized_name == "\"mime\"")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        mime_import_edges.len(),
+        expected_external_peer_count,
+        "expected one raw mime import placeholder per consumer"
+    );
+    assert!(
+        mime_import_edges
+            .iter()
+            .all(|edge| edge.source == edge.target),
+        "Go external imports must retain their extracted self-placeholder endpoints: {mime_import_edges:?}"
+    );
+    assert!(
+        mime_import_edges
+            .iter()
+            .all(|edge| edge.resolved_target.is_none()),
+        "peer consumers of the same absent external package must not resolve to one another: {mime_import_edges:?}"
+    );
+
+    let shared_package = node_in_file(
+        nodes,
+        &nodes_by_id,
+        "shared",
+        NodeKind::MODULE,
+        "internal/shared/shared.go",
+    )
+    .ok_or_else(|| anyhow::anyhow!("missing internal shared package declaration"))?;
+    let internal_import = edges
+        .iter()
+        .find(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge_importer_path(&nodes_by_id, edge)
+                    .is_some_and(|path| path_ends_with(path, "cmd/app/main.go"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing internal shared import edge"))?;
+    assert_eq!(
+        internal_import.source, internal_import.target,
+        "internal import must retain its extracted self-placeholder endpoint"
+    );
+    match internal_import.resolved_target {
+        Some(target) => assert_eq!(
+            target, shared_package.id,
+            "an internal import must never resolve to an import occurrence"
+        ),
+        None if !require_internal_resolution => {}
+        None => panic!("default resolution must resolve the internal import declaration"),
+    }
+
+    let ambiguous_import_edges = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter(|edge| {
+            edge_importer_path(&nodes_by_id, edge)
+                .is_some_and(|path| path_ends_with(path, "cmd/ambiguous/main.go"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ambiguous_import_edges.len(),
+        1,
+        "expected one raw ambiguous import placeholder"
+    );
+    assert!(
+        ambiguous_import_edges
+            .iter()
+            .all(|edge| edge.source == edge.target && edge.resolved_target.is_none()),
+        "multiple declaration-backed Go import targets must remain unresolved without rewriting the raw placeholder: {ambiguous_import_edges:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_go_peer_external_import_occurrences_do_not_resolve_to_each_other() -> anyhow::Result<()> {
+    let fixture = go_import_occurrence_fixture(3);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 3, true)
+}
+
+#[test]
+fn test_two_go_peer_external_import_occurrences_do_not_resolve_to_each_other() -> anyhow::Result<()>
+{
+    let fixture = go_import_occurrence_fixture(2);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 2, true)
+}
+
+#[test]
+fn test_go_import_occurrence_safety_when_internal_resolution_is_optional() -> anyhow::Result<()> {
+    let fixture = go_import_occurrence_fixture(3);
+    let (nodes, edges) = index_workspace(&fixture)?;
+    assert_go_import_occurrence_resolution(&nodes, &edges, 3, false)
+}
+
 #[test]
 fn test_generic_parser_backed_imports_resolve_to_indexed_targets() -> anyhow::Result<()> {
     let (nodes, edges) = index_workspace(&[
