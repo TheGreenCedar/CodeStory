@@ -524,23 +524,41 @@ fn build_incremental_wall_receipt(
         bail!("retrieval finalization reported both complete and incremental vector totals");
     }
     let vector_total = vector_complete.max(vector_incremental);
-    let retrieval_process_ipc_ms =
-        phase_total(retrieval, "vector ipc and orchestration").min(vector_total);
     let retrieval_input_fingerprint_ms = phase_total(retrieval, "input fingerprint");
     let lexical_ms = phase_total(retrieval, "lexical sidecar");
     let graph_ms = phase_total(retrieval, "graph artifact");
     let retrieval_manifest_publication_ms = phase_total(retrieval, "manifest write");
+    // These workers run concurrently. Their elapsed durations are preserved in
+    // retrieval_phase_timings, but without interval boundaries only the longest
+    // worker is a safe exclusive lower bound for the wall receipt. Resolve ties
+    // consistently so one duration is never credited twice.
+    let (lexical_wall_ms, vector_wall_ms, graph_wall_ms) =
+        if vector_total >= lexical_ms && vector_total >= graph_ms {
+            (0, vector_total, 0)
+        } else if lexical_ms >= graph_ms {
+            (lexical_ms, 0, 0)
+        } else {
+            (0, 0, graph_ms)
+        };
+    let vector_ipc_ms = phase_total(retrieval, "vector ipc and orchestration");
+    if vector_ipc_ms > vector_total {
+        bail!("vector ipc exceeds vector finalization wall");
+    }
+    let retrieval_process_ipc_ms = vector_ipc_ms.min(vector_wall_ms);
     let retrieval_named_ms = retrieval_input_fingerprint_ms
-        .saturating_add(lexical_ms)
-        .saturating_add(vector_total)
-        .saturating_add(graph_ms)
-        .saturating_add(retrieval_manifest_publication_ms);
+        .checked_add(lexical_wall_ms)
+        .and_then(|total| total.checked_add(vector_wall_ms))
+        .and_then(|total| total.checked_add(graph_wall_ms))
+        .and_then(|total| total.checked_add(retrieval_manifest_publication_ms))
+        .context("retrieval phase duration overflow")?;
     if retrieval_named_ms > retrieval_finalize_ms {
         bail!(
             "retrieval phases exceed finalization wall: phases={retrieval_named_ms} total={retrieval_finalize_ms}"
         );
     }
-    let command_named_ms = u64::from(core.core_refresh_ms).saturating_add(retrieval_finalize_ms);
+    let command_named_ms = u64::from(core.core_refresh_ms)
+        .checked_add(retrieval_finalize_ms)
+        .context("core and retrieval wall duration overflow")?;
     if command_named_ms > total_ms {
         bail!(
             "core and retrieval phases exceed command wall: phases={command_named_ms} total={total_ms}"
@@ -556,9 +574,9 @@ fn build_incremental_wall_receipt(
         core_staging_and_mutation_ms: u64::from(core.core_staging_and_mutation_ms),
         candidate_sealing_ms: u64::from(core.candidate_sealing_ms),
         pointer_publication_ms: u64::from(core.pointer_publication_ms),
-        lexical_ms,
-        vector_ms: vector_total.saturating_sub(retrieval_process_ipc_ms),
-        graph_ms,
+        lexical_ms: lexical_wall_ms,
+        vector_ms: vector_wall_ms.saturating_sub(retrieval_process_ipc_ms),
+        graph_ms: graph_wall_ms,
         retrieval_input_fingerprint_ms,
         retrieval_manifest_publication_ms,
         lock_wait_ms: u64::from(core.lock_wait_ms),
@@ -996,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_wall_receipt_uses_exclusive_phases_and_reconciles_outer_wall() {
+    fn incremental_wall_receipt_credits_one_concurrent_worker_and_reconciles_outer_wall() {
         let core = codestory_contracts::api::IncrementalCoreWallTimings {
             core_refresh_ms: 10_000,
             discovery_and_scheduling_ms: 120,
@@ -1055,11 +1073,219 @@ mod tests {
         assert_eq!(receipt.total_ms, 16_000);
         assert_eq!(receipt.accounted_ms, 16_000);
         assert_eq!(receipt.reconciliation_basis_points, 10_000);
-        assert_eq!(receipt.phases.vector_ms, 398);
-        assert_eq!(receipt.phases.process_ipc_ms, 443);
-        assert_eq!(receipt.phases.unattributed_ms, 438);
+        assert_eq!(receipt.phases.lexical_ms, 1_902);
+        assert_eq!(receipt.phases.vector_ms, 0);
+        assert_eq!(receipt.phases.graph_ms, 0);
+        assert_eq!(receipt.phases.process_ipc_ms, 100);
+        assert_eq!(receipt.phases.unattributed_ms, 2_567);
         assert_eq!(receipt.phases.sum(), receipt.total_ms);
         assert_eq!(receipt.scheduled_paths, core.scheduled_paths);
+    }
+
+    #[test]
+    fn incremental_wall_receipt_reconciles_overlapping_finalization() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings {
+            core_refresh_ms: 1_000,
+            core_staging_and_mutation_ms: 1_000,
+            ..Default::default()
+        };
+        let retrieval = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 300,
+            },
+            FinalizePhaseTiming {
+                phase: "lexical sidecar".into(),
+                elapsed_ms: 800,
+            },
+            FinalizePhaseTiming {
+                phase: "incremental embedded vectors".into(),
+                elapsed_ms: 1_000,
+            },
+            FinalizePhaseTiming {
+                phase: "vector ipc and orchestration".into(),
+                elapsed_ms: 200,
+            },
+            FinalizePhaseTiming {
+                phase: "graph artifact".into(),
+                elapsed_ms: 900,
+            },
+            FinalizePhaseTiming {
+                phase: "manifest write".into(),
+                elapsed_ms: 200,
+            },
+        ];
+
+        let receipt = build_incremental_wall_receipt(2_600, 1_600, &core, &retrieval)
+            .expect("overlapping workers fit the finalization wall");
+        assert_eq!(receipt.phases.retrieval_input_fingerprint_ms, 300);
+        assert_eq!(receipt.phases.vector_ms, 800);
+        assert_eq!(receipt.phases.process_ipc_ms, 200);
+        assert_eq!(receipt.phases.lexical_ms, 0);
+        assert_eq!(receipt.phases.graph_ms, 0);
+        assert_eq!(receipt.phases.retrieval_manifest_publication_ms, 200);
+        assert_eq!(receipt.phases.unattributed_ms, 100);
+        assert_eq!(receipt.attributed_ms, 2_500);
+        assert_eq!(receipt.accounted_ms, receipt.total_ms);
+    }
+
+    #[test]
+    fn incremental_wall_receipt_selects_longest_worker_with_deterministic_ties() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        for (lexical, vector, graph, expected) in [
+            (90, 100, 80, (0, 75, 0, 25)),
+            (100, 90, 80, (100, 0, 0, 0)),
+            (80, 90, 100, (0, 0, 100, 0)),
+            (100, 100, 100, (0, 75, 0, 25)),
+            (100, 0, 100, (100, 0, 0, 0)),
+            (0, 0, 0, (0, 0, 0, 0)),
+        ] {
+            let retrieval = vec![
+                FinalizePhaseTiming {
+                    phase: "lexical sidecar".into(),
+                    elapsed_ms: lexical,
+                },
+                FinalizePhaseTiming {
+                    phase: "incremental embedded vectors".into(),
+                    elapsed_ms: vector,
+                },
+                FinalizePhaseTiming {
+                    phase: "vector ipc and orchestration".into(),
+                    elapsed_ms: vector.min(25),
+                },
+                FinalizePhaseTiming {
+                    phase: "graph artifact".into(),
+                    elapsed_ms: graph,
+                },
+            ];
+            let wall_ms = lexical.max(vector).max(graph);
+            let receipt = build_incremental_wall_receipt(wall_ms, wall_ms, &core, &retrieval)
+                .expect("longest worker fits wall");
+            assert_eq!(
+                (
+                    receipt.phases.lexical_ms,
+                    receipt.phases.vector_ms,
+                    receipt.phases.graph_ms,
+                    receipt.phases.process_ipc_ms,
+                ),
+                expected
+            );
+            assert_eq!(receipt.accounted_ms, wall_ms);
+        }
+    }
+
+    #[test]
+    fn incremental_wall_receipt_preserves_serial_phases() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        let retrieval = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 10,
+            },
+            FinalizePhaseTiming {
+                phase: "lexical sidecar".into(),
+                elapsed_ms: 50,
+            },
+            FinalizePhaseTiming {
+                phase: "manifest write".into(),
+                elapsed_ms: 20,
+            },
+        ];
+        let receipt = build_incremental_wall_receipt(80, 80, &core, &retrieval)
+            .expect("serial phases fit wall");
+        assert_eq!(receipt.phases.retrieval_input_fingerprint_ms, 10);
+        assert_eq!(receipt.phases.lexical_ms, 50);
+        assert_eq!(receipt.phases.retrieval_manifest_publication_ms, 20);
+        assert_eq!(receipt.phases.unattributed_ms, 0);
+    }
+
+    #[test]
+    fn incremental_wall_receipt_rejects_unreconcilable_finalization() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        let retrieval = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 300,
+            },
+            FinalizePhaseTiming {
+                phase: "incremental embedded vectors".into(),
+                elapsed_ms: 1_000,
+            },
+            FinalizePhaseTiming {
+                phase: "graph artifact".into(),
+                elapsed_ms: 900,
+            },
+            FinalizePhaseTiming {
+                phase: "manifest write".into(),
+                elapsed_ms: 200,
+            },
+        ];
+        let error = build_incremental_wall_receipt(1_499, 1_499, &core, &retrieval)
+            .expect_err("serial phases and the longest worker cannot fit");
+        assert!(error.to_string().contains("exceed finalization wall"));
+    }
+
+    #[test]
+    fn incremental_wall_receipt_rejects_invalid_vector_ipc_and_duration_overflow() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        let invalid_ipc = vec![FinalizePhaseTiming {
+            phase: "vector ipc and orchestration".into(),
+            elapsed_ms: 1,
+        }];
+        let error = build_incremental_wall_receipt(1, 1, &core, &invalid_ipc)
+            .expect_err("ipc without vector work is invalid");
+        assert!(error.to_string().contains("vector ipc exceeds"));
+
+        let overflowing_phases = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 1,
+            },
+            FinalizePhaseTiming {
+                phase: "incremental embedded vectors".into(),
+                elapsed_ms: u64::MAX,
+            },
+        ];
+        let error = build_incremental_wall_receipt(u64::MAX, u64::MAX, &core, &overflowing_phases)
+            .expect_err("overflow must not be accepted through saturation");
+        assert!(
+            error
+                .to_string()
+                .contains("retrieval phase duration overflow")
+        );
+    }
+
+    #[test]
+    fn incremental_wall_receipt_preserves_millisecond_residual() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        let retrieval = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 1,
+            },
+            FinalizePhaseTiming {
+                phase: "lexical sidecar".into(),
+                elapsed_ms: 1,
+            },
+            FinalizePhaseTiming {
+                phase: "incremental embedded vectors".into(),
+                elapsed_ms: 1,
+            },
+            FinalizePhaseTiming {
+                phase: "graph artifact".into(),
+                elapsed_ms: 1,
+            },
+            FinalizePhaseTiming {
+                phase: "manifest write".into(),
+                elapsed_ms: 1,
+            },
+        ];
+        let receipt = build_incremental_wall_receipt(4, 4, &core, &retrieval)
+            .expect("small overlapping phases fit the wall");
+        assert_eq!(receipt.phases.unattributed_ms, 1);
+        assert_eq!(receipt.attributed_ms, 3);
+        assert_eq!(receipt.accounted_ms, 4);
+        assert_eq!(receipt.phases.sum(), 4);
     }
 
     struct LiveOperationFixture {
