@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Full-retrieval search can now find declarations by terms in their attached
+comments, even when those terms do not fit the short symbol summary. Source
+that could not be read within the configured bounds remains marked unavailable
+instead of appearing to have no comment.
+
 On projects with full retrieval ready, broad searches with `--plan-details`
 now run after opening the project instead of reporting an uninitialized search engine.
 

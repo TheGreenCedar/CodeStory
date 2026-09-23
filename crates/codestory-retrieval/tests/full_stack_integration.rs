@@ -91,6 +91,13 @@ fn seed_fixture_graph(storage: &mut Store, project_root: &Path) -> NodeId {
             doc_text: "symbol_kind: FUNCTION\nname: extension_service".into(),
             doc_version: 1,
             doc_hash: "extension-service-doc".into(),
+            attached_comment_text: Some(String::new()),
+            attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                Some(""),
+            ),
             policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.into(),
             source_provenance: "graph".into(),
             updated_at_epoch_ms: 1,
@@ -160,6 +167,136 @@ fn published_generation_reaches_full_mode_and_returns_graph_backed_hits() {
         "expected a graph-backed lexical hit, got {:?}",
         result.hits
     );
+}
+
+#[test]
+fn attached_comment_is_lexical_evidence_without_changing_dense_document() {
+    let (project, cache, _database, storage_path) = seeded_project();
+    let runtime = runtime(project.path(), cache.path());
+    {
+        let mut storage = Store::open(&storage_path).expect("open core");
+        let mut docs = storage
+            .get_symbol_search_docs_batch_after(None, 10)
+            .expect("symbol docs");
+        let doc = docs
+            .iter_mut()
+            .find(|doc| doc.node_id == NodeId(2001))
+            .expect("fixture symbol");
+        let original_doc = doc.doc_text.clone();
+        let original_hash = doc.doc_hash.clone();
+        doc.attached_comment_text = Some(
+            "Failure deletes previously downloaded outputs with evanescentsignal and TF_VAR_* markers.".into(),
+        );
+        doc.attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            doc.attached_comment_text.as_deref(),
+        );
+        storage
+            .upsert_symbol_search_docs_batch(&docs)
+            .expect("write comment evidence");
+        let persisted = storage
+            .get_symbol_search_docs_batch_after(None, 10)
+            .expect("persisted docs");
+        assert_eq!(persisted[0].doc_text, original_doc);
+        assert_eq!(persisted[0].doc_hash, original_hash);
+    }
+
+    publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+        .expect("publish strict zero-dense generation");
+    let result = execute_retrieval_query_with_cache_for_runtime(
+        QueryRequest {
+            project_root: project.path(),
+            storage_path: &storage_path,
+            query: "evanescentsignal",
+            budget_ms: Some(2_000),
+            cancelled: None,
+        },
+        &mut RetrievalCache::new(),
+        &runtime,
+    )
+    .expect("query comment evidence");
+    assert_eq!(result.trace.retrieval_mode, "full");
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.node_id.as_deref() == Some("2001")),
+        "expected attached-comment lexical hit: {:?}",
+        result.hits
+    );
+    let tf_var_result = execute_retrieval_query_with_cache_for_runtime(
+        QueryRequest {
+            project_root: project.path(),
+            storage_path: &storage_path,
+            query: "TF_VAR",
+            budget_ms: Some(2_000),
+            cancelled: None,
+        },
+        &mut RetrievalCache::new(),
+        &runtime,
+    )
+    .expect("query comment identifier");
+    assert!(
+        tf_var_result
+            .hits
+            .iter()
+            .any(|hit| hit.node_id.as_deref() == Some("2001")),
+        "expected TF_VAR attached-comment lexical hit: {:?}",
+        tf_var_result.hits
+    );
+}
+
+#[test]
+fn bounded_source_unavailable_keeps_full_retrieval_without_claiming_empty_comment() {
+    let (project, cache, _database, storage_path) = seeded_project();
+    let runtime = runtime(project.path(), cache.path());
+    {
+        let mut storage = Store::open(&storage_path).expect("open core");
+        let mut docs = storage
+            .get_symbol_search_docs_batch_after(None, 10)
+            .expect("symbol docs");
+        let doc = docs
+            .iter_mut()
+            .find(|doc| doc.node_id == NodeId(2001))
+            .expect("fixture symbol");
+        doc.attached_comment_text = None;
+        doc.attached_comment_state = SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE.into();
+        doc.attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE,
+            None,
+        );
+        storage
+            .upsert_symbol_search_docs_batch(&docs)
+            .expect("persist unavailable state");
+    }
+    publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+        .expect("publish bounded full generation");
+    let result = execute_retrieval_query_with_cache_for_runtime(
+        QueryRequest {
+            project_root: project.path(),
+            storage_path: &storage_path,
+            query: "extension_service",
+            budget_ms: Some(2_000),
+            cancelled: None,
+        },
+        &mut RetrievalCache::new(),
+        &runtime,
+    )
+    .expect("query bounded generation");
+    assert_eq!(result.trace.retrieval_mode, "full");
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.node_id.as_deref() == Some("2001"))
+    );
+    let stored = Store::open_read_only(&storage_path).expect("read core");
+    let docs = stored
+        .get_symbol_search_docs_batch_after(None, 10)
+        .expect("read evidence");
+    assert!(docs.iter().any(|doc| doc.node_id == NodeId(2001)
+        && doc.attached_comment_text.is_none()
+        && doc.attached_comment_state == SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE));
 }
 
 #[test]

@@ -1048,6 +1048,13 @@ pub(crate) fn publish_admissible_retrieval_manifest(
             doc_text: format!("admissible_{id:02}"),
             doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
             doc_hash: format!("admissible-doc-{id:02}"),
+            attached_comment_text: Some(String::new()),
+            attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                Some(""),
+            ),
             policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.to_string(),
             source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
             updated_at_epoch_ms: 1,

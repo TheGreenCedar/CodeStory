@@ -755,6 +755,7 @@ pub(crate) fn prepare_lexical_input_for_store(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_bounded_lexical_input(
     project_root: &Path,
+    current_store: &Store,
     current_storage_path: &Path,
     previous_storage_path: &Path,
     lexical_data_dir: &Path,
@@ -782,6 +783,10 @@ pub(crate) fn prepare_bounded_lexical_input(
         || current_policy.structural_unit_cap != expected_policy.structural_unit_cap
     {
         bounded_ineligible!("source_policy_changed");
+    }
+    let previous_store = Store::open_read_only(previous_storage_path)?;
+    if !symbol_documents_match(project_root, current_store, &previous_store)? {
+        bounded_ineligible!("symbol_documents_changed");
     }
 
     let previous_shard = shard_dir_for(lexical_data_dir, previous_generation);
@@ -901,6 +906,39 @@ pub(crate) fn prepare_bounded_lexical_input(
         source_seals: source_seals.to_vec(),
         bounded_state: Some(desired_state),
     }))
+}
+
+/// The source-only shortcut carries every symbol document from its predecessor.
+/// Compare lexical content against the pinned core because a leading comment
+/// can change while the graph and v10 dense document remain equivalent.
+fn symbol_documents_match(project_root: &Path, current: &Store, previous: &Store) -> Result<bool> {
+    let mut current_after = None;
+    let mut previous_after = None;
+    loop {
+        let current_batch = current.get_symbol_search_docs_batch_after(current_after, 4096)?;
+        let previous_batch = previous.get_symbol_search_docs_batch_after(previous_after, 4096)?;
+        if current_batch.len() != previous_batch.len() {
+            return Ok(false);
+        }
+        if current_batch.is_empty() {
+            return Ok(true);
+        }
+        current_after = current_batch.last().map(|doc| doc.node_id);
+        previous_after = previous_batch.last().map(|doc| doc.node_id);
+        for (current_doc, previous_doc) in current_batch.iter().zip(&previous_batch) {
+            if !current_doc.attached_comment_is_valid()
+                || !previous_doc.attached_comment_is_valid()
+                || current_doc.node_id != previous_doc.node_id
+                || current_doc.attached_comment_policy != previous_doc.attached_comment_policy
+                || current_doc.attached_comment_state != previous_doc.attached_comment_state
+                || current_doc.attached_comment_hash != previous_doc.attached_comment_hash
+                || lexical_document_hash(&symbol_document(project_root, current_doc))
+                    != lexical_document_hash(&symbol_document(project_root, previous_doc))
+            {
+                return Ok(false);
+            }
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -4124,6 +4162,12 @@ fn scan_symbol_documents_from_store(
         }
         after = batch.last().map(|doc| doc.node_id);
         for doc in &batch {
+            if !doc.attached_comment_is_valid() {
+                anyhow::bail!(
+                    "symbol search document {} has invalid attached-comment evidence",
+                    doc.node_id.0
+                );
+            }
             visit(&symbol_document(project_root, doc))?;
         }
     }
@@ -4146,9 +4190,18 @@ fn symbol_document(project_root: &Path, doc: &SymbolSearchDoc) -> LexicalDocumen
                 doc.display_name.replace([' ', '\t', '\r', '\n'], "_")
             )
         });
+    let mut content = doc.doc_text.clone();
+    if let Some(comment) = doc
+        .attached_comment_text
+        .as_deref()
+        .filter(|comment| !comment.is_empty())
+    {
+        content.push_str("\ncomments:\n");
+        content.push_str(comment);
+    }
     LexicalDocument {
         path,
-        content: doc.doc_text.clone(),
+        content,
         source,
         node_id: Some(doc.node_id.0.to_string()),
         symbol_name: Some(doc.display_name.clone()),
@@ -4732,9 +4785,84 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn symbol_reuse_requires_exact_attached_comment_evidence() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_path = root.path().join("previous.sqlite3");
+        let current_path = root.path().join("current.sqlite3");
+        let mut previous = Store::open(&previous_path).expect("previous store");
+        let mut current = Store::open(&current_path).expect("current store");
+        let node = Node {
+            id: NodeId(7),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".into(),
+            ..Default::default()
+        };
+        previous
+            .insert_nodes_batch(std::slice::from_ref(&node))
+            .expect("previous node");
+        current
+            .insert_nodes_batch(std::slice::from_ref(&node))
+            .expect("current node");
+        let mut doc = SymbolSearchDoc {
+            node_id: node.id,
+            file_node_id: None,
+            kind: node.kind,
+            display_name: "run".into(),
+            qualified_name: None,
+            file_path: Some("src/run.go".into()),
+            start_line: Some(5),
+            doc_text: "semantic_doc_version: 10\nsymbol: run".into(),
+            doc_version: 10,
+            doc_hash: "unchanged-dense-hash".into(),
+            attached_comment_text: Some("old requirement".into()),
+            attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                Some("old requirement"),
+            ),
+            policy_version: "test".into(),
+            source_provenance: "extracted".into(),
+            updated_at_epoch_ms: 1,
+        };
+        previous
+            .upsert_symbol_search_docs_batch(std::slice::from_ref(&doc))
+            .expect("previous doc");
+        current
+            .upsert_symbol_search_docs_batch(std::slice::from_ref(&doc))
+            .expect("current doc");
+        assert!(symbol_documents_match(root.path(), &current, &previous).expect("same symbols"));
+        doc.attached_comment_text = Some("new requirement".into());
+        doc.attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            doc.attached_comment_text.as_deref(),
+        );
+        current
+            .upsert_symbol_search_docs_batch(std::slice::from_ref(&doc))
+            .expect("updated comment");
+        assert!(
+            !symbol_documents_match(root.path(), &current, &previous).expect("comment changed")
+        );
+        doc.attached_comment_text = None;
+        doc.attached_comment_state = SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE.into();
+        doc.attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE,
+            None,
+        );
+        current
+            .upsert_symbol_search_docs_batch(std::slice::from_ref(&doc))
+            .expect("bounded source unavailable");
+        assert!(
+            !symbol_documents_match(root.path(), &current, &previous)
+                .expect("availability changed")
+        );
+    }
 
     struct CountingReader {
         remaining: usize,
@@ -5173,6 +5301,7 @@ mod tests {
             .collect();
         let bounded = prepare_bounded_lexical_input(
             &project,
+            &Store::open_read_only(&current_storage_path).expect("pinned current store"),
             &current_storage_path,
             &previous_storage_path,
             &data,

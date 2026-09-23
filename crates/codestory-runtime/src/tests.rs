@@ -78,6 +78,7 @@ use crate::search_scoring::{
     primary_source_retention_threshold, should_pretruncate_primary_source_window,
 };
 use crate::search_terms::search_plan_terms;
+use crate::semantic_projection::attached_comment_for_symbol;
 use crate::semantic_projection::{
     LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
     SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats,
@@ -1905,6 +1906,131 @@ fn semantic_file_text_cache_respects_aggregate_byte_limit() {
     );
     assert_eq!(cache.get("b.rs"), Some(&None));
     assert_eq!(cache.get("c.rs"), Some(&None));
+    assert_eq!(
+        attached_comment_for_symbol(&nodes[1], Some("b.rs"), &cache),
+        None
+    );
+}
+
+#[test]
+fn attached_declaration_comments_preserve_source_order_and_target_constraints() {
+    let cases = [
+        (
+            "run.go",
+            "// SetTerragruntInputsAsEnvVars merges the inputs from Terragrunt\n// configurations into env as TF_VAR_* entries, preserving any keys\n// already present.\n//\n// Requires a non-nil env: it is the destination the entries are written into.\nfunc SetTerragruntInputsAsEnvVars() {}",
+            "TF_VAR_*",
+            "Requires a non-nil env",
+        ),
+        (
+            "run.go",
+            "// ToTerraformEnvVars converts the given variables to a map of environment variables that will expose those variables to Terraform. The\n// keys will be of the format TF_VAR_xxx and the values will be converted to JSON, which Terraform knows how to read\n// natively.\n//\n// A string value only has its interpolation sequences escaped when the module declares the matching\n// variable with a type constraint that makes OpenTofu/Terraform parse the value as HCL. Escaping a\n// value that is read literally would deliver $${...} to the module instead of ${...}.\nfunc ToTerraformEnvVars() {}",
+            "TF_VAR_xxx",
+            "value that is read literally",
+        ),
+        (
+            "RemoteExecutionService.java",
+            "  /**\n   * Upload inputs of a remote action to remote cache if they are not presented already.\n   *\n   * <p>Must be called before calling {@link #executeRemotely}.\n   */\n  public void uploadInputsIfNotPresent() {}",
+            "Upload inputs",
+            "Must be called before",
+        ),
+        (
+            "RemoteExecutionService.java",
+            "  /**\n   * Executes the remote action remotely and returns the result.\n   *\n   * @param acceptCachedResult tells remote execution server whether it should used cached result.\n   * @param observer receives status updates during the execution.\n   */\n  public RemoteActionResult executeRemotely() {}",
+            "Executes the remote action",
+            "observer receives status",
+        ),
+        (
+            "RemoteExecutionService.java",
+            "  /**\n   * Downloads the outputs of a remotely executed action and injects their metadata.\n   *\n   * <p>For a successful action, the {@link RemoteOutputChecker} is consulted to determine which of\n   * the outputs should be downloaded. For a failed action, all outputs are downloaded. The action\n   * stdout and stderr, as well as the in-memory output when present, are always downloaded even in\n   * the success case. Any outputs that are not downloaded have their metadata injected into the\n   * {@link RemoteActionFileSystem}.\n   *\n   * <p>In case of download failure, all of the already downloaded outputs are deleted.\n   *\n   * @return The in-memory output if the spawn had one, otherwise null.\n   */\n  @Nullable\n  public InMemoryOutput downloadOutputs() {}",
+            "RemoteOutputChecker",
+            "already downloaded outputs are deleted",
+        ),
+        (
+            "client.go",
+            "// This processes the sublist results for a given message.\n// Returns if the message was delivered to at least target and queue filters.\nfunc (c *client) processMsgResults() {}",
+            "sublist results",
+            "target and queue filters",
+        ),
+    ];
+    for (path, source, opening, later) in cases {
+        let start_line = source.lines().count() as u32;
+        let node = Node {
+            start_line: Some(start_line),
+            ..semantic_policy_node(900, NodeKind::FUNCTION, "subject", 1)
+        };
+        let cache = HashMap::from([(path.to_string(), Some(source.to_string()))]);
+        let comment =
+            attached_comment_for_symbol(&node, Some(path), &cache).expect("verified source");
+        assert!(comment.contains(opening), "{path}: {comment}");
+        assert!(comment.contains(later), "{path}: {comment}");
+        assert!(
+            comment.find(opening) < comment.find(later),
+            "source order: {path}"
+        );
+        assert!(!comment.contains("/**"), "syntax decoration: {path}");
+    }
+}
+
+#[test]
+fn attached_comment_window_and_proxy_cap_truncate_the_tail() {
+    let mut source = (0..70)
+        .map(|index| format!("// line_{index:02}"))
+        .collect::<Vec<_>>();
+    source.push("func bounded() {}".into());
+    let source = source.join("\n");
+    let node = Node {
+        start_line: Some(71),
+        ..semantic_policy_node(901, NodeKind::FUNCTION, "bounded", 1)
+    };
+    let cache = HashMap::from([("bounded.go".to_string(), Some(source))]);
+    let comment =
+        attached_comment_for_symbol(&node, Some("bounded.go"), &cache).expect("verified source");
+    assert!(
+        comment.starts_with("line_06"),
+        "nearest 64 lines: {comment}"
+    );
+    assert!(comment.ends_with("line_69"));
+    assert!(!comment.contains("line_05"));
+
+    let words = (0..300)
+        .map(|index| format!("w{index:03}"))
+        .collect::<Vec<_>>();
+    let source = format!("// {}\nfunc bounded() {{}}", words.join(" "));
+    let node = Node {
+        start_line: Some(2),
+        ..node
+    };
+    let cache = HashMap::from([("bounded.go".to_string(), Some(source))]);
+    let comment =
+        attached_comment_for_symbol(&node, Some("bounded.go"), &cache).expect("verified source");
+    assert!(comment.starts_with("w000"));
+    assert!(!comment.contains("w299"));
+    assert!(
+        comment
+            .split_whitespace()
+            .map(crate::semantic_projection::semantic_doc_budget_cost)
+            .sum::<usize>()
+            + crate::semantic_projection::semantic_doc_budget_cost("comments:")
+            <= 256
+    );
+
+    let cache = HashMap::from([(
+        "broken.java".to_string(),
+        Some(" * orphaned block text\nvoid broken() {}".into()),
+    )]);
+    assert_eq!(
+        attached_comment_for_symbol(&node, Some("broken.java"), &cache).as_deref(),
+        Some("")
+    );
+    let cache = HashMap::from([(
+        "broken.java".to_string(),
+        Some("doWork(); /* trailing note about prior operation */\nvoid next() {}".into()),
+    )]);
+    assert_eq!(
+        attached_comment_for_symbol(&node, Some("broken.java"), &cache).as_deref(),
+        Some(""),
+        "an inline trailing comment belongs to the prior statement"
+    );
 }
 
 #[test]
@@ -5368,6 +5494,67 @@ fn previous_semantic_body_contract_requires_source_refresh_before_republish() {
 }
 
 #[test]
+fn legacy_unknown_comment_rows_require_source_repair_and_preserve_v10_hashes() {
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish current core");
+    let (before, original_hashes) = mutate_published_core(&storage_path, |storage| {
+        let before = storage
+            .get_complete_index_publication()
+            .expect("publication")
+            .expect("complete core");
+        let hashes = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbol docs")
+            .into_iter()
+            .map(|doc| (doc.node_id, doc.doc_hash))
+            .collect::<HashMap<_, _>>();
+        storage.get_connection().execute(
+            "UPDATE symbol_search_doc SET attached_comment_text = NULL, attached_comment_state = '', attached_comment_policy = '', attached_comment_hash = ''", []
+        ).expect("simulate migrated v34 rows");
+        (before, hashes)
+    });
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("readiness")
+    );
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("unknown comments cannot be restamped");
+    assert_eq!(error.code, "semantic_projection_migration_required");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path).expect("preserved publication"),
+        Some(before)
+    );
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("repair from source");
+    let repaired = Storage::open(&storage_path).expect("repaired core");
+    let docs = repaired
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("repaired docs");
+    assert_eq!(docs.len(), original_hashes.len());
+    assert!(docs.iter().all(|doc| doc.attached_comment_is_valid()
+        && original_hashes.get(&doc.node_id) == Some(&doc.doc_hash)));
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("repaired readiness")
+    );
+}
+
+#[test]
 fn semantic_projection_republish_rejects_a_cache_owned_by_another_project() {
     let _env = hybrid_test_env();
     let selected = copy_tictactoe_workspace();
@@ -7155,6 +7342,13 @@ fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_repor
         doc_text: "stale".to_string(),
         doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
         doc_hash: "stale".to_string(),
+        attached_comment_text: Some(String::new()),
+        attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+        attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+        attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            Some(""),
+        ),
         policy_version: SEMANTIC_POLICY_VERSION.to_string(),
         source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
         updated_at_epoch_ms: 1,

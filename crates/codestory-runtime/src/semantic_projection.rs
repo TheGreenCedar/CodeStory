@@ -409,6 +409,8 @@ pub(super) const FLOW_NEIGHBORS_PER_SEED: usize = 8;
 pub(super) const DOC_IDENTITY_BUDGET: usize = 32;
 pub(super) const DOC_SOURCE_BUDGET: usize = 48;
 pub(super) const DOC_GRAPH_BUDGET: usize = 48;
+pub(super) const ATTACHED_COMMENT_MAX_LINES: usize = 64;
+pub(super) const ATTACHED_COMMENT_MAX_UNITS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DenseAnchorReason {
@@ -2060,6 +2062,89 @@ pub(super) fn comment_block_before(lines: &[&str], start_idx: usize, limit: usiz
     block
 }
 
+/// Return source-ordered, bounded lexical evidence for the declaration's
+/// attached comment. `None` means the bounded source bytes were unavailable;
+/// `Some("")` proves that those bytes contain no attached comment.
+pub(super) fn attached_comment_for_symbol(
+    node: &GraphNode,
+    file_path: Option<&str>,
+    file_text_cache: &HashMap<String, Option<String>>,
+) -> Option<String> {
+    let Some(path) = file_path else {
+        return None;
+    };
+    let Some(start_line) = node.start_line else {
+        return None;
+    };
+    if start_line == 0 {
+        return None;
+    }
+    let contents = file_text_cache.get(path)?.as_deref()?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start_idx = start_line.saturating_sub(1) as usize;
+    if start_idx >= lines.len() {
+        return None;
+    }
+    let hash_comments = path.ends_with(".py") || path.ends_with(".sh") || path.ends_with(".rb");
+    let mut block = Vec::new();
+    let mut in_block_comment = false;
+    for line in lines[..start_idx].iter().rev() {
+        if block.len() >= ATTACHED_COMMENT_MAX_LINES {
+            break;
+        }
+        let trimmed = line.trim();
+        if block.is_empty() && trimmed.starts_with('@') {
+            continue;
+        }
+        if trimmed.is_empty() && !in_block_comment {
+            break;
+        }
+        if in_block_comment {
+            block.push(trimmed);
+            if trimmed.contains("/*") {
+                break;
+            }
+        } else if trimmed.starts_with("//") || (hash_comments && trimmed.starts_with('#')) {
+            block.push(trimmed);
+        } else if (trimmed.starts_with("/*") || trimmed.starts_with('*')) && trimmed.ends_with("*/")
+        {
+            block.push(trimmed);
+            if trimmed.contains("/*") {
+                break;
+            }
+            in_block_comment = true;
+        } else {
+            break;
+        }
+    }
+    block.reverse();
+    let mut remaining =
+        ATTACHED_COMMENT_MAX_UNITS.saturating_sub(semantic_doc_budget_cost("comments:"));
+    let mut selected = Vec::new();
+    'lines: for line in block {
+        let cleaned = line
+            .trim_start_matches(|ch: char| matches!(ch, '/' | '*' | '#' | ' '))
+            .trim_end_matches("*/")
+            .trim();
+        let mut words = Vec::new();
+        for word in cleaned.split_whitespace() {
+            let cost = semantic_doc_budget_cost(word);
+            if cost > remaining {
+                if !words.is_empty() {
+                    selected.push(words.join(" "));
+                }
+                break 'lines;
+            }
+            words.push(word);
+            remaining -= cost;
+        }
+        if !words.is_empty() {
+            selected.push(words.join(" "));
+        }
+    }
+    Some(selected.join("\n"))
+}
+
 pub(super) fn symbol_excerpt(
     node: &codestory_contracts::graph::Node,
     file_path: Option<&str>,
@@ -3113,6 +3198,14 @@ impl ComponentReportAccumulator {
                     doc_text: doc_text.clone(),
                     doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
                     doc_hash: doc_hash.clone(),
+                    attached_comment_text: Some(String::new()),
+                    attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+                    attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION
+                        .into(),
+                    attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                        Some(""),
+                    ),
                     policy_version: SEMANTIC_POLICY_VERSION.to_string(),
                     source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                     updated_at_epoch_ms,
@@ -3247,7 +3340,7 @@ fn build_semantic_symbol_docs(
                 .graph_context
                 .file_path_for_node(node)
                 .map(ToString::to_string);
-            let doc_text = if let Some(stored_docs) = context.stored_docs {
+            let (doc_text, attached_comment_text, attached_comment_state, attached_comment_hash) = if let Some(stored_docs) = context.stored_docs {
                 let stored = stored_docs.get(&node.id).ok_or_else(|| {
                     ApiError::new(
                         "semantic_projection_migration_required",
@@ -3271,6 +3364,7 @@ fn build_semantic_symbol_docs(
                             &stored.doc_text,
                             context.semantic_alias_mode,
                         )
+                    || !stored.attached_comment_is_valid()
                 {
                     return Err(ApiError::new(
                         "semantic_projection_migration_required",
@@ -3280,9 +3374,9 @@ fn build_semantic_symbol_docs(
                         ),
                     ));
                 }
-                stored.doc_text.clone()
+                (stored.doc_text.clone(), stored.attached_comment_text.clone(), stored.attached_comment_state.clone(), stored.attached_comment_hash.clone())
             } else {
-                build_llm_symbol_doc_text_with_policy(
+                let doc_text = build_llm_symbol_doc_text_with_policy(
                     context.graph_context,
                     node,
                     &display_name,
@@ -3290,7 +3384,15 @@ fn build_semantic_symbol_docs(
                     context.file_text_cache,
                     context.semantic_alias_mode,
                     context.semantic_max_tokens,
-                )
+                );
+                let attached_comment_text = attached_comment_for_symbol(node, file_path.as_deref(), context.file_text_cache);
+                let attached_comment_state = if attached_comment_text.is_some() {
+                    SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED
+                } else {
+                    SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE
+                };
+                let attached_comment_hash = SymbolSearchDoc::attached_comment_hash(attached_comment_state, attached_comment_text.as_deref());
+                (doc_text, attached_comment_text, attached_comment_state.into(), attached_comment_hash)
             };
             let doc_hash =
                 llm_symbol_doc_hash_with_alias(&doc_text, context.semantic_alias_mode);
@@ -3314,6 +3416,10 @@ fn build_semantic_symbol_docs(
                 doc_text: doc_text.clone(),
                 doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
                 doc_hash: doc_hash.clone(),
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+                attached_comment_hash,
                 policy_version: SEMANTIC_POLICY_VERSION.to_string(),
                 source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                 updated_at_epoch_ms: context.updated_at_epoch_ms,

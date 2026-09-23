@@ -253,6 +253,10 @@ const TABLE_STATEMENTS: &[&str] = &[
         doc_text TEXT NOT NULL,
         doc_version INTEGER NOT NULL DEFAULT 0,
         doc_hash TEXT NOT NULL DEFAULT '',
+        attached_comment_text TEXT,
+        attached_comment_state TEXT NOT NULL DEFAULT '',
+        attached_comment_policy TEXT NOT NULL DEFAULT '',
+        attached_comment_hash TEXT NOT NULL DEFAULT '',
         policy_version TEXT NOT NULL,
         source_provenance TEXT NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL,
@@ -827,11 +831,36 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
             stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
         )?;
     }
+    if stored_version < ATTACHED_COMMENT_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        migrate_v35_attached_comment_evidence(&storage.conn)?;
+    }
     create_indexes(&storage.conn, index_mode)?;
 
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
     }
+    Ok(())
+}
+
+fn migrate_v35_attached_comment_evidence(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "symbol_search_doc", "attached_comment_text TEXT")?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_state TEXT NOT NULL DEFAULT ''",
+    )?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_policy TEXT NOT NULL DEFAULT ''",
+    )?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_hash TEXT NOT NULL DEFAULT ''",
+    )?;
     Ok(())
 }
 
