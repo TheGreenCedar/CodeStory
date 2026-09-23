@@ -778,13 +778,48 @@ struct GoModuleControl {
     module_path: Option<String>,
 }
 
+// Full refresh deliberately defers graph indexes. Materialize self-imports
+// once, then exclude only those package nodes; a correlated anti-join scans
+// the entire edge table for every MODULE node in that staged shape.
+const GO_PACKAGE_NAMES_QUERY: &str = "WITH self_import AS MATERIALIZED (
+         SELECT DISTINCT source_node_id
+         FROM edge
+         WHERE kind = ?2 AND source_node_id = target_node_id
+     )
+     SELECT package.file_node_id, package.serialized_name
+     FROM node AS package
+     LEFT JOIN self_import ON self_import.source_node_id = package.id
+     WHERE package.kind = ?1 AND self_import.source_node_id IS NULL";
+
+fn load_go_package_names(conn: &rusqlite::Connection) -> Result<HashMap<i64, Option<String>>> {
+    let mut package_names = HashMap::<i64, Option<String>>::new();
+    let mut stmt = conn.prepare(GO_PACKAGE_NAMES_QUERY)?;
+    let rows = stmt.query_map(
+        params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    for row in rows {
+        let (Some(file_node_id), package_name) = row? else {
+            continue;
+        };
+        match package_names.entry(file_node_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(package_name));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+    Ok(package_names)
+}
+
 impl GoResolutionContext {
     fn load(root: &Path, storage: &Storage) -> Result<Self> {
         let files = storage.get_files()?;
-        if !files
-            .iter()
-            .any(|file| matches!(file.language.as_str(), "go" | "go-module-control"))
-        {
+        // Controls only inform package identity for indexed Go source files.
+        // A go.mod/go.work-only repository has no Go claims to resolve.
+        if !files.iter().any(|file| file.language == "go") {
             return Ok(Self::default());
         }
         let Ok(canonical_root) = root.canonicalize() else {
@@ -820,36 +855,8 @@ impl GoResolutionContext {
         }
         controls.sort_by_key(|control| std::cmp::Reverse(control.directory.components().count()));
 
-        let mut package_names = HashMap::<i64, Option<String>>::new();
         let conn = storage.get_connection();
-        let mut stmt = conn.prepare(
-            "SELECT package.file_node_id, package.serialized_name
-             FROM node AS package
-             WHERE package.kind = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM edge AS import_edge
-                   WHERE import_edge.kind = ?2
-                     AND import_edge.source_node_id = package.id
-                     AND import_edge.target_node_id = package.id
-               )",
-        )?;
-        let rows = stmt.query_map(
-            params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        for row in rows {
-            let (Some(file_node_id), package_name) = row? else {
-                continue;
-            };
-            match package_names.entry(file_node_id) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(Some(package_name));
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.insert(None);
-                }
-            }
-        }
+        let package_names = load_go_package_names(conn)?;
 
         let mut packages_by_file_node_id = HashMap::new();
         let mut package_directories_by_import = HashMap::<String, HashSet<PathBuf>>::new();
@@ -4273,6 +4280,187 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Instant;
     use tempfile::tempdir;
+
+    #[test]
+    fn go_control_without_go_sources_skips_unindexed_graph() -> Result<()> {
+        let root = tempdir()?;
+        let control = root.path().join("go.mod");
+        let source = b"module example.org/project\n";
+        fs::write(&control, source)?;
+        let storage = Storage::new_in_memory()?;
+        let conn = storage.get_connection();
+        conn.execute(
+            "INSERT INTO file (id, path, language, modification_time, indexed, complete, content_hash)
+             VALUES (1, ?1, 'go-module-control', 0, 1, 1, ?2)",
+            params![control.to_string_lossy(), format!("{:x}", Sha256::digest(source))],
+        )?;
+
+        // A full staged build defers graph indexes. Unrelated MODULE and IMPORT
+        // rows must not make a control-only repository run a graph-wide lookup.
+        for table in ["node", "edge"] {
+            let mut indexes = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")?;
+            let names = indexes
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in names {
+                conn.execute(&format!("DROP INDEX \"{name}\""), [])?;
+            }
+        }
+        for index in 0..384_i64 {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name) VALUES (?1, ?2, ?3)",
+                params![
+                    1_000 + index,
+                    NodeKind::MODULE as i32,
+                    format!("module{index}")
+                ],
+            )?;
+        }
+        for index in 0..384_i64 {
+            conn.execute(
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    2_000 + index,
+                    1_000 + index,
+                    1_000 + (index + 1) % 384,
+                    EdgeKind::IMPORT as i32
+                ],
+            )?;
+        }
+        let mut ticks = 0;
+        conn.progress_handler(
+            1_000,
+            Some(move || {
+                ticks += 1;
+                ticks >= 100
+            }),
+        )?;
+        let loaded = ResolutionPass::for_workspace(root.path(), &storage);
+        conn.progress_handler(0, None::<fn() -> bool>)?;
+        let pass = loaded?;
+        let context = pass.go_context.expect("workspace has Go context");
+        assert!(context.packages_by_file_node_id.is_empty());
+        assert!(context.ambiguous_import_paths.is_empty());
+        assert!(context.return_declarations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn go_package_names_scan_unindexed_edges_once_and_keep_identity_rules() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                kind INTEGER NOT NULL
+            );",
+        )?;
+        for (id, kind, file_id, name) in [
+            (1, NodeKind::MODULE, Some(10), "alpha"),
+            (2, NodeKind::MODULE, Some(11), "self_import"),
+            (3, NodeKind::MODULE, Some(12), "duplicate_a"),
+            (4, NodeKind::MODULE, Some(12), "duplicate_b"),
+            (5, NodeKind::FUNCTION, Some(13), "not_package"),
+            (6, NodeKind::MODULE, None, "no_file"),
+            (7, NodeKind::MODULE, Some(14), "nonself_import"),
+        ] {
+            conn.execute(
+                "INSERT INTO node (id, kind, file_node_id, serialized_name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, kind as i32, file_id, name],
+            )?;
+        }
+        for (id, source, target, kind) in [
+            (1, 1, 1, EdgeKind::CALL),
+            (2, 2, 2, EdgeKind::IMPORT),
+            (3, 7, 1, EdgeKind::IMPORT),
+        ] {
+            conn.execute(
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, source, target, kind as i32],
+            )?;
+        }
+
+        let packages = load_go_package_names(&conn)?;
+        assert_eq!(packages.get(&10), Some(&Some("alpha".to_string())));
+        assert!(!packages.contains_key(&11));
+        assert_eq!(packages.get(&12), Some(&None));
+        assert!(!packages.contains_key(&13));
+        assert_eq!(packages.get(&14), Some(&Some("nonself_import".to_string())));
+
+        let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {GO_PACKAGE_NAMES_QUERY}"))?;
+        let details = plan
+            .query_map(
+                params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("SCAN edge"))
+                .count(),
+            1,
+            "unindexed edge table must be scanned once: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("CORRELATED")),
+            "package lookup must not repeat the edge scan: {details:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn go_source_keeps_module_control_package_identity() -> Result<()> {
+        let root = tempdir()?;
+        let control = root.path().join("go.mod");
+        let source_file = root.path().join("alpha.go");
+        let control_bytes = b"module example.org/project\n";
+        let source_bytes = b"package alpha\nfunc F() {}\n";
+        fs::write(&control, control_bytes)?;
+        fs::write(&source_file, source_bytes)?;
+        let storage = Storage::new_in_memory()?;
+        let conn = storage.get_connection();
+        for (id, path, language, bytes) in [
+            (1, &control, "go-module-control", control_bytes.as_slice()),
+            (2, &source_file, "go", source_bytes.as_slice()),
+        ] {
+            conn.execute(
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, content_hash)
+                 VALUES (?1, ?2, ?3, 0, 1, 1, ?4)",
+                params![
+                    id,
+                    path.to_string_lossy(),
+                    language,
+                    format!("{:x}", Sha256::digest(bytes))
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name) VALUES (2, ?1, ?2)",
+            params![NodeKind::FILE as i32, source_file.to_string_lossy()],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, file_node_id, serialized_name)
+             VALUES (100, ?1, 2, 'alpha')",
+            [NodeKind::MODULE as i32],
+        )?;
+
+        let context = GoResolutionContext::load(root.path(), &storage)?;
+        let package = context
+            .packages_by_file_node_id
+            .get(&2)
+            .expect("Go source has a package identity from go.mod");
+        assert_eq!(package.import_path, "example.org/project");
+        assert_eq!(package.package_name, "alpha");
+        assert!(context.ambiguous_import_paths.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn resolution_cancellation_signal_is_typed() {
