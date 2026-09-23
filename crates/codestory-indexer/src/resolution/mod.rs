@@ -4340,7 +4340,7 @@ mod tests {
         let loaded = ResolutionPass::for_workspace(root.path(), &storage);
         conn.progress_handler(0, None::<fn() -> bool>)?;
         let pass = loaded?;
-        let context = pass.go_context.expect("workspace resolution has Go context");
+        let context = pass.go_context.expect("workspace has Go context");
         assert!(context.packages_by_file_node_id.is_empty());
         assert!(context.ambiguous_import_paths.is_empty());
         assert!(context.return_declarations.is_empty());
