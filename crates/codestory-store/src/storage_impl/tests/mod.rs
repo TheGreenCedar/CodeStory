@@ -578,7 +578,7 @@ fn canonical_suffix_schema_33_migration_preserves_rows_and_replaces_index()
     };
 
     let migrated = Storage::open(&path)?;
-    assert_eq!(migrated.schema_version()?, 34);
+    assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
     assert!(sqlite_index_exists(&migrated, "idx_node_canonical_suffix")?);
     assert!(!sqlite_index_exists(&migrated, "idx_node_canonical_id")?);
     assert_eq!(
@@ -3896,14 +3896,191 @@ fn test_symbol_search_doc_contract_mismatch_detection() -> Result<(), StorageErr
         doc_text: "semantic_doc_version: 6\nsymbol: do_work".to_string(),
         doc_version: 6,
         doc_hash: "symbol-search-hash-500".to_string(),
+        attached_comment_text: Some(String::new()),
+        attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+        attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+        attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            Some(""),
+        ),
         policy_version: "graph_first_v1".to_string(),
         source_provenance: "extracted".to_string(),
         updated_at_epoch_ms: 123,
     }])?;
 
     assert!(!storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?);
+    let mut docs = storage.get_symbol_search_docs_batch_after(None, 10)?;
+    docs[0].attached_comment_text = Some("older declaration comment".into());
+    docs[0].attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+        docs[0].attached_comment_text.as_deref(),
+    );
+    storage.upsert_symbol_search_docs_batch(&docs)?;
+    docs[0].attached_comment_text = Some(String::new());
+    docs[0].attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+        Some(""),
+    );
+    storage.upsert_symbol_search_docs_batch(&docs)?;
+    assert_eq!(
+        storage.get_symbol_search_docs_batch_after(None, 10)?[0]
+            .attached_comment_text
+            .as_deref(),
+        Some(""),
+        "removing a comment clears lexical evidence without claiming unavailable source"
+    );
     assert!(storage.has_symbol_search_doc_contract_mismatch(5, "graph_first_v1")?);
     assert!(storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v2")?);
+    storage.conn.execute(
+        "UPDATE symbol_search_doc SET attached_comment_hash = 'stale' WHERE node_id = 500",
+        [],
+    )?;
+    assert!(storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?);
+    storage.conn.execute("UPDATE symbol_search_doc SET attached_comment_text = NULL, attached_comment_state = '', attached_comment_policy = '', attached_comment_hash = '' WHERE node_id = 500", [])?;
+    assert!(
+        storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?,
+        "legacy unknown requires source repair"
+    );
+    let unavailable = SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE;
+    storage.conn.execute(
+        "UPDATE symbol_search_doc SET attached_comment_state = ?1, attached_comment_policy = ?2, attached_comment_hash = ?3 WHERE node_id = 500",
+        params![unavailable, SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION, SymbolSearchDoc::attached_comment_hash(unavailable, None)],
+    )?;
+    assert!(
+        !storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?,
+        "current-policy bounded unavailability is admissible"
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_34_symbol_docs_migrate_as_unknown_comment_evidence() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("attached-comment-v35-migration");
+    {
+        let mut storage = Storage::open(&path)?;
+        storage.insert_nodes_batch(&[Node {
+            id: NodeId(51),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".into(),
+            ..Default::default()
+        }])?;
+        let state = SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED;
+        storage.upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+            node_id: NodeId(51),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "run".into(),
+            qualified_name: None,
+            file_path: Some("src/run.go".into()),
+            start_line: Some(2),
+            doc_text: "v10 source".into(),
+            doc_version: 10,
+            doc_hash: "v10-hash".into(),
+            attached_comment_text: Some("source comment".into()),
+            attached_comment_state: state.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                state,
+                Some("source comment"),
+            ),
+            policy_version: "current".into(),
+            source_provenance: "extracted".into(),
+            updated_at_epoch_ms: 1,
+        }])?;
+        for column in [
+            "attached_comment_hash",
+            "attached_comment_policy",
+            "attached_comment_state",
+            "attached_comment_text",
+        ] {
+            storage.conn.execute(
+                &format!("ALTER TABLE symbol_search_doc DROP COLUMN {column}"),
+                [],
+            )?;
+        }
+        storage.set_schema_version(34)?;
+    }
+    let migrated = Storage::open(&path)?;
+    assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
+    let docs = migrated.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].doc_text, "v10 source");
+    assert_eq!(docs[0].doc_hash, "v10-hash");
+    assert_eq!(docs[0].attached_comment_text, None);
+    assert_eq!(docs[0].attached_comment_state, "");
+    assert!(migrated.has_symbol_search_doc_contract_mismatch(10, "current")?);
+    drop(migrated);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn symbol_doc_copy_forward_keeps_verified_comment_and_marks_legacy_unknown()
+-> Result<(), StorageError> {
+    let source_path = unique_temp_db_path("attached-comment-copy-source");
+    let node = Node {
+        id: NodeId(73),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "run".into(),
+        ..Default::default()
+    };
+    {
+        let mut source = Storage::open(&source_path)?;
+        source.insert_nodes_batch(std::slice::from_ref(&node))?;
+        let state = SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED;
+        source.upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+            node_id: node.id,
+            file_node_id: None,
+            kind: node.kind,
+            display_name: "run".into(),
+            qualified_name: None,
+            file_path: Some("run.go".into()),
+            start_line: Some(2),
+            doc_text: "v10 doc".into(),
+            doc_version: 10,
+            doc_hash: "v10 hash".into(),
+            attached_comment_text: Some("commented requirement".into()),
+            attached_comment_state: state.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                state,
+                Some("commented requirement"),
+            ),
+            policy_version: "current".into(),
+            source_provenance: "extracted".into(),
+            updated_at_epoch_ms: 1,
+        }])?;
+    }
+    let mut destination = Storage::new_in_memory()?;
+    destination.insert_nodes_batch(std::slice::from_ref(&node))?;
+    assert_eq!(destination.copy_symbol_search_docs_from(&source_path)?, 1);
+    let docs = destination.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(
+        docs[0].attached_comment_text.as_deref(),
+        Some("commented requirement")
+    );
+    assert!(docs[0].attached_comment_is_valid());
+
+    {
+        let source = Storage::open(&source_path)?;
+        for column in [
+            "attached_comment_hash",
+            "attached_comment_policy",
+            "attached_comment_state",
+            "attached_comment_text",
+        ] {
+            source.conn.execute(
+                &format!("ALTER TABLE symbol_search_doc DROP COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    assert_eq!(destination.copy_symbol_search_docs_from(&source_path)?, 1);
+    let docs = destination.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(docs[0].attached_comment_text, None);
+    assert_eq!(docs[0].attached_comment_state, "");
+    assert!(destination.has_symbol_search_doc_contract_mismatch(10, "current")?);
+    let _ = std::fs::remove_file(source_path);
     Ok(())
 }
 
@@ -12361,7 +12538,10 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 34);
+    assert!(
+        CURRENT_SCHEMA_VERSION >= ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION,
+        "the current writer barrier must include the annotation cutover"
+    );
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");

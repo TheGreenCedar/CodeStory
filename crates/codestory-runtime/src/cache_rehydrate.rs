@@ -1759,6 +1759,15 @@ mod tests {
                 doc_text: format!("source file: {absolute_source_text}"),
                 doc_version: 1,
                 doc_hash: "symbol-doc-hash".into(),
+                attached_comment_text: Some(String::new()),
+                attached_comment_state: codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED
+                    .into(),
+                attached_comment_policy:
+                    codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+                attached_comment_hash: codestory_store::SymbolSearchDoc::attached_comment_hash(
+                    codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                    Some(""),
+                ),
                 policy_version: "test".into(),
                 source_provenance: absolute_source_text.clone(),
                 updated_at_epoch_ms: 1,

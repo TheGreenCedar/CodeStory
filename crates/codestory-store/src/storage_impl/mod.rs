@@ -75,7 +75,8 @@ pub(crate) struct SealedCoreCandidateReceipt {
 
 const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
 const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
-const SCHEMA_VERSION: u32 = CANONICAL_SUFFIX_SCHEMA_VERSION;
+const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
+const SCHEMA_VERSION: u32 = ATTACHED_COMMENT_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -4906,9 +4907,52 @@ pub struct SymbolSearchDoc {
     pub doc_text: String,
     pub doc_version: u32,
     pub doc_hash: String,
+    /// `Some("")` proves absence; `None` is valid only with an unavailable
+    /// state and makes no comment-coverage claim.
+    pub attached_comment_text: Option<String>,
+    pub attached_comment_state: String,
+    pub attached_comment_policy: String,
+    pub attached_comment_hash: String,
     pub policy_version: String,
     pub source_provenance: String,
     pub updated_at_epoch_ms: i64,
+}
+
+impl SymbolSearchDoc {
+    pub const ATTACHED_COMMENT_POLICY_VERSION: &'static str =
+        "attached-comment-v1-nearest64-lines-256-proxy-units";
+    pub const ATTACHED_COMMENT_VERIFIED: &'static str = "verified";
+    pub const ATTACHED_COMMENT_UNAVAILABLE: &'static str = "bounded_source_unavailable";
+
+    pub fn attached_comment_hash(state: &str, text: Option<&str>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(Self::ATTACHED_COMMENT_POLICY_VERSION.as_bytes());
+        hasher.update([0]);
+        hasher.update(state.as_bytes());
+        hasher.update([0]);
+        match text {
+            Some(text) => {
+                hasher.update([1]);
+                hasher.update(text.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn attached_comment_is_valid(&self) -> bool {
+        self.attached_comment_policy == Self::ATTACHED_COMMENT_POLICY_VERSION
+            && match self.attached_comment_state.as_str() {
+                Self::ATTACHED_COMMENT_VERIFIED => self.attached_comment_text.is_some(),
+                Self::ATTACHED_COMMENT_UNAVAILABLE => self.attached_comment_text.is_none(),
+                _ => false,
+            }
+            && self.attached_comment_hash
+                == Self::attached_comment_hash(
+                    &self.attached_comment_state,
+                    self.attached_comment_text.as_deref(),
+                )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -11060,6 +11104,11 @@ impl Storage {
         if docs.is_empty() {
             return Ok(());
         }
+        if docs.iter().any(|doc| !doc.attached_comment_is_valid()) {
+            return Err(StorageError::Other(
+                "symbol search document has invalid attached-comment evidence".into(),
+            ));
+        }
 
         let tx = self.conn.transaction()?;
         {
@@ -11077,9 +11126,14 @@ impl Storage {
                     doc_hash,
                     policy_version,
                     source_provenance,
-                    updated_at_epoch_ms
+                    updated_at_epoch_ms,
+                    attached_comment_text,
+                    attached_comment_state,
+                    attached_comment_policy,
+                    attached_comment_hash
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -11093,7 +11147,11 @@ impl Storage {
                     doc_hash = excluded.doc_hash,
                     policy_version = excluded.policy_version,
                     source_provenance = excluded.source_provenance,
-                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms,
+                    attached_comment_text = excluded.attached_comment_text,
+                    attached_comment_state = excluded.attached_comment_state,
+                    attached_comment_policy = excluded.attached_comment_policy,
+                    attached_comment_hash = excluded.attached_comment_hash",
             )?;
             for doc in docs {
                 stmt.execute(params![
@@ -11110,6 +11168,10 @@ impl Storage {
                     doc.policy_version,
                     doc.source_provenance,
                     doc.updated_at_epoch_ms,
+                    doc.attached_comment_text,
+                    doc.attached_comment_state,
+                    doc.attached_comment_policy,
+                    doc.attached_comment_hash,
                 ])?;
             }
         }
@@ -11136,7 +11198,11 @@ impl Storage {
                 doc_hash,
                 policy_version,
                 source_provenance,
-                updated_at_epoch_ms
+                updated_at_epoch_ms,
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy,
+                attached_comment_hash
              FROM symbol_search_doc
              WHERE (?1 IS NULL OR node_id > ?1)
              ORDER BY node_id ASC
@@ -11163,6 +11229,10 @@ impl Storage {
                 policy_version: row.get(10)?,
                 source_provenance: row.get(11)?,
                 updated_at_epoch_ms: row.get(12)?,
+                attached_comment_text: row.get(13)?,
+                attached_comment_state: row.get(14)?,
+                attached_comment_policy: row.get(15)?,
+                attached_comment_hash: row.get(16)?,
             });
         }
         Ok(docs)
@@ -11187,7 +11257,9 @@ impl Storage {
                 "SELECT
                     node_id, file_node_id, kind, display_name, qualified_name,
                     file_path, start_line, doc_text, doc_version, doc_hash,
-                    policy_version, source_provenance, updated_at_epoch_ms
+                    policy_version, source_provenance, updated_at_epoch_ms,
+                    attached_comment_text, attached_comment_state,
+                    attached_comment_policy, attached_comment_hash
                  FROM symbol_search_doc
                  WHERE node_id IN ({placeholders})
                  ORDER BY node_id ASC"
@@ -11211,6 +11283,10 @@ impl Storage {
                     policy_version: row.get(10)?,
                     source_provenance: row.get(11)?,
                     updated_at_epoch_ms: row.get(12)?,
+                    attached_comment_text: row.get(13)?,
+                    attached_comment_state: row.get(14)?,
+                    attached_comment_policy: row.get(15)?,
+                    attached_comment_hash: row.get(16)?,
                 });
             }
         }
@@ -11232,17 +11308,33 @@ impl Storage {
         expected_version: u32,
         expected_policy_version: &str,
     ) -> Result<bool, StorageError> {
-        let mismatch = self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM symbol_search_doc
-                WHERE doc_version <> ?1 OR policy_version <> ?2
-                LIMIT 1
-            )",
-            params![expected_version as i64, expected_policy_version],
-            |row| row.get::<_, bool>(0),
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_version, policy_version, attached_comment_text,
+                    attached_comment_state, attached_comment_policy, attached_comment_hash
+             FROM symbol_search_doc",
         )?;
-        Ok(mismatch)
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let doc_version: i64 = row.get(0)?;
+            let policy_version: String = row.get(1)?;
+            let text: Option<String> = row.get(2)?;
+            let state: String = row.get(3)?;
+            let comment_policy: String = row.get(4)?;
+            let comment_hash: String = row.get(5)?;
+            if doc_version != expected_version as i64
+                || policy_version != expected_policy_version
+                || comment_policy != SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION
+                || !matches!(
+                    (state.as_str(), text.as_ref()),
+                    (SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED, Some(_))
+                        | (SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE, None)
+                )
+                || comment_hash != SymbolSearchDoc::attached_comment_hash(&state, text.as_deref())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn clear_symbol_search_docs(&mut self) -> Result<usize, StorageError> {
@@ -11260,7 +11352,17 @@ impl Storage {
         let source = sqlite_path::attach_argument(&source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
-        let copy_result = self.conn.execute(
+        let source_has_comments = self
+            .conn
+            .prepare("SELECT attached_comment_state FROM source_snapshot.symbol_search_doc LIMIT 0")
+            .is_ok();
+        let comment_columns = if source_has_comments {
+            "source_doc.attached_comment_text, source_doc.attached_comment_state,
+             source_doc.attached_comment_policy, source_doc.attached_comment_hash"
+        } else {
+            "NULL, '', '', ''"
+        };
+        let copy_sql = format!(
             "INSERT OR REPLACE INTO symbol_search_doc (
                 node_id,
                 file_node_id,
@@ -11274,7 +11376,11 @@ impl Storage {
                 doc_hash,
                 policy_version,
                 source_provenance,
-                updated_at_epoch_ms
+                updated_at_epoch_ms,
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy,
+                attached_comment_hash
              )
              SELECT
                 source_doc.node_id,
@@ -11289,7 +11395,8 @@ impl Storage {
                 source_doc.doc_hash,
                 source_doc.policy_version,
                 source_doc.source_provenance,
-                source_doc.updated_at_epoch_ms
+                source_doc.updated_at_epoch_ms,
+                {comment_columns}
              FROM source_snapshot.symbol_search_doc source_doc
              WHERE EXISTS (
                 SELECT 1 FROM node WHERE node.id = source_doc.node_id
@@ -11299,9 +11406,9 @@ impl Storage {
                 OR EXISTS (
                     SELECT 1 FROM node WHERE node.id = source_doc.file_node_id
                 )
-             )",
-            [],
+             )"
         );
+        let copy_result = self.conn.execute(&copy_sql, []);
         let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
         let copied = copy_result?;
         detach_result?;

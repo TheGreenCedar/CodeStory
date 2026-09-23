@@ -1011,6 +1011,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             let previous_generation = manifest.sidecar_generation.as_deref()?;
             prepare_bounded_lexical_input(
                 project_root,
+                input_snapshot.storage(),
                 storage_path,
                 &predecessor.core_database_path,
                 &layout.lexical_data_dir,
@@ -3767,6 +3768,12 @@ fn compute_sidecar_input_fingerprint_with_lexical_fingerprint(
                 after_symbol_doc = batch.last().map(|doc| doc.node_id);
                 symbol_doc_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
                 for doc in batch {
+                    if !doc.attached_comment_is_valid() {
+                        anyhow::bail!(
+                            "symbol search document {} has invalid attached-comment evidence",
+                            doc.node_id.0
+                        );
+                    }
                     observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
                     hash_symbol_search_doc_detail(&mut graph_hasher, project_root, &doc);
                 }
@@ -3884,6 +3891,10 @@ fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: 
     );
     hash_part(hasher, &doc.doc_version.to_string());
     hash_part(hasher, &doc.doc_hash);
+    hash_part(hasher, &doc.attached_comment_policy);
+    hash_part(hasher, &doc.attached_comment_state);
+    hash_part(hasher, &doc.attached_comment_hash);
+    hash_part(hasher, doc.attached_comment_text.as_deref().unwrap_or(""));
     hash_part(hasher, &doc.policy_version);
     hash_part(hasher, &doc.source_provenance);
 }
