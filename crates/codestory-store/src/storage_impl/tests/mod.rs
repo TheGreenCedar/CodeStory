@@ -12538,7 +12538,10 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 34);
+    assert!(
+        CURRENT_SCHEMA_VERSION >= ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION,
+        "the current writer barrier must include the annotation cutover"
+    );
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");
