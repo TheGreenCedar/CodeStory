@@ -2180,7 +2180,27 @@ fn search_lexical_index_on_connection(
         content_candidates,
         symbol_candidates,
     ]));
-    if payload == LexicalHitPayload::DescriptorOnly {
+    if payload == LexicalHitPayload::Full {
+        // The FTS lanes may return the same source row several times. Only the
+        // first MAX_CANDIDATES distinct rows can enter the coverage gate, so
+        // read their FTS bodies once and defer stored-source decoding until a
+        // source row actually clears that gate.
+        let mut seen = HashSet::new();
+        let mut bounded = Vec::with_capacity(MAX_CANDIDATES.min(candidates.len()));
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if index % 64 == 0 && cancelled() {
+                bail!("lexical search cancelled");
+            }
+            if seen.insert(lexical_candidate_identity(&candidate.document)) {
+                bounded.push(candidate);
+                if bounded.len() == MAX_CANDIDATES {
+                    break;
+                }
+            }
+        }
+        candidates = bounded;
+        populate_full_candidate_content(connection, &mut candidates, cancelled)?;
+    } else {
         // Keep the two-of-three / ~40% gate fail-closed: never invent tokens
         // for FTS-lane survivors, and never re-run per-token MATCH×rowid
         // (Keycloak-class cost). Path/symbol are proven in memory; content
@@ -2229,9 +2249,15 @@ fn search_lexical_index_on_connection(
                 == LexicalDocumentSource::LexicalSource
                 && payload == LexicalHitPayload::Full
             {
+                let content = read_admitted_source_content(
+                    connection,
+                    candidate.row_id,
+                    representation,
+                    cancelled,
+                )?;
                 lexical_source_target(
                     &candidate.document.path,
-                    &candidate.document.content,
+                    &content,
                     &tokens,
                     token_match.content_weight > 0.0,
                 )
@@ -2331,6 +2357,74 @@ fn row_lexical_content(
     })
 }
 
+fn read_admitted_source_content(
+    connection: &Connection,
+    row_id: i64,
+    representation: LexicalDatabaseRepresentation,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    let sql = if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 {
+        "SELECT content, content_codec, content_decoded_bytes
+         FROM lexical_documents WHERE id = ?1"
+    } else {
+        "SELECT content FROM lexical_documents WHERE id = ?1"
+    };
+    connection
+        .prepare_cached(sql)?
+        .query_row([row_id], |row| {
+            row_lexical_content(
+                row,
+                representation.schema_version,
+                0,
+                1,
+                2,
+                representation.decoded_byte_limit,
+                cancelled,
+            )
+        })
+        .map_err(Into::into)
+}
+
+fn populate_full_candidate_content(
+    connection: &Connection,
+    candidates: &mut [LexicalCandidate],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    const ROW_ID_CHUNK: usize = 500;
+    let mut content_by_row = HashMap::with_capacity(candidates.len());
+    for chunk in candidates.chunks(ROW_ID_CHUNK) {
+        if cancelled() {
+            bail!("lexical search cancelled");
+        }
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT rowid, content FROM lexical_fts WHERE rowid IN ({placeholders})");
+        let mut statement = connection.prepare_cached(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(chunk.iter().map(|candidate| candidate.row_id)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            if cancelled() {
+                bail!("lexical search cancelled");
+            }
+            let (row_id, content) = row?;
+            content_by_row.insert(row_id, content);
+        }
+    }
+    for candidate in candidates {
+        candidate.normalized_content = content_by_row
+            .remove(&candidate.row_id)
+            .context("lexical candidate lost its FTS body")?;
+    }
+    Ok(())
+}
+
 fn query_fts_candidates(
     connection: &Connection,
     fts_query: &str,
@@ -2340,6 +2434,9 @@ fn query_fts_candidates(
     representation: LexicalDatabaseRepresentation,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<LexicalCandidate>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
     let scoped_query = match order {
         LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
         LexicalCandidateOrder::Content | LexicalCandidateOrder::SymbolDocument => {
@@ -2350,7 +2447,7 @@ fn query_fts_candidates(
         (LexicalCandidateOrder::Path, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
@@ -2360,7 +2457,7 @@ fn query_fts_candidates(
              LIMIT ?2"
         }
         (LexicalCandidateOrder::Path, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2371,7 +2468,7 @@ fn query_fts_candidates(
         (LexicalCandidateOrder::Content, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
@@ -2381,7 +2478,7 @@ fn query_fts_candidates(
              LIMIT ?2"
         }
         (LexicalCandidateOrder::Content, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2392,7 +2489,7 @@ fn query_fts_candidates(
         (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
@@ -2402,7 +2499,7 @@ fn query_fts_candidates(
              LIMIT ?2"
         }
         (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -2442,19 +2539,7 @@ fn query_fts_candidates(
     let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
             path: row.get(1)?,
-            content: if payload == LexicalHitPayload::Full {
-                row_lexical_content(
-                    row,
-                    representation.schema_version,
-                    2,
-                    9,
-                    10,
-                    representation.decoded_byte_limit,
-                    cancelled,
-                )?
-            } else {
-                String::new()
-            },
+            content: String::new(),
             source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     5,
@@ -2473,8 +2558,14 @@ fn query_fts_candidates(
             normalized_content: row.get(4)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let mut candidates = Vec::new();
+    for row in rows {
+        if cancelled() {
+            bail!("lexical search cancelled");
+        }
+        candidates.push(row?);
+    }
+    Ok(candidates)
 }
 
 fn query_exact_candidates(
@@ -2485,6 +2576,9 @@ fn query_exact_candidates(
     representation: LexicalDatabaseRepresentation,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<LexicalCandidate>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
     let mut needles = quoted_query_tokens(query);
     let intent = crate::query_features::classify_query(query).intent;
     needles.extend(
@@ -2500,7 +2594,7 @@ fn query_exact_candidates(
     let mut candidates = Vec::new();
     let sql = match payload {
         LexicalHitPayload::Full if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 => {
-            "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
                 d.source, d.node_id, d.symbol_name, d.start_line,
                 d.content_codec, d.content_decoded_bytes
          FROM lexical_documents d
@@ -2513,7 +2607,7 @@ fn query_exact_candidates(
          LIMIT ?2"
         }
         LexicalHitPayload::Full => {
-            "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
@@ -2539,22 +2633,13 @@ fn query_exact_candidates(
     };
     let mut statement = connection.prepare_cached(sql)?;
     for needle in needles {
+        if cancelled() {
+            bail!("lexical search cancelled");
+        }
         let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
             let document = LexicalDocument {
                 path: row.get(1)?,
-                content: if payload == LexicalHitPayload::Full {
-                    row_lexical_content(
-                        row,
-                        representation.schema_version,
-                        2,
-                        9,
-                        10,
-                        representation.decoded_byte_limit,
-                        cancelled,
-                    )?
-                } else {
-                    String::new()
-                },
+                content: String::new(),
                 source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(
                     |error| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -2575,7 +2660,12 @@ fn query_exact_candidates(
                 normalized_content: row.get(4)?,
             })
         })?;
-        candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        for row in rows {
+            if cancelled() {
+                bail!("lexical search cancelled");
+            }
+            candidates.push(row?);
+        }
         if candidates.len() >= candidate_limit {
             break;
         }
@@ -5589,6 +5679,101 @@ mod tests {
             )
             .is_err(),
             "the hostile stored body must fail if a query tries to materialize it"
+        );
+    }
+
+    #[test]
+    fn full_search_hydrates_only_admitted_source_candidates() {
+        let connection = Connection::open_in_memory().expect("in-memory lexical database");
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE lexical_documents (
+                     id INTEGER PRIMARY KEY,
+                     path TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     node_id TEXT,
+                     symbol_name TEXT,
+                     start_line INTEGER
+                 );
+                 CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);
+                 INSERT INTO lexical_documents
+                     (id, path, content, source, node_id, symbol_name, start_line)
+                 VALUES (1, 'src/a.rs', X'80', 'lexical_source', NULL, NULL, NULL),
+                        (2, 'src/b.rs', 'alpha beta implementation',
+                         'lexical_source', NULL, NULL, NULL);
+                 INSERT INTO lexical_fts(rowid, path, content)
+                 VALUES (1, 'src/a.rs', 'alpha'),
+                        (2, 'src/b.rs', 'alpha beta implementation');",
+            )
+            .expect("lexical fixture");
+
+        let hits = search_lexical_index_on_connection(
+            &connection,
+            "alpha beta",
+            2,
+            2,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::Full,
+        )
+        .expect("an unadmitted source body does not need hydration");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/b.rs");
+        assert_eq!(
+            hits[0].source_excerpt.as_deref(),
+            Some("alpha beta implementation")
+        );
+
+        let admitted_error = search_lexical_index_on_connection(
+            &connection,
+            "alpha",
+            2,
+            2,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::Full,
+        );
+        assert!(
+            admitted_error.is_err(),
+            "admitted corrupt source must fail closed"
+        );
+    }
+
+    #[test]
+    fn cancelled_full_body_fetch_does_not_expose_partial_candidates() {
+        let connection = Connection::open_in_memory().expect("in-memory lexical database");
+        connection
+            .execute_batch("CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content)")
+            .expect("FTS fixture");
+        let mut candidates = Vec::new();
+        for index in 1..=16 {
+            let path = format!("src/file_{index}.rs");
+            connection
+                .execute(
+                    "INSERT INTO lexical_fts(rowid, path, content) VALUES (?1, ?2, 'alpha beta')",
+                    params![index, path],
+                )
+                .expect("FTS row");
+            candidates.push(LexicalCandidate {
+                row_id: index,
+                document: source_document(&path, ""),
+                normalized_path: path,
+                normalized_content: String::new(),
+            });
+        }
+        let polls = AtomicUsize::new(0);
+        let error = populate_full_candidate_content(&connection, &mut candidates, &|| {
+            polls.fetch_add(1, Ordering::Relaxed) >= 4
+        })
+        .expect_err("cancel during deferred FTS body reads");
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.normalized_content.is_empty()),
+            "a cancelled body wave cannot leave partially admitted candidates"
         );
     }
 
