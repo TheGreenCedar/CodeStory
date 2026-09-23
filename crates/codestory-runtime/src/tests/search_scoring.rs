@@ -895,6 +895,206 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 }
 
 #[test]
+fn dotted_owner_method_query_resolves_with_file_constraint() {
+    use crate::{TargetResolution, TargetSelection};
+
+    let temp = tempdir().expect("create temp dir");
+    let db_path = temp.path().join("codestory.db");
+    let parser_file = temp.path().join("OAuth2CodeParser.java");
+    let alternate_file = temp.path().join("AlternateParser.java");
+    std::fs::write(
+        &parser_file,
+        "class OAuth2CodeParser {\n  void parseCode() {}\n  void other() {}\n}\n",
+    )
+    .expect("write parser source");
+    std::fs::write(
+        &alternate_file,
+        "class OAuth2CodeParser { void parseCode() {} }\n",
+    )
+    .expect("write alternate source");
+
+    {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: parser_file.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "OAuth2CodeParser.parseCode".to_string(),
+                    qualified_name: Some(
+                        "org.keycloak.protocol.oidc.utils.OAuth2CodeParser.parseCode".to_string(),
+                    ),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(15),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "OtherOAuth2CodeParser.parseCode".to_string(),
+                    qualified_name: Some(
+                        "org.keycloak.protocol.oidc.utils.OtherOAuth2CodeParser.parseCode"
+                            .to_string(),
+                    ),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(12),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "OtherParser.parseCode".to_string(),
+                    qualified_name: Some(
+                        "org.keycloak.protocol.oidc.utils.OtherParser.parseCode".to_string(),
+                    ),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(13),
+                    kind: NodeKind::FILE,
+                    serialized_name: alternate_file.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(14),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "OAuth2CodeParser.parseCode".to_string(),
+                    qualified_name: Some("other.package.OAuth2CodeParser.parseCode".to_string()),
+                    file_node_id: Some(CoreNodeId(13)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert symbols");
+    }
+
+    let controller = AppController::new();
+    controller
+        .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+        .expect("open project");
+    let resolved = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".to_string(),
+                choose: None,
+            },
+            Some("OAuth2CodeParser.java"),
+        )
+        .expect("resolve target");
+    let TargetResolution::Resolved(target) = resolved else {
+        panic!("qualified method should resolve: {resolved:?}");
+    };
+    assert_eq!(target.selected.node_id, NodeId("11".to_string()));
+    assert_eq!(
+        target.alternatives.len(),
+        1,
+        "other owners must be excluded"
+    );
+
+    let fully_qualified = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "org.keycloak.protocol.oidc.utils.OAuth2CodeParser.parseCode".to_string(),
+                choose: None,
+            },
+            None,
+        )
+        .expect("resolve full method name");
+    assert!(matches!(fully_qualified, TargetResolution::Resolved(target)
+        if target.selected.node_id == NodeId("11".to_string())));
+
+    let ambiguous = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".to_string(),
+                choose: None,
+            },
+            None,
+        )
+        .expect("resolve both owner matches");
+    let TargetResolution::Ambiguous(ambiguity) = ambiguous else {
+        panic!("duplicate owner.method targets should be ambiguous: {ambiguous:?}");
+    };
+    assert_eq!(ambiguity.alternatives.len(), 2);
+    let second_id = ambiguity.alternatives[1].node_id.clone();
+
+    let chosen = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".to_string(),
+                choose: Some(2),
+            },
+            None,
+        )
+        .expect("choose displayed tied alternative");
+    assert!(matches!(chosen, TargetResolution::Resolved(target)
+        if target.selected.node_id == second_id));
+
+    let out_of_range = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".to_string(),
+                choose: Some(3),
+            },
+            None,
+        )
+        .expect("check choice range");
+    assert!(matches!(out_of_range, TargetResolution::Rejected(_)));
+
+    for query in [
+        "MissingParser.parseCode",
+        "NotOAuth2CodeParser.parseCode",
+        "wrong.package.OAuth2CodeParser.parseCode",
+    ] {
+        let result = controller
+            .resolve_target(
+                TargetSelection::Query {
+                    query: query.to_string(),
+                    choose: None,
+                },
+                Some("OAuth2CodeParser.java"),
+            )
+            .expect("resolve hostile query");
+        assert!(matches!(result, TargetResolution::Rejected(_)), "{query}");
+    }
+
+    let wrong_file = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".to_string(),
+                choose: None,
+            },
+            Some("MissingParser.java"),
+        )
+        .expect("resolve wrong file");
+    assert!(matches!(wrong_file, TargetResolution::Rejected(_)));
+
+    let exact_id = controller
+        .resolve_target(
+            TargetSelection::Id(NodeId("11".to_string())),
+            Some("MissingParser.java"),
+        )
+        .expect("resolve exact id");
+    assert!(matches!(exact_id, TargetResolution::Resolved(target)
+        if target.selected.node_id == NodeId("11".to_string())));
+
+    let mut rust_method = target.selected.clone();
+    rust_method.display_name = "crate::RustType::parseCode".to_string();
+    assert!(crate::target_resolution::is_name_resolvable_graph_target(
+        "RustType::parseCode",
+        &rust_method
+    ));
+}
+
+#[test]
 fn core_exact_search_is_invariant_to_absolute_project_root() {
     struct Fixture {
         controller: AppController,
