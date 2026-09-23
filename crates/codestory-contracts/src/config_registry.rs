@@ -57,6 +57,7 @@ pub const INDEX_LEGACY_EDGE_IDENTITY_ENV: &str = "CODESTORY_INDEX_LEGACY_EDGE_ID
 pub const INDEX_SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 pub const INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256_ENV: &str =
     "CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256";
+pub const INTERNAL_EMBED_INVOCATION_GROUP_ENV: &str = "CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP";
 pub const LATEST_RELEASE_VERSION_ENV: &str = "CODESTORY_LATEST_RELEASE_VERSION";
 pub const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 pub const LOG_ENV: &str = "CODESTORY_LOG";
@@ -421,6 +422,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Text,
         SettingAudience::Diagnostic,
         "Expected embedding-server executable digest the transport verifies before connecting.",
+    ),
+    setting(
+        INTERNAL_EMBED_INVOCATION_GROUP_ENV,
+        CLI_EMBEDDING_SERVER_TRANSPORT,
+        SettingKind::Boolean,
+        SettingAudience::Diagnostic,
+        "On macOS, exact value `1` keeps private qualification embedding servers in the caller's invocation group; other present values are rejected. Ignored on other platforms.",
     ),
     setting(
         LATEST_RELEASE_VERSION_ENV,
