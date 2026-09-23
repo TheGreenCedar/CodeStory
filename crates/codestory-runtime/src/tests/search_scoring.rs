@@ -1333,6 +1333,67 @@ fn build_search_state_prefers_qualified_name() {
 }
 
 #[test]
+fn broad_search_plan_loads_symbols_after_summary_only_open() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let storage_path = cache.path().join("codestory.db");
+    fs::write(project.path().join("metadata.rs"), "// fixture marker\n")
+        .expect("write zero-dense source");
+    let mut runtime = codestory_retrieval::with_test_cache_root(cache.path(), || {
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Agent,
+        )
+    });
+    runtime.embedding.allow_cpu = true;
+    let publisher = AppController::new_with_config(runtime.clone());
+    publisher
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary for indexing");
+    publisher
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core and persisted search generation");
+    codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+        project.path(),
+        &storage_path,
+        &runtime,
+    )
+    .expect("publish full retrieval fixture");
+
+    let reader = AppController::new_with_config(runtime);
+    reader
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path)
+        .expect("open completed project summary without loading search state");
+    assert!(reader.state.lock().search_engine.is_none());
+
+    let query = "How do action inputs and outputs move across remote execution?";
+    let results = reader
+        .search_results(SearchRequest {
+            query: query.to_string(),
+            repo_text: SearchRepoTextMode::On,
+            limit_per_source: 5,
+            expand_search_plan: true,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .expect("broad search should return a bounded plan from the complete publication");
+    let plan = results
+        .search_plan
+        .expect("broad low-hit question should run a plan");
+    assert_eq!(plan.original_query, query);
+    assert!(plan.eligible);
+    assert!(
+        plan.candidate_windows
+            .iter()
+            .any(|window| window.subquery == query),
+        "plan should execute the broad indexed subquery: {plan:#?}"
+    );
+    assert!(results.hits.len() <= 5);
+    assert!(results.retrieval_publication.is_some());
+    assert!(reader.state.lock().search_engine.is_some());
+}
+
+#[test]
 fn open_project_summary_preserves_search_state_for_the_same_complete_publication() {
     let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
