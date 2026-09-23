@@ -2070,12 +2070,8 @@ pub(super) fn attached_comment_for_symbol(
     file_path: Option<&str>,
     file_text_cache: &HashMap<String, Option<String>>,
 ) -> Option<String> {
-    let Some(path) = file_path else {
-        return None;
-    };
-    let Some(start_line) = node.start_line else {
-        return None;
-    };
+    let path = file_path?;
+    let start_line = node.start_line?;
     if start_line == 0 {
         return None;
     }
@@ -2123,7 +2119,7 @@ pub(super) fn attached_comment_for_symbol(
     let mut selected = Vec::new();
     'lines: for line in block {
         let cleaned = line
-            .trim_start_matches(|ch: char| matches!(ch, '/' | '*' | '#' | ' '))
+            .trim_start_matches(['/', '*', '#', ' '])
             .trim_end_matches("*/")
             .trim();
         let mut words = Vec::new();
