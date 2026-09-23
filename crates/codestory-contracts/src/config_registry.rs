@@ -428,7 +428,7 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         CLI_EMBEDDING_SERVER_TRANSPORT,
         SettingKind::Boolean,
         SettingAudience::Diagnostic,
-        "Exact value `1` keeps private qualification embedding servers in the caller's invocation group; every other present value is rejected.",
+        "On macOS, exact value `1` keeps private qualification embedding servers in the caller's invocation group; other present values are rejected. Ignored on other platforms.",
     ),
     setting(
         LATEST_RELEASE_VERSION_ENV,

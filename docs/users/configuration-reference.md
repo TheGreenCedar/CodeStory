@@ -117,7 +117,7 @@ Rollout and diagnostic switches. They are not product configuration and may chan
 | `CODESTORY_INDEX_LEGACY_DEDUP` | boolean | `crates/codestory-indexer/src/lib.rs` | Restores the superseded edge de-duplication pass. |
 | `CODESTORY_INDEX_LEGACY_EDGE_IDENTITY` | boolean | `crates/codestory-indexer/src/lib.rs` | Restores the superseded edge identity derivation. |
 | `CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256` | text | `crates/codestory-cli/src/embedding_server_transport.rs` | Expected embedding-server executable digest the transport verifies before connecting. |
-| `CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP` | boolean | `crates/codestory-cli/src/embedding_server_transport.rs` | Exact value `1` keeps private qualification embedding servers in the caller's invocation group; every other present value is rejected. |
+| `CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP` | boolean | `crates/codestory-cli/src/embedding_server_transport.rs` | On macOS, exact value `1` keeps private qualification embedding servers in the caller's invocation group; other present values are rejected. Ignored on other platforms. |
 | `CODESTORY_PACKET_CANDIDATE_TRACE` | text | `crates/codestory-runtime/src/agent/orchestrator.rs` | Symbol filter that turns on packet candidate tracing. |
 | `CODESTORY_PACKET_STEP_TRACE_OUT` | path | `crates/codestory-runtime/src/agent/trace_export.rs` | File that receives the packet step trace. |
 | `CODESTORY_PIPELINE_FLUSH` | boolean | `crates/codestory-indexer/src/lib.rs` | Forces a storage flush after every indexing batch. |
