@@ -443,6 +443,7 @@ impl AppController {
     }
 
     fn expanded_symbol_matches(&self, query: &str) -> Result<ExpandedSymbolMatches, ApiError> {
+        self.ensure_search_state()?;
         let mut s = self.state.lock();
         let engine = s.search_engine.as_mut().ok_or_else(|| {
             ApiError::invalid_argument("Search engine not initialized. Open a project first.")

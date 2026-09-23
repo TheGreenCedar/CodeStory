@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+On projects with full retrieval ready, broad searches with `--plan-details`
+now run after opening the project instead of reporting an uninitialized search engine.
+
 The grounding skill now tells agents to leave causes unresolved when available
 observations cannot distinguish them, name what would decide among them, and
 rank a cause only when evidence supports the distinction.
