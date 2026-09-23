@@ -5,6 +5,8 @@
 //! that prove one local OS user is talking to one lifetime authority.
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use codestory_contracts::config_registry::INTERNAL_EMBED_INVOCATION_GROUP_ENV as INVOCATION_GROUP_ENV;
 use codestory_contracts::config_registry::{
     EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV,
     EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV,
@@ -24,8 +26,6 @@ use std::time::Duration;
 const INTERNAL_SERVER_COMMAND: &str = "internal-embedding-server";
 const EXPECTED_EXECUTABLE_SHA256_ENV: &str =
     "CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256";
-#[cfg(target_os = "macos")]
-const INVOCATION_GROUP_ENV: &str = "CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
 const CHILD_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const EXECUTABLE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
