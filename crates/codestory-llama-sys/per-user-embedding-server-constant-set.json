@@ -43,22 +43,7 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": {
-    "calibration_bundle_sha256": "6e48f90799dea69ba83482df435cdcac7b801ce677dbe2a5e7faa3768de3c758",
-    "calibration_freeze_digest": "973e6cae72e7f934a4d5314a38450253bda02aa334512d3e5e2e6f1ee790eb3c",
-    "input_constant_set_sha256": "bbed9d4469e242a4ea928f4e4510f39132a7c6ed83c8566625a81229f0cfbb8a",
-    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
-    "protocol_sha256": "69688d108bd571f9a3b3b68492991c13d676fc8f944b90718d196ea4d67b297f",
-    "run_artifact_sha256s": [
-      "0f117179fe62c032d5f12bd87152c59b29968acb1f9fa6fd5ace58ca4ff3b038",
-      "425f9403f70dc917e1ef7980c80e25bc46af9bdb02526d95442373389fba363d",
-      "730928c6303e8a0941b210307c83cc692a9d07dfacf11eea6bfac42e56d584c7"
-    ],
-    "selected_at": "github-actions-run:36020145115:1",
-    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "073a2c00194fcea2b5feeeb995dfe817e838bfcf",
-    "selection_source_tree": "80c2e789baba5ff4ee77b32928176e85e1728d7a"
-  },
+  "freeze_record": null,
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
       "existing_owner_connect": 125,
@@ -81,5 +66,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "frozen"
+  "status": "unfrozen"
 }
