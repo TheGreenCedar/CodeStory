@@ -1445,6 +1445,82 @@ mod tests {
     }
 
     #[test]
+    fn tiny_packet_budget_keeps_navigation_truthful_or_uses_whole_budget_fallback() {
+        let mut location = packet_evidence(
+            "file-location",
+            Some("Navigation only: source exceeds the row budget"),
+        );
+        location.kind = EvidenceKindV3Dto::SourceLocation;
+        location.path = Some(PathTextV3::new("src/large.rs").unwrap());
+        location.start_line = None;
+        location.end_line = None;
+        let gap = projection_gap(
+            "source-budget-exceeded",
+            GapKindV3Dto::ContinuationRequired,
+            Some("The complete file did not fit the bounded source row."),
+        );
+        let record = record_fixture_with(
+            "trace the file",
+            PacketBudgetModeDto::Tiny,
+            vec![location],
+            vec![gap],
+            Some(ContinuationStateV3Dto {
+                continuation_id: identity("continue-source"),
+                remaining_rounds: 1,
+                gap_ids: BoundedVecV3::new(vec![GapIdentityV3Dto {
+                    gap_id: identity("source-budget-exceeded"),
+                }])
+                .unwrap(),
+            }),
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let complete =
+            build_packet_projection_v3(&record, diagnostics_capability_fixture(), |candidate| {
+                Ok(serde_json::to_vec(candidate).unwrap().len())
+            })
+            .expect("tiny packet location fits the public output bound");
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = &complete else {
+            panic!("small navigation envelope should remain complete");
+        };
+        assert_eq!(evidence.as_slice().len(), 1);
+        assert_eq!(
+            evidence.as_slice()[0].kind,
+            EvidenceKindV3Dto::SourceLocation
+        );
+        assert_eq!(
+            evidence.as_slice()[0].path.as_ref().unwrap().as_str(),
+            "src/large.rs"
+        );
+        assert_eq!(
+            (
+                evidence.as_slice()[0].start_line,
+                evidence.as_slice()[0].end_line
+            ),
+            (None, None)
+        );
+        assert!(gaps.as_slice().iter().any(|gap| {
+            gap.identity.gap_id.as_str() == "source-budget-exceeded"
+                && gap.kind == GapKindV3Dto::ContinuationRequired
+        }));
+
+        let mut overbound = complete;
+        finalize_packet_projection_v3(&mut overbound, |candidate| match candidate {
+            PacketProjectionV3Dto::Complete { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1),
+            PacketProjectionV3Dto::BudgetExceeded { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+        })
+        .expect("whole budget fallback fits");
+        let PacketProjectionV3Dto::BudgetExceeded { gaps, .. } = overbound else {
+            panic!("overbound complete packet must not misclassify its locator");
+        };
+        assert_eq!(gaps.as_slice()[0].kind, GapKindV3Dto::OutputBudgetExceeded);
+    }
+
+    #[test]
     fn packet_projection_v3_measurement_failures_and_oversized_fallback_return_no_dto() {
         let record = record_fixture("measurement failures");
         assert_eq!(

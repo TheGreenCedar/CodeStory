@@ -33,10 +33,14 @@ use codestory_contracts::graph::{
     NodeKind as CoreNodeKind, ResolutionCertainty,
 };
 use codestory_store::{FileInfo, Store};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
+const FILE_NAVIGATION_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct FrozenPacketCompilationV1 {
     pub(crate) product: RepositoryDerivedCompilationV1,
@@ -63,7 +67,7 @@ pub(crate) fn freeze_packet_compilation(
     let admissions = session.receipts();
     let mut admission_gaps = session.gaps();
     let storage = controller.open_storage_read_only()?;
-    let (authenticated_admissions, mut sources) =
+    let (authenticated_admissions, mut sources, file_navigation_paths) =
         hydrate_admitted_sources(controller, &storage, &admissions, &mut admission_gaps)?;
     let source_paths = sources
         .iter()
@@ -95,12 +99,24 @@ pub(crate) fn freeze_packet_compilation(
         ambiguities: probe_ambiguities(probe_resolutions),
         admission_gaps,
     };
-    let product = compile_repository_evidence(&input);
+    let mut product = compile_repository_evidence(&input);
+    attach_file_navigation_paths(&mut product.support, &file_navigation_paths);
     Ok(FrozenPacketCompilationV1 {
         product,
         source_coverage,
         publication,
     })
+}
+
+fn attach_file_navigation_paths(support: &mut [SupportUnitDto], paths: &HashMap<String, String>) {
+    for unit in support {
+        if unit.kind == SupportUnitKindDto::SymbolLocation
+            && let Some(identity) = unit.id.strip_prefix("symbol:")
+            && let Some(path) = paths.get(identity)
+        {
+            unit.path = Some(path.clone());
+        }
+    }
 }
 
 pub(crate) fn apply_frozen_packet_compilation(
@@ -160,24 +176,68 @@ fn final_support_stable_identity(unit: &SupportUnitDto) -> Option<String> {
     }
 }
 
+type HydratedAdmittedSources = (
+    Vec<AuthenticatedPacketAdmissionV1>,
+    Vec<PacketHydratedSourceRangeV1>,
+    HashMap<String, String>,
+);
+
 fn hydrate_admitted_sources(
     controller: &AppController,
     storage: &Store,
     admissions: &[PacketAdmissionReceiptV1],
     admission_gaps: &mut Vec<PacketAdmissionGapV1>,
-) -> Result<
-    (
-        Vec<AuthenticatedPacketAdmissionV1>,
-        Vec<PacketHydratedSourceRangeV1>,
-    ),
-    codestory_contracts::api::ApiError,
-> {
+) -> Result<HydratedAdmittedSources, codestory_contracts::api::ApiError> {
     let project_root = controller.require_project_root()?;
     let mut authenticated = Vec::new();
     let mut sources = Vec::new();
+    let mut file_navigation_paths = HashMap::new();
     for admission in admissions {
-        let result = if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
-            let Some(node) = authenticated_node(storage, raw_id)? else {
+        let (core_node_id, result) =
+            if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
+                let Some(node) = authenticated_node(storage, raw_id)? else {
+                    push_admission_gap(
+                        admission_gaps,
+                        admission,
+                        PacketAdmissionGapKindV1::StableIdentityMissing,
+                        false,
+                    );
+                    continue;
+                };
+                if let Some(file_id) = (node.kind == CoreNodeKind::FILE)
+                    .then_some(node.id)
+                    .or(node.file_node_id)
+                    && let Some(file) = storage.get_file_by_id(file_id.0).map_err(|error| {
+                        codestory_contracts::api::ApiError::internal(format!(
+                            "Failed to authenticate admitted packet file: {error}"
+                        ))
+                    })?
+                    && let Some(path) = authenticated_file_navigation_path(controller, &file)
+                {
+                    file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                }
+                (
+                    node.id,
+                    hydrate_admitted_node_source(controller, storage, admission, &node),
+                )
+            } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
+                let Some(file) = find_admitted_file(storage, &project_root, path)? else {
+                    push_admission_gap(
+                        admission_gaps,
+                        admission,
+                        PacketAdmissionGapKindV1::StableIdentityMissing,
+                        false,
+                    );
+                    continue;
+                };
+                if let Some(path) = authenticated_file_navigation_path(controller, &file) {
+                    file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                }
+                (
+                    CoreNodeId(file.id),
+                    hydrate_admitted_file_source(controller, storage, admission, &file),
+                )
+            } else {
                 push_admission_gap(
                     admission_gaps,
                     admission,
@@ -186,41 +246,52 @@ fn hydrate_admitted_sources(
                 );
                 continue;
             };
-            authenticated.push(AuthenticatedPacketAdmissionV1 {
-                receipt: admission.clone(),
-                core_node_id: node.id,
-            });
-            hydrate_admitted_node_source(controller, storage, admission, &node)
-        } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
-            let Some(file) = find_admitted_file(storage, &project_root, path)? else {
-                push_admission_gap(
-                    admission_gaps,
-                    admission,
-                    PacketAdmissionGapKindV1::StableIdentityMissing,
-                    false,
-                );
-                continue;
-            };
-            authenticated.push(AuthenticatedPacketAdmissionV1 {
-                receipt: admission.clone(),
-                core_node_id: CoreNodeId(file.id),
-            });
-            hydrate_admitted_file_source(controller, admission, &file)
-        } else {
-            push_admission_gap(
-                admission_gaps,
-                admission,
-                PacketAdmissionGapKindV1::StableIdentityMissing,
-                false,
-            );
-            continue;
-        };
         match result {
-            Ok(source) => sources.push(source),
-            Err(kind) => push_admission_gap(admission_gaps, admission, kind, true),
+            Ok(source) => {
+                authenticated.push(AuthenticatedPacketAdmissionV1 {
+                    receipt: admission.clone(),
+                    core_node_id,
+                });
+                sources.push(source);
+            }
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded) => {
+                authenticated.push(AuthenticatedPacketAdmissionV1 {
+                    receipt: admission.clone(),
+                    core_node_id,
+                });
+                push_admission_gap(
+                    admission_gaps,
+                    admission,
+                    PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                    true,
+                );
+            }
+            Err(kind) => {
+                file_navigation_paths.remove(&admission.stable_identity);
+                push_admission_gap(admission_gaps, admission, kind, true);
+            }
         }
     }
-    Ok((authenticated, sources))
+    Ok((authenticated, sources, file_navigation_paths))
+}
+
+fn authenticated_file_navigation_path(
+    controller: &AppController,
+    file: &FileInfo,
+) -> Option<String> {
+    let path = file.path.to_string_lossy();
+    let resolved = controller.resolve_project_file_path(&path, false).ok()?;
+    let project_root = controller.require_project_root().ok()?;
+    let indexed_path = if file.path.is_absolute() {
+        file.path.clone()
+    } else {
+        project_root.join(&file.path)
+    };
+    if !codestory_workspace::same_workspace_path(&resolved, &indexed_path) {
+        return None;
+    }
+    codestory_workspace::workspace_relative_path(&project_root, &resolved)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
 fn push_admission_gap(
@@ -268,7 +339,7 @@ fn hydrate_admitted_node_source(
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     if node.kind == CoreNodeKind::FILE {
-        return hydrate_admitted_file_source(controller, admission, &file);
+        return hydrate_admitted_file_source(controller, storage, admission, &file);
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
@@ -299,20 +370,83 @@ fn hydrate_admitted_node_source(
 
 fn hydrate_admitted_file_source(
     controller: &AppController,
+    storage: &Store,
     admission: &PacketAdmissionReceiptV1,
     file: &FileInfo,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    // A file identity has no source focus. Preserve a complete short file when
+    // its pinned bytes fit the admission; otherwise leave it as navigation.
+    // Reading its first few lines would falsely promote an arbitrary header
+    // to a source witness for the retrieval question.
+    if !file.indexed || !file.complete || file.line_count == 0 {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let expected_hash = storage
+        .get_file_content_hash(file.id)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     let path = file.path.to_string_lossy();
-    let (_, bounded) = controller
-        .bounded_file_snippet(
-            &path,
-            1,
-            8,
-            source_byte_cap(admission),
-            COMPILER_SOURCE_TRUNCATION_SUFFIX,
-        )
+    let resolved = controller
+        .resolve_project_file_path(&path, false)
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    hydrated_source(admission, &path, None, &bounded.markdown)
+    let project_root = controller
+        .require_project_root()
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let indexed_path = if file.path.is_absolute() {
+        file.path.clone()
+    } else {
+        project_root.join(&file.path)
+    };
+    if !codestory_workspace::same_workspace_path(&resolved, &indexed_path) {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let cap = source_byte_cap(admission);
+    let mut bytes = Vec::new();
+    std::fs::File::open(&resolved)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .take((FILE_NAVIGATION_VERIFICATION_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if bytes.len() > FILE_NAVIGATION_VERIFICATION_MAX_BYTES {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    };
+    if text.lines().count() != file.line_count as usize {
+        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+    }
+    if text.len() > cap {
+        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+    }
+    let markdown = complete_file_markdown(&text, file.line_count, cap)?;
+    hydrated_source(admission, &path, None, &markdown)
+}
+
+fn complete_file_markdown(
+    text: &str,
+    line_count: u32,
+    cap: usize,
+) -> Result<String, PacketAdmissionGapKindV1> {
+    // The focused-snippet helper caps context at 50 lines. File admission is
+    // different: it may claim source only when every line fits the row cap.
+    let mut markdown = String::from("```text\n");
+    for (index, line) in text.lines().enumerate() {
+        let marker = if index == 0 { ">" } else { " " };
+        writeln!(markdown, "{marker}{:>5} | {line}", index + 1)
+            .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+        if markdown.len().saturating_add(3) > cap {
+            return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+        }
+    }
+    markdown.push_str("```");
+    if source_receipt_line_range(&markdown) != Some((1, line_count)) {
+        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+    }
+    Ok(markdown)
 }
 
 fn hydrated_source(
@@ -780,6 +914,299 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
 mod tests {
     use super::*;
     use codestory_contracts::graph::{Edge as CoreEdge, EdgeId as CoreEdgeId};
+    use codestory_store::FileRole;
+
+    #[test]
+    fn whole_file_renderer_has_no_fifty_line_focus_limit() {
+        let source = "\n".repeat(80);
+        let rendered = complete_file_markdown(&source, 80, 1024)
+            .expect("all eighty numbered lines fit the larger bounded row");
+        assert_eq!(source_receipt_line_range(&rendered), Some((1, 80)));
+        assert!(rendered.len() <= 1024);
+        assert!(matches!(
+            complete_file_markdown("x\n", 1, 8),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn file_admission_retains_only_complete_pinned_source_or_navigation() {
+        let project = tempfile::tempdir().expect("project");
+        let controller = AppController::new();
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let storage = Store::new_in_memory().expect("store");
+        let path = project.path().join("settings.rs");
+        let admission = PacketAdmissionReceiptV1 {
+            packet_ordinal: 0,
+            stable_identity: "path:settings.rs".into(),
+            score_version: "test".into(),
+            reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+            origin: PacketAdmissionOriginV1::Retrieval,
+        };
+        let mut file = FileInfo {
+            id: 1,
+            path: path.clone(),
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 2,
+            file_role: FileRole::Source,
+        };
+        let short = "const ENABLED: bool = true;\nconst LIMIT: usize = 2;\n";
+        std::fs::write(&path, short).expect("short source");
+        storage.insert_file(&file).expect("file");
+        let short_hash = format!("{:x}", Sha256::digest(short.as_bytes()));
+        storage
+            .update_file_metadata(&file, Some(&short_hash))
+            .expect("pinned source hash");
+        let whole = hydrate_admitted_file_source(&controller, &storage, &admission, &file)
+            .expect("complete short file source");
+        assert_eq!((whole.start_line, whole.end_line), (1, 2));
+        assert!(whole.source.contains("const LIMIT: usize = 2;"));
+
+        let many_short_lines = "\n".repeat(45);
+        file.line_count = 45;
+        std::fs::write(&path, &many_short_lines).expect("short multiline source");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!(
+                    "{:x}",
+                    Sha256::digest(many_short_lines.as_bytes())
+                )),
+            )
+            .expect("multiline source hash");
+        let whole = hydrate_admitted_file_source(&controller, &storage, &admission, &file)
+            .expect("every line fits the bounded source row");
+        assert_eq!((whole.start_line, whole.end_line), (1, 45));
+        assert!(whole.source.len() <= INTERIM_SOURCE_ROW_UPPER_BOUND);
+
+        let tiny_but_unrenderable = "\n".repeat(51);
+        file.line_count = 51;
+        std::fs::write(&path, &tiny_but_unrenderable).expect("raw bytes fit");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!(
+                    "{:x}",
+                    Sha256::digest(tiny_but_unrenderable.as_bytes())
+                )),
+            )
+            .expect("raw source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        ));
+
+        let long = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        file.line_count = 120;
+        std::fs::write(&path, &long).expect("long source");
+        let long_hash = format!("{:x}", Sha256::digest(long.as_bytes()));
+        storage
+            .update_file_metadata(&file, Some(&long_hash))
+            .expect("long source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        ));
+
+        std::fs::write(&path, "changed source\n").expect("drifted source");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+
+        let invalid_utf8 = b"\xff\n";
+        file.line_count = 1;
+        std::fs::write(&path, invalid_utf8).expect("invalid UTF-8 source");
+        storage
+            .update_file_metadata(&file, Some(&format!("{:x}", Sha256::digest(invalid_utf8))))
+            .expect("invalid UTF-8 source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+        storage
+            .update_file_metadata(&file, None)
+            .expect("missing source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn file_node_navigation_keeps_authenticated_path_without_source_text() {
+        let mut support = vec![SupportUnitDto {
+            id: "symbol:node:17".into(),
+            kind: SupportUnitKindDto::SymbolLocation,
+            summary: "Navigation only: no bounded source range for node:17".into(),
+            path: None,
+            symbol_id: Some("17".into()),
+            start_line: None,
+            end_line: None,
+            snippet: None,
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        }];
+        let paths = HashMap::from([("node:17".into(), "src/large.rs".into())]);
+        attach_file_navigation_paths(&mut support, &paths);
+        assert_eq!(support[0].path.as_deref(), Some("src/large.rs"));
+        assert!(support[0].summary.starts_with("Navigation only:"));
+        assert!(support[0].snippet.is_none());
+    }
+
+    #[test]
+    fn packet_file_admissions_distinguish_verified_budget_from_source_drift() {
+        let project = tempfile::tempdir().expect("project");
+        let controller = AppController::new();
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let mut storage = Store::new_in_memory().expect("store");
+        let path = project.path().join("large.rs");
+        let source = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &source).expect("source");
+        let mut file = FileInfo {
+            id: 17,
+            path: path.clone(),
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 120,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).expect("file");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("pinned hash");
+        storage
+            .insert_nodes_batch(&[CoreNode {
+                id: CoreNodeId(17),
+                kind: CoreNodeKind::FILE,
+                serialized_name: "large.rs".into(),
+                file_node_id: Some(CoreNodeId(17)),
+                start_line: Some(1),
+                ..Default::default()
+            }])
+            .expect("file node");
+        let admissions = ["path:large.rs", "node:17"]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, stable_identity)| PacketAdmissionReceiptV1 {
+                packet_ordinal: ordinal as u32,
+                stable_identity: stable_identity.into(),
+                score_version: "test".into(),
+                reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            })
+            .collect::<Vec<_>>();
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("packet hydration");
+        assert_eq!(authenticated.len(), 2);
+        assert!(sources.is_empty());
+        assert_eq!(paths.get("node:17").map(String::as_str), Some("large.rs"));
+        assert_eq!(gaps.len(), 2);
+        assert!(
+            gaps.iter()
+                .all(|gap| matches!(gap.kind, PacketAdmissionGapKindV1::SourceBudgetExceeded))
+        );
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "test".into(),
+                core_generation_id: "pinned".into(),
+                retrieval_generation: None,
+            },
+            admissions: authenticated.into_iter().map(|item| item.receipt).collect(),
+            sources,
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: gaps,
+        };
+        let mut product = compile_repository_evidence(&input);
+        attach_file_navigation_paths(&mut product.support, &paths);
+        assert_eq!(product.support.len(), 2);
+        assert!(product.support.iter().all(|unit| {
+            unit.kind == SupportUnitKindDto::SymbolLocation
+                && unit.path.as_deref() == Some("large.rs")
+                && unit.snippet.is_none()
+                && unit.summary.starts_with("Navigation only:")
+        }));
+        assert_eq!(product.continuation.len(), 2);
+        assert!(
+            product.continuation.iter().all(|option| {
+                option.reason == PacketStructuralGapReasonV1::SourceBudgetExceeded
+            })
+        );
+
+        std::fs::write(&path, source.replace("line 1", "xxxx 1")).expect("drift");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("packet drift check");
+        assert!(authenticated.is_empty());
+        assert!(sources.is_empty());
+        assert!(paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+        assert!(
+            gaps.iter()
+                .all(|gap| matches!(gap.kind, PacketAdmissionGapKindV1::SourceUnavailable))
+        );
+
+        std::fs::write(&path, &source).expect("restore source");
+        storage
+            .update_file_metadata(&file, None)
+            .expect("remove pinned hash");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("missing hash check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+
+        file.complete = false;
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("incomplete file metadata");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("incomplete metadata check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+
+        let outside = tempfile::tempdir().expect("outside project");
+        file.complete = true;
+        file.path = outside.path().join("outside.rs");
+        std::fs::write(&file.path, &source).expect("outside source");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("mismatched file path");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("path containment check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+    }
 
     #[test]
     fn unknown_query_continuations_are_not_decoded() {

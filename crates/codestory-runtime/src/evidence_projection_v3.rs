@@ -376,9 +376,10 @@ fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceCo
     PacketEvidenceContentKeyV3 {
         kind: match row.kind {
             EvidenceKindV3Dto::ExactSource => 0,
-            EvidenceKindV3Dto::StructuralSource => 1,
-            EvidenceKindV3Dto::GraphRelation => 2,
-            EvidenceKindV3Dto::RetrievalExcerpt => 3,
+            EvidenceKindV3Dto::SourceLocation => 1,
+            EvidenceKindV3Dto::StructuralSource => 2,
+            EvidenceKindV3Dto::GraphRelation => 3,
+            EvidenceKindV3Dto::RetrievalExcerpt => 4,
         },
         path: row.path.as_ref().map(|value| value.as_str().to_owned()),
         symbol_id: row
@@ -651,22 +652,28 @@ fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvid
     if unit.kind == SupportUnitKindDto::CompleteQueryNegative {
         return None;
     }
+    if unit.kind == SupportUnitKindDto::SymbolLocation && unit.path.is_none() {
+        return None;
+    }
     Some(PacketEvidenceRowV3Dto {
         // The execution record canonicalizes by identity. A fixed-width rank
         // prefix keeps that canonical order equal to the projection's useful-
         // context order while avoiding repository-shaped identifiers.
         identity: evidence_identity(&format!("packet-evidence-{index:03}")),
         kind: match unit.kind {
-            SupportUnitKindDto::SymbolLocation | SupportUnitKindDto::SourceRange => {
-                EvidenceKindV3Dto::ExactSource
-            }
+            SupportUnitKindDto::SymbolLocation => EvidenceKindV3Dto::SourceLocation,
+            SupportUnitKindDto::SourceRange => EvidenceKindV3Dto::ExactSource,
             SupportUnitKindDto::TypedGraphEdge => EvidenceKindV3Dto::GraphRelation,
             SupportUnitKindDto::CompleteQueryNegative => return None,
         },
         path: unit.path.as_deref().map(path_text),
         symbol_id: symbol_text(unit.symbol_id.as_deref()),
-        start_line: unit.start_line,
-        end_line: unit.end_line,
+        start_line: (unit.kind != SupportUnitKindDto::SymbolLocation)
+            .then_some(unit.start_line)
+            .flatten(),
+        end_line: (unit.kind != SupportUnitKindDto::SymbolLocation)
+            .then_some(unit.end_line)
+            .flatten(),
         summary: packet_evidence_summary(unit),
     })
 }
@@ -1056,6 +1063,7 @@ mod tests {
     fn packet_evidence_prioritizes_source_excerpts_locations_and_relations() {
         let mut location = support_unit(SupportUnitKindDto::SymbolLocation);
         location.summary = "location".to_owned();
+        location.path = Some("src/location.rs".to_owned());
         let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
         relation.from_symbol = Some("caller".to_owned());
         relation.edge_kind = Some("CALL".to_owned());
@@ -1080,6 +1088,8 @@ mod tests {
                 "packet-evidence-002"
             ]
         );
+        assert_eq!(rows[2].kind, EvidenceKindV3Dto::SourceLocation);
+        assert_eq!((rows[2].start_line, rows[2].end_line), (None, None));
     }
 
     #[test]
@@ -1821,9 +1831,26 @@ mod tests {
         location.summary = "/private/project/src/lib.rs at src/lib.rs:7".to_owned();
         location.path = Some("src/lib.rs".to_owned());
         location.start_line = Some(7);
+        location.end_line = Some(9);
 
         let row = packet_evidence_row(0, &location).expect("location evidence");
+        assert_eq!(row.kind, EvidenceKindV3Dto::SourceLocation);
+        assert_eq!(row.path.as_ref().unwrap().as_str(), "src/lib.rs");
+        assert_eq!((row.start_line, row.end_line), (None, None));
         assert_eq!(row.summary.as_ref().unwrap().as_str(), "src/lib.rs:7");
+
+        location.summary = "Navigation only: no bounded source range for node:17".into();
+        let row = packet_evidence_row(1, &location).expect("bounded locator");
+        assert_eq!(row.kind, EvidenceKindV3Dto::SourceLocation);
+        assert!(
+            row.summary
+                .unwrap()
+                .as_str()
+                .starts_with("Navigation only:")
+        );
+
+        location.path = None;
+        assert!(packet_evidence_row(2, &location).is_none());
     }
 
     #[test]

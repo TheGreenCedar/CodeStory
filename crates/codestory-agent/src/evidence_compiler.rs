@@ -93,7 +93,10 @@ pub fn compile_repository_evidence(
             SupportUnitDto {
                 id: format!("symbol:{}", admission.stable_identity),
                 kind: SupportUnitKindDto::SymbolLocation,
-                summary: admission.stable_identity.clone(),
+                summary: format!(
+                    "Navigation only: no bounded source range for {}",
+                    admission.stable_identity
+                ),
                 path: admission
                     .stable_identity
                     .strip_prefix("path:")
@@ -620,6 +623,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn admitted_file_without_source_is_explicit_navigation() {
+        let mut input = input();
+        input.admissions = vec![PacketAdmissionReceiptV1 {
+            packet_ordinal: 0,
+            stable_identity: "path:src/large.rs".into(),
+            score_version: "v1".into(),
+            reserved_source_bytes: 512,
+            origin: PacketAdmissionOriginV1::Retrieval,
+        }];
+        input.sources.clear();
+        let product = compile_repository_evidence(&input);
+        assert_eq!(product.support.len(), 1);
+        let location = &product.support[0];
+        assert_eq!(location.kind, SupportUnitKindDto::SymbolLocation);
+        assert_eq!(location.path.as_deref(), Some("src/large.rs"));
+        assert!(location.summary.starts_with("Navigation only:"));
+        assert!(location.snippet.is_none());
     }
 
     #[test]

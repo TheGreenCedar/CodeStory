@@ -306,6 +306,7 @@ fn packet_evidence_schema_v3() -> Value {
             "kind",
             enum_schema_v3(&[
                 "exact_source",
+                "source_location",
                 "structural_source",
                 "graph_relation",
                 "retrieval_excerpt",
@@ -872,6 +873,17 @@ mod tests {
             "diagnostics":diagnostics
         });
         let tools = tools_for_revision_v3(McpRevisionV3::June2025);
+        let mut packet_location = packet_complete.clone();
+        packet_location["evidence"][0]["kind"] = json!("source_location");
+        packet_location["evidence"][0]["start_line"] = json!(null);
+        packet_location["evidence"][0]["end_line"] = json!(null);
+        assert!(
+            crate::stdio_arguments::validate_structured_content(
+                &tool(&tools, "packet")["outputSchema"],
+                &packet_location
+            )
+            .is_ok()
+        );
         let cases = [
             (
                 "packet",
