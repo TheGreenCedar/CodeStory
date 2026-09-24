@@ -176,19 +176,18 @@ fn final_support_stable_identity(unit: &SupportUnitDto) -> Option<String> {
     }
 }
 
+type HydratedAdmittedSources = (
+    Vec<AuthenticatedPacketAdmissionV1>,
+    Vec<PacketHydratedSourceRangeV1>,
+    HashMap<String, String>,
+);
+
 fn hydrate_admitted_sources(
     controller: &AppController,
     storage: &Store,
     admissions: &[PacketAdmissionReceiptV1],
     admission_gaps: &mut Vec<PacketAdmissionGapV1>,
-) -> Result<
-    (
-        Vec<AuthenticatedPacketAdmissionV1>,
-        Vec<PacketHydratedSourceRangeV1>,
-        HashMap<String, String>,
-    ),
-    codestory_contracts::api::ApiError,
-> {
+) -> Result<HydratedAdmittedSources, codestory_contracts::api::ApiError> {
     let project_root = controller.require_project_root()?;
     let mut authenticated = Vec::new();
     let mut sources = Vec::new();

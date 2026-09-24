@@ -703,13 +703,24 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         !adapter.contains("observe_source_coverage("),
         "packet compiler coverage must stay admission-scoped"
     );
-    let input_build = adapter
+    let freeze = source_between(
+        &adapter,
+        "pub(crate) fn freeze_packet_compilation",
+        "fn attach_file_navigation_paths",
+    );
+    let input_build = freeze
         .find("let input = PacketCompilationInputV1")
         .expect("runtime builds typed compiler input");
-    let compile = adapter
-        .find("let product = compile_repository_evidence(&input)")
+    let compile = freeze
+        .find("compile_repository_evidence(&input)")
         .expect("runtime compiles the frozen typed input");
-    assert!(input_build < compile);
+    let navigation = freeze
+        .find("attach_file_navigation_paths(&mut product.support, &file_navigation_paths)")
+        .expect("runtime attaches authenticated navigation paths after pure compilation");
+    let frozen = freeze
+        .find("Ok(FrozenPacketCompilationV1 {")
+        .expect("runtime returns the compiled packet only after navigation attachment");
+    assert!(input_build < compile && compile < navigation && navigation < frozen);
     let services = read("crates/codestory-runtime/src/services.rs");
     let agent_service = source_between(
         &services,
