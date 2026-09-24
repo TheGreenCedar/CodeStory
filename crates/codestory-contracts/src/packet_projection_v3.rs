@@ -225,6 +225,7 @@ pub struct RetrievalStateDescriptorV3Dto {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKindV3Dto {
     ExactSource,
+    SourceLocation,
     StructuralSource,
     GraphRelation,
     RetrievalExcerpt,
@@ -805,6 +806,7 @@ mod tests {
             ],
             "evidence_variants": [
                 EvidenceKindV3Dto::ExactSource,
+                EvidenceKindV3Dto::SourceLocation,
                 EvidenceKindV3Dto::StructuralSource,
                 EvidenceKindV3Dto::GraphRelation,
                 EvidenceKindV3Dto::RetrievalExcerpt,

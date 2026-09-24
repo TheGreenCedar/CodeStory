@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Compact packets now distinguish file locations from source evidence. Short,
+complete files remain available as source; larger files whose contents can be
+verified show a navigation path and a continuation gap instead of an arbitrary
+header excerpt.
+
 Full-retrieval search can now find declarations by terms in their attached
 comments, even when those terms do not fit the short symbol summary. Source
 that could not be read within the configured bounds remains marked unavailable

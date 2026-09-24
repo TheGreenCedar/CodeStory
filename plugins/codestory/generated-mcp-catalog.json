@@ -12,8 +12,8 @@
     "discoveryContracts": {
       "2024-11-05": "8fdea8a20e1d99582494f2ab720eccf6861580b09b5d3c6af060450e69d224ef",
       "2025-03-26": "7ad01810d1f9d073c427f57479ee5650add94f4cf5e2005f217501686cafa75e",
-      "2025-06-18": "40f8d58d3588bab257d0e12db648e2bf84d588196f42da37680cf8eca6b4e4d5",
-      "2025-11-25": "f6f7225044ad16a896ba83b3822e9aee2c9d00ae702451b1536f293dd606e6a5"
+      "2025-06-18": "b7a7152fbac4b24ba0f079918aa52a5b54644e49fa85a20ba6ef52d36997d878",
+      "2025-11-25": "5a2d04f8bfa3750cff6d2876a507bb9abe60cd7be246c3208fc6524366ddd7c9"
     }
   },
   "revisionProfiles": {
@@ -3528,7 +3528,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "40f8d58d3588bab257d0e12db648e2bf84d588196f42da37680cf8eca6b4e4d5",
+      "discoveryContractSha256": "b7a7152fbac4b24ba0f079918aa52a5b54644e49fa85a20ba6ef52d36997d878",
       "tools": [
         {
           "_meta": {
@@ -4193,6 +4193,7 @@
                                 "kind": {
                                   "enum": [
                                     "exact_source",
+                                    "source_location",
                                     "structural_source",
                                     "graph_relation",
                                     "retrieval_excerpt"
@@ -12230,7 +12231,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "f6f7225044ad16a896ba83b3822e9aee2c9d00ae702451b1536f293dd606e6a5",
+      "discoveryContractSha256": "5a2d04f8bfa3750cff6d2876a507bb9abe60cd7be246c3208fc6524366ddd7c9",
       "tools": [
         {
           "_meta": {
@@ -12895,6 +12896,7 @@
                                 "kind": {
                                   "enum": [
                                     "exact_source",
+                                    "source_location",
                                     "structural_source",
                                     "graph_relation",
                                     "retrieval_excerpt"
@@ -21596,6 +21598,7 @@
                             "kind": {
                               "enum": [
                                 "exact_source",
+                                "source_location",
                                 "structural_source",
                                 "graph_relation",
                                 "retrieval_excerpt"
