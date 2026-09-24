@@ -38,7 +38,6 @@ serde_json = { workspace = true }
 # stops reading stdout cannot hold the process past its own kill deadline.
 tokio = { workspace = true, features = ["signal", "time"] }
 toml = { workspace = true }
-sha2 = { workspace = true }
 ureq = { workspace = true }
 notify = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -47,6 +46,13 @@ ratatui = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Use SHA-2 instructions when present; sha2 retains its runtime software fallback.
+sha2 = { workspace = true, features = ["asm-aarch64"] }
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
