@@ -5605,6 +5605,24 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
   }
 });
 
+test("release Linux proof binds the package producer run", () => {
+  const workflows = loadWorkflows();
+  assert.deepEqual(validateWorkflows(workflows), []);
+
+  for (const [name, mutate] of [
+    ["missing binding", job => { delete job.with.package_run_id; }],
+    ["different run", job => { job.with.package_run_id = "${{ inputs.package_run_id }}"; }],
+  ]) {
+    const changed = loadWorkflows();
+    mutate(changed.get("release.yml").jobs["linux-vulkan-proof"]);
+    assert.match(
+      validateWorkflows(changed).join("\n"),
+      /release\.yml Linux proof must bind package_run_id to this release run/u,
+      name,
+    );
+  }
+});
+
 test("standard release paths reject calibration plumbing", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
