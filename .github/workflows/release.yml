@@ -552,6 +552,7 @@ jobs:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
+      package_run_id: ${{ github.run_id }}
       server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}

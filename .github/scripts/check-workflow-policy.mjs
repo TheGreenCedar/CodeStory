@@ -3742,6 +3742,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, sameMembers(needs(linuxVulkan), releaseChain.dependencies["linux-vulkan-proof"]), `${releaseFile} Linux Vulkan proof dependencies must match the release claim graph`);
   add(
     violations,
+    object(linuxVulkan.with).package_run_id === "${{ github.run_id }}",
+    `${releaseFile} Linux proof must bind package_run_id to this release run`,
+  );
+  add(
+    violations,
     object(linuxVulkan.with).candidate_installed_proof === true
       && object(linuxVulkan.with).server_behavior_only === true
       && object(linuxVulkan.with).emit_release_cells === true,
