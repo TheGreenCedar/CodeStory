@@ -280,6 +280,17 @@ test("operation parser and policy fail closed on arm leakage", () => {
     }], exactOptions),
     [],
   );
+  for (const flag of ["--why", "--plan-details"]) {
+    assert.match(
+      builderOperationViolations("exact_identity_source", [{
+        operation: "search",
+        transport: "cli",
+        successful: true,
+        raw: { command: `${exactSearchCommand} ${flag}` },
+      }], exactOptions).join("\n"),
+      new RegExp(`${flag}.*not permitted`),
+    );
+  }
   const wrappedExactSearch = `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query "Alpha Beta" --repo-text off'`;
   const wrappedAnalysis = analyzeTranscript([
     commandEvent("wrapped-exact", "completed", wrappedExactSearch, "{}"),

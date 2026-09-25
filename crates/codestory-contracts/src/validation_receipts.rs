@@ -44,9 +44,11 @@
 //! Receipts are process-local. They are an optimization over re-reading bytes
 //! this process already read; they are never persisted and never shared.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -308,6 +310,32 @@ fn system_time_nanos(time: SystemTime) -> i128 {
     }
 }
 
+/// Hash only at the exceptional hard-link transfer boundary. A link changes
+/// ctime, so metadata alone cannot distinguish that change from a same-length
+/// rewrite between receipt capture and resealing. This is a bounded streaming
+/// read, not a repeat of the artifact's domain validation or a query-time cost.
+fn content_digests(seals: &[ArtifactSeal]) -> Option<Vec<Option<[u8; 32]>>> {
+    seals
+        .iter()
+        .map(|seal| match seal.presence {
+            SealPresence::Absent => Some(None),
+            SealPresence::Present { .. } => {
+                let mut file = std::fs::File::open(&seal.path).ok()?;
+                let mut digest = Sha256::new();
+                let mut chunk = [0_u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut chunk).ok()?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&chunk[..count]);
+                }
+                Some(Some(digest.finalize().into()))
+            }
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn native_device(metadata: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::dev(metadata)
@@ -365,6 +393,7 @@ struct Receipt<V> {
 #[derive(Clone)]
 pub struct TransferableReceipt<V> {
     seals: Vec<ArtifactSeal>,
+    content_digests: Vec<Option<[u8; 32]>>,
     value: V,
     stats: ReceiptStats,
 }
@@ -473,12 +502,23 @@ where
         artifacts: &[PathBuf],
     ) -> Option<TransferableReceipt<V>> {
         let observed = ArtifactSeal::observe_all(artifacts).ok()?;
-        let entries = self.locked_entries();
-        let receipt = entries.get(key)?;
-        (receipt.seals == observed).then(|| TransferableReceipt {
+        let (value, stats) = {
+            let entries = self.locked_entries();
+            let receipt = entries.get(key)?;
+            if receipt.seals != observed {
+                return None;
+            }
+            (receipt.value.clone(), receipt.stats)
+        };
+        let content_digests = content_digests(&observed)?;
+        if ArtifactSeal::observe_all(artifacts).ok().as_ref() != Some(&observed) {
+            return None;
+        }
+        Some(TransferableReceipt {
             seals: observed,
-            value: receipt.value.clone(),
-            stats: receipt.stats,
+            content_digests,
+            value,
+            stats,
         })
     }
 
@@ -533,6 +573,7 @@ where
                 .iter()
                 .zip(&destination_after)
                 .all(|(source, destination)| source.same_hard_link_state(destination))
+            || content_digests(&source_after).as_ref() != Some(&transferable.content_digests)
         {
             return Ok(false);
         }
@@ -596,6 +637,7 @@ where
                 .iter()
                 .zip(&after)
                 .all(|(before, after)| before.same_source_after_hard_link(after))
+            || content_digests(&after).as_ref() != Some(&transferable.content_digests)
             || ArtifactSeal::observe_all(artifacts).ok().as_ref() != Some(&after)
         {
             return false;
@@ -951,6 +993,72 @@ mod tests {
             })
             .expect("reuse refreshed source receipt");
         assert_eq!(validator.runs.get(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_length_rewrite_between_receipt_capture_and_link_transfer_cannot_reseal() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        write(&source, "generation-a");
+        let pinned_modified = 1_700_000_000_000_000_000;
+        set_modified(&source, pinned_modified);
+        let mut permissions = std::fs::metadata(&source)
+            .expect("source metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions.clone()).expect("make source immutable");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        let validator = CountingValidator::new();
+        cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                validator.ok("validated-original")
+            })
+            .expect("seal original source");
+        let transferable = cache
+            .transferable_receipt(&source, std::slice::from_ref(&source))
+            .expect("capture original receipt");
+        std::fs::hard_link(&source, &destination).expect("create owned link");
+
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&source, permissions.clone()).expect("allow hostile rewrite");
+        write(&source, "generation-X");
+        set_modified(&source, pinned_modified);
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions).expect("restore immutable bit");
+
+        assert!(
+            !cache
+                .install_hard_link_alias(
+                    &source,
+                    std::slice::from_ref(&source),
+                    destination.clone(),
+                    std::slice::from_ref(&destination),
+                    transferable.clone(),
+                    Ok::<_, String>,
+                )
+                .expect("reject altered alias"),
+            "link identity, length, mtime and readonly bit do not prove unchanged bytes"
+        );
+        assert!(
+            !cache.refresh_after_hard_links(
+                source.clone(),
+                std::slice::from_ref(&source),
+                transferable,
+            ),
+            "owned link cleanup cannot restore a stale content verdict"
+        );
+        assert_eq!(cache.stats(&destination), None);
+        assert_eq!(
+            cache
+                .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                    validator.ok("validated-rewrite")
+                })
+                .expect("revalidate changed source"),
+            "validated-rewrite"
+        );
+        assert_eq!(validator.runs.get(), 2);
     }
 
     #[test]

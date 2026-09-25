@@ -4,6 +4,7 @@
 
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
 - Bookmarks retain their last verified binding when a core lookup or post-index cache refresh fails, so a later refresh can still follow a unique rename or move. Direct relative-root incremental indexing reports a committed refresh as successful when optional retrieval refresh evidence cannot be used.
+- Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
 
 ## 0.17.6
 
@@ -34,7 +35,7 @@ CodeStory 0.17.6 improves how agents find, inspect and follow repository evidenc
 - Embedding-server startup is faster on Apple Silicon while retaining executable authentication.
 - Semantic and lexical indexes, parser caches and stored source provenance use less disk through compression and deduplication. Existing formats remain readable, with applicable migrations performed during project preparation.
 - Preparation reuses unchanged indexes and compatible embedding batches. Retrieval avoids repeated admission and snapshot work, and compatible sidecars can be prepared concurrently.
-- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings. Broad searches with `--plan-details` work after opening a ready project.
+- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings.
 - Packet deadlines include preparation and publication checks. Cancellation and failure diagnostics identify the operation stage when available.
 
 ### Upgrading

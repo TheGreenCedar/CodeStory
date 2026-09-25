@@ -1228,7 +1228,7 @@ fn search_operator_next_action(project_root: &Path, output: &SearchOutput) -> St
         );
     }
     format!(
-        "codestory-cli search --project {} --query {} --why",
+        "codestory-cli search --project {} --query {}",
         quoted_project_arg(project_root),
         quoted_cli_arg(&output.query)
     )
@@ -1986,7 +1986,7 @@ fn append_search_evidence_packet(
         } else {
             let _ = writeln!(
                 markdown,
-                "- `codestory-cli search --project {} --query {} --why`",
+                "- `codestory-cli search --project {} --query {}`",
                 quoted_project_arg(project_root),
                 quoted_cli_arg(&output.query)
             );
@@ -2087,7 +2087,7 @@ fn append_agent_evidence_packet(
     } else {
         let _ = writeln!(
             markdown,
-            "- `codestory-cli search --project {} --query {} --why`",
+            "- `codestory-cli search --project {} --query {}`",
             quoted_project_arg(project_root),
             quoted_cli_arg(&answer.prompt.replace('\n', " "))
         );
@@ -2577,7 +2577,7 @@ pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerD
 
 fn context_operator_next_action(answer: &AgentAnswerDto) -> &'static str {
     if answer.citations.is_empty() {
-        "Run search --why for a concrete symbol or file before answering."
+        "Run search for a concrete symbol or file before answering."
     } else if answer
         .retrieval_trace
         .steps
@@ -5316,11 +5316,11 @@ mod tests {
         );
         assert!(
             !markdown.contains("query_hints:"),
-            "search --why should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
+            "search should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
         );
         assert!(
             !markdown.contains("why:"),
-            "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
+            "search should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
         );
         assert!(
             markdown.contains("trust=untrusted_repo_evidence"),
@@ -5735,7 +5735,7 @@ mod tests {
             coverage_buckets: Vec::new(),
             notes: vec!["No fallback was needed.".to_string()],
             recommended_queries: vec![
-                "codestory-cli search --project C:/repo --query packet --why".to_string(),
+                "codestory-cli search --project C:/repo --query packet".to_string(),
             ],
         };
 
@@ -5965,7 +5965,7 @@ mod tests {
                 stale_or_missing_anchor: false,
                 repo_text_fallback_reason: None,
                 recommended_next_action: Some(
-                    "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string(),
+                    "Run retrieval index to restore full sidecar mode, then rerun search with a shorter concrete symbol.".to_string(),
                 ),
                 orientation: None,
             }),
