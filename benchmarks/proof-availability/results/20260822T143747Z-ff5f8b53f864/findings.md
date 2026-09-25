@@ -69,7 +69,7 @@ Qualification: `20260822T143747Z-ff5f8b53f864`
 
 ## Frozen thresholds
 
-Threshold set: `proof-availability-v1`  
+Threshold set: `proof-availability-v1`\
 Methodology SHA-256: `28f11893fc1d0c17c1b1b70aeda74818a311009e24b85d899b2d52fa6c8e0dcf`
 
 Hard gates: `false_proofs<=0; exact_receipts=true; certified_absence<=0; complete_funnel=true; complete_provenance=true; invalid<=0; over_cap<=0; transport_errors<=0; maximum_bytes<=65536; each_cohort=true; disposition_match=true`
@@ -82,7 +82,7 @@ Hard gates: `false_proofs<=0; exact_receipts=true; certified_absence<=0; complet
 
 ## Decision
 
-Outcome: `keep_proof_dark`  
+Outcome: `keep_proof_dark`\
 Automatic thresholds met: `false`
 
 ### Failed gates

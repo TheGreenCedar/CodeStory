@@ -2,25 +2,31 @@
 
 The `--installed-navigation` profile in `scripts/codestory-agent-ab-benchmark.mjs`
 compares ordinary installed CodeStory plugins with native repository tools. It
-uses Terra at low reasoning, the same workspace-write sandbox in each arm, and a
-ten-minute session timeout. It adds no investigation prelude or approval override.
+uses Terra at low reasoning, the same workspace-write host canary in each arm,
+and a ten-minute session timeout. Model execution instead uses `read-only` for
+`read_only` tasks and `workspace-write` for `change` tasks in every arm. It adds
+no investigation prelude or approval override.
 Authenticated accounts can discover remote plugins even with an empty isolated
 Codex home. This profile passes `--disable remote_plugin` to inventory and model
 execution in every arm. It records that setting explicitly; installed local
 CodeStory plugins and native source-reading tools remain available.
 Historical benchmark profiles retain their existing contracts.
 
-Each participant receives a fresh temporary directory, explicitly declared as an
-additional writable root alongside its checkout. This is the same bounded
-workspace-write policy in every arm; it does not grant access to arbitrary
-temporary paths or change approval behavior. Use the participant's `TMPDIR` for
+Each participant receives a fresh temporary directory, passed to model execution
+as an additional directory and declared writable alongside its checkout for the
+shared workspace-write host canary. A `change` task runs with those bounded
+writable roots; a `read_only` task runs with a read-only model sandbox. Both
+policies are applied identically across arms and neither grants arbitrary
+temporary paths or changes approval behavior. Use the participant's `TMPDIR` for
 scratch files. Go, npm, Python, Cargo and compiler-cache state is redirected into
 that directory, including explicit cache overrides inherited from the operator.
 Go and npm user-configuration paths and shell startup overrides cannot redirect
 these settings back into the operator's home. Installed toolchains remain
 discoverable through the existing executable path, `GOROOT` and `RUSTUP_HOME`.
 The receipt records these participant settings separately from the installed
-MCP child's infrastructure controls.
+MCP child's infrastructure controls. In `effective-config.json`, top-level
+`sandbox: workspace-write` describes the host canary; `model_policy.sandbox`
+records the task's actual model invocation selected from `effect_mode`.
 
 An independent evaluator freezes the task manifest and keeps answer keys outside
 it. The manifest names pinned complete repository clones, tasks, arms, repeats,
@@ -66,13 +72,15 @@ node scripts/codestory-agent-ab-benchmark.mjs --installed-navigation \
 
 Omit `--preflight-only` and use a new output directory for the comparison. Every
 arm must pass installation, launcher, schema and edit/refresh canaries before any
-model starts. Canaries use Codex's zero-model app-server path. In every arm,
-an actual sandboxed command checks the participant environment, writes and rereads
-temporary sentinels in the checkout and declared cache directories, removes them,
-and verifies that an unrelated write outside the declared roots is denied. A
-missing setting or unwritable cache fails before participants run. This command
-canary proves shell execution and write boundaries; it does not claim that every
-editor tool treats arbitrary temporary paths identically.
+model starts. Canaries use Codex's zero-model app-server path with the common
+workspace-write host policy, separately from the later task model sandbox. In
+every arm, an actual sandboxed command checks the participant environment,
+writes and rereads temporary sentinels in the checkout and declared cache
+directories, removes them, and verifies that an unrelated write outside the
+declared roots is denied. A missing setting or unwritable cache fails before
+participants run. This command canary proves shell execution and write
+boundaries; it does not claim that every editor tool treats arbitrary temporary
+paths identically.
 
 CodeStory canaries additionally verify the installed MCP child environment,
 full retrieval, native identity, private native completion with CPU fallback
