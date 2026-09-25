@@ -9,7 +9,10 @@
 use crate::config::{SidecarRuntimeConfig, private_cache_directory};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline};
-use codestory_workspace::owned_deletion::OwnedDeletionRoot;
+use codestory_workspace::{
+    owned_deletion::OwnedDeletionRoot, workspace_file_identity, workspace_file_link_count,
+    workspace_path_identity,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -214,13 +217,31 @@ impl ContentAddressedVectorCache {
         )?;
         let scope_directory = cache_scope_directory(runtime, artifact_scope_id)?;
         let path = scope_directory.join("vectors.sqlite3");
-        if let Ok(metadata) = std::fs::symlink_metadata(&path)
-            && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
-        {
-            bail!("content-addressed vector cache is not a regular file");
+        let pinned_scope = OwnedDeletionRoot::open(&scope_directory)
+            .context("pin content-addressed vector cache scope")?;
+        let pinned_database = pinned_scope
+            .open_regular_file(Path::new("vectors.sqlite3"))
+            .context("inspect content-addressed vector cache database")?;
+        if let Some(ref file) = pinned_database {
+            reject_writable_database_hard_links(file)?;
+            if workspace_file_identity(file)? != workspace_path_identity(&path)? {
+                bail!("content-addressed vector cache database identity changed before open");
+            }
         }
         let connection = Connection::open(&path)
             .with_context(|| format!("open content-addressed vector cache {}", path.display()))?;
+        let opened_database = pinned_scope
+            .open_regular_file(Path::new("vectors.sqlite3"))
+            .context("verify opened content-addressed vector cache database")?
+            .context("opened content-addressed vector cache database is missing")?;
+        reject_writable_database_hard_links(&opened_database)?;
+        let opened_identity = workspace_file_identity(&opened_database)?;
+        if !pinned_scope.matches_path(&scope_directory)?
+            || opened_identity != workspace_path_identity(&path)?
+            || matches!(pinned_database.as_ref(), Some(file) if workspace_file_identity(file)? != opened_identity)
+        {
+            bail!("content-addressed vector cache database identity changed during open");
+        }
         connection.busy_timeout(Duration::from_secs(30))?;
         let page_size = u64::try_from(
             connection.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
@@ -1281,6 +1302,16 @@ fn reject_non_regular_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn reject_writable_database_hard_links(file: &File) -> Result<()> {
+    if workspace_file_link_count(file)
+        .context("inspect content-addressed vector cache database link count")?
+        != 1
+    {
+        bail!("refuse writable hard link to content-addressed vector cache database");
+    }
+    Ok(())
+}
+
 fn known_scope_bytes(path: &Path) -> Result<Option<u64>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1444,41 +1475,100 @@ fn remove_owned_scope(
     scope_name: &str,
     ownership_token: &str,
 ) -> Result<()> {
+    remove_owned_scope_with_after_validation(
+        cache_root,
+        root_name,
+        scope_name,
+        ownership_token,
+        || {},
+    )
+}
+
+fn remove_owned_scope_with_after_validation(
+    cache_root: &Path,
+    root_name: &str,
+    scope_name: &str,
+    ownership_token: &str,
+    after_validation: impl FnOnce(),
+) -> Result<()> {
     validate_scope_components(root_name, scope_name)?;
     let root = cache_root.join(root_name);
     let scope = root.join(scope_name);
-    let Some(bytes) = known_scope_bytes(&scope)? else {
+    private_cache_directory(&root).context("verify owned vector cache root")?;
+    let deletion = OwnedDeletionRoot::open(&root).context("pin owned vector cache root")?;
+    let pinned_scope = match deletion.open_child_directory(Path::new(scope_name)) {
+        Ok(scope) => scope,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("pin owned vector cache scope"),
+    };
+    let Some(bytes) = pinned_scope
+        .known_regular_file_bytes(&[
+            "vectors.sqlite3",
+            "vectors.sqlite3-wal",
+            "vectors.sqlite3-shm",
+            "vectors.sqlite3-journal",
+            CACHE_SCOPE_OWNERSHIP_MARKER,
+        ])
+        .context("inspect pinned vector cache scope")?
+    else {
         bail!("refuse to remove vector cache scope containing unknown artifacts");
     };
-    if !scope.exists() {
-        return Ok(());
-    }
-    let observed_token = read_scope_ownership_token(&scope)?;
+    let observed_token = match pinned_scope
+        .read_regular_file_bounded(Path::new(CACHE_SCOPE_OWNERSHIP_MARKER), 36)
+        .context("read pinned vector cache ownership token")?
+    {
+        Some(bytes) => {
+            if bytes.len() != 36 {
+                bail!("content-addressed vector cache ownership token is invalid");
+            }
+            let token = String::from_utf8(bytes).context("decode vector cache ownership token")?;
+            Uuid::parse_str(&token).context("parse vector cache ownership token")?;
+            Some(token)
+        }
+        None => None,
+    };
     if observed_token.as_deref() != Some(ownership_token)
         && !(observed_token.is_none() && bytes == 0)
     {
         bail!("refuse to remove vector cache scope with mismatched ownership token");
     }
-    private_cache_directory(&root).context("verify owned vector cache root")?;
-    let deletion = OwnedDeletionRoot::open(&root).context("pin owned vector cache root")?;
+    if !pinned_scope
+        .matches_path(&scope)
+        .context("verify pinned vector cache scope name")?
+    {
+        bail!("refuse to remove vector cache scope whose directory identity changed");
+    }
+    after_validation();
     for name in [
         "vectors.sqlite3-journal",
         "vectors.sqlite3-wal",
         "vectors.sqlite3-shm",
         "vectors.sqlite3",
     ] {
-        deletion
-            .remove(&PathBuf::from(scope_name).join(name))
+        pinned_scope
+            .remove(Path::new(name))
             .with_context(|| format!("remove owned vector cache file {scope_name}/{name}"))?;
     }
-    deletion
-        .remove(&PathBuf::from(scope_name).join(CACHE_SCOPE_OWNERSHIP_MARKER))
+    pinned_scope
+        .remove(Path::new(CACHE_SCOPE_OWNERSHIP_MARKER))
         .context("remove owned vector cache ownership token")?;
-    match deletion.remove_empty_directory(Path::new(scope_name)) {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("remove empty owned vector cache scope"),
+    if !pinned_scope
+        .matches_path(&scope)
+        .context("verify owned vector cache scope name after cleanup")?
+    {
+        bail!("refuse to retire vector cache scope whose directory identity changed");
     }
+    let removed = pinned_scope
+        .remove_pinned_empty_directory()
+        .context("remove empty owned vector cache scope")?;
+    if removed {
+        match std::fs::symlink_metadata(&scope) {
+            Ok(_) => bail!("refuse to retire vector cache scope whose removed name was replaced"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("verify removed vector cache scope name"),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1964,6 +2054,22 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    fn assert_retired_scope(scope: &Path) {
+        #[cfg(unix)]
+        {
+            assert!(
+                scope.is_dir(),
+                "Unix retains an empty scope without name-based rmdir"
+            );
+            assert_eq!(std::fs::read_dir(scope).expect("retained scope").count(), 0);
+        }
+        #[cfg(windows)]
+        assert!(
+            !scope.exists(),
+            "Windows removes the pinned empty scope by handle"
+        );
+    }
+
     fn runtime(cache: &TempDir, outer_batch_size: usize) -> SidecarRuntimeConfig {
         let private_root = cache.path().join("private");
         private_cache_directory(&private_root).expect("private cache root");
@@ -2022,6 +2128,99 @@ mod tests {
         assert_eq!(observed, expected);
         assert_eq!(observed[0][0].to_bits(), expected[0][0].to_bits());
         assert_eq!(observed[0][1].to_bits(), expected[0][1].to_bits());
+    }
+
+    #[test]
+    fn registered_scope_refuses_hardlinked_writable_database() {
+        let cache = TempDir::new().expect("cache root");
+        let outside = TempDir::new().expect("external database root");
+        let selected_runtime = runtime(&cache, 128);
+        let owner =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("register owned scope");
+        let cache_db = owner.path.clone();
+        let marker = cache_db
+            .parent()
+            .expect("scope")
+            .join(CACHE_SCOPE_OWNERSHIP_MARKER);
+        let marker_bytes = std::fs::read(&marker).expect("owned marker");
+        drop(owner);
+
+        let external_db = outside.path().join("external.sqlite3");
+        let external = Connection::open(&external_db).expect("create external SQLite database");
+        external
+            .execute_batch("CREATE TABLE external_sentinel (value TEXT NOT NULL); INSERT INTO external_sentinel VALUES ('outside');")
+            .expect("seed external database");
+        drop(external);
+        let before = Sha256::digest(std::fs::read(&external_db).expect("external bytes before"));
+        std::fs::remove_file(&cache_db).expect("replace owned database name");
+        std::fs::hard_link(&external_db, &cache_db).expect("install external hard link");
+
+        let reopened =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2);
+        let after = Sha256::digest(std::fs::read(&external_db).expect("external bytes after"));
+        assert!(
+            reopened.is_err(),
+            "writable hard-linked database was accepted; external bytes changed={}",
+            after != before,
+        );
+        let error = reopened.err().expect("refused hard link");
+        assert!(error.to_string().contains("hard link"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&marker).expect("marker survives"),
+            marker_bytes
+        );
+        assert_eq!(
+            after, before,
+            "refusal must precede any SQLite mutation through the alias",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_scope_removal_keeps_replacement_after_token_validation() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let owner =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("register owned scope");
+        let scope = owner.path.parent().expect("scope").to_path_buf();
+        let root = scope.parent().expect("root").to_path_buf();
+        let moved = root.join("moved-owned-scope");
+        let scope_name = scope
+            .file_name()
+            .expect("scope name")
+            .to_str()
+            .expect("utf8");
+        let token = read_scope_ownership_token(&scope)
+            .expect("read token")
+            .expect("token exists");
+        drop(owner);
+
+        let result = remove_owned_scope_with_after_validation(
+            &selected_runtime.cache_root,
+            CACHE_DIRECTORY,
+            scope_name,
+            &token,
+            || {
+                std::fs::rename(&scope, &moved).expect("move opened owned scope");
+                std::fs::create_dir(&scope).expect("install replacement scope");
+                std::fs::write(scope.join("vectors.sqlite3"), b"outside-db")
+                    .expect("install replacement database");
+                std::fs::write(scope.join(CACHE_SCOPE_OWNERSHIP_MARKER), b"outside-token")
+                    .expect("install replacement token");
+            },
+        );
+        assert!(result.is_err(), "moved scope must not retire the registry");
+        assert_eq!(
+            std::fs::read(scope.join("vectors.sqlite3")).expect("replacement database survives"),
+            b"outside-db"
+        );
+        assert_eq!(
+            std::fs::read(scope.join(CACHE_SCOPE_OWNERSHIP_MARKER))
+                .expect("replacement token survives"),
+            b"outside-token"
+        );
     }
 
     #[test]
@@ -2670,14 +2869,8 @@ mod tests {
         )
         .expect("open current scope");
         assert!(current.path.exists());
-        assert!(
-            !obsolete_scope.exists(),
-            "obsolete registered cache survived"
-        );
-        assert!(
-            !previous_scope.exists(),
-            "oldest inactive project cache survived"
-        );
+        assert_retired_scope(&obsolete_scope);
+        assert_retired_scope(&previous_scope);
         assert!(
             registered_owned_cache_bytes_for_test(&selected_runtime).expect("aggregate bytes")
                 <= aggregate_limit
@@ -2771,7 +2964,7 @@ mod tests {
             aggregate_limit,
         )
         .expect("retry retention");
-        assert!(!stale_scope.exists());
+        assert_retired_scope(&stale_scope);
         assert!(current.path.exists());
         drop(current);
 
