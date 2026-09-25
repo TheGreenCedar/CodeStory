@@ -228,6 +228,19 @@ machine policy disagree, stop and reconcile their owners before continuing.
   must execute the required hostile mutations on that exact head; diff review
   and existing green tests do not qualify. Any later commit revokes
   acceptance.
+- Before an expensive release gate, check downstream consumers of changed test
+  contracts, workflow inputs, or release artifacts with the smallest check
+  that exercises the actual caller under the pinned toolchain. Verify required
+  identities cross workflow calls. Do not add a routine full-workspace
+  preflight for this purpose.
+- A protected-runner heartbeat proves reachability at that moment, not sustained
+  availability. Before long native proof, record host power and runner state
+  and use a bounded, owner-scoped means of keeping the host available for the
+  expected duration. A sleep inhibitor does not prevent physical lid closure.
+- Required proof failures retain the failed stage, exit status, and sanitized
+  causal error alongside identity digests. An output hash alone cannot explain
+  a child that exits before an expected event. Preserve secret redaction and
+  ownership controls.
 - Support PRs use focused checks only. Do not add a proof-triggering label or
   dispatch a broad source, package, calibration, or hardware gate until all
   support PRs are integrated into the release lane. Broad proof belongs to the
