@@ -1339,6 +1339,14 @@ fn publish_scip_component(
     result
 }
 
+#[cfg(test)]
+pub(crate) fn publish_scip_component_for_test(
+    project_dir: &Path,
+    index: &ScipSymbolsIndex,
+) -> Result<()> {
+    publish_scip_component(project_dir, None, index, &mut || Ok(())).map(|_| ())
+}
+
 fn verify_staged_scip_component(
     path: &Path,
     index: &ScipSymbolsIndex,
