@@ -2755,9 +2755,15 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/codestory-release-claims.mjs",
       "scripts/codestory-release-closeout.mjs",
       "scripts/codestory-release-evidence-gate.mjs",
+      "scripts/lib/release-coordinator-github.mjs",
+      "scripts/lib/release-coordinator-contract.mjs",
+      "scripts/lib/release-coordinator-evidence.mjs",
+      "scripts/lib/read-release-artifact.py",
       "scripts/tests/codestory-release-claims.test.mjs",
       "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
+      "scripts/tests/codestory-release-live.test.mjs",
+      "scripts/tests/fixtures/release-github.mjs",
       "scripts/tests/fixtures/release-claims/**",
       ".github/scripts/publish-marketplace-catalog.mjs",
       ".github/scripts/publish-marketplace-catalog.test.mjs",
@@ -2803,6 +2809,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       'if [ "$plugin_version" = "$cli_version" ]',
       '--version "$cli_version"',
       '--version "$plugin_version" --lane plugin',
+    ]);
+    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
+      "scripts/tests/codestory-release-live.test.mjs",
     ]);
     // The plugin lane's structural pin (job existence) is a rule instance and
     // lives in release-claims.json under workflow_policy.structural_pins;
