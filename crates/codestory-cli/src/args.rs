@@ -1077,17 +1077,6 @@ pub(crate) struct SearchCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Show compact ranking, uncertainty, and next-action explanations for each result."
-    )]
-    pub(crate) why: bool,
-    #[arg(
-        long = "plan-details",
-        requires = "why",
-        help = "Include the full search plan in --why output. By default --why keeps provenance compact."
-    )]
-    pub(crate) plan_details: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2964,10 +2953,30 @@ mod tests {
         assert!(help.contains("--repo-text <REPO_TEXT>"));
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
-        assert!(help.contains("--why"));
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn search_explanation_flags_are_unknown_and_normal_search_still_parses() {
+        let help = render_subcommand_help("search");
+        for flag in ["--why", "--plan-details"] {
+            assert!(
+                !help.contains(flag),
+                "retired {flag} leaked into search help: {help}"
+            );
+            let error =
+                Cli::try_parse_from(["codestory-cli", "search", "--query", "indexing", flag])
+                    .expect_err("retired search explanation flag must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+        let parsed = Cli::try_parse_from(["codestory-cli", "search", "--query", "indexing"])
+            .expect("ordinary search must remain valid");
+        assert!(matches!(parsed.command, Command::Search(_)));
+        let ground = Cli::try_parse_from(["codestory-cli", "ground", "--why"])
+            .expect("ground keeps its explanation option");
+        assert!(matches!(ground.command, Command::Ground(_)));
     }
 
     #[test]

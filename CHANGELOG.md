@@ -33,12 +33,12 @@ CodeStory 0.17.6 improves how agents find, inspect and follow repository evidenc
 - Embedding-server startup is faster on Apple Silicon while retaining executable authentication.
 - Semantic and lexical indexes, parser caches and stored source provenance use less disk through compression and deduplication. Existing formats remain readable, with applicable migrations performed during project preparation.
 - Preparation reuses unchanged indexes and compatible embedding batches. Retrieval avoids repeated admission and snapshot work, and compatible sidecars can be prepared concurrently.
-- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings. Broad searches with `--plan-details` work after opening a ready project.
+- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings.
 - Packet deadlines include preparation and publication checks. Cancellation and failure diagnostics identify the operation stage when available.
 
 ### Upgrading
 
-**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
+**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Search no longer accepts `--why` or `--plan-details`; its output contains evidence, status and gaps rather than explanations or a search plan. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
 
 See the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback using a preserved pre-upgrade cache copy.
 

@@ -59,7 +59,8 @@ status, confidence floor, handler-link support, known gaps, and promotability.
   updated.
 
 `ambiguous` and `unmatched` are not support levels. They are workflow states:
-`ambiguous` means a query must be rerun with `search --why`, `--id`, or `--file`;
+`ambiguous` means narrow the `search` query or select a concrete target with
+`--id` or `--file`;
 `unmatched` means a changed path was not found in the persisted index and should
 be checked with `files --path <fragment>` or a fresh index.
 

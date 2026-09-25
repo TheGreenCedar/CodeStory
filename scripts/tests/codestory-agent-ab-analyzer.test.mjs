@@ -9130,11 +9130,11 @@ test("buildQualityDebugPayload preserves packet sufficiency diagnostics", () => 
           "Packet omitted answer-critical evidence under Compact budget; use a deeper packet before treating this as complete.",
         ],
         open_next_count: 2,
-        open_next: ["codestory-cli packet --budget standard", "codestory-cli search --why"],
+        open_next: ["codestory-cli packet --budget standard", "codestory-cli search --query indexing"],
         follow_up_commands_count: 2,
         follow_up_commands: [
           "codestory-cli packet --budget standard",
-          "codestory-cli search --why",
+          "codestory-cli search --query indexing",
         ],
         covered_claims_count: 8,
         avoid_opening_count: 4,

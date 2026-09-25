@@ -421,7 +421,6 @@ if (!existsSync(cliPath)) {
       repoPath,
       "--query",
       "How does this repo fit together?",
-      "--why",
       "--format",
       "json",
     ]);
