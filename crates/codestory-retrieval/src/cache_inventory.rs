@@ -6,6 +6,9 @@
 
 use crate::cache_clean::{CacheCleanPlan, plan_cache_clean};
 use crate::config::user_cache_root;
+use crate::content_addressed_vector_cache::{
+    is_known_vector_cache_artifact, is_vector_cache_namespace,
+};
 use anyhow::Result;
 use codestory_contracts::owned_artifacts::{
     ANNOTATIONS_SIDECAR_FILE, EMBEDDED_MODEL_CACHE_DIR, EMBEDDED_MODEL_DIGEST_DIR,
@@ -61,11 +64,9 @@ pub struct CacheHardlinkGroup {
     pub paths: Vec<String>,
 }
 
-/// One file whose allocated size is smaller than its apparent size.
-///
-/// The shortfall is measured, but its cause is not: copy-on-write extent
-/// sharing, sparse regions, and filesystem compression all produce it. Nothing
-/// here claims a specific cause, and nothing here is a capability probe.
+/// Reserved schema-v1 row for directly verified clone extent sharing.
+/// Allocation shortfall alone cannot populate it: sparse regions and
+/// filesystem compression can produce the same measurement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCloneSharing {
     pub relative_path: String,
@@ -95,11 +96,8 @@ pub struct CacheInventoryReport {
     /// evidence, so no allocation claim is made at all.
     pub allocated_bytes: Option<u64>,
     pub hardlink_deduplicated_bytes: u64,
-    /// Apparent bytes with no distinct allocation behind them, measured as the
-    /// shortfall between apparent and allocated size. Copy-on-write sharing,
-    /// sparse regions, and compression all contribute; this does not attribute
-    /// the shortfall to any one of them, and it is never inferred from hardlink
-    /// counts or from a write probe.
+    /// Reserved schema-v1 field. No direct clone extent evidence is available,
+    /// so this remains `None` even when apparent size exceeds allocation.
     pub clone_shared_bytes: Option<u64>,
     /// Whether an unreadable entry kept the scan from seeing the whole tree.
     /// When true every byte total below is a lower bound.
@@ -118,6 +116,8 @@ pub struct CacheInventoryReport {
     pub unreadable: Vec<CacheInventoryEntry>,
     pub unknown: Vec<CacheInventoryEntry>,
     pub hardlink_groups: Vec<CacheHardlinkGroup>,
+    /// Reserved for direct clone extent evidence; allocation shortfalls do not
+    /// populate these rows.
     pub clone_sharing: Vec<CacheCloneSharing>,
     pub sqlite_databases: Vec<SqliteDatabaseObservation>,
     pub top_consumers: Vec<CacheConsumer>,
@@ -152,7 +152,6 @@ struct InventoryState {
     sqlite_paths: Vec<PathBuf>,
     file_identities: HashMap<String, FileIdentityRecord>,
     hardlink_groups: BTreeMap<String, CacheHardlinkGroup>,
-    clone_sharing: Vec<CacheCloneSharing>,
     sqlite_databases: Vec<SqliteDatabaseObservation>,
     partial_scan: bool,
     errors: Vec<String>,
@@ -172,7 +171,6 @@ impl InventoryState {
             sqlite_paths: Vec::new(),
             file_identities: HashMap::new(),
             hardlink_groups: BTreeMap::new(),
-            clone_sharing: Vec::new(),
             sqlite_databases: Vec::new(),
             partial_scan: false,
             errors: Vec::new(),
@@ -282,18 +280,6 @@ impl InventoryState {
                 link_count: 0,
             });
         record.link_count = record.link_count.saturating_add(1);
-        if let Some(allocated) = allocated_bytes
-            && allocated < apparent_bytes
-            && record.link_count == 1
-        {
-            self.clone_sharing.push(CacheCloneSharing {
-                relative_path: relative.to_string(),
-                apparent_bytes,
-                allocated_bytes: allocated,
-                unallocated_bytes: apparent_bytes.saturating_sub(allocated),
-                detail: "apparent size exceeds allocated size; the filesystem is sharing, sparsifying, or compressing these bytes".into(),
-            });
-        }
         let group = self
             .hardlink_groups
             .entry(identity.clone())
@@ -346,11 +332,6 @@ impl InventoryState {
                     .saturating_mul(group.link_count.saturating_sub(1))
             })
             .sum();
-        // Measured allocation shortfall over distinct files. Hardlink counts
-        // prove aliasing, not extent sharing, so they never feed this figure.
-        let clone_shared_bytes =
-            allocated_bytes.map(|allocated| apparent_unique_bytes.saturating_sub(allocated));
-
         let mut top_consumers = self
             .entries
             .iter()
@@ -420,7 +401,7 @@ impl InventoryState {
             unique_bytes,
             allocated_bytes,
             hardlink_deduplicated_bytes,
-            clone_shared_bytes,
+            clone_shared_bytes: None,
             partial_scan: self.partial_scan,
             required_bytes,
             reclaimable_bytes,
@@ -436,7 +417,7 @@ impl InventoryState {
             unreadable,
             unknown,
             hardlink_groups: self.hardlink_groups.into_values().collect(),
-            clone_sharing: self.clone_sharing,
+            clone_sharing: Vec::new(),
             sqlite_databases: self.sqlite_databases,
             top_consumers,
             clean_plan,
@@ -500,6 +481,13 @@ fn path_is_under_retained(entry_relative: &str, retained_relative: &str) -> bool
 }
 
 fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
+    if is_vector_cache_namespace(relative) {
+        return if is_known_vector_cache_artifact(relative) {
+            CacheInventoryKind::VectorCache
+        } else {
+            CacheInventoryKind::Unknown
+        };
+    }
     let components: Vec<_> = relative.split('/').collect();
     if components
         .iter()
@@ -591,35 +579,14 @@ mod tests {
             report.errors
         );
         assert!(
-            report
-                .clone_sharing
-                .iter()
-                .all(|entry| entry.unallocated_bytes > 0
-                    && entry.allocated_bytes < entry.apparent_bytes),
-            "clone sharing rows must carry a measured allocation shortfall: {:?}",
-            report.clone_sharing
+            report.clone_sharing.is_empty(),
+            "no clone extent proof exists"
         );
+        assert_eq!(report.clone_shared_bytes, None);
         if cfg!(unix) {
-            let clone_shared = report
-                .clone_shared_bytes
-                .expect("unix reports allocation evidence");
-            assert_eq!(
-                clone_shared,
-                report
-                    .clone_sharing
-                    .iter()
-                    .map(|entry| entry.unallocated_bytes)
-                    .sum::<u64>(),
-                "shared bytes must be the measured shortfall, not a hardlink count"
-            );
             assert!(
                 report.allocated_bytes.is_some(),
                 "unix inventory must report allocation"
-            );
-        } else {
-            assert_eq!(
-                report.clone_shared_bytes, None,
-                "a platform without allocation evidence must make no sharing claim"
             );
         }
         assert!(
@@ -704,6 +671,188 @@ mod tests {
         drop(writer);
     }
 
+    #[test]
+    fn vector_v5_scope_and_retention_are_required_without_reclaiming_unknown_files() {
+        let cache = tempdir().expect("cache root");
+        let project = cache.path().join("00112233445566aa");
+        std::fs::create_dir_all(&project).expect("project cache");
+        let project_db = project.join("codestory.db");
+        let project_connection = Connection::open(&project_db).expect("project database");
+        project_connection
+            .execute_batch("CREATE TABLE ordinary(value INTEGER); INSERT INTO ordinary VALUES (1);")
+            .expect("nonempty project database");
+        drop(project_connection);
+
+        let scope = cache
+            .path()
+            .join("content-addressed-vectors-v5")
+            .join("a".repeat(64));
+        std::fs::create_dir_all(&scope).expect("vector scope");
+        let vector_db = scope.join("vectors.sqlite3");
+        let writer = Connection::open(&vector_db).expect("vector database");
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(value BLOB);
+                 INSERT INTO payload(value) VALUES (zeroblob(4096));",
+            )
+            .expect("nonempty live-WAL vector database");
+        assert!(std::fs::metadata(&vector_db).expect("vector DB").len() > 0);
+        let ownership = scope.join("ownership-v1");
+        std::fs::write(&ownership, b"00000000-0000-4000-8000-000000000000")
+            .expect("scope ownership marker");
+        let retention = cache.path().join("content-addressed-vector-retention-v1");
+        let locks = retention.join("scope-locks");
+        std::fs::create_dir_all(&locks).expect("retention locks");
+        let registry = retention.join("registry.sqlite3");
+        let registry_connection = Connection::open(&registry).expect("retention registry");
+        registry_connection
+            .execute_batch("CREATE TABLE scopes(value INTEGER); INSERT INTO scopes VALUES (1);")
+            .expect("nonempty registry");
+        drop(registry_connection);
+        let maintenance = retention.join("maintenance.lock");
+        std::fs::write(&maintenance, b"lock").expect("maintenance lock");
+        let scope_lock = locks.join(format!("{}.lock", "b".repeat(64)));
+        std::fs::write(&scope_lock, b"lock").expect("scope lock");
+        let unknown_files = [
+            scope.join("unexpected.bin"),
+            scope.join("codestory.db"),
+            scope.join(ANNOTATIONS_SIDECAR_FILE),
+            retention.join("unexpected.bin"),
+            retention.join("generation-marker"),
+            retention.join("codestory.db"),
+            retention.join(ANNOTATIONS_SIDECAR_FILE),
+        ];
+        for path in &unknown_files {
+            std::fs::write(path, b"unknown").expect("unknown vector neighbor");
+        }
+
+        let before = snapshot_tree(cache.path());
+        let report = with_test_cache_root(cache.path(), cache_inventory).expect("inventory");
+        assert_eq!(
+            snapshot_tree(cache.path()),
+            before,
+            "inventory changed cache files"
+        );
+        assert!(
+            !report.partial_scan,
+            "physical scan is complete: {:?}",
+            report.errors
+        );
+        let expected_vector_files = [
+            vector_db.clone(),
+            scope.join("vectors.sqlite3-wal"),
+            scope.join("vectors.sqlite3-shm"),
+            ownership,
+            registry,
+            maintenance,
+            scope_lock,
+        ];
+        for path in &expected_vector_files {
+            let relative = display_relative(cache.path(), path);
+            assert!(
+                report.vectors.iter().any(|entry| {
+                    entry.relative_path == relative && entry.kind == CacheInventoryKind::VectorCache
+                }),
+                "owned vector file was misclassified: {relative}; entries={:?}",
+                report.entries
+            );
+        }
+        assert!(report.entries.iter().any(|entry| {
+            entry.relative_path == "00112233445566aa/codestory.db"
+                && entry.kind == CacheInventoryKind::ProjectCache
+        }));
+        for path in &unknown_files {
+            let relative = display_relative(cache.path(), path);
+            assert!(
+                report
+                    .unknown
+                    .iter()
+                    .any(|entry| entry.relative_path == relative),
+                "unrecognized vector neighbor was assigned a known kind: {relative}"
+            );
+        }
+        let expected_required = std::iter::once(&project_db)
+            .chain(expected_vector_files.iter())
+            .map(|path| std::fs::metadata(path).expect("required file").len())
+            .sum::<u64>();
+        assert_eq!(report.required_bytes, expected_required);
+        assert_eq!(
+            report.reclaimable_bytes, 0,
+            "vector scopes are not clean candidates"
+        );
+        assert!(report.clean_plan.candidates.is_empty());
+        assert!(
+            report
+                .sqlite_databases
+                .iter()
+                .any(|row| row.path == project_db.display().to_string())
+        );
+        assert!(
+            report
+                .sqlite_databases
+                .iter()
+                .all(|row| row.path != vector_db.display().to_string())
+        );
+        assert!(report.errors.iter().any(|error| {
+            error.contains(&vector_db.display().to_string()) && error.contains("live WAL")
+        }));
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unshared_sparse_file_has_allocation_shortfall_without_clone_evidence() {
+        use std::os::unix::fs::MetadataExt;
+
+        let cache = tempdir().expect("cache root");
+        let path = cache.path().join("sparse-unshared.bin");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("new sparse file");
+        file.set_len(8 * 1024 * 1024)
+            .expect("sparse logical length");
+        drop(file);
+        let metadata = std::fs::metadata(&path).expect("sparse metadata");
+        assert_eq!(metadata.nlink(), 1, "fixture has no hard-link peer");
+        assert!(
+            metadata.blocks() * 512 < metadata.len(),
+            "fixture must be sparse"
+        );
+        let before = snapshot_tree(cache.path());
+
+        let report = with_test_cache_root(cache.path(), cache_inventory).expect("inventory");
+        assert_eq!(
+            snapshot_tree(cache.path()),
+            before,
+            "inventory changed sparse file"
+        );
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "sparse-unshared.bin")
+            .expect("sparse entry");
+        assert_eq!(entry.kind, CacheInventoryKind::Unknown);
+        assert!(entry.allocated_bytes.expect("Unix allocation") < entry.apparent_bytes);
+        assert!(
+            report.allocated_bytes.is_some(),
+            "direct allocation remains reported"
+        );
+        assert_eq!(
+            report.clone_shared_bytes, None,
+            "sparse bytes are not clone proof"
+        );
+        assert!(
+            report.clone_sharing.is_empty(),
+            "sparse file is not a clone row"
+        );
+        assert_eq!(report.required_bytes, 0);
+        assert_eq!(report.reclaimable_bytes, 0);
+    }
+
     fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
         let mut entries = BTreeMap::new();
         collect_tree(root, root, &mut entries);
@@ -765,22 +914,9 @@ mod tests {
             "hardlink dedup should be reported: {:?}",
             report.hardlink_groups
         );
-        // Two names for eight bytes is aliasing, not extent sharing. The
-        // previous report equated the two and claimed shared bytes that the
-        // filesystem had never shared.
-        assert_ne!(
-            report.clone_shared_bytes,
-            Some(report.hardlink_deduplicated_bytes),
-            "hardlink aliasing must not be restated as clone sharing"
-        );
-        assert!(
-            report
-                .clone_sharing
-                .iter()
-                .all(|entry| entry.allocated_bytes < entry.apparent_bytes),
-            "every sharing row must rest on measured allocation: {:?}",
-            report.clone_sharing
-        );
+        // Two names for eight bytes prove aliasing, not clone extent sharing.
+        assert_eq!(report.clone_shared_bytes, None);
+        assert!(report.clone_sharing.is_empty());
     }
 
     /// A directory the scan cannot open is a hole in the observation. Aborting

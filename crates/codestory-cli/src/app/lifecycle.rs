@@ -200,13 +200,13 @@ fn render_cache_inventory_markdown(report: &codestory_runtime::CacheInventoryRep
         Some(shared) => {
             let _ = writeln!(
                 markdown,
-                "clone_shared_bytes: {shared} (apparent minus allocated; cause not attributed)"
+                "clone_shared_bytes: {shared} (directly verified clone extents)"
             );
         }
         None => {
             let _ = writeln!(
                 markdown,
-                "clone_shared_bytes: unavailable (no allocation evidence)"
+                "clone_shared_bytes: unavailable (no direct clone extent evidence)"
             );
         }
     }

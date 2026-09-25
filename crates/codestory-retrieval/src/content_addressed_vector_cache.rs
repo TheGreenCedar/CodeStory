@@ -41,6 +41,48 @@ const CACHE_RETENTION_REGISTRY_SCHEMA_VERSION: i64 = 2;
 const CACHE_RETENTION_REGISTRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_SCOPE_OWNERSHIP_MARKER: &str = "ownership-v1";
 
+pub(crate) fn is_vector_cache_namespace(relative: &str) -> bool {
+    let root = relative.split('/').next();
+    root == Some(CACHE_DIRECTORY) || root == Some(CACHE_RETENTION_DIRECTORY)
+}
+
+/// Recognized files in the current vector cache and its retention registry.
+/// Unknown neighbors stay unknown to inventory even when their root name matches.
+pub(crate) fn is_known_vector_cache_artifact(relative: &str) -> bool {
+    fn digest_name(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    let parts: Vec<_> = relative.split('/').collect();
+    match parts.as_slice() {
+        [root, scope, name] if *root == CACHE_DIRECTORY && digest_name(scope) => matches!(
+            *name,
+            "vectors.sqlite3"
+                | "vectors.sqlite3-wal"
+                | "vectors.sqlite3-shm"
+                | "vectors.sqlite3-journal"
+                | CACHE_SCOPE_OWNERSHIP_MARKER
+        ),
+        [root, name] if *root == CACHE_RETENTION_DIRECTORY => matches!(
+            *name,
+            CACHE_RETENTION_REGISTRY
+                | "registry.sqlite3-wal"
+                | "registry.sqlite3-shm"
+                | "registry.sqlite3-journal"
+                | CACHE_RETENTION_GLOBAL_LOCK
+        ),
+        [root, locks, name]
+            if *root == CACHE_RETENTION_DIRECTORY && *locks == CACHE_RETENTION_SCOPE_LOCKS =>
+        {
+            name.strip_suffix(".lock").is_some_and(digest_name)
+        }
+        _ => false,
+    }
+}
+
 struct VectorCacheScopeLease {
     file: File,
 }
