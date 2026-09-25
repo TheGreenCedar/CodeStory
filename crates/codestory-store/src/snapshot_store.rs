@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn disposable_full_refresh_busy_seal_never_starts_promotion() {
+    fn disposable_full_refresh_busy_seal_cleans_stage_and_allows_retry() {
         let temp = fresh_temp_root("disposable-busy");
         let live_path = temp.join("live.sqlite");
         let mut staged = SnapshotStore::open_disposable_full_refresh(&live_path)
@@ -1133,14 +1133,38 @@ mod tests {
             !live_path.exists(),
             "seal failure must not create live state"
         );
-        assert!(staged_path.exists(), "failed stage must remain inspectable");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        assert!(layout.read_pointer().expect("read pointer").is_none());
         assert!(!live_path.with_extension("sqlite.backup").exists());
         assert!(
             !PathBuf::from(format!("{}.promotion.prepared.json", live_path.display())).exists()
         );
 
+        // Unix can unlink a rejected owned stage while another SQLite reader
+        // still has it open. Windows may retain the file until that reader exits.
+        #[cfg(unix)]
+        assert!(!staged_path.exists(), "rejected owned stage must be removed");
         drop(reader);
-        Store::discard_staged_snapshot(&staged_path).expect("discard failed stage");
+        Store::discard_staged_snapshot(&staged_path).expect("discard failed stage sidecars");
+        crate::core_generation::remove_staging_database(&staged_path)
+            .expect("discard rejected owned stage after reader closes");
+        assert!(!staged_path.exists());
+
+        let mut retry = SnapshotStore::open_disposable_full_refresh(&live_path)
+            .expect("open retry stage");
+        retry
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify retry candidate");
+        publish_empty_source_policy(retry.store_mut(), &publication);
+        retry.publish(&live_path).expect("publish completed retry");
+        let live = Store::open(&live_path).expect("open retry publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retry publication"),
+            Some(publication)
+        );
+        drop(live);
         let _ = fs::remove_dir_all(&temp);
     }
 
