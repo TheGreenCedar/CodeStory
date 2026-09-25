@@ -2810,9 +2810,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       '--version "$cli_version"',
       '--version "$plugin_version" --lane plugin',
     ]);
-    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
-      "scripts/tests/codestory-release-live.test.mjs",
-    ]);
     // The plugin lane's structural pin (job existence) is a rule instance and
     // lives in release-claims.json under workflow_policy.structural_pins;
     // structuralPinViolations evaluates it. The lane's step fragments - the

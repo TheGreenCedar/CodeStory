@@ -2023,9 +2023,10 @@
         "fragments": [
           "scripts/tests/codestory-release-claims.test.mjs",
           "scripts/tests/codestory-release-closeout.test.mjs",
-          "scripts/tests/codestory-release-evidence-gate.test.mjs"
+          "scripts/tests/codestory-release-evidence-gate.test.mjs",
+          "scripts/tests/codestory-release-live.test.mjs"
         ],
-        "reason": "The release claim graph, the closeout, and the evidence gate are the programs that decide whether a release may ship; their suites must run in the lane that gates every policy and graph edit, so a claims regression cannot merge unproven."
+        "reason": "The release claim graph, closeout, evidence gate, and live coordinator adapter decide whether a release may proceed; their suites must run in the lane that gates policy and graph edits."
       },
       "plugin_static_ci_proof_routing": {
         "kind": "require",
