@@ -7140,6 +7140,44 @@ fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageEr
     seed_promotion_file_with_identity(path, id, name, true)
 }
 
+fn seed_schema31_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    let current = path.with_extension("current-seed.db");
+    seed_promotion_file(&current, id, name)?;
+    let legacy = Connection::open(path)?;
+    // This DDL comes from the v0.17.5 tag, so the fixture crosses the actual
+    // schema-31 disk layout rather than just restamping a current-schema DB.
+    legacy.execute_batch(include_str!("../../../tests/fixtures/v17_5_schema31.sql"))?;
+    legacy.execute(
+        "ATTACH DATABASE ?1 AS seed",
+        [current.to_string_lossy().as_ref()],
+    )?;
+    let table_names = legacy
+        .prepare(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for table in table_names {
+        let columns = legacy
+            .prepare(&format!("PRAGMA main.table_info(\"{table}\")"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let columns = columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        legacy.execute(
+            &format!("INSERT OR REPLACE INTO main.\"{table}\" ({columns}) SELECT {columns} FROM seed.\"{table}\""),
+            [],
+        )?;
+    }
+    legacy.execute_batch("DETACH DATABASE seed; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(legacy);
+    cleanup_sqlite_sidecars(&current)?;
+    Ok(())
+}
+
 #[test]
 fn promotion_rejects_a_corrupt_candidate_proof_projection() {
     let live_path = unique_temp_db_path("proof-bound-promotion-live");
@@ -8441,29 +8479,185 @@ fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
 }
 
 #[test]
-fn immutable_migration_does_not_publish_an_incomplete_legacy_predecessor() {
+fn immutable_migration_replaces_incomplete_legacy_predecessor_without_rollback() {
+    for retained_publication in [true, false] {
+        let root = tempfile::tempdir().expect("migration root");
+        let live = root.path().join("codestory.db");
+        seed_promotion_file_with_identity(&live, 1, "old.rs", retained_publication)
+            .expect("material legacy predecessor");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live).expect("layout");
+        let candidate = layout.create_staging_database_path().expect("stage");
+        seed_promotion_file(&candidate, 2, "new.rs").expect("complete replacement");
+        {
+            let previous = Storage::open(&live).expect("open predecessor");
+            previous
+                .begin_incremental_run()
+                .expect("mark interrupted writer");
+        }
+        let before = durable_sqlite_state(&live);
+        Storage::promote_staged_snapshot(&candidate, &live)
+            .expect("complete full candidate replaces incomplete predecessor");
+        assert_eq!(durable_sqlite_state(&live), before, "legacy image survives");
+        let pointer = layout
+            .read_pointer()
+            .expect("pointer")
+            .expect("published core");
+        assert_eq!(pointer.active.generation_id, "generation-2");
+        assert!(
+            pointer.rollback.is_none(),
+            "incomplete core cannot be rollback"
+        );
+        assert!(!Storage::database_has_incomplete_incremental_run(&live).unwrap());
+        assert_eq!(
+            Storage::open(&live).unwrap().get_files().unwrap()[0].path,
+            PathBuf::from("new.rs")
+        );
+    }
+}
+
+#[test]
+fn immutable_migration_copies_complete_schema31_rollback_without_cow() -> Result<(), StorageError> {
     let root = tempfile::tempdir().expect("migration root");
     let live = root.path().join("codestory.db");
-    seed_promotion_file(&live, 1, "old.rs").expect("complete predecessor");
+    seed_schema31_promotion_file(&live, 1, "old.rs").expect("nonempty schema-31 predecessor");
     let layout = crate::CorePublicationLayout::from_storage_path(&live).expect("layout");
     let candidate = layout.create_staging_database_path().expect("stage");
-    seed_promotion_file(&candidate, 2, "new.rs").expect("complete replacement");
-    {
-        let previous = Storage::open(&live).expect("open predecessor");
-        previous
-            .begin_incremental_run()
-            .expect("mark interrupted writer");
-    }
+    seed_promotion_file(&candidate, 2, "new.rs").expect("complete candidate");
     let before = durable_sqlite_state(&live);
-    let error = Storage::promote_staged_snapshot(&candidate, &live)
-        .expect_err("incomplete predecessor cannot become a complete rollback generation");
-    assert!(error.to_string().contains("incomplete"), "{error}");
-    assert_eq!(durable_sqlite_state(&live), before);
-    assert!(layout.read_pointer().expect("pointer").is_none());
-    assert!(
-        candidate.exists(),
-        "failed candidate remains available for diagnosis"
+
+    crate::with_core_clone_disabled(|| Storage::promote_staged_snapshot(&candidate, &live))
+        .expect("one-time legacy rollback copy must not require CoW");
+
+    let pointer = layout.read_pointer()?.expect("published pointer");
+    assert_eq!(pointer.active.generation_id, "generation-2");
+    assert_eq!(
+        pointer.rollback.as_ref().unwrap().generation_id,
+        "generation-1"
     );
+    let rollback = layout.resolve_generation_database("generation-1")?;
+    assert_eq!(durable_sqlite_state(&live), before, "old image survives");
+    let retained = Connection::open_with_flags(&rollback, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let old_file: String =
+        retained.query_row("SELECT path FROM file WHERE id = 1", [], |row| row.get(0))?;
+    assert_eq!(old_file, "old.rs");
+    let publication_count: i64 =
+        retained.query_row("SELECT COUNT(*) FROM index_publication", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(publication_count, 1);
+    assert_eq!(Storage::database_schema_version(&rollback)?, 31);
+    assert_eq!(
+        Storage::open(&live)?.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_legacy_rollback_copy_removes_its_partial_stage() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = std::fs::read(&live).expect("read source");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let calls = std::cell::Cell::new(0);
+    let cancelled = || {
+        let next = calls.get() + 1;
+        calls.set(next);
+        next > 1
+    };
+    let error = crate::with_core_clone_disabled(|| {
+        layout.materialize_existing_generation(&live, "generation-1", &cancelled)
+    })
+    .expect_err("cancelled copy must not install rollback");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(!layout.generation_database_path("generation-1")?.is_file());
+    assert_eq!(std::fs::read(&live).expect("read preserved source"), before);
+    assert_eq!(
+        std::fs::read_dir(layout.staging_root())
+            .expect("read owned staging root")
+            .count(),
+        0,
+        "partial owned stage must be removed"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_legacy_copy_cannot_commit_pointer() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = durable_sqlite_state(&live);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let installed_candidate = layout.generation_database_path("generation-2")?;
+    let cancelled = || installed_candidate.is_file();
+
+    let error = crate::with_core_clone_disabled(|| {
+        Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+    })
+    .expect_err("late cancellation must prevent pointer publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(durable_sqlite_state(&live), before);
+    assert!(
+        Storage::open(&live)?
+            .get_complete_index_publication()?
+            .is_some(),
+        "old complete publication stays usable"
+    );
+
+    let retry = layout.create_staging_database_path()?;
+    seed_promotion_file(&retry, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&retry, &live).expect("retry publishes complete candidate");
+    assert_eq!(
+        layout
+            .read_pointer()?
+            .expect("retry pointer")
+            .active
+            .generation_id,
+        "generation-2"
+    );
+    Ok(())
+}
+
+#[test]
+fn schema31_rollback_snapshot_includes_committed_wal_rows() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let writer = Connection::open(&live)?;
+    writer.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         INSERT INTO bookmark_category (id, name) VALUES (77, 'committed WAL annotation');",
+    )?;
+    let wal = sqlite_sidecar_path(&live, "-wal");
+    assert!(fs::metadata(&wal).expect("live WAL").len() > 0);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+
+    Storage::promote_staged_snapshot(&candidate, &live)?;
+
+    let pointer = layout.read_pointer()?.expect("published pointer");
+    let rollback = layout.resolve_generation_database(&pointer.rollback.unwrap().generation_id)?;
+    assert!(
+        !sqlite_sidecar_path(&rollback, "-wal").exists(),
+        "published rollback contains its committed pages in one database file"
+    );
+    let retained = Connection::open_with_flags(&rollback, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let annotation: String = retained.query_row(
+        "SELECT name FROM bookmark_category WHERE id = 77",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(annotation, "committed WAL annotation");
+    assert_eq!(Storage::database_schema_version(&rollback)?, 31);
+    drop(writer);
+    Ok(())
 }
 
 #[test]

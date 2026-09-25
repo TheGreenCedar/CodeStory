@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const CORE_DIRECTORY: &str = "core";
 pub const CORE_GENERATIONS_DIRECTORY: &str = "generations";
@@ -27,6 +28,8 @@ pub const RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
 /// Callers must escalate to a disposable complete-build rather than silently
 /// byte-copying the live database in production.
 pub const CORE_COPY_ON_WRITE_UNAVAILABLE: &str = "core_copy_on_write_unavailable";
+const LEGACY_ROLLBACK_COPY_PAGES_PER_STEP: i32 = 16;
+const LEGACY_ROLLBACK_BUSY_RETRIES: usize = 50;
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
@@ -319,22 +322,91 @@ impl CorePublicationLayout {
         &self,
         source_database: &Path,
         generation_id: &str,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<PathBuf, StorageError> {
         let destination = self.generation_database_path(generation_id)?;
         if destination.is_file() {
             return Ok(destination);
         }
         let staged = self.create_staging_database_path()?;
-        let cloned = clone_file_copy_on_write(source_database, &staged)?;
-        if !cloned {
+        let result = (|| {
+            // Even a successful main-file CoW clone can omit committed WAL
+            // pages or race an old writer. This one-time legacy preservation
+            // needs a coherent SQLite snapshot, unlike the recurring
+            // incremental stage path which still requires CoW.
+            copy_legacy_rollback_snapshot(source_database, &staged, cancelled)?;
+            if cancelled() {
+                return Err(core_publication_error(
+                    "Legacy rollback preparation was cancelled".into(),
+                ));
+            }
+            make_file_owner_writable(&staged)?;
+            sync_staging_database(&staged)?;
+            self.install_staging_generation(&staged, generation_id)
+        })();
+        if result.is_err() {
             let _ = remove_staging_database(&staged);
-            return Err(StorageError::Other(format!(
-                "{CORE_COPY_ON_WRITE_UNAVAILABLE}: the filesystem cannot materialize immutable core generation {generation_id} without a foreground full copy"
-            )));
         }
-        make_file_owner_writable(&staged)?;
-        self.install_staging_generation(&staged, generation_id)
+        result
     }
+}
+
+fn copy_legacy_rollback_snapshot(
+    source: &Path,
+    destination: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), StorageError> {
+    use rusqlite::OpenFlags;
+    use rusqlite::backup::{Backup, StepResult};
+
+    // SQLite's online backup reads committed WAL pages and presents one
+    // coherent source image even if a separate connection changes the file.
+    let input = rusqlite::Connection::open_with_flags(
+        crate::sqlite_path::open_path(source),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    input.busy_timeout(Duration::from_millis(2_500))?;
+    let reserved = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| core_path_error("create legacy rollback stage", destination, error))?;
+    drop(reserved);
+    let mut output = rusqlite::Connection::open_with_flags(
+        crate::sqlite_path::open_path(destination),
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    output.busy_timeout(Duration::from_millis(2_500))?;
+    let backup = Backup::new(&input, &mut output)?;
+    let mut busy_retries = 0;
+    loop {
+        if cancelled() {
+            return Err(core_publication_error(
+                "Legacy rollback preparation was cancelled".into(),
+            ));
+        }
+        match backup.step(LEGACY_ROLLBACK_COPY_PAGES_PER_STEP)? {
+            StepResult::Done => break,
+            StepResult::More => busy_retries = 0,
+            StepResult::Busy | StepResult::Locked => {
+                busy_retries += 1;
+                if busy_retries >= LEGACY_ROLLBACK_BUSY_RETRIES {
+                    return Err(core_publication_error(
+                        "Legacy rollback snapshot stayed busy".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                return Err(core_publication_error(
+                    "Legacy rollback snapshot returned an unknown backup state".into(),
+                ));
+            }
+        }
+    }
+    drop(backup);
+    drop(output);
+    sync_staging_database(destination)
 }
 
 pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, StorageError> {

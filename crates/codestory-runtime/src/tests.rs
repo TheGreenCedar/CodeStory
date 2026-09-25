@@ -12572,6 +12572,249 @@ fn a_full_refresh_rescues_legacy_annotations_before_it_replaces_core() {
 }
 
 #[test]
+fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_cow() {
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path().join("project");
+    fs::create_dir(&root).expect("project root");
+    fs::write(
+        root.join("lib.rs"),
+        "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { alpha() }\n",
+    )
+    .expect("source with a call edge");
+    let storage_path = workspace.path().join("cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(root.clone(), storage_path.clone())
+        .expect("open seed project");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("seed nonempty predecessor");
+    let node_id = Storage::open(&storage_path)
+        .expect("seeded core")
+        .get_nodes()
+        .expect("graph nodes")
+        .into_iter()
+        .find(|node| node.serialized_name == "alpha")
+        .expect("alpha node")
+        .id;
+    mutate_published_core(&storage_path, |core| {
+        let category = core.create_bookmark_category("Legacy").expect("category");
+        core.add_bookmark(category, node_id, Some("legacy note"))
+            .expect("bookmark");
+    });
+    drop(controller);
+
+    let active =
+        codestory_store::resolve_core_database_path(&storage_path).expect("seed generation");
+    let legacy_path = workspace.path().join("schema31.db");
+    let legacy = rusqlite::Connection::open(&legacy_path).expect("legacy database");
+    // Exact v0.17.5 table/index DDL; copy the completed graph, publication,
+    // manifests, and legacy annotation rows into that disk layout.
+    legacy
+        .execute_batch(include_str!(
+            "../../codestory-store/tests/fixtures/v17_5_schema31.sql"
+        ))
+        .expect("v0.17.5 schema");
+    legacy
+        .execute(
+            "ATTACH DATABASE ?1 AS seed",
+            [active.to_string_lossy().as_ref()],
+        )
+        .expect("attach completed seed");
+    let table_names = legacy
+        .prepare(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .expect("table list")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("table rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("table names");
+    for table in table_names {
+        let columns = legacy
+            .prepare(&format!("PRAGMA main.table_info(\"{table}\")"))
+            .expect("table columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("column names")
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        legacy
+            .execute(
+                &format!("INSERT OR REPLACE INTO main.\"{table}\" ({columns}) SELECT {columns} FROM seed.\"{table}\""),
+                [],
+            )
+            .unwrap_or_else(|error| panic!("copy {table}: {error}"));
+    }
+    legacy
+        .execute_batch("DETACH DATABASE seed")
+        .expect("detach seed");
+    assert_eq!(
+        legacy
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("legacy schema version"),
+        31
+    );
+    assert_eq!(
+        legacy
+            .query_row("SELECT COUNT(*) FROM bookmark_node", [], |row| row
+                .get::<_, u32>(0))
+            .expect("legacy bookmark count"),
+        1
+    );
+    for table in ["node", "edge", "index_publication"] {
+        let count: u32 = legacy
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|error| panic!("read legacy {table}: {error}"));
+        assert!(count > 0, "schema-31 predecessor must contain {table}");
+    }
+    drop(legacy);
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+        .expect("core layout");
+    fs::remove_dir_all(layout.root()).expect("remove temp seed generations");
+    if storage_path.is_file() {
+        fs::remove_file(&storage_path).expect("remove temp seed standalone core");
+    }
+    fs::rename(&legacy_path, &storage_path).expect("install schema-31 disk fixture");
+    assert!(layout.read_pointer().expect("pointer read").is_none());
+
+    let upgraded = AppController::new();
+    upgraded
+        .bind_project_paths_for_refresh(root, storage_path.clone())
+        .expect("bind legacy project without opening it");
+    with_core_clone_disabled(|| {
+        upgraded
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("managed schema-31 upgrade and full refresh")
+    });
+    let pointer = layout
+        .read_pointer()
+        .expect("pointer read")
+        .expect("pointer");
+    assert!(
+        pointer.rollback.is_some(),
+        "complete legacy predecessor stays rollback eligible"
+    );
+    assert_eq!(Storage::database_schema_version(&storage_path).unwrap(), 35);
+    assert_eq!(
+        upgraded.list_bookmarks(None).expect("migrated annotations")[0]
+            .comment
+            .as_deref(),
+        Some("legacy note")
+    );
+    assert!(
+        codestory_contracts::owned_artifacts::annotations_sidecar_path(&storage_path).is_file(),
+        "annotation ownership moved before replacement"
+    );
+    drop(upgraded);
+    let reopened = Storage::open(&storage_path).expect("reopen published core");
+    assert!(
+        reopened
+            .get_complete_index_publication()
+            .expect("reopened publication")
+            .is_some(),
+        "the active generation remains complete after reopening"
+    );
+    assert!(!reopened.get_nodes().expect("reopened graph").is_empty());
+    assert!(!reopened.get_edges().expect("reopened edges").is_empty());
+    assert_eq!(
+        layout.read_pointer().expect("reopened pointer"),
+        Some(pointer),
+        "reopening must not replace the active or rollback pointer"
+    );
+}
+
+#[test]
+fn full_refresh_replaces_interrupted_standalone_core_with_retained_publication_and_annotation() {
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path().join("project");
+    fs::create_dir(&root).expect("project root");
+    fs::write(root.join("lib.rs"), "pub fn alpha() -> i32 { 1 }\n").expect("source");
+    let storage_path = workspace.path().join("cache").join("codestory.db");
+    let seed = AppController::new();
+    seed.open_project_summary_with_storage_path(root.clone(), storage_path.clone())
+        .expect("open seed project");
+    seed.run_indexing_blocking(IndexMode::Full)
+        .expect("publish seed graph");
+    let node_id = Storage::open(&storage_path)
+        .expect("open published core")
+        .get_nodes()
+        .expect("graph nodes")
+        .into_iter()
+        .find(|node| node.serialized_name == "alpha")
+        .expect("alpha node")
+        .id;
+    mutate_published_core(&storage_path, |core| {
+        let category = core.create_bookmark_category("Legacy").expect("category");
+        core.add_bookmark(category, node_id, Some("keep on recovery"))
+            .expect("legacy bookmark");
+    });
+    drop(seed);
+
+    let active =
+        codestory_store::resolve_core_database_path(&storage_path).expect("seed generation");
+    let standalone = workspace.path().join("interrupted-standalone.db");
+    fs::copy(&active, &standalone).expect("materialize pre-generation standalone core");
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+        .expect("core layout");
+    fs::remove_dir_all(layout.root()).expect("remove seed generations");
+    if storage_path.is_file() {
+        fs::remove_file(&storage_path).expect("remove seed standalone core");
+    }
+    fs::rename(standalone, &storage_path).expect("install standalone predecessor");
+    codestory_store::make_file_owner_writable(&storage_path)
+        .expect("legacy standalone writer can open its core");
+    assert!(layout.read_pointer().expect("pointer read").is_none());
+    let predecessor = Storage::open(&storage_path).expect("open standalone predecessor");
+    assert!(predecessor.get_index_publication().unwrap().is_some());
+    assert!(!predecessor.get_nodes().unwrap().is_empty());
+    predecessor
+        .begin_incremental_run()
+        .expect("interrupt prior incremental writer");
+    assert!(predecessor.has_incomplete_incremental_run().unwrap());
+    drop(predecessor);
+    assert!(
+        !codestory_contracts::owned_artifacts::annotations_sidecar_path(&storage_path).exists(),
+        "annotation rescue is still required before replacement"
+    );
+
+    let recovered = AppController::new();
+    recovered
+        .bind_project_paths_for_refresh(root, storage_path.clone())
+        .expect("bind interrupted project");
+    recovered
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("managed full recovery");
+    let pointer = layout
+        .read_pointer()
+        .expect("pointer read")
+        .expect("new pointer");
+    assert!(
+        pointer.rollback.is_none(),
+        "incomplete predecessor is never rollback eligible"
+    );
+    let published = Storage::open(&storage_path).expect("reopen recovered core");
+    assert!(
+        published
+            .get_complete_index_publication()
+            .unwrap()
+            .is_some()
+    );
+    assert!(!published.has_incomplete_incremental_run().unwrap());
+    assert_eq!(
+        recovered.list_bookmarks(None).expect("rescued annotations")[0]
+            .comment
+            .as_deref(),
+        Some("keep on recovery")
+    );
+}
+
+#[test]
 fn annotations_outlive_a_quarantined_core_database() {
     let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
     project.index();
