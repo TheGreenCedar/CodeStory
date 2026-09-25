@@ -611,6 +611,42 @@ pub fn workspace_file_identity(file: &fs::File) -> io::Result<WorkspacePathIdent
     existing_workspace_file_identity(file, &metadata)
 }
 
+/// Number of native directory entries referring to an already-open file.
+pub fn workspace_file_link_count(file: &fs::File) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: the file handle remains valid and the output buffer has the
+        // native structure's size for the duration of the call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(
+            unsafe { information.assume_init() }.nNumberOfLinks,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native file link count is unsupported on this platform",
+        ))
+    }
+}
+
 /// Compare workspace paths through [`workspace_path_identity`].
 ///
 /// The compatibility boolean fails closed when either identity is unavailable.
@@ -1569,6 +1605,24 @@ mod tests {
         assert_eq!(
             workspace_file_identity(&file).expect("open file identity"),
             workspace_path_identity(&path).expect("path identity")
+        );
+    }
+
+    #[test]
+    fn open_file_link_count_tracks_native_hard_link_aliases() {
+        let project = tempdir().expect("project");
+        let path = project.path().join("owned");
+        let alias = project.path().join("external-alias");
+        fs::write(&path, b"identity").expect("write owned file");
+        let file = fs::File::open(&path).expect("pin owned file");
+
+        assert_eq!(workspace_file_link_count(&file).expect("single link"), 1);
+        fs::hard_link(&path, &alias).expect("install alias");
+        assert_eq!(workspace_file_link_count(&file).expect("two links"), 2);
+        fs::remove_file(&alias).expect("remove alias");
+        assert_eq!(
+            workspace_file_link_count(&file).expect("single link again"),
+            1
         );
     }
 
