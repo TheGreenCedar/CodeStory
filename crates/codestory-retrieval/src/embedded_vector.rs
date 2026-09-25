@@ -888,9 +888,9 @@ impl EmbeddedVectorIndex {
         if !crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
             return Ok(None);
         }
-        crate::copy_on_write::make_file_owner_writable(&temp_path)?;
 
         let result = (|| {
+            crate::copy_on_write::make_file_owner_writable(&temp_path)?;
             let work = reconcile_cloned_database(
                 &temp_path,
                 publication.generation,
@@ -3751,6 +3751,130 @@ mod tests {
                 .permissions()
                 .readonly()
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn incremental_clone_permissions_failure_removes_candidate_and_preserves_predecessor() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        let previous_manifest =
+            VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("predecessor manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &previous_manifest)
+            .expect("publish predecessor manifest");
+        let previous_path = index_path(&layout, "previous");
+        let previous_bytes = std::fs::read(&previous_path).expect("predecessor vectors");
+        let previous_manifest_path = generation_manifest_path(&layout, "previous");
+        let previous_manifest_bytes =
+            std::fs::read(&previous_manifest_path).expect("predecessor manifest");
+
+        let current_path = index_path(&layout, "current");
+        let current = [
+            current_anchor("1", "document-1", "changed display name"),
+            current_anchor("2", "document-2", "symbol_2"),
+        ];
+        let build = |fail_writable| {
+            crate::copy_on_write::with_clone_copy_fallback_and_writable_failure(
+                fail_writable,
+                || {
+                    EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                        AttestedVectorPublication {
+                            layout: &layout,
+                            collection: "current",
+                            generation: "generation-v2",
+                            input_hash: "input-v2",
+                            contract: &contract,
+                            expected_anchors: &expected,
+                        },
+                        "previous",
+                        &evidence,
+                        &current,
+                        || Ok(()),
+                        |missing, _| {
+                            assert!(missing.is_empty());
+                            Ok(())
+                        },
+                    )
+                },
+            )
+        };
+        let (failed, used_copy_fallback) = build(true);
+        eprintln!("clone fixture used copy fallback: {used_copy_fallback}");
+        let error = failed.expect_err("permissions failure after clone");
+        assert!(format!("{error:#}").contains("injected staged component permissions failure"));
+        assert!(
+            !current_path.exists(),
+            "candidate was published after failure"
+        );
+        assert_eq!(
+            std::fs::read_dir(current_path.parent().expect("collection directory"))
+                .expect("candidate directory")
+                .count(),
+            0,
+            "failed clone left a temporary vector database"
+        );
+        assert_eq!(std::fs::read(&previous_path).unwrap(), previous_bytes);
+        assert_eq!(
+            std::fs::read(&previous_manifest_path).unwrap(),
+            previous_manifest_bytes
+        );
+
+        let (retry, retry_used_copy_fallback) = build(false);
+        assert_eq!(retry_used_copy_fallback, used_copy_fallback);
+        let (attestation, work) = retry.expect("retry").expect("clone path");
+        assert_eq!(attestation.point_count, 2);
+        assert!(!work.direct_reference);
+        assert_eq!(std::fs::read(&previous_path).unwrap(), previous_bytes);
+        assert_eq!(
+            std::fs::read(&previous_manifest_path).unwrap(),
+            previous_manifest_bytes
+        );
+        let entries: Vec<_> = std::fs::read_dir(current_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries, vec![current_path]);
     }
 
     #[test]
