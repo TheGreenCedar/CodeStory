@@ -71,7 +71,7 @@ quality.
 
 ```sh
 codestory-cli packet --project <repo> --question "<broad task question>"
-codestory-cli search --project <repo> --query "<symbol or behavior>" --why
+codestory-cli search --project <repo> --query "<symbol or behavior>"
 ```
 
 Packets use the standard evidence budget by default. Pass `--budget compact`

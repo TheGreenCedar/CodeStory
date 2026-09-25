@@ -547,7 +547,7 @@ pub(in crate::app) fn index_next_commands(
     }
     commands.push(format!("codestory-cli ground --project {project}"));
     commands.push(format!(
-        "codestory-cli search --project {project} --query \"<symbol/file/literal/API path>\" --why"
+        "codestory-cli search --project {project} --query \"<symbol/file/literal/API path>\""
     ));
     commands.push(format!(
         "codestory-cli context --project {project} --query \"<concrete target>\""
