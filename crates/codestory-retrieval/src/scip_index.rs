@@ -40,6 +40,27 @@ const SCIP_PARSED_INDEX_RECEIPT_CAPACITY: usize = 4;
 
 static SCIP_PARSED_INDEX_RECEIPTS: SealedReceiptCache<PathBuf, Arc<ScipQueryData>> =
     SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
+static SCIP_GRAPH_HEALTH_RECEIPTS: SealedReceiptCache<PathBuf, String> =
+    SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
+
+fn scip_graph_health_artifacts(project_dir: &Path, component: &Path) -> Vec<PathBuf> {
+    let mut artifacts = sqlite_file_with_sidecars(component);
+    artifacts.push(project_dir.join("revision.txt"));
+    artifacts.push(project_dir.join(SCIP_INDEX_FILE));
+    artifacts
+}
+
+/// The producer has verified the staged rows before publishing this immutable
+/// component and has now written its revision and marker. A later health probe
+/// can reuse that fact only while the whole publication envelope stays sealed.
+fn seal_produced_scip_graph_health(project_dir: &Path, revision: &str) {
+    let component = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    let _ = SCIP_GRAPH_HEALTH_RECEIPTS.seal_produced(
+        component.clone(),
+        &scip_graph_health_artifacts(project_dir, &component),
+        revision.to_owned(),
+    );
+}
 
 /// Header of the graph-projection `index.scip` marker.
 const SCIP_INDEX_MARKER_HEADER: &str = "codestory-scip-v1";
@@ -1111,6 +1132,7 @@ pub(crate) fn emit_scip_artifacts_from_store_incremental(
     if stub.is_file() {
         std::fs::remove_file(stub).context("remove scip stub marker")?;
     }
+    seal_produced_scip_graph_health(project_dir, &revision);
     Ok(ScipIncrementalOutcome {
         revision: Some(revision),
         retained_records: work.retained,
@@ -1184,16 +1206,27 @@ pub(crate) fn reference_equivalent_scip_generation(
         if stub.is_file() {
             std::fs::remove_file(stub).context("remove scip stub marker")?;
         }
-        if let Some(transferable) = transferable {
-            let _ = SCIP_PARSED_INDEX_RECEIPTS.install_hard_link_alias(
+        let aliased = if let Some(transferable) = transferable {
+            SCIP_PARSED_INDEX_RECEIPTS.install_hard_link_alias(
                 &previous_key,
                 &previous_artifacts,
                 path.clone(),
                 &sqlite_file_with_sidecars(&path),
                 transferable,
                 Ok::<_, anyhow::Error>,
-            )?;
+            )?
+        } else {
+            false
+        };
+        if !aliased {
+            // A missing or invalid transfer cannot authorize the referenced
+            // bytes. Validate the newly published component before returning.
+            let validated = load_scip_symbols_database(&path)?;
+            if validated.revision != expected_revision {
+                bail!("referenced scip component revision changed");
+            }
         }
+        seal_produced_scip_graph_health(project_dir, expected_revision);
         let retained_records = previous_view
             .symbol_count()
             .saturating_add(previous_view.proof_count()) as u64;
@@ -2407,8 +2440,9 @@ fn load_scip_symbols_database_for_generation(
 /// [`load_fresh_scip_query_view`].
 ///
 /// JSON fixture components are admitted by deserializing the index envelope only
-/// (no adjacency build). Sealed SQLite components use metadata + cardinality
-/// counts without loading row payloads into a query view.
+/// (no adjacency build). SQLite components use the same deep row validation as
+/// query execution once per sealed publication envelope, without materializing
+/// the adjacency view on warm health probes.
 pub(crate) fn scip_component_admits_graph_health(
     project_dir: &Path,
     expected_revision: &str,
@@ -2439,7 +2473,7 @@ pub(crate) fn scip_component_admits_graph_health(
     if component_is_json {
         return scip_json_component_admits_graph_health(&path, expected_revision, generation);
     }
-    scip_sqlite_component_admits_graph_health(&path, expected_revision)
+    scip_sqlite_component_admits_graph_health(project_dir, &path, expected_revision)
 }
 
 fn scip_json_component_admits_graph_health(
@@ -2461,71 +2495,21 @@ fn scip_json_component_admits_graph_health(
         && index.contract.is_fresh_for(expected_revision)
 }
 
-fn scip_sqlite_component_admits_graph_health(path: &Path, expected_revision: &str) -> bool {
-    let Ok(schema) = scip_component_schema(path) else {
-        return false;
-    };
-    let Ok(connection) = Connection::open_with_flags(
-        sqlite_open_path(path),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return false;
-    };
-    let Ok(check) =
-        connection.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-    else {
-        return false;
-    };
-    if check != "ok" {
-        return false;
-    }
-    let Ok((_meta_generation, revision, contract_json, symbol_count, proof_count)) = connection
-        .query_row(
-            "SELECT generation, revision, contract_json, symbol_count, proof_count
-             FROM metadata WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
-    else {
-        return false;
-    };
-    if revision != expected_revision || symbol_count <= 0 || proof_count <= 0 {
-        return false;
-    }
-    let Ok(contract) = serde_json::from_str::<ScipProofAdapterContract>(&contract_json) else {
-        return false;
-    };
-    if !contract.is_fresh_for(expected_revision) {
-        return false;
-    }
-    let Ok((observed_symbols, observed_proofs)) = (match schema {
-        1 => connection.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM records WHERE kind = 'symbol'),
-                 (SELECT COUNT(*) FROM records WHERE kind = 'proof')",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        ),
-        2 => connection.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM symbol_records),
-                 (SELECT COUNT(*) FROM proof_records)",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        ),
-        _ => return false,
-    }) else {
-        return false;
-    };
-    observed_symbols == symbol_count && observed_proofs == proof_count
+fn scip_sqlite_component_admits_graph_health(
+    project_dir: &Path,
+    path: &Path,
+    expected_revision: &str,
+) -> bool {
+    let artifacts = scip_graph_health_artifacts(project_dir, path);
+    SCIP_GRAPH_HEALTH_RECEIPTS
+        .validate_sealed(path.to_path_buf(), &artifacts, || {
+            let index = load_scip_symbols_database(path)?;
+            if index.symbols.is_empty() || !index.contract.is_fresh_for(&index.revision) {
+                bail!("scip graph component is empty or its producer contract is stale");
+            }
+            Ok::<_, anyhow::Error>(index.revision)
+        })
+        .is_ok_and(|revision| revision == expected_revision)
 }
 
 pub(crate) fn load_fresh_scip_query_view(
@@ -2588,27 +2572,46 @@ pub(crate) fn load_fresh_scip_query_view(
 
 pub(crate) struct ScipGenerationReceiptRefresh {
     key: PathBuf,
-    artifacts: Vec<PathBuf>,
-    receipt: TransferableReceipt<Arc<ScipQueryData>>,
+    parsed_artifacts: Vec<PathBuf>,
+    parsed_receipt: Option<TransferableReceipt<Arc<ScipQueryData>>>,
+    health_artifacts: Vec<PathBuf>,
+    health_receipt: Option<TransferableReceipt<String>>,
 }
 
 pub(crate) fn capture_scip_generation_receipt(
     project_dir: &Path,
 ) -> Option<ScipGenerationReceiptRefresh> {
     let key = scip_symbols_component_path(project_dir);
-    let artifacts = sqlite_file_with_sidecars(&key);
-    SCIP_PARSED_INDEX_RECEIPTS
-        .transferable_receipt(&key, &artifacts)
-        .map(|receipt| ScipGenerationReceiptRefresh {
-            key,
-            artifacts,
-            receipt,
-        })
+    let parsed_artifacts = sqlite_file_with_sidecars(&key);
+    let health_artifacts = scip_graph_health_artifacts(project_dir, &key);
+    let parsed_receipt = SCIP_PARSED_INDEX_RECEIPTS.transferable_receipt(&key, &parsed_artifacts);
+    let health_receipt = SCIP_GRAPH_HEALTH_RECEIPTS.transferable_receipt(&key, &health_artifacts);
+    (parsed_receipt.is_some() || health_receipt.is_some()).then_some(ScipGenerationReceiptRefresh {
+        key,
+        parsed_artifacts,
+        parsed_receipt,
+        health_artifacts,
+        health_receipt,
+    })
 }
 
 impl ScipGenerationReceiptRefresh {
     pub(crate) fn refresh_after_owned_link_cleanup(self) -> bool {
-        SCIP_PARSED_INDEX_RECEIPTS.refresh_after_hard_links(self.key, &self.artifacts, self.receipt)
+        let parsed = self.parsed_receipt.is_none_or(|receipt| {
+            SCIP_PARSED_INDEX_RECEIPTS.refresh_after_hard_links(
+                self.key.clone(),
+                &self.parsed_artifacts,
+                receipt,
+            )
+        });
+        let health = self.health_receipt.is_none_or(|receipt| {
+            SCIP_GRAPH_HEALTH_RECEIPTS.refresh_after_hard_links(
+                self.key,
+                &self.health_artifacts,
+                receipt,
+            )
+        });
+        parsed && health
     }
 }
 
@@ -2942,8 +2945,13 @@ mod tests {
 
         assert!(
             scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
-            "published component must admit graph health from metadata"
+            "published component must admit content-validated graph health"
         );
+        let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let initial = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component_path)
+            .expect("first health validation seals the component and envelope");
+        assert_eq!(initial.validations, 1);
         assert!(
             scip_component_admits_graph_health(
                 &project_dir,
@@ -2952,6 +2960,14 @@ mod tests {
             ),
             "sqlite components may remap generation under hard-link reuse"
         );
+        let warm = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component_path)
+            .expect("warm health keeps its content receipt");
+        assert_eq!(
+            warm.validations, 1,
+            "warm health must avoid another row scan"
+        );
+        assert!(warm.reuses > initial.reuses);
         assert!(
             !scip_component_admits_graph_health(
                 &project_dir,
@@ -2968,7 +2984,6 @@ mod tests {
         );
         let _ = std::fs::remove_file(project_dir.join(SCIP_STUB_MARKER_FILE));
 
-        let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
         crate::copy_on_write::make_file_owner_writable(&component_path)
             .expect("make component writable for zero-proof tamper");
         let connection =
@@ -3071,6 +3086,82 @@ mod tests {
         assert!(
             !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
             "json stale contract must refuse graph health"
+        );
+    }
+
+    #[test]
+    fn graph_health_rejects_same_count_v2_row_drift_after_publication() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let damaged_dir = root.path().join("damaged");
+        std::fs::create_dir_all(&previous_dir).expect("previous directory");
+        std::fs::create_dir_all(&damaged_dir).expect("damaged directory");
+        let index = component_index(
+            "generation-health",
+            vec![
+                component_symbol("1", "a.ts", "alpha"),
+                component_symbol("2", "b.ts", "beta"),
+            ],
+        );
+        for directory in [&previous_dir, &damaged_dir] {
+            publish_scip_component(directory, None, &index, &mut || Ok(()))
+                .expect("publish valid component");
+            std::fs::write(
+                directory.join("revision.txt"),
+                format!("{}\n", index.revision),
+            )
+            .expect("revision");
+            write_scip_index_marker(directory, &index.revision).expect("marker");
+            assert!(scip_component_admits_graph_health(
+                directory,
+                &index.revision,
+                "generation-health"
+            ));
+        }
+
+        let component = damaged_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        crate::copy_on_write::make_file_owner_writable(&component)
+            .expect("allow hostile row rewrite");
+        let connection = Connection::open(sqlite_open_path(&component)).expect("open component");
+        let before: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata");
+        connection
+            .execute(
+                "UPDATE symbol_records SET start_line = start_line + 1 WHERE ordinal = 0",
+                [],
+            )
+            .expect("rewrite valid symbol cell");
+        let after: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reread metadata");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .expect("check SQLite structure");
+        drop(connection);
+        crate::copy_on_write::make_file_immutable(&component)
+            .expect("restore immutable component bit");
+        assert_eq!(before, after, "metadata digest and counts stay unchanged");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            load_fresh_scip_query_view(&damaged_dir, &index.revision, "generation-health").is_err(),
+            "deep query reader must refuse corrupted rows"
+        );
+        assert!(
+            !scip_component_admits_graph_health(&damaged_dir, &index.revision, "generation-health"),
+            "Full graph health cannot admit a component its query reader rejects"
+        );
+        assert!(
+            scip_component_admits_graph_health(&previous_dir, &index.revision, "generation-health"),
+            "the prior valid graph remains available"
         );
     }
 
@@ -3567,6 +3658,23 @@ mod tests {
             codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
         );
         let current_key = current_path;
+        let graph_health = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&current_key)
+            .expect("referenced generation inherits producer-validated graph health");
+        assert_eq!(graph_health.validations, 1);
+        assert!(scip_component_admits_graph_health(
+            &current_dir,
+            &previous.revision,
+            "generation-v2"
+        ));
+        assert_eq!(
+            SCIP_GRAPH_HEALTH_RECEIPTS
+                .stats(&current_key)
+                .expect("referenced graph remains sealed")
+                .validations,
+            1,
+            "warm referenced graph health must avoid another row scan"
+        );
         let aliased = SCIP_PARSED_INDEX_RECEIPTS
             .stats(&current_key)
             .expect("referenced graph inherits parsed receipt");
@@ -3598,6 +3706,19 @@ mod tests {
                 .validations,
             1,
             "owned hard-link cleanup must not force another full graph scan",
+        );
+        assert!(scip_component_admits_graph_health(
+            &current_dir,
+            &previous.revision,
+            "generation-v2"
+        ));
+        assert_eq!(
+            SCIP_GRAPH_HEALTH_RECEIPTS
+                .stats(&current_key)
+                .expect("cleanup refreshed current health receipt")
+                .validations,
+            1,
+            "owned hard-link cleanup must preserve cheap graph health",
         );
     }
 
@@ -4074,6 +4195,21 @@ mod tests {
         let revision = emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
             .expect("emit scip")
             .expect("revision");
+        let component = scip_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let produced = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component)
+            .expect("published component has producer-validated health receipt");
+        assert_eq!(produced.validations, 1);
+        assert!(scip_component_admits_graph_health(
+            &scip_dir,
+            &revision,
+            "generation-a"
+        ));
+        let warm = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component)
+            .expect("produced component receipt remains sealed");
+        assert_eq!(warm.validations, 1);
+        assert!(warm.reuses > produced.reuses);
         let index = load_scip_symbols(&scip_dir)
             .expect("load scip")
             .expect("index");

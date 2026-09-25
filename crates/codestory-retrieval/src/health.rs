@@ -516,7 +516,8 @@ fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
     // Full sidecar health must not build the query adjacency view. Keycloak-class
     // SCIP components are tens of MB / hundreds of thousands of rows; loading them
     // during validation@90 burned multi-second wall after #2291 made graph present.
-    // Publish already digest-bound the component; health re-checks the envelope.
+    // Producer-verified components carry a sealed content receipt; cold or
+    // changed components validate their rows before graph health is admitted.
     crate::scip_index::scip_component_admits_graph_health(project_dir, &revision, generation)
 }
 
