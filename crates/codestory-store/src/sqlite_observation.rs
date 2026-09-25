@@ -3,6 +3,7 @@
 use crate::StorageError;
 use rusqlite::{Connection, OpenFlags};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const ONE_MIB: u64 = 1024 * 1024;
@@ -58,30 +59,87 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn sidecar_bytes(path: &Path) -> u64 {
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| metadata.file_type().is_file())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+fn sidecar_bytes(path: &Path) -> Result<Option<u64>, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.len())),
+        Ok(_) => Err(promotion_error(format!(
+            "SQLite logical observation unavailable: unsafe sidecar {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(promotion_error(format!(
+            "SQLite logical observation unavailable: inspect sidecar {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
-fn open_observational_database(path: &Path) -> Result<Connection, StorageError> {
-    let wal_path = sqlite_sidecar_path(path, "-wal");
-    let has_live_wal = fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0);
-    if has_live_wal {
-        Connection::open_with_flags(
-            crate::sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(StorageError::from)
-    } else {
-        Connection::open_with_flags(
-            crate::sqlite_path::observational_uri(path, true),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(StorageError::from)
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObservationalSidecars {
+    wal_bytes: u64,
+    shm_bytes: u64,
+}
+
+fn checked_observational_sidecars(path: &Path) -> Result<ObservationalSidecars, StorageError> {
+    let wal = sidecar_bytes(&sqlite_sidecar_path(path, "-wal"))?;
+    let shm = sidecar_bytes(&sqlite_sidecar_path(path, "-shm"))?;
+    let journal = sidecar_bytes(&sqlite_sidecar_path(path, "-journal"))?;
+    // Even an empty journal is retained for the activating recovery owner:
+    // filesystem metadata alone cannot prove that it is safe to ignore.
+    if journal.is_some() {
+        return Err(promotion_error(format!(
+            "SQLite logical observation unavailable: rollback recovery is pending for {}",
+            path.display()
+        )));
     }
+    if wal.is_some() != shm.is_some() {
+        return Err(promotion_error(format!(
+            "SQLite logical observation unavailable: incomplete WAL/SHM sidecar pair for {}",
+            path.display()
+        )));
+    }
+    if wal.unwrap_or(0) > 0 {
+        return Err(promotion_error(format!(
+            "SQLite logical observation unavailable: live WAL for {}",
+            path.display()
+        )));
+    }
+    if shm.unwrap_or(0) > 0 {
+        return Err(promotion_error(format!(
+            "SQLite logical observation unavailable: unsafe SHM without WAL content for {}",
+            path.display()
+        )));
+    }
+    Ok(ObservationalSidecars {
+        wal_bytes: wal.unwrap_or(0),
+        shm_bytes: shm.unwrap_or(0),
+    })
+}
+
+fn open_observational_database(
+    path: &Path,
+) -> Result<(Connection, ObservationalSidecars), StorageError> {
+    let sidecars = checked_observational_sidecars(path)?;
+    #[cfg(test)]
+    fail_if_observational_sqlite_open_forbidden();
+    let connection = Connection::open_with_flags(
+        crate::sqlite_path::observational_uri(path, true),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(StorageError::from)?;
+    Ok((connection, sidecars))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORBID_OBSERVATIONAL_SQLITE_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_if_observational_sqlite_open_forbidden() {
+    FORBID_OBSERVATIONAL_SQLITE_OPEN.with(|flag| {
+        assert!(!flag.get(), "unsafe observation reached SQLite open");
+    });
 }
 
 fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> {
@@ -97,7 +155,7 @@ fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> 
 
 /// Observe one SQLite database without mutating it or creating lock sidecars.
 pub fn observe_sqlite_database(path: &Path) -> Result<SqliteDatabaseObservation, StorageError> {
-    let connection = open_observational_database(path)?;
+    let (connection, sidecars_before) = open_observational_database(path)?;
     let page_size = pragma_u64(&connection, "page_size")?;
     let page_count = pragma_u64(&connection, "page_count")?;
     let freelist_count = pragma_u64(&connection, "freelist_count")?;
@@ -112,6 +170,13 @@ pub fn observe_sqlite_database(path: &Path) -> Result<SqliteDatabaseObservation,
     let file_bytes = fs::metadata(path)
         .map_err(|error| promotion_error(format!("inspect {}: {error}", path.display())))?
         .len();
+    let sidecars_after = checked_observational_sidecars(path)?;
+    if sidecars_after != sidecars_before {
+        return Err(promotion_error(format!(
+            "SQLite logical observation unavailable: sidecar state changed for {}",
+            path.display()
+        )));
+    }
     Ok(SqliteDatabaseObservation {
         path: path.display().to_string(),
         page_size,
@@ -119,8 +184,8 @@ pub fn observe_sqlite_database(path: &Path) -> Result<SqliteDatabaseObservation,
         freelist_count,
         logical_bytes,
         file_bytes,
-        wal_bytes: sidecar_bytes(&sqlite_sidecar_path(path, "-wal")),
-        shm_bytes: sidecar_bytes(&sqlite_sidecar_path(path, "-shm")),
+        wal_bytes: sidecars_after.wal_bytes,
+        shm_bytes: sidecars_after.shm_bytes,
         auto_vacuum,
     })
 }
@@ -436,7 +501,36 @@ pub use available_override::with_available_filesystem_bytes_override;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn forbid_observational_sqlite_open<R>(f: impl FnOnce() -> R) -> R {
+        FORBID_OBSERVATIONAL_SQLITE_OPEN.with(|flag| {
+            let previous = flag.replace(true);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            flag.set(previous);
+            match result {
+                Ok(value) => value,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+    }
+
+    fn sqlite_tree_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let file = if suffix.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    sqlite_sidecar_path(path, suffix)
+                };
+                fs::read(&file)
+                    .ok()
+                    .map(|bytes| (suffix.to_string(), bytes))
+            })
+            .collect()
+    }
 
     fn create_database(path: &Path, pages: u64) {
         let connection = Connection::open(path).expect("open database");
@@ -464,15 +558,142 @@ mod tests {
     }
 
     #[test]
-    fn observe_sqlite_database_reports_freelist_and_sidecars() {
+    fn observe_sqlite_database_reports_freelist_without_sidecars() {
         let root = tempdir().expect("tempdir");
         let path = root.path().join("observe.sqlite3");
         create_database(&path, 4);
-        fs::write(sqlite_sidecar_path(&path, "-wal"), b"wal").expect("write wal");
         let observation = observe_sqlite_database(&path).expect("observe database");
         assert_eq!(observation.page_size, 1024);
         assert!(observation.freelist_count >= 1);
-        assert_eq!(observation.wal_bytes, 3);
+        assert_eq!(observation.wal_bytes, 0);
+        assert_eq!(observation.shm_bytes, 0);
+    }
+
+    #[test]
+    fn live_wal_observation_refuses_sqlite_open_without_changing_files() {
+        let root = tempdir().expect("tempdir");
+        let path = root.path().join("live.sqlite3");
+        create_database(&path, 4);
+        let writer = Connection::open(&path).expect("open live writer");
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 INSERT INTO payload(value) VALUES (zeroblob(4096));",
+            )
+            .expect("hold committed live WAL");
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        let shm = sqlite_sidecar_path(&path, "-shm");
+        assert!(fs::metadata(&wal).expect("live WAL").len() > 0);
+        assert!(shm.is_file(), "writer supplies complete WAL/SHM pair");
+        let before = sqlite_tree_bytes(&path);
+
+        let error = forbid_observational_sqlite_open(|| observe_sqlite_database(&path))
+            .expect_err("live WAL has unavailable logical observation");
+        assert!(error.to_string().contains("live WAL"), "{error}");
+        assert_eq!(sqlite_tree_bytes(&path), before);
+        drop(writer);
+    }
+
+    #[test]
+    fn incomplete_or_unsafe_sidecars_refuse_sqlite_open() {
+        let root = tempdir().expect("tempdir");
+        let path = root.path().join("incomplete.sqlite3");
+        create_database(&path, 1);
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        let shm = sqlite_sidecar_path(&path, "-shm");
+
+        for lone in [&wal, &shm] {
+            fs::write(lone, b"").expect("install empty lone sidecar");
+            let before = sqlite_tree_bytes(&path);
+            let error = forbid_observational_sqlite_open(|| observe_sqlite_database(&path))
+                .expect_err("incomplete sidecar pair must be unavailable");
+            assert!(error.to_string().contains("incomplete WAL/SHM"), "{error}");
+            assert_eq!(sqlite_tree_bytes(&path), before);
+            fs::remove_file(lone).expect("remove lone sidecar");
+        }
+
+        fs::create_dir(&wal).expect("install nonregular WAL entry");
+        let error = forbid_observational_sqlite_open(|| observe_sqlite_database(&path))
+            .expect_err("nonregular sidecar must be unavailable");
+        assert!(error.to_string().contains("unsafe"), "{error}");
+        assert!(wal.is_dir(), "unsafe sidecar survives");
+    }
+
+    #[test]
+    fn empty_complete_wal_pair_remains_immutable_and_unchanged() {
+        let root = tempdir().expect("tempdir");
+        let path = root.path().join("empty-pair.sqlite3");
+        create_database(&path, 1);
+        fs::write(sqlite_sidecar_path(&path, "-wal"), b"").expect("empty WAL");
+        fs::write(sqlite_sidecar_path(&path, "-shm"), b"").expect("empty SHM");
+        let before = sqlite_tree_bytes(&path);
+
+        let observation = observe_sqlite_database(&path).expect("empty pair is harmless");
+        assert!(observation.logical_bytes > 0);
+        assert_eq!(observation.wal_bytes, 0);
+        assert_eq!(observation.shm_bytes, 0);
+        assert_eq!(sqlite_tree_bytes(&path), before);
+    }
+
+    #[test]
+    fn abandoned_rollback_writer_child() {
+        let Ok(path) = std::env::var("CODESTORY_C1_HOT_JOURNAL_CHILD_DB") else {
+            return;
+        };
+        let connection = Connection::open(path).expect("open rollback writer child");
+        connection
+            .execute_batch(
+                "PRAGMA cache_size=1;
+                 PRAGMA cache_spill=ON;
+                 BEGIN IMMEDIATE;
+                 UPDATE payload SET value=zeroblob(3000);",
+            )
+            .expect("spill uncommitted pages and rollback journal");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn interrupted_rollback_journal_refuses_immutable_observation() {
+        let root = tempdir().expect("tempdir");
+        let path = root.path().join("interrupted.sqlite3");
+        let connection = Connection::open(&path).expect("create rollback database");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE payload(value BLOB);
+                 WITH RECURSIVE n(x) AS (
+                   SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000
+                 ) INSERT INTO payload(value) SELECT randomblob(3000) FROM n;",
+            )
+            .expect("seed rollback database");
+        drop(connection);
+        let committed = fs::read(&path).expect("committed database bytes");
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "sqlite_observation::tests::abandoned_rollback_writer_child",
+            ])
+            .env("CODESTORY_C1_HOT_JOURNAL_CHILD_DB", &path)
+            .status()
+            .expect("run interrupted writer child");
+        assert!(status.success(), "writer child reached uncommitted spill");
+        let journal = sqlite_sidecar_path(&path, "-journal");
+        let journal_bytes = fs::read(&journal).expect("rollback journal left by exited writer");
+        assert!(journal_bytes.len() > 512, "journal has rollback pages");
+        assert_eq!(
+            &journal_bytes[..8],
+            &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+            "journal retains SQLite's hot-journal header"
+        );
+        assert_ne!(fs::read(&path).expect("unrecovered image"), committed);
+        let before = sqlite_tree_bytes(&path);
+
+        let error = forbid_observational_sqlite_open(|| observe_sqlite_database(&path))
+            .expect_err("pending rollback recovery must be unavailable");
+        assert!(error.to_string().contains("rollback"), "{error}");
+        assert_eq!(sqlite_tree_bytes(&path), before);
     }
 
     #[test]

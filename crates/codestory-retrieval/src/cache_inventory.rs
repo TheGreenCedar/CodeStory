@@ -558,6 +558,7 @@ mod tests {
     use crate::config::{RETRIEVAL_STATE_FILE, with_test_cache_root};
     use crate::retention::{GenerationRetentionMarker, write_retention_marker};
     use codestory_store::{RetrievalIndexManifest, Store};
+    use rusqlite::Connection;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -641,6 +642,66 @@ mod tests {
             "inventory must not create a probe under the cache root at all: {:?}",
             after.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn live_wal_inventory_keeps_file_bytes_without_logical_sqlite_open() {
+        let cache = tempdir().expect("cache root");
+        let project_cache = cache.path().join("00112233445566aa");
+        std::fs::create_dir_all(&project_cache).expect("project cache");
+        let database = project_cache.join("codestory.db");
+        let writer = Connection::open(&database).expect("open writer");
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(value BLOB);
+                 INSERT INTO payload(value) VALUES (zeroblob(4096));",
+            )
+            .expect("commit live WAL");
+        let wal = project_cache.join("codestory.db-wal");
+        let shm = project_cache.join("codestory.db-shm");
+        assert!(std::fs::metadata(&wal).expect("live WAL").len() > 0);
+        assert!(shm.is_file(), "writer has complete WAL pair");
+        let before = snapshot_tree(cache.path());
+
+        let report = with_test_cache_root(cache.path(), cache_inventory).expect("inventory");
+        assert_eq!(
+            snapshot_tree(cache.path()),
+            before,
+            "inventory changed live tree"
+        );
+        assert!(
+            report
+                .sqlite_databases
+                .iter()
+                .all(|row| row.path != database.display().to_string()),
+            "live WAL must have no logical SQLite row"
+        );
+        assert!(
+            report.errors.iter().any(|error| {
+                error.contains("SQLite logical observation unavailable")
+                    && error.contains("live WAL")
+            }),
+            "inventory must explain unavailable logical observation: {:?}",
+            report.errors
+        );
+        assert!(
+            !report.partial_scan,
+            "a complete filesystem scan remains complete despite unavailable SQL"
+        );
+        for name in ["codestory.db", "codestory.db-wal", "codestory.db-shm"] {
+            let path = project_cache.join(name);
+            let relative = format!("00112233445566aa/{name}");
+            let expected = std::fs::metadata(&path).expect("file bytes").len();
+            assert!(
+                report.entries.iter().any(|entry| {
+                    entry.relative_path == relative && entry.apparent_bytes == expected
+                }),
+                "filesystem bytes missing for {relative}"
+            );
+        }
+        drop(writer);
     }
 
     fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
