@@ -425,6 +425,18 @@ fn dependency_file_ids(fact: &CallResolutionFact) -> BTreeSet<FileId> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProofValidationMode {
+    LiveSource,
+    StoredCore,
+}
+
+impl ProofValidationMode {
+    fn authenticates_live_source(self) -> bool {
+        self == Self::LiveSource
+    }
+}
+
 struct ProofResolutionValidationContext {
     file_by_id: HashMap<i64, FileInfo>,
     file_content_hash_by_id: HashMap<i64, String>,
@@ -460,7 +472,7 @@ struct ProofResolutionValidationContext {
     go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
-    live_go_sources_authenticated: bool,
+    mode: ProofValidationMode,
 }
 
 #[derive(Default)]
@@ -1340,7 +1352,7 @@ fn python_dependency_ids(
             .ok_or_else(|| proof_error("Python source path has no package directory"))?
             .to_path_buf();
         for _ in 0..depth {
-            expected.insert(python_live_package_marker(context, &base)?);
+            expected.insert(python_package_marker(context, &base)?);
             base = base.parent().map(Path::to_path_buf).ok_or_else(|| {
                 proof_error("Python relative import escapes the classic package root")
             })?;
@@ -1357,7 +1369,7 @@ fn python_dependency_ids(
         }
         for component in &components[..components.len() - 1] {
             base.push(component);
-            expected.insert(python_live_package_marker(context, &base)?);
+            expected.insert(python_package_marker(context, &base)?);
         }
         let target = fact.target.expect("Exact Python fact has a target");
         let target_file_id = context
@@ -1370,7 +1382,7 @@ fn python_dependency_ids(
             .get(&target_file_id.0)
             .ok_or_else(|| proof_error("Python imported target file is missing"))?;
         let leaf = components.last().expect("relative module has a component");
-        let target_ids = python_live_module_candidates(context, &base, leaf)?;
+        let target_ids = python_module_candidates(context, &base, leaf)?;
         if target_ids.as_slice() != [FileId(target_file.id)] {
             return Err(proof_error(
                 "Python relative import has no unique indexed native module target",
@@ -1420,6 +1432,72 @@ fn prepare_python_file_ids_by_path(
             .push(FileId(file.id));
     }
     by_path
+}
+
+fn python_package_marker(
+    context: &ProofResolutionValidationContext,
+    directory: &Path,
+) -> Result<FileId, StorageError> {
+    if context.mode.authenticates_live_source() {
+        return python_live_package_marker(context, directory);
+    }
+    let marker = directory.join("__init__.py");
+    let markers = context
+        .python_file_ids_by_path
+        .get(&marker)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let [file_id] = markers else {
+        return Err(proof_error(
+            "stored Python relative import has no unique indexed package marker",
+        ));
+    };
+    let file = context
+        .file_by_id
+        .get(&file_id.0)
+        .ok_or_else(|| proof_error("stored Python package marker file is missing"))?;
+    if !file.indexed || !file.complete {
+        return Err(proof_error(
+            "stored Python package marker is not indexed-complete",
+        ));
+    }
+    Ok(*file_id)
+}
+
+fn python_module_candidates(
+    context: &ProofResolutionValidationContext,
+    base: &Path,
+    leaf: &str,
+) -> Result<Vec<FileId>, StorageError> {
+    if context.mode.authenticates_live_source() {
+        return python_live_module_candidates(context, base, leaf);
+    }
+    let file = base.join(leaf).with_extension("py");
+    let package = base.join(leaf).join("__init__.py");
+    let mut candidates = Vec::new();
+    for path in [&file, &package] {
+        let Some(indexed) = context.python_file_ids_by_path.get(path) else {
+            continue;
+        };
+        let [file_id] = indexed.as_slice() else {
+            return Err(proof_error(
+                "stored Python relative import candidate is not uniquely indexed",
+            ));
+        };
+        let source = context
+            .file_by_id
+            .get(&file_id.0)
+            .ok_or_else(|| proof_error("stored Python module candidate file is missing"))?;
+        if !source.indexed || !source.complete {
+            return Err(proof_error(
+                "stored Python module candidate is not indexed-complete",
+            ));
+        }
+        candidates.push(*file_id);
+    }
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
 }
 
 fn python_live_package_marker(
@@ -1926,7 +2004,7 @@ mod go_replay_complexity_tests {
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
-            live_go_sources_authenticated: true,
+            mode: ProofValidationMode::LiveSource,
         };
         for _ in 0..lookup_count {
             go_package_dependency_ids(FileId(1), &BTreeSet::from([FileId(1)]), &context)
@@ -2105,7 +2183,7 @@ mod python_replay_complexity_tests {
             go_package_identity_by_file: HashMap::new(),
             go_dependency_ids_by_package: HashMap::new(),
             go_attestation_error_by_file: HashMap::new(),
-            live_go_sources_authenticated: true,
+            mode: ProofValidationMode::LiveSource,
         };
         for _ in 0..fact_count {
             python_dependency_ids(
@@ -2235,7 +2313,7 @@ mod ruby_php_replay_complexity_tests {
             go_package_identity_by_file: HashMap::new(),
             go_dependency_ids_by_package: HashMap::new(),
             go_attestation_error_by_file: HashMap::new(),
-            live_go_sources_authenticated: true,
+            mode: ProofValidationMode::LiveSource,
         };
         let fact = CallResolutionFact {
             fact_id: String::new(),
@@ -2385,10 +2463,7 @@ fn python_raw_import_marker_is_admissible(edge: &Edge, nodes: &HashMap<NodeId, N
 }
 
 impl ProofResolutionValidationContext {
-    fn prepare(
-        storage: &Storage,
-        authenticate_live_go_sources: bool,
-    ) -> Result<Self, StorageError> {
+    fn prepare(storage: &Storage, mode: ProofValidationMode) -> Result<Self, StorageError> {
         let files = storage.get_files()?;
         let file_by_id = files.iter().cloned().map(|file| (file.id, file)).collect();
         let (rust_file_ids_by_path, rust_root_count_by_directory) =
@@ -2398,13 +2473,13 @@ impl ProofResolutionValidationContext {
         let python_attestation_error_by_file = prepare_python_source_attestation(
             &file_by_id,
             &file_content_hash_by_id,
-            authenticate_live_go_sources,
+            mode.authenticates_live_source(),
         );
         let (
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
-        ) = if authenticate_live_go_sources {
+        ) = if mode.authenticates_live_source() {
             prepare_go_package_closure(&file_by_id, &file_content_hash_by_id)
         } else {
             (HashMap::new(), HashMap::new(), HashMap::new())
@@ -2622,13 +2697,17 @@ impl ProofResolutionValidationContext {
             dart_runtime_closed_nodes,
             dart_overridden_owner_methods,
             dart_ancestry_invalid_domains,
-        ) = prepare_dart_dispatch_closure(
-            &files,
-            &file_content_hash_by_id,
-            &node_by_id,
-            &csd_domain_identity_by_file,
-            &member_by_owner_and_name,
-        );
+        ) = if mode.authenticates_live_source() {
+            prepare_dart_dispatch_closure(
+                &files,
+                &file_content_hash_by_id,
+                &node_by_id,
+                &csd_domain_identity_by_file,
+                &member_by_owner_and_name,
+            )
+        } else {
+            (HashSet::new(), HashSet::new(), HashSet::new())
+        };
         Ok(Self {
             file_by_id,
             file_content_hash_by_id,
@@ -2663,7 +2742,7 @@ impl ProofResolutionValidationContext {
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
-            live_go_sources_authenticated: authenticate_live_go_sources,
+            mode,
         })
     }
 
@@ -3066,7 +3145,7 @@ impl Storage {
     fn validate_facts_against_graph(
         &self,
         facts: &[CallResolutionFact],
-        authenticate_live_go_sources: bool,
+        mode: ProofValidationMode,
     ) -> Result<(), StorageError> {
         for fact in facts {
             if fact.provenance.language_adapter == "bash" {
@@ -3080,8 +3159,7 @@ impl Storage {
             }
             validate_fact_seal(fact)?;
         }
-        let context =
-            ProofResolutionValidationContext::prepare(self, authenticate_live_go_sources)?;
+        let context = ProofResolutionValidationContext::prepare(self, mode)?;
         let exact_fact_indices = facts
             .iter()
             .enumerate()
@@ -3293,7 +3371,7 @@ impl Storage {
                     "Go exact import evidence has no authenticated module-domain receipt",
                 ));
             }
-            required_dependency_ids = if context.live_go_sources_authenticated {
+            required_dependency_ids = if context.mode.authenticates_live_source() {
                 go_package_dependency_ids(fact.callsite.file_id, &required_dependency_ids, context)?
             } else {
                 stored_go_package_dependency_ids(
@@ -3448,8 +3526,13 @@ impl Storage {
                     .and_then(|node| node.file_node_id)
                     .and_then(|file| context.csd_domain_identity_by_file.get(&file.0))
                     .is_none_or(|domain| context.dart_ancestry_invalid_domains.contains(domain));
+                // Full publication reauthenticates final/sealed and override
+                // declarations from source. Stored-only rebind preserves the
+                // already-sealed Exact fact and rechecks its graph and complete
+                // dependency domain without requiring vanished source bytes.
                 if ancestry_invalid
-                    || (!direct_construction
+                    || (context.mode.authenticates_live_source()
+                        && !direct_construction
                         && (!context.dart_runtime_closed_nodes.contains(&owner)
                             || context
                                 .dart_overridden_owner_methods
@@ -4292,7 +4375,7 @@ impl Storage {
                 ))
         });
         facts.extend(linear_facts);
-        self.validate_facts_against_graph(&facts, true)?;
+        self.validate_facts_against_graph(&facts, ProofValidationMode::LiveSource)?;
         let mut exact_callsites = HashSet::new();
         if facts.iter().any(|fact| {
             !exact_callsites.insert((
@@ -4520,7 +4603,7 @@ impl Storage {
             return Ok(None);
         };
         let (manifest, facts) = self.validate_proof_resolution_receipt(previous)?;
-        self.validate_facts_against_graph(&facts, false)?;
+        self.validate_facts_against_graph(&facts, ProofValidationMode::StoredCore)?;
         let inherited = proof_resolution_publication_validation(manifest, &facts)?;
         self.rebind_validated_proof_resolution_source_identities(
             &inherited,
@@ -4794,7 +4877,10 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
-        let validation = self.validate_proof_resolution_publication_contents(publication, true)?;
+        let validation = self.validate_proof_resolution_publication_contents(
+            publication,
+            ProofValidationMode::LiveSource,
+        )?;
         *self.cache.produced_proof_resolution_validation.write() = Some(validation.clone());
         Ok(validation.manifest)
     }
@@ -4803,8 +4889,11 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
-        self.validate_proof_resolution_publication_contents(publication, false)
-            .map(|validation| validation.manifest)
+        self.validate_proof_resolution_publication_contents(
+            publication,
+            ProofValidationMode::StoredCore,
+        )
+        .map(|validation| validation.manifest)
     }
 
     pub(crate) fn validate_stored_legacy_v32_proof_resolution_publication(
@@ -4846,7 +4935,7 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
-        self.validate_facts_against_graph(&facts, false)?;
+        self.validate_facts_against_graph(&facts, ProofValidationMode::StoredCore)?;
         proof_resolution_publication_validation(manifest, &facts)
             .map(|validation| validation.manifest)
     }
@@ -4854,10 +4943,10 @@ impl Storage {
     fn validate_proof_resolution_publication_contents(
         &self,
         publication: &IndexPublicationRecord,
-        authenticate_live_go_sources: bool,
+        mode: ProofValidationMode,
     ) -> Result<ProofResolutionPublicationValidation, StorageError> {
         let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
-        self.validate_facts_against_graph(&facts, authenticate_live_go_sources)?;
+        self.validate_facts_against_graph(&facts, mode)?;
         proof_resolution_publication_validation(manifest, &facts)
     }
 
@@ -5036,7 +5125,10 @@ impl Storage {
             ));
         }
         tx.commit()?;
-        let validation = self.validate_proof_resolution_publication_contents(next, false)?;
+        let validation = self.validate_proof_resolution_publication_contents(
+            next,
+            ProofValidationMode::StoredCore,
+        )?;
         *self.cache.produced_proof_resolution_validation.write() = Some(validation.clone());
         Ok(Some(validation.manifest))
     }
