@@ -4,6 +4,9 @@ use std::path::Path;
 #[cfg(test)]
 thread_local! {
     static CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLONE_COPY_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLONE_COPY_FALLBACK_USED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OWNER_WRITABLE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PUBLICATION_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -22,6 +25,31 @@ pub(crate) fn with_clone_disabled<T>(action: impl FnOnce() -> T) -> T {
         drop(restore);
         result
     })
+}
+
+#[cfg(test)]
+pub(crate) fn with_clone_copy_fallback_and_writable_failure<T>(
+    fail_writable: bool,
+    action: impl FnOnce() -> T,
+) -> (T, bool) {
+    struct Restore(bool, bool, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLONE_COPY_FALLBACK.set(self.0);
+            CLONE_COPY_FALLBACK_USED.set(self.1);
+            OWNER_WRITABLE_FAILURE.set(self.2);
+        }
+    }
+
+    let restore = Restore(
+        CLONE_COPY_FALLBACK.replace(true),
+        CLONE_COPY_FALLBACK_USED.replace(false),
+        OWNER_WRITABLE_FAILURE.replace(fail_writable),
+    );
+    let result = action();
+    let used_copy_fallback = CLONE_COPY_FALLBACK_USED.get();
+    drop(restore);
+    (result, used_copy_fallback)
 }
 
 #[cfg(test)]
@@ -62,7 +90,14 @@ pub(crate) fn clone_file(source: &Path, destination: &Path) -> Result<bool> {
         bail!("copy-on-write clone destination already exists");
     }
 
-    clone_file_platform(source, destination)
+    let cloned = clone_file_platform(source, destination)?;
+    #[cfg(test)]
+    if !cloned && CLONE_COPY_FALLBACK.get() {
+        std::fs::copy(source, destination).context("copy clone fixture after unsupported CoW")?;
+        CLONE_COPY_FALLBACK_USED.set(true);
+        return Ok(true);
+    }
+    Ok(cloned)
 }
 
 /// Give another immutable generation a direct filesystem reference to the
@@ -171,6 +206,14 @@ pub(crate) fn make_file_owner_writable(path: &Path) -> Result<()> {
         bail!("staged component is not a regular file");
     }
     let permissions = owner_writable_permissions(metadata.permissions());
+    #[cfg(test)]
+    if OWNER_WRITABLE_FAILURE.get() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected staged component permissions failure",
+        ))
+        .with_context(|| format!("make staged component owner-writable {}", path.display()));
+    }
     std::fs::set_permissions(path, permissions)
         .with_context(|| format!("make staged component owner-writable {}", path.display()))
 }
