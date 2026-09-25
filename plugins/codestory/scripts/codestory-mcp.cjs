@@ -4486,7 +4486,6 @@ function runFailOpenMcp(status, options = {}) {
     return catalogFailure ? catalogFailureStatus(current, catalogFailure) : current;
   };
   let handoff = null;
-  let handoffWrite = null;
   let handoffDispatch = null;
   let handoffValidated = false;
   let initializeRequest = null;
@@ -4521,14 +4520,16 @@ function runFailOpenMcp(status, options = {}) {
       return null;
     }
     handoff = options.startRuntime(liveStatus);
+    const activeHandoff = handoff;
     handoffStderrObservation = null;
     handoffFailureHandled = false;
+    const ownsHandoff = () => handoff === activeHandoff && !handoffFailureHandled;
     let initializeTimer = null;
     const failHandoff = (reasonCode, details = {}) => {
-      if (handoffFailureHandled) return;
+      if (!ownsHandoff()) return;
       handoffFailureHandled = true;
       clearTimeout(initializeTimer);
-      const failedHandoff = handoff;
+      const failedHandoff = activeHandoff;
       const stderrObservation = renderRuntimeStderrTail(handoffStderrObservation);
       const failureDetails = {
         code: Number.isSafeInteger(details.code) ? details.code : null,
@@ -4548,7 +4549,6 @@ function runFailOpenMcp(status, options = {}) {
       };
       const detailedReason = runtimeFailureDetail(reasonCode, failureDetails);
       handoff = null;
-      handoffWrite = null;
       handoffDispatch = null;
       shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
@@ -4569,12 +4569,12 @@ function runFailOpenMcp(status, options = {}) {
         ...failureDetails,
       });
     };
-    handoffWrite = (line) => {
+    const writeToChild = (line) => {
       try {
-        if (!handoff?.stdin || handoff.stdin.destroyed) {
+        if (!ownsHandoff() || !activeHandoff?.stdin || activeHandoff.stdin.destroyed) {
           throw Object.assign(new Error('child stdin is unavailable'), { code: 'EPIPE' });
         }
-        handoff.stdin.write(`${line}\n`, (error) => {
+        activeHandoff.stdin.write(`${line}\n`, (error) => {
           if (error) {
             failHandoff('runtime_stdio_child_stdin', {
               errorCode: error?.code,
@@ -4595,7 +4595,8 @@ function runFailOpenMcp(status, options = {}) {
     const queuedLines = [];
     let queuedBytes = 0;
     handoffDispatch = (line) => {
-      if (handoffValidated) return handoffWrite(line);
+      if (!ownsHandoff()) return false;
+      if (handoffValidated) return writeToChild(line);
       queuedBytes += Buffer.byteLength(line, 'utf8') + 1;
       if (queuedBytes > failOpenMaxFrameBytes) {
         failHandoff('runtime_stdio_child_stdin', { errorCode: 'handoff_queue_full' });
@@ -4604,23 +4605,24 @@ function runFailOpenMcp(status, options = {}) {
       queuedLines.push(line);
       return true;
     };
-    handoff.stdin?.on?.('error', (error) => {
+    activeHandoff.stdin?.on?.('error', (error) => {
       failHandoff('runtime_stdio_child_stdin', {
         errorCode: error?.code,
         stdinError: true,
       });
     });
-    if (handoff.stdout) {
+    if (activeHandoff.stdout) {
       let stdout = '';
-      handoff.stdout.setEncoding('utf8');
-      handoff.stdout.on('data', (chunk) => {
+      activeHandoff.stdout.setEncoding('utf8');
+      activeHandoff.stdout.on('data', (chunk) => {
         // A failed handoff stops relaying immediately. Chunks that arrive after
         // the failure carry results from a runtime the launcher already refused.
-        if (handoffFailureHandled) return;
+        if (!ownsHandoff()) return;
         stdout += chunk;
         const lines = stdout.split(/\r?\n/u);
         stdout = lines.pop() || '';
         for (const output of lines) {
+          if (!ownsHandoff()) return;
           if (!output) continue;
           let parsed = null;
           try {
@@ -4643,11 +4645,11 @@ function runFailOpenMcp(status, options = {}) {
             clearTimeout(initializeTimer);
             handoffValidated = true;
             for (const line of queuedLines) {
-              if (!handoffWrite(line)) return;
+              if (!ownsHandoff() || !writeToChild(line)) return;
             }
             queuedLines.length = 0;
             queuedBytes = 0;
-            if (stdinEnded) shutdownHandoffChild(handoff, options);
+            if (stdinEnded && ownsHandoff()) shutdownHandoffChild(activeHandoff, options);
             continue;
           }
           for (const reply of Array.isArray(parsed) ? parsed : [parsed]) {
@@ -4657,22 +4659,24 @@ function runFailOpenMcp(status, options = {}) {
         }
       });
     }
-    if (handoff.stderr) {
-      handoff.stderr.setEncoding?.('utf8');
-      handoff.stderr.on('data', (chunk) => {
+    if (activeHandoff.stderr) {
+      activeHandoff.stderr.setEncoding?.('utf8');
+      activeHandoff.stderr.on('data', (chunk) => {
+        if (!ownsHandoff()) return;
         // Drain child stderr without retaining its free-form bytes. Only
         // saturating byte/chunk counts cross the diagnostic boundary.
         handoffStderrObservation = appendRuntimeStderrTail(handoffStderrObservation, chunk);
       });
     }
-    handoff.on('close', (code, signal) => {
+    activeHandoff.on('close', (code, signal) => {
+      if (!ownsHandoff()) return;
       if (signal || code || !handoffValidated) {
         failHandoff('runtime_stdio_child_exit', { code, signal });
         return;
       }
       process.exit(0);
     });
-    handoff.on('error', (error) => {
+    activeHandoff.on('error', (error) => {
       failHandoff('runtime_stdio_child_spawn', {
         errorCode: error?.code,
         spawnError: true,
@@ -4683,14 +4687,14 @@ function runFailOpenMcp(status, options = {}) {
         failHandoff('runtime_stdio_child_exit', { errorCode: 'initialize_timeout' });
       }, options.handoffInitializeTimeoutMs ?? 5000);
       initializeTimer.unref?.();
-      if (handoffWrite(JSON.stringify(initializeRequest))) {
-        handoffWrite?.(JSON.stringify(initializedNotification || {
+      if (writeToChild(JSON.stringify(initializeRequest))) {
+        writeToChild(JSON.stringify(initializedNotification || {
           jsonrpc: '2.0',
           method: 'notifications/initialized',
         }));
       }
     }
-    if (stdinEnded && handoffValidated) shutdownHandoffChild(handoff, options);
+    if (stdinEnded && handoffValidated && ownsHandoff()) shutdownHandoffChild(activeHandoff, options);
     return handoff;
   };
   // Fail-open serves the project-bound status template and static guide. Do

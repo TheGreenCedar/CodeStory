@@ -614,6 +614,59 @@ test("handoff fails pending calls when child initialize ends or rejects", () => 
   }
 });
 
+test("late events from a refused child cannot affect the retry handoff", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const revision = "2025-03-26";
+  const validInitialize = {
+    jsonrpc: "2.0", id: "init",
+    result: {
+      protocolVersion: revision,
+      _meta: {
+        codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
+        codestory_publication: { schema_version: 3, minimum_compatible_schema_version: 3 },
+      },
+    },
+  };
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "ready" }, warnings: [], readiness: [],
+    managed_retrieval: { state: "ready", automatic: true },
+  };
+  const fixture = [
+    "const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');",
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `const valid=${JSON.stringify(validInitialize)};const status=${JSON.stringify(status)};`,
+    "const children=[];const failures=[];",
+    "function makeChild(){const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;child.frames=[];",
+    "let input='';child.stdin.setEncoding('utf8');child.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);child.frames.push(frame);if(children.length===2&&frame.id==='second')child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'second',result:{from:'second-child'}})+'\\n');}});children.push(child);return child;}",
+    "run(status,{shouldHandoff:()=>true,startRuntime:makeChild,onRuntimeFailure:(failure)=>failures.push(failure.reasonCode),handoffInitializeTimeoutMs:500});",
+    "const send=(frame)=>process.stdin.emit('data',JSON.stringify(frame)+'\\n');",
+    `send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});`,
+    "send({jsonrpc:'2.0',method:'notifications/initialized'});",
+    `send({jsonrpc:'2.0',id:'first',method:'tools/call',params:{name:'status',arguments:{project:${JSON.stringify(repoRoot)}}}});`,
+    "const skew=structuredClone(valid);skew.result._meta.codestory_publication.schema_version=99;children[0].stdout.write(JSON.stringify(skew)+'\\n');",
+    `send({jsonrpc:'2.0',id:'second',method:'tools/call',params:{name:'status',arguments:{project:${JSON.stringify(repoRoot)}}}});`,
+    "const before=children[1].frames.map((frame)=>frame.method||frame.id);",
+    "children[0].stdout.write(JSON.stringify({jsonrpc:'2.0',id:'second',result:{from:'old-child'}})+'\\n');",
+    "children[0].stderr.write('old child stderr');",
+    "const oldError=Object.assign(new Error('late old child'),{code:'EPIPE'});children[0].stdin.emit('error',oldError);children[0].emit('error',oldError);children[0].emit('close',0,null);",
+    "children[1].stdout.write(JSON.stringify(valid)+'\\n');",
+    "process.stderr.write('PROBE:'+JSON.stringify({before,after:children[1].frames.map((frame)=>frame.method||frame.id),secondStdinEnded:children[1].stdin.writableEnded,failures})+'\\n');",
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["-e", fixture], { encoding: "utf8", timeout: 5000 });
+  assert.equal(result.status, 0, result.stderr);
+  const probe = JSON.parse(result.stderr.split(/\r?\n/u).find((line) => line.startsWith("PROBE:")).slice(6));
+  assert.deepEqual(probe.before, ["initialize", "notifications/initialized"]);
+  assert.deepEqual(probe.after, ["initialize", "notifications/initialized", "tools/call"]);
+  assert.equal(probe.secondStdinEnded, false);
+  assert.deepEqual(probe.failures, ["runtime_wire_contract_skew"]);
+  const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(frames.filter((frame) => frame.id === "first" && frame.error?.code === -32000).length, 1);
+  assert.deepEqual(frames.filter((frame) => frame.id === "second"), [
+    { jsonrpc: "2.0", id: "second", result: { from: "second-child" } },
+  ]);
+});
+
 test("fail-open preparing is a successful revision-native result in every profile", () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const status = {
