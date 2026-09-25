@@ -1089,6 +1089,7 @@ impl WorkspaceDiscovery {
         let mut seen = HashSet::new();
         let mut issues = repository_metadata_issues;
         let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
+        let mut warned_non_source_symlinks = HashSet::new();
         let mut inspected_source_roots = 0usize;
         #[cfg(test)]
         manifest.discovery_walk_count.set(0);
@@ -1234,7 +1235,11 @@ impl WorkspaceDiscovery {
                             // Helm U08 / dep-fs fixtures: dangling or device
                             // symlinks are observed and skipped; they must not
                             // demote a otherwise-complete inventory to Partial.
-                            warnings.push(skipped);
+                            push_non_source_symlink_warning(
+                                &mut warnings,
+                                &mut warned_non_source_symlinks,
+                                skipped,
+                            );
                             continue;
                         }
                         record_walk_error(&mut issues, &walk.path, &error);
@@ -1243,7 +1248,11 @@ impl WorkspaceDiscovery {
                 };
                 if let Some(error) = entry.error() {
                     if let Some(skipped) = non_source_symlink_walk_skip(error) {
-                        warnings.push(skipped);
+                        push_non_source_symlink_warning(
+                            &mut warnings,
+                            &mut warned_non_source_symlinks,
+                            skipped,
+                        );
                     } else {
                         record_walk_error(&mut issues, entry.path(), error);
                     }
@@ -1295,7 +1304,11 @@ impl WorkspaceDiscovery {
                         &discovery_exclusions,
                         manifest.is_synthetic_default.get(),
                     ) {
-                        warnings.push(warning);
+                        push_non_source_symlink_warning(
+                            &mut warnings,
+                            &mut warned_non_source_symlinks,
+                            warning,
+                        );
                     }
                     continue;
                 }
@@ -2003,6 +2016,28 @@ fn non_source_symlink_walk_skip(error: &ignore::Error) -> Option<WorkspaceInvent
                 "skipped non-regular symlink target during discovery follow; not admitted as source ({error})"
             ),
         }),
+    }
+}
+
+fn push_non_source_symlink_warning(
+    warnings: &mut Vec<WorkspaceInventoryIssue>,
+    warned_paths: &mut HashSet<String>,
+    warning: WorkspaceInventoryIssue,
+) {
+    // A tracked link can be observed by the walk, tracked recovery, and more
+    // than one source route. Keep the first attributed diagnostic for its link.
+    let path = &warning.path;
+    let parent = path.parent().unwrap_or(path);
+    let stable_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexical_path(parent));
+    let stable_path = path
+        .file_name()
+        .map(|name| stable_parent.join(name))
+        .unwrap_or_else(|| normalize_lexical_path(path));
+    let key = normalize_path_key(&stable_path);
+    if warned_paths.insert(key) {
+        warnings.push(warning);
     }
 }
 
@@ -3526,15 +3561,114 @@ mod tests {
         assert!(inventory.files.contains(&visible));
         assert!(!inventory.files.contains(&dangling));
         assert!(!inventory.files.contains(&nonregular));
+        let dangling_warnings = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == dangling)
+            .collect::<Vec<_>>();
+        assert_eq!(dangling_warnings.len(), 1, "{inventory:?}");
+        assert!(dangling_warnings[0].message.contains("dangling symlink"));
+        let nonregular_warnings = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == nonregular)
+            .collect::<Vec<_>>();
+        assert_eq!(nonregular_warnings.len(), 1, "{inventory:?}");
         assert!(
-            inventory.warnings.iter().any(|warning| {
-                warning.path == dangling && warning.message.contains("dangling symlink")
-            }),
-            "{inventory:?}"
+            nonregular_warnings[0]
+                .message
+                .contains("non-regular symlink")
         );
-        assert!(inventory.warnings.iter().any(|warning| {
-            warning.path == nonregular && warning.message.contains("non-regular symlink")
-        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walked_tracked_symlinks_have_one_attributed_warning_each() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let dangling = root.join("Dangling.rs");
+        let nonregular = root.join("Device.rs");
+        let visible = root.join("Visible.rs");
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        symlink("/dev/null", &nonregular)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &["add", "-f", "Dangling.rs", "Device.rs", "Visible.rs"],
+        )?;
+
+        let inventory = WorkspaceManifest::open(root)?.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        for (link, kind) in [
+            (&dangling, "dangling symlink"),
+            (&nonregular, "non-regular symlink"),
+        ] {
+            assert!(!inventory.files.contains(link));
+            let matching = inventory
+                .warnings
+                .iter()
+                .filter(|warning| warning.path == *link)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{inventory:?}");
+            assert!(matching[0].message.contains(kind));
+            if link == &dangling {
+                assert!(
+                    matching[0].message.contains("during discovery follow"),
+                    "{inventory:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_coalesced_routes_warn_once_for_tracked_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let dangling = nested.join("Dangling.rs");
+        let visible = nested.join("Visible.rs");
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &["add", "-f", "nested/Dangling.rs", "nested/Visible.rs"],
+        )?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "overlapping".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, nested, &[]),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        assert!(!inventory.files.contains(&dangling));
+        let matching = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == dangling)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{inventory:?}");
         Ok(())
     }
 
