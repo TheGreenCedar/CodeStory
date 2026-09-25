@@ -1143,15 +1143,18 @@ mod tests {
         // Unix can unlink a rejected owned stage while another SQLite reader
         // still has it open. Windows may retain the file until that reader exits.
         #[cfg(unix)]
-        assert!(!staged_path.exists(), "rejected owned stage must be removed");
+        assert!(
+            !staged_path.exists(),
+            "rejected owned stage must be removed"
+        );
         drop(reader);
         Store::discard_staged_snapshot(&staged_path).expect("discard failed stage sidecars");
         crate::core_generation::remove_staging_database(&staged_path)
             .expect("discard rejected owned stage after reader closes");
         assert!(!staged_path.exists());
 
-        let mut retry = SnapshotStore::open_disposable_full_refresh(&live_path)
-            .expect("open retry stage");
+        let mut retry =
+            SnapshotStore::open_disposable_full_refresh(&live_path).expect("open retry stage");
         retry
             .store_mut()
             .put_index_publication(&publication)
