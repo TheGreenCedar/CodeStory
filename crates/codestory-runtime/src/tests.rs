@@ -5075,6 +5075,82 @@ fn exact_proof_rematerializes_for_full_and_incremental_edits_and_faults_preserve
 }
 
 #[test]
+fn incremental_nongraph_generated_marker_retires_exact_csharp_proof() {
+    use codestory_contracts::proof_resolution::ProofResolutionStatus;
+
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source = workspace.path().join("Exact.cs");
+    let before = "static class Calls { static void Target() {} static void Caller() { Target(); } }\n// sourceonly\n";
+    let after = "static class Calls { static void Target() {} static void Caller() { Target(); } }\n// @generated\n";
+    assert_eq!(before.len(), after.len());
+    fs::write(&source, before).expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+    let baseline = Storage::open(&storage_path).expect("open baseline");
+    let baseline_facts = baseline
+        .get_proof_resolution_facts()
+        .expect("baseline facts");
+    let baseline_fact = baseline_facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("same-file call fact");
+    assert_eq!(baseline_fact.status, ProofResolutionStatus::Exact);
+    let old_hash = baseline_fact.callsite.source_sha256.clone();
+    drop(baseline);
+
+    fs::write(&source, after).expect("poison comment");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("publish edited core");
+    let storage = Storage::open(&storage_path).expect("open edited core");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    storage
+        .validate_proof_resolution_publication(&publication)
+        .expect("valid proof publication");
+    let facts = storage.get_proof_resolution_facts().expect("edited facts");
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("same-file call fact");
+    assert_ne!(fact.callsite.source_sha256, old_hash);
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert!(fact.evidence_chain.is_empty());
+
+    let fresh = tempfile::tempdir().expect("fresh workspace");
+    fs::write(fresh.path().join("Exact.cs"), after).expect("fresh source");
+    let fresh_storage_path = fresh.path().join(".cache").join("codestory.db");
+    let fresh_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    fresh_controller
+        .open_project_summary_with_storage_path(
+            fresh.path().to_path_buf(),
+            fresh_storage_path.clone(),
+        )
+        .expect("open fresh project");
+    fresh_controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("fresh full publication");
+    let fresh_storage = Storage::open(&fresh_storage_path).expect("open fresh core");
+    let fresh_facts = fresh_storage
+        .get_proof_resolution_facts()
+        .expect("fresh facts");
+    let fresh_fact = fresh_facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("fresh same-file call fact");
+    assert_eq!(fact.status, fresh_fact.status);
+}
+
+#[test]
 fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source() {
     let _env = hybrid_test_env();
     let workspace = tempfile::tempdir().expect("workspace");

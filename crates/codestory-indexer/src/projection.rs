@@ -100,6 +100,15 @@ pub(crate) fn build_callable_projection_states(
         });
     }
 
+    // SQLite retains the last row for each `(file_id, symbol_key)`. A callable
+    // discarded by that rule has no caller-scoped repair row, so its edges and
+    // occurrences must remain inside the file fence.
+    let mut states_by_key = BTreeMap::new();
+    for state in states {
+        states_by_key.insert(state.symbol_key.clone(), state);
+    }
+    let mut states = states_by_key.into_values().collect::<Vec<_>>();
+
     if let Some(file_node) = nodes.iter().find(|node| node.kind == NodeKind::FILE) {
         let repaired_callables = CallableProjectionExtents::from_states(&states);
         let fence = structural_projection_fence(
@@ -130,16 +139,8 @@ pub(crate) fn build_callable_projection_states(
         });
     }
 
-    // SQLite owns one row per `(file_id, symbol_key)` and its UPSERT contract
-    // retains the last projected row. Canonicalize to that exact shape before
-    // comparing a refresh: otherwise an earlier duplicate can disagree with
-    // the stored last row and manufacture a full replacement even though the
-    // database-visible projection is unchanged.
-    let mut states_by_key = BTreeMap::new();
-    for state in states {
-        states_by_key.insert(state.symbol_key.clone(), state);
-    }
-    states_by_key.into_values().collect()
+    states.sort_by(|left, right| left.symbol_key.cmp(&right.symbol_key));
+    states
 }
 
 /// Tag for a normalized signature whose body projected at least one part.
