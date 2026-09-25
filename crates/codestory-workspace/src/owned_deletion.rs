@@ -42,7 +42,7 @@ impl OwnedDeletionRoot {
         name: &Path,
         max_bytes: u64,
     ) -> io::Result<Option<Vec<u8>>> {
-        let Some(mut file) = self.open_regular_file(name)? else {
+        let Some(file) = self.open_regular_file(name)? else {
             return Ok(None);
         };
         if file.metadata()?.len() > max_bytes {
