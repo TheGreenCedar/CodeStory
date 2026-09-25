@@ -2,265 +2,45 @@
 
 ## Unreleased
 
-Compact packets now distinguish file locations from source evidence. Short,
-complete files remain available as source; larger files whose contents can be
-verified show a navigation path and a continuation gap instead of an arbitrary
-header excerpt.
-
-Full-retrieval search can now find declarations by terms in their attached
-comments, even when those terms do not fit the short symbol summary. Source
-that could not be read within the configured bounds remains marked unavailable
-instead of appearing to have no comment.
-
-On projects with full retrieval ready, broad searches with `--plan-details`
-now run after opening the project instead of reporting an uninitialized search engine.
-
-The grounding skill now tells agents to leave causes unresolved when available
-observations cannot distinguish them, name what would decide among them, and
-rank a cause only when evidence supports the distinction.
-
-Go dependency and impact results no longer connect unrelated files merely
-because they import the same external package. Ambiguous package matches stay
-unresolved instead of selecting an arbitrary target.
-
-Go navigation now follows static calls through local imported packages,
-including explicit aliases and package names that differ from their directory.
-Module changes, malformed controls, and ambiguous local ownership leave those
-calls unresolved instead of retaining or guessing a target.
-
-Go navigation now follows concrete values returned by local factory functions
-into their receiver methods and refreshes those links when declarations change.
-
-Core-only symbol search ranks project files by their project-relative paths, so
-moving a checkout no longer adds unrelated fuzzy results from its absolute root.
-Explicit in-project absolute-path lookup remains available.
-
-Java classes, interfaces, enums, records, and annotation declarations now keep
-their declared visibility during indexing, so semantic retrieval can recognize
-public APIs from that evidence.
-
-Windows core publication again opens the staged `codestory.db` with a
-write-capable handle before its durability sync, so `ground` / activation can
-finish `core_freshness` publish instead of failing with `Access is denied`
-(os error 5).
-
-Explicit full refresh can recover an incomplete incremental fence that has no
-complete publication identity, without promoting that incomplete predecessor as
-a rollback generation. Incomplete images that still carry a complete publication
-continue to fail closed.
-
-Workspace discovery no longer demotes a complete inventory to Partial when
-`follow_links` hits dangling symlink fixtures or non-regular targets (helm-class
-`frobnitz_with_dev_null` → `/dev/null` and intentional broken-symlink testdata).
-Those paths stay out of the admitted source set and surface as warnings, so full
-refresh can proceed instead of failing closed as `source_discovery_incomplete`.
-Other symlink target inspection failures keep discovery incomplete and preserve
-the prior indexed inventory instead of authorizing deletion.
-
-Synthetic workspace discovery keeps Git-tracked source beneath a directory
-named `build` while continuing to exclude untracked build output and other
-default output trees. Filesystem freshness watches `build` paths
-conservatively, so heavy output churn may trigger an extra rescan instead of
-hiding a tracked source change.
-
-Rust indexing no longer aborts on `let` bindings to `async ||` / `async move ||`
-closures (meilisearch-class and surrealdb-class sources). Those bindings stay
-function nodes instead of colliding with the local-variable stanza and failing
-closed as `source_collector_failure`.
-
-OpenAPI/Swagger schema indexing keeps endpoint graph nodes file-owned when
-sibling fixtures share the same method and path, so repos with multiple API
-specs (localstack-class `tests/aws/files/*.json`, kratos-class
-`.schema/openapi.json` + `spec/swagger.json`) can complete full refresh instead
-of failing closed as `source_collector_failure`.
-
-Dense selection no longer treats a `lib` path segment as a package-callable
-surface for Python sources, so CPython-class stdlib trees (`Lib/`) stop forcing
-tens of thousands of ordinary callables into cold retrieval finalize. Ruby/JS
-`lib/` layouts and other package markers stay unchanged; projects are more
-likely to leave `publication@75` under the frozen preparation budget.
-
-Packet descriptor lexical coverage keeps the two-of-three / ~40% gate
-fail-closed: path and symbol tokens are matched in memory, and any remaining
-content tokens are proven by one batched FTS-body read for under-covered
-survivors only—never by inventing tokens for an OR-lane hit or by re-running
-per-token `MATCH … AND rowid IN (…)` queries that burned Keycloak-class
-first-packet budget after `validation@90`.
-
-Activation validation proves SCIP graph readiness from the sealed component
-envelope (marker, revision, non-empty symbols and proofs, and a fresh proof
-adapter contract) instead of loading the full query view, and the first packet
-after a ready lease reuses that lease's source snapshot only when its observer
-epoch is still coherent, so Keycloak-class projects are more likely to leave
-`validation@90` under the frozen preparation budget.
-
-Activation finalization builds lexical, dense-vector, and SCIP graph sidecars
-concurrently and verifies staged SCIP components by digest, so large
-repositories are more likely to leave `publication@75` under the frozen
-preparation budget after dense embed completes.
-
-Packet descriptor preadmission keeps lexical recall near the dense calibration
-window instead of scanning the full fusion pool, so large-repository packets
-are less likely to exhaust the frozen latency budget before handoff.
-
-Indexing accepts valid UTF-8 source containing terminal escape bytes while
-preserving the original bytes. Markdown snippets show those escapes as `\x1b`
-instead of passing them through to the terminal.
-
-Retrieval errors now explain the observed cancellation reason and operation
-stage or readiness-validation checkpoint when that information is available.
-
-Search and packet requests report no indexed evidence when their only matches
-are verified project files outside source indexing, instead of failing to
-resolve them as symbols.
-
-Nested packet requests reuse their active publication instead of repeating
-admission and snapshot setup. Cancellation, deadlines and source-change checks
-still apply to the complete response.
-
-Large fresh semantic indexes use less disk while existing indexes remain readable.
-
-Lexical indexes compress retained raw source while preserving existing search,
-ranking and source evidence. Existing lexical indexes remain readable.
-
-Precise source evidence stores repeated names and paths once, reducing disk use
-while keeping existing indexes readable.
-
-Fallback retrieval preserves the active search deadline and cancellation limits
-when prepared results are unavailable.
-
-Packet retrieval stops starting another stage when its latency allowance runs
-out. Cancellation and deadline checks also apply between mandatory readiness
-checks, without interrupting validation already in progress.
-MCP packet requests include activation and publication checks in their latency
-allowance, so those steps cannot grant retrieval a fresh budget.
-
-Private packet diagnostics retain entry-phase timings so operators can distinguish
-project selection, preparation waits and ready-state checks before retrieval.
-
-Loading precise source evidence uses less temporary disk and rejects malformed
-record ordering.
-
-Project preparation no longer fails when source data contains empty or
-whitespace-only property names.
-
-Managed CLI recovery reclaims interrupted pre-publication extraction directories,
-preventing abandoned runtime copies from accumulating outside retention.
-
-Incremental project refreshes preserve supported in-project source symlinks,
-keeping navigation tied to the selected source path.
-
-Affected test hints preserve graph-backed distances, confidence and reasons
-when the same tests also qualify as package-level suggestions.
-
-Project preparation reuses an unchanged complete source index when search or
-retrieval data needs to be built, avoiding an unnecessary copy of that index.
-It can also prepare search data when no earlier search publication exists.
-
-Route navigation keeps declarations with matching HTTP methods and paths
-separate, preserving links to each declaration’s own file and handler.
-
-Index dry runs inspect the selected project and cache without requiring a prior
-project open, while remaining read-only.
-
-Go method navigation keeps the declared receiver when a nested closure captures
-it, preserving direct calls elsewhere in the method.
-
-Managed CLI installation removes temporary extraction bytes before publishing
-the runtime, so a host interrupted after publication does not retain a duplicate
-runtime copy.
-
-Terraform `.tf` and `.tfvars` files provide exact structural source anchors for
-blocks and assignments without claiming resource-graph or expression semantics.
-
-Search correctly prioritizes extensionless files from the selected project
-without treating files from another working directory as project evidence.
-
-Parser caches compress extraction data to reduce stored bytes while preserving
-source and call-resolution information. Existing caches remain readable.
-
-Proof-resolution indexes store repeated file provenance once per shared group,
-reducing index size without changing proof facts. Existing indexes migrate
-automatically when opened for project preparation.
-
-Canonical symbol lookup indexes store a bounded suffix instead of repeating
-complete identifiers, reducing index storage while preserving exact matches.
-Existing indexes migrate automatically during project preparation.
-
-Vector caching preserves reusable embedding batches when separate symbols share
-one source span, while keeping complete anchor coverage when identity is missing
-or ambiguous.
-
-Dense index rebuilds retain later cached batches before earlier missing work can
-evict them, reducing repeated embedding work when resuming a compatible build.
-
-Fresh project preparation reclaims oversized retained SQLite journal storage
-after active transactions and readers release it.
-
-Project preparation no longer rejects Java packages merely because they contain
-interface-only source files.
-
-Indexing C and C++ no longer crashes on deeply nested syntax trees. Collecting
-calls and declarations in those trees no longer aborts either.
-
-Go navigation no longer binds an ownerless bare call or conversion such as
-`string(...)` or `run()` to an unrelated receiver method. Package functions and
-genuine receiver calls keep their previous targets.
-
-MCP graph navigation (`trail`, `trace`, `callers`, `callees`, `neighbors`,
-`query_subgraph`, `shortest_path`) accepts `caller_scope` so agents can include
-test and bench callers. The default stays production-only, and empty results
-describe that filtered view instead of claiming no graph edges were indexed.
-
-Code-mode hosts can see named navigation arguments, including project routing
-and snippet ranges, when a tool accepts alternative selectors.
-
 ## 0.17.6
 
-CodeStory 0.17.6 lets agents choose how to investigate a repository and puts
-more of the relevant source in their results. Search, inspect code and follow
-relationships in the order the task needs, with native tools available
-throughout.
+CodeStory 0.17.6 improves how agents find, inspect and follow repository evidence. It adds comment-aware search and more accurate language relationships, fixes indexing failures across several source formats, and reduces storage and startup overhead.
 
-- **Inspect useful source directly.** Context results include focused source
-  snippets with verified line ranges and clear truncation limits. C and C++
-  functions returning pointers, and functions assigned to variables in
-  JavaScript, TypeScript and TSX, retain their complete definitions.
-- **Follow relationships from the first index.** Calls and imports are
-  available after full indexing, including when parser results are reused.
-  Affected-code results also suggest relevant tests in the same package.
-- **Follow search results in relevance order.** Results keep their relevance
-  order across the CLI and agent responses.
-- **Retry during CLI installation.** Hosts that validate MCP responses can
-  accept the retry guidance while the CLI installs.
-- **Keep working past broken configuration files.** Malformed text
-  configuration no longer blocks the whole repository index. Unsupported or
-  broken content is reported as a coverage gap. Supported JSONC files accept
-  comments and trailing commas; ordinary JSON remains strict.
-- **Reuse work and keep navigation focused.** Indexing reuses unchanged
-  components and exact vectors, and packets reuse completed retrieval work.
-  Core-only `search --repo-text off` searches an existing symbol index without
-  starting embeddings. File listings focus on project coverage; the full
-  framework catalog remains available on request.
-- **Search linked source files.** Repository search accepts selected symlinks
-  to source files inside the project and retains their selected paths.
-- **Keep bookmarks through upgrades and interruptions.** Cache upgrades
-  preserve bookmarks and annotations. If publishing an updated index fails or
-  is interrupted, the previous complete index remains available for recovery.
+### Source inspection and navigation
+
+- **Search declarations through their comments.** Search can match terms in attached comments even when they fall outside a symbol’s short summary.
+- **Open the source behind a result.** Context and snippet results retain verified line ranges and explicit truncation limits. Qualified method names such as `Owner.method` resolve with file and ambiguity checks. Pointer-returning C and C++ functions and functions assigned to JavaScript, TypeScript and TSX variables retain their complete definitions.
+- **Keep locations distinct from source evidence.** Compact packets include complete short files when possible. Larger files can appear as navigation targets with an explicit follow-up gap, rather than an arbitrary header excerpt presented as source support.
+- **Follow more accurate relationships.** Calls and imports remain available after full indexing and parser-cache reuse. Go navigation follows local package calls, aliases and concrete factory returns into receiver methods, while avoiding false links caused by shared imports, unrelated methods or ambiguous ownership.
+- **Include tests when needed.** Graph navigation accepts `caller_scope` to include test and benchmark callers. Production callers remain the default. Affected-code results preserve graph-backed reasons and also suggest tests from the same package.
+- **Preserve search relevance and project boundaries.** Results retain their relevance order across CLI and agent responses. File matching uses the selected project rather than its checkout location, including for extensionless files and supported source symlinks. File listings default to project coverage; the framework catalog remains available on request.
+- **Inspect configuration alongside code.** Terraform `.tf` and `.tfvars` files expose structural source anchors for blocks and assignments. Route and OpenAPI declarations with identical methods and paths remain attached to their own files and handlers.
+
+### Indexing and recovery
+
+- C and C++ indexing handles deeply nested syntax without overflowing the stack. Rust async closures, interface-only Java packages, Java type visibility, duplicate OpenAPI fixtures and empty property names are handled correctly.
+- Git-tracked source beneath directories named `build` remains discoverable while untracked build output stays excluded.
+- Dangling symlinks and non-regular targets are excluded with warnings. Permission errors and other unresolved inspection failures preserve incomplete status and the previous indexed inventory.
+- Malformed text configuration no longer blocks the entire repository index; unsupported or unreadable content is reported as a coverage gap. Supported JSONC files accept comments and trailing commas while ordinary JSON remains strict.
+- Windows indexing and grounding no longer fail with `Access is denied` when syncing a staged core database.
+- Cache upgrades preserve bookmarks and annotations. Interrupted index publication retains the previous complete publication for recovery, and explicit full refresh can recover eligible incomplete state.
+- Managed CLI installation and recovery remove owned temporary extraction files left by interruptions. MCP hosts can accept retry guidance while installation is in progress.
+
+### Performance and storage
+
+- Embedding-server startup is faster on Apple Silicon while retaining executable authentication.
+- Semantic and lexical indexes, parser caches and stored source provenance use less disk through compression and deduplication. Existing formats remain readable, with applicable migrations performed during project preparation.
+- Preparation reuses unchanged indexes and compatible embedding batches. Retrieval avoids repeated admission and snapshot work, and compatible sidecars can be prepared concurrently.
+- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings. Broad searches with `--plan-details` work after opening a ready project.
+- Packet deadlines include preparation and publication checks. Cancellation and failure diagnostics identify the operation stage when available.
 
 ### Upgrading
 
-**Breaking interface change:** search, context and packet responses move to
-publication schema 3. Custom clients must use evidence identities, status and
-gaps in place of the previous hit, support and disposition shapes. Obsolete
-packet arguments are rejected, and `--diagnostics-out` replaces
-`--step-trace-out`. MCP responses use the format required by each supported
-protocol profile.
+**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
 
-See the [upgrade guide](docs/users/upgrading.md) for migration examples and the
-rollback procedure, which uses a preserved pre-upgrade cache copy. Packets
-remain optional experiments, bounded to sixteen evidence rows and 16 KiB;
-their results do not decide whether an investigation is complete.
+See the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback using a preserved pre-upgrade cache copy.
+
+Packets remain experimental and bounded to sixteen evidence rows and 16 KiB. They provide evidence and navigation limits; they do not determine whether an investigation is complete. Terraform anchors describe source structure rather than resource-graph or expression semantics. The grounding skill directs agents to keep causes unresolved when available observations cannot distinguish them and to identify the next discriminating observation.
 
 ## 0.17.5
 
