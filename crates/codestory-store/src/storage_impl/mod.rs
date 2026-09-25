@@ -1540,19 +1540,11 @@ fn read_recovery_database_identity(
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
             if contract == RecoveryDatabaseContract::CurrentPromotion =>
         {
-            // Incomplete images must never become rollback generations. A
-            // complete publication identity under the incomplete fence fails
-            // closed. An incomplete fence without a complete publication is
-            // not a rollback candidate — treat it as absent so an explicit
-            // full rebuild can replace it.
+            // A prior incremental writer can retain its old publication row
+            // while fencing the image. Neither that row nor material graph
+            // state makes the interrupted image a rollback generation.
             if has_incomplete_incremental_marker(&conn)? {
-                match read_index_publication(&conn)? {
-                    Some(_) => Err(promotion_error(format!(
-                        "SQLite predecessor {} is incomplete and cannot become a rollback generation",
-                        path.display()
-                    ))),
-                    None => Ok(None),
-                }
+                Ok(None)
             } else {
                 Err(promotion_error(format!(
                     "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
@@ -1575,6 +1567,14 @@ fn read_recovery_database_identity(
             path.display(),
         ))),
     }
+}
+
+fn is_replaceable_incomplete_legacy_predecessor(path: &Path) -> Result<bool, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(false);
+    };
+    Ok(schema_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+        && has_incomplete_incremental_marker(&conn)?)
 }
 
 fn require_complete_promotion_database_identity(
@@ -7006,21 +7006,23 @@ impl Storage {
         staged_path: &Path,
         live_path: &Path,
     ) -> Result<CorePromotionStats, StorageError> {
-        Self::promote_staged_snapshot_inner(staged_path, live_path, None)
+        Self::promote_staged_snapshot_inner(staged_path, live_path, None, &|| false)
     }
 
     pub(crate) fn promote_staged_snapshot_with_receipt(
         staged_path: &Path,
         live_path: &Path,
         receipt: SealedCoreCandidateReceipt,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<CorePromotionStats, StorageError> {
-        Self::promote_staged_snapshot_inner(staged_path, live_path, Some(receipt))
+        Self::promote_staged_snapshot_inner(staged_path, live_path, Some(receipt), cancelled)
     }
 
     fn promote_staged_snapshot_inner(
         staged_path: &Path,
         live_path: &Path,
         sealed_receipt: Option<SealedCoreCandidateReceipt>,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<CorePromotionStats, StorageError> {
         let promotion_started = Instant::now();
         let mut durations = CorePromotionDurations::default();
@@ -7138,52 +7140,59 @@ impl Storage {
 
         let previous_validation_started = Instant::now();
         let previous_pointer = layout.read_pointer()?;
-        let previous_identity = if let Some(pointer) = previous_pointer.as_ref() {
-            // Pointer parsing verifies its receipt and generation path. The
-            // active database was deep-validated before that pointer was
-            // minted, so a refresh does not read the whole old image again.
-            let _ = layout.resolve_generation_database(&pointer.active.generation_id)?;
-            Some(pointer.active.clone())
-        } else if live_path.is_file() {
-            match read_recovery_database_identity(
-                live_path,
-                RecoveryDatabaseContract::CurrentPromotion,
-            )? {
-                Some(previous) => {
-                    // One-time v0.17 migration. Validate the legacy publication
-                    // once, then preserve it as an immutable rollback generation
-                    // with CoW.
-                    let previous_bytes = database_logical_bytes_at_path(live_path)?;
-                    let identity = core_generation_identity(&previous, previous_bytes);
-                    let materialized = layout
-                        .materialize_existing_generation(live_path, &identity.generation_id)?;
-                    // This is the unchanged predecessor, not a new candidate.
-                    // Preserve its supported legacy schema rather than requiring
-                    // the schema of the replacement we already validated above.
-                    let materialized_publication = require_recovery_database_identity(
-                        &materialized,
-                        "Migrated immutable rollback generation",
-                        RecoveryDatabaseContract::CurrentPromotion,
-                    )?;
-                    if materialized_publication != previous {
-                        return Err(promotion_error(
-                            "Migrated immutable rollback generation changed core identity",
-                        ));
+        let (previous_identity, predecessor_incomplete) =
+            if let Some(pointer) = previous_pointer.as_ref() {
+                // Pointer parsing verifies its receipt and generation path. The
+                // active database was deep-validated before that pointer was
+                // minted, so a refresh does not read the whole old image again.
+                let _ = layout.resolve_generation_database(&pointer.active.generation_id)?;
+                (Some(pointer.active.clone()), false)
+            } else if live_path.is_file() {
+                match read_recovery_database_identity(
+                    live_path,
+                    RecoveryDatabaseContract::CurrentPromotion,
+                )? {
+                    Some(previous) => {
+                        // One-time v0.17 migration. Validate the legacy publication
+                        // once, then preserve it as an immutable rollback generation.
+                        // A cancellable SQLite backup preserves the whole
+                        // committed legacy image, including WAL pages.
+                        let previous_bytes = database_logical_bytes_at_path(live_path)?;
+                        let identity = core_generation_identity(&previous, previous_bytes);
+                        let materialized = layout.materialize_existing_generation(
+                            live_path,
+                            &identity.generation_id,
+                            cancelled,
+                        )?;
+                        // This is the unchanged predecessor, not a new candidate.
+                        // Preserve its supported legacy schema rather than requiring
+                        // the schema of the replacement we already validated above.
+                        let materialized_publication = require_recovery_database_identity(
+                            &materialized,
+                            "Migrated immutable rollback generation",
+                            RecoveryDatabaseContract::CurrentPromotion,
+                        )?;
+                        if materialized_publication != previous {
+                            return Err(promotion_error(
+                                "Migrated immutable rollback generation changed core identity",
+                            ));
+                        }
+                        (Some(identity), false)
                     }
-                    Some(identity)
+                    None => {
+                        let incomplete = is_replaceable_incomplete_legacy_predecessor(live_path)?;
+                        // A marked legacy image is replaceable after the complete
+                        // candidate is validated, but never rollback eligible.
+                        // Other unpublished material remains ambiguous.
+                        if !incomplete {
+                            require_empty_unpublished_core(live_path)?;
+                        }
+                        (None, incomplete)
+                    }
                 }
-                None => {
-                    // Project opening can create a schema-only cache before the
-                    // first full index. It is not a publication and must not
-                    // become a rollback generation, but any material row keeps
-                    // the fail-closed ambiguity fence.
-                    require_empty_unpublished_core(live_path)?;
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                (None, false)
+            };
         let previous_live_bytes = previous_identity
             .as_ref()
             .map(|identity| identity.logical_bytes);
@@ -7251,7 +7260,7 @@ impl Storage {
 
         let pointer_started = Instant::now();
         if previous_pointer.is_none() {
-            let retained_retrieval = if live_path.is_file() {
+            let retained_retrieval = if live_path.is_file() && !predecessor_incomplete {
                 retrieval_manifest::read_embedded_retrieval_publications(live_path)?
             } else {
                 Vec::new()
@@ -7272,6 +7281,14 @@ impl Storage {
                         .clone(),
                 },
             )?;
+        }
+        // Copying a legacy predecessor and installing the candidate can take
+        // time after the last backup step. Cancellation still has to win before
+        // the one atomic publication change.
+        if cancelled() {
+            return Err(promotion_error(
+                "Core promotion was cancelled before pointer publication",
+            ));
         }
         let commit = publication.commit_pointer(candidate_identity, previous_identity.clone())?;
         if let crate::CorePublicationDurabilityV1::Unconfirmed(reason) = commit.durability {

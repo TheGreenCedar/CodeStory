@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
+
 ## 0.17.6
 
 CodeStory 0.17.6 improves how agents find, inspect and follow repository evidence. It adds comment-aware search and more accurate language relationships, fixes indexing failures across several source formats, and reduces storage and startup overhead.

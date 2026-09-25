@@ -247,3 +247,75 @@ fn run_index_watch(mut cmd: IndexCommand) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{OutputFormat, ProjectArgs, RefreshMode};
+
+    #[test]
+    fn index_command_reports_executed_full_fallback_when_clone_is_unavailable() {
+        let temp = tempfile::tempdir().expect("isolated index command fixture");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).expect("project root");
+        let source = project.join("lib.rs");
+        fs::write(&source, "pub fn alpha() -> i32 { 1 }\n").expect("seed source");
+        let output_file = temp.path().join("index.json");
+        let command = |refresh| IndexCommand {
+            project: ProjectArgs {
+                project: project.clone(),
+                cache_dir: Some(temp.path().join("cache")),
+            },
+            refresh,
+            format: OutputFormat::Json,
+            output_file: Some(output_file.clone()),
+            dry_run: false,
+            summarize: false,
+            progress: false,
+            watch: false,
+        };
+        run_index(command(RefreshMode::Full)).expect("seed published core through index command");
+        fs::write(&source, "pub fn alpha() -> i32 { 2 }\n").expect("change indexed source");
+        codestory_store::with_core_clone_disabled(|| run_index(command(RefreshMode::Auto)))
+            .expect("auto refresh falls back to a full publication");
+
+        let output: serde_json::Value = serde_json::from_slice(
+            &fs::read(&output_file).expect("read executed index command JSON"),
+        )
+        .expect("parse index command JSON");
+        assert_eq!(output["refresh"], "auto(full)");
+        assert_eq!(output["refresh_reason"], "core_copy_on_write_unavailable");
+        assert!(
+            !output["phase_timings"]["full_refresh_wall"].is_null(),
+            "the command must report the full refresh that actually executed"
+        );
+        let storage_path = output["storage_path"]
+            .as_str()
+            .expect("command storage path");
+        let published_mode = || {
+            codestory_store::Store::open(std::path::Path::new(storage_path))
+                .expect("open command publication")
+                .get_complete_index_publication()
+                .expect("read command publication")
+                .expect("complete command publication")
+                .mode
+        };
+        assert_eq!(
+            published_mode(),
+            codestory_store::IndexPublicationMode::Full
+        );
+
+        fs::write(&source, "pub fn alpha() -> i32 { 3 }\n").expect("change source again");
+        run_index(command(RefreshMode::Auto)).expect("ordinary incremental index command");
+        let ordinary: serde_json::Value = serde_json::from_slice(
+            &fs::read(&output_file).expect("read ordinary index command JSON"),
+        )
+        .expect("parse ordinary index command JSON");
+        assert_eq!(ordinary["refresh"], "auto(incremental)");
+        assert!(ordinary.get("refresh_reason").is_none());
+        assert_eq!(
+            published_mode(),
+            codestory_store::IndexPublicationMode::Incremental
+        );
+    }
+}

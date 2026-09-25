@@ -6,7 +6,7 @@ use crate::publication::{PublicationTestBoundary, publication_test_checkpoint};
 use crate::search_publication::{
     SearchGenerationCatalogGuard, discard_unpublished_search_generation,
 };
-use crate::search_state_cache::ensure_indexing_active;
+use crate::search_state_cache::{ensure_indexing_active, indexing_cancelled_error};
 use crate::semantic_projection::{SEMANTIC_POLICY_VERSION, SearchStateBuildResult};
 use crate::{
     current_epoch_ms, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
@@ -347,16 +347,20 @@ impl PreparedCoreCommit {
             .take()
             .expect("prepared core commit must own staged storage");
         let publish_started = Instant::now();
+        let cancelled = || cancel_token.is_some_and(CancellationToken::is_cancelled);
         let publish_stats = staged
-            .publish_receipted_with_stats(&self.storage_path)
+            .publish_receipted_with_stats(&self.storage_path, &cancelled)
             .map_err(|error| {
+                if cancelled() {
+                    return indexing_cancelled_error();
+                }
                 let publication = match mode {
                     CoreCommitMode::Full { .. } => "storage",
                     CoreCommitMode::Incremental => "incremental storage",
                 };
                 ApiError::internal(format!(
-                    "Failed to publish staged {publication}: {error}. Preserved staged snapshot at {}",
-                    staged_path.display()
+                    "Failed to publish staged {publication}: {error}. Rejected stage cleanup attempted at {}",
+                    staged_path.display(),
                 ))
             })?;
         let search_state = self

@@ -78,5 +78,6 @@ codestory-workspace = { workspace = true, features = ["test-support"] }
 fs4 = { workspace = true }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-runtime = { workspace = true, features = ["test-support"] }
+codestory-store = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }

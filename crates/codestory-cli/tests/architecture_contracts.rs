@@ -2502,14 +2502,14 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         full_refresh.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
             && full_refresh.contains("staged.snapshots().finalize_staged()")
             && full_refresh.contains("staged.snapshots().refresh_detail()")
-            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path, &cancelled)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
         incremental_refresh.contains("SnapshotStore::clone_live_to_staged(storage_path)")
             && incremental_refresh.contains(".snapshots()\n            .finalize_staged()")
             && incremental_refresh.contains(".snapshots()\n            .refresh_detail()")
-            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path, &cancelled)"),
         "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
     for forbidden in [
@@ -2546,7 +2546,7 @@ fn staged_publication_identity_and_fence_are_complete_before_publication() {
         commit.contains("pub(super) fn next_index_publication(")
             && commit.contains(".put_index_publication(publication)")
             && commit.contains(".finish_incremental_run()")
-            && commit.contains(".publish_receipted_with_stats(&self.storage_path)")
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path, &cancelled)")
             && full_refresh.contains("next_index_publication(")
             && full_refresh.contains("stage_core_publication_identity(")
             && full_refresh.contains("CoreCommitMode::Full")
