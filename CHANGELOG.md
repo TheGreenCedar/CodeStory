@@ -3,6 +3,7 @@
 ## Unreleased
 
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
+- Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
 
 ## 0.17.6
 
@@ -38,7 +39,7 @@ CodeStory 0.17.6 improves how agents find, inspect and follow repository evidenc
 
 ### Upgrading
 
-**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Search no longer accepts `--why` or `--plan-details`; its output contains evidence, status and gaps rather than explanations or a search plan. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
+**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
 
 See the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback using a preserved pre-upgrade cache copy.
 
