@@ -2005,7 +2005,7 @@ fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {
         .checked_sub(document.contract_proven_cases)
         .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_count_invalid"))?;
     text.push_str(&format!(
-        "\n## Inferences\n\n- The evaluator selected `{}` from these reproduced measurements and the frozen thresholds below.\n- {} of {} cases satisfy the report contract's evidence-backed full-proof predicate.\n- {} cases do not satisfy that predicate.\n\n## Frozen thresholds\n\nThreshold set: `{}`  \nMethodology SHA-256: `{}`\n\nHard gates: `{}`\n\n| Role | Full proofs min | Cohort min | Full Wilson min milli | Cohort Wilson min milli | Step recall min milli | Full/useful min milli | Actionable gap min milli | Unknown p95 max ms | Transport p95 max ms | Complete p95 max bytes | Unknown p95 max bytes | Absolute max bytes |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "\n## Inferences\n\n- The evaluator selected `{}` from these reproduced measurements and the frozen thresholds below.\n- {} of {} cases satisfy the report contract's evidence-backed full-proof predicate.\n- {} cases do not satisfy that predicate.\n\n## Frozen thresholds\n\nThreshold set: `{}`\\\nMethodology SHA-256: `{}`\n\nHard gates: `{}`\n\n| Role | Full proofs min | Cohort min | Full Wilson min milli | Cohort Wilson min milli | Step recall min milli | Full/useful min milli | Actionable gap min milli | Unknown p95 max ms | Transport p95 max ms | Complete p95 max bytes | Unknown p95 max bytes | Absolute max bytes |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         document.outcome,
         document.contract_proven_cases,
         document.positive_requests,
@@ -2036,7 +2036,7 @@ fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {
         .automatic_thresholds_met
         .map_or("not_applicable", |met| if met { "true" } else { "false" });
     text.push_str(&format!(
-        "\n## Decision\n\nOutcome: `{}`  \nAutomatic thresholds met: `{automatic}`\n\n### Failed gates\n\n",
+        "\n## Decision\n\nOutcome: `{}`\\\nAutomatic thresholds met: `{automatic}`\n\n### Failed gates\n\n",
         document.outcome,
     ));
     if document.failed_gates.is_empty() {
