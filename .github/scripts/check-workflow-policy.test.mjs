@@ -3171,6 +3171,31 @@ test("release workflows retain the closeout coordinator contract test", () => {
   }
 });
 
+test("plugin static routes and executes the live coordinator adapter suite", () => {
+  const files = [
+    "scripts/lib/release-coordinator-github.mjs",
+    "scripts/lib/release-coordinator-contract.mjs",
+    "scripts/lib/release-coordinator-evidence.mjs",
+    "scripts/lib/read-release-artifact.py",
+    "scripts/tests/codestory-release-live.test.mjs",
+    "scripts/tests/fixtures/release-github.mjs",
+  ];
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const event of ["pull_request", "push"]) {
+    for (const file of files) {
+      const workflows = loadWorkflows();
+      workflows.get("plugin-static.yml").on[event].paths = workflows.get("plugin-static.yml").on[event].paths.filter(path => path !== file);
+      assert.match(validateWorkflows(workflows).join("\n"), /plugin-static\.yml.*paths must cover policy and release surfaces/u);
+    }
+  }
+  const workflows = loadWorkflows();
+  const step = workflows.get("plugin-static.yml").jobs["plugin-static"].steps.find(
+    ({ name }) => name === "Check release claim and evidence contracts",
+  );
+  step.run = step.run.replace("scripts/tests/codestory-release-live.test.mjs", "");
+  assert.match(validateWorkflows(workflows).join("\n"), /scripts\/tests\/codestory-release-live\.test\.mjs/u);
+});
+
 test("plugin static validates both native and plugin-only version surfaces", () => {
   const workflows = loadWorkflows();
   const step = workflows.get("plugin-static.yml").jobs["plugin-static"].steps.find(

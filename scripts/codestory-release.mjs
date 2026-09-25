@@ -73,6 +73,7 @@ function stepHead(record, phase) {
 function liveStep(host, step) {
   const run = host.getRun(step.id);
   validateRun(run, { repository: host.repository, head: step.head, workflow: step.workflow });
+  requireThat(run.actor?.login === step.actor, 'release run actor differs from its persisted dispatch owner');
   requireThat(typeof step.dispatch_id === 'string' && run.display_title === `codestory-release:${step.dispatch_id}`,
     'release run does not carry its persisted dispatch identity');
   return run;
@@ -82,11 +83,12 @@ function recoverIntents(record, host) {
   for (const step of record.dispatches.filter(row => !row.id && !row.rejected)) {
     const matches = host.runsFor(step.head.commit).filter(run => run.path === step.workflow
       && run.event === 'workflow_dispatch' && run.head_repository?.full_name === host.repository
-      && run.actor?.login === step.actor && Date.parse(run.created_at) >= Date.parse(step.started_at)
+      && run.actor?.login === step.actor
       && typeof step.dispatch_id === 'string' && run.display_title === `codestory-release:${step.dispatch_id}`);
     requireThat(matches.length === 1, `unconfirmed ${step.phase} dispatch: ${matches.length} matching runs; no replacement will be dispatched`);
-    step.id = matches[0].id;
-    liveStep(host, step);
+    const validated = { ...step, id: matches[0].id };
+    liveStep(host, validated);
+    step.id = validated.id;
     save(record, host);
   }
 }

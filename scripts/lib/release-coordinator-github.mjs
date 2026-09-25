@@ -55,6 +55,26 @@ export function createDefaultHost({ repository = 'TheGreenCedar/CodeStory', proj
       return action(root);
     } finally { rmSync(root, { recursive: true, force: true }); }
   };
+  const ownedComment = issue => {
+    const comments = paged(`${base}/issues/${issue}/comments?per_page=100`)
+      .filter(row => row.user?.login === host.actor && row.body?.includes(MARKER));
+    requireThat(comments.length <= 1, `release coordinator has ambiguous authorized comments on issue #${issue}`);
+    return comments[0] ?? null;
+  };
+  const commentPin = comment => {
+    requireThat(Number.isSafeInteger(comment?.id) && comment.id > 0 && comment.user?.login === host.actor,
+      'release coordinator comment has no authenticated owner or identity');
+    return { id: comment.id, author: comment.user.login };
+  };
+  const verifiedRecord = (comment, issue) => {
+    const pin = commentPin(comment);
+    const record = parseRecord(comment.body);
+    requireThat(record && record.issue_number === Number(issue), `invalid authorized coordinator record on issue #${issue}`);
+    requireThat(!record.durable_comment || (record.durable_comment.id === pin.id && record.durable_comment.author === pin.author),
+      'release coordinator comment identity differs from its persisted pin');
+    record.durable_comment = pin; // Legacy records acquire a pin on their next save.
+    return record;
+  };
   const host = {
     repository, projectRoot, now,
     graph: loadReleaseClaimGraph(projectRoot),
@@ -88,11 +108,9 @@ export function createDefaultHost({ repository = 'TheGreenCedar/CodeStory', proj
         requireThat(issues.length === 1, 'select one release coordinator with --issue');
         issue = issues[0].number;
       }
-      const comments = paged(`${base}/issues/${issue}/comments?per_page=100`);
-      const matches = comments.map(comment => ({ comment, record: parseRecord(comment.body) })).filter(row => row.record);
-      requireThat(matches.length === 1, `expected one coordinator record on issue #${issue}`);
-      requireThat(matches[0].record.issue_number === Number(issue), 'coordinator record belongs to another issue');
-      return matches[0].record;
+      const comment = ownedComment(issue);
+      requireThat(comment, `expected one authorized coordinator record on issue #${issue}`);
+      return verifiedRecord(comment, issue);
     },
     createIssue(title, body) { return api(`${base}/issues`, { title, body }); },
     findCoordinator(version) {
@@ -109,11 +127,20 @@ export function createDefaultHost({ repository = 'TheGreenCedar/CodeStory', proj
       return matches[0];
     },
     save(record) {
-      const comments = paged(`${base}/issues/${record.issue_number}/comments?per_page=100`).filter(row => row.body?.includes(MARKER));
-      requireThat(comments.length <= 1, 'release coordinator has duplicate durable records');
-      const body = recordBody(record);
-      if (comments.length) patch(`${base}/issues/comments/${comments[0].id}`, { body });
-      else api(`${base}/issues/${record.issue_number}/comments`, { body });
+      const comment = ownedComment(record.issue_number);
+      if (comment) {
+        const existing = verifiedRecord(comment, record.issue_number);
+        requireThat(!record.durable_comment || (record.durable_comment.id === existing.durable_comment.id
+          && record.durable_comment.author === existing.durable_comment.author),
+        'release coordinator save differs from its authenticated comment pin');
+        record.durable_comment = existing.durable_comment;
+        patch(`${base}/issues/comments/${comment.id}`, { body: recordBody(record) });
+      } else {
+        requireThat(!record.durable_comment, 'pinned release coordinator comment is missing');
+        const created = api(`${base}/issues/${record.issue_number}/comments`, { body: recordBody(record) });
+        record.durable_comment = commentPin(created);
+        patch(`${base}/issues/comments/${created.id}`, { body: recordBody(record) });
+      }
     },
     readArtifact(artifact, members) {
       const key = `artifact-bytes:${artifact.id}:${artifact.digest}`;

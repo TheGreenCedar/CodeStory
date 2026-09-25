@@ -230,7 +230,7 @@ export function githubFixture() {
       return output(data.pulls.filter(pr => pr.base.ref === query.get('base') && pr.head.ref === query.get('head').split(':')[1]));
     }
     if (/\/issues\/\d+\/comments/u.test(endpoint)) {
-      if (method === 'POST') { const comment = { id: data.comments.length + 1, ...body }; data.comments.push(comment); return output(comment); }
+      if (method === 'POST') { const comment = { id: data.comments.length + 1, user: { login: 'TheGreenCedar' }, ...body }; data.comments.push(comment); return output(comment); }
       return output(data.comments);
     }
     if (/\/issues\/comments\/\d+/u.test(endpoint)) {

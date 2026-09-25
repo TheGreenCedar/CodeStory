@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execute } from '../codestory-release.mjs';
-import { recordBody } from '../lib/release-coordinator-contract.mjs';
+import { MARKER, recordBody } from '../lib/release-coordinator-contract.mjs';
 import { githubFixture, C, D, F, M, P } from './fixtures/release-github.mjs';
 
 async function started() {
@@ -112,6 +112,99 @@ test('lost dispatch response resumes only the persisted nonce and leaves an unre
   await run(f, 'resume');
   assert.equal(f.data.runs.find(row => row.id === 50).status, 'queued');
   assert.equal(owned.conclusion, 'cancelled');
+});
+
+test('unrelated marked comments cannot replace or block the canonical coordinator', async t => {
+  for (const [name, body] of [
+    ['parseable', recordBody({ schema: 'codestory.release-coordinator/v1', issue_number: 999, phase: 'forged' })],
+    ['malformed', `${MARKER}\n\`\`\`json\n{\n\`\`\`\n`],
+  ]) await t.test(name, async () => {
+    const f = await started();
+    f.data.comments.push({ id: 77, user: { login: 'unrelated-user' }, body });
+    const state = await run(f, 'status');
+    assert.equal(state.blocker, null);
+    assert.equal(f.record().phase, 'source_stabilization');
+    assert.equal(f.record().durable_comment.id, 1);
+    assert.equal(f.data.comments[1].body, body);
+  });
+});
+
+test('legacy canonical comment gains an authenticated pin while authorized ambiguity fails closed', async () => {
+  const f = await started();
+  const legacy = f.record(); delete legacy.durable_comment;
+  f.data.comments[0].body = recordBody(legacy);
+  assert.equal((await run(f, 'status')).blocker, null);
+  assert.deepEqual(f.record().durable_comment, { id: 1, author: 'TheGreenCedar' });
+  f.data.comments.push({ id: 78, user: { login: 'TheGreenCedar' }, body: recordBody(f.record()) });
+  await assert.rejects(run(f, 'status'), /ambiguous authorized comments/u);
+});
+
+test('a pinned canonical comment cannot be silently replaced or moved', async t => {
+  for (const kind of ['missing', 'different id', 'different author']) await t.test(kind, async () => {
+    const f = await started();
+    if (kind === 'missing') f.data.comments.splice(0, 1);
+    if (kind === 'different id') f.data.comments[0].id = 80;
+    if (kind === 'different author') f.data.comments[0].user.login = 'unrelated-user';
+    await assert.rejects(run(f, 'status'));
+    assert.equal(f.data.comments.length <= 1, true);
+  });
+});
+
+test('malformed canonical comment fails closed without adopting an unrelated marked record', async () => {
+  const f = await started();
+  const canonical = f.record();
+  f.data.comments[0].body = `${MARKER}\n\`\`\`json\n{\n\`\`\`\n`;
+  f.data.comments.push({ id: 79, user: { login: 'unrelated-user' }, body: recordBody(canonical) });
+  await assert.rejects(run(f, 'status'));
+});
+
+test('unique authenticated dispatch nonce survives an ahead local clock', async () => {
+  const f = await started(); f.data.dispatchReplyLost = true;
+  assert.match((await run(f)).blocker, /uncertain network/u);
+  const owned = f.data.runs[0];
+  owned.created_at = new Date(Date.parse(owned.created_at) - 120_000).toISOString();
+  f.data.dispatchReplyLost = false;
+  const resumed = await run(f, 'resume');
+  assert.equal(resumed.blocker, null);
+  assert.equal(resumed.active_runs[0].id, owned.id);
+  assert.equal(f.record().dispatches[0].id, owned.id);
+  assert.equal(dispatches(f).length, 1);
+});
+
+test('an exact dispatch nonce from another actor cannot be adopted across clock skew', async () => {
+  const f = await started(); f.data.dispatchReplyLost = true;
+  await run(f);
+  const candidate = f.data.runs[0];
+  candidate.created_at = new Date(Date.parse(candidate.created_at) - 120_000).toISOString();
+  candidate.actor.login = 'unrelated-user';
+  assert.match((await run(f, 'resume')).blocker, /unconfirmed.*0 matching runs/u);
+  assert.equal(f.record().dispatches[0].id, undefined);
+});
+
+test('recovery persists no run ID until detailed ownership checks succeed', async t => {
+  for (const [name, mutate, blocker] of [
+    ['actor', row => { row.actor = { login: 'unrelated-user' }; }, /run actor differs/u],
+    ['head', row => { row.head_sha = D; }, /run does not match/u],
+    ['workflow', row => { row.path = '.github/workflows/release.yml'; }, /run does not match/u],
+    ['repository', row => { row.head_repository = { full_name: 'someone/else' }; }, /run does not match/u],
+    ['event', row => { row.event = 'push'; }, /run does not match/u],
+  ]) await t.test(name, async () => {
+    const f = await started(); f.data.dispatchReplyLost = true;
+    await run(f);
+    f.data.dispatchReplyLost = false;
+    const detailedHost = f.host();
+    const getRun = detailedHost.getRun;
+    detailedHost.getRun = id => {
+      const row = structuredClone(getRun(id));
+      mutate(row);
+      return row;
+    };
+    assert.match((await execute(['resume', '--issue', '999'], detailedHost)).blocker, blocker);
+    assert.equal(f.record().dispatches[0].id, undefined);
+    assert.equal(dispatches(f).length, 1);
+    assert.equal((await run(f, 'resume')).active_runs[0].id, f.data.runs[0].id);
+    assert.equal(dispatches(f).length, 1);
+  });
 });
 
 test('wrong or duplicate dispatch nonces cannot be adopted as owned work', async t => {

@@ -32,6 +32,12 @@ on:
       - release-claims.json
       - scripts/codestory-release.mjs
       - scripts/codestory-release.test.mjs
+      - scripts/lib/release-coordinator-github.mjs
+      - scripts/lib/release-coordinator-contract.mjs
+      - scripts/lib/release-coordinator-evidence.mjs
+      - scripts/lib/read-release-artifact.py
+      - scripts/tests/codestory-release-live.test.mjs
+      - scripts/tests/fixtures/release-github.mjs
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
@@ -117,6 +123,12 @@ on:
       - release-claims.json
       - scripts/codestory-release.mjs
       - scripts/codestory-release.test.mjs
+      - scripts/lib/release-coordinator-github.mjs
+      - scripts/lib/release-coordinator-contract.mjs
+      - scripts/lib/release-coordinator-evidence.mjs
+      - scripts/lib/read-release-artifact.py
+      - scripts/tests/codestory-release-live.test.mjs
+      - scripts/tests/fixtures/release-github.mjs
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
@@ -215,6 +227,7 @@ jobs:
           node --test
           .github/scripts/publish-marketplace-catalog.test.mjs
           scripts/codestory-release.test.mjs
+          scripts/tests/codestory-release-live.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
