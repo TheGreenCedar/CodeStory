@@ -3,6 +3,7 @@
 ## Unreleased
 
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
+- Cache rehydrate copies the source generation it validated. If a new target lacks space, it leaves the target directory untouched so a later retry starts cleanly.
 
 ## 0.17.6
 
