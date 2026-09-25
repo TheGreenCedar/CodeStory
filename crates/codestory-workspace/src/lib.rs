@@ -1283,17 +1283,30 @@ impl WorkspaceDiscovery {
             }
             let walk_had_errors = issues.len() != issue_count_before_walk;
             for tracked_path in &repository_tracked_paths {
-                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
-                    || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
-                    || !should_include_discovered_path_for_routes(
+                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path)) {
+                    continue;
+                }
+                let metadata = fs::metadata(tracked_path);
+                if let Some(warning) = non_source_tracked_symlink_skip(tracked_path, &metadata) {
+                    if should_include_tracked_symlink_warning_for_routes(
                         tracked_path,
-                        false,
                         &workspace_root,
                         &walk.routes,
                         &discovery_exclusions,
                         manifest.is_synthetic_default.get(),
-                    )
-                {
+                    ) {
+                        warnings.push(warning);
+                    }
+                    continue;
+                }
+                if !should_include_discovered_path_for_routes(
+                    tracked_path,
+                    false,
+                    &workspace_root,
+                    &walk.routes,
+                    &discovery_exclusions,
+                    manifest.is_synthetic_default.get(),
+                ) {
                     continue;
                 }
                 match discovery_exclusions.file_is_excluded(tracked_path) {
@@ -1305,6 +1318,23 @@ impl WorkspaceDiscovery {
                             message: format!(
                                 "failed to observe tracked source identity against caller-owned exclusions: {error}"
                             ),
+                        });
+                        continue;
+                    }
+                }
+                match metadata {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => continue,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && tracked_path_absence_is_proven(tracked_path) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: tracked_path.clone(),
+                            message: format!("failed to inspect tracked source: {error}"),
                         });
                         continue;
                     }
@@ -1976,6 +2006,46 @@ fn non_source_symlink_walk_skip(error: &ignore::Error) -> Option<WorkspaceInvent
     }
 }
 
+fn non_source_tracked_symlink_skip(
+    path: &Path,
+    target: &io::Result<fs::Metadata>,
+) -> Option<WorkspaceInventoryIssue> {
+    if !fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let message = match target {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            "skipped dangling symlink during tracked discovery follow; not admitted as source"
+        }
+        Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+            "skipped non-regular symlink target during tracked discovery follow; not admitted as source"
+        }
+        _ => return None,
+    };
+    Some(WorkspaceInventoryIssue {
+        path: path.to_path_buf(),
+        message: message.to_string(),
+    })
+}
+
+fn tracked_path_absence_is_proven(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) if current == path => return false,
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(metadata) => return metadata.is_dir(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = current.parent() else {
+                    return false;
+                };
+                current = parent;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 fn inventory_failure_message(inventory: &WorkspaceFileInventory) -> String {
     let detail = inventory
         .issues
@@ -2609,6 +2679,37 @@ fn should_include_discovered_path_for_routes(
             },
         )
     })
+}
+
+fn should_include_tracked_symlink_warning_for_routes(
+    path: &Path,
+    workspace_root: &Path,
+    routes: &[DiscoveryRoute],
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+    admit_tracked_synthetic_build_source: bool,
+) -> bool {
+    let Some(mut observed) = ObservedDiscoveryPath::observe(path, false) else {
+        return false;
+    };
+    // The target is already known to be non-source. Check the tracked link's
+    // lexical route, without making an outside or missing target admissible.
+    observed.canonical = None;
+    observed.exclusion_canonical = None;
+    should_include_observed_discovery_path_globally(&observed, workspace_root, discovery_exclusions)
+        && routes.iter().any(|route| {
+            should_include_observed_discovery_path(
+                &observed,
+                &DiscoveryPathFilter {
+                    workspace_root,
+                    source_root: &route.source_root,
+                    filter_by_language: route.filter_by_language,
+                    language: &route.language,
+                    exclude_patterns: &route.exclude_patterns,
+                    discovery_exclusions,
+                    admit_tracked_synthetic_build_source,
+                },
+            )
+        })
 }
 
 fn should_include_discovered_path(
@@ -3309,6 +3410,131 @@ mod tests {
         assert!(plan.files_to_index.contains(&tracked_generated));
         assert!(!plan.files_to_index.contains(&output));
         assert!(!plan.files_to_index.contains(&nested_output));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_tracked_build_source_preserves_stored_projection() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let build = root.join("build");
+        let tracked = build.join("Tracked.rs");
+        let visible = root.join("Visible.rs");
+        fs::create_dir_all(&build)?;
+        fs::write(&tracked, "pub fn tracked() {}\n")?;
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(&root, &["add", "-f", "build/Tracked.rs", "Visible.rs"])?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inputs = RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 41,
+                path: tracked.clone(),
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        };
+        let initial = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            initial.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(initial.plan.files_to_remove.is_empty());
+
+        let _restore = RestorePermissions {
+            path: build.clone(),
+            permissions: fs::metadata(&build)?.permissions(),
+        };
+        fs::set_permissions(&build, fs::Permissions::from_mode(0))?;
+        assert_eq!(
+            fs::metadata(&tracked).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let inaccessible = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            inaccessible.inventory_outcome,
+            WorkspaceInventoryOutcome::Partial
+        );
+        assert!(inaccessible.plan.files_to_remove.is_empty());
+        assert!(
+            inaccessible
+                .inventory_issues
+                .iter()
+                .any(|issue| issue.path == tracked)
+        );
+        assert!(inaccessible.plan.files_to_index.contains(&visible));
+
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o755))?;
+        fs::remove_file(&tracked)?;
+        let absent = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            absent.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(absent.plan.files_to_remove, vec![41]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruned_tracked_build_symlinks_warn_without_demoting_inventory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let build = root.join("build");
+        let dangling = build.join("Dangling.rs");
+        let nonregular = build.join("Device.rs");
+        let visible = root.join("Visible.rs");
+        fs::create_dir_all(&build)?;
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        symlink("/dev/null", &nonregular)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &[
+                "add",
+                "-f",
+                "build/Dangling.rs",
+                "build/Device.rs",
+                "Visible.rs",
+            ],
+        )?;
+
+        let inventory = WorkspaceManifest::open(root)?.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        assert!(!inventory.files.contains(&dangling));
+        assert!(!inventory.files.contains(&nonregular));
+        assert!(
+            inventory.warnings.iter().any(|warning| {
+                warning.path == dangling && warning.message.contains("dangling symlink")
+            }),
+            "{inventory:?}"
+        );
+        assert!(inventory.warnings.iter().any(|warning| {
+            warning.path == nonregular && warning.message.contains("non-regular symlink")
+        }));
         Ok(())
     }
 
