@@ -2370,7 +2370,7 @@ function v3RuntimeWireContractSkew(response, session) {
       !== session.publicationSchemaVersion) {
     return 'publication_schema_skew';
   }
-  return null;
+  return publicationStampSkew(result._meta.codestory_publication);
 }
 
 function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
@@ -4487,6 +4487,8 @@ function runFailOpenMcp(status, options = {}) {
   };
   let handoff = null;
   let handoffWrite = null;
+  let handoffDispatch = null;
+  let handoffValidated = false;
   let initializeRequest = null;
   let negotiatedProtocol = null;
   let v3Session = null;
@@ -4521,9 +4523,11 @@ function runFailOpenMcp(status, options = {}) {
     handoff = options.startRuntime(liveStatus);
     handoffStderrObservation = null;
     handoffFailureHandled = false;
+    let initializeTimer = null;
     const failHandoff = (reasonCode, details = {}) => {
       if (handoffFailureHandled) return;
       handoffFailureHandled = true;
+      clearTimeout(initializeTimer);
       const failedHandoff = handoff;
       const stderrObservation = renderRuntimeStderrTail(handoffStderrObservation);
       const failureDetails = {
@@ -4545,6 +4549,7 @@ function runFailOpenMcp(status, options = {}) {
       const detailedReason = runtimeFailureDetail(reasonCode, failureDetails);
       handoff = null;
       handoffWrite = null;
+      handoffDispatch = null;
       shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
         process.exit(failureDetails.code || 1);
@@ -4586,6 +4591,19 @@ function runFailOpenMcp(status, options = {}) {
         return false;
       }
     };
+    handoffValidated = !initializeRequest;
+    const queuedLines = [];
+    let queuedBytes = 0;
+    handoffDispatch = (line) => {
+      if (handoffValidated) return handoffWrite(line);
+      queuedBytes += Buffer.byteLength(line, 'utf8') + 1;
+      if (queuedBytes > failOpenMaxFrameBytes) {
+        failHandoff('runtime_stdio_child_stdin', { errorCode: 'handoff_queue_full' });
+        return false;
+      }
+      queuedLines.push(line);
+      return true;
+    };
     handoff.stdin?.on?.('error', (error) => {
       failHandoff('runtime_stdio_child_stdin', {
         errorCode: error?.code,
@@ -4594,7 +4612,6 @@ function runFailOpenMcp(status, options = {}) {
     });
     if (handoff.stdout) {
       let stdout = '';
-      let suppressInitialize = Boolean(initializeRequest);
       handoff.stdout.setEncoding('utf8');
       handoff.stdout.on('data', (chunk) => {
         // A failed handoff stops relaying immediately. Chunks that arrive after
@@ -4611,20 +4628,31 @@ function runFailOpenMcp(status, options = {}) {
           } catch {
             // Non-JSON output remains visible instead of hiding a runtime failure.
           }
-          if (suppressInitialize && parsed?.id === initializeRequest.id) {
-            suppressInitialize = false;
+          if (!handoffValidated) {
             // The host never sees this frame — the launcher already answered
             // `initialize`. That makes the launcher the only reader of the
             // runtime's own compatibility claim, and the only place a
             // `CODESTORY_CLI` override can be caught at session runtime.
-            const skew = v3RuntimeWireContractSkew(parsed, v3Session);
+            const skew = parsed?.id === initializeRequest.id
+              ? v3RuntimeWireContractSkew(parsed, v3Session)
+              : 'initialize_response_invalid';
             if (skew) {
               failHandoff('runtime_wire_contract_skew', { errorCode: skew });
               return;
             }
+            clearTimeout(initializeTimer);
+            handoffValidated = true;
+            for (const line of queuedLines) {
+              if (!handoffWrite(line)) return;
+            }
+            queuedLines.length = 0;
+            queuedBytes = 0;
+            if (stdinEnded) shutdownHandoffChild(handoff, options);
             continue;
           }
-          if (parsed?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(parsed.id));
+          for (const reply of Array.isArray(parsed) ? parsed : [parsed]) {
+            if (reply?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(reply.id));
+          }
           process.stdout.write(`${output}\n`);
         }
       });
@@ -4638,7 +4666,7 @@ function runFailOpenMcp(status, options = {}) {
       });
     }
     handoff.on('close', (code, signal) => {
-      if (signal || code) {
+      if (signal || code || !handoffValidated) {
         failHandoff('runtime_stdio_child_exit', { code, signal });
         return;
       }
@@ -4651,6 +4679,10 @@ function runFailOpenMcp(status, options = {}) {
       });
     });
     if (initializeRequest) {
+      initializeTimer = setTimeout(() => {
+        failHandoff('runtime_stdio_child_exit', { errorCode: 'initialize_timeout' });
+      }, options.handoffInitializeTimeoutMs ?? 5000);
+      initializeTimer.unref?.();
       if (handoffWrite(JSON.stringify(initializeRequest))) {
         handoffWrite?.(JSON.stringify(initializedNotification || {
           jsonrpc: '2.0',
@@ -4658,7 +4690,7 @@ function runFailOpenMcp(status, options = {}) {
         }));
       }
     }
-    if (stdinEnded) handoff.stdin.end();
+    if (stdinEnded && handoffValidated) shutdownHandoffChild(handoff, options);
     return handoff;
   };
   // Fail-open serves the project-bound status template and static guide. Do
@@ -4700,7 +4732,7 @@ function runFailOpenMcp(status, options = {}) {
     const delegated = allowHandoff && request.method !== 'initialize' ? maybeHandoff() : null;
     if (delegated) {
       if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
-      handoffWrite(rawLine);
+      handoffDispatch(rawLine);
       return null;
     }
     if (request.id === undefined) return null;
@@ -4823,7 +4855,7 @@ function runFailOpenMcp(status, options = {}) {
           delegatedRequestIds.add(JSON.stringify(request.id));
         }
       }
-      handoffWrite(line);
+      handoffDispatch(line);
       return;
     }
     const responses = frame
@@ -4874,7 +4906,7 @@ function runFailOpenMcp(status, options = {}) {
     buffer = '';
     bufferBytes = 0;
     stdinEnded = true;
-    shutdownHandoffChild(handoff, options);
+    if (handoffValidated) shutdownHandoffChild(handoff, options);
   });
   return { notifyRuntimeReady };
 }
