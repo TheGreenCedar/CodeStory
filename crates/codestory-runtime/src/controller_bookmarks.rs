@@ -16,8 +16,8 @@ use codestory_contracts::api::{
 use codestory_contracts::owned_artifacts;
 use codestory_store::{
     AnnotationBookmark, AnnotationError, AnnotationResolution, AnnotationStore,
-    BookmarkAnchorInput, CoreAnchorCandidate, CoreAnchorIndex, NativeRootBinding, OrphanReason,
-    ResolutionStatus, Store, resolve_bookmark,
+    BookmarkAnchorInput, CURRENT_SCHEMA_VERSION, CoreAnchorCandidate, CoreAnchorIndex,
+    NativeRootBinding, OrphanReason, ResolutionStatus, StorageError, Store, resolve_bookmark,
 };
 
 /// Proof that user annotations already moved out of the core database.
@@ -66,15 +66,33 @@ struct CoreAnchors<'a> {
     generation: Option<i64>,
 }
 
+impl<'a> CoreAnchors<'a> {
+    fn new(storage: &'a Store) -> Result<Self, StorageError> {
+        let generation = storage
+            .get_complete_index_publication()?
+            .map(|publication| {
+                i64::try_from(publication.generation)
+                    .map_err(|_| StorageError::Other("core generation exceeds i64".to_string()))
+            })
+            .transpose()?;
+        Ok(Self {
+            storage,
+            generation,
+        })
+    }
+}
+
 impl CoreAnchorIndex for CoreAnchors<'_> {
-    fn current_generation(&self) -> Option<i64> {
-        self.generation
+    fn current_generation(&self) -> Result<Option<i64>, StorageError> {
+        Ok(self.generation)
     }
 
-    fn candidates_by_canonical_id(&self, canonical_id: &str) -> Vec<CoreAnchorCandidate> {
+    fn candidates_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
         self.storage
             .annotation_anchors_by_canonical_id(canonical_id)
-            .unwrap_or_default()
     }
 
     fn candidates_by_anchor_tuple(
@@ -82,20 +100,18 @@ impl CoreAnchorIndex for CoreAnchors<'_> {
         file_identity: &str,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
         self.storage
             .annotation_anchors_by_anchor_tuple(file_identity, qualified_name, kind)
-            .unwrap_or_default()
     }
 
     fn candidates_by_qualified_name(
         &self,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
         self.storage
             .annotation_anchors_by_qualified_name(qualified_name, kind)
-            .unwrap_or_default()
     }
 
     fn candidates_by_normalized_signature(
@@ -103,10 +119,12 @@ impl CoreAnchorIndex for CoreAnchors<'_> {
         normalized_signature: &str,
         file_identity: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
-        self.storage
-            .annotation_anchors_by_normalized_signature(normalized_signature, file_identity, kind)
-            .unwrap_or_default()
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.storage.annotation_anchors_by_normalized_signature(
+            normalized_signature,
+            file_identity,
+            kind,
+        )
     }
 }
 
@@ -206,8 +224,33 @@ impl AppController {
         if !self.annotations_sidecar_path()?.is_file() && !self.core_owns_legacy_annotations()? {
             return Ok(AnnotationsOwned(()));
         }
-        self.open_annotations_for_write()
-            .map(|_| AnnotationsOwned(()))
+        self.open_annotations_for_write()?;
+        // A previously committed core may have missed its postcommit rebind.
+        // Catch it up while the old generation is still live, before another
+        // publication could turn a valid rename or move into a generation gap.
+        // A missing or older/incomplete standalone core has no complete
+        // generation to catch up; full recovery must remain possible.
+        let storage_path = self.require_storage_path()?;
+        if codestory_store::core_database_exists(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to inspect annotation core: {error}"))
+        })? && Store::database_schema_version(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to inspect annotation core schema: {error}"))
+        })? == CURRENT_SCHEMA_VERSION
+        {
+            let has_complete_core = self
+                .open_storage_read_only()?
+                .get_complete_index_publication()
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect annotation core publication: {error}"
+                    ))
+                })?
+                .is_some();
+            if has_complete_core {
+                self.rebind_annotations_after_core_publication()?;
+            }
+        }
+        Ok(AnnotationsOwned(()))
     }
 
     fn core_owns_legacy_annotations(&self) -> Result<bool, ApiError> {
@@ -239,28 +282,28 @@ impl AppController {
         }
         let annotations = self.open_annotations_for_write()?;
         let storage = self.open_storage_read_only()?;
-        let anchors = CoreAnchors {
-            storage: &storage,
-            generation: Self::core_generation(&storage),
-        };
+        let anchors = CoreAnchors::new(&storage).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read annotation core generation: {error}"
+            ))
+        })?;
         let bookmarks = annotations
             .bookmarks(None)
             .map_err(|error| annotation_error("Failed to load annotations", error))?;
-        for bookmark in bookmarks {
-            let resolution = resolve_bookmark(&bookmark, &anchors);
-            annotations
-                .apply_resolution(&bookmark.uuid, &resolution)
-                .map_err(|error| annotation_error("Failed to record annotation binding", error))?;
-        }
+        let resolutions = bookmarks
+            .iter()
+            .map(|bookmark| {
+                resolve_bookmark(bookmark, &anchors)
+                    .map(|resolution| (bookmark.uuid.clone(), resolution))
+                    .map_err(|error| {
+                        ApiError::internal(format!("Failed to resolve annotation anchor: {error}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        annotations
+            .apply_resolutions(&resolutions)
+            .map_err(|error| annotation_error("Failed to record annotation bindings", error))?;
         Ok(())
-    }
-
-    fn core_generation(storage: &Store) -> Option<i64> {
-        storage
-            .get_complete_index_publication()
-            .ok()
-            .flatten()
-            .and_then(|publication| i64::try_from(publication.generation).ok())
     }
 
     fn bookmark_dto(
@@ -413,10 +456,15 @@ impl AppController {
         // runtime will not read — the sidecar still reports every annotation
         // from its own durable state instead of failing the read.
         let storage = self.open_storage_read_only().ok();
-        let anchors = storage.as_deref().map(|storage| CoreAnchors {
-            storage,
-            generation: Self::core_generation(storage),
-        });
+        let anchors = storage
+            .as_deref()
+            .map(CoreAnchors::new)
+            .transpose()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read annotation core generation: {error}"
+                ))
+            })?;
         let bookmarks = annotations
             .bookmarks(category_id)
             .map_err(|error| annotation_error("Failed to load bookmarks", error))?;
@@ -425,7 +473,9 @@ impl AppController {
             // A read resolves live but never writes: an observational caller
             // must not be able to mutate the sidecar.
             let resolution = match anchors.as_ref() {
-                Some(anchors) => resolve_bookmark(&bookmark, anchors),
+                Some(anchors) => resolve_bookmark(&bookmark, anchors).map_err(|error| {
+                    ApiError::internal(format!("Failed to resolve annotation anchor: {error}"))
+                })?,
                 None => stored_resolution(&bookmark),
             };
             response.push(Self::bookmark_dto(
@@ -491,15 +541,21 @@ impl AppController {
             .annotation_anchor_for_node(node_id)
             .map_err(|e| ApiError::internal(format!("Failed to read bookmark anchor: {e}")))?
             .ok_or_else(|| ApiError::not_found(format!("Node not found: {}", req.node_id.0)))?;
-        let anchors = CoreAnchors {
-            storage: &storage,
-            generation: Self::core_generation(&storage),
-        };
+        let anchors = CoreAnchors::new(&storage).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read annotation core generation: {error}"
+            ))
+        })?;
         // The same evidence the rebind pass records, including how well this
         // anchor separated its symbol from its neighbours: a later rename or
         // move may only be inferred from evidence that was discriminating when
         // it was proven.
-        let evidence = codestory_store::anchor_evidence(&anchor, anchors.generation, &anchors);
+        let evidence = codestory_store::anchor_evidence(&anchor, anchors.generation, &anchors)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read annotation anchor evidence: {error}"
+                ))
+            })?;
         let bookmark = annotations
             .create_bookmark(
                 category_id,
@@ -572,15 +628,22 @@ impl AppController {
             .map(|raw| parse_db_id(raw, "category_id"))
             .transpose()?;
         let comment_patch = req.comment.as_ref().map(|value| value.as_deref());
+        let current = annotations
+            .bookmark(id)
+            .map_err(|error| annotation_error("Failed to load bookmark", error))?
+            .ok_or_else(|| ApiError::not_found(format!("Bookmark not found: {id}")))?;
+        let storage = self.open_storage_read_only()?;
+        let anchors = CoreAnchors::new(&storage).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read annotation core generation: {error}"
+            ))
+        })?;
+        let resolution = resolve_bookmark(&current, &anchors).map_err(|error| {
+            ApiError::internal(format!("Failed to resolve annotation anchor: {error}"))
+        })?;
         let bookmark = annotations
             .update_bookmark(id, category_id, comment_patch)
             .map_err(|error| annotation_error("Failed to update bookmark", error))?;
-        let storage = self.open_storage_read_only()?;
-        let anchors = CoreAnchors {
-            storage: &storage,
-            generation: Self::core_generation(&storage),
-        };
-        let resolution = resolve_bookmark(&bookmark, &anchors);
         annotations
             .apply_resolution(&bookmark.uuid, &resolution)
             .map_err(|error| annotation_error("Failed to record annotation binding", error))?;

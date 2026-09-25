@@ -159,6 +159,13 @@ whether the qualified name matched exactly one symbol anywhere. An inference may
 only rest on evidence that was discriminating when it was proven, so a surviving
 same-shaped sibling never inherits a deleted symbol's annotation.
 
+Selective anchor lookup errors are not evidence that a symbol is absent. A
+rebind resolves every bookmark before writing and commits the outcomes in one
+sidecar transaction; a failed query or write leaves the prior evidence intact.
+That persisted generation is the retry checkpoint: the next core writer catches
+it up against the still-current complete generation before publishing another.
+The adjacent-generation rule for changed anchors remains unchanged.
+
 The migration is paired with the schema-31 core writer barrier. Forward-only
 migration already refuses a newer schema, so a 0.16.3 CLI opening a migrated
 database fails closed on the whole database instead of silently writing the

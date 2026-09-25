@@ -13,7 +13,8 @@ use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
 use crate::publication::{
     PublicationTestBoundary, publication_test_checkpoint,
-    run_activation_search_before_revalidate_hook,
+    run_activation_search_before_revalidate_hook, run_postcommit_before_annotation_rebind_hook,
+    take_postcommit_cache_refresh_error,
 };
 use crate::search_publication::{
     load_persisted_search_state_for_runtime, retrieval_state_from_storage_for_runtime,
@@ -710,7 +711,15 @@ impl AppController {
             }
         }
         let cache_refresh_started = Instant::now();
-        let cache_stats_result = if let Some(prepared) = summary.prepared_search_state.take() {
+        #[cfg(test)]
+        let forced_cache_failure = take_postcommit_cache_refresh_error();
+        #[cfg(not(test))]
+        let forced_cache_failure = false;
+        let cache_stats_result = if forced_cache_failure {
+            Err(ApiError::internal(
+                "Injected postcommit runtime cache refresh failure",
+            ))
+        } else if let Some(prepared) = summary.prepared_search_state.take() {
             if refresh_runtime_caches {
                 Ok(publish_prepared_search_state(self, prepared))
             } else {
@@ -755,6 +764,17 @@ impl AppController {
                 },
             )
         };
+        // Core is already committed. Annotation evidence must advance even if
+        // resident cache publication fails; a failed rebind remains retryable
+        // at the next core-replacement gate before another generation moves.
+        #[cfg(test)]
+        run_postcommit_before_annotation_rebind_hook(storage_path);
+        if let Err(error) = self.rebind_annotations_after_core_publication() {
+            tracing::warn!(
+                error = %error.message,
+                "Annotation rebinding failed after core publication; the next writer must catch up before replacing core"
+            );
+        }
         let mut cache_stats = match cache_stats_result {
             Ok(cache_stats) => cache_stats,
             Err(error) => {
@@ -771,16 +791,6 @@ impl AppController {
             cache_stats.semantic_stats = summary.staged_semantic_stats;
         }
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
-        // The publication that just replaced core projections is the mutating
-        // trigger for annotations: rebinding here keeps recorded anchor
-        // evidence one generation behind the live core, which is exactly the
-        // window the conservative rebind gate accepts.
-        if let Err(error) = self.rebind_annotations_after_core_publication() {
-            tracing::warn!(
-                error = %error.message,
-                "Annotation rebinding failed after core publication; annotations stay at their last recorded binding"
-            );
-        }
         Ok(IndexingCompletion {
             phase_timings: summary.phase_timings,
             repository_tracking_digest,
@@ -1231,14 +1241,21 @@ impl AppController {
                 return Err(error);
             }
         };
-        let result = semantic_projection_republish_for_runtime(
-            &root,
-            &storage_path,
-            cancel_token,
-            &self.runtime_config,
-            &self.source_index_policy,
-            staged_mutation,
-        );
+        // This writer advances the same core generation as source refreshes.
+        // Catch up any persisted annotation evidence while the predecessor is
+        // still live, before a semantic-only generation can widen a rebind gap.
+        let result = self
+            .ensure_annotations_owned_before_core_replacement()
+            .and_then(|_annotations_owned| {
+                semantic_projection_republish_for_runtime(
+                    &root,
+                    &storage_path,
+                    cancel_token,
+                    &self.runtime_config,
+                    &self.source_index_policy,
+                    staged_mutation,
+                )
+            });
         match result {
             Ok((
                 summary,

@@ -6,6 +6,7 @@ type ActivationSearchRevalidateHook = Box<dyn FnOnce(&Path)>;
 type SemanticProjectionRevalidateHook = Box<dyn FnOnce(&Path)>;
 type FullRefreshStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
 type IncrementalStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
+type PostcommitBeforeAnnotationRebindHook = Box<dyn FnOnce(&Path)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublicationTestBoundary {
@@ -49,6 +50,30 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static INCREMENTAL_STAGED_STORE_HOOK: std::cell::RefCell<Option<IncrementalStagedStoreHook>> =
         const { std::cell::RefCell::new(None) };
+    static POSTCOMMIT_CACHE_REFRESH_ERROR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static POSTCOMMIT_BEFORE_ANNOTATION_REBIND_HOOK: std::cell::RefCell<Option<PostcommitBeforeAnnotationRebindHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn arm_postcommit_cache_refresh_error() {
+    POSTCOMMIT_CACHE_REFRESH_ERROR.with(|fault| fault.set(true));
+}
+
+pub(super) fn take_postcommit_cache_refresh_error() -> bool {
+    POSTCOMMIT_CACHE_REFRESH_ERROR.with(std::cell::Cell::take)
+}
+
+pub(super) fn arm_postcommit_before_annotation_rebind_hook(hook: impl FnOnce(&Path) + 'static) {
+    POSTCOMMIT_BEFORE_ANNOTATION_REBIND_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(super) fn run_postcommit_before_annotation_rebind_hook(storage_path: &Path) {
+    POSTCOMMIT_BEFORE_ANNOTATION_REBIND_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage_path);
+        }
+    });
 }
 
 pub(super) fn arm_publication_test_fault(

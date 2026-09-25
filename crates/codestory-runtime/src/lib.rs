@@ -174,7 +174,8 @@ use index_freshness::{
 use publication::{
     PUBLICATION_TEST_FAULT, PublicationTestAction, PublicationTestBoundary,
     arm_activation_search_before_revalidate_hook, arm_full_refresh_staged_store_hook,
-    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_incremental_staged_store_hook, arm_postcommit_before_annotation_rebind_hook,
+    arm_postcommit_cache_refresh_error, arm_publication_test_fault,
     arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
     arm_source_policy_before_revalidate_hook,
 };
