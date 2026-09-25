@@ -181,6 +181,32 @@ test('an exact dispatch nonce from another actor cannot be adopted across clock 
   assert.equal(f.record().dispatches[0].id, undefined);
 });
 
+test('recovery persists no run ID until detailed ownership checks succeed', async t => {
+  for (const [name, mutate, blocker] of [
+    ['actor', row => { row.actor = { login: 'unrelated-user' }; }, /run actor differs/u],
+    ['head', row => { row.head_sha = D; }, /run does not match/u],
+    ['workflow', row => { row.path = '.github/workflows/release.yml'; }, /run does not match/u],
+    ['repository', row => { row.head_repository = { full_name: 'someone/else' }; }, /run does not match/u],
+    ['event', row => { row.event = 'push'; }, /run does not match/u],
+  ]) await t.test(name, async () => {
+    const f = await started(); f.data.dispatchReplyLost = true;
+    await run(f);
+    f.data.dispatchReplyLost = false;
+    const detailedHost = f.host();
+    const getRun = detailedHost.getRun;
+    detailedHost.getRun = id => {
+      const row = structuredClone(getRun(id));
+      mutate(row);
+      return row;
+    };
+    assert.match((await execute(['resume', '--issue', '999'], detailedHost)).blocker, blocker);
+    assert.equal(f.record().dispatches[0].id, undefined);
+    assert.equal(dispatches(f).length, 1);
+    assert.equal((await run(f, 'resume')).active_runs[0].id, f.data.runs[0].id);
+    assert.equal(dispatches(f).length, 1);
+  });
+});
+
 test('wrong or duplicate dispatch nonces cannot be adopted as owned work', async t => {
   for (const kind of ['missing', 'different', 'duplicate']) await t.test(kind, async () => {
     const f = await started(); f.data.dispatchReplyLost = true; await run(f);

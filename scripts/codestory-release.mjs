@@ -86,8 +86,9 @@ function recoverIntents(record, host) {
       && run.actor?.login === step.actor
       && typeof step.dispatch_id === 'string' && run.display_title === `codestory-release:${step.dispatch_id}`);
     requireThat(matches.length === 1, `unconfirmed ${step.phase} dispatch: ${matches.length} matching runs; no replacement will be dispatched`);
-    step.id = matches[0].id;
-    liveStep(host, step);
+    const validated = { ...step, id: matches[0].id };
+    liveStep(host, validated);
+    step.id = validated.id;
     save(record, host);
   }
 }
