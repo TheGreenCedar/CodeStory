@@ -346,6 +346,12 @@ test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => 
     ),
     "publication_schema_skew",
   );
+  const tooNewMinimum = response(session.negotiated, session.discoveryContractSha256);
+  tooNewMinimum.result._meta.codestory_publication.minimum_compatible_schema_version = 4;
+  assert.equal(
+    launcherTest.v3RuntimeWireContractSkew(tooNewMinimum, session),
+    "publication_stamp_producer_too_new",
+  );
   assert.deepEqual(
     launcherTest.supportedMcpProtocolVersions,
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
@@ -493,6 +499,174 @@ test("fail-open relay applies revision-native JSON-RPC batch rules", async () =>
   }
 });
 
+test("handoff waits for child validation and retires answered legacy batch IDs", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "ready" }, warnings: [], readiness: [],
+    managed_retrieval: { state: "ready", automatic: true },
+  };
+  for (const revision of ["2024-11-05", "2025-03-26"]) {
+    for (const mode of ["ordered", "batch-exit"]) {
+      const dir = fs.mkdtempSync(join(tmpdir(), "codestory-handoff-order-"));
+      try {
+        const tracePath = join(dir, "trace.jsonl");
+        const childScript = [
+          "const fs=require('node:fs');",
+          "let input='';const seen=[];",
+          "const record=(phase)=>fs.appendFileSync(process.env.TEST_TRACE,JSON.stringify({phase,seen:[...seen]})+'\\n');",
+          "process.stdin.setEncoding('utf8');",
+          "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
+          "if(Array.isArray(frame)){seen.push('batch');record('received');process.stdout.write(JSON.stringify([{jsonrpc:'2.0',id:'A',result:{ok:'A'}},{jsonrpc:'2.0',id:'B',result:{ok:'B'}}])+'\\n',()=>setTimeout(()=>process.exit(17),30));continue;}",
+          "if(frame.method==='initialize'){seen.push('initialize');setTimeout(()=>{record('before-validation');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:process.env.TEST_REVISION,_meta:{codestory_protocol:{discovery_contract_sha256:process.env.TEST_DIGEST},codestory_publication:{schema_version:3,minimum_compatible_schema_version:3}}}})+'\\n');},100);continue;}",
+          "if(frame.method==='notifications/initialized'){seen.push('initialized');continue;}",
+          "seen.push(String(frame.id));record('received');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{ok:frame.id}})+'\\n');",
+          "}});",
+        ].join("");
+        const hostScript = [
+          `const spawn=require('node:child_process').spawn;const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+          `run(${JSON.stringify(status)},{shouldHandoff:()=>true,startRuntime:()=>spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['pipe','pipe','pipe'],env:process.env}),onRuntimeFailure:()=>{}});`,
+        ].join("");
+        const requests = [
+          { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: revision } },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          ...(mode === "ordered"
+            ? ["first", "second"].map((id) => ({
+              jsonrpc: "2.0", id, method: "tools/call",
+              params: { name: "status", arguments: { project: repoRoot } },
+            }))
+            : [[
+              { jsonrpc: "2.0", id: "A", method: "tools/list" },
+              { jsonrpc: "2.0", method: "notifications/cancelled" },
+              { jsonrpc: "2.0", id: "B", method: "resources/list" },
+              { jsonrpc: "2.0", id: "C", method: "tools/list" },
+            ]]),
+        ];
+        const result = spawnSync(process.execPath, ["-e", hostScript], {
+          input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
+          encoding: "utf8", timeout: 5000,
+          env: { ...process.env, TEST_TRACE: tracePath, TEST_REVISION: revision, TEST_DIGEST: discoveryDigest(revision) },
+        });
+        assert.equal(result.status, 0, result.stderr);
+        const trace = fs.readFileSync(tracePath, "utf8").trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+        assert.deepEqual(trace.find((entry) => entry.phase === "before-validation")?.seen,
+          ["initialize", "initialized"], `${revision} ${mode} dispatched before validation`);
+        const frames = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+        assert.equal(frames.filter((frame) => frame.id === "init").length, 1);
+        if (mode === "ordered") {
+          assert.deepEqual(trace.filter((entry) => entry.phase === "received").map((entry) => entry.seen.at(-1)), ["first", "second"]);
+          assert.deepEqual(frames.filter((frame) => frame.id !== undefined && frame.id !== "init").map((frame) => frame.id), ["first", "second"]);
+        } else {
+          assert.deepEqual(trace.filter((entry) => entry.phase === "received").map((entry) => entry.seen.at(-1)), ["batch"]);
+          assert.deepEqual(frames.filter(Array.isArray).flat().map((frame) => frame.id), ["A", "B"]);
+          assert.deepEqual(frames.filter((frame) => frame.error).map((frame) => frame.id), ["C"]);
+        }
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("handoff fails pending calls when child initialize ends or rejects", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "ready" }, warnings: [], readiness: [],
+    managed_retrieval: { state: "ready", automatic: true },
+  };
+  for (const failure of ["eof", "error", "malformed", "premature-result", "nonzero", "silent"]) {
+    const childScript = [
+      "let input='';process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
+      "if(frame.method==='tools/call')process.stderr.write('TOOL_DISPATCHED\\n');",
+      "if(frame.method!=='initialize')continue;",
+      failure === "eof" ? "process.exit(0);" : "",
+      failure === "nonzero" ? "process.exit(17);" : "",
+      failure === "error" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,error:{code:-32600,message:'rejected'}})+'\\n');" : "",
+      failure === "malformed" ? "process.stdout.write('not-json\\n');" : "",
+      failure === "premature-result" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'pending',result:{leaked:true}})+'\\n');" : "",
+      "}});",
+    ].join("");
+    const hostScript = [
+      `const spawn=require('node:child_process').spawn;const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+      `run(${JSON.stringify(status)},{shouldHandoff:()=>true,startRuntime:()=>spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['pipe','pipe','pipe']}),handoffInitializeTimeoutMs:200,onRuntimeFailure:()=>{}});`,
+    ].join("");
+    const input = [
+      { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: "2025-03-26" } },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: "pending", method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } },
+    ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+    const result = spawnSync(process.execPath, ["-e", hostScript], { input, encoding: "utf8", timeout: 5000 });
+    assert.equal(result.status, 0, `${failure}: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /TOOL_DISPATCHED/u, failure);
+    const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(frames.filter((frame) => frame.id === "init").length, 1, failure);
+    const pending = frames.filter((frame) => frame.id === "pending");
+    assert.equal(pending.length, 1, failure);
+    assert.equal(pending[0].error.code, -32000, failure);
+    if (failure === "premature-result") {
+      assert.match(pending[0].error.message, /error_code=initialize_response_invalid/u);
+    }
+    if (failure === "silent") {
+      assert.match(pending[0].error.message, /error_code=initialize_timeout/u);
+    }
+  }
+});
+
+test("late events from a refused child cannot affect the retry handoff", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const revision = "2025-03-26";
+  const validInitialize = {
+    jsonrpc: "2.0", id: "init",
+    result: {
+      protocolVersion: revision,
+      _meta: {
+        codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
+        codestory_publication: { schema_version: 3, minimum_compatible_schema_version: 3 },
+      },
+    },
+  };
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "ready" }, warnings: [], readiness: [],
+    managed_retrieval: { state: "ready", automatic: true },
+  };
+  const fixture = [
+    "const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');",
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `const valid=${JSON.stringify(validInitialize)};const status=${JSON.stringify(status)};`,
+    "const children=[];const failures=[];",
+    "function makeChild(){const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;child.frames=[];",
+    "let input='';child.stdin.setEncoding('utf8');child.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);child.frames.push(frame);if(children.length===2&&frame.id==='second')child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'second',result:{from:'second-child'}})+'\\n');}});children.push(child);return child;}",
+    "run(status,{shouldHandoff:()=>true,startRuntime:makeChild,onRuntimeFailure:(failure)=>failures.push(failure.reasonCode),handoffInitializeTimeoutMs:500});",
+    "const send=(frame)=>process.stdin.emit('data',JSON.stringify(frame)+'\\n');",
+    `send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});`,
+    "send({jsonrpc:'2.0',method:'notifications/initialized'});",
+    `send({jsonrpc:'2.0',id:'first',method:'tools/call',params:{name:'status',arguments:{project:${JSON.stringify(repoRoot)}}}});`,
+    "const skew=structuredClone(valid);skew.result._meta.codestory_publication.schema_version=99;children[0].stdout.write(JSON.stringify(skew)+'\\n');",
+    `send({jsonrpc:'2.0',id:'second',method:'tools/call',params:{name:'status',arguments:{project:${JSON.stringify(repoRoot)}}}});`,
+    "const before=children[1].frames.map((frame)=>frame.method||frame.id);",
+    "children[0].stdout.write(JSON.stringify({jsonrpc:'2.0',id:'second',result:{from:'old-child'}})+'\\n');",
+    "children[0].stderr.write('old child stderr');",
+    "const oldError=Object.assign(new Error('late old child'),{code:'EPIPE'});children[0].stdin.emit('error',oldError);children[0].emit('error',oldError);children[0].emit('close',0,null);",
+    "children[1].stdout.write(JSON.stringify(valid)+'\\n');",
+    "process.stderr.write('PROBE:'+JSON.stringify({before,after:children[1].frames.map((frame)=>frame.method||frame.id),secondStdinEnded:children[1].stdin.writableEnded,failures})+'\\n');",
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["-e", fixture], { encoding: "utf8", timeout: 5000 });
+  assert.equal(result.status, 0, result.stderr);
+  const probe = JSON.parse(result.stderr.split(/\r?\n/u).find((line) => line.startsWith("PROBE:")).slice(6));
+  assert.deepEqual(probe.before, ["initialize", "notifications/initialized"]);
+  assert.deepEqual(probe.after, ["initialize", "notifications/initialized", "tools/call"]);
+  assert.equal(probe.secondStdinEnded, false);
+  assert.deepEqual(probe.failures, ["runtime_wire_contract_skew"]);
+  const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(frames.filter((frame) => frame.id === "first" && frame.error?.code === -32000).length, 1);
+  assert.deepEqual(frames.filter((frame) => frame.id === "second"), [
+    { jsonrpc: "2.0", id: "second", result: { from: "second-child" } },
+  ]);
+});
+
 test("fail-open preparing is a successful revision-native result in every profile", () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const status = {
@@ -566,6 +740,46 @@ test("managed provisioning replies satisfy every non-status tool output schema",
       kind: "retry_same_request",
       after_ms: result.structuredContent.retry_after_ms,
     });
+  }
+});
+
+test("modern fail-open status matches its advertised output schema and text", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const outputSchema = generatedCatalog.tools.find((tool) => tool.name === "status")?.outputSchema;
+  assert.ok(outputSchema);
+  for (const state of ["preparing", "unavailable"]) {
+    const status = {
+      plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+      runtime: { state }, warnings: [], readiness: [],
+      managed_retrieval: { state, automatic: true },
+      degraded_reason: state === "preparing" ? "managed_cli_provisioning" : "runtime_unavailable",
+    };
+    const fixture = `require(${JSON.stringify(launcher)})._test.runFailOpenMcp(${JSON.stringify(status)});`;
+    for (const revision of ["2025-06-18", "2025-11-25"]) {
+      const input = [
+        { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: revision } },
+        { jsonrpc: "2.0", id: "status", method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } },
+      ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+      const result = spawnSync(process.execPath, ["-e", fixture], { input, encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+      const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+      assert.equal(frames.length, 2);
+      const toolResult = frames[1].result;
+      assert.equal(toolResult.isError, false);
+      assert.deepEqual(JSON.parse(toolResult.content[0].text), toolResult.structuredContent);
+      assert.deepEqual(launcherTest.validatePublishedSchemaValue(outputSchema, toolResult.structuredContent, "/result"), []);
+      assert.equal(toolResult.structuredContent.project, repoRoot);
+      assert.equal(toolResult.structuredContent.state, state);
+      assert.equal(toolResult.structuredContent.diagnostics_uri,
+        launcherTest.projectBoundResourceUri("codestory://status", repoRoot));
+      if (state === "preparing") {
+        assert.equal(toolResult.structuredContent.failure, null);
+        assert.ok(toolResult.structuredContent.retry_after_ms > 0);
+      } else {
+        assert.equal(toolResult.structuredContent.retry_after_ms, null);
+        assert.equal(typeof toolResult.structuredContent.failure, "string");
+      }
+    }
   }
 });
 
@@ -4665,14 +4879,14 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
         "    if (!line.trim()) continue;",
         "    const request = JSON.parse(line);",
         "    if (request.method === 'initialize') {",
-        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 1 } } } }) + '\\n');`,
-        "    } else if (request.method === 'tools/list') {",
+        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 3, minimum_compatible_schema_version: 4 } } } }) + '\\n');`,
+        "    } else if (request.method === 'tools/call') {",
         // Answer in a later chunk so the reply lands after the launcher has
         // already refused this runtime: the relay must stay shut, not just
         // drop the rest of the chunk that carried the initialize frame.
         "      setTimeout(() => {",
         "        fs.writeFileSync(process.env.TEST_SERVED, 'runtime-answered');",
-        "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'skewed-runtime' }] } }) + '\\n');",
+        "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: 'skewed-runtime' }] } }) + '\\n');",
         "      }, 50);",
         "    }",
         "  }",
@@ -4758,7 +4972,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
       discovery_contract_sha256: discoveryDigest("2025-03-26"),
     });
 
-    const delegated = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
+    const delegated = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/call", params: { name: "status", arguments: { project: dataDir } } });
     assert.equal(
       delegated.result,
       undefined,
@@ -4766,7 +4980,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
     );
     assert.equal(delegated.error.code, -32000);
     assert.match(delegated.error.message, /reason_code=runtime_wire_contract_skew/u);
-    assert.match(delegated.error.message, /error_code=publication_schema_skew/u);
+    assert.match(delegated.error.message, /error_code=publication_stamp_producer_too_new/u);
 
     const diagnostic = await sendRequest({
       jsonrpc: "2.0",
@@ -4779,14 +4993,10 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
     assert.equal(status.readiness[0].status, "unavailable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
 
-    // The refused runtime did produce a `tools/list` answer — the request was
-    // already in flight when its initialize frame arrived. The contract is that
-    // none of it reaches the host.
-    for (let waited = 0; waited < 2000 && !fs.existsSync(servedFile); waited += 25) {
-      await delay(25);
-    }
+    // The first project-scoped call must not reach a runtime before its
+    // compatibility claim is accepted.
     await delay(100);
-    assert.equal(fs.existsSync(servedFile), true, "the fixture must have produced a reply to suppress");
+    assert.equal(fs.existsSync(servedFile), false, "a refused runtime must never receive the tool call");
     assert.equal(
       hostFrames.some((frame) => frame.includes("skewed-runtime")),
       false,
@@ -5870,6 +6080,7 @@ test("managed cli cleanup failure cannot publish over prior managed state", { ti
   const failureMarker = join(isolatedTmp, "cleanup-failed");
   const preloadPath = join(isolatedTmp, "fail-extraction-cleanup.cjs");
   const versionDir = join(dataDir, "codestory-cli", version);
+  const lockPath = join(dataDir, "codestory-cli", ".retention-lock");
   let launched;
   try {
     await writeReleaseFixture(releaseDir, version);
@@ -5917,11 +6128,49 @@ test("managed cli cleanup failure cannot publish over prior managed state", { ti
       { preload: preloadPath },
     );
     await waitForPath(failureMarker);
-    launched.child.kill("SIGKILL");
-    await launched.completed;
+    let nextId = 100;
+    let responseBuffer = "";
+    const terminalStatus = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        clearInterval(poll);
+        reject(new Error("managed CLI cleanup failure did not reach a terminal status"));
+      }, 8000);
+      const poll = setInterval(() => {
+        launched.child.stdin.write(`${JSON.stringify({
+          jsonrpc: "2.0", id: nextId++, method: "resources/read", params: { uri: statusUri },
+        })}\n`);
+      }, 100);
+      launched.child.stdout.setEncoding("utf8");
+      launched.child.stdout.on("data", (chunk) => {
+        responseBuffer += chunk;
+        const lines = responseBuffer.split(/\r?\n/u);
+        responseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line) continue;
+          const frame = JSON.parse(line);
+          if (typeof frame.id !== "number" || frame.id < 100) continue;
+          const status = JSON.parse(frame.result.contents[0].text);
+          if (status.degraded_reason === "managed_cli_provisioning") continue;
+          clearTimeout(timeout);
+          clearInterval(poll);
+          resolve(status);
+        }
+      });
+    });
+    const failed = await terminalStatus;
+    assert.match(failed.degraded_reason, /^managed_cli_provision_failed:/u);
+    assert.equal(failed.readiness[0].status, "unavailable");
+    launched.child.stdin.end();
+    const terminal = await Promise.race([
+      launched.completed,
+      delay(5000).then(() => { throw new Error("launcher did not exit naturally after cleanup failure"); }),
+    ]);
     launched = null;
+    assert.equal(terminal.signal, null);
+    assert.equal(terminal.status, 0, terminal.stderr);
 
     assert.equal(fs.existsSync(versionDir), false);
+    assert.equal(fs.existsSync(lockPath), false);
     assert.deepEqual(await readFile(prior.cliPath), priorCli);
     assert.deepEqual(await readFile(join(prior.versionDir, "manifest.json")), priorManifest);
   } finally {
