@@ -7418,6 +7418,79 @@ mod tests {
     }
 
     #[test]
+    fn reuse_refuses_same_count_scip_row_drift_after_publication() {
+        let fixture = publish_healthy_generation("reuse-scip-row-drift");
+        let json_path = fixture.scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE);
+        let index: crate::scip_index::ScipSymbolsIndex = serde_json::from_slice(
+            &std::fs::read(&json_path).expect("read published graph fixture"),
+        )
+        .expect("decode published graph fixture");
+        crate::scip_index::publish_scip_component_for_test(&fixture.scip_dir, &index)
+            .expect("publish the same graph through the real SQLite producer");
+        assert!(
+            !json_path.exists(),
+            "SQLite publication replaces the JSON fixture"
+        );
+
+        let semantic_point_count = Some(0);
+        let healthy = probe(&fixture, "reuse-scip-row-drift");
+        assert!(healthy.scip.capabilities.graph);
+        assert!(unchanged_generation_is_reusable(
+            &healthy,
+            semantic_point_count
+        ));
+
+        let component = crate::scip_index::scip_symbols_component_path(&fixture.scip_dir);
+        crate::copy_on_write::make_file_owner_writable(&component)
+            .expect("allow hostile row rewrite");
+        let connection = rusqlite::Connection::open(&component).expect("open published graph");
+        let before: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read graph envelope");
+        connection
+            .execute(
+                "UPDATE symbol_records SET start_line = start_line + 1 WHERE ordinal = 0",
+                [],
+            )
+            .expect("rewrite one symbol cell without changing row counts");
+        let after: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reread graph envelope");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .expect("check SQLite structure");
+        drop(connection);
+        crate::copy_on_write::make_file_immutable(&component)
+            .expect("restore immutable component bit");
+        assert_eq!(before, after);
+        assert_eq!(quick_check, "ok");
+
+        let damaged = probe(&fixture, "reuse-scip-row-drift");
+        assert_eq!(
+            damaged.retrieval_mode, "full",
+            "manifest classification is unchanged"
+        );
+        assert!(
+            !damaged.scip.capabilities.graph,
+            "damaged rows revoke graph health"
+        );
+        assert!(damaged.degraded_reason.is_some());
+        assert!(!unchanged_generation_is_reusable(
+            &damaged,
+            semantic_point_count
+        ));
+        assert!(!damaged.is_live_ready());
+    }
+
+    #[test]
     fn reuse_refuses_a_generation_whose_lexical_shard_was_damaged_after_publication() {
         let fixture = publish_healthy_generation("reuse-lexical");
         let semantic_point_count = Some(0);
