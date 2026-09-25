@@ -566,7 +566,6 @@ dependencies = [
  "codestory-llama-sys",
  "codestory-retrieval",
  "codestory-runtime",
- "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
  "crossterm 0.28.1",

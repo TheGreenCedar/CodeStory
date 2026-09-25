@@ -75,6 +75,15 @@ pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiErr
         .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
 }
 
+/// Test-support: force the core clone attempt to report unavailable while an
+/// owning command runs. Consumer tests exercise their real command boundary
+/// without adding a production configuration override or a store dependency.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_core_clone_disabled_for_test<T>(action: impl FnOnce() -> T) -> T {
+    codestory_store::with_core_clone_disabled(action)
+}
+
 mod affected;
 mod agent;
 mod call_path_grammar;

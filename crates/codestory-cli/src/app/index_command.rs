@@ -276,8 +276,10 @@ mod tests {
         };
         run_index(command(RefreshMode::Full)).expect("seed published core through index command");
         fs::write(&source, "pub fn alpha() -> i32 { 2 }\n").expect("change indexed source");
-        codestory_store::with_core_clone_disabled(|| run_index(command(RefreshMode::Auto)))
-            .expect("auto refresh falls back to a full publication");
+        codestory_runtime::with_core_clone_disabled_for_test(|| {
+            run_index(command(RefreshMode::Auto))
+        })
+        .expect("auto refresh falls back to a full publication");
 
         let output: serde_json::Value = serde_json::from_slice(
             &fs::read(&output_file).expect("read executed index command JSON"),
@@ -292,17 +294,19 @@ mod tests {
         let storage_path = output["storage_path"]
             .as_str()
             .expect("command storage path");
+        let observer = RuntimeContext::new_inspect_only(&command(RefreshMode::Auto).project)
+            .expect("observe command publication through runtime");
         let published_mode = || {
-            codestory_store::Store::open(std::path::Path::new(storage_path))
-                .expect("open command publication")
-                .get_complete_index_publication()
+            observer
+                .project
+                .complete_index_publication_at(std::path::Path::new(storage_path))
                 .expect("read command publication")
                 .expect("complete command publication")
                 .mode
         };
         assert_eq!(
             published_mode(),
-            codestory_store::IndexPublicationMode::Full
+            codestory_contracts::api::IndexPublicationModeDto::Full
         );
 
         fs::write(&source, "pub fn alpha() -> i32 { 3 }\n").expect("change source again");
@@ -315,7 +319,7 @@ mod tests {
         assert!(ordinary.get("refresh_reason").is_none());
         assert_eq!(
             published_mode(),
-            codestory_store::IndexPublicationMode::Incremental
+            codestory_contracts::api::IndexPublicationModeDto::Incremental
         );
     }
 }
