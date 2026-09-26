@@ -3558,6 +3558,102 @@ fn c_cpp_closed_direct_identifier_matrix() -> anyhow::Result<()> {
 fn cpp_same_named_free_function_does_not_certify_constructor_receiver() -> anyhow::Result<()> {
     for (name, source, call_line, member_line, exact) in [
         (
+            "enclosing_class_static_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            6,
+            1,
+            false,
+        ),
+        (
+            "deeper_enclosing_class_late_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  struct Middle {\n",
+                "    struct Inner {\n",
+                "      void caller() { Worker().target(); }\n",
+                "    };\n",
+                "  };\n",
+                "  static Other Worker() { return {}; }\n",
+                "};\n",
+            ),
+            6,
+            1,
+            false,
+        ),
+        (
+            "sibling_type_does_not_hide_enclosing_factory",
+            concat!(
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Sibling {\n",
+                "    struct Worker { void target() {} };\n",
+                "  };\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            8,
+            5,
+            false,
+        ),
+        (
+            "nested_caller_constructor_control",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Holder {\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            4,
+            1,
+            true,
+        ),
+        (
+            "nested_type_declaration_remains_unsupported",
+            concat!(
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Inner {\n",
+                "    struct Worker { void target() {} };\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            6,
+            5,
+            false,
+        ),
+        (
+            "injected_class_name_hides_namespace_factory_control",
+            concat!(
+                "struct Worker {\n",
+                "  void target() {}\n",
+                "  void caller() { Worker().target(); }\n",
+                "};\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+            ),
+            3,
+            2,
+            true,
+        ),
+        (
             "global_function_collision",
             concat!(
                 "struct Worker { void target() {} };\n",
@@ -3773,6 +3869,11 @@ fn cpp_same_named_free_function_does_not_certify_constructor_receiver() -> anyho
             assert!(
                 fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty()
             );
+            if name == "nested_type_declaration_remains_unsupported" {
+                // A class-only field declaration has no declarator, so the existing
+                // bounded adapter poisons this immediate owner's declaration domain.
+                assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+            }
             assert_eq!(
                 after.resolved_target, call.resolved_target,
                 "{name}: proof upgraded target"

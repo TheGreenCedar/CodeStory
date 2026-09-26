@@ -2847,6 +2847,7 @@ struct CCppResolutionIndex<'tree> {
     declaration_indices_by_key: HashMap<(Vec<String>, String), Vec<usize>>,
     classes: Vec<CachedClassDeclaration>,
     class_namespace_paths: Vec<Vec<String>>,
+    class_parent_indices: Vec<Option<usize>>,
     class_indices_by_name: HashMap<String, Vec<usize>>,
     class_method_indices_by_name: HashMap<(usize, String), Vec<usize>>,
     namespaces: Vec<CachedCCppNamespace>,
@@ -2922,6 +2923,7 @@ impl<'tree> CCppResolutionIndex<'tree> {
             declaration_indices_by_key: HashMap::new(),
             classes: Vec::new(),
             class_namespace_paths: Vec::new(),
+            class_parent_indices: Vec::new(),
             class_indices_by_name: HashMap::new(),
             class_method_indices_by_name: HashMap::new(),
             namespaces: Vec::new(),
@@ -3252,7 +3254,19 @@ impl<'tree> CCppResolutionIndex<'tree> {
         if self.macro_names.contains(name) {
             return false;
         }
-        if let Some(owner) = call.owner_index {
+        let visible_class = self
+            .class_indices_by_name
+            .get(name)
+            .and_then(|classes| match classes.as_slice() {
+                [class] => Some(*class),
+                _ => None,
+            });
+        // Nested classes inherit unqualified lookup through every enclosing class
+        // scope. Keep those scopes ahead of namespace lookup, including declarations
+        // encountered after the call in the complete class body.
+        let mut scope = call.owner_index;
+        while let Some(owner) = scope {
+            count_c_cpp_resolution_work(4);
             let owner_name = &self.classes[owner].name;
             let callable_key = (
                 self.class_namespace_paths[owner].clone(),
@@ -3268,16 +3282,18 @@ impl<'tree> CCppResolutionIndex<'tree> {
             {
                 return false;
             }
+            if visible_class.is_some_and(|class| {
+                class == owner || self.class_parent_indices[class] == Some(owner)
+            }) {
+                return true;
+            }
+            scope = self.class_parent_indices[owner];
         }
         // Unqualified expression lookup includes enclosing namespaces. The complete
         // callable census also covers prototypes and declarations with no graph target.
-        let class_namespace =
-            self.class_indices_by_name
-                .get(name)
-                .and_then(|classes| match classes.as_slice() {
-                    [class] => Some(&self.class_namespace_paths[*class]),
-                    _ => None,
-                });
+        let class_namespace = visible_class
+            .filter(|class| self.class_parent_indices[*class].is_none())
+            .map(|class| &self.class_namespace_paths[class]);
         for depth in (0..=call.namespace_path.len()).rev() {
             count_c_cpp_resolution_work(3);
             let namespace = call.namespace_path[..depth].to_vec();
@@ -3583,6 +3599,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
         node: TsNode<'tree>,
         mut context: CCppWalkContext,
     ) -> CCppWalkContext {
+        let parent_owner = context.owner_index;
         context.owner_index = None;
         context.unsupported |= node.child_by_field_name("name").is_none()
             || c_cpp_has_direct_kind(node, "base_class_clause")
@@ -3602,6 +3619,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
             .map(Vec::as_slice)
             .unwrap_or_default();
         let [declaration] = candidates else {
+            context.unsupported = true;
             return context;
         };
         count_c_cpp_resolution_work(2);
@@ -3616,6 +3634,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
         self.index
             .class_namespace_paths
             .push(self.namespace_path.clone());
+        self.index.class_parent_indices.push(parent_owner);
         let owner_index = self.index.classes.len() - 1;
         count_c_cpp_resolution_work(1);
         self.index
