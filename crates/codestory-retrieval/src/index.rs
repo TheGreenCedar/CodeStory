@@ -2909,6 +2909,7 @@ fn persist_finalized_manifest(
         stub_flags,
         validate_candidate_generation,
         || {},
+        || {},
     )
 }
 
@@ -2932,6 +2933,7 @@ fn persist_finalized_manifest_with_hooks(
         &Store,
         &Path,
     ) -> Result<()>,
+    after_pointer_write: impl FnOnce(),
     after_marker: impl FnOnce(),
 ) -> Result<FinalizeIndexOutcome> {
     let manifest_started = Instant::now();
@@ -2984,7 +2986,7 @@ fn persist_finalized_manifest_with_hooks(
             )
             .context("lock retrieval publication commit")?;
             let mut publication = storage
-                .write_transaction()
+                .retrieval_publication_transaction()
                 .context("lock sidecar input and manifest publication")?;
             prepared_lexical
                 .revalidate_source_seals(project_root, storage_path)
@@ -3050,12 +3052,12 @@ fn persist_finalized_manifest_with_hooks(
                 }
             }
             publication
-                .storage_mut()
                 .publish_retrieval_index_publication(
                     &manifest,
                     prepared_retention.verified_previous.as_ref(),
                 )
                 .context("persist atomic retrieval current and rollback pointers")?;
+            after_pointer_write();
             ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit")?;
             publication
                 .finish()
@@ -3184,14 +3186,13 @@ fn promote_retrieval_manifest_with_cancel<T>(
     validate_candidate(storage)?;
     let prepared = prepare_publication(storage)?;
     let mut publication = storage
-        .write_transaction()
+        .retrieval_publication_transaction()
         .context("lock sidecar input and manifest publication")?;
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
     let rollback = publication_rollback(&prepared)?;
     ensure_not_cancelled()?;
     publication
-        .storage_mut()
         .publish_retrieval_index_publication(manifest, rollback.as_ref())
         .context("persist atomic retrieval current and rollback pointers")?;
     ensure_not_cancelled()?;
@@ -5881,6 +5882,179 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalized_manifest_external_pointer_cancellation_preserves_commit_boundary() {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let candidate = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("prepare complete candidate artifacts");
+        let generation = candidate.sidecar_generation.as_deref().expect("generation");
+        let artifacts = [
+            crate::lexical_index::shard_dir_for(
+                &fixture.runtime.layout.lexical_data_dir,
+                generation,
+            )
+            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+            crate::scip_index::scip_symbols_component_path(
+                &fixture.runtime.layout.scip_project_dir(generation),
+            ),
+            crate::embedded_vector::index_path(
+                &fixture.runtime.layout,
+                &candidate.semantic_generation,
+            ),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read candidate artifact before commit");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        fs::remove_file(&fixture.retrieval_pointer_path)
+            .expect("reset prepared candidate to an absent first-publication pointer");
+
+        let storage = Store::open(&fixture.storage_path).expect("open candidate core");
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_dim = candidate.embedding_dim.expect("embedding dimension");
+        let producer = crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).expect("positive dimension"),
+        )
+        .expect("producer compatibility identity");
+        let sidecar_input = compute_sidecar_input_fingerprint(
+            &storage,
+            fixture.project.path(),
+            &fixture.storage_path,
+            &candidate.project_id,
+            candidate.embedding_backend.as_deref().expect("backend"),
+            embedding_dim,
+            &producer,
+        )
+        .expect("compute exact candidate input");
+        assert_eq!(
+            candidate.sidecar_input_hash.as_deref(),
+            Some(sidecar_input.hash.as_str()),
+            "test validator must not admit a stale candidate"
+        );
+        let prepared_lexical = prepare_lexical_input_for_store(
+            lexical_source_input(fixture.project.path(), &fixture.storage_path)
+                .expect("scan lexical source"),
+            fixture.project.path(),
+            &storage,
+        )
+        .expect("prepare lexical source seals");
+        drop(storage);
+        let residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "external-commit-finalizer-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency: residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+        for cancel_after_write in [true, false] {
+            let cancelled = AtomicBool::new(false);
+            let writes = std::cell::Cell::new(0_u8);
+            let markers = std::cell::Cell::new(0_u8);
+            let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+                persist_finalized_manifest_with_hooks(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                    &prepared_lexical,
+                    &context,
+                    &cancelled,
+                    &sidecar_input,
+                    candidate.project_id.clone(),
+                    candidate.clone(),
+                    Vec::new(),
+                    SidecarStubFlags {
+                        scip_stubbed: false,
+                    },
+                    |project_id, input, manifest, context, storage, _storage_path| {
+                        // Substitute backend validation only; retain the real
+                        // input/core/source fence, pointer write and finalizer.
+                        assert_eq!(project_id, manifest.project_id);
+                        assert_eq!(
+                            manifest.sidecar_input_hash.as_deref(),
+                            Some(input.hash.as_str())
+                        );
+                        assert_eq!(
+                            storage.get_complete_index_publication()?,
+                            Some(context.pinned_core_publication.clone())
+                        );
+                        assert!(crate::lexical_index::shard_matches_lexical_input(
+                            &context.layout.lexical_data_dir,
+                            manifest.sidecar_generation.as_deref().expect("generation"),
+                            input.lexical_file_count,
+                            &input.lexical_hash,
+                            &input.hash,
+                        ));
+                        Ok(())
+                    },
+                    || {
+                        writes.set(writes.get() + 1);
+                        cancelled.store(cancel_after_write, std::sync::atomic::Ordering::Release);
+                    },
+                    || markers.set(markers.get() + 1),
+                )
+            });
+            assert_eq!(
+                writes.get(),
+                1,
+                "actual staged pointer write hook must execute"
+            );
+            let observed = Store::open(&fixture.storage_path)
+                .expect("reopen authoritative finalizer pointer")
+                .get_retrieval_index_publication(&candidate.project_id)
+                .expect("read finalizer current+rollback pair");
+            if cancel_after_write {
+                let error = result.expect_err("precommit cancellation must reject candidate");
+                assert!(
+                    is_retrieval_index_cancelled(&error),
+                    "typed cancellation lost: {error:#}"
+                );
+                assert_eq!(
+                    markers.get(),
+                    0,
+                    "cancelled staging cannot enter postcommit cleanup"
+                );
+                assert!(
+                    observed.is_none(),
+                    "cancelled external candidate became authoritative: {observed:?}"
+                );
+            } else {
+                let outcome =
+                    result.expect("healthy external commit must return committed outcome");
+                assert_eq!(markers.get(), 1);
+                assert_eq!(
+                    outcome.manifest.sidecar_generation,
+                    candidate.sidecar_generation
+                );
+                let (manifest, rollback) = observed.expect("healthy pointer commit missing");
+                assert_eq!(manifest, outcome.manifest);
+                assert!(rollback.is_none());
+            }
+            fixture.assert_core_unchanged();
+            for (path, bytes) in &artifacts {
+                assert_eq!(
+                    &fs::read(path).expect("read candidate artifact after finalizer"),
+                    bytes
+                );
+            }
+        }
+    }
+
     #[cfg(all(feature = "test-support", unix))]
     #[test]
     fn finalized_manifest_returns_committed_outcome_when_cleanup_setup_fails() {
@@ -6005,6 +6179,7 @@ mod tests {
                     ));
                     Ok(())
                 },
+                || {},
                 || {
                     fs::rename(root, &parked).expect("park sidecar root after marker");
                     restore = Some(RestoreOwnedRoot {
@@ -6228,6 +6403,162 @@ mod tests {
             prior,
             "cancelled transaction changed current or rollback pointers"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    fn pointer_backed_publication_cancellation_case(cancel_at: Option<u8>) {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let mut storage =
+            Store::open(&fixture.storage_path).expect("open real pointer-backed immutable core");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("complete core"),
+            Some(fixture.publication.clone())
+        );
+        assert!(fixture.core_pointer_path.is_file());
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input("11111111111111111111111111111111");
+        let current_input = input("22222222222222222222222222222222");
+        let candidate_input = input("33333333333333333333333333333333");
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        storage
+            .publish_retrieval_index_publication(&rollback_manifest, None)
+            .expect("bind first external retrieval publication to pinned core");
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest,
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+        assert!(fixture.retrieval_pointer_path.is_file());
+        {
+            let mut transaction = storage
+                .retrieval_publication_transaction()
+                .expect("stage hostile rollback binding");
+            let wrong_rollback = prior
+                .as_ref()
+                .and_then(|(_, rollback)| rollback.as_ref())
+                .expect("prior rollback fixture");
+            let error = transaction
+                .publish_retrieval_index_publication(&candidate_manifest, Some(wrong_rollback))
+                .expect_err("a non-current rollback must not substitute the bound predecessor");
+            assert!(
+                error.to_string().contains("currently bound publication"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read after wrong binding"),
+            prior,
+            "wrong rollback binding changed the prior pointer pair"
+        );
+        let checks = std::cell::Cell::new(0_u8);
+
+        let result = promote_retrieval_manifest_with_cancel(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if Some(next) == cancel_at {
+                    return Err(RetrievalIndexCancelled {
+                        boundary: "fixture authoritative pointer commit",
+                    }
+                    .into());
+                }
+                Ok(())
+            },
+        );
+        fixture.assert_core_unchanged();
+        let observed = Store::open(&fixture.storage_path)
+            .expect("independently reopen pointer-backed core")
+            .get_retrieval_index_publication("proj")
+            .expect("read authoritative publication after cancellation fence");
+        if let Some(cancel_at) = cancel_at {
+            let error = result.expect_err("cancellation before commit must reject publication");
+            assert!(is_retrieval_index_cancelled(&error), "{error:#}");
+            assert_eq!(checks.get(), cancel_at, "cancellation callback census");
+            assert_eq!(
+                observed, prior,
+                "cancelled transaction changed current or rollback pointers"
+            );
+        } else {
+            result.expect("uncancelled pointer publication must commit");
+            assert_eq!(checks.get(), 3, "all cancellation fences must execute");
+            assert_eq!(
+                observed,
+                Some((
+                    candidate_manifest,
+                    Some(RetrievalIndexRollbackRecord {
+                        manifest: current_manifest,
+                        verified_at_epoch_ms: 3,
+                    })
+                ))
+            );
+            let bound = Store::open(&fixture.storage_path)
+                .expect("reopen committed binding")
+                .get_bound_retrieval_index_manifest("proj")
+                .expect("read committed binding")
+                .expect("committed binding exists");
+            assert_eq!(bound.core.generation_id, fixture.publication.generation_id);
+            assert_eq!(bound.core.run_id, fixture.publication.run_id);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn pointer_backed_cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
+        pointer_backed_publication_cancellation_case(Some(3));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn pointer_backed_publication_preserves_prewrite_cancellation_and_healthy_commit() {
+        pointer_backed_publication_cancellation_case(Some(2));
+        pointer_backed_publication_cancellation_case(None);
     }
 
     #[test]
