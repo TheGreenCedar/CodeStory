@@ -1008,9 +1008,14 @@ pub fn emit_scip_artifacts_from_store(
     project_dir: &Path,
     generation: &str,
 ) -> Result<Option<String>> {
-    emit_scip_artifacts_from_store_incremental(storage_path, project_dir, generation, None, || {
-        Ok(())
-    })
+    emit_scip_artifacts_from_store_incremental_with_cancel(
+        storage_path,
+        project_dir,
+        generation,
+        None,
+        &|| false,
+        || Ok(()),
+    )
     .map(|outcome| outcome.revision)
 }
 
@@ -1022,14 +1027,16 @@ pub(crate) struct ScipIncrementalOutcome {
     pub removed_records: u64,
     pub reordered_records: u64,
     pub cloned: bool,
+    pub copied: bool,
     pub direct_reference: bool,
 }
 
-pub(crate) fn emit_scip_artifacts_from_store_incremental(
+pub(crate) fn emit_scip_artifacts_from_store_incremental_with_cancel(
     storage_path: &Path,
     project_dir: &Path,
     generation: &str,
     previous_project_dir: Option<&Path>,
+    cancelled: &dyn Fn() -> bool,
     mut before_publish: impl FnMut() -> Result<()>,
 ) -> Result<ScipIncrementalOutcome> {
     if generation.trim().is_empty() {
@@ -1093,6 +1100,7 @@ pub(crate) fn emit_scip_artifacts_from_store_incremental(
             removed_records: 0,
             reordered_records: 0,
             cloned: false,
+            copied: false,
             direct_reference: false,
         });
     }
@@ -1115,10 +1123,11 @@ pub(crate) fn emit_scip_artifacts_from_store_incremental(
     index
         .validate_records(generation)
         .context("validate scip artifact before publication")?;
-    let work = publish_scip_component(
+    let work = publish_scip_component_with_cancel(
         project_dir,
         previous_project_dir,
         &index,
+        cancelled,
         &mut before_publish,
     )?;
     before_publish()?;
@@ -1140,8 +1149,27 @@ pub(crate) fn emit_scip_artifacts_from_store_incremental(
         removed_records: work.removed,
         reordered_records: work.reordered,
         cloned: work.cloned,
+        copied: work.copied,
         direct_reference: work.direct_reference,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn emit_scip_artifacts_from_store_incremental(
+    storage_path: &Path,
+    project_dir: &Path,
+    generation: &str,
+    previous_project_dir: Option<&Path>,
+    before_publish: impl FnMut() -> Result<()>,
+) -> Result<ScipIncrementalOutcome> {
+    emit_scip_artifacts_from_store_incremental_with_cancel(
+        storage_path,
+        project_dir,
+        generation,
+        previous_project_dir,
+        &|| false,
+        before_publish,
+    )
 }
 
 /// Publish a generation envelope over graph bytes already proven equivalent.
@@ -1237,6 +1265,7 @@ pub(crate) fn reference_equivalent_scip_generation(
             removed_records: 0,
             reordered_records: 0,
             cloned: false,
+            copied: false,
             direct_reference: true,
         })
     })();
@@ -1260,6 +1289,7 @@ struct ScipComponentWork {
     removed: u64,
     reordered: u64,
     cloned: bool,
+    copied: bool,
     direct_reference: bool,
 }
 
@@ -1273,10 +1303,11 @@ struct ScipComponentRow {
     ordinal: u64,
 }
 
-fn publish_scip_component(
+fn publish_scip_component_with_cancel(
     project_dir: &Path,
     previous_project_dir: Option<&Path>,
     index: &ScipSymbolsIndex,
+    cancelled: &dyn Fn() -> bool,
     before_publish: &mut dyn FnMut() -> Result<()>,
 ) -> Result<ScipComponentWork> {
     let rows = scip_component_rows(index)?;
@@ -1284,9 +1315,10 @@ fn publish_scip_component(
     let (temp_path, reserved) =
         codestory_workspace::atomic_file::create_unique_temp_file(&path, "scip-symbols")?;
     drop(reserved);
+    let mut stage_failed = false;
     let result: Result<ScipComponentWork> = (|| {
         std::fs::remove_file(&temp_path)?;
-        let mut cloned = false;
+        let mut stage = None;
         let mut direct_reference = false;
         if let Some(previous_dir) = previous_project_dir {
             let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
@@ -1296,11 +1328,14 @@ fn publish_scip_component(
                     && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
                 {
                     direct_reference = true;
-                } else if scip_component_schema(&previous_path)? == 2
-                    && crate::copy_on_write::clone_file(&previous_path, &temp_path)?
-                {
-                    crate::copy_on_write::make_file_owner_writable(&temp_path)?;
-                    cloned = true;
+                } else if scip_component_schema(&previous_path)? == 2 {
+                    stage = Some(
+                        crate::copy_on_write::stage_file(&previous_path, &temp_path, cancelled)
+                            .map_err(|error| {
+                                stage_failed = true;
+                                error
+                            })?,
+                    );
                 }
             }
         }
@@ -1311,9 +1346,10 @@ fn publish_scip_component(
                 removed: 0,
                 reordered: 0,
                 cloned: false,
+                copied: false,
                 direct_reference: true,
             }
-        } else if cloned {
+        } else if stage.is_some() {
             reconcile_scip_component(&temp_path, index, &rows)?
         } else {
             write_scip_component(&temp_path, index, &rows)?
@@ -1328,15 +1364,36 @@ fn publish_scip_component(
             std::fs::remove_file(legacy)?;
         }
         Ok(ScipComponentWork {
-            cloned,
+            cloned: stage.is_some_and(|stage| {
+                stage.strategy == codestory_store::SealedStageStrategy::Cloned
+            }),
+            copied: stage.is_some_and(|stage| {
+                stage.strategy == codestory_store::SealedStageStrategy::Copied
+            }),
             direct_reference,
             ..work
         })
     })();
-    if result.is_err() {
+    if result.is_err() && !stage_failed {
         let _ = std::fs::remove_file(&temp_path);
     }
     result
+}
+
+#[cfg(test)]
+fn publish_scip_component(
+    project_dir: &Path,
+    previous_project_dir: Option<&Path>,
+    index: &ScipSymbolsIndex,
+    before_publish: &mut dyn FnMut() -> Result<()>,
+) -> Result<ScipComponentWork> {
+    publish_scip_component_with_cancel(
+        project_dir,
+        previous_project_dir,
+        index,
+        &|| false,
+        before_publish,
+    )
 }
 
 #[cfg(test)]
@@ -1736,6 +1793,7 @@ fn write_scip_component(
         removed: 0,
         reordered: 0,
         cloned: false,
+        copied: false,
         direct_reference: false,
     })
 }
@@ -1850,6 +1908,7 @@ fn reconcile_scip_component(
         removed: existing.len().saturating_sub(retained) as u64,
         reordered: reordered as u64,
         cloned: true,
+        copied: false,
         direct_reference: false,
     })
 }
@@ -3316,6 +3375,43 @@ mod tests {
     }
 
     #[test]
+    fn scip_delta_reuses_rows_when_native_clone_is_unavailable() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "old"),
+                component_symbol("2", "src/kept.rs", "kept"),
+            ],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![
+                component_symbol("1", "src/a.rs", "changed"),
+                component_symbol("2", "src/kept.rs", "kept"),
+            ],
+        );
+        let work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+        })
+        .expect("incremental component");
+        assert!(work.copied);
+        assert!(!work.cloned);
+        assert!(work.retained > 0);
+        assert_eq!(
+            load_scip_symbols_database(&current_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("published component"),
+            current
+        );
+    }
+
+    #[test]
     fn identical_scip_records_do_not_rewrite_ordering_rows() {
         let root = TempDir::new().expect("tempdir");
         let previous_dir = root.path().join("previous");
@@ -4578,6 +4674,7 @@ mod tests {
                 removed_records: 0,
                 reordered_records: 0,
                 cloned: false,
+                copied: false,
                 direct_reference: false,
             }
         );

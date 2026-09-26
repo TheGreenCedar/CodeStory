@@ -1012,6 +1012,7 @@ pub(crate) struct IncrementalLexicalWork {
     pub inserted: u64,
     pub removed: u64,
     pub direct_reference: bool,
+    pub copied: bool,
 }
 
 fn publish_lexical_state_for_generation(
@@ -1019,13 +1020,14 @@ fn publish_lexical_state_for_generation(
     previous_state_path: Option<&Path>,
     desired: &LexicalLogicalState,
     delta: Option<&LexicalStateDelta<'_>>,
-) -> Result<()> {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<codestory_store::SealedStageStats>> {
     let state_path = shard_dir.join(LEXICAL_STATE_FILE);
     if state_path.is_file()
         && load_lexical_state_database(&state_path, &desired.fingerprint, &desired.state_sha256)
             .is_ok()
     {
-        return Ok(());
+        return Ok(None);
     }
     if state_path.exists() {
         let _ = crate::copy_on_write::make_file_owner_writable(&state_path);
@@ -1048,7 +1050,7 @@ fn publish_lexical_state_for_generation(
                     Ok::<_, anyhow::Error>,
                 )?;
             }
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -1056,21 +1058,26 @@ fn publish_lexical_state_for_generation(
         codestory_workspace::atomic_file::create_unique_temp_file(&state_path, "lexical-state")?;
     drop(reserved);
     std::fs::remove_file(&temp_path)?;
+    let mut stage_failed = false;
     let result = (|| {
-        let mut reconciled = false;
-        if let (Some(previous_state_path), Some(delta)) = (previous_state_path, delta)
-            && crate::copy_on_write::clone_file(previous_state_path, &temp_path)?
-        {
-            crate::copy_on_write::make_file_owner_writable(&temp_path)?;
+        let stage = if let (Some(previous_state_path), Some(delta)) = (previous_state_path, delta) {
+            let stage = match crate::copy_on_write::stage_file(
+                previous_state_path,
+                &temp_path,
+                cancelled,
+            ) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    stage_failed = true;
+                    return Err(error);
+                }
+            };
             reconcile_cloned_lexical_state_database(&temp_path, desired, delta)?;
-            reconciled = true;
-        }
-        if !reconciled {
-            if temp_path.exists() {
-                std::fs::remove_file(&temp_path)?;
-            }
+            Some(stage)
+        } else {
             write_lexical_state_database(&temp_path, desired)?;
-        }
+            None
+        };
         let observed = read_lexical_state_database(&temp_path)?;
         if observed.fingerprint != desired.fingerprint
             || observed.documents != desired.documents
@@ -1078,19 +1085,24 @@ fn publish_lexical_state_for_generation(
         {
             bail!("staged lexical state does not match desired logical state");
         }
-        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &state_path)
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &state_path)?;
+        Ok(stage)
     })();
-    if result.is_err() && temp_path.exists() {
+    if result.is_err() && !stage_failed && temp_path.exists() {
         let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
     }
     result
 }
 
-fn install_lexical_component_reference(source: &Path, destination: &Path) -> Result<bool> {
+fn install_lexical_component_reference(
+    source: &Path,
+    destination: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<codestory_store::SealedStageStats>> {
     if destination.is_file() {
         if codestory_workspace::same_workspace_path(source, destination) {
-            return Ok(true);
+            return Ok(None);
         }
         let _ = crate::copy_on_write::make_file_owner_writable(destination);
         std::fs::remove_file(destination)?;
@@ -1109,31 +1121,32 @@ fn install_lexical_component_reference(source: &Path, destination: &Path) -> Res
                 Ok::<_, anyhow::Error>,
             )?;
         }
-        return Ok(true);
+        return Ok(None);
     }
-    if crate::copy_on_write::clone_file(source, destination)? {
-        crate::copy_on_write::make_file_immutable(destination)?;
-        return Ok(true);
-    }
-    Ok(false)
+    let stage = crate::copy_on_write::stage_file(source, destination, cancelled)?;
+    crate::copy_on_write::make_file_immutable(destination)?;
+    Ok(Some(stage))
 }
 
 fn install_previous_lexical_components(
     previous_shard: &Path,
     shard_dir: &Path,
     component_set: &LexicalComponentSet,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<bool> {
+    let mut copied = false;
     for descriptor in std::iter::once(&component_set.base)
         .chain(component_set.deltas.iter().map(|delta| &delta.component))
     {
-        if !install_lexical_component_reference(
+        if let Some(stage) = install_lexical_component_reference(
             &previous_shard.join(&descriptor.file_name),
             &shard_dir.join(&descriptor.file_name),
+            cancelled,
         )? {
-            return Ok(false);
+            copied |= stage.strategy == codestory_store::SealedStageStrategy::Copied;
         }
     }
-    Ok(true)
+    Ok(copied)
 }
 
 fn write_lexical_delta_component(
@@ -1218,7 +1231,7 @@ fn publish_full_lexical_component_set(
         }
         let base_metadata = verify_lexical_database_contents(&temp_path)?;
         before_publish()?;
-        publish_lexical_state_for_generation(shard_dir, None, desired_state, None)?;
+        publish_lexical_state_for_generation(shard_dir, None, desired_state, None, &|| false)?;
         publish_immutable_lexical_database(&temp_path, &index_path)?;
         let base = lexical_component_descriptor(&index_path, base_metadata.clone())?;
         publish_lexical_component_envelope(
@@ -1386,12 +1399,13 @@ fn compact_lexical_component_set(
     result
 }
 
-pub(crate) fn build_prepared_lexical_shard(
+pub(crate) fn build_prepared_lexical_shard_with_cancel(
     lexical_data_dir: &Path,
     project_id: &str,
     expected: &PreparedLexicalInput,
     sidecar_input_hash: &str,
     previous_project_id: Option<&str>,
+    cancelled: &dyn Fn() -> bool,
     before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<(LexicalInputFingerprint, Option<IncrementalLexicalWork>)> {
     if expected.bounded_state.is_none()
@@ -1463,71 +1477,76 @@ pub(crate) fn build_prepared_lexical_shard(
             before_publish
                 .take()
                 .expect("lexical publication callback runs once")()?;
-            if install_previous_lexical_components(&previous_shard, &shard_dir, &previous_set)? {
-                publish_lexical_state_for_generation(
+            let copied_components = install_previous_lexical_components(
+                &previous_shard,
+                &shard_dir,
+                &previous_set,
+                cancelled,
+            )?;
+            let state_stage = publish_lexical_state_for_generation(
+                &shard_dir,
+                previous_state_path.as_deref(),
+                &desired_state,
+                Some(&delta),
+                cancelled,
+            )?;
+            if let Some((key, artifacts, receipt)) = previous_receipt {
+                let _ = LEXICAL_COMPONENT_SET_RECEIPTS
+                    .refresh_after_hard_links(key, &artifacts, receipt);
+            }
+            let mut deltas = previous_set.deltas.clone();
+            if !delta.upserts.is_empty() || !delta.tombstones.is_empty() {
+                let ordinal = deltas
+                    .last()
+                    .map_or(1, |delta| delta.ordinal.saturating_add(1));
+                deltas.push(write_lexical_delta_component(
                     &shard_dir,
-                    previous_state_path.as_deref(),
-                    &desired_state,
-                    Some(&delta),
-                )?;
-                if let Some((key, artifacts, receipt)) = previous_receipt {
-                    let _ = LEXICAL_COMPONENT_SET_RECEIPTS
-                        .refresh_after_hard_links(key, &artifacts, receipt);
-                }
-                let mut deltas = previous_set.deltas.clone();
-                if !delta.upserts.is_empty() || !delta.tombstones.is_empty() {
-                    let ordinal = deltas
-                        .last()
-                        .map_or(1, |delta| delta.ordinal.saturating_add(1));
-                    deltas.push(write_lexical_delta_component(
-                        &shard_dir,
-                        project_id,
-                        sidecar_input_hash,
-                        ordinal,
-                        &delta,
-                    )?);
-                }
-                let base_path = shard_dir.join(&previous_set.base.file_name);
-                let base_metadata = previous_set.base.metadata.clone();
-                let component_set = LexicalComponentSet::new(
                     project_id,
                     sidecar_input_hash,
-                    &expected.fingerprint,
-                    lexical_component_descriptor(&base_path, base_metadata.clone())?,
-                    deltas,
-                    desired_state.state_sha256.clone(),
-                );
-                publish_lexical_component_envelope(
-                    &shard_dir,
-                    &LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &base_metadata),
-                )?;
-                publish_lexical_component_set(&shard_dir, &component_set)?;
-                let _ = LEXICAL_COMPONENT_SET_RECEIPTS.seal_produced(
-                    shard_dir.join(LEXICAL_COMPONENT_SET_FILE),
-                    &lexical_component_set_artifacts(&shard_dir, &component_set),
-                    Arc::clone(&desired_state),
-                );
-                if expected.bounded_state.is_none() {
-                    schedule_lexical_compaction_if_needed(
-                        shard_dir.clone(),
-                        expected,
-                        component_set,
-                    );
-                }
-                let inserted = u64::try_from(delta.upserts.len()).unwrap_or(u64::MAX);
-                let removed = u64::try_from(previous_state.documents.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(delta.retained);
-                return Ok((
-                    expected.fingerprint.clone(),
-                    Some(IncrementalLexicalWork {
-                        retained: delta.retained,
-                        inserted,
-                        removed,
-                        direct_reference: inserted == 0 && removed == 0,
-                    }),
-                ));
+                    ordinal,
+                    &delta,
+                )?);
             }
+            let base_path = shard_dir.join(&previous_set.base.file_name);
+            let base_metadata = previous_set.base.metadata.clone();
+            let component_set = LexicalComponentSet::new(
+                project_id,
+                sidecar_input_hash,
+                &expected.fingerprint,
+                lexical_component_descriptor(&base_path, base_metadata.clone())?,
+                deltas,
+                desired_state.state_sha256.clone(),
+            );
+            publish_lexical_component_envelope(
+                &shard_dir,
+                &LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &base_metadata),
+            )?;
+            publish_lexical_component_set(&shard_dir, &component_set)?;
+            let _ = LEXICAL_COMPONENT_SET_RECEIPTS.seal_produced(
+                shard_dir.join(LEXICAL_COMPONENT_SET_FILE),
+                &lexical_component_set_artifacts(&shard_dir, &component_set),
+                Arc::clone(&desired_state),
+            );
+            if expected.bounded_state.is_none() {
+                schedule_lexical_compaction_if_needed(shard_dir.clone(), expected, component_set);
+            }
+            let inserted = u64::try_from(delta.upserts.len()).unwrap_or(u64::MAX);
+            let removed = u64::try_from(previous_state.documents.len())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(delta.retained);
+            return Ok((
+                expected.fingerprint.clone(),
+                Some(IncrementalLexicalWork {
+                    retained: delta.retained,
+                    inserted,
+                    removed,
+                    direct_reference: inserted == 0 && removed == 0,
+                    copied: copied_components
+                        || state_stage.is_some_and(|stage| {
+                            stage.strategy == codestory_store::SealedStageStrategy::Copied
+                        }),
+                }),
+            ));
         }
     }
 
@@ -1547,6 +1566,26 @@ pub(crate) fn build_prepared_lexical_shard(
         },
     )?;
     Ok((expected.fingerprint.clone(), None))
+}
+
+#[cfg(test)]
+pub(crate) fn build_prepared_lexical_shard(
+    lexical_data_dir: &Path,
+    project_id: &str,
+    expected: &PreparedLexicalInput,
+    sidecar_input_hash: &str,
+    previous_project_id: Option<&str>,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<(LexicalInputFingerprint, Option<IncrementalLexicalWork>)> {
+    build_prepared_lexical_shard_with_cancel(
+        lexical_data_dir,
+        project_id,
+        expected,
+        sidecar_input_hash,
+        previous_project_id,
+        &|| false,
+        before_publish,
+    )
 }
 
 fn publish_immutable_lexical_database(temp_path: &Path, index_path: &Path) -> Result<()> {
@@ -5173,6 +5212,42 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn lexical_delta_reuses_components_when_native_clone_is_unavailable() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("data");
+        let previous = prepared_documents(vec![
+            source_document("src/a.rs", "old alpha"),
+            source_document("src/kept.rs", "unchanged epsilon"),
+        ]);
+        build_prepared_lexical_shard(&data, "previous", &previous, "input-v1", None, || Ok(()))
+            .expect("previous shard");
+        let current = prepared_documents(vec![
+            source_document("src/a.rs", "changed gamma"),
+            source_document("src/kept.rs", "unchanged epsilon"),
+        ]);
+        let (_, work) = crate::copy_on_write::with_clone_disabled(|| {
+            build_prepared_lexical_shard(
+                &data,
+                "current",
+                &current,
+                "input-v2",
+                Some("previous"),
+                || Ok(()),
+            )
+        })
+        .expect("incremental lexical shard");
+        let work = work.expect("incremental work");
+        assert!(work.copied);
+        assert_eq!((work.retained, work.inserted, work.removed), (1, 1, 1));
+        assert_eq!(
+            search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "gamma", 8)
+                .expect("changed query")
+                .len(),
+            1
+        );
     }
 
     #[test]

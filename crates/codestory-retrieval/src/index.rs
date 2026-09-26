@@ -16,7 +16,7 @@ use crate::generation::{
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::lexical_index::{
     LEXICAL_INDEX_VERSION, LexicalInputFingerprint, PreparedLexicalInput,
-    build_prepared_lexical_shard, capture_lexical_generation_receipts,
+    build_prepared_lexical_shard_with_cancel, capture_lexical_generation_receipts,
     finish_lexical_input_for_store, lexical_source_input, prepare_bounded_lexical_input,
     prepare_lexical_input_for_store,
 };
@@ -28,7 +28,7 @@ use crate::retention::{
 };
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, capture_scip_generation_receipt,
-    emit_scip_artifacts_from_store_incremental, import_precise_semantic_scip_artifact,
+    emit_scip_artifacts_from_store_incremental_with_cancel, import_precise_semantic_scip_artifact,
     reference_equivalent_scip_generation,
 };
 use anyhow::{Context, Result, bail};
@@ -376,7 +376,7 @@ impl SidecarInputChanged {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("retrieval index cancelled before {boundary}")]
 pub struct RetrievalIndexCancelled {
-    boundary: &'static str,
+    pub(crate) boundary: &'static str,
 }
 
 pub fn is_retrieval_index_cancelled(error: &anyhow::Error) -> bool {
@@ -1473,12 +1473,13 @@ fn ensure_lexical_generation(
         let output_bytes = crate::lexical_index::lexical_component_bytes(&output_shard);
         record_finalize_component_details("lexical", None, None, output_bytes, output_bytes);
     } else {
-        match build_prepared_lexical_shard(
+        match build_prepared_lexical_shard_with_cancel(
             &layout.lexical_data_dir,
             generation,
             expected,
             sidecar_input_hash,
             previous_generation,
+            &|| cancelled.load(Ordering::Acquire),
             || ensure_retrieval_index_not_cancelled(cancelled, "lexical shard publication"),
         ) {
             Ok((_, work)) => {
@@ -1488,6 +1489,8 @@ fn ensure_lexical_generation(
                         "lexical",
                         if work.direct_reference {
                             "reused"
+                        } else if work.copied {
+                            "copied"
                         } else {
                             "delta"
                         },
@@ -1865,6 +1868,7 @@ fn ensure_semantic_index(
                     &previous.semantic_generation,
                     &evidence,
                     &current_vector_anchors,
+                    &|| cancelled.load(Ordering::Acquire),
                     || {
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
@@ -1892,6 +1896,11 @@ fn ensure_semantic_index(
             "vectors",
             if work.direct_reference {
                 "reused"
+            } else if work
+                .stage
+                .is_some_and(|stage| stage.strategy == codestory_store::SealedStageStrategy::Copied)
+            {
+                "copied"
             } else {
                 "copy_on_write"
             },
@@ -1916,6 +1925,20 @@ fn ensure_semantic_index(
             output_bytes,
             output_bytes,
         );
+        if let Some(stage) = work.stage {
+            info!(
+                project_id = %project_id,
+                sidecar_generation = %semantic.generation,
+                strategy = ?stage.strategy,
+                fallback_reason = stage.fallback_reason.unwrap_or("none"),
+                native_error_code = stage.native_error_code,
+                source_bytes = stage.source_bytes,
+                cloned_bytes = stage.cloned_bytes,
+                copied_bytes = stage.copied_bytes,
+                wall_ms = stage.wall_ms,
+                "vector generation staged from immutable predecessor"
+            );
+        }
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
@@ -2659,11 +2682,12 @@ fn ensure_scip_artifacts(
         );
         return Ok(());
     }
-    match emit_scip_artifacts_from_store_incremental(
+    match emit_scip_artifacts_from_store_incremental_with_cancel(
         storage_path,
         scip_dir,
         generation,
         previous_project_dir.as_deref(),
+        &|| cancelled.load(Ordering::Acquire),
         || ensure_retrieval_index_not_cancelled(cancelled, "SCIP component publication"),
     ) {
         Ok(outcome) if outcome.revision.is_some() => {
@@ -2673,6 +2697,8 @@ fn ensure_scip_artifacts(
                     "reused"
                 } else if outcome.cloned {
                     "copy_on_write"
+                } else if outcome.copied {
+                    "copied"
                 } else {
                     "complete"
                 },
