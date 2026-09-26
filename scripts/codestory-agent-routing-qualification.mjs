@@ -23,6 +23,7 @@ import {
   MCP_PROTOCOL_REVISIONS,
   ROUTING_PACKET_QUESTIONS,
   ROUTING_SCENARIOS,
+  requireSupportedRoutingScenario,
   materializeRoutingRequests,
   validateInstalledSession,
   validateRoutingRequestCorpus,
@@ -31,7 +32,7 @@ import {
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
-const EXPECTED_SESSION_COUNT = 32;
+const EXPECTED_SESSION_COUNT = ROUTING_SCENARIOS.length * 2;
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
 const MAX_CANDIDATE_CLI_BYTES = 1024 * 1024 * 1024;
 const MAX_PLUGIN_ARCHIVE_BYTES = 256 * 1024 * 1024;
@@ -1067,24 +1068,7 @@ export async function materializeRoutingFixture(sourceRoot, destination) {
 }
 
 export function validateRoutingPreflight(scenarioId, body, { exitCode = 0 } = {}) {
-  const dispositions = {
-    typed_proof_contract_proven: "contract_proven",
-    typed_proof_contract_refuted: "contract_refuted",
-    typed_proof_unknown: "unknown",
-    typed_proof_unavailable: "unavailable",
-    proof_observational: "unknown",
-    hidden_proof_tool_discovery: "contract_proven",
-  };
-  if (scenarioId === "malformed_proof_contract") {
-    if (exitCode === 0) fail("malformed proof preflight must produce a semantic tool error");
-    return true;
-  }
-  if (Object.hasOwn(dispositions, scenarioId)) {
-    if (exitCode !== 0 || body?.kind !== "complete" || body?.disposition?.kind !== dispositions[scenarioId]) {
-      fail(`${scenarioId} preflight did not materialize its required proof disposition`);
-    }
-    return true;
-  }
+  requireSupportedRoutingScenario(scenarioId);
   if (scenarioId === "packet_single_continuation") {
     if (exitCode !== 0 || body?.kind !== "complete" || body?.status !== "continuation_available"
         || !plainObject(body.continuation) || !Array.isArray(body.continuation.gap_ids)
@@ -1124,17 +1108,6 @@ async function prepareRoutingFixture({ cli, projectRoot, env, includeRetrieval }
   }
 }
 
-async function requireMissingRetrievalProjection({ cli, projectRoot, env, label }) {
-  const stdout = await successfulProcess(
-    cli, ["retrieval", "status", "--project", projectRoot, "--profile", "agent", "--format", "json"],
-    { cwd: projectRoot, env, timeoutMs: 60_000 }, label,
-  );
-  const status = parseJsonOutput(stdout, label);
-  if (status.retrieval_mode !== "unavailable" || status.degraded_reason !== "retrieval_manifest_missing") {
-    fail(`${label} observed semantic retrieval activation`);
-  }
-}
-
 function parseJsonOutput(stdout, label) {
   try {
     return JSON.parse(stdout.trim());
@@ -1144,15 +1117,7 @@ function parseJsonOutput(stdout, label) {
 }
 
 async function preflightRoutingScenario({ cli, entry, projectRoot, env }) {
-  const proof = entry.request.proof_contract;
-  if (proof) {
-    const result = await spawnBounded(cli, ["prove-call-path", "--project", projectRoot, "--spec", "-"], {
-      cwd: projectRoot, env, stdin: JSON.stringify(proof), timeoutMs: PROCESS_TIMEOUT_MS,
-    });
-    const body = result.stdout.trim() ? parseJsonOutput(result.stdout, `${entry.scenario_id} proof preflight`) : null;
-    validateRoutingPreflight(entry.scenario_id, body, { exitCode: result.code });
-    return;
-  }
+  requireSupportedRoutingScenario(entry.scenario_id);
   if (["broad_packet", "packet_single_continuation", "packet_gap_to_focused_source", "packet_named_fallback_to_source"].includes(entry.scenario_id)) {
     const question = ROUTING_PACKET_QUESTIONS[entry.scenario_id];
     const result = await spawnBounded(cli, ["packet", "--project", projectRoot, "--question", question, "--format", "json"], {
@@ -1280,12 +1245,6 @@ async function main(argv) {
       await prepareRoutingFixture({
         cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv, includeRetrieval,
       });
-      if (id === "proof_observational") {
-        await requireMissingRetrievalProjection({
-          cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,
-          label: "proof observational preflight retrieval status",
-        });
-      }
       await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
       const hostRequest = host === "cursor" ? {
         ...entry.request,
@@ -1324,12 +1283,6 @@ async function main(argv) {
         fail(`${error.message}; capture ${capture.metadataPath}`);
       }
       if (host === "cursor") await verifyCursorQualificationProvider(cursorProvider);
-      if (id === "proof_observational") {
-        await requireMissingRetrievalProjection({
-          cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,
-          label: "proof observational post-session retrieval status",
-        });
-      }
       rows.push({ host, scenario_id: entry.scenario_id, transcript: session.stdout, report });
     }
   }

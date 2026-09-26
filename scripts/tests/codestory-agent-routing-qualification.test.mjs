@@ -248,7 +248,7 @@ test("qualification CLI accepts only the mission source candidate boundary", () 
   }
 });
 
-test("qualification artifacts require exactly 32 separately validated host sessions", async () => {
+test("qualification artifacts require exactly 16 separately validated host sessions", async () => {
   const root = await mkdtemp(join(tmpdir(), "codestory-routing-artifacts-"));
   try {
     const rows = ["codex", "cursor"].flatMap((host) => ROUTING_SCENARIOS.map(({ id }) => ({
@@ -259,13 +259,13 @@ test("qualification artifacts require exactly 32 separately validated host sessi
     })));
     assert.equal(validateRoutingArtifactMatrix(rows), true);
     const summary = await writeRoutingQualificationArtifacts(root, rows);
-    assert.equal(summary.expected_sessions, 32);
-    assert.equal(summary.completed_sessions, 32);
+    assert.equal(summary.expected_sessions, 16);
+    assert.equal(summary.completed_sessions, 16);
     assert.equal(summary.status, "pass");
-    assert.equal(JSON.parse(await readFile(join(root, "summary.json"), "utf8")).completed_sessions, 32);
+    assert.equal(JSON.parse(await readFile(join(root, "summary.json"), "utf8")).completed_sessions, 16);
     assert.equal((await readFile(join(root, "codex", `${ROUTING_SCENARIOS[0].id}.jsonl`), "utf8")).length > 0, true);
     assert.equal((await readFile(join(root, "cursor", `${ROUTING_SCENARIOS[0].id}.report.json`), "utf8")).length > 0, true);
-    assert.throws(() => validateRoutingArtifactMatrix(rows.slice(1)), /exactly 32/u);
+    assert.throws(() => validateRoutingArtifactMatrix(rows.slice(1)), /exactly 16/u);
     const duplicate = structuredClone(rows);
     duplicate[1] = structuredClone(duplicate[0]);
     assert.throws(() => validateRoutingArtifactMatrix(duplicate), /exactly once/u);
@@ -500,7 +500,7 @@ test("source candidate authentication rejects the full input-identity mismatch c
   }
 });
 
-test("routing state preflight fails closed for missing continuation fallback and proof disposition", () => {
+test("routing state preflight fails closed for missing continuation fallback and retired scenarios", () => {
   assert.equal(validateRoutingPreflight("packet_single_continuation", {
     kind: "complete", status: "continuation_available",
     continuation: { continuation_id: "next", gap_ids: [{ gap_id: "gap" }] },
@@ -515,12 +515,9 @@ test("routing state preflight fails closed for missing continuation fallback and
     kind: "complete", status: "available",
     evidence: [{ path: "src/fallback.rs" }], gaps: [{ kind: "evidence_missing" }],
   }), /exact fallback unresolved/u);
-  assert.equal(validateRoutingPreflight("typed_proof_contract_proven", {
-    kind: "complete", disposition: { kind: "contract_proven" },
-  }), true);
   assert.throws(() => validateRoutingPreflight("typed_proof_contract_proven", {
-    kind: "complete", disposition: { kind: "unknown" },
-  }), /required proof disposition/u);
+    kind: "complete", disposition: { kind: "contract_proven" },
+  }), /unsupported routing scenario.*retired/u);
 });
 
 test("routing fixture materialization expands deterministic state per isolated scenario", async () => {
