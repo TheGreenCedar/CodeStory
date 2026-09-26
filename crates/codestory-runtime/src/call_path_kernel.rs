@@ -18,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 use codestory_contracts::proof_resolution::{
-    EXACT_CALL_RESOLUTION_ALGORITHM, INTERNAL_RESOLUTION_PRODUCER,
-    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ResolutionEvidence, ResolutionProvenance,
-    parse_canonical_callsite_identity,
+    EXACT_CALL_RESOLUTION_ALGORITHM, FileId, INTERNAL_RESOLUTION_PRODUCER,
+    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofDependencyOrder, ResolutionEvidence,
+    ResolutionProvenance, parse_canonical_callsite_identity,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2364,10 +2364,12 @@ fn valid_resolution_provenance(provenance: &ResolutionProvenance) -> bool {
         && is_lower_hex_sha256(&provenance.parser_fingerprint)
         && is_lower_hex_sha256(&provenance.evidence_sha256)
         && !provenance.dependency_file_hashes.is_empty()
-        && provenance
-            .dependency_file_hashes
-            .windows(2)
-            .all(|pair| pair[0].file_id < pair[1].file_id)
+        && ProofDependencyOrder::for_language_adapter(&provenance.language_adapter).is_canonical(
+            provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id),
+        )
         && provenance.dependency_file_hashes.iter().all(|dependency| {
             dependency.file_id.0 != 0 && is_lower_hex_sha256(&dependency.source_sha256)
         })
@@ -2662,7 +2664,15 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
         if dependencies.is_empty() {
             return Err("compact_dependency_files_missing".to_owned());
         }
-        let mut prior_file_id = None;
+        let language_adapter = compact_string(
+            compact_object(
+                &provenance_profiles[profile],
+                "compact_provenance_profile_invalid",
+            )?,
+            "language_adapter",
+            "compact_provenance_profile_invalid",
+        )?;
+        let mut dependency_ids = Vec::with_capacity(dependencies.len());
         for file in dependencies {
             let index = compact_index(
                 file,
@@ -2674,10 +2684,12 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
                 "file_node_id",
                 "compact_file_id_invalid",
             )?;
-            if prior_file_id.is_some_and(|prior| prior >= file_id) {
-                return Err("compact_dependency_files_noncanonical".to_owned());
-            }
-            prior_file_id = Some(file_id);
+            dependency_ids.push(FileId(file_id));
+        }
+        if !ProofDependencyOrder::for_language_adapter(language_adapter)
+            .is_canonical(dependency_ids)
+        {
+            return Err("compact_dependency_files_noncanonical".to_owned());
         }
     }
     if referenced_profiles.iter().any(|referenced| !referenced) {

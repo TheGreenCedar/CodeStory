@@ -2860,10 +2860,16 @@ mod tests {
                     result.as_ref().map(|_| "accepted")
                 );
                 match result {
-                    Ok(checked) => assert!(matches!(
-                        checked.disposition(),
-                        ProofDisposition::ContractProven { .. }
-                    )),
+                    Ok(checked) => {
+                        assert!(matches!(
+                            checked.disposition(),
+                            ProofDisposition::ContractProven { .. }
+                        ));
+                        assert!(matches!(
+                            project_internal_call_path_result(&checked).unwrap(),
+                            InternalProjection::Complete { .. }
+                        ));
+                    }
                     Err(error) => failures.push((language, source_after_target, error)),
                 }
             }
@@ -2896,6 +2902,361 @@ mod tests {
         assert!(
             failures.is_empty(),
             "actual sealed compact failures: {failures:?}"
+        );
+    }
+
+    fn checked_dependency_root(case: &SealedDependencyOrderCase) -> serde_json::Value {
+        let (built, contract, hashes, rendering) = dependency_order_built(case);
+        let checked =
+            check_built_call_path_integration(&contract, &hashes, &rendering, built).unwrap();
+        assert!(matches!(
+            checked.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&checked).unwrap()
+        else {
+            panic!("bounded actual proof must project completely")
+        };
+        assert_eq!(
+            crate::call_path_kernel::validate_compact_projection(&root),
+            Ok(())
+        );
+        let evidence = &root["identities"]["evidence"][0];
+        assert_eq!(evidence["fact_id"], case.fact.fact_id);
+        assert_eq!(
+            evidence["provenance"]["evidence_sha256"],
+            case.fact.provenance.evidence_sha256
+        );
+        let files = root["identities"]["files"].as_array().unwrap();
+        let projected_ids = evidence["provenance"]["dependency_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|index| {
+                files[index.as_u64().unwrap() as usize]["file_node_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected_ids,
+            vec![
+                case.caller.file_node_id.unwrap().0,
+                case.target.file_node_id.unwrap().0
+            ]
+        );
+        root
+    }
+
+    #[test]
+    fn sealed_encounter_order_representatives_use_normal_checked_projection() {
+        for language in ["ruby", "php", "csharp", "swift", "dart"] {
+            for source_after_target in [false, true] {
+                let case = sealed_dependency_order_case(language, source_after_target);
+                checked_dependency_root(&case);
+                eprintln!(
+                    "normal checked projection: {language} source_after_target={source_after_target}"
+                );
+            }
+        }
+        let bash =
+            source_built_fixture_with_extension("sh", "target() { :; }\ncaller() { target; }\n");
+        let caller = source_callable(&bash.store, "caller");
+        let target = source_callable(&bash.store, "target");
+        let fact = bash
+            .store
+            .get_proof_resolution_facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| {
+                fact.caller == caller.id
+                    && fact.target == Some(target.id)
+                    && fact.status == ProofResolutionStatus::Exact
+            })
+            .expect("actual same-file Bash exact fact");
+        assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
+        assert_eq!(
+            fact.provenance.dependency_file_hashes[0].file_id,
+            FileId(caller.file_node_id.unwrap().0)
+        );
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&target)]);
+        let checked = evaluate_from_store(
+            &bash.store,
+            &bash.root,
+            &bash.project_id,
+            &bash.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(matches!(
+            checked.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert!(matches!(
+            project_internal_call_path_result(&checked).unwrap(),
+            InternalProjection::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn sealed_dependency_order_preserves_binding_and_corruption_refusals() {
+        let mut case = sealed_dependency_order_case("ruby", true);
+        let before = case.fixture.store.get_proof_resolution_facts().unwrap();
+        let publication_before = case
+            .fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap();
+        for mutation in ["duplicate", "missing_source", "hash", "digest", "reordered"] {
+            let mut fact = case.fact.clone();
+            match mutation {
+                "duplicate" => fact
+                    .provenance
+                    .dependency_file_hashes
+                    .push(fact.provenance.dependency_file_hashes[0].clone()),
+                "missing_source" => fact
+                    .provenance
+                    .dependency_file_hashes
+                    .retain(|dependency| dependency.file_id != fact.callsite.file_id),
+                "hash" => fact.provenance.dependency_file_hashes[1].source_sha256 = "0".repeat(64),
+                "digest" => fact.provenance.evidence_sha256 = "0".repeat(64),
+                "reordered" => fact.provenance.dependency_file_hashes.reverse(),
+                _ => unreachable!(),
+            }
+            if matches!(mutation, "duplicate" | "missing_source") {
+                assert!(
+                    seal_call_resolution_fact(fact).is_err(),
+                    "{mutation} must not seal"
+                );
+            } else {
+                if mutation != "digest" {
+                    fact = seal_call_resolution_fact(fact).unwrap();
+                }
+                let mut facts = before.clone();
+                *facts
+                    .iter_mut()
+                    .find(|existing| existing.fact_id == case.fact.fact_id)
+                    .unwrap() = fact;
+                let replacement = ProofResolutionProjection {
+                    adapter_roster: current_proof_resolution_adapter_roster(),
+                    funnel: build_proof_resolution_funnel(&facts),
+                    facts,
+                };
+                let mut next = case.fixture.publication.clone();
+                next.generation += 1;
+                next.generation_id = "rejected-generation-2".to_owned();
+                next.run_id = "rejected-run-2".to_owned();
+                let error = case
+                    .fixture
+                    .store
+                    .replace_proof_resolution_projection(&next, &replacement)
+                    .expect_err("corrupt actual fact must not publish");
+                let message = error.to_string();
+                assert!(
+                    match mutation {
+                        "hash" => message.contains("hash"),
+                        "digest" => message.contains("digest"),
+                        "reordered" => message.contains("governed domain"),
+                        _ => false,
+                    },
+                    "{mutation}: {message}"
+                );
+            }
+            assert_eq!(
+                case.fixture.store.get_proof_resolution_facts().unwrap(),
+                before,
+                "{mutation}"
+            );
+            assert_eq!(
+                case.fixture
+                    .store
+                    .get_proof_resolution_publication()
+                    .unwrap(),
+                publication_before,
+                "{mutation}"
+            );
+        }
+        let (built, contract, hashes, rendering) = dependency_order_built(&case);
+        for mutation in ["duplicate", "generation", "digest", "sorted_adapter"] {
+            let mut altered = built.clone();
+            let receipt = &mut altered.receipts[0];
+            match mutation {
+                "duplicate" => receipt
+                    .resolution_provenance
+                    .dependency_file_hashes
+                    .push(receipt.resolution_provenance.dependency_file_hashes[0].clone()),
+                "generation" => {
+                    receipt.source.pinned.core_generation_id = "other-generation".to_owned()
+                }
+                "digest" => receipt.resolution_provenance.evidence_sha256 = "0".repeat(64),
+                "sorted_adapter" => {
+                    receipt.resolution_provenance.language_adapter = "unknown-adapter".to_owned()
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                check_built_call_path_integration(&contract, &hashes, &rendering, altered)
+                    .unwrap_err(),
+                crate::call_path_kernel::CheckedIntegrationError::PublicationBindingMismatch,
+                "{mutation}"
+            );
+        }
+        let root = checked_dependency_root(&case);
+        for mutation in ["duplicate", "sorted_adapter", "fact_digest"] {
+            let mut altered = root.clone();
+            match mutation {
+                "duplicate" => {
+                    let dependencies =
+                        altered["identities"]["evidence"][0]["provenance"]["dependency_files"]
+                            .as_array_mut()
+                            .unwrap();
+                    dependencies.push(dependencies[0].clone());
+                }
+                "sorted_adapter" => {
+                    altered["identities"]["provenance_profiles"][0]["language_adapter"] =
+                        json!("unknown-adapter")
+                }
+                "fact_digest" => {
+                    altered["identities"]["evidence"][0]["provenance"]["evidence_sha256"] =
+                        json!("0".repeat(64))
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                crate::call_path_kernel::validate_compact_projection(&altered),
+                Err(if mutation == "fact_digest" {
+                    "compact_fact_id_evidence_digest_mismatch"
+                } else {
+                    "compact_dependency_files_noncanonical"
+                }
+                .to_owned()),
+                "{mutation}"
+            );
+        }
+        checked_dependency_root(&case);
+    }
+
+    #[test]
+    fn sealed_encounter_order_compact_selects_each_evidence_profile() {
+        // Actual two-step Ruby source chain produces both receipts before any JSON mutation.
+        let mut case = sealed_dependency_order_case("ruby", true);
+        let worker_path = case.fixture.root.join("lib/worker.rb");
+        let worker_id = case.target.file_node_id.unwrap().0;
+        let other_path = (0..4096)
+            .map(|index| case.fixture.root.join(format!("lib/other_{index}.rb")))
+            .find(|path| {
+                let path = path.to_string_lossy().replace('\\', "/");
+                #[cfg(windows)]
+                let path = path.to_lowercase();
+                codestory_indexer::generate_id(&format!("{path}:{path}:1")) < worker_id
+            })
+            .expect("ordinary target spelling before worker ID");
+        let other_stem = other_path.file_stem().unwrap().to_str().unwrap();
+        fs::write(&worker_path, format!("require_relative \"{other_stem}\"\nclass Worker\n  def target\n    Other.new.finish\n  end\nend\n")).unwrap();
+        fs::write(&other_path, "class Other\n  def finish\n  end\nend\n").unwrap();
+        WorkspaceIndexer::new(case.fixture.root.clone())
+            .run_incremental(
+                &mut case.fixture.store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: vec![case.fixture.source_path.clone(), worker_path, other_path],
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .unwrap();
+        case.fixture.publication.generation = 2;
+        case.fixture.publication.generation_id = "mixed-profile-generation-2".to_owned();
+        case.fixture.publication.run_id = "mixed-profile-run-2".to_owned();
+        rematerialize_proof_resolution_projection(
+            &mut case.fixture.store,
+            &case.fixture.publication,
+        )
+        .unwrap();
+        case.fixture
+            .store
+            .validate_proof_resolution_publication(&case.fixture.publication)
+            .unwrap();
+        let target = case
+            .fixture
+            .store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                is_callable(node.kind) && node.qualified_name.as_deref() == Some("Worker.target")
+            })
+            .unwrap();
+        let finish = case
+            .fixture
+            .store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                is_callable(node.kind) && node.qualified_name.as_deref() == Some("Other.finish")
+            })
+            .unwrap();
+        let (contract, hashes, rendering) = validated_contract(
+            canonical_id(&case.caller),
+            &[canonical_id(&target), canonical_id(&finish)],
+        );
+        let checked = evaluate_from_store(
+            &case.fixture.store,
+            &case.fixture.root,
+            &case.fixture.project_id,
+            &case.fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(
+            matches!(checked.disposition(), ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 2)
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&checked).unwrap()
+        else {
+            panic!("actual two-step source chain must project")
+        };
+        assert_eq!(
+            crate::call_path_kernel::validate_compact_projection(&root),
+            Ok(())
+        );
+        let mut mixed = root.clone();
+        let profile_index = mixed["identities"]["provenance_profiles"]
+            .as_array()
+            .unwrap()
+            .len();
+        let mut sorted_profile = mixed["identities"]["provenance_profiles"][0].clone();
+        sorted_profile["language_adapter"] = json!("unknown-adapter");
+        mixed["identities"]["provenance_profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(sorted_profile);
+        mixed["identities"]["evidence"][1]["provenance"]["profile"] = json!(profile_index);
+        assert_eq!(
+            crate::call_path_kernel::validate_compact_projection(&mixed),
+            Err("compact_dependency_files_noncanonical".to_owned()),
+            "second evidence must use its sorted profile, not the first encounter profile"
+        );
+        assert_eq!(
+            crate::call_path_kernel::validate_compact_projection(&root),
+            Ok(())
         );
     }
 

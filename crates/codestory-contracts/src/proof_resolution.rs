@@ -5,7 +5,7 @@
 
 use crate::graph::{EdgeId, NodeId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const PROOF_RESOLUTION_FACT_SCHEMA_VERSION: u32 = 1;
 pub const INTERNAL_RESOLUTION_PRODUCER: &str = "codestory-internal";
@@ -483,6 +483,42 @@ pub struct DependencyFileHash {
     pub source_sha256: String,
 }
 
+/// The dependency sequence is part of the sealed fact bytes. The linear
+/// adapters retain source-first encounter order; other adapters seal ascending
+/// file IDs. This checks order/uniqueness only; owners still authenticate the
+/// complete source/evidence dependency set and hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofDependencyOrder {
+    Encounter,
+    AscendingFileId,
+}
+
+impl ProofDependencyOrder {
+    pub fn for_language_adapter(language: &str) -> Self {
+        match language {
+            "bash" | "ruby" | "php" | "csharp" | "swift" | "dart" => Self::Encounter,
+            _ => Self::AscendingFileId,
+        }
+    }
+
+    pub fn is_canonical(self, file_ids: impl IntoIterator<Item = FileId>) -> bool {
+        match self {
+            Self::Encounter => {
+                let mut members = HashSet::new();
+                file_ids.into_iter().all(|file_id| members.insert(file_id))
+            }
+            Self::AscendingFileId => {
+                let mut prior = None;
+                file_ids.into_iter().all(|file_id| {
+                    let ordered = prior.is_none_or(|prior| prior < file_id);
+                    prior = Some(file_id);
+                    ordered
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionProvenance {
     pub producer: String,
@@ -552,6 +588,24 @@ pub struct ProofResolutionProjection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dependency_order_policy_preserves_encounter_adapters_and_sorted_fallback() {
+        use super::{FileId, ProofDependencyOrder};
+        for language in ["bash", "ruby", "php", "csharp", "swift", "dart"] {
+            let policy = ProofDependencyOrder::for_language_adapter(language);
+            assert_eq!(policy, ProofDependencyOrder::Encounter);
+            assert!(policy.is_canonical([FileId(9), FileId(1), FileId(5)]));
+            assert!(!policy.is_canonical([FileId(9), FileId(1), FileId(9)]));
+        }
+        for language in ["rust", "python", "typescript", "go", "unknown-adapter"] {
+            let policy = ProofDependencyOrder::for_language_adapter(language);
+            assert_eq!(policy, ProofDependencyOrder::AscendingFileId);
+            assert!(policy.is_canonical([FileId(1), FileId(5), FileId(9)]));
+            assert!(!policy.is_canonical([FileId(9), FileId(1), FileId(5)]));
+            assert!(!policy.is_canonical([FileId(1), FileId(1)]));
+        }
+    }
+
     use super::*;
 
     fn syntax() -> Vec<ExactSyntaxCallsiteCorrelationInput<'static>> {
