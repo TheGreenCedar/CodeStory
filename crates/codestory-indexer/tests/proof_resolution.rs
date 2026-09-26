@@ -3,6 +3,7 @@ use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind, Resol
 use codestory_contracts::proof_resolution::{
     CalleeForm, DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    parse_canonical_callsite_identity,
 };
 use codestory_indexer::{
     WorkspaceIndexer, build_proof_resolution_funnel, current_proof_resolution_adapter_roster,
@@ -1892,6 +1893,310 @@ fn csharp_swift_and_dart_cache_blob_semantics_are_not_self_authenticating() -> a
         rematerialize_proof_resolution_projection(&mut store, &publication(1))
             .expect_err("CSD semantic cache BLOB mutation must fail closed");
     }
+    Ok(())
+}
+
+fn assert_nonexact_receiver_with_exact_control(
+    language: &str,
+    path: &str,
+    source: &str,
+    target: &str,
+    earlier_line: u32,
+    conditional_line: u32,
+    control_line: u32,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[(path, source)])?;
+    let nodes = store.get_nodes()?;
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(conditional_line))
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("{language} needs one ordinary CALL for the hostile receiver: {calls:#?}");
+    };
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary CALL has a callsite identity"),
+    )
+    .expect("ordinary CALL identity is canonical");
+    assert_eq!(identity.file_id, FileId(call.file_node_id.unwrap().0));
+    assert_eq!(identity.line, conditional_line);
+    assert_eq!(identity.raw_target, call.target);
+
+    // Isolate the proof projector from an earlier graph resolution. The raw
+    // CALL and its source identity remain real parser/indexer output.
+    store.get_connection().execute(
+        "UPDATE edge SET resolved_target_node_id = NULL,
+                         confidence = NULL,
+                         certainty = NULL,
+                         candidate_target_node_ids = '[]'
+         WHERE id = ?1",
+        [call.id.0],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let hostile = facts
+        .iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language
+                && fact.callsite.raw_target == target
+                && fact.callsite.line == conditional_line
+        })
+        .collect::<Vec<_>>();
+    let [hostile] = hostile.as_slice() else {
+        panic!("{language} needs one source-bound hostile fact: {facts:#?}");
+    };
+    let caller = nodes
+        .iter()
+        .find(|node| node.id == hostile.caller)
+        .expect("fact caller belongs to the indexed graph");
+    assert!(caller.serialized_name.contains("caller"), "{caller:#?}");
+    assert_eq!(call.effective_source(), caller.id, "{language}: {call:#?}");
+    assert_eq!(call.file_node_id, caller.file_node_id);
+    assert_eq!(hostile.callsite.file_id, identity.file_id);
+    assert_ne!(hostile.status, ProofResolutionStatus::Exact, "{hostile:#?}");
+    assert!(
+        hostile.edge_id.is_none() && hostile.target.is_none(),
+        "{hostile:#?}"
+    );
+    assert!(hostile.evidence_chain.is_empty(), "{hostile:#?}");
+    let after = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == call.id)
+        .expect("ordinary CALL survives proof replay");
+    assert_eq!(after.resolved_target, None, "{language}: {after:#?}");
+    assert_eq!(after.certainty, None, "{language}: {after:#?}");
+
+    let earlier = facts
+        .iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == language
+                && fact.caller == hostile.caller
+                && fact.callsite.raw_target == target
+                && fact.callsite.line == earlier_line
+        })
+        .expect("earlier same-caller receiver fact");
+    assert_eq!(earlier.status, ProofResolutionStatus::Exact, "{earlier:#?}");
+    assert!(
+        earlier.edge_id.is_some() && earlier.target.is_some(),
+        "{earlier:#?}"
+    );
+
+    let exact = facts
+        .iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == language
+                && fact.callsite.raw_target == target
+                && fact.callsite.line == control_line
+        })
+        .expect("unaffected receiver control fact");
+    assert_eq!(exact.status, ProofResolutionStatus::Exact, "{exact:#?}");
+    assert!(
+        exact.edge_id.is_some() && exact.target.is_some(),
+        "{exact:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn ruby_conditional_receiver_assignment_stays_nonexact() -> anyhow::Result<()> {
+    assert_nonexact_receiver_with_exact_control(
+        "ruby",
+        "conditional.rb",
+        concat!(
+            "class Worker\n  def target\n  end\nend\n",
+            "class Other\n  def target\n  end\nend\n",
+            "def caller(receiver, flag)\n",
+            "  safe = Worker.new\n  safe.target\n",
+            "  if flag\n    receiver = Worker.new\n  end\n",
+            "  receiver.target\nend\n",
+            "def certain\n  receiver = Worker.new\n  receiver.target\nend\n",
+        ),
+        "target",
+        11,
+        15,
+        19,
+    )
+}
+
+#[test]
+fn ruby_modifier_and_short_circuit_assignments_stay_nonexact() -> anyhow::Result<()> {
+    for (path, setup, assignment, earlier_line, hostile_line, control_line) in [
+        (
+            "modifier.rb",
+            "  safe = Worker.new\n  safe.target\n",
+            "  receiver = Worker.new if flag\n",
+            11,
+            13,
+            17,
+        ),
+        (
+            "short_circuit.rb",
+            "",
+            "  (safe = Worker.new) && (receiver = Worker.new)\n  safe.target\n",
+            11,
+            12,
+            16,
+        ),
+    ] {
+        let source = format!(
+            "{}{}{}{}{}{}{}",
+            "class Worker\n  def target\n  end\nend\n",
+            "class Other\n  def target\n  end\nend\n",
+            "def caller(receiver, flag)\n",
+            setup,
+            assignment,
+            "  receiver.target\nend\n",
+            "def certain\n  receiver = Worker.new\n  receiver.target\nend\n",
+        );
+        assert_nonexact_receiver_with_exact_control(
+            "ruby",
+            path,
+            &source,
+            "target",
+            earlier_line,
+            hostile_line,
+            control_line,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn php_conditional_receiver_assignment_stays_nonexact() -> anyhow::Result<()> {
+    assert_nonexact_receiver_with_exact_control(
+        "php",
+        "conditional.php",
+        concat!(
+            "<?php\n",
+            "class Worker { public function target() {} }\n",
+            "class Other { public function target() {} }\n",
+            "function caller($receiver, $flag) {\n",
+            "  $safe = new Worker();\n  $safe->target();\n",
+            "  if ($flag) { $receiver = new Worker(); }\n",
+            "  $receiver->target();\n}\n",
+            "function certain() {\n",
+            "  $receiver = new Worker();\n  $receiver->target();\n}\n",
+        ),
+        "target",
+        6,
+        8,
+        12,
+    )
+}
+
+#[test]
+fn php_short_circuit_assignments_stay_nonexact() -> anyhow::Result<()> {
+    for (path, setup, assignment, earlier_line, hostile_line, control_line) in [
+        (
+            "short_circuit.php",
+            "",
+            "  ($safe = new Worker()) && ($receiver = new Worker());\n  $safe->target();\n",
+            6,
+            7,
+            11,
+        ),
+        (
+            "coalesce.php",
+            "  $safe = new Worker();\n  $safe->target();\n",
+            "  $flag ?? ($receiver = new Worker());\n",
+            6,
+            8,
+            12,
+        ),
+    ] {
+        let source = format!(
+            "{}{}{}{}{}{}{}{}",
+            "<?php\n",
+            "class Worker { public function target() {} }\n",
+            "class Other { public function target() {} }\n",
+            "function caller($receiver, $flag) {\n",
+            setup,
+            assignment,
+            "  $receiver->target();\n}\n",
+            "function certain() {\n  $receiver = new Worker();\n  $receiver->target();\n}\n",
+        );
+        assert_nonexact_receiver_with_exact_control(
+            "php",
+            path,
+            &source,
+            "target",
+            earlier_line,
+            hostile_line,
+            control_line,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn php_extract_overwrite_invalidates_only_affected_receiver() -> anyhow::Result<()> {
+    assert_nonexact_receiver_with_exact_control(
+        "php",
+        "extract.php",
+        concat!(
+            "<?php\n",
+            "class Worker { public function memberTarget() {} }\n",
+            "class Other { public function memberTarget() {} }\n",
+            "function caller(Worker $worker) {\n",
+            "  $worker->memberTarget();\n",
+            "  extract([\"worker\" => new Other()]);\n",
+            "  $worker->memberTarget();\n}\n",
+            "function untouched(Worker $worker) {\n",
+            "  $worker->memberTarget();\n}\n",
+        ),
+        "memberTarget",
+        5,
+        7,
+        10,
+    )
+}
+
+#[test]
+fn php_explicit_rebind_after_extract_restores_exact_receiver() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "rebound.php",
+            concat!(
+                "<?php\n",
+                "class Worker { public function memberTarget() {} }\n",
+                "class Other { public function memberTarget() {} }\n",
+                "function caller(Worker $worker) {\n",
+                "  extract([\"worker\" => new Other()]);\n",
+                "  $worker = new Worker();\n",
+                "  $worker->memberTarget();\n}\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == "php"
+                && fact.callsite.raw_target == "memberTarget"
+                && fact.callsite.line == 7
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("rebound receiver needs one source-bound fact: {facts:#?}");
+    };
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(
+        fact.edge_id.is_some() && fact.target.is_some() && !fact.evidence_chain.is_empty(),
+        "{fact:#?}"
+    );
     Ok(())
 }
 
