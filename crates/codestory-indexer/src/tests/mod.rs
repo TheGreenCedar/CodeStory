@@ -16,6 +16,389 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+mod walk_tree_nodes;
+
+#[test]
+fn exact_owned_canonical_self_call_survives_legacy_placeholder_attribution() {
+    let file = NodeId(1);
+    let recursive = Node {
+        id: NodeId(2),
+        kind: NodeKind::FUNCTION,
+        file_node_id: Some(file),
+        start_line: Some(1),
+        end_line: Some(2),
+        ..Default::default()
+    };
+    let nearby = Node {
+        id: NodeId(3),
+        kind: NodeKind::FUNCTION,
+        file_node_id: Some(file),
+        start_line: Some(2),
+        end_line: Some(2),
+        ..Default::default()
+    };
+    for legacy_edge_identity in [false, true] {
+        let mut edges = vec![Edge {
+            source: recursive.id,
+            target: recursive.id,
+            resolved_source: Some(recursive.id),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file),
+            line: Some(2),
+            ..Default::default()
+        }];
+        apply_line_range_call_attribution(
+            &[recursive.clone(), nearby.clone()],
+            &mut edges,
+            IndexFeatureFlags {
+                legacy_edge_identity,
+                lazy_graph_execution: true,
+            },
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source, recursive.id);
+        assert_eq!(edges[0].target, recursive.id);
+        assert_eq!(edges[0].resolved_source, Some(recursive.id));
+
+        // Without exact capture provenance, the existing line-based fallback
+        // remains a separate legacy boundary.
+        let placeholder = NodeId(4);
+        let mut fallback = vec![Edge {
+            source: placeholder,
+            target: placeholder,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file),
+            line: Some(2),
+            ..Default::default()
+        }];
+        apply_line_range_call_attribution(
+            &[recursive.clone(), nearby.clone()],
+            &mut fallback,
+            IndexFeatureFlags {
+                legacy_edge_identity,
+                lazy_graph_execution: true,
+            },
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].source, nearby.id);
+        assert_eq!(fallback[0].target, placeholder);
+    }
+}
+
+fn measured_go_method_identity_qualification_work(method_count: usize) -> usize {
+    let mut nodes = HashMap::new();
+    let mut roles = HashMap::new();
+    let mut specs = Vec::new();
+    for index in 0..method_count {
+        let id = NodeId(i64::try_from(index + 1).expect("method id"));
+        let line = u32::try_from(index + 1).expect("method line");
+        nodes.insert(
+            id,
+            Node {
+                id,
+                kind: NodeKind::METHOD,
+                serialized_name: format!("Method{index}"),
+                start_line: Some(line),
+                start_col: Some(1),
+                end_line: Some(line),
+                end_col: Some(20),
+                ..Default::default()
+            },
+        );
+        roles.insert(id, CanonicalNodeRole::Definition);
+        specs.push(ManualMemberEdgeSpec {
+            source_name: format!("Owner{index}"),
+            target_name: format!("Method{index}"),
+            source_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 5,
+            },
+            target_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 20,
+            },
+            line: Some(line),
+        });
+    }
+
+    reset_go_method_identity_work();
+    apply_go_receiver_method_identities("go", &mut nodes, &specs, &HashSet::new(), &roles);
+    assert!(
+        nodes
+            .values()
+            .all(|node| node.serialized_name.starts_with("Owner"))
+    );
+    go_method_identity_work()
+}
+
+#[test]
+fn go_method_identity_qualification_work_is_linear() {
+    let baseline = measured_go_method_identity_qualification_work(128);
+    let doubled = measured_go_method_identity_qualification_work(256);
+    assert!(baseline >= 256, "Go identity work was not fully counted");
+    assert!(
+        doubled <= baseline * 2 + 16,
+        "Go identity qualification grew superlinearly: {baseline} -> {doubled}"
+    );
+}
+
+#[test]
+fn go_builtin_new_package_and_local_shadowing_matrix_is_closed() -> Result<()> {
+    struct Case {
+        name: &'static str,
+        declarations: &'static str,
+        expect_receiver_resolution: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "direct package var",
+            declarations: "var new func(int)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package var",
+            declarations: "var (\n  new func(int)\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package const",
+            declarations: "const new = 1\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package const",
+            declarations: "const (\n  new = 1\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package type",
+            declarations: "type new int\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package type",
+            declarations: "type (\n  new int\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "unrelated package names",
+            declarations: "var otherVar func(int)\nconst otherConst = 1\ntype otherType int\n",
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in unrelated callable",
+            declarations: r#"
+func unrelated() {
+  { var new func(int); _ = new }
+  { const new = 1; _ = new }
+  { type new int; var _ new }
+}
+"#,
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in caller",
+            declarations: "",
+            expect_receiver_resolution: false,
+        },
+    ];
+
+    for case in cases {
+        let caller_shadow = if case.name == "local new in caller" {
+            "  var new func(int)\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            r#"package proof
+
+type node struct{{}}
+func (*node) addRoute() {{}}
+
+{}
+func build() {{
+{}  root := new(node)
+  root.addRoute()
+}}
+"#,
+            case.declarations, caller_shadow
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go parser language");
+        let tree = parser.parse(&source, None).expect("Go syntax tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "case `{}` must be syntactically valid",
+            case.name
+        );
+
+        let has_receiver_spec = languages::go::receiver_call_specs(&tree, &source)
+            .iter()
+            .any(|spec| {
+                spec.source_name == "build"
+                    && spec.owner_name == "node"
+                    && spec.method_name == "addRoute"
+            });
+        assert_eq!(
+            has_receiver_spec, case.expect_receiver_resolution,
+            "case `{}` receiver-spec decision",
+            case.name
+        );
+
+        let language_config = get_language_for_ext("go").expect("Go language config");
+        let result = index_file(Path::new("main.go"), &source, &language_config, None, None)?;
+        let nodes_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let has_resolved_method_edge = result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .resolved_target
+                    .and_then(|target| nodes_by_id.get(&target))
+                    .is_some_and(|target| {
+                        target.serialized_name == "node.addRoute"
+                            || target.serialized_name.ends_with(".node.addRoute")
+                    })
+        });
+        assert_eq!(
+            has_resolved_method_edge, case.expect_receiver_resolution,
+            "case `{}` resolved-edge decision",
+            case.name
+        );
+    }
+
+    Ok(())
+}
+
+fn measured_manual_receiver_index_work(owner_count: usize, lookup_count: usize) -> usize {
+    let file_id = NodeId(1);
+    let mut nodes = HashMap::new();
+    let mut edges = Vec::new();
+    for index in 0..owner_count {
+        let owner_id = NodeId(i64::try_from(index * 2 + 2).expect("owner id"));
+        let target_id = NodeId(i64::try_from(index * 2 + 3).expect("target id"));
+        nodes.insert(
+            owner_id,
+            Node {
+                id: owner_id,
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Owner{index}"),
+                qualified_name: Some(format!("module.Owner{index}")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 1).expect("owner line")),
+                end_line: Some(u32::try_from(index + 2).expect("owner end line")),
+                ..Default::default()
+            },
+        );
+        nodes.insert(
+            target_id,
+            Node {
+                id: target_id,
+                kind: NodeKind::METHOD,
+                serialized_name: "run".to_owned(),
+                qualified_name: Some(format!("module.Owner{index}.run")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 2).expect("method line")),
+                ..Default::default()
+            },
+        );
+        edges.push(Edge {
+            source: owner_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        });
+    }
+    reset_manual_receiver_lookup_work();
+    let prepared = PreparedMemberTargetIndex::prepare(&nodes, &edges);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert_eq!(
+            prepared.target(&format!("Owner{owner_index}"), "run", file_id, false, None,),
+            Some(NodeId(
+                i64::try_from(owner_index * 2 + 3).expect("target id")
+            ))
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn prepared_manual_receiver_members_and_lookups_are_independently_linear() {
+    let baseline = measured_manual_receiver_index_work(64, 64);
+    let more_members = measured_manual_receiver_index_work(128, 64);
+    let more_lookups = measured_manual_receiver_index_work(64, 128);
+    let combined = measured_manual_receiver_index_work(128, 128);
+    assert!(baseline >= 64, "manual receiver work was not counted");
+    assert!(
+        more_members <= baseline * 2 + 64,
+        "member preparation: {baseline} -> {more_members}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "member lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 128,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
+fn measured_python_local_owner_line_work(owner_count: usize, lookup_count: usize) -> usize {
+    let mut source = String::new();
+    for index in 0..owner_count {
+        source.push_str(&format!(
+            "def caller_{index}():\n    class Owner{index}:\n        pass\n\n"
+        ));
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("Python parser language");
+    let tree = parser.parse(&source, None).expect("Python syntax tree");
+    reset_manual_receiver_lookup_work();
+    let prepared = PythonLocalOwnerLineIndex::prepare(&tree, &source);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert!(
+            prepared
+                .unique_line(&format!("caller_{owner_index}.Owner{owner_index}"))
+                .is_some()
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn python_local_owner_lines_are_prepared_once_and_looked_up_linearly() {
+    let baseline = measured_python_local_owner_line_work(64, 64);
+    let more_owners = measured_python_local_owner_line_work(128, 64);
+    let more_lookups = measured_python_local_owner_line_work(64, 128);
+    let combined = measured_python_local_owner_line_work(128, 128);
+    assert!(baseline >= 64, "Python owner-line work was not counted");
+    assert!(
+        more_owners <= baseline * 2 + 128,
+        "owner preparation: {baseline} -> {more_owners}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "owner lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 192,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
 /// A file whose only structural node is a position-derived one: a shape
 /// several collectors produce today, because `structural_node_id` mixes the
 /// declaration's line and column into the id.
@@ -1106,6 +1489,61 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 }
 
 #[test]
+fn parser_artifact_cache_writer_compacts_and_replays_a_meaningful_projection() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("many_calls.rs");
+    let mut source = String::from("fn target() {}\n");
+    for index in 0..256 {
+        source.push_str(&format!("fn caller_{index}() {{ target(); }}\n"));
+    }
+    std::fs::write(&path, source)?;
+    let refresh = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![path],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+
+    let first = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert_eq!(first.parser_artifact_cache.misses, 1);
+    assert_eq!(first.artifact_cache_writes, 1);
+    let encoded: Vec<u8> = storage.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get(0),
+    )?;
+    let decoded = crate::cache::decode_index_artifact(&encoded)?;
+    let raw = serde_json::to_vec(&decoded)?;
+    assert_eq!(crate::cache::encode_index_artifact(&decoded)?, encoded);
+    assert_eq!(decoded.files.len(), 1);
+    assert!(decoded.files[0].complete);
+    assert!(!decoded.nodes.is_empty());
+    assert!(!decoded.edges.is_empty());
+    assert!(!decoded.occurrences.is_empty());
+    assert!(!decoded.call_resolution_inputs.is_empty());
+    let resolution_file = decoded
+        .resolution_file
+        .as_ref()
+        .expect("stored parser artifact must retain resolution file inputs");
+    assert!(resolution_file.complete);
+    assert!(resolution_file.lookup_input_complete);
+    assert!(
+        encoded.len() < raw.len() / 2,
+        "stored parser artifact did not materially compact: encoded={} raw={}",
+        encoded.len(),
+        raw.len()
+    );
+
+    let replay = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert_eq!(replay.parser_artifact_cache.hits, 1);
+    assert_eq!(replay.parser_artifact_cache.misses, 0);
+    assert_eq!(replay.artifact_cache_writes, 0);
+    Ok(())
+}
+
+#[test]
 fn test_incremental_indexing() -> Result<()> {
     use codestory_store::Store as Storage;
     use codestory_workspace::RefreshInfo;
@@ -1135,9 +1573,11 @@ fn test_incremental_indexing() -> Result<()> {
     };
 
     let first_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+    storage.put_resolution_support_snapshot(7_001, b"sealed graph support")?;
     let reused_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
 
     assert_eq!(first_stats.parser_artifact_cache.misses, 1);
+    assert!(first_stats.graph_projection_changed);
     assert_eq!(
         reused_stats.parser_artifact_cache.policy,
         ArtifactCachePolicy::ReadThrough
@@ -1147,6 +1587,19 @@ fn test_incremental_indexing() -> Result<()> {
     assert_eq!(reused_stats.parser_artifact_cache.hits, 1);
     assert_eq!(reused_stats.parser_artifact_cache.misses, 0);
     assert_eq!(reused_stats.parser_artifact_cache.reader_opens, 0);
+    assert!(!reused_stats.graph_projection_changed);
+    assert_eq!(reused_stats.source_identity_only_files, 1);
+    assert!(
+        !reused_stats.resolution_ran,
+        "an unchanged graph cannot require a global resolution pass"
+    );
+    assert_eq!(reused_stats.flush_nodes_ms, 0);
+    assert_eq!(reused_stats.flush_edges_ms, 0);
+    assert_eq!(
+        storage.get_resolution_support_snapshot(7_001)?,
+        Some(b"sealed graph support".to_vec()),
+        "source-identity-only persistence must retain graph-derived support"
+    );
 
     let file_id = WorkspaceIndexer::canonical_file_node_id_for_path(&f1);
     assert_eq!(
@@ -1154,6 +1607,26 @@ fn test_incremental_indexing() -> Result<()> {
         Some(source_content_hash(source.as_bytes()).as_str())
     );
     assert_eq!(reused_stats.artifact_cache_hits, 1);
+
+    let graph_before_lf = (storage.get_nodes()?.len(), storage.get_edges()?.len());
+    let source_with_appended_lf = format!("{source}\n");
+    fs::write(&f1, &source_with_appended_lf)?;
+    let appended_lf_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+    assert!(!appended_lf_stats.graph_projection_changed);
+    assert_eq!(appended_lf_stats.source_identity_only_files, 1);
+    assert!(
+        !appended_lf_stats.resolution_ran,
+        "source-identity-only refresh must retain resolved edges as-is"
+    );
+    assert_eq!(
+        (storage.get_nodes()?.len(), storage.get_edges()?.len()),
+        graph_before_lf,
+        "an appended line feed cannot rewrite an equivalent graph"
+    );
+    assert_eq!(
+        storage.get_file_content_hash(file_id)?.as_deref(),
+        Some(source_content_hash(source_with_appended_lf.as_bytes()).as_str())
+    );
 
     // Check verification
     let nodes = storage.get_nodes().unwrap();
@@ -1243,6 +1716,38 @@ fn incremental_incomplete_result_preserves_previous_projection() -> Result<()> {
             && error.message.contains("Skipped oversized source file")
             && error.coverage_reason == Some(FileCoverageReason::Oversized)
     }));
+    Ok(())
+}
+
+#[test]
+fn parser_partial_append_lf_reuses_the_equivalent_graph_projection() -> Result<()> {
+    use codestory_workspace::RefreshInfo;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("partial.c");
+    let source = "int helper(void) { return 1; }\nint broken( { return helper(); }\n";
+    std::fs::write(&path, source)?;
+    let refresh = RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![path.clone()],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+    let graph_before = (storage.get_nodes()?.len(), storage.get_edges()?.len());
+
+    std::fs::write(&path, format!("{source}\n"))?;
+    let stats = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert!(!stats.graph_projection_changed);
+    assert_eq!(stats.source_identity_only_files, 1);
+    assert!(!stats.resolution_ran);
+    assert_eq!(
+        (storage.get_nodes()?.len(), storage.get_edges()?.len()),
+        graph_before
+    );
     Ok(())
 }
 
@@ -1357,6 +1862,7 @@ fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> R
         full_path: path.clone(),
         artifact_cache_path: Some(path.with_extension("artifact")),
         source: original.to_string(),
+        source_utf8_exact: true,
         compilation_info: None,
         language_config: get_language_for_ext("rs").expect("rust config"),
         artifact_cache_key: Some("old-source".to_string()),
@@ -1459,6 +1965,77 @@ fn test_full_refresh_batches_artifact_cache_writes_per_file_chunk() -> Result<()
     let nodes = storage.get_nodes()?;
     assert!(nodes.len() >= 24);
 
+    Ok(())
+}
+
+#[test]
+fn test_full_refresh_resolves_flushed_calls_in_serial_pipeline_and_cache_replay() -> Result<()> {
+    let dir = tempdir()?;
+    let caller = dir.path().join("caller.go");
+    let target = dir.path().join("target.go");
+    std::fs::write(&caller, "package sample\nfunc begin() { finish() }\n")?;
+    std::fs::write(&target, "package sample\nfunc finish() {}\n")?;
+    let plan = codestory_workspace::RefreshExecutionPlan {
+        mode: codestory_workspace::BuildMode::FullRefresh,
+        files_to_index: vec![caller, target.clone()],
+        files_to_remove: vec![],
+        existing_file_ids: HashMap::new(),
+    };
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+        IncrementalIndexingConfig {
+            file_batch_size: 1,
+            ..IncrementalIndexingConfig::default()
+        },
+    );
+    let pipeline_path = dir.path().join("pipeline.sqlite");
+    let mut serial = Storage::new_in_memory()?;
+    let mut pipeline = Storage::open_build(&pipeline_path)?;
+    let mut replay = Storage::open_build(dir.path().join("replay.sqlite"))?;
+    for (label, storage) in [("serial", &mut serial), ("pipeline", &mut pipeline)] {
+        let stats = indexer.run(storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(
+            stats.full_refresh_queue_capacity,
+            usize::from(label == "pipeline")
+        );
+        assert!(
+            stats.graph_projection_changed,
+            "{label}: fresh graph was flushed"
+        );
+        assert!(
+            stats.resolution_ran,
+            "{label}: full refresh must resolve its graph"
+        );
+        let nodes = storage.get_nodes()?;
+        let target_file = storage.get_files_by_paths(std::slice::from_ref(&target))?[&target].id;
+        let definition = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node.file_node_id == Some(NodeId(target_file))
+                    && node
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with("finish"))
+            })
+            .expect("the other file must contain the definition");
+        assert!(
+            storage.get_edges()?.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL && edge.resolved_target == Some(definition.id)
+            }),
+            "{label}: post-flush resolution must reach the other file's definition"
+        );
+    }
+    assert!(replay.copy_index_artifact_cache_from(&pipeline_path)? > 0);
+    let stats = indexer.run(&mut replay, &plan, &EventBus::new(), None)?;
+    assert!(stats.artifact_cache_hits > 0);
+    assert_eq!(stats.full_refresh_queue_capacity, 1);
+    assert!(stats.graph_projection_changed);
+    assert!(
+        stats.resolution_ran,
+        "cache replay rebuilds a graph that still needs resolution"
+    );
+    assert_projection_snapshots_equal(&serial, &pipeline, "pipelined")?;
+    assert_projection_snapshots_equal(&serial, &replay, "cache-replayed")?;
     Ok(())
 }
 
@@ -1944,6 +2521,7 @@ fn structural_source_drift_discards_units_and_cache_write_even_with_restored_mti
     let content_hash = source_content_hash(original.as_bytes());
     let prepared = PreparedStructuralInput {
         full_path: path.clone(),
+        role_classification_path: PathBuf::from("schema.sql"),
         artifact_cache_path: Some(PathBuf::from("schema.sql")),
         artifact_cache_key: Some("v1:original".to_string()),
         source: original.to_string(),
@@ -2121,6 +2699,11 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
             "[package]\nname = \"app\"\n",
             "structural_cargo_manifest_collector",
         ),
+        (
+            "tsconfig.json",
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/health\":{\"get\":{}}},\"compilerOptions\":{\"strict\":true}}",
+            "structural_typescript_config_jsonc_collector",
+        ),
     ];
     for (relative, source, _expected_producer) in fixtures {
         let path = dir.path().join(relative);
@@ -2229,6 +2812,49 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
         Ok(_) => panic!("parser-backed .sh entered structural fallback"),
         Err(_) => panic!("parser-backed .sh preparation failed"),
     }
+    Ok(())
+}
+
+#[test]
+fn structural_zero_byte_role_uses_the_workspace_relative_path() -> Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path().join("target/workspace");
+    let relative = PathBuf::from("src/__tests__/fixtures/empty.json");
+    let full_path = root.join(&relative);
+    std::fs::create_dir_all(full_path.parent().expect("fixture parent"))?;
+    std::fs::write(&full_path, [])?;
+
+    let indexer = WorkspaceIndexer::new(root.clone());
+    let mut storage = Storage::new_in_memory()?;
+    let symbol_table = Arc::new(SymbolTable::new());
+    let mut stats = IncrementalIndexingStats::default();
+    let prepared_result = {
+        let mut cache_access =
+            ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
+        indexer.prepare_index_work(
+            &mut cache_access,
+            &relative,
+            &root,
+            None,
+            &symbol_table,
+            &mut stats,
+        )
+    };
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("zero-byte test JSON preparation failed"),
+    };
+    let input = match prepared {
+        PreparedIndexWork::Structural(input) => input,
+        _ => panic!("zero-byte test JSON must enter structural collection"),
+    };
+    let projected = indexer.execute_prepared_structural_index(&input);
+    assert!(projected.local_storage.errors.is_empty());
+    assert_eq!(
+        projected.local_storage.files[0].file_role,
+        codestory_store::FileRole::Test
+    );
+    assert!(projected.local_storage.structural_text_units.is_empty());
     Ok(())
 }
 
@@ -2619,6 +3245,8 @@ fn test_empty_full_refresh_reports_adaptive_chunk_config() -> Result<()> {
     assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
     assert_eq!(stats.projection_batch_transactions, 0);
     assert_eq!(stats.projection_batch_wall_ms, 0);
+    assert!(!stats.graph_projection_changed);
+    assert!(!stats.resolution_ran);
     Ok(())
 }
 
@@ -3208,6 +3836,11 @@ fn test_full_refresh_cancellation_after_writer_acceptance_drains_that_chunk() ->
     assert!(cancel_token.is_cancelled());
     assert_eq!(stats.full_refresh_chunks_produced, 1);
     assert_eq!(stats.full_refresh_chunks_persisted, 1);
+    assert!(stats.graph_projection_changed);
+    assert!(
+        !stats.resolution_ran,
+        "cancelled work must not enter resolution"
+    );
     let names = storage
         .get_nodes()?
         .into_iter()
@@ -3275,6 +3908,75 @@ fn test_full_refresh_writer_failure_disconnects_producer_without_deadlock() -> R
         .expect_err("injected writer failure must propagate");
     handle.join().expect("indexing thread must not panic");
     assert!(error.contains("forced pipeline cache failure"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn companion_source_without_evidence_producer_persists_inventory_identity_only() -> Result<()> {
+    use codestory_store::Store as Storage;
+    use codestory_workspace::{RefreshInfo, RefreshInputs, WorkspaceManifest};
+
+    let dir = tempdir()?;
+    let companion = dir.path().join("maintenance.lua");
+    std::fs::write(&companion, "return { enabled = true }\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    WorkspaceIndexer::new(dir.path().to_path_buf()).run_incremental(
+        &mut storage,
+        &RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![companion.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    let file = storage
+        .get_file_by_path(&companion)?
+        .expect("companion inventory row");
+    assert_eq!(file.language, "lua");
+    assert!(file.indexed);
+    assert!(
+        !file.complete,
+        "inventory-only rows cannot prove graph absence"
+    );
+    assert!(storage.get_file_content_hash(file.id)?.is_some());
+    assert!(
+        storage
+            .get_errors(None)?
+            .iter()
+            .all(|error| error.file_id != Some(NodeId(file.id))),
+        "inventory-only coverage is stable, not a retryable collector failure"
+    );
+    let nodes = storage.get_nodes()?;
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(NodeId(file.id)))
+            .count(),
+        0,
+        "inventory-only sources cannot emit non-file graph nodes"
+    );
+    assert!(storage.get_edges()?.is_empty());
+
+    let manifest = WorkspaceManifest::open(dir.path().to_path_buf())?;
+    let inventory = storage.files().inventory()?;
+    let clean = manifest.build_execution_plan(&RefreshInputs {
+        stored_files: inventory.clone(),
+        policy_exclusions: Vec::new(),
+        inventory: codestory_workspace::WorkspaceInventory::default(),
+    })?;
+    assert!(clean.files_to_index.is_empty());
+
+    std::fs::write(&companion, "return { enabled = false }\n")?;
+    let changed = manifest.build_execution_plan(&RefreshInputs {
+        stored_files: inventory,
+        policy_exclusions: Vec::new(),
+        inventory: codestory_workspace::WorkspaceInventory::default(),
+    })?;
+    assert_eq!(changed.files_to_index, vec![companion]);
     Ok(())
 }
 
@@ -5451,7 +6153,10 @@ fn test_openapi_schema_indexes_endpoint_symbols() -> Result<()> {
 }"#;
     let storage = index_openapi_schema_file(Path::new("openapi.json"), schema)?
         .expect("schema should be indexed");
-    let endpoint_id = schema_endpoint_node_id("GET", "/api/users");
+    let file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(
+        Path::new("openapi.json"),
+    ));
+    let endpoint_id = schema_endpoint_node_id(file_id, "GET", "/api/users");
     assert!(storage.nodes.iter().any(|node| {
         node.id == endpoint_id
             && node.kind == NodeKind::FUNCTION
@@ -5689,6 +6394,50 @@ fn test_text_only_sveltekit_page_indexes_file_convention_route() -> Result<()> {
     assert!(storage.edges.iter().any(|edge| {
         edge.kind == EdgeKind::MEMBER && edge.certainty == Some(ResolutionCertainty::Certain)
     }));
+    Ok(())
+}
+
+#[test]
+fn text_only_framework_routes_are_owned_by_their_declaration_file() -> Result<()> {
+    let temp = tempdir()?;
+    let left_dir = temp.path().join("left/src/routes/shared");
+    let right_dir = temp.path().join("right/src/routes/shared");
+    std::fs::create_dir_all(&left_dir)?;
+    std::fs::create_dir_all(&right_dir)?;
+    let left_path = left_dir.join("+page.svelte");
+    let right_path = right_dir.join("+page.svelte");
+    std::fs::write(&left_path, "<h1>Left</h1>\n")?;
+    std::fs::write(&right_path, "<h1>Right</h1>\n")?;
+
+    let left = index_text_only_file(&left_path)?;
+    let right = index_text_only_file(&right_path)?;
+    let left_route = left
+        .nodes
+        .iter()
+        .find(|node| {
+            node.serialized_name == "GET /shared (sveltekit route; confidence=file_convention)"
+        })
+        .expect("left text-only route");
+    let right_route = right
+        .nodes
+        .iter()
+        .find(|node| {
+            node.serialized_name == "GET /shared (sveltekit route; confidence=file_convention)"
+        })
+        .expect("right text-only route");
+
+    assert_ne!(left_route.id, right_route.id);
+    assert_ne!(
+        left_route.canonical_id.as_deref(),
+        right_route.canonical_id.as_deref()
+    );
+    for (storage, route) in [(&left, left_route), (&right, right_route)] {
+        let file_id = NodeId(storage.files[0].id);
+        assert_eq!(route.file_node_id, Some(file_id));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == file_id && edge.target == route.id
+        }));
+    }
     Ok(())
 }
 
@@ -6656,8 +7405,10 @@ fn test_nextjs_file_route_metadata_preserves_raw_path_params_and_convention() {
     assert_eq!(route.confidence, "file_convention");
     assert_eq!(route.source_convention, "file_convention");
 
-    let canonical_id = framework_route_canonical_id(route);
+    let canonical_id = framework_route_canonical_id(NodeId(42), route);
     assert!(canonical_id.starts_with("route_endpoint:"));
+    assert!(canonical_id.contains(r#""file_node_id":42"#));
+    assert!(canonical_id.contains(&format!(r#""line":{}"#, route.line)));
     assert!(canonical_id.contains(r#""framework":"nextjs""#));
     assert!(canonical_id.contains(r#""raw_path":"/api/users/[id]""#));
     assert!(canonical_id.contains(r#""params":["id"]"#));
@@ -6817,8 +7568,11 @@ export async function createUser() {
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
-    let get_endpoint = schema_endpoint_node_id("GET", "/api/users");
-    let post_endpoint = schema_endpoint_node_id("POST", "/api/users");
+    // Call-site stubs keep a stable openapi:endpoint canonical_id; canonicalize
+    // rebinds the node id from that preserved id (not the pre-canonical file-owned
+    // hash used by dedicated OpenAPI schema projections).
+    let get_endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
+    let post_endpoint = NodeId(generate_id("openapi:endpoint:POST /api/users"));
     let node_by_id = result
         .nodes
         .iter()
@@ -6860,7 +7614,7 @@ export function handler() {}
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("routes.ts"), code, &language_config, None, None)?;
-    let endpoint = schema_endpoint_node_id("GET", "/api/users");
+    let endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
 
     assert!(
         result.nodes.iter().all(|node| node.id != endpoint),
@@ -6885,7 +7639,7 @@ export function handler() {
 "#;
     let language_config = get_language_for_ext("ts").expect("typescript config");
     let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
-    let endpoint = schema_endpoint_node_id("GET", "/api/users");
+    let endpoint = NodeId(generate_id("openapi:endpoint:GET /api/users"));
 
     assert!(
         result.nodes.iter().all(|node| node.id != endpoint),
@@ -7145,6 +7899,199 @@ fn removal_affected_callers_join_an_already_scoped_incremental_run() -> Result<(
     assert!(
         storage.get_node(NodeId(fixture.caller_file_id))?.is_some(),
         "the caller file must survive the removal"
+    );
+    Ok(())
+}
+
+#[test]
+fn type_usage_finalize_cleans_orphans_without_scanning_all_nodes() -> Result<()> {
+    // Regression for activation @20 dwell: orphan cleanup used
+    // `DELETE ... WHERE canonical_id LIKE 'type_ref_pending:%' AND NOT EXISTS (...)`,
+    // which scanned every node row on large multi-language cores (protobuf-class).
+    let mut storage = Storage::new_in_memory()?;
+    let noise_nodes = 25_000usize;
+    let pending_count = 1_200usize;
+
+    let mut nodes = Vec::with_capacity(noise_nodes + pending_count + 8);
+    for index in 0..noise_nodes {
+        let id = NodeId(i64::try_from(index + 1).expect("noise id"));
+        nodes.push(Node {
+            id,
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("noise_{index}"),
+            qualified_name: Some(format!("Noise.Lib.Fn{index}")),
+            ..Default::default()
+        });
+    }
+
+    let declaration_id = NodeId(i64::try_from(noise_nodes + 1).expect("decl id"));
+    nodes.push(Node {
+        id: declaration_id,
+        kind: NodeKind::CLASS,
+        serialized_name: "Widget".to_string(),
+        qualified_name: Some("Acme.Widgets.Widget".to_string()),
+        ..Default::default()
+    });
+
+    let source_id = NodeId(i64::try_from(noise_nodes + 2).expect("source id"));
+    nodes.push(Node {
+        id: source_id,
+        kind: NodeKind::CLASS,
+        serialized_name: "Owner".to_string(),
+        qualified_name: Some("Acme.App.Owner".to_string()),
+        ..Default::default()
+    });
+
+    let mut edges = Vec::with_capacity(pending_count + 1);
+    let resolve_pending_id = NodeId(i64::try_from(noise_nodes + 3).expect("resolve pending"));
+    nodes.push(Node {
+        id: resolve_pending_id,
+        kind: NodeKind::UNKNOWN,
+        serialized_name: "Widget".to_string(),
+        canonical_id: Some(format!(
+            "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Widget"
+        )),
+        ..Default::default()
+    });
+    edges.push(Edge {
+        id: EdgeId(1),
+        source: source_id,
+        target: resolve_pending_id,
+        kind: EdgeKind::TYPE_USAGE,
+        ..Default::default()
+    });
+
+    let pending_base = noise_nodes + 10;
+    for index in 0..pending_count {
+        let pending_id = NodeId(i64::try_from(pending_base + index).expect("pending id"));
+        nodes.push(Node {
+            id: pending_id,
+            kind: NodeKind::UNKNOWN,
+            serialized_name: format!("Missing{index}"),
+            canonical_id: Some(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Missing{index}"
+            )),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(i64::try_from(index + 2).expect("edge id")),
+            source: source_id,
+            target: pending_id,
+            kind: EdgeKind::TYPE_USAGE,
+            ..Default::default()
+        });
+    }
+
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let started = Instant::now();
+    finalize_pending_type_usage_edges(&mut storage)?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed.as_secs() < 3,
+        "TYPE_USAGE finalize must stay sub-second-class with {noise_nodes} noise nodes; took {elapsed:?}"
+    );
+
+    let conn = storage.get_connection();
+    let remaining_pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node WHERE canonical_id LIKE ?1",
+        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
+        |row| row.get(0),
+    )?;
+    // The uniquely resolved pending reference node remains because the edge
+    // still targets it; failed-closed pendings must be gone.
+    assert_eq!(remaining_pending, 1);
+
+    let resolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edge
+         WHERE kind = ?1 AND resolved_target_node_id = ?2",
+        rusqlite::params![EdgeKind::TYPE_USAGE as i32, declaration_id.0],
+        |row| row.get(0),
+    )?;
+    assert_eq!(resolved, 1);
+
+    let unresolved_type_usage: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edge
+         WHERE kind = ?1 AND resolved_target_node_id IS NULL",
+        rusqlite::params![EdgeKind::TYPE_USAGE as i32],
+        |row| row.get(0),
+    )?;
+    assert_eq!(unresolved_type_usage, 0);
+    Ok(())
+}
+
+#[test]
+fn type_usage_finalize_resolves_owner_qualified_nested_type_by_bare_name() -> Result<()> {
+    // Challenge counterexample: declaration serialized_name is `Outer.Inner`
+    // while the pending bare target is `Inner`. Exact `serialized_name IN`
+    // miss-closed; short_member_name / `.`/`::` suffix matching must resolve.
+    let mut storage = Storage::new_in_memory()?;
+
+    let declaration_id = NodeId(1);
+    let source_id = NodeId(2);
+    let pending_id = NodeId(3);
+    storage.insert_nodes_batch(&[
+        Node {
+            id: declaration_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Outer.Inner".to_string(),
+            qualified_name: Some("Acme.App.Outer.Inner".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: source_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Owner".to_string(),
+            qualified_name: Some("Acme.App.Owner".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: pending_id,
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "Inner".to_string(),
+            canonical_id: Some(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Inner"
+            )),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(10),
+        source: source_id,
+        target: pending_id,
+        kind: EdgeKind::TYPE_USAGE,
+        ..Default::default()
+    }])?;
+
+    finalize_pending_type_usage_edges(&mut storage)?;
+
+    let conn = storage.get_connection();
+    let resolved_target: Option<i64> = conn.query_row(
+        "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+        rusqlite::params![10i64],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        resolved_target,
+        Some(declaration_id.0),
+        "bare pending Inner must resolve to owner-qualified Outer.Inner"
+    );
+    let certainty: String = conn.query_row(
+        "SELECT certainty FROM edge WHERE id = ?1",
+        rusqlite::params![10i64],
+        |row| row.get(0),
+    )?;
+    assert_eq!(certainty, "certain");
+
+    let pending_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node WHERE id = ?1",
+        rusqlite::params![pending_id.0],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        pending_nodes, 1,
+        "resolved pending reference node must remain while the edge targets it"
     );
     Ok(())
 }

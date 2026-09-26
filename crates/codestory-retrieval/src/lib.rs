@@ -11,9 +11,12 @@
 
 mod cache;
 mod cache_clean;
+mod cache_inventory;
 mod candidate;
 mod capabilities;
 mod config;
+mod content_addressed_vector_cache;
+mod copy_on_write;
 mod embedded_vector;
 mod embedding_contract;
 mod embedding_server_compat;
@@ -246,6 +249,10 @@ pub use cache_clean::{
     CacheCleanRefusal, CacheCleanRemoval, CacheCleanReport, CacheCleanRetained, apply_cache_clean,
     plan_cache_clean,
 };
+pub use cache_inventory::{
+    CACHE_INVENTORY_SCHEMA_VERSION, CacheCloneSharing, CacheConsumer, CacheHardlinkGroup,
+    CacheInventoryEntry, CacheInventoryKind, CacheInventoryReport, cache_inventory,
+};
 pub use candidate::{
     CandidateGraphDirection, CandidateGraphEvidence, CandidateHit, CandidateLane,
     CandidateLaneEvidence, CandidateLaneScores, CandidateSource, RankFeatures,
@@ -292,11 +299,13 @@ pub use health::{
     probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
-    FinalizeIndexOutcome, RetrievalIndexCancelled, SidecarInputChanged, finalize_index,
-    finalize_index_for_runtime, finalize_index_for_runtime_with_cancel,
-    finalize_index_for_runtime_with_progress, finalize_index_for_runtime_with_progress_and_cancel,
-    is_retrieval_index_cancelled, is_sidecar_input_changed, project_id_for_root,
-    sidecar_project_id_for_root,
+    FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming,
+    IncrementalRetrievalRefreshReceipt, RetrievalIndexCancelled, SidecarInputChanged,
+    clear_incremental_retrieval_refresh_receipt, finalize_index, finalize_index_for_runtime,
+    finalize_index_for_runtime_with_cancel, finalize_index_for_runtime_with_progress,
+    finalize_index_for_runtime_with_progress_and_cancel,
+    install_incremental_retrieval_refresh_receipt, is_retrieval_index_cancelled,
+    is_sidecar_input_changed, project_id_for_root, sidecar_project_id_for_root,
 };
 pub use inventory::{
     SidecarGcReport, SidecarInventoryReport, sidecar_gc_apply_with_storage,
@@ -346,9 +355,10 @@ pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,
 };
 pub use query::{
-    PinnedQuerySession, QueryBatchItem, QueryBatchRequest, QueryRequest,
-    RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged, execute_retrieval_query,
-    execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
+    PacketDescriptorBatchObservation, PinnedQuerySession, QueryBatchItem, QueryBatchRequest,
+    QueryRequest, RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged,
+    execute_retrieval_query, execute_retrieval_query_with_cache,
+    execute_retrieval_query_with_cache_for_runtime,
     execute_strict_retrieval_query_batch_with_cache,
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
@@ -372,9 +382,11 @@ pub use scip_client::ScipClient;
 pub use sidecar::{
     ReadyEmbeddingEngineIdentity, ReadyRetrievalIdentity,
     observe_ready_retrieval_identity_for_project_id, ready_retrieval_identity_for_runtime,
-    sidecar_status, strict_sidecar_status, strict_sidecar_status_for_profile,
-    strict_sidecar_status_for_runtime,
+    sidecar_status, strict_descriptor_sidecar_status_for_runtime, strict_sidecar_status,
+    strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
-pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
+pub use sidecar_search::{
+    LiveSidecarSearch, SidecarSearch, deferred_full_readiness_stop_message, retrieval_stop_message,
+};
 
 pub use codestory_store::RetrievalIndexManifest;

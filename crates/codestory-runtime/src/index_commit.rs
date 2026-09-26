@@ -1,3 +1,4 @@
+use crate::index_full::{FailedRefreshBoundary, FailedRefreshDiagnosticSink};
 #[cfg(test)]
 use crate::publication::run_source_policy_before_revalidate_hook;
 #[cfg(test)]
@@ -5,7 +6,7 @@ use crate::publication::{PublicationTestBoundary, publication_test_checkpoint};
 use crate::search_publication::{
     SearchGenerationCatalogGuard, discard_unpublished_search_generation,
 };
-use crate::search_state_cache::ensure_indexing_active;
+use crate::search_state_cache::{ensure_indexing_active, indexing_cancelled_error};
 use crate::semantic_projection::{SEMANTIC_POLICY_VERSION, SearchStateBuildResult};
 use crate::{
     current_epoch_ms, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
@@ -119,6 +120,67 @@ impl Drop for IndexWriterGuard {
     }
 }
 
+pub(super) fn rematerialize_staged_proof_resolution_projection(
+    staged: &mut StagedSnapshot,
+    publication: &IndexPublicationRecord,
+    cancel_token: Option<&CancellationToken>,
+    diagnostics: Option<&FailedRefreshDiagnosticSink>,
+) -> Result<(), ApiError> {
+    if let Err(error) = ensure_indexing_active(cancel_token) {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.observe_cancellation();
+        }
+        return Err(error);
+    }
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_boundary(FailedRefreshBoundary::ProofBegin);
+    }
+    let result = if let Some(diagnostics) = diagnostics {
+        codestory_indexer::rematerialize_proof_resolution_projection_with_progress(
+            staged.store_mut(),
+            publication,
+            &mut |progress| {
+                diagnostics.record_proof_progress(
+                    progress,
+                    cancel_token.is_some_and(CancellationToken::is_cancelled),
+                );
+            },
+        )
+    } else {
+        codestory_indexer::rematerialize_proof_resolution_projection(
+            staged.store_mut(),
+            publication,
+        )
+    };
+    if let Err(error) = result {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_boundary(FailedRefreshBoundary::ProofError);
+        }
+        return Err(ApiError::internal(format!(
+            "Failed to rematerialize complete proof resolution facts: {error}"
+        )));
+    }
+    if let Err(error) = ensure_indexing_active(cancel_token) {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.observe_cancellation();
+        }
+        return Err(error);
+    }
+    staged
+        .store_mut()
+        .validate_proof_resolution_publication(publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to validate complete proof resolution facts: {error}"
+            ))
+        })?;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_boundary(FailedRefreshBoundary::ProofEnd);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_core_publication_identity(
     staged: &mut StagedSnapshot,
     root: &Path,
@@ -126,19 +188,39 @@ pub(super) fn stage_core_publication_identity(
     publication: &IndexPublicationRecord,
     policy_exclusions: &[OversizedSourceExclusionCandidate],
     source_index_policy: &SourceIndexPolicy,
+    graph_equivalent_predecessor: Option<&IndexPublicationRecord>,
+    source_identity_file_ids: Option<&[i64]>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<(), ApiError> {
     ensure_indexing_active(cancel_token)?;
     #[cfg(test)]
     publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)?;
-    staged
-        .store_mut()
-        .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+    let rebound = graph_equivalent_predecessor
+        .map(|previous| {
+            staged.rebind_inherited_dense_anchor_generation(
+                previous,
+                publication,
+                SEMANTIC_POLICY_VERSION,
+            )
+        })
+        .transpose()
         .map_err(|error| {
             ApiError::internal(format!(
-                "Failed to publish complete dense anchor inputs: {error}"
+                "Failed to rebind graph-equivalent dense anchor inputs: {error}"
             ))
-        })?;
+        })?
+        .flatten()
+        .is_some();
+    if !rebound {
+        staged
+            .store_mut()
+            .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish complete dense anchor inputs: {error}"
+                ))
+            })?;
+    }
     #[cfg(test)]
     run_source_policy_before_revalidate_hook();
     let exclusions =
@@ -150,14 +232,28 @@ pub(super) fn stage_core_publication_identity(
         &exclusions,
         source_index_policy,
     )?;
-    staged
-        .store_mut()
-        .publish_structural_text_unit_generation(publication)
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to publish complete structural text units: {error}"
-            ))
-        })?;
+    let structural_rebound = match (graph_equivalent_predecessor, source_identity_file_ids) {
+        (Some(previous), Some(file_ids)) => staged
+            .rebind_inherited_structural_text_generation(previous, publication, file_ids)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind graph-equivalent structural text units: {error}"
+                ))
+            })?
+            .is_some(),
+        _ => false,
+    };
+    if !structural_rebound {
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish complete structural text units: {error}"
+                ))
+            })?;
+    }
+    ensure_indexing_active(cancel_token)?;
     let mode = match publication.mode {
         IndexPublicationMode::Full => "full",
         IndexPublicationMode::Incremental => "incremental",
@@ -244,23 +340,28 @@ impl PreparedCoreCommit {
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)?;
         ensure_indexing_active(cancel_token)?;
+        crate::index_coverage::revalidate_malformed_sources(self.staged_mut().store_mut())?;
         let staged_path = self.staged_mut().path().to_path_buf();
         let staged = self
             .staged
             .take()
             .expect("prepared core commit must own staged storage");
         let publish_started = Instant::now();
+        let cancelled = || cancel_token.is_some_and(CancellationToken::is_cancelled);
         let publish_stats = staged
-            .publish_with_stats(&self.storage_path)
+            .publish_receipted_with_stats(&self.storage_path, &cancelled)
             .map_err(|error| {
+                if cancelled() {
+                    return indexing_cancelled_error();
+                }
                 let publication = match mode {
                     CoreCommitMode::Full { .. } => "storage",
                     CoreCommitMode::Incremental => "incremental storage",
                 };
-                ApiError::internal(format!(
-                    "Failed to publish staged {publication}: {error}. Preserved staged snapshot at {}",
-                    staged_path.display()
-                ))
+                crate::index_storage_error(
+                    &format!("Failed to publish staged {publication}; rejected stage cleanup attempted at {}", staged_path.display()),
+                    error,
+                )
             })?;
         let search_state = self
             .search_state

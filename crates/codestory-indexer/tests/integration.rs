@@ -389,6 +389,179 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
 }
 
 #[test]
+fn test_go_import_candidate_filter_survives_resolution_support_snapshot_hit() -> anyhow::Result<()>
+{
+    fn assert_import_state(storage: &Storage) -> anyhow::Result<i64> {
+        let nodes = storage.get_nodes()?;
+        let edges = storage.get_edges()?;
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mime_import_edges = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::IMPORT)
+            .filter(|edge| {
+                nodes_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| target.serialized_name == "\"mime\"")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mime_import_edges.len(), 3);
+        assert!(
+            mime_import_edges
+                .iter()
+                .all(|edge| { edge.source == edge.target && edge.resolved_target.is_none() })
+        );
+
+        let shared_package = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::MODULE
+                    && node.serialized_name == "shared"
+                    && node.file_node_id.is_some_and(|file_id| {
+                        nodes_by_id.get(&file_id).is_some_and(|file| {
+                            file.serialized_name
+                                .replace('\\', "/")
+                                .ends_with("internal/shared/shared.go")
+                        })
+                    })
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing internal shared package declaration"))?;
+        let internal_import = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::IMPORT
+                    && nodes_by_id.get(&edge.target).is_some_and(|target| {
+                        target.serialized_name == "\"example.com/acme/internal/shared\""
+                    })
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing internal shared import edge"))?;
+        assert_eq!(internal_import.resolved_target, Some(shared_package.id));
+        Ok(internal_import.id.0)
+    }
+
+    let dir = tempdir()?;
+    let root = dir.path();
+    let files = [
+        (
+            "consumer_a/a.go",
+            "package consumer_a\nimport \"mime\"\nfunc value() string { return mime.TypeByExtension(\".a\") }\n",
+        ),
+        (
+            "consumer_b/b.go",
+            "package consumer_b\nimport \"mime\"\nfunc value() string { return mime.TypeByExtension(\".b\") }\n",
+        ),
+        (
+            "consumer_c/c.go",
+            "package consumer_c\nimport \"mime\"\nfunc value() string { return mime.TypeByExtension(\".c\") }\n",
+        ),
+        (
+            "internal/shared/shared.go",
+            "package shared\nfunc Value() string { return \"shared\" }\n",
+        ),
+        (
+            "cmd/app/main.go",
+            "package app\nimport \"example.com/acme/internal/shared\"\nfunc run() string { return shared.Value() }\n",
+        ),
+    ];
+    let mut paths = Vec::with_capacity(files.len());
+    for (relative_path, contents) in files {
+        let path = root.join(relative_path);
+        fs::create_dir_all(path.parent().expect("fixture file has parent"))?;
+        fs::write(&path, contents)?;
+        paths.push(path);
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    let first_stats = run_incremental_indexing(root, &mut storage, paths)?;
+    assert!(!first_stats.resolution_support_snapshot_hit);
+    assert!(first_stats.resolution_support_snapshot_stored);
+    let internal_import_edge_id = assert_import_state(&storage)?;
+
+    let current_snapshot = storage
+        .get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
+        .expect("initial version 8 support snapshot");
+    let mut prior_snapshot: serde_json::Value = serde_json::from_slice(&current_snapshot)?;
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let go_import_occurrences = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT && edge.source == edge.target)
+        .filter_map(|edge| nodes_by_id.get(&edge.target).copied())
+        .filter(|node| node.serialized_name == "\"mime\"")
+        .collect::<Vec<_>>();
+    assert_eq!(go_import_occurrences.len(), 3);
+
+    let prior_import_candidates = prior_snapshot
+        .get_mut("import_candidates")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("missing prior import candidate array"))?;
+    for node in &go_import_occurrences {
+        let file_path = node
+            .file_node_id
+            .and_then(|file_id| nodes_by_id.get(&file_id).copied())
+            .map(|file| file.serialized_name.clone());
+        prior_import_candidates.push(serde_json::json!({
+            "id": node.id.0,
+            "kind": node.kind as i32,
+            "file_node_id": node.file_node_id.map(|id| id.0),
+            "file_path": file_path,
+            "serialized_name": node.serialized_name.clone(),
+            "qualified_name": node.qualified_name.clone(),
+            "is_declaration": false,
+        }));
+    }
+    let prior_semantic_candidates = prior_snapshot
+        .get_mut("import_semantic_nodes")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("missing prior semantic import candidate array"))?;
+    for node in &go_import_occurrences {
+        prior_semantic_candidates.push(serde_json::json!({
+            "id": node.id.0,
+            "kind": node.kind as i32,
+            "serialized_name": node.serialized_name.clone(),
+            "qualified_name": node.qualified_name.clone(),
+            "file_node_id": node.file_node_id.map(|id| id.0),
+            "language_family": "go",
+        }));
+    }
+    storage.put_resolution_support_snapshot(7, &serde_json::to_vec(&prior_snapshot)?)?;
+
+    storage.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+         WHERE id = ?1",
+        [internal_import_edge_id],
+    )?;
+
+    let rebuilt = ResolutionPass::new().run(&mut storage)?;
+    assert!(!rebuilt.telemetry.support_snapshot_hit);
+    assert!(rebuilt.telemetry.support_snapshot_stored);
+    assert!(storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
+    assert_eq!(assert_import_state(&storage)?, internal_import_edge_id);
+
+    storage.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+         WHERE id = ?1",
+        [internal_import_edge_id],
+    )?;
+
+    let restored = ResolutionPass::new().run(&mut storage)?;
+    assert!(restored.telemetry.support_snapshot_hit);
+    assert!(!restored.telemetry.support_snapshot_stored);
+    assert_eq!(assert_import_state(&storage)?, internal_import_edge_id);
+
+    Ok(())
+}
+
+#[test]
 fn test_resolution_skips_oversized_optional_snapshot_without_changing_results() -> anyhow::Result<()>
 {
     let dir = tempdir()?;
@@ -1399,6 +1572,287 @@ private:
         storage.get_component_access(close.id)?,
         Some(AccessKind::Private)
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_java_public_type_visibility_is_captured() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "TypeVisibility.java",
+        r#"
+public class PublicClass {}
+class PackageClass {}
+public interface PublicInterface {}
+interface PackageInterface {}
+public enum PublicEnum { VALUE }
+enum PackageEnum { VALUE }
+public record PublicRecord(int value) {}
+record PackageRecord(int value) {}
+public @interface PublicAnnotation {}
+@interface PackageAnnotation {}
+@interface PublicMarker {}
+@PublicMarker class AnnotatedDefault {}
+@SuppressWarnings("public") class AnnotationStringDefault {}
+@SuppressWarnings("""
+public class TextBlockDecoy {}
+""") class TextBlockDefault {}
+// public must not leak into the next declaration.
+class CommentDefault {}
+abstract public class OrderedPublic {}
+sealed
+public class SplitModifierPublic permits SplitModifierChild {}
+final class SplitModifierChild extends SplitModifierPublic {}
+public sealed class SealedPublic permits SealedChild {}
+final class SealedChild extends SealedPublic {}
+class Container {
+    protected interface ProtectedInterface {}
+    private enum PrivateEnum { VALUE }
+}
+class SameLine { public class Open {} private class Closed {} class Local {} }
+class MethodCarrier {
+    public void DeclaredPublicMethod() {}
+    private void DeclaredPrivateMethod() {}
+}
+class DefaultMethodCarrier {
+    void DeclaredDefaultMethod() {}
+}
+interface InterfaceMemberCarrier { void ImplicitInterfaceMethod(); }
+"#,
+    )])?;
+    let nodes = storage.get_nodes()?;
+
+    for (name, expected, kind) in [
+        ("PublicClass", AccessKind::Public, NodeKind::CLASS),
+        ("PackageClass", AccessKind::Default, NodeKind::CLASS),
+        ("PublicInterface", AccessKind::Public, NodeKind::INTERFACE),
+        ("PackageInterface", AccessKind::Default, NodeKind::INTERFACE),
+        ("PublicEnum", AccessKind::Public, NodeKind::ENUM),
+        ("PackageEnum", AccessKind::Default, NodeKind::ENUM),
+        ("PublicRecord", AccessKind::Public, NodeKind::CLASS),
+        ("PackageRecord", AccessKind::Default, NodeKind::CLASS),
+        ("PublicAnnotation", AccessKind::Public, NodeKind::ANNOTATION),
+        (
+            "PackageAnnotation",
+            AccessKind::Default,
+            NodeKind::ANNOTATION,
+        ),
+        ("PublicMarker", AccessKind::Default, NodeKind::ANNOTATION),
+        ("AnnotatedDefault", AccessKind::Default, NodeKind::CLASS),
+        (
+            "AnnotationStringDefault",
+            AccessKind::Default,
+            NodeKind::CLASS,
+        ),
+        ("TextBlockDefault", AccessKind::Default, NodeKind::CLASS),
+        ("CommentDefault", AccessKind::Default, NodeKind::CLASS),
+        ("OrderedPublic", AccessKind::Public, NodeKind::CLASS),
+        ("SplitModifierPublic", AccessKind::Public, NodeKind::CLASS),
+        ("SealedPublic", AccessKind::Public, NodeKind::CLASS),
+        (
+            "ProtectedInterface",
+            AccessKind::Protected,
+            NodeKind::INTERFACE,
+        ),
+        ("PrivateEnum", AccessKind::Private, NodeKind::ENUM),
+        ("SameLine.Open", AccessKind::Public, NodeKind::CLASS),
+        ("SameLine.Closed", AccessKind::Private, NodeKind::CLASS),
+        ("SameLine.Local", AccessKind::Default, NodeKind::CLASS),
+        ("DeclaredPublicMethod", AccessKind::Public, NodeKind::METHOD),
+        (
+            "DeclaredPrivateMethod",
+            AccessKind::Private,
+            NodeKind::METHOD,
+        ),
+        (
+            "DeclaredDefaultMethod",
+            AccessKind::Default,
+            NodeKind::METHOD,
+        ),
+        // Preserve the existing declared-keyword policy for interface members.
+        (
+            "ImplicitInterfaceMethod",
+            AccessKind::Default,
+            NodeKind::METHOD,
+        ),
+    ] {
+        let declaration_line = match name {
+            "PublicClass" => 2,
+            "PackageClass" => 3,
+            "PublicInterface" => 4,
+            "PackageInterface" => 5,
+            "PublicEnum" => 6,
+            "PackageEnum" => 7,
+            "PublicRecord" => 8,
+            "PackageRecord" => 9,
+            "PublicAnnotation" => 10,
+            "PackageAnnotation" => 11,
+            "PublicMarker" => 12,
+            "AnnotatedDefault" => 13,
+            "AnnotationStringDefault" => 14,
+            "TextBlockDefault" => 15,
+            "CommentDefault" => 19,
+            "OrderedPublic" => 20,
+            "SplitModifierPublic" => 21,
+            "SealedPublic" => 24,
+            "ProtectedInterface" => 27,
+            "PrivateEnum" => 28,
+            "SameLine.Open" | "SameLine.Closed" | "SameLine.Local" => 30,
+            "DeclaredPublicMethod" => 32,
+            "DeclaredPrivateMethod" => 33,
+            "DeclaredDefaultMethod" => 36,
+            "ImplicitInterfaceMethod" => 38,
+            _ => unreachable!("fixture declaration line for {name}"),
+        };
+        let declaration_occurrence = if kind == NodeKind::ANNOTATION {
+            OccurrenceKind::DECLARATION
+        } else {
+            OccurrenceKind::DEFINITION
+        };
+        let node = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(declaration_line)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                occurrence.kind == declaration_occurrence
+                                    && occurrence.location.start_line == declaration_line
+                            })
+                        })
+            })
+            .unwrap_or_else(|| {
+                panic!("{name} {kind:?} declaration at line {declaration_line} missing")
+            });
+        assert_eq!(
+            storage.get_component_access(node.id)?,
+            Some(expected),
+            "Java type {name} must retain its declared visibility"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_java_type_references_do_not_inherit_enclosing_declaration_visibility() -> anyhow::Result<()>
+{
+    let storage = index_project(&[(
+        "TypeReferenceVisibility.java",
+        r#"
+class ReferenceVisibility {
+    private class PrivateBase {}
+    public class PublicChild extends PrivateBase {}
+    private interface PrivateContract {}
+    public class PublicImplementation implements PrivateContract {}
+    private @interface PrivateMarker {}
+    @PrivateMarker public @interface PublicChildMarker {}
+}
+"#,
+    )])?;
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+
+    for (name, kind, declaration_line, declaration_occurrence, reference_line, relation) in [
+        (
+            "PrivateBase",
+            NodeKind::CLASS,
+            3,
+            OccurrenceKind::DEFINITION,
+            4,
+            EdgeKind::INHERITANCE,
+        ),
+        (
+            "PrivateContract",
+            NodeKind::INTERFACE,
+            5,
+            OccurrenceKind::DEFINITION,
+            6,
+            EdgeKind::INHERITANCE,
+        ),
+        (
+            "PrivateMarker",
+            NodeKind::ANNOTATION,
+            7,
+            OccurrenceKind::DECLARATION,
+            8,
+            EdgeKind::ANNOTATION_USAGE,
+        ),
+    ] {
+        let declaration = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(declaration_line)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                occurrence.kind == declaration_occurrence
+                                    && occurrence.location.start_line == declaration_line
+                            })
+                        })
+            })
+            .unwrap_or_else(|| panic!("{name} declaration at line {declaration_line} missing"));
+        assert_eq!(
+            storage.get_component_access(declaration.id)?,
+            Some(AccessKind::Private),
+            "{name} declaration must retain its private visibility"
+        );
+
+        let reference = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && node.start_line == Some(reference_line)
+            })
+            .unwrap_or_else(|| panic!("{name} reference at line {reference_line} missing"));
+        assert_eq!(
+            storage.get_component_access(reference.id)?,
+            None,
+            "{name} reference must not inherit its enclosing declaration visibility"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.kind == relation && edge.target == reference.id),
+            "{name} reference must remain the target of its {relation:?} edge"
+        );
+    }
+
+    for (name, kind) in [
+        ("PublicChild", NodeKind::CLASS),
+        ("PublicImplementation", NodeKind::CLASS),
+        ("PublicChildMarker", NodeKind::ANNOTATION),
+    ] {
+        let node = nodes
+            .iter()
+            .find(|node| {
+                node.kind == kind
+                    && node.serialized_name.ends_with(name)
+                    && storage
+                        .get_occurrences_for_node(node.id)
+                        .is_ok_and(|occurrences| {
+                            occurrences.iter().any(|occurrence| {
+                                matches!(
+                                    occurrence.kind,
+                                    OccurrenceKind::DEFINITION | OccurrenceKind::DECLARATION
+                                )
+                            })
+                        })
+            })
+            .unwrap_or_else(|| panic!("{name} {kind:?} definition node missing"));
+        assert_eq!(
+            storage.get_component_access(node.id)?,
+            Some(AccessKind::Public),
+            "{name} declaration must retain its public visibility"
+        );
+    }
 
     Ok(())
 }

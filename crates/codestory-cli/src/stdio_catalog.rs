@@ -114,7 +114,10 @@ impl ToolSpec {
         let mut tool = Map::from_iter([
             ("name".to_string(), json!(self.name)),
             ("description".to_string(), json!(self.description)),
-            ("inputSchema".to_string(), input_schema),
+            (
+                "inputSchema".to_string(),
+                compose_input_selectors(input_schema),
+            ),
             ("safety".to_string(), self.safety.to_json()),
             ("annotations".to_string(), self.safety.annotations_json()),
         ]);
@@ -126,6 +129,58 @@ impl ToolSpec {
         }
         Value::Object(tool)
     }
+}
+
+/// Keep common named arguments visible to hosts that project `oneOf` as a union.
+/// Only selector-only object unions need factoring; tagged unions keep their
+/// branch-local properties. Traverse schema positions, never defaults or examples.
+fn compose_input_selectors(mut schema: Value) -> Value {
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            *property = compose_input_selectors(property.take());
+        }
+    }
+    for keyword in ["items", "not"] {
+        if let Some(child) = object.get_mut(keyword) {
+            *child = compose_input_selectors(child.take());
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                *child = compose_input_selectors(child.take());
+            }
+        }
+    }
+    let selector_union = object
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| {
+            !branches.is_empty()
+                && branches.iter().all(|branch| {
+                    branch.as_object().is_some_and(|branch| {
+                        branch.len() == 1 && branch.get("required").is_some_and(Value::is_array)
+                    })
+                })
+        });
+    if object.get("type") != Some(&json!("object"))
+        || !object.get("properties").is_some_and(Value::is_object)
+        || !selector_union
+    {
+        return schema;
+    }
+    let mut constraints = Map::new();
+    for keyword in ["anyOf", "oneOf", "allOf", "not"] {
+        if let Some(value) = object.remove(keyword) {
+            constraints.insert(keyword.to_string(), value);
+        }
+    }
+    // The outer type keeps invalid scalar inputs from reaching selector-only
+    // branches, which have no type constraint of their own.
+    json!({"type": "object", "allOf": [schema, constraints]})
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,24 +559,6 @@ impl SchemaProperty {
         self
     }
 
-    const fn with_item_max_length(mut self, max_length: u64) -> Self {
-        self.items = match self.items {
-            Some(SchemaItems::Type {
-                schema_type,
-                min_length,
-                enum_values,
-                ..
-            }) => Some(SchemaItems::Type {
-                schema_type,
-                min_length,
-                max_length: Some(max_length),
-                enum_values,
-            }),
-            items => items,
-        };
-        self
-    }
-
     const fn with_item_enum(mut self, enum_values: &'static [&'static str]) -> Self {
         self.items = match self.items {
             Some(SchemaItems::Type {
@@ -561,7 +598,15 @@ impl SchemaProperty {
             schema.insert("description".to_string(), json!(description));
         }
         if !self.enum_values.is_empty() {
-            schema.insert("enum".to_string(), json!(self.enum_values));
+            let mut enum_values = self
+                .enum_values
+                .iter()
+                .map(|value| json!(value))
+                .collect::<Vec<_>>();
+            if self.nullable {
+                enum_values.push(Value::Null);
+            }
+            schema.insert("enum".to_string(), Value::Array(enum_values));
         }
         if let Some(default) = self.default {
             schema.insert("default".to_string(), default.to_json());
@@ -685,16 +730,6 @@ impl SchemaObject {
         self
     }
 
-    const fn with_combined_item_limit(
-        mut self,
-        left: &'static str,
-        right: &'static str,
-        limit: u64,
-    ) -> Self {
-        self.combined_item_limit = Some((left, right, limit));
-        self
-    }
-
     fn to_json(self) -> Value {
         let properties = self
             .properties
@@ -778,6 +813,13 @@ const PACKET_EVIDENCE_RESOLUTIONS: &[&str] = &[
     "diagnostic_only",
 ];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
+const GRAPH_CALLER_SCOPES: &[&str] = &["production_only", "include_tests_and_benches"];
+const GRAPH_CALLER_SCOPE_PROPERTY: SchemaProperty = SchemaProperty::string(
+    "caller_scope",
+    "CALL-edge caller file scope. Omitted or production_only hides test and bench callers; include_tests_and_benches includes them. Filtering is not truncation and does not invent omitted-edge counts.",
+)
+.with_enum(GRAPH_CALLER_SCOPES)
+.with_default(ValueLiteral::String("production_only"));
 const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "unknown"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
@@ -794,9 +836,17 @@ const GROUNDING_ORIENTATION_UNCERTAINTY: &[&str] = &[
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
 const PACKET_PROBE_EXACT_PATH_KIND: &[&str] = &["exact_path"];
 const PACKET_PROBE_SYMBOL_ID_KIND: &[&str] = &["symbol_id"];
+const PACKET_PROBE_QUALIFIED_SYMBOL_KIND: &[&str] = &["qualified_symbol"];
 const PACKET_PROBE_FILE_SYMBOL_KIND: &[&str] = &["file_symbol"];
 const PACKET_PROBE_FREE_QUERY_KIND: &[&str] = &["free_query"];
 const PACKET_PROBE_CONTINUATION_KIND: &[&str] = &["continuation"];
+const PACKET_STRUCTURAL_GAP_REASONS: &[&str] = &[
+    "candidate_count_exceeded",
+    "source_budget_exceeded",
+    "source_unavailable",
+    "ambiguous_selector",
+    "disconnected_seed",
+];
 const AFFECTED_CHANGE_KINDS: &[&str] = &[
     "added",
     "modified",
@@ -814,15 +864,6 @@ const AFFECTED_INPUT_CLASSIFICATIONS: &[&str] = &[
     "stale_index",
     "malformed",
     "unavailable_evidence",
-];
-const PACKET_TASK_CLASSES: &[&str] = &[
-    "architecture_explanation",
-    "bug_localization",
-    "change_impact",
-    "route_tracing",
-    "symbol_ownership",
-    "data_flow",
-    "edit_planning",
 ];
 
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
@@ -847,9 +888,9 @@ static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string("next_action", "Direct next action for the caller."),
         SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
-        SchemaProperty::object(
+        SchemaProperty::string(
             "failure",
-            "Structured capability failure when the compact status is not live-ready.",
+            "Capability failure message when the compact status is not live-ready.",
         )
         .nullable(),
         SchemaProperty::string(
@@ -1016,7 +1057,7 @@ static SYMBOL_SUMMARY_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
+    "CodeStory discovery results DTO. Search rows select candidates for graph or source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval readiness."),
@@ -1034,7 +1075,10 @@ pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
             "Repo text scan cap, byte, and truncation telemetry.",
         )
         .nullable(),
-        SchemaProperty::object("counts", "Source counts before merged-result deduplication."),
+        SchemaProperty::object(
+            "counts",
+            "Source counts before merged-result deduplication.",
+        ),
         SchemaProperty::array("hits", "Merged hit list.", &SEARCH_HIT_SCHEMA),
         SchemaProperty::string("code", "Typed API error code."),
         SchemaProperty::string("message", "Human-readable API error message."),
@@ -1199,13 +1243,7 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 )
 .with_any_of_required(&[
-    &[
-        "project_root",
-        "usable",
-        "summary",
-        "files",
-        "policy_exclusions",
-    ],
+    &["project_root", "usable", "summary", "files"],
     &["code", "message"],
 ]);
 
@@ -1535,6 +1573,11 @@ static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("focus", "Focused node details DTO."),
         SchemaProperty::object("trail", "Graph response DTO."),
         SchemaProperty::object("story", "Optional readable trail story DTO.").nullable(),
+        SchemaProperty::string(
+            "caller_scope",
+            "Applied CALL-edge caller file scope for this filtered view.",
+        )
+        .with_enum(GRAPH_CALLER_SCOPES),
     ],
     &["focus", "trail"],
 );
@@ -1555,6 +1598,15 @@ static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("node_count", "Returned node count."),
         SchemaProperty::integer("edge_count", "Returned edge count."),
         SchemaProperty::boolean("truncated", "Whether the graph result was truncated."),
+        SchemaProperty::string(
+            "caller_scope",
+            "Applied CALL-edge caller file scope for this filtered view.",
+        )
+        .with_enum(GRAPH_CALLER_SCOPES),
+        SchemaProperty::string("from_id", "Shortest-path source node id, when applicable.")
+            .nullable(),
+        SchemaProperty::string("to_id", "Shortest-path target node id, when applicable.")
+            .nullable(),
     ],
     &[
         "certainty",
@@ -1774,9 +1826,6 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("packet_id", "Stable packet id."),
         SchemaProperty::string("question", "Packet question."),
-        SchemaProperty::string("task_class", "Optional task class.")
-            .with_enum(PACKET_TASK_CLASSES)
-            .nullable(),
         SchemaProperty::object("plan", "Packet planner trace."),
         SchemaProperty::object("answer", "Underlying DB-first answer packet."),
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
@@ -1849,6 +1898,7 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 120),
         SchemaProperty::boolean("story", "Include a readable trail story DTO.")
             .with_default(ValueLiteral::Boolean(false)),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -1870,6 +1920,7 @@ static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(50))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -1896,6 +1947,7 @@ static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 120),
         SchemaProperty::boolean("story", "Include a readable trail story DTO.")
             .with_default(ValueLiteral::Boolean(true)),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -2051,6 +2103,7 @@ static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(50))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -2067,6 +2120,7 @@ static SHORTEST_PATH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(80))
             .with_bounds(2, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &["from_id", "to_id"],
 );
@@ -2090,6 +2144,7 @@ static QUERY_SUBGRAPH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
             .with_default(ValueLiteral::Integer(80))
             .with_bounds(1, 120),
+        GRAPH_CALLER_SCOPE_PROPERTY,
     ],
     &[],
 )
@@ -2109,6 +2164,11 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "List indexed files from the existing local index.",
     &[
+        SchemaProperty::boolean(
+            "include_framework_coverage",
+            "Include the global framework capability catalog and its limitations.",
+        )
+        .with_default(ValueLiteral::Boolean(false)),
         SchemaProperty::string("path", "Only include files whose path contains this text."),
         SchemaProperty::string("language", "Only include files for this language."),
         SchemaProperty::string("role", "Only include files with this inferred role.")
@@ -2201,6 +2261,18 @@ static PACKET_SYMBOL_ID_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     &["kind", "id"],
 );
 
+static PACKET_QUALIFIED_SYMBOL_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Exact qualified-symbol probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_QUALIFIED_SYMBOL_KIND),
+        SchemaProperty::string_required("symbol", "Qualified symbol name.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "symbol"],
+);
+
 static PACKET_FILE_SYMBOL_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Exact file-scoped symbol probe.",
     &[
@@ -2228,6 +2300,24 @@ static PACKET_FREE_QUERY_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     &["kind", "query"],
 );
 
+static PACKET_CONTINUATION_SELECTOR_SCHEMA: SchemaObject = SchemaObject::object(
+    "Stable path or symbol selector plus the exact structural reason it remains uncovered.",
+    &[
+        SchemaProperty::string_required("stable_identity", "Stable packet identity.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string("path", "Optional exact project-relative path.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string("symbol_id", "Optional exact stable symbol id.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string_required("reason", "Typed uncovered structural reason.")
+            .with_enum(PACKET_STRUCTURAL_GAP_REASONS),
+    ],
+    &["stable_identity", "reason"],
+);
+
 static PACKET_CONTINUATION_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Project- and generation-bound continuation probe.",
     &[
@@ -2251,63 +2341,44 @@ static PACKET_CONTINUATION_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
         .with_min_length(1)
         .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
         .nullable(),
-        SchemaProperty::string("symbol_id", "Optional exact continuation symbol id.")
-            .with_min_length(1)
-            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
-            .nullable(),
-        SchemaProperty::string_required("query", "Continuation display query.")
-            .with_min_length(1)
-            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::object("selector", "Stable typed continuation selector.")
+            .with_object_schema(&PACKET_CONTINUATION_SELECTOR_SCHEMA),
     ],
     &[
         "kind",
         "contract_version",
         "project_id",
         "core_generation_id",
-        "query",
+        "selector",
     ],
 );
 
 static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
     &PACKET_EXACT_PATH_PROBE_SCHEMA,
     &PACKET_SYMBOL_ID_PROBE_SCHEMA,
+    &PACKET_QUALIFIED_SYMBOL_PROBE_SCHEMA,
     &PACKET_FILE_SYMBOL_PROBE_SCHEMA,
     &PACKET_FREE_QUERY_PROBE_SCHEMA,
     &PACKET_CONTINUATION_PROBE_SCHEMA,
 ];
 
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
+    "Build a broad evidence packet with typed availability and one bounded continuation.",
     &[
         SchemaProperty::string_required(
             "question",
-            "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
+            "Broad repository question or task. Repeat it unchanged for one generation-bound continuation.",
         )
         .with_min_length(1),
         SchemaProperty::string("budget", "Packet budget.")
             .with_enum(PACKET_BUDGETS)
             .with_default(ValueLiteral::String("standard")),
-        SchemaProperty::string("task_class", "Optional task class.")
-            .with_enum(PACKET_TASK_CLASSES)
-            .nullable(),
         SchemaProperty::tagged_union_array(
             "probes",
-            "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
             PACKET_PROBE_SCHEMAS,
         )
         .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64),
-        SchemaProperty::string_array(
-            "extra_probes",
-            "Legacy string probes normalized through the same typed runtime resolver.",
-        )
-        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64)
-        .with_item_min_length(1)
-        .with_item_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
-        SchemaProperty::boolean(
-            "include_evidence",
-            "Include citation edge ids and score details.",
-        )
-        .with_default(ValueLiteral::Boolean(true)),
         SchemaProperty::integer(
             "latency_budget_ms",
             "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2316,26 +2387,25 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string(
             "parent_packet_id",
-            "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
+            "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
         ),
         SchemaProperty::string_array(
             "option_ids",
-            "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+            "Continuation option ids returned by the parent packet. Execute them once; do not invent a second search.",
         )
         .with_item_bounds(1, 8)
         .with_item_min_length(1),
         SchemaProperty::string(
             "core_generation_id",
-            "Pinned core publication generation for a DrillOnce continuation.",
+            "Pinned core publication generation for a continuation.",
         ),
         SchemaProperty::string(
             "retrieval_generation",
-            "Pinned retrieval generation for a DrillOnce continuation.",
+            "Pinned retrieval generation for a continuation.",
         ),
     ],
     &["question"],
-)
-.with_combined_item_limit("probes", "extra_probes", PACKET_PROBE_MAX_COUNT as u64);
+);
 
 static STATUS_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
@@ -2350,21 +2420,21 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Gather an experimental bounded packet of source evidence, availability and gaps, with at most one generation-bound continuation. It does not assert answer sufficiency. Ordinary search, source reads and relationship navigation remain available.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "search",
-        description: "Discover candidate symbols and retrieval hits; for broad structural questions call packet before snippet/source reads. CodeStory prepares managed retrieval automatically.",
+        description: "Discover candidate symbols and retrieval hits for inspection and relationship navigation. Use repo_text=off for existing core-only symbol search without embedding preparation; other modes prepare managed retrieval automatically.",
         input_schema: SEARCH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SEARCH_RESULTS_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "ground",
-        description: "Return a compact repository map for orientation before packet/search; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
+        description: "Return a compact repository map for orientation; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
         input_schema: GROUND_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2420,7 +2490,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "get_node",
-        description: "Return one stable graph node with file refs before requesting a packet.",
+        description: "Return one stable graph node with file references for source inspection and relationship navigation.",
         input_schema: GRAPH_TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2441,7 +2511,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "query_subgraph",
-        description: "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
+        description: "Return a bounded subgraph around one resolved node for relationship navigation.",
         input_schema: QUERY_SUBGRAPH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2469,14 +2539,14 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "snippet",
-        description: "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
+        description: "Read line-numbered source for a selected symbol or path. Use `paths` to inspect several file ranges in one call; ordinary host source reads are also available.",
         input_schema: SNIPPET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "context",
-        description: "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
+        description: "Build closed source and graph evidence for one concrete target; not broad question answering.",
         input_schema: CONTEXT_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2638,12 +2708,21 @@ fn attach_stdio_retry_envelope(mut schema: Value) -> Value {
 }
 
 /// Build the `tools/list` response.
+#[allow(dead_code)]
 pub(crate) fn tools_list_json() -> Value {
     json!({
         "result": {
             "tools": TOOLS.iter().map(|tool| tool.to_json()).collect::<Vec<_>>()
         }
     })
+}
+
+/// Return the current declarative tool inputs to the test-only v3 projector.
+///
+/// The projector owns revision-native field selection; this accessor keeps it
+/// from copying the v2 schemas or reaching the live `tools/list` response.
+pub(crate) fn v3_tool_source_json() -> Vec<Value> {
+    TOOLS.iter().map(|tool| tool.to_json()).collect()
 }
 
 /// Build the `resources/list` response.
@@ -2688,6 +2767,32 @@ pub(crate) fn prompt_get_json(name: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_composition_exposes_named_arguments_without_rewriting_data_or_tagged_unions() {
+        let tagged = json!({"oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "a"}}, "required": ["kind"]},
+            {"type": "object", "properties": {"kind": {"const": "b"}}, "required": ["kind"]}
+        ]});
+        let data = json!({"type": "object", "properties": {}, "oneOf": [{"required": ["x"]}]});
+        let schema = json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"oneOf": {"default": data}, "tagged": tagged,
+                "items": {"type": "array", "items": {
+                    "type": "object", "properties": {"id": {"type": "string"}, "query": {"type": "string"}},
+                    "oneOf": [{"required": ["id"]}, {"required": ["query"]}]
+                }}},
+            "required": ["items"], "oneOf": [{"required": ["oneOf"]}, {"required": ["tagged"]}]
+        });
+        let composed = compose_input_selectors(schema);
+        assert_eq!(composed["type"], "object");
+        let common = &composed["allOf"][0];
+        assert_eq!(common["properties"]["oneOf"]["default"], data);
+        assert_eq!(common["properties"]["tagged"], tagged);
+        assert!(common["properties"]["items"]["items"]["allOf"][0]["properties"]["id"].is_object());
+        assert_eq!(common["required"], json!(["items"]));
+        assert_eq!(compose_input_selectors(composed.clone()), composed);
+    }
 
     fn packet_probe_schema() -> Value {
         let catalog = tools_list_json();
@@ -2748,10 +2853,11 @@ mod tests {
     #[test]
     fn packet_probe_schema_is_a_strict_bounded_tagged_union() {
         let schema = packet_probe_schema();
-        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(5));
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(6));
         for valid in [
             json!({"kind": "exact_path", "path": "assets/desk.svg"}),
             json!({"kind": "symbol_id", "id": "42"}),
+            json!({"kind": "qualified_symbol", "symbol": "crate::runtime::run"}),
             json!({"kind": "file_symbol", "path": "src/lib.rs", "symbol": "run"}),
             json!({"kind": "free_query", "query": "runtime path"}),
             json!({
@@ -2759,7 +2865,11 @@ mod tests {
                 "contract_version": 1,
                 "project_id": "project",
                 "core_generation_id": "core",
-                "query": "run"
+                "selector": {
+                    "stable_identity": "node:42",
+                    "symbol_id": "42",
+                    "reason": "disconnected_seed"
+                }
             }),
         ] {
             assert!(tagged_union_accepts(&schema, &valid), "{valid}");
@@ -2785,8 +2895,8 @@ mod tests {
             .find(|tool| tool["name"] == "packet")
             .expect("packet tool");
         assert_eq!(
-            packet["inputSchema"]["allOf"].as_array().map(Vec::len),
-            Some(PACKET_PROBE_MAX_COUNT)
+            packet["inputSchema"]["properties"]["probes"]["maxItems"].as_u64(),
+            Some(PACKET_PROBE_MAX_COUNT as u64)
         );
     }
 
@@ -2821,6 +2931,7 @@ mod tests {
     fn the_context_packet_emits_only_fields_its_schema_declares() {
         let declared = CONTEXT_PACKET_SCHEMA.declared_property_names();
         let mut answer = codestory_contracts::api::AgentAnswerDto {
+            focused_source: None,
             answer_id: "packet".to_string(),
             prompt: "question".to_string(),
             summary: "summary".to_string(),
@@ -3027,6 +3138,7 @@ mod tests {
             project_root: "/repo".to_string(),
             usable: true,
             summary: codestory_contracts::api::IndexedFilesSummaryDto {
+                framework_route_coverage_included: None,
                 file_count: 0,
                 indexed_file_count: 0,
                 filtered_file_count: 0,
@@ -3045,6 +3157,14 @@ mod tests {
             files: Vec::new(),
         };
         let payload = serde_json::to_value(&files).expect("serialize indexed files");
+        assert!(
+            payload["summary"]
+                .get("framework_route_coverage_included")
+                .is_none()
+        );
+        let legacy: codestory_contracts::api::IndexedFilesDto =
+            serde_json::from_value(payload.clone()).expect("older inventory response");
+        assert_eq!(legacy.summary.framework_route_coverage_included, None);
         assert_eq!(
             payload.get("policy_exclusions"),
             Some(&json!([])),
@@ -3059,6 +3179,68 @@ mod tests {
         assert!(
             satisfies_required_any_of(&schema, &payload),
             "files success payload must satisfy an anyOf required branch: {schema}"
+        );
+    }
+
+    fn graph_schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
+        schema
+            .pointer(&format!("/properties/{name}"))
+            .or_else(|| {
+                schema
+                    .get("allOf")
+                    .and_then(Value::as_array)
+                    .and_then(|branches| {
+                        branches
+                            .iter()
+                            .find_map(|branch| branch.pointer(&format!("/properties/{name}")))
+                    })
+            })
+            .unwrap_or_else(|| panic!("missing property {name}: {schema}"))
+    }
+
+    #[test]
+    fn graph_tools_advertise_caller_scope_with_production_only_default() {
+        let catalog = tools_list_json();
+        let tools = catalog["result"]["tools"].as_array().expect("tools");
+        let expected = json!(["production_only", "include_tests_and_benches"]);
+        for name in [
+            "trail",
+            "trace",
+            "callers",
+            "callees",
+            "neighbors",
+            "query_subgraph",
+            "shortest_path",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            let scope = graph_schema_property(&tool["inputSchema"], "caller_scope");
+            assert_eq!(
+                scope["enum"], expected,
+                "{name} must publish the runtime caller-scope choice: {scope}"
+            );
+            assert_eq!(
+                scope.get("default"),
+                Some(&json!("production_only")),
+                "{name} must keep production-only as the documented default: {scope}"
+            );
+            let output = graph_schema_property(&tool["outputSchema"], "caller_scope");
+            assert_eq!(
+                output["enum"], expected,
+                "{name} output must make the applied caller scope visible: {output}"
+            );
+        }
+        let get_node = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_node")
+            .expect("get_node");
+        assert!(
+            get_node["inputSchema"]["properties"]
+                .get("caller_scope")
+                .is_none(),
+            "get_node is not a caller-scoped graph walk: {get_node}"
         );
     }
 }

@@ -5,6 +5,8 @@
 //! that prove one local OS user is talking to one lifetime authority.
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use codestory_contracts::config_registry::INTERNAL_EMBED_INVOCATION_GROUP_ENV as INVOCATION_GROUP_ENV;
 use codestory_contracts::config_registry::{
     EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV,
     EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV,
@@ -33,6 +35,16 @@ type TransportIdentity = codestory_retrieval::EmbeddingTransportIdentity;
 pub(crate) enum ClientTransportMode {
     SpawnCapable,
     ObserveOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerLaunchPolicy {
+    Detached,
+    #[cfg(target_os = "macos")]
+    InvocationGroup {
+        authority: String,
+        process_group: libc::pid_t,
+    },
 }
 
 trait ExecutableAttestationStore {
@@ -178,6 +190,7 @@ pub(crate) struct NativeEmbeddingClientTransport {
     executable: ExactExecutable,
     executable_identity: codestory_retrieval::EmbeddingExecutableIdentity,
     mode: ClientTransportMode,
+    launch_policy: ServerLaunchPolicy,
     clock: Arc<NativeAwakeClock>,
     next_spawn_generation: Arc<AtomicU64>,
 }
@@ -188,12 +201,14 @@ impl NativeEmbeddingClientTransport {
     }
 
     pub(crate) fn capture_with_mode(mode: ClientTransportMode) -> Result<Self> {
+        let launch_policy = capture_server_launch_policy()?;
         let executable = ExactExecutable::capture_for_client(mode)?;
         let executable_identity = executable_identity(&executable)?;
         Ok(Self {
             executable,
             executable_identity,
             mode,
+            launch_policy,
             clock: Arc::new(NativeAwakeClock::capture()?),
             next_spawn_generation: Arc::new(AtomicU64::new(1)),
         })
@@ -280,7 +295,7 @@ impl NativeEmbeddingClientTransport {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = spawn_detached(&mut command).with_context(|| {
+        let mut child = spawn_server(&mut command, &self.launch_policy).with_context(|| {
             format!(
                 "spawn exact executable {}",
                 self.executable.path().display()
@@ -338,7 +353,37 @@ impl NativeEmbeddingClientTransport {
     }
 }
 
-fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child> {
+fn capture_server_launch_policy() -> Result<ServerLaunchPolicy> {
+    #[cfg(target_os = "macos")]
+    if platform::invocation_group_requested()? {
+        let (authority, process_group) = platform::qualification_invocation_group_authority()?;
+        return Ok(ServerLaunchPolicy::InvocationGroup {
+            authority,
+            process_group,
+        });
+    }
+    Ok(ServerLaunchPolicy::Detached)
+}
+
+fn spawn_server(command: &mut Command, policy: &ServerLaunchPolicy) -> Result<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    if let ServerLaunchPolicy::InvocationGroup {
+        authority,
+        process_group,
+    } = policy
+    {
+        let (current_authority, current_group) =
+            platform::qualification_invocation_group_authority()?;
+        if current_authority != *authority || current_group != *process_group {
+            bail!("embedding_qualification_invocation_authority_changed");
+        }
+        // A supervised qualification call keeps every server generation in
+        // its invocation group, including replacements and servers whose CLI
+        // exits first. The supervisor can then signal that group on timeout.
+        return command.spawn().map_err(Into::into);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = policy;
     platform::detach_command(command);
     let spawned = command.spawn();
     #[cfg(windows)]
@@ -350,9 +395,9 @@ fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child>
         // the server's pre-job lifetime in such environments and beats
         // refusing to serve embeddings at all.
         platform::detach_command_without_breakaway(command);
-        return command.spawn();
+        return command.spawn().map_err(Into::into);
     }
-    spawned
+    spawned.map_err(Into::into)
 }
 
 #[derive(Debug)]
@@ -686,16 +731,11 @@ impl codestory_retrieval::EmbeddingServerTransport for NativeEmbeddingServerTran
     }
 
     fn fail_stop(&self, reason_code: &str) {
-        fail_stop_process(reason_code);
+        // A spawned server can outlive the process that owns its stderr reader.
+        // Evidence recording stays best-effort inside diagnostics; termination
+        // itself never waits on a live stderr reader or a successful write.
+        crate::diagnostics::fail_stop_process(reason_code);
     }
-}
-
-fn fail_stop_process(reason_code: &str) -> ! {
-    // A spawned server can outlive the process that owns its stderr reader.
-    // The marker is best-effort, but the attempt is unconditional and abort is
-    // never contingent on a live stderr reader or a successful filesystem write.
-    crate::diagnostics::record_fail_stop(reason_code);
-    std::process::abort()
 }
 
 impl codestory_retrieval::EmbeddingServerListener for NativeEmbeddingListener {
@@ -996,6 +1036,8 @@ fn executable_file_identity(file: &File) -> Result<ExecutableFileIdentity> {
 
 #[cfg(unix)]
 mod platform {
+    #[cfg(target_os = "macos")]
+    use super::INVOCATION_GROUP_ENV;
     use super::{
         ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
         QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, TransportIdentity, sha256_fields,
@@ -1544,6 +1586,41 @@ mod platform {
                 Ok(())
             });
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn invocation_group_requested() -> Result<bool> {
+        match std::env::var_os(INVOCATION_GROUP_ENV) {
+            None => Ok(false),
+            Some(value) if value.to_str() == Some("1") => Ok(true),
+            Some(_) => bail!(
+                "embedding_qualification_invocation_group_invalid: expected {INVOCATION_GROUP_ENV}=1"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn qualification_invocation_group_authority() -> Result<(String, libc::pid_t)> {
+        let paths = runtime_paths()?;
+        // The opt-in is meaningful only with the existing private directory
+        // and nonce boundary. Revalidate that boundary before every spawn.
+        if paths.expected_authority_identity.is_none() {
+            bail!(
+                "embedding_qualification_invocation_group_unavailable: private qualification gate is required"
+            );
+        }
+        let process_group = unsafe { libc::getpgrp() };
+        let session = unsafe { libc::getsid(0) };
+        if session < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect embedding qualification invocation session");
+        }
+        if process_group != session {
+            bail!(
+                "embedding_qualification_invocation_group_unavailable: caller must run inside its invocation session group"
+            );
+        }
+        Ok((paths.namespace_salt, process_group))
     }
 
     pub(super) fn clock_api() -> &'static str {
@@ -4624,6 +4701,306 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qualification_invocation_group_probe_helper() -> Result<()> {
+        use std::io::Write as _;
+
+        let Some(mode) = std::env::var_os("CODESTORY_TEST_INVOCATION_GROUP_MODE") else {
+            return Ok(());
+        };
+        let mode = mode
+            .to_str()
+            .context("invocation group probe mode is not UTF-8")?;
+        if mode == "creation" {
+            println!("CS_PROBE_CREATION_READY");
+            std::io::stdout().flush()?;
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        let command = || {
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg(if mode == "normal" || mode == "qualified_detached" {
+                    "1"
+                } else {
+                    "30"
+                })
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        };
+        if mode == "partial"
+            || mode == "invalid"
+            || mode == "untrusted"
+            || mode == "shared_group"
+            || mode == "without_gate"
+            || mode == "bad_optin"
+        {
+            let error = capture_server_launch_policy().expect_err("gate must reject capture");
+            println!("CS_PROBE_REJECTED={error:#}");
+            return Ok(());
+        }
+        let mut policy = capture_server_launch_policy()?;
+        if mode == "changed_group" || mode == "changed_authority" {
+            let ServerLaunchPolicy::InvocationGroup {
+                authority,
+                process_group,
+            } = &mut policy
+            else {
+                bail!("invocation group probe did not capture its private launch policy");
+            };
+            if mode == "changed_group" {
+                *process_group += 1;
+            } else {
+                authority.push_str(":changed");
+            }
+            let error = spawn_server(&mut command(), &policy)
+                .expect_err("changed invocation authority must reject native spawn");
+            println!("CS_PROBE_REJECTED={error:#}");
+            return Ok(());
+        }
+        let mut first = spawn_server(&mut command(), &policy)?;
+        let first_group = unsafe { libc::getpgid(first.id() as i32) };
+        if mode == "replacement" {
+            first.kill()?;
+            first.wait()?;
+            let second = spawn_server(&mut command(), &policy)?;
+            let second_group = unsafe { libc::getpgid(second.id() as i32) };
+            println!(
+                "CS_PROBE_SERVER={} FIRST_GROUP={first_group} SECOND_GROUP={second_group}",
+                second.id()
+            );
+            std::io::stdout().flush()?;
+            std::thread::sleep(Duration::from_secs(30));
+            return Ok(());
+        }
+        println!("CS_PROBE_SERVER={} FIRST_GROUP={first_group}", first.id());
+        std::io::stdout().flush()?;
+        if mode == "normal" || mode == "qualified_detached" {
+            first.wait()?;
+            return Ok(());
+        }
+        if mode != "early_exit" {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qualification_invocation_group_contains_native_generations() -> Result<()> {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                // The unreaped leader keeps this process-group ID from reuse.
+                unsafe { libc::killpg(self.0.id() as i32, libc::SIGKILL) };
+                let _ = self.0.wait();
+            }
+        }
+        struct OwnedSentinel(std::process::Child);
+        impl Drop for OwnedSentinel {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let untrusted_directory = tempfile::tempdir()?;
+        std::fs::set_permissions(
+            untrusted_directory.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let mut sentinel = Command::new("/bin/sleep");
+        sentinel.arg("30");
+        unsafe {
+            sentinel.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sentinel = OwnedSentinel(sentinel.spawn()?);
+        (|| -> Result<()> {
+            for mode in [
+                "creation",
+                "stall",
+                "replacement",
+                "early_exit",
+                "partial",
+                "invalid",
+                "untrusted",
+                "shared_group",
+                "without_gate",
+                "bad_optin",
+                "changed_group",
+                "changed_authority",
+                "qualified_detached",
+                "normal",
+            ] {
+                let mut command = Command::new(std::env::current_exe()?);
+                command
+                    .arg("--exact")
+                    .arg("embedding_server_transport::tests::qualification_invocation_group_probe_helper")
+                    .arg("--nocapture")
+                    .env("CODESTORY_TEST_INVOCATION_GROUP_MODE", mode)
+                    .env(
+                        INVOCATION_GROUP_ENV,
+                        if mode == "bad_optin" { "yes" } else { "1" },
+                    )
+                    .env(
+                        QUALIFICATION_DIR_ENV,
+                        if mode == "untrusted" {
+                            untrusted_directory.path()
+                        } else {
+                            directory.path()
+                        },
+                    )
+                    .env(QUALIFICATION_NONCE_ENV, if mode == "invalid" { "bad!" } else { "probe_nonce" })
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                if mode == "partial" {
+                    command.env_remove(QUALIFICATION_NONCE_ENV);
+                } else if mode == "normal" || mode == "without_gate" {
+                    command
+                        .env_remove(QUALIFICATION_DIR_ENV)
+                        .env_remove(QUALIFICATION_NONCE_ENV);
+                }
+                if mode == "normal" || mode == "qualified_detached" {
+                    command.env_remove(INVOCATION_GROUP_ENV);
+                }
+                unsafe {
+                    command.pre_exec(move || {
+                        let result = if mode == "shared_group" {
+                            libc::setpgid(0, 0)
+                        } else {
+                            libc::setsid()
+                        };
+                        if result == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut group = OwnedGroup(command.spawn()?);
+                let group_id = group.0.id() as i32;
+                let output = group.0.stdout.take().context("probe stdout")?;
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    let mut output = BufReader::new(output);
+                    loop {
+                        let mut line = String::new();
+                        match output.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) if line.starts_with("CS_PROBE_") => {
+                                if sender.send(line).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = sender.send("CS_PROBE_EOF".into());
+                });
+                let line = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("qualification group probe did not report within five seconds")?;
+                if mode == "creation" {
+                    assert_eq!(line.trim(), "CS_PROBE_CREATION_READY");
+                    drop(group);
+                    reader.join().expect("join terminated probe output reader");
+                    continue; // The group was terminated before server creation.
+                }
+                if mode == "partial"
+                    || mode == "invalid"
+                    || mode == "untrusted"
+                    || mode == "shared_group"
+                    || mode == "without_gate"
+                    || mode == "bad_optin"
+                    || mode == "changed_group"
+                    || mode == "changed_authority"
+                {
+                    let expected = match mode {
+                        "untrusted" => "embedding_runtime_authority_untrusted",
+                        "changed_group" | "changed_authority" => {
+                            "embedding_qualification_invocation_authority_changed"
+                        }
+                        _ => "embedding_qualification_",
+                    };
+                    assert!(line.contains(expected), "{line}");
+                    drop(group);
+                    reader.join().expect("join rejected probe output reader");
+                    continue;
+                }
+                let pid: i32 = line
+                    .split_whitespace()
+                    .next()
+                    .context("server marker")?
+                    .trim_start_matches("CS_PROBE_SERVER=")
+                    .parse()?;
+                if mode == "normal" || mode == "qualified_detached" {
+                    assert!(line.contains(&format!("FIRST_GROUP={pid}")), "{line}");
+                    assert_ne!(pid, group_id, "ordinary server must detach");
+                    assert_eq!(
+                        receiver.recv_timeout(Duration::from_secs(5))?,
+                        "CS_PROBE_EOF",
+                        "the helper must reap its detached server"
+                    );
+                    drop(group);
+                    reader.join().expect("join normal probe output reader");
+                    continue;
+                }
+                assert!(line.contains(&format!("FIRST_GROUP={group_id}")), "{line}");
+                if mode == "replacement" {
+                    assert!(line.contains(&format!("SECOND_GROUP={group_id}")), "{line}");
+                }
+                assert_eq!(
+                    unsafe { libc::getpgid(pid) },
+                    group_id,
+                    "{mode}: server escaped invocation group"
+                );
+                assert_eq!(
+                    unsafe { libc::getpgid(group_id) },
+                    group_id,
+                    "{mode}: supervisor lost its group"
+                );
+                if mode == "early_exit" {
+                    assert_eq!(
+                        receiver.recv_timeout(Duration::from_secs(5))?,
+                        "CS_PROBE_EOF",
+                        "CLI must exit before the supervisor signals its group"
+                    ); // The leader remains unreaped.
+                    assert_eq!(unsafe { libc::getpgid(pid) }, group_id);
+                }
+                drop(group); // The held supervisor signals exactly its invocation group.
+                reader.join().expect("join terminated probe output reader");
+                for _ in 0..100 {
+                    if unsafe { libc::getpgid(pid) } == -1 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    unsafe { libc::getpgid(pid) },
+                    -1,
+                    "{mode}: native surrogate survived group termination"
+                );
+                assert!(
+                    sentinel.0.try_wait()?.is_none(),
+                    "{mode}: unrelated session was signalled"
+                );
+            }
+            Ok(())
+        })()
+    }
+
     struct TestAttestationStore {
         endpoint_namespace_id: String,
         content: std::sync::Mutex<Option<Vec<u8>>>,
@@ -4684,7 +5061,7 @@ mod tests {
             unsafe {
                 libc::close(libc::STDERR_FILENO);
             }
-            fail_stop_process("embedding_engine_stalled");
+            crate::diagnostics::fail_stop_process("embedding_engine_stalled");
         }
 
         let status = Command::new(std::env::current_exe().expect("current test executable"))
@@ -4696,6 +5073,57 @@ mod tests {
             .expect("run fail-stop child");
 
         assert_eq!(status.signal(), Some(libc::SIGABRT));
+    }
+
+    /// Packaged Windows Vulkan qualification waits ≤75s for the exact PID that
+    /// accepted `crash_server` to exit. CRT `abort()` has stalled past that
+    /// bound once native accelerator libraries are loaded; fail-stop must use
+    /// `TerminateProcess` and become observably gone promptly.
+    #[cfg(windows)]
+    #[test]
+    fn fail_stop_terminates_the_windows_process_promptly() {
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "CODESTORY_TEST_FAIL_STOP_PROMPT_EXIT";
+        const EXIT_BUDGET: Duration = Duration::from_secs(5);
+        if std::env::var_os(CHILD_ENV).is_some() {
+            crate::diagnostics::fail_stop_process("embedding_qualification_crash");
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(
+                "embedding_server_transport::tests::fail_stop_terminates_the_windows_process_promptly",
+            )
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .expect("spawn fail-stop child");
+        let started = Instant::now();
+        loop {
+            match child.try_wait().expect("poll fail-stop child") {
+                Some(status) => {
+                    assert!(
+                        !status.success(),
+                        "fail-stop must exit unsuccessfully, got {status}"
+                    );
+                    assert!(
+                        started.elapsed() < EXIT_BUDGET,
+                        "fail-stop child took {:?} to exit",
+                        started.elapsed()
+                    );
+                    return;
+                }
+                None if started.elapsed() >= EXIT_BUDGET => {
+                    let _ = child.kill();
+                    panic!(
+                        "fail-stop child remained live for {:?} after accepting fail-stop",
+                        started.elapsed()
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]

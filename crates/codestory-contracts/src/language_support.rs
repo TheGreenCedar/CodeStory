@@ -57,7 +57,7 @@ pub enum LanguageClaimTier {
     SourceGraphExtraction,
     StructuralSourceProof,
     TypedSemanticEdges,
-    PacketSufficientAnswerQuality,
+    PacketEvidenceProductQuality,
 }
 
 impl LanguageClaimTier {
@@ -68,7 +68,7 @@ impl LanguageClaimTier {
             Self::SourceGraphExtraction => "source_graph_extraction",
             Self::StructuralSourceProof => "structural_source_proof",
             Self::TypedSemanticEdges => "typed_semantic_edges",
-            Self::PacketSufficientAnswerQuality => "packet_sufficient_answer_quality",
+            Self::PacketEvidenceProductQuality => "packet_evidence_product_quality",
         }
     }
 }
@@ -81,7 +81,7 @@ pub enum LanguageProofRole {
     GraphFixture,
     StructuralCollectorFixture,
     SemanticResolverFixture,
-    PacketRuntimeArtifact,
+    InstalledPacketArtifact,
 }
 
 impl LanguageProofRole {
@@ -92,7 +92,7 @@ impl LanguageProofRole {
             Self::GraphFixture => "graph_fixture",
             Self::StructuralCollectorFixture => "structural_collector_fixture",
             Self::SemanticResolverFixture => "semantic_resolver_fixture",
-            Self::PacketRuntimeArtifact => "packet_runtime_artifact",
+            Self::InstalledPacketArtifact => "installed_packet_artifact",
         }
     }
 }
@@ -132,9 +132,9 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
         provenance_expectations: &["targeted resolver regression"],
     },
     LanguageClaimTierContract {
-        tier: LanguageClaimTier::PacketSufficientAnswerQuality,
-        allowed_proof_roles: &[LanguageProofRole::PacketRuntimeArtifact],
-        provenance_expectations: &["publishable packet-runtime artifact"],
+        tier: LanguageClaimTier::PacketEvidenceProductQuality,
+        allowed_proof_roles: &[LanguageProofRole::InstalledPacketArtifact],
+        provenance_expectations: &["fresh installed-agent acceptance artifact"],
     },
 ];
 
@@ -190,6 +190,11 @@ const GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES: &[&str] = &[
     "Anchors are conservative source labels, not a complete syntax tree.",
     "Imports, references, substitutions, execution behavior, and typed targets are not resolved.",
     "The collector records exact source anchors only; it does not admit packet semantic proof.",
+];
+const TERRAFORM_STRUCTURAL_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Expressions, references, interpolation, providers, and module resolution are not evaluated.",
+    "Resource graphs, dependency order, plans, state, and external module implementations are not inferred.",
+    "The collector records conservative block, assignment, and simple unquoted object-key anchors with exact source spans only.",
 ];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
@@ -279,7 +284,7 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
     },
     StructuralSourceProofContract {
         collector_name: "json",
-        path_pattern: "generic **/*.json after dedicated OpenAPI routing",
+        path_pattern: "generic **/*.json after dedicated OpenAPI and TypeScript/JavaScript config JSONC routing",
         emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
         source_span: "1-based exact source span for an object-key anchor",
         evidence_tier: PacketEvidenceTierDto::StructuralText,
@@ -287,6 +292,30 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         confidence: 1.0,
         unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
         claim_boundary: "structural exact-source proof only; not OpenAPI semantics, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "terraform",
+        path_pattern: "**/*.{tf,tfvars}",
+        emitted_node_kinds: &[NodeKind::MODULE, NodeKind::ANNOTATION],
+        source_span: "1-based exact source span for a conservative block header, assignment key, or simple unquoted object key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: TERRAFORM_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not HCL expression evaluation, resource-graph construction, provider or module resolution, external module source, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "typescript_config_jsonc",
+        path_pattern: "basename-scoped tsconfig.json, tsconfig.<suffix>.json, jsconfig.json, or jsconfig.<suffix>.json",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a quoted JSONC object-key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not generic JSONC support, TypeScript compiler semantics, typed target resolution, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
     StructuralSourceProofContract {
@@ -363,6 +392,7 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     structural_profile("yaml", &["yml", "yaml"]),
     structural_profile("toml", &["toml"]),
     structural_profile("json", &["json"]),
+    structural_profile("terraform", &["tf", "tfvars"]),
     structural_profile("shell", &["zsh", "ksh", "command"]),
     structural_profile("powershell", &["ps1", "psm1"]),
     structural_profile("docker_compose", &[]),
@@ -722,6 +752,32 @@ pub fn is_cargo_manifest_file_path_with_case(path: &str, path_case: NativePathCa
         })
 }
 
+/// Whether a path names a TypeScript or JavaScript config that admits the
+/// JSONC dialect under explicit native basename-case rules.
+pub fn is_typescript_config_jsonc_file_path(path: &str) -> bool {
+    is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::current())
+}
+
+/// Whether a path names a TypeScript or JavaScript config under `path_case`.
+pub fn is_typescript_config_jsonc_file_path_with_case(
+    path: &str,
+    path_case: NativePathCase,
+) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or_default();
+    let file_name = match path_case {
+        NativePathCase::Sensitive => std::borrow::Cow::Borrowed(file_name),
+        NativePathCase::Insensitive => std::borrow::Cow::Owned(file_name.to_ascii_lowercase()),
+    };
+    matches!(file_name.as_ref(), "tsconfig.json" | "jsconfig.json")
+        || ["tsconfig.", "jsconfig."].into_iter().any(|prefix| {
+            file_name
+                .strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_suffix(".json"))
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+}
+
 /// Whether a path belongs to a structural source format.
 ///
 /// JSONC is deliberately absent: the public structural contract is JSON only.
@@ -935,6 +991,55 @@ mod tests {
     }
 
     #[test]
+    fn terraform_extensions_claim_only_structural_source_proof() {
+        for extension in ["tf", ".TFVARS"] {
+            let profile = language_support_profile_for_ext(extension)
+                .expect("Terraform extension should have a public profile");
+            assert_eq!(profile.language_name, "terraform");
+            assert_eq!(
+                profile.support_mode,
+                LanguageSupportMode::StructuralCollector
+            );
+            assert_eq!(profile.evidence_tier, LanguageEvidenceTier::StructuralOnly);
+            assert_eq!(
+                language_claim_tiers_for_profile(profile),
+                STRUCTURAL_CLAIM_TIERS
+            );
+        }
+        assert_eq!(
+            structural_language_name_for_path(Some("environments/prod/main.tf")),
+            Some("terraform")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("environments/prod.tfvars")),
+            Some("terraform")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("generated/main.tf.json")),
+            Some("json"),
+            "Terraform JSON keeps the existing JSON structural contract"
+        );
+        let contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "terraform")
+            .expect("Terraform structural proof contract");
+        assert_eq!(
+            contract.evidence_tier,
+            PacketEvidenceTierDto::StructuralText
+        );
+        assert_eq!(
+            contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert!(!contract.semantic_proof_allowed);
+        assert!(
+            contract
+                .claim_boundary
+                .contains("not HCL expression evaluation")
+        );
+    }
+
+    #[test]
     fn profile_extensions_are_unique() {
         let mut seen = HashSet::new();
         for extension in supported_extensions() {
@@ -993,7 +1098,7 @@ mod tests {
                 profile.language_name
             );
             assert!(
-                !tiers.contains(&LanguageClaimTier::PacketSufficientAnswerQuality),
+                !tiers.contains(&LanguageClaimTier::PacketEvidenceProductQuality),
                 "{} runtime profile must not imply packet-quality proof",
                 profile.language_name
             );
@@ -1466,6 +1571,41 @@ mod tests {
             );
         }
         assert!(!is_structural_source_path("config.jsonc"));
+    }
+
+    #[test]
+    fn typescript_config_jsonc_routing_is_basename_scoped_under_native_case_rules() {
+        for path in [
+            "tsconfig.json",
+            "config/tsconfig.build.json",
+            r"config\\jsconfig.editor.json",
+            "jsconfig.json",
+        ] {
+            assert!(
+                is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::Sensitive),
+                "{path}"
+            );
+        }
+        for path in [
+            "config.json",
+            "my-tsconfig.json",
+            "tsconfig.json.bak",
+            "tsconfig..json",
+            "tsconfig.jsonc",
+        ] {
+            assert!(
+                !is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::Sensitive),
+                "{path}"
+            );
+        }
+        assert!(is_typescript_config_jsonc_file_path_with_case(
+            "TSCONFIG.JSON",
+            NativePathCase::Insensitive
+        ));
+        assert!(!is_typescript_config_jsonc_file_path_with_case(
+            "TSCONFIG.JSON",
+            NativePathCase::Sensitive
+        ));
     }
 
     #[test]

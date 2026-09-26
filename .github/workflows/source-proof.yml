@@ -1,5 +1,7 @@
 name: Exact-head source proof
 
+run-name: ${{ inputs.coordinator_dispatch_id && format('codestory-release:{0}', inputs.coordinator_dispatch_id) || 'Exact-head source proof' }}
+
 on:
   workflow_call:
     inputs:
@@ -18,6 +20,11 @@ on:
         type: string
   workflow_dispatch:
     inputs:
+      coordinator_dispatch_id:
+        description: Optional release coordinator identity for resumable dispatch ownership.
+        required: false
+        default: ""
+        type: string
       pr_number:
         description: Optional same-repository pull request accepted by exact-head review. Dispatch with --ref <same-repository PR head branch>. Omit when dev/codestory-next is already the exact expected head and dispatch with --ref dev/codestory-next.
         required: false

@@ -1,10 +1,15 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, ResolutionCertainty};
+use codestory_contracts::graph::{
+    Edge, EdgeKind, Node, NodeId, NodeKind, Occurrence, ResolutionCertainty,
+};
+use codestory_contracts::proof_resolution::parse_canonical_callsite_identity;
 use codestory_indexer::WorkspaceIndexer;
+use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_store::Store as Storage;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use tempfile::tempdir;
+use std::path::{Path, PathBuf};
+use tempfile::{TempDir, tempdir};
 
 const PYTHON_SOURCE: &str =
     include_str!("fixtures/call_resolution_comprehensive/python_workflow.py");
@@ -243,7 +248,21 @@ fn rich_fixture_cases() -> Vec<RichFixtureCase> {
 
 fn index_files(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let dir = tempdir()?;
-    let root = dir.path();
+    index_files_at_root(dir.path(), files)
+}
+
+fn index_files_at_root(
+    root: &Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    let (nodes, edges, _) = index_files_at_root_with_occurrences(root, files)?;
+    Ok((nodes, edges))
+}
+
+fn index_files_at_root_with_occurrences(
+    root: &Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<Occurrence>)> {
     let mut files_to_index = Vec::with_capacity(files.len());
     for (filename, contents) in files {
         let file_path = root.join(filename);
@@ -275,7 +294,11 @@ fn index_files(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)>
             .collect::<Vec<_>>()
     );
 
-    Ok((storage.get_nodes()?, storage.get_edges()?))
+    Ok((
+        storage.get_nodes()?,
+        storage.get_edges()?,
+        storage.get_occurrences()?,
+    ))
 }
 
 fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
@@ -603,6 +626,66 @@ fn assert_resolved_call_to_name(
     assert!(
         found,
         "Case `{case_name}`: expected CALL from `{caller_name}` to resolve to `{callee_name}`. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
+fn assert_resolved_call_to_kind(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    callee_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_name(&source.serialized_name, caller_name) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            node_by_id.get(&resolved_id).copied()
+        })
+        .any(|resolved| {
+            is_matching_name(&resolved.serialized_name, callee_name)
+                && resolved.kind == expected_kind
+        });
+
+    assert!(
+        found,
+        "Case `{case_name}`: expected CALL from `{caller_name}` to resolve to `{callee_name}` with kind {expected_kind:?}. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
+fn assert_no_resolved_call_of_kind(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_name(&source.serialized_name, caller_name) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            node_by_id.get(&resolved_id).copied()
+        })
+        .any(|resolved| resolved.kind == expected_kind);
+
+    assert!(
+        !found,
+        "Case `{case_name}`: CALL from `{caller_name}` must not resolve to kind {expected_kind:?}. Calls: {:?}",
         describe_call_edges(edges, nodes)
     );
 }
@@ -2293,6 +2376,101 @@ def outer(repo: Repository):
 }
 
 #[test]
+fn test_python_returned_call_projects_one_inner_member_call() -> anyhow::Result<()> {
+    let source = r#"
+class App:
+    def ensure_sync(self, function):
+        return function
+
+    def dispatch(self):
+        pass
+
+    def caller(self):
+        return self.ensure_sync(self.dispatch)()
+"#;
+
+    let (nodes, edges) = index_single_file("app.py", source)?;
+    let ensure_sync = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "ensure_sync"))
+        .expect("ensure_sync declaration");
+    let projected = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(10)
+                && edge.effective_target() == ensure_sync.id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        projected.len(),
+        1,
+        "duplicate returned-call projection: {projected:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_python_parenthesized_member_call_is_transparent_but_returned_call_is_not()
+-> anyhow::Result<()> {
+    let source = r#"
+class App:
+    def run(self):
+        pass
+
+    def ensure_sync(self, function):
+        return function
+
+    def caller(self):
+        (self.run)()
+        return self.ensure_sync(self.run)()
+"#;
+
+    let (nodes, edges) = index_single_file("app.py", source)?;
+    let run = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "run"))
+        .expect("run declaration");
+    let ensure_sync = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "ensure_sync"))
+        .expect("ensure_sync declaration");
+
+    let parenthesized = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(10)
+                && edge.effective_target() == run.id
+        })
+        .count();
+    assert_eq!(parenthesized, 1, "parenthesized member call: {edges:#?}");
+
+    let returned = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(11))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        returned
+            .iter()
+            .filter(|edge| edge.effective_target() == ensure_sync.id)
+            .count(),
+        1,
+        "returned-call inner member must project once: {returned:#?}"
+    );
+    assert_eq!(
+        returned
+            .iter()
+            .filter(|edge| edge.effective_target() == run.id)
+            .count(),
+        0,
+        "callable-return invocation must not project as the argument member: {returned:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_go_imported_receiver_uses_qualified_import_owner() -> anyhow::Result<()> {
     let notifier_source = r#"
 package notifier
@@ -2709,6 +2887,234 @@ func orchestrate() {
         "Run",
         "project/external/workflow.go",
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_go_method_receiver_capture_does_not_erase_direct_receiver_owner() -> anyhow::Result<()> {
+    let service_source = r#"package service
+
+type Server struct{}
+type OtherServer struct{}
+
+func (s *Server) serveHTTP() {}
+func (s *OtherServer) serveHTTP() {}
+
+func (s *Server) direct() {
+    s.serveHTTP()
+}
+
+func (s *Server) captured() {
+    s.serveHTTP()
+    defer func() {
+        _ = s
+    }()
+    s.serveHTTP()
+}
+
+func (s *Server) shadowed() {
+    if true {
+        s := OtherServer{}
+        s.serveHTTP()
+    }
+    s.serveHTTP()
+}
+
+func (s *Server) closureLocalShadow() {
+    defer func() {
+        s := OtherServer{}
+        s.serveHTTP()
+    }()
+    s.serveHTTP()
+}
+
+func ownerless(s any) {
+    s.serveHTTP()
+}
+
+func (s *Server) nestedReceiverCall() {
+    defer func() {
+        s.serveHTTP()
+    }()
+    s.serveHTTP()
+}
+"#;
+    let foreign_source = r#"package foreign
+
+type Server struct{}
+
+func (s *Server) serveHTTP() {}
+"#;
+    let dir = tempdir()?;
+    let (nodes, edges) = index_files_at_root(
+        dir.path(),
+        &[
+            ("service.go", service_source),
+            ("foreign/server.go", foreign_source),
+        ],
+    )?;
+    let expected_service_path = dir.path().join("service.go");
+
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go direct method receiver control",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "direct",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go method receiver survives calls before and after capture",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "captured",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 2,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go block-local shadow resolves to its actual owner",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "shadowed",
+            owner_name: "OtherServer",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go method receiver resumes after block-local shadow",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "shadowed",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go closure-local shadow does not erase outer method receiver",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "closureLocalShadow",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "go nested receiver call stays closed while the outer receiver resumes",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "nestedReceiverCall",
+            owner_name: "Server",
+            method_name: "serveHTTP",
+            file_suffix: "service.go",
+            expected_count: 1,
+        },
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "go closure-local shadow is not attributed to the enclosing method",
+        &nodes,
+        &edges,
+        "closureLocalShadow",
+        "OtherServer",
+        "serveHTTP",
+        "service.go",
+    );
+    for caller_name in [
+        "direct",
+        "captured",
+        "shadowed",
+        "closureLocalShadow",
+        "nestedReceiverCall",
+    ] {
+        assert_no_resolved_call_to_method_owner_in_file(
+            "go same-named foreign method does not capture direct receiver calls",
+            &nodes,
+            &edges,
+            caller_name,
+            "Server",
+            "serveHTTP",
+            "foreign/server.go",
+        );
+    }
+    for owner_name in ["Server", "OtherServer"] {
+        assert_no_resolved_call_to_method_owner(
+            "go ownerless receiver remains unresolved",
+            &nodes,
+            &edges,
+            "ownerless",
+            owner_name,
+            "serveHTTP",
+        );
+    }
+
+    for (caller_name, line, owner_name) in [
+        ("direct", 10, "Server"),
+        ("captured", 14, "Server"),
+        ("captured", 18, "Server"),
+        ("shadowed", 24, "OtherServer"),
+        ("shadowed", 26, "Server"),
+        ("closureLocalShadow", 34, "Server"),
+        ("nestedReceiverCall", 45, "Server"),
+    ] {
+        let callsite = call_edges_from_caller_at_line(&nodes, &edges, caller_name, line);
+        assert_eq!(
+            callsite.len(),
+            1,
+            "expected one callsite for {caller_name} line {line}: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        let node_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let target = callsite[0]
+            .resolved_target
+            .and_then(|target_id| node_by_id.get(&target_id).copied())
+            .expect("direct receiver call must have a resolved target");
+        assert!(
+            is_matching_owned_method(&target.serialized_name, owner_name, "serveHTTP"),
+            "wrong target for {caller_name} line {line}: {}",
+            target.serialized_name
+        );
+        assert_eq!(
+            file_path_for_node(&node_by_id, target).map(Path::new),
+            Some(expected_service_path.as_path())
+        );
+        let observed_line = callsite[0]
+            .callsite_identity
+            .as_deref()
+            .and_then(|identity| identity.split('|').next())
+            .and_then(|coordinates| coordinates.split(':').nth(1))
+            .and_then(|line| line.parse::<u32>().ok());
+        assert_eq!(observed_line, Some(line));
+    }
+    let ownerless = call_edges_from_caller_at_line(&nodes, &edges, "ownerless", 38);
+    assert_eq!(ownerless.len(), 1);
+    assert!(ownerless[0].resolved_target.is_none());
+    let nested_shadow = call_edges_from_caller_at_line(&nodes, &edges, "closureLocalShadow", 32);
+    assert_eq!(nested_shadow.len(), 1);
+    assert!(nested_shadow[0].resolved_target.is_none());
+    let nested_receiver = call_edges_from_caller_at_line(&nodes, &edges, "nestedReceiverCall", 43);
+    assert_eq!(nested_receiver.len(), 1);
+    assert!(nested_receiver[0].resolved_target.is_none());
 
     Ok(())
 }
@@ -8781,6 +9187,93 @@ function loneLoopWriteExternal(body) {
         describe_call_edges(&edges, &nodes)
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -> anyhow::Result<()>
+{
+    for extension in ["js", "ts", "tsx"] {
+        for imported_first in [false, true] {
+            let imported = "function outside() { dispatch(2); }";
+            let shadowed = "function shadow() { const dispatch = (value) => value; dispatch(1); }";
+            let source = if imported_first {
+                format!("const dispatch = require('opaque-module'); {imported} {shadowed}\n")
+            } else {
+                format!("const dispatch = require('opaque-module'); {shadowed} {imported}\n")
+            };
+            let project = tempdir()?;
+            let (nodes, edges, occurrences) = index_files_at_root_with_occurrences(
+                project.path(),
+                &[(&format!("neutral.{extension}"), &source)],
+            )?;
+            let marked = edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge.callsite_identity.as_deref().is_some_and(|identity| {
+                            identity
+                                .split('|')
+                                .any(|part| part == "syntax:js-runtime-import-call")
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                marked.len(),
+                1,
+                "{extension}/imported_first={imported_first}: {:?}",
+                describe_call_edges(&edges, &nodes)
+            );
+            assert!(marked[0].resolved_target.is_none());
+            let outside_col = source.find("dispatch(2)").expect("outside call") as u32 + 1;
+            let shadow_col = source.find("dispatch(1)").expect("shadow call") as u32 + 1;
+            for (column, owner_name, should_mark) in [
+                (outside_col, "outside", true),
+                (shadow_col, "shadow", false),
+            ] {
+                let calls = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(1)
+                            && edge
+                                .callsite_identity
+                                .as_deref()
+                                .and_then(parse_canonical_callsite_identity)
+                                .is_some_and(|identity| {
+                                    identity.line == 1
+                                        && identity.column_or_ordinal == column
+                                        && identity.raw_target == edge.target
+                                        && edge
+                                            .file_node_id
+                                            .is_some_and(|file| file.0 == identity.file_id.0)
+                                })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(calls.len(), 1, "{extension} column{column}: {calls:#?}");
+                let call = calls[0];
+                assert!(
+                    occurrences
+                        .iter()
+                        .any(|occurrence| { occurrence.element_id == call.target.0 }),
+                    "canonical raw target must retain its node occurrence"
+                );
+                let owner = nodes
+                    .iter()
+                    .find(|node| node.id == call.effective_source())
+                    .expect("call owner");
+                assert!(
+                    is_matching_name(&owner.serialized_name, owner_name),
+                    "expected {owner_name} at column{column}, got {owner:#?}"
+                );
+                assert_eq!(
+                    marked.iter().any(|marked| marked.id == call.id),
+                    should_mark,
+                    "marker swapped at column{column}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -15609,6 +16102,65 @@ func build() {
 }
 
 #[test]
+fn test_go_navigation_accepts_only_closed_type_and_constructor_ast_shapes() -> anyhow::Result<()> {
+    let source = r#"
+package proof
+
+type A struct { B B }
+type B struct{}
+func (*A) Run() {}
+func (*B) Run() {}
+
+func nestedSelector() {
+    x := A{B: B{}}.B
+    x.Run()
+}
+
+func doublePointer(x **A) {
+    x.Run()
+}
+
+func indexedComposite() {
+    x := []A{{}}[0]
+    x.Run()
+}
+"#;
+    let (nodes, edges) = index_files(&[("main.go", source)])?;
+    let call_lines = source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains("x.Run()").then_some(index as u32 + 1))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_lines.len(),
+        3,
+        "fixture must retain all hostile x.Run() sites"
+    );
+    for (caller, line) in ["nestedSelector", "doublePointer", "indexedComposite"]
+        .into_iter()
+        .zip(call_lines)
+    {
+        let call = one_go_call(&nodes, &edges, caller, "Run");
+        assert_eq!(call.line, Some(line), "{caller}: wrong x.Run() source site");
+        assert_eq!(
+            call.resolved_target, None,
+            "{caller}: unsupported shape resolved"
+        );
+        for owner in ["A", "B"] {
+            assert_no_resolved_call_to_method_owner(
+                "Go non-closed type/constructor AST",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "Run",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_projection_regression_dart_arrow_and_initializer_calls_are_typed() -> anyhow::Result<()> {
     let request = r#"
 class BaseRequest {
@@ -16557,5 +17109,1899 @@ public ref struct TypeMapPlanBuilder(TypeMap typeMap)
 
     assert_no_call_self_edges("csharp automapper mirror", &edges);
     assert_no_type_usage_self_edges("csharp automapper mirror", &edges);
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_rejects_receiver_methods() -> anyhow::Result<()> {
+    // G01: builtin conversion vs uppercase method.
+    let (nodes, edges) = index_files(&[(
+        "g01.go",
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "string").resolved_target,
+        None
+    );
+    assert_no_resolved_call_to_method_owner("G01", &nodes, &edges, "Convert", "Handler", "String");
+    assert_no_resolved_call_of_kind("G01", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G02: same conversion vs lowercase method.
+    let (nodes, edges) = index_files(&[(
+        "g02.go",
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) string() int { return 1 }
+func Convert(k Key) string { return string(k) }
+"#,
+    )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "string").resolved_target,
+        None
+    );
+    assert_no_resolved_call_to_method_owner("G02", &nodes, &edges, "Convert", "Handler", "string");
+    assert_no_resolved_call_of_kind("G02", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G03: callable parameter vs same-named method.
+    let (nodes, edges) = index_files(&[(
+        "g03.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) run() int { return 1 }
+func Variable(run func() int) int { return run() }
+"#,
+    )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Variable", "run").resolved_target,
+        None
+    );
+    assert_no_resolved_call_to_method_owner("G03", &nodes, &edges, "Variable", "Handler", "run");
+    assert_no_resolved_call_of_kind("G03", &nodes, &edges, "Variable", NodeKind::METHOD);
+
+    // G04: package function named string wins over Handler.String.
+    let (nodes, edges) = index_files(&[(
+        "g04.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) String() int { return 1 }
+func string(n int) int { return n }
+func Convert() int { return string(2) }
+"#,
+    )])?;
+    assert_resolved_call_to_kind(
+        "G04",
+        &nodes,
+        &edges,
+        "Convert",
+        "string",
+        NodeKind::FUNCTION,
+    );
+    assert_no_resolved_call_to_method_owner("G04", &nodes, &edges, "Convert", "Handler", "String");
+
+    // G05: named conversion must not target Handler.Token.
+    let (nodes, edges) = index_files(&[(
+        "g05.go",
+        r#"
+package probe
+type Token string
+type Handler struct{}
+func (Handler) Token() {}
+func Convert() Token { return Token("x") }
+"#,
+    )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "Token").resolved_target,
+        None
+    );
+    assert_no_resolved_call_to_method_owner("G05", &nodes, &edges, "Convert", "Handler", "Token");
+    assert_no_resolved_call_of_kind("G05", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    // G06: package Run() vs method Run(), declaration order method-first.
+    let (nodes, edges) = index_files(&[(
+        "g06.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) Run() {}
+func Run() {}
+func Caller() { Run() }
+"#,
+    )])?;
+    assert_resolved_call_to_kind("G06", &nodes, &edges, "Caller", "Run", NodeKind::FUNCTION);
+    assert_no_resolved_call_to_method_owner("G06", &nodes, &edges, "Caller", "Handler", "Run");
+
+    let (nodes, edges) = index_files(&[(
+        "g06b.go",
+        r#"
+package probe
+type Handler struct{}
+func Run() {}
+func (Handler) Run() {}
+func Caller() { Run() }
+"#,
+    )])?;
+    assert_resolved_call_to_kind(
+        "G06-function-first",
+        &nodes,
+        &edges,
+        "Caller",
+        "Run",
+        NodeKind::FUNCTION,
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G06-function-first",
+        &nodes,
+        &edges,
+        "Caller",
+        "Handler",
+        "Run",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_go_owner_qualified_receiver_calls_keep_intended_owner() -> anyhow::Result<()> {
+    // G07: genuine lowercase/uppercase receiver calls with other-owner collisions.
+    let source = r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "H" }
+func (Handler) string() string { return "h" }
+type Other struct{}
+func (Other) String() string { return "O" }
+func (Other) string() string { return "o" }
+func RealUpper(h Handler) string { return h.String() }
+func RealLower(h Handler) string { return h.string() }
+"#;
+    let (nodes, edges) = index_files(&[("g07.go", source)])?;
+    assert_resolved_call_to_method_owner(
+        "G07-upper",
+        &nodes,
+        &edges,
+        "RealUpper",
+        "Handler",
+        "String",
+    );
+    assert_resolved_call_to_method_owner(
+        "G07-lower",
+        &nodes,
+        &edges,
+        "RealLower",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G07-upper",
+        &nodes,
+        &edges,
+        "RealUpper",
+        "Other",
+        "String",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G07-lower",
+        &nodes,
+        &edges,
+        "RealLower",
+        "Other",
+        "string",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_rejects_cross_file_method_and_keeps_package_function()
+-> anyhow::Result<()> {
+    // G08: misleading METHOD lives in a second file of the same package.
+    let methods = r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func (Handler) string() int { return 1 }
+func (Handler) run() int { return 1 }
+"#;
+    let conversions = r#"
+package probe
+type Key string
+func Convert(k Key) string { return string(k) }
+func Variable(run func() int) int { return run() }
+"#;
+    let (nodes, edges) = index_files(&[("methods.go", methods), ("calls.go", conversions)])?;
+    assert_no_resolved_call_to_method_owner(
+        "G08-string",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G08-string-lower",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G08-run", &nodes, &edges, "Variable", "Handler", "run",
+    );
+    assert_no_resolved_call_of_kind("G08-string", &nodes, &edges, "Convert", NodeKind::METHOD);
+    assert_no_resolved_call_of_kind("G08-run", &nodes, &edges, "Variable", NodeKind::METHOD);
+
+    // G09: package FUNCTION in a second file, competing receiver METHOD.
+    let helpers = r#"
+package probe
+func Run() {}
+"#;
+    let methods = r#"
+package probe
+type Handler struct{}
+func (Handler) Run() {}
+"#;
+    let caller = r#"
+package probe
+func Caller() { Run() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("helpers.go", helpers),
+        ("methods.go", methods),
+        ("caller.go", caller),
+    ])?;
+    assert_resolved_call_to_kind("G09", &nodes, &edges, "Caller", "Run", NodeKind::FUNCTION);
+    assert_no_resolved_call_to_method_owner("G09", &nodes, &edges, "Caller", "Handler", "Run");
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_package_function_resolves_through_explicit_alias() -> anyhow::Result<()> {
+    let selected_package = r#"
+package selected
+func Target() {}
+"#;
+    let same_basename_decoy = r#"
+package selected
+func Target() {}
+"#;
+    let caller = r#"
+package caller
+import chosen "example.com/project/selected"
+func Caller() { chosen.Target() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n\ngo 1.24\n"),
+        ("selected/selected.go", selected_package),
+        (
+            "external/example.com/project/selected/selected.go",
+            same_basename_decoy,
+        ),
+        ("caller.go", caller),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let resolved_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            is_matching_name(&source.serialized_name, "Caller")
+                .then_some(edge.resolved_target)
+                .flatten()
+                .and_then(|target| node_by_id.get(&target).copied())
+        })
+        .filter(|target| {
+            target.kind == NodeKind::FUNCTION && is_matching_name(&target.serialized_name, "Target")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        resolved_targets.len(),
+        1,
+        "G10-imported-package-function: expected exactly one resolved Target FUNCTION. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        file_path_for_node(&node_by_id, resolved_targets[0])
+            .map(|path| {
+                let path = path.replace('\\', "/");
+                path.ends_with("/selected/selected.go")
+                    && !path.ends_with("/external/example.com/project/selected/selected.go")
+            })
+            .unwrap_or(false),
+        "G10-imported-package-function: the module declaration must bind example.com/project/selected to the local selected/selected.go, not the same-basename external suffix decoy. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_import_alias_shadow_never_receives_package_function_evidence() -> anyhow::Result<()> {
+    let caller = r#"package caller
+import chosen "example.com/project/selected"
+func Parameter(chosen Runner) { chosen.Target() }
+func UntypedVar() { var chosen = Runner{}; chosen.Target() }
+func Unshadowed() { chosen.Target() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n\ngo 1.24\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "runner.go",
+            "package caller\ntype Runner struct{}\nfunc (Runner) Target() {}\n",
+        ),
+        ("caller.go", caller),
+    ])?;
+    for name in ["Parameter", "UntypedVar"] {
+        let call = one_go_call(&nodes, &edges, name, "Target");
+        assert!(
+            !callsite_has_segment(call, "syntax:go-package-function"),
+            "{name}: lexical receiver shadow carried imported-package evidence: {call:?}"
+        );
+        assert!(
+            resolved_function_paths(&nodes, &edges, name, "Target").is_empty(),
+            "{name}: lexical receiver shadow resolved to imported package Target"
+        );
+    }
+    let unshadowed = one_go_call(&nodes, &edges, "Unshadowed", "Target");
+    assert!(callsite_has_segment(
+        unshadowed,
+        "syntax:go-package-function"
+    ));
+    let target = resolved_function_paths(&nodes, &edges, "Unshadowed", "Target");
+    assert_eq!(target.len(), 1, "unshadowed alias must resolve once");
+    assert!(
+        target[0]
+            .replace('\\', "/")
+            .ends_with("/selected/selected.go")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_ordinary_package_excludes_external_test_name_collision() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.org/mod\n\ngo 1.24\n"),
+        (
+            "pkg/pkg.go",
+            "package pkg\nfunc Target() {}\ntype Worker struct{}\nfunc New() *Worker { return nil }\nfunc (Worker) Finish() {}\n",
+        ),
+        (
+            "pkg/pkg_test.go",
+            "package pkg_test\nfunc Target() {}\nfunc New() int { return 0 }\n",
+        ),
+        (
+            "caller/caller.go",
+            "package caller\nimport alias \"example.org/mod/pkg\"\nfunc Direct() { alias.Target() }\nfunc Factory() { alias.New().Finish() }\n",
+        ),
+    ])?;
+    for (caller, function) in [("Direct", "Target"), ("Factory", "New")] {
+        one_go_call(&nodes, &edges, caller, function);
+        let paths = resolved_function_paths(&nodes, &edges, caller, function);
+        assert_eq!(
+            paths.len(),
+            1,
+            "{caller}: ordinary package {function} must resolve despite external _test duplicate; calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        assert!(
+            paths[0].replace('\\', "/").ends_with("/pkg/pkg.go"),
+            "{caller}: external _test declaration competed with importable package: {paths:?}"
+        );
+    }
+    one_go_call(&nodes, &edges, "Factory", "Finish");
+    assert_resolved_call_to_method_owner_in_file(
+        "external-test-imported-factory",
+        &nodes,
+        &edges,
+        "Factory",
+        "Worker",
+        "Finish",
+        "pkg/pkg.go",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_methods_resolve_without_dynamic_interface_guessing() -> anyhow::Result<()>
+{
+    let worker_package = r#"
+package worker
+
+type Worker struct{}
+type Alternate struct{}
+
+type Finisher interface {
+    Finish()
+}
+
+func NewWorker() *Worker { return &Worker{} }
+func NewWorkerPair() (*Worker, error) { return &Worker{}, nil }
+func SelectWorker(alternate bool) Finisher {
+    if alternate {
+        return &Alternate{}
+    }
+    return &Worker{}
+}
+
+func (w *Worker) Continue() *Worker { return w }
+func (w *Worker) Finish() {}
+func (a *Alternate) Finish() {}
+"#;
+    let callers = r#"
+package app
+
+import "example.com/factory/worker"
+
+func FluentFactory() {
+    worker.NewWorker().Continue().Finish()
+}
+
+func AssignedFactory() {
+    current := worker.NewWorker()
+    current.Finish()
+}
+
+func MultiFactory() {
+    current, err := worker.NewWorkerPair()
+    if err != nil {
+        return
+    }
+    current.Finish()
+}
+
+func DynamicFactory() {
+    worker.SelectWorker(true).Finish()
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/factory\n\ngo 1.24\n"),
+        ("worker/worker.go", worker_package),
+        ("app/app.go", callers),
+    ])?;
+
+    for (caller, factory) in [
+        ("FluentFactory", "NewWorker"),
+        ("AssignedFactory", "NewWorker"),
+        ("MultiFactory", "NewWorkerPair"),
+        ("DynamicFactory", "SelectWorker"),
+    ] {
+        let paths = resolved_function_paths(&nodes, &edges, caller, factory);
+        assert_eq!(
+            paths.len(),
+            1,
+            "{caller}: imported factory FUNCTION `{factory}` must resolve before testing return-owner propagation. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        assert!(
+            paths[0].replace('\\', "/").ends_with("/worker/worker.go"),
+            "{caller}: imported factory FUNCTION `{factory}` resolved outside its exact package: {paths:?}"
+        );
+    }
+
+    // The interface result can hold either concrete implementation. Keep this
+    // dynamic call unresolved rather than choosing a same-named method.
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let dynamic_finish_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "DynamicFactory"))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, "Finish"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dynamic_finish_calls.len(),
+        1,
+        "DynamicFactory: expected one interface receiver Finish CALL. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_eq!(
+        dynamic_finish_calls[0].resolved_target, None,
+        "an interface result with two concrete implementations must not guess a Finish owner"
+    );
+
+    let resolves_worker_method = |caller: &str, method: &str| {
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                && edge
+                    .resolved_target
+                    .and_then(|target| node_by_id.get(&target).copied())
+                    .is_some_and(|target| {
+                        target.kind == NodeKind::METHOD
+                            && is_matching_owned_method(&target.serialized_name, "Worker", method)
+                    })
+        })
+    };
+    let missing = [
+        ("FluentFactory", "Continue"),
+        ("FluentFactory", "Finish"),
+        ("AssignedFactory", "Finish"),
+        ("MultiFactory", "Finish"),
+    ]
+    .into_iter()
+    .filter(|(caller, method)| !resolves_worker_method(caller, method))
+    .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "factory return ownership must reach fluent, assigned, and first-position multi-result receiver methods; missing {missing:?}. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_import_provenance_matrix() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/factory\n"),
+        (
+            "worker/worker.go",
+            "package worker\ntype Worker struct{}\nfunc NewWorker() *Worker { return nil }\nfunc (*Worker) Finish() {}\n",
+        ),
+        (
+            "other/other.go",
+            "package other\ntype Worker struct{}\nfunc NewWorker() *Worker { return nil }\nfunc (*Worker) Finish() {}\n",
+        ),
+        (
+            "oddpath/worker.go",
+            "package declared\ntype Worker struct{}\nfunc NewWorker() *Worker { return nil }\nfunc (*Worker) Finish() {}\n",
+        ),
+        (
+            "app/app.go",
+            r#"package app
+import (
+    actual "example.com/factory/worker"
+    "example.com/factory/oddpath"
+)
+
+/*
+import ghost "example.com/factory/worker"
+*/
+
+var misleading = `
+import actual "example.com/factory/other"
+`
+
+func FabricatedImport() { ghost.NewWorker().Finish() }
+func ActualImport() { actual.NewWorker().Finish() }
+func ImplicitDeclaredPackage() { declared.NewWorker().Finish() }
+"#,
+        ),
+    ])?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "FabricatedImport", "Finish");
+    assert_resolved_call_to_method_owner(
+        "return-import-ast",
+        &nodes,
+        &edges,
+        "ActualImport",
+        "Worker",
+        "Finish",
+    );
+    assert_resolved_call_to_method_owner(
+        "return-import-implicit-package-clause",
+        &nodes,
+        &edges,
+        "ImplicitDeclaredPackage",
+        "Worker",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_concrete_type_matrix() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/factory\n"),
+        (
+            "worker/types.go",
+            "package worker\ntype CrossFile struct{}\ntype Token int\n",
+        ),
+        (
+            "worker/factory.go",
+            "package worker\nfunc NewCrossFile() *CrossFile { return nil }\nfunc NewToken() *Token { return nil }\n",
+        ),
+        (
+            "worker/methods.go",
+            "package worker\nfunc (*CrossFile) Finish() {}\nfunc (*Token) Finish() {}\n",
+        ),
+        (
+            "app/app.go",
+            "package app\nimport \"example.com/factory/worker\"\nfunc CrossFileCaller() { worker.NewCrossFile().Finish() }\nfunc TokenCaller() { worker.NewToken().Finish() }\n",
+        ),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "return-cross-file-struct",
+        &nodes,
+        &edges,
+        "CrossFileCaller",
+        "CrossFile",
+        "Finish",
+    );
+    assert_resolved_call_to_method_owner(
+        "return-named-nonstruct",
+        &nodes,
+        &edges,
+        "TokenCaller",
+        "Token",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_declarations_isolate_external_test_package() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/m\n"),
+        (
+            "worker.go",
+            r#"package m
+type Worker struct{}
+func New() *Worker { return nil }
+func (Worker) Finish() {}
+func UsePositive() { New().Finish() }
+"#,
+        ),
+        (
+            "worker_test.go",
+            r#"package m_test
+func New() int { return 0 }
+"#,
+        ),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "return-package-identity-positive",
+        &nodes,
+        &edges,
+        "UsePositive",
+        "Worker",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_methods_do_not_cross_external_test_package() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/m\n"),
+        (
+            "worker.go",
+            r#"package m
+type Worker struct{}
+func Build() *Worker { return nil }
+func UseNegative() { Build().OnlyTest() }
+"#,
+        ),
+        (
+            "worker_test.go",
+            r#"package m_test
+type Worker struct{}
+func (Worker) OnlyTest() {}
+"#,
+        ),
+    ])?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "UseNegative", "OnlyTest");
+    Ok(())
+}
+
+fn go_factory_return_use_order_fixture() -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    index_files(&[
+        ("go.mod", "module example.com/order\n"),
+        (
+            "worker/worker.go",
+            "package worker\ntype Worker struct{}\nfunc New() *Worker { return nil }\nfunc (Worker) Finish() {}\n",
+        ),
+        (
+            "app/app.go",
+            r#"package app
+import factory "example.com/order/worker"
+type Worker struct{}
+type Other struct{}
+type Shadow int
+type ScopedShadow struct{}
+func New() *Worker { return nil }
+func (Worker) Finish() {}
+func (Other) Finish() {}
+func (Shadow) New() *Other { return nil }
+func (ScopedShadow) Finish() {}
+func SamePackageBefore() {
+    New().Finish()
+    New := func() *Other { return nil }
+    _ = New
+}
+func SamePackageAfter() {
+    New := func() *Other { return nil }
+    _ = New
+    New().Finish()
+}
+func BeforeInnerBlockShadow() {
+    New().Finish()
+    { New := func() *Other { return nil }; _ = New }
+}
+func BeforeClosureShadow() {
+    New().Finish()
+    _ = func() { New := func() *Other { return nil }; _ = New }
+}
+func ImportedBefore() {
+    factory.New().Finish()
+    factory := 1
+    _ = factory
+}
+func ImportedAfter() {
+    factory := 1
+    _ = factory
+    factory.New().Finish()
+}
+func AfterIfHeader(cond bool) {
+    if factory := Shadow(0); cond { _ = factory } else { _ = factory }
+    factory.New().Finish()
+}
+func InsideIfHeader(cond bool) {
+    if factory := Shadow(0); cond { factory.New().Finish() } else { _ = factory }
+}
+func AfterForHeader(cond bool) {
+    for factory := Shadow(0); cond; { _ = factory; break }
+    factory.New().Finish()
+}
+func InsideForHeader(cond bool) {
+    for factory := Shadow(0); cond; { factory.New().Finish(); break }
+}
+func AfterSwitchHeader(value int) {
+    switch factory := Shadow(value); factory {
+    case 0: _ = factory
+    default: _ = factory
+    }
+    factory.New().Finish()
+}
+func InsideSwitchHeader(value int) {
+    switch factory := Shadow(value); factory {
+    case 0: factory.New().Finish()
+    default: _ = factory
+    }
+}
+func AfterSwitchCase(value int) {
+    switch value {
+    case 0: factory := Shadow(0); _ = factory
+    }
+    factory.New().Finish()
+}
+func InsideSwitchCase(value int) {
+    switch value {
+    case 0: factory := Shadow(0); factory.New().Finish()
+    }
+}
+func AssignedIfHeader(cond bool) {
+    r := factory.New()
+    if r := ScopedShadow{}; cond { r.Finish() } else { _ = r }
+    r.Finish()
+}
+func ReassignedIfHeader(cond bool) {
+    r := factory.New()
+    r = factory.New()
+    if r := ScopedShadow{}; cond { r.Finish() } else { _ = r }
+    r.Finish()
+}
+func AssignedForHeader(cond bool) {
+    r := factory.New()
+    for r := ScopedShadow{}; cond; { r.Finish(); break }
+    r.Finish()
+}
+func AssignedSwitchHeader(value int) {
+    r := factory.New()
+    switch r := ScopedShadow{}; value {
+    case 0: r.Finish()
+    default: _ = r
+    }
+    r.Finish()
+}
+func AssignedSwitchCase(value int) {
+    r := factory.New()
+    switch value {
+    case 0: r := ScopedShadow{}; r.Finish()
+    }
+    r.Finish()
+}
+func AssignedRangeDeclaration(values []ScopedShadow) {
+    r := factory.New()
+    for _, r := range values { r.Finish() }
+    r.Finish()
+}
+"#,
+        ),
+    ])
+}
+
+#[test]
+fn test_go_factory_return_same_package_later_shadow_preserves_prior_call() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_resolved_call_to_method_owner_in_file(
+        "return-use-order-same-package-before",
+        &nodes,
+        &edges,
+        "SamePackageBefore",
+        "Worker",
+        "Finish",
+        "app/app.go",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_same_package_prior_shadow_blocks_later_call() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "SamePackageAfter", "Finish");
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_inner_block_shadow_does_not_hide_outer_prior_call() -> anyhow::Result<()>
+{
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_resolved_call_to_method_owner_in_file(
+        "return-use-order-inner-block",
+        &nodes,
+        &edges,
+        "BeforeInnerBlockShadow",
+        "Worker",
+        "Finish",
+        "app/app.go",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_closure_shadow_does_not_hide_outer_prior_call() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_resolved_call_to_method_owner_in_file(
+        "return-use-order-closure",
+        &nodes,
+        &edges,
+        "BeforeClosureShadow",
+        "Worker",
+        "Finish",
+        "app/app.go",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_import_alias_later_shadow_preserves_prior_call() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_resolved_call_to_method_owner_in_file(
+        "return-use-order-import-before",
+        &nodes,
+        &edges,
+        "ImportedBefore",
+        "Worker",
+        "Finish",
+        "worker/worker.go",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_import_alias_prior_shadow_blocks_later_call() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "ImportedAfter", "Finish");
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_header_and_case_shadows_expire_after_scope() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    for caller in [
+        "AfterIfHeader",
+        "AfterForHeader",
+        "AfterSwitchHeader",
+        "AfterSwitchCase",
+    ] {
+        assert_resolved_call_to_method_owner_in_file(
+            "return-header-shadow-expiration",
+            &nodes,
+            &edges,
+            caller,
+            "Worker",
+            "Finish",
+            "worker/worker.go",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_header_and_case_shadows_block_import_inside_scope() -> anyhow::Result<()>
+{
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    for caller in [
+        "InsideIfHeader",
+        "InsideForHeader",
+        "InsideSwitchHeader",
+        "InsideSwitchCase",
+    ] {
+        assert_no_resolved_call_to_method_owner_in_file(
+            "return-header-shadow-inside",
+            &nodes,
+            &edges,
+            caller,
+            "Worker",
+            "Finish",
+            "worker/worker.go",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_header_and_case_shadows_override_assigned_outer_receiver_only_inside_scope()
+-> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_use_order_fixture()?;
+    for caller in [
+        "AssignedIfHeader",
+        "ReassignedIfHeader",
+        "AssignedForHeader",
+        "AssignedSwitchHeader",
+        "AssignedSwitchCase",
+    ] {
+        assert_resolved_call_count_to_method_owner_in_file(
+            "return-assigned-header-shadow-inside",
+            &nodes,
+            &edges,
+            ResolvedCallCountInFile {
+                caller_name: caller,
+                owner_name: "ScopedShadow",
+                method_name: "Finish",
+                file_suffix: "app/app.go",
+                expected_count: 1,
+            },
+        );
+        assert_resolved_call_count_to_method_owner_in_file(
+            "return-assigned-header-shadow-after",
+            &nodes,
+            &edges,
+            ResolvedCallCountInFile {
+                caller_name: caller,
+                owner_name: "Worker",
+                method_name: "Finish",
+                file_suffix: "worker/worker.go",
+                expected_count: 1,
+            },
+        );
+    }
+    assert_resolved_call_count_to_method_owner_in_file(
+        "return-assigned-range-shadow",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "AssignedRangeDeclaration",
+            owner_name: "Worker",
+            method_name: "Finish",
+            file_suffix: "worker/worker.go",
+            expected_count: 1,
+        },
+    );
+    Ok(())
+}
+
+const GO_FACTORY_RETURN_FLOW_SOURCE: &str = r#"package worker
+type A struct{}
+type B struct{}
+type Finisher interface { Finish() }
+func NewA() *A { return nil }
+func Pair() (error, *B) { return nil, nil }
+func Duo() (*A, error) { return nil, nil }
+func One() *A { return nil }
+func (A) ToB() *B { return nil }
+func (A) Next() *A { return nil }
+func (A) Finish() {}
+func (B) Finish() {}
+func TupleSecond() { _, value := Pair(); value.Finish() }
+func BlankSecond() { value, _ := Duo(); value.Finish() }
+func DirectTuple() { Pair().Finish() }
+func InvalidArity() { first, second := One(); first.Finish(); _ = second }
+func FluentOwnerChange() { NewA().ToB().Finish() }
+func AssignedFluentOwnerChange() { value := NewA().ToB(); value.Finish() }
+func TopLevelFluentReassignment() { value := NewA(); value = value.Next(); value.Finish() }
+func NestedUnknownOverwrite(cond bool) {
+    value := NewA()
+    if cond { value = PairSecond() }
+    value.Finish()
+}
+func DifferingBranch(cond bool) {
+    var value Finisher
+    if cond { value = NewA() } else { value = PairSecond() }
+    value.Finish()
+}
+func PairSecond() *B { return nil }
+"#;
+
+fn go_factory_return_flow_fixture() -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    index_files(&[
+        ("go.mod", "module example.com/worker\n"),
+        ("worker.go", GO_FACTORY_RETURN_FLOW_SOURCE),
+    ])
+}
+
+#[test]
+fn test_go_factory_return_tuple_and_fluent_positive_matrix() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_flow_fixture()?;
+
+    for (case, caller, owner) in [
+        ("return-tuple-second", "TupleSecond", "B"),
+        ("return-tuple-blank", "BlankSecond", "A"),
+        ("return-fluent-owner-change", "FluentOwnerChange", "B"),
+        (
+            "return-assigned-fluent-owner-change",
+            "AssignedFluentOwnerChange",
+            "B",
+        ),
+        (
+            "return-top-level-fluent-reassignment",
+            "TopLevelFluentReassignment",
+            "A",
+        ),
+    ] {
+        assert_resolved_call_to_method_owner(case, &nodes, &edges, caller, owner, "Finish");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_direct_multi_result_receiver_stays_unresolved() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_flow_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "DirectTuple", "Finish");
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_invalid_assignment_arity_stays_unresolved() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_flow_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "InvalidArity", "Finish");
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_differing_branch_owners_stay_unresolved() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_flow_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "DifferingBranch", "Finish");
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_nested_unknown_overwrite_stays_unresolved() -> anyhow::Result<()> {
+    let (nodes, edges) = go_factory_return_flow_fixture()?;
+    assert_unresolved_nonpackage_go_selector_call(
+        &nodes,
+        &edges,
+        "NestedUnknownOverwrite",
+        "Finish",
+    );
+    Ok(())
+}
+
+struct GoFactoryReturnRefreshFixture {
+    _dir: TempDir,
+    module_path: PathBuf,
+    factory_path: PathBuf,
+    caller_path: PathBuf,
+    storage: Storage,
+    indexer: WorkspaceIndexer,
+    event_bus: EventBus,
+}
+
+impl GoFactoryReturnRefreshFixture {
+    fn new() -> anyhow::Result<Self> {
+        let dir = tempdir()?;
+        let root = dir.path();
+        let module_path = root.join("go.mod");
+        let types_path = root.join("worker/types.go");
+        let factory_path = root.join("worker/factory.go");
+        let caller_path = root.join("app/app.go");
+        fs::create_dir_all(root.join("worker"))?;
+        fs::create_dir_all(root.join("app"))?;
+        fs::write(&module_path, "module example.com/refresh\n")?;
+        fs::write(
+            &types_path,
+            "package worker\ntype Alpha struct{}\ntype Bravo struct{}\nfunc (*Alpha) Finish() {}\nfunc (*Bravo) Finish() {}\n",
+        )?;
+        fs::write(
+            &factory_path,
+            "package worker\nfunc New() *Alpha { return nil }\n",
+        )?;
+        fs::write(
+            &caller_path,
+            "package app\nimport \"example.com/refresh/worker\"\nfunc Caller() { worker.New().Finish() }\n",
+        )?;
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(root.to_path_buf());
+        let event_bus = EventBus::new();
+        indexer.run_incremental(
+            &mut storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: vec![
+                    module_path.clone(),
+                    types_path,
+                    factory_path.clone(),
+                    caller_path.clone(),
+                ],
+                files_to_remove: vec![],
+                existing_file_ids: HashMap::new(),
+            },
+            &event_bus,
+            None,
+        )?;
+        Ok(Self {
+            _dir: dir,
+            module_path,
+            factory_path,
+            caller_path,
+            storage,
+            indexer,
+            event_bus,
+        })
+    }
+
+    fn refresh(
+        &mut self,
+        files_to_index: Vec<PathBuf>,
+        files_to_remove: Vec<i64>,
+    ) -> anyhow::Result<()> {
+        self.indexer.run_incremental(
+            &mut self.storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index,
+                files_to_remove,
+                existing_file_ids: HashMap::new(),
+            },
+            &self.event_bus,
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn assert_initial_alpha(&self, case_name: &str) -> anyhow::Result<()> {
+        assert_resolved_call_to_method_owner(
+            case_name,
+            &self.storage.get_nodes()?,
+            &self.storage.get_edges()?,
+            "Caller",
+            "Alpha",
+            "Finish",
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn test_go_factory_return_signature_refresh_recomputes_unchanged_caller() -> anyhow::Result<()> {
+    let mut fixture = GoFactoryReturnRefreshFixture::new()?;
+    fixture.assert_initial_alpha("return-refresh-signature-initial")?;
+    fs::write(
+        &fixture.factory_path,
+        "package worker\nfunc New() *Bravo { return nil }\n",
+    )?;
+    fixture.refresh(vec![fixture.factory_path.clone()], vec![])?;
+    assert_no_resolved_call_to_method_owner(
+        "return-refresh-signature-old",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Alpha",
+        "Finish",
+    );
+    assert_resolved_call_to_method_owner(
+        "return-refresh-signature-new",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Bravo",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_module_refresh_clears_unchanged_caller() -> anyhow::Result<()> {
+    let mut fixture = GoFactoryReturnRefreshFixture::new()?;
+    fixture.assert_initial_alpha("return-refresh-module-initial")?;
+    fs::write(&fixture.module_path, "module example.com/changed\n")?;
+    fixture.refresh(vec![fixture.module_path.clone()], vec![])?;
+    assert_no_resolved_call_to_method_owner(
+        "return-refresh-module-control",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Alpha",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_deletion_refresh_clears_unchanged_caller() -> anyhow::Result<()> {
+    let mut fixture = GoFactoryReturnRefreshFixture::new()?;
+    fixture.assert_initial_alpha("return-refresh-deletion-initial")?;
+    let factory_id = fixture
+        .storage
+        .get_file_by_path(&fixture.factory_path)?
+        .expect("factory file indexed")
+        .id;
+    fs::remove_file(&fixture.factory_path)?;
+    fixture.refresh(vec![], vec![factory_id])?;
+    assert_no_resolved_call_to_method_owner(
+        "return-refresh-factory-deletion",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Alpha",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_factory_return_source_hash_drift_stays_unresolved() -> anyhow::Result<()> {
+    let mut fixture = GoFactoryReturnRefreshFixture::new()?;
+    fixture.assert_initial_alpha("return-refresh-drift-initial")?;
+    fs::write(
+        &fixture.factory_path,
+        "package worker\nfunc New() *Bravo { return nil }\n",
+    )?;
+    fixture.refresh(vec![fixture.caller_path.clone()], vec![])?;
+    assert_no_resolved_call_to_method_owner(
+        "return-refresh-drift-old",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Alpha",
+        "Finish",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "return-refresh-drift-unindexed",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Bravo",
+        "Finish",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_package_function_resolution_hostile_matrix() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("oddpath/target.go", "package declared\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport \"example.com/project/oddpath\"\nfunc Caller() { declared.Target() }\n",
+        ),
+    ])?;
+    let implicit_paths = resolved_function_paths(&nodes, &edges, "Caller", "Target");
+    assert_eq!(implicit_paths.len(), 1);
+    assert!(
+        implicit_paths[0]
+            .replace('\\', "/")
+            .ends_with("/oddpath/target.go"),
+        "implicit import binding must use the indexed package clause rather than the path basename: {implicit_paths:?}"
+    );
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            r#"package caller
+import chosen "example.com/project/selected"
+type local struct{}
+func (local) Target() {}
+func Parameter(chosen local) { chosen.Target() }
+func Local() { chosen := local{}; chosen.Target() }
+func Closure() { chosen := local{}; func() { chosen.Target() }() }
+"#,
+        ),
+    ])?;
+    for caller in ["Parameter", "Local"] {
+        assert!(
+            resolved_function_paths(&nodes, &edges, caller, "Target").is_empty(),
+            "{caller}: a local binding must shadow the imported package alias"
+        );
+        assert_resolved_call_kind(&nodes, &edges, caller, "Target", NodeKind::METHOD);
+    }
+    assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "Closure", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\ntype Thing struct{}\nfunc (Thing) Target() {}\n",
+        ),
+        ("wrong/wrong.go", "package wrong\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "package selector resolution must select only a FUNCTION in the exact imported package"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module \"example.com/project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/+project\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/+project/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("nested/go.mod", "module\tbroken extra\n"),
+        (
+            "nested/selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "caller.go",
+            "package caller\nimport chosen \"example.com/project/nested/selected\"\nfunc Caller() { chosen.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "a malformed nested go.mod must block fallback to the outer module"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+
+    let (nodes, edges) = index_files(&[
+        ("left/go.mod", "module example.com/shared\n"),
+        ("left/pkg/target.go", "package pkg\nfunc Target() {}\n"),
+        ("right/go.mod", "module example.com/shared\n"),
+        ("right/pkg/other.go", "package pkg\nfunc Other() {}\n"),
+        ("app/go.mod", "module example.com/app\n"),
+        (
+            "app/caller.go",
+            "package app\nimport shared \"example.com/shared/pkg\"\nfunc Caller() { shared.Target() }\n",
+        ),
+    ])?;
+    assert!(
+        resolved_function_paths(&nodes, &edges, "Caller", "Target").is_empty(),
+        "duplicate local ownership of one import path must remain ambiguous even when only one root defines the function"
+    );
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+    Ok(())
+}
+
+#[test]
+fn test_go_module_control_change_reindexes_callers_and_clears_old_resolution() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    fs::create_dir_all(root.join("selected"))?;
+    fs::write(root.join(".gitignore"), "go.mod\n")?;
+    fs::write(root.join("go.mod"), "module example.com/project\n")?;
+    fs::write(
+        root.join("selected/selected.go"),
+        "package selected\nfunc Target() {}\n",
+    )?;
+    fs::write(
+        root.join("caller.go"),
+        "package caller\nimport chosen \"example.com/project/selected\"\ntype local struct{}\nfunc (local) Keep() {}\nfunc Caller() { chosen.Target() }\nfunc Local() { value := local{}; value.Keep() }\n",
+    )?;
+
+    let manifest = codestory_workspace::WorkspaceManifest::open(root.to_path_buf())?;
+    let initial = manifest.build_execution_outcome(&Default::default())?;
+    assert!(
+        initial.plan.files_to_index.contains(&root.join("go.mod")),
+        "an ignored go.mod ancestor is still a required control input"
+    );
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    indexer.run(&mut storage, &initial.plan, &event_bus, None)?;
+    assert_eq!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .len(),
+        1
+    );
+
+    fs::write(root.join("go.mod"), "module example.com/changed\n")?;
+    let legacy_changed = indexer.run_incremental(
+        &mut storage,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![root.join("go.mod")],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &event_bus,
+        None,
+    )?;
+    assert!(
+        legacy_changed.graph_projection_changed,
+        "clearing a stale package-call target must invalidate downstream graph snapshots"
+    );
+    assert!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .is_empty(),
+        "legacy control-only refresh must invalidate the old package claim"
+    );
+    assert_resolved_call_kind(
+        &storage.get_nodes()?,
+        &storage.get_edges()?,
+        "Local",
+        "Keep",
+        NodeKind::METHOD,
+    );
+
+    fs::write(root.join("go.mod"), "module example.com/project\n")?;
+    let restored = indexer.run_incremental(
+        &mut storage,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![root.join("go.mod")],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &event_bus,
+        None,
+    )?;
+    assert!(
+        restored.graph_projection_changed,
+        "restoring a package-call target must invalidate downstream graph snapshots"
+    );
+    assert_eq!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .len(),
+        1,
+        "restoring the verified module control must recompute the package call"
+    );
+
+    let refresh_inputs = codestory_workspace::RefreshInputs {
+        stored_files: storage.files().inventory()?,
+        policy_exclusions: Vec::new(),
+        inventory: Default::default(),
+    };
+    fs::remove_file(root.join("go.mod"))?;
+    let removed = manifest.build_execution_outcome(&refresh_inputs)?;
+    for source in [root.join("caller.go"), root.join("selected/selected.go")] {
+        assert!(
+            removed.plan.files_to_index.contains(&source),
+            "removing a module control must schedule every admitted Go source: {source:?}"
+        );
+    }
+    assert_eq!(removed.plan.files_to_remove.len(), 1);
+    indexer.run(&mut storage, &removed.plan, &event_bus, None)?;
+    assert!(
+        resolved_function_paths(
+            &storage.get_nodes()?,
+            &storage.get_edges()?,
+            "Caller",
+            "Target"
+        )
+        .is_empty(),
+        "projection replacement after go.mod removal must clear the old resolved target"
+    );
+    assert_resolved_call_kind(
+        &storage.get_nodes()?,
+        &storage.get_edges()?,
+        "Local",
+        "Keep",
+        NodeKind::METHOD,
+    );
+    Ok(())
+}
+
+fn one_go_call<'a>(nodes: &[Node], edges: &'a [Edge], caller: &str, target: &str) -> &'a Edge {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                && node_by_id.get(&edge.target).is_some_and(|target_node| {
+                    is_matching_name(&target_node.serialized_name, target)
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{caller}.{target}: expected one extracted CALL at the selector, got: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+    let call = calls[0];
+    let file = call.file_node_id.expect("CALL file identity");
+    let line = call.line.expect("CALL source line");
+    let canonical = format!("{}:{line}:", file.0);
+    assert!(
+        call.callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with(&canonical)),
+        "{caller}.{target}: CALL must retain its source-file and line identity: {call:?}"
+    );
+    call
+}
+
+fn resolved_function_paths(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) -> Vec<String> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            is_matching_name(&source.serialized_name, caller_name)
+                .then_some(edge.resolved_target)
+                .flatten()
+                .and_then(|target| node_by_id.get(&target).copied())
+        })
+        .filter(|target| {
+            target.kind == NodeKind::FUNCTION
+                && is_matching_name(&target.serialized_name, target_name)
+        })
+        .filter_map(|target| file_path_for_node(&node_by_id, target).map(str::to_string))
+        .collect()
+}
+
+fn assert_unresolved_go_package_call(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, target_name))
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:go-package-function"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected one package selector CALL: {calls:?}"
+    );
+    assert_eq!(
+        calls[0].resolved_target, None,
+        "invalid package selector CALL must remain explicitly unresolved"
+    );
+}
+
+fn assert_unresolved_nonpackage_go_selector_call(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, target_name))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{caller_name}.{target_name}: expected one selector CALL: {calls:?}"
+    );
+    assert_eq!(
+        calls[0].resolved_target, None,
+        "{caller_name}.{target_name}: selector CALL must remain unresolved"
+    );
+    assert!(
+        calls[0]
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("syntax:go-selector-call"))
+    );
+    assert!(
+        !calls[0]
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("syntax:go-package-function")),
+        "a captured local inside an unsupported function-literal scope must not become a package call"
+    );
+}
+
+fn assert_resolved_call_kind(
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    target_name: &str,
+    expected_kind: NodeKind,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let matching = edges.iter().any(|edge| {
+        edge.kind == EdgeKind::CALL
+            && node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+            && edge
+                .resolved_target
+                .and_then(|target| node_by_id.get(&target).copied())
+                .is_some_and(|target| {
+                    target.kind == expected_kind
+                        && is_matching_name(&target.serialized_name, target_name)
+                })
+    });
+    assert!(
+        matching,
+        "{caller_name}: expected resolved {expected_kind:?} call"
+    );
+}
+
+#[test]
+fn test_go_imported_and_unowned_selector_controls_stay_in_place() -> anyhow::Result<()> {
+    // G10: imported typed receiver with same-named methods elsewhere.
+    let notifier_source = r#"
+package notifier
+type Notifier interface {
+    Notify()
+}
+"#;
+    let workflow_source = r#"
+package workflow
+import mail "example.com/project/notifier"
+type Notifier interface {
+    Notify()
+}
+func Run(n mail.Notifier) {
+    n.Notify()
+}
+"#;
+    let other_notifier_source = r#"
+package other
+type Notifier interface {
+    Notify()
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("project/notifier/notifier.go", notifier_source),
+        ("other/notifier/notifier.go", other_notifier_source),
+        ("workflow.go", workflow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "G10",
+        &nodes,
+        &edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "project/notifier/notifier.go",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "G10",
+        &nodes,
+        &edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "other/notifier/notifier.go",
+    );
+
+    // G11: unowned selector must not gain a concrete METHOD target.
+    let (nodes, edges) = index_files(&[(
+        "g11.go",
+        r#"
+package probe
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Guess(x any) { x.String() }
+"#,
+    )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Guess", "String").resolved_target,
+        None
+    );
+    assert_no_resolved_call_to_method_owner("G11", &nodes, &edges, "Guess", "Handler", "String");
+    assert_no_resolved_call_of_kind("G11", &nodes, &edges, "Guess", NodeKind::METHOD);
+    Ok(())
+}
+
+#[test]
+fn test_go_ownerless_bare_call_eligibility_survives_resolution_support_refresh()
+-> anyhow::Result<()> {
+    // G13: eligibility after snapshot-loaded resolution, then after a method-case
+    // refresh. Unchanged incremental indexing skips ResolutionPass when
+    // graph_projection_changed is false; the authentic reuse path is the same
+    // standalone ResolutionPass::run used by the existing snapshot integration
+    // test.
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("g13.go");
+    fs::write(
+        &file_path,
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) String() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let refresh = |storage: &mut Storage, files: Vec<std::path::PathBuf>| {
+        indexer.run_incremental(
+            storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: files,
+                files_to_remove: vec![],
+                existing_file_ids: std::collections::HashMap::new(),
+            },
+            &event_bus,
+            None,
+        )
+    };
+
+    let first = refresh(&mut storage, vec![file_path.clone()])?;
+    assert!(!first.resolution_support_snapshot_hit);
+    assert!(first.resolution_support_snapshot_stored);
+    assert!(storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
+
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner(
+        "G13-initial",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_of_kind("G13-initial", &nodes, &edges, "Convert", NodeKind::METHOD);
+
+    let snapshot_loaded = ResolutionPass::new().run(&mut storage)?;
+    assert!(
+        snapshot_loaded.telemetry.support_snapshot_hit,
+        "G13 must load v7 call-candidate kind from the stored snapshot"
+    );
+    assert!(!snapshot_loaded.telemetry.support_snapshot_stored);
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner(
+        "G13-snapshot-hit",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_of_kind(
+        "G13-snapshot-hit",
+        &nodes,
+        &edges,
+        "Convert",
+        NodeKind::METHOD,
+    );
+
+    fs::write(
+        &file_path,
+        r#"
+package probe
+type Key string
+type Handler struct{}
+func (Handler) string() string { return "handler" }
+func Convert(k Key) string { return string(k) }
+"#,
+    )?;
+    refresh(&mut storage, vec![file_path])?;
+
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    assert_no_resolved_call_to_method_owner(
+        "G13-refresh",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "string",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "G13-refresh",
+        &nodes,
+        &edges,
+        "Convert",
+        "Handler",
+        "String",
+    );
+    assert_no_resolved_call_of_kind("G13-refresh", &nodes, &edges, "Convert", NodeKind::METHOD);
+    Ok(())
+}
+
+#[test]
+fn test_go_implicit_import_must_use_declared_package_name() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n"),
+        ("oddpath/target.go", "package declared\nfunc Target() {}\n"),
+        (
+            "caller.go",
+            "package caller\nimport \"example.com/project/oddpath\"\nfunc Caller() { wrong.Target() }\n",
+        ),
+    ])?;
+    assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
     Ok(())
 }

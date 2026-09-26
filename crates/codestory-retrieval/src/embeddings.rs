@@ -4,6 +4,7 @@ use crate::config::SidecarRuntimeConfig;
 use crate::embedding_server_compat::{
     ProductEmbeddingIdentity, embed_prepared_queries_via_server_with_control,
     embed_prepared_query_via_server_with_control, embed_prepared_via_server_with_control,
+    embed_prepared_via_server_with_control_and_timings,
 };
 #[cfg(not(feature = "test-support"))]
 use crate::embedding_server_compat::{
@@ -208,6 +209,35 @@ impl ProductEmbeddingClient {
             .map(|text| format!("{CODERANK_DOCUMENT_PREFIX_DEFAULT}{text}"))
             .collect::<Vec<_>>();
         self.embed_prepared_texts_with_control(&prepared, maximum_timeout, cancelled)
+    }
+
+    pub(crate) fn embed_documents_with_control_and_timings(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(
+        Vec<Vec<f32>>,
+        crate::per_user_embedding::EmbeddingVectorTimings,
+    )> {
+        let prepared = if CODERANK_DOCUMENT_PREFIX_DEFAULT.is_empty() {
+            texts.to_vec()
+        } else {
+            texts
+                .iter()
+                .map(|text| format!("{CODERANK_DOCUMENT_PREFIX_DEFAULT}{text}"))
+                .collect()
+        };
+        ensure_test_embedding_available(&self.runtime.cache_root)?;
+        if prepared.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed empty text");
+        }
+        embed_prepared_via_server_with_control_and_timings(
+            &self.runtime,
+            &prepared,
+            maximum_timeout,
+            cancelled,
+        )
     }
 
     pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

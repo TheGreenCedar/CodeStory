@@ -3,6 +3,7 @@ use crate::route_coverage::{
     RouteHandlerCandidate, compare_route_handler_candidates,
     route_endpoint_metadata_from_canonical, route_endpoint_metadata_from_openapi_label,
 };
+use crate::search::engine::search_core_symbol_names_with_scores;
 #[cfg(test)]
 use crate::search_scoring::HybridSearchInstrumentation;
 use crate::support::node_display_name;
@@ -15,8 +16,19 @@ use codestory_contracts::api::{
     NodeOccurrencesRequest, RouteEndpointHandlerDto, RouteEndpointMetadataDto, SearchHit,
     SourceOccurrenceDto, SymbolSummaryDto, TrailConfigDto, TrailFilterOptionsDto,
 };
+use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use codestory_contracts::graph::Node as GraphNode;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// Identity-index result that can be considered before a packet candidate is
+/// hydrated. It deliberately carries no node body, file record, source, or
+/// graph neighborhood.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedSymbolIdentityCandidate {
+    pub(crate) node_id: NodeId,
+    pub(crate) display_name: String,
+}
 
 /// Copy only the cached display names the caller can still read back.
 ///
@@ -35,6 +47,148 @@ where
 }
 
 impl AppController {
+    pub(crate) fn resolve_indexed_symbol_identity_by_id(
+        &self,
+        id: &NodeId,
+    ) -> Result<Option<IndexedSymbolIdentityCandidate>, ApiError> {
+        self.ensure_search_state()?;
+        let Some(core_id) =
+            id.0.parse::<i64>()
+                .ok()
+                .map(codestory_contracts::graph::NodeId)
+        else {
+            return Ok(None);
+        };
+        let state = self.state.lock();
+        Ok(state
+            .node_names
+            .get(&core_id)
+            .map(|display_name| IndexedSymbolIdentityCandidate {
+                node_id: id.clone(),
+                display_name: display_name.clone(),
+            }))
+    }
+
+    pub(crate) fn resolve_exact_indexed_symbol_identities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<IndexedSymbolIdentityCandidate>, ApiError> {
+        self.ensure_search_state()?;
+        let query = query.trim();
+        let mut candidates = {
+            let mut state = self.state.lock();
+            let engine = state.search_engine.as_mut().ok_or_else(|| {
+                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+            })?;
+            let matches = engine.search_symbol_with_scores(query);
+            let names = node_names_for_ids(&state.node_names, matches.iter().map(|(id, _)| *id));
+            matches
+                .into_iter()
+                .filter_map(|(id, _)| {
+                    names
+                        .get(&id)
+                        .filter(|display_name| display_name.as_str() == query)
+                        .map(|display_name| IndexedSymbolIdentityCandidate {
+                            node_id: NodeId::from(id),
+                            display_name: display_name.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+        candidates.dedup_by(|left, right| left.node_id == right.node_id);
+        // One extra identity lets the packet admission gate observe and type
+        // the overflow without opening an unbounded file/detail projection.
+        candidates.truncate(INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1));
+        Ok(candidates)
+    }
+
+    pub(crate) fn resolve_exact_indexed_symbol_identities_in_file(
+        &self,
+        query: &str,
+        project_root: &Path,
+        exact_path: &Path,
+    ) -> Result<Vec<IndexedSymbolIdentityCandidate>, ApiError> {
+        let query = query.trim();
+        let file = std::fs::File::open(exact_path).map_err(|error| {
+            ApiError::internal(format!("Failed to pin file-symbol path identity: {error}"))
+        })?;
+        let file_identity =
+            codestory_workspace::workspace_file_identity(&file).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to observe file-symbol path identity: {error}"
+                ))
+            })?;
+        let storage = self.open_storage_read_only()?;
+        // Public packet operations already hold a core read snapshot. Direct
+        // controller callers also need all identity pages to share one view.
+        let snapshot = if self.active_core_publication().is_none() {
+            Some(storage.read_snapshot().map_err(|error| {
+                ApiError::internal(format!("Failed to pin file-symbol identities: {error}"))
+            })?)
+        } else {
+            None
+        };
+        let mut after_node_id = None;
+        let mut candidates = Vec::new();
+        let local_limit = INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1);
+        loop {
+            let page = storage
+                .get_exact_symbol_file_identities_after(query, after_node_id, 256)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve file-scoped symbol identities: {error}"
+                    ))
+                })?;
+            if page.is_empty() {
+                break;
+            }
+            after_node_id = page.last().map(|identity| identity.node_id);
+            for identity in page {
+                let Some(path) = identity.file_path else {
+                    continue;
+                };
+                let path = Path::new(&path);
+                let joined;
+                let candidate_path = if path.is_absolute() {
+                    path
+                } else {
+                    joined = project_root.join(path);
+                    joined.as_path()
+                };
+                if codestory_workspace::workspace_path_identity(candidate_path)
+                    .is_ok_and(|identity| identity == file_identity)
+                {
+                    candidates.push(IndexedSymbolIdentityCandidate {
+                        node_id: NodeId::from(identity.node_id),
+                        display_name: query.to_string(),
+                    });
+                }
+            }
+            // Preserve deterministic API-ID ordering with bounded retained
+            // memory. Neither the fuzzy 200-result window nor the global
+            // admission window can hide a match in the selected file.
+            candidates.sort_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+            candidates.truncate(local_limit);
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.finish().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to finish file-symbol identity read: {error}"
+                ))
+            })?;
+        }
+        if !codestory_workspace::workspace_path_identity(exact_path)
+            .is_ok_and(|identity| identity == file_identity)
+        {
+            return Err(ApiError::new(
+                "file_identity_changed",
+                "file-symbol path changed during identity resolution",
+            ));
+        }
+        Ok(candidates)
+    }
+
     pub(crate) fn cached_labels<I>(
         &self,
         ids: I,
@@ -164,8 +318,9 @@ impl AppController {
     ///
     /// This intentionally bypasses mandatory sidecar product search so symbol,
     /// snippet, trail, and graph-query target resolution can work from an
-    /// already-open indexed store. Product search and packet evidence must use
-    /// the sidecar-primary search paths instead.
+    /// already-open indexed store. Explicit `search --repo-text off` composes
+    /// this resolver as its complete-core lane. Ordinary search and packet
+    /// evidence still use the sidecar-primary paths.
     pub fn resolve_indexed_symbol_candidates(
         &self,
         query: &str,
@@ -197,6 +352,96 @@ impl AppController {
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
+        });
+        hits.truncate(max_results.clamp(1, 50));
+        Ok(hits)
+    }
+
+    /// Resolve symbols from the immutable core projection only.
+    ///
+    /// This deliberately avoids `ensure_search_state`: that path attaches the
+    /// persisted search generation and therefore acquires its catalog lock.
+    /// An explicit `repo_text=off` query owns no retrieval or search-generation
+    /// dependency, so it streams canonical identities from the already-pinned
+    /// core and applies the same in-memory fuzzy matcher directly.
+    pub(crate) fn resolve_core_symbol_candidates(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        let storage = self.open_storage_read_only()?;
+        let project_root = self.require_project_root()?;
+        let absolute_file_query = Path::new(query.trim()).is_absolute();
+        let expected_rows = storage
+            .get_canonical_search_symbol_count()
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+            })?;
+        let mut symbols = Vec::new();
+        let mut node_names = HashMap::with_capacity(expected_rows as usize);
+        let mut after_node_id = None;
+        let mut stream_rows = 0_usize;
+        loop {
+            let batch = storage
+                .get_canonical_search_symbol_detail_batch_after(
+                    after_node_id,
+                    crate::semantic_projection::SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+                )
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to stream canonical search symbol details: {error}"
+                    ))
+                })?;
+            if batch.is_empty() {
+                break;
+            }
+            after_node_id = batch.last().map(|entry| entry.node_id);
+            stream_rows = stream_rows.saturating_add(batch.len());
+            for entry in batch {
+                let display_name =
+                    if entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64) {
+                        let path = Path::new(&entry.display_name);
+                        match codestory_workspace::workspace_relative_path(&project_root, path) {
+                            // Preserve an explicit absolute FILE lookup, but keep
+                            // checkout-root spelling out of ordinary fuzzy search.
+                            Some(_) if absolute_file_query => entry.display_name.clone(),
+                            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+                            None if path.is_absolute() => continue,
+                            None => entry.display_name.clone(),
+                        }
+                    } else {
+                        entry.display_name
+                    };
+                node_names.insert(entry.node_id, display_name.clone());
+                symbols.push((entry.node_id, display_name));
+            }
+        }
+        if stream_rows != expected_rows as usize {
+            return Err(ApiError::internal(format!(
+                "Canonical search symbol detail stream count changed: expected {expected_rows}, loaded {stream_rows}"
+            )));
+        }
+        let matches = search_core_symbol_names_with_scores(&symbols, query);
+        let names = node_names_for_ids(&node_names, matches.iter().map(|(id, _)| *id));
+        let mut hits = matches
+            .into_iter()
+            .map(|(id, score)| Self::build_search_hit(&storage, &names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(
+                Some(project_root.as_path()),
+                query,
+                left,
+                right,
+                None,
+            )
         });
         hits.truncate(max_results.clamp(1, 50));
         Ok(hits)
@@ -263,14 +508,37 @@ impl AppController {
         self.state.lock().last_hybrid_instrumentation.take()
     }
 
-    /// Build an evidence packet with sufficiency, diagnostics, and budget metadata.
+    /// Build one bounded, source-backed evidence packet with typed diagnostics.
     ///
-    /// Packet sufficiency is a runtime judgment over resolved evidence. Full-mode sidecar
-    /// candidates that fail symbol resolution remain diagnostics and do not become supported
-    /// claims merely because retrieval returned them.
+    /// The packet reports no answer-sufficiency judgment. Candidate admission is
+    /// descriptor-only; source and graph evidence may be opened only after the
+    /// packet-wide admission session is sealed.
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        agent::retrieval_primary::with_stable_retrieval_publication(self, "packet output", || {
-            agent::agent_packet(self, req.clone())
+        self.with_complete_core_snapshot(|publication| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                &publication.generation_id,
+                &publication.run_id,
+                || agent::agent_packet(self, req.clone()),
+            )
+        })
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn agent_packet_for_benchmark(
+        &self,
+        req: AgentPacketRequestDto,
+        include_dense_semantic: bool,
+    ) -> Result<agent::orchestrator::BenchmarkPacketExecution, ApiError> {
+        self.with_complete_core_snapshot(|publication| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                &publication.generation_id,
+                &publication.run_id,
+                || agent::agent_packet_for_benchmark(self, req.clone(), include_dense_semantic),
+            )
         })
     }
 

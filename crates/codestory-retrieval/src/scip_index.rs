@@ -2,16 +2,29 @@
 
 use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::{EdgeKind, NodeId, NodeKind};
-use codestory_contracts::validation_receipts::SealedReceiptCache;
+use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
+use codestory_contracts::validation_receipts::{SealedReceiptCache, TransferableReceipt};
 use codestory_store::Store;
+use codestory_workspace::paths::sqlite_open_path;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const SCIP_SYMBOLS_FILE: &str = "symbols.index.json";
+const SCIP_SYMBOLS_DATABASE_FILE: &str = "symbols.index.sqlite3";
+
+pub(crate) fn scip_symbols_component_path(project_dir: &Path) -> PathBuf {
+    let database = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    if database.is_file() {
+        database
+    } else {
+        project_dir.join(SCIP_SYMBOLS_FILE)
+    }
+}
 pub const SCIP_INDEX_FILE: &str = "index.scip";
 pub const SCIP_PRECISE_SEMANTIC_IMPORT_DIR: &str = "precise-semantic-import";
 pub const SCIP_IMPORTED_PROOF_PROVENANCE: &str = "imported_scip_proof";
@@ -23,12 +36,31 @@ const SCIP_POSITION_ENCODING: &str = "line_one_based_utf16_column_zero_based";
 /// Marker written beside stubbed SCIP artifacts. One spelling, so a probe and a
 /// producer cannot disagree about what "stubbed" looks like on disk.
 pub const SCIP_STUB_MARKER_FILE: &str = "index.scip.stub";
-const SCIP_PARSED_INDEX_RECEIPT_CAPACITY: usize = 1;
+const SCIP_PARSED_INDEX_RECEIPT_CAPACITY: usize = 4;
 
-static SCIP_PARSED_INDEX_RECEIPTS: SealedReceiptCache<
-    (PathBuf, String, String),
-    Option<Arc<ScipQueryView>>,
-> = SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
+static SCIP_PARSED_INDEX_RECEIPTS: SealedReceiptCache<PathBuf, Arc<ScipQueryData>> =
+    SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
+static SCIP_GRAPH_HEALTH_RECEIPTS: SealedReceiptCache<PathBuf, String> =
+    SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
+
+fn scip_graph_health_artifacts(project_dir: &Path, component: &Path) -> Vec<PathBuf> {
+    let mut artifacts = sqlite_file_with_sidecars(component);
+    artifacts.push(project_dir.join("revision.txt"));
+    artifacts.push(project_dir.join(SCIP_INDEX_FILE));
+    artifacts
+}
+
+/// The producer has verified the staged rows before publishing this immutable
+/// component and has now written its revision and marker. A later health probe
+/// can reuse that fact only while the whole publication envelope stays sealed.
+fn seal_produced_scip_graph_health(project_dir: &Path, revision: &str) {
+    let component = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    let _ = SCIP_GRAPH_HEALTH_RECEIPTS.seal_produced(
+        component.clone(),
+        &scip_graph_health_artifacts(project_dir, &component),
+        revision.to_owned(),
+    );
+}
 
 /// Header of the graph-projection `index.scip` marker.
 const SCIP_INDEX_MARKER_HEADER: &str = "codestory-scip-v1";
@@ -186,7 +218,7 @@ const SCIP_ADJACENCY_SEED_BATCH: usize = 512;
 /// neighbours, never adds one.
 const SCIP_MAX_REFERENCES_PER_SYMBOL: usize = 32;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScipSymbolRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
@@ -439,7 +471,7 @@ impl fmt::Display for ScipArtifactDefect {
 
 impl std::error::Error for ScipArtifactDefect {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScipSymbolsIndex {
     /// Retrieval generation this artifact was built for or admitted into.
     /// Legacy artifacts deserialize with an empty generation and are refused.
@@ -455,19 +487,25 @@ pub struct ScipSymbolsIndex {
 
 /// Generation-bound query state derived once from one sealed SCIP artifact.
 ///
-/// The JSON records remain the serialized source of truth. This view only
-/// removes repeated hot-path parsing, normalization, symbol-map construction,
-/// and whole-proof scans. It is cached under the same sealed file identity as
-/// the parsed artifact and cannot outlive that receipt.
+/// The validated component records remain the serialized source of truth. This
+/// view removes repeated hot-path normalization, symbol-map construction, and
+/// whole-proof scans. It is cached under the same sealed file identity as the
+/// parsed artifact and cannot outlive that receipt.
 #[derive(Debug)]
 pub(crate) struct ScipQueryView {
+    generation: String,
+    data: Arc<ScipQueryData>,
+}
+
+#[derive(Debug)]
+struct ScipQueryData {
     index: Arc<ScipSymbolsIndex>,
     normalized_symbols: Vec<ScipNormalizedSymbol>,
     by_node_id: HashMap<String, usize>,
     adjacency_by_node: HashMap<String, Vec<ScipTypedAdjacency>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ScipNormalizedSymbol {
     pub(crate) symbol_lower: String,
     pub(crate) path_lower: String,
@@ -492,9 +530,67 @@ pub(crate) enum ScipAdjacencyDirection {
 }
 
 impl ScipQueryView {
-    fn build(index: Arc<ScipSymbolsIndex>, generation: &str) -> Result<Self> {
+    fn from_data(data: Arc<ScipQueryData>, generation: &str) -> Result<Self> {
+        if generation.trim().is_empty() {
+            bail!("scip artifact carries no generation");
+        }
+        Ok(Self {
+            generation: generation.to_string(),
+            data,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn contract(&self) -> &ScipProofAdapterContract {
+        &self.data.index.contract
+    }
+
+    pub(crate) fn symbol_count(&self) -> usize {
+        self.data.index.symbols.len()
+    }
+
+    pub(crate) fn proof_count(&self) -> usize {
+        self.data.index.proofs.len()
+    }
+
+    pub(crate) fn symbols(
+        &self,
+    ) -> impl Iterator<Item = (&ScipSymbolRecord, &ScipNormalizedSymbol)> {
+        self.data
+            .index
+            .symbols
+            .iter()
+            .zip(&self.data.normalized_symbols)
+    }
+
+    pub(crate) fn symbol_at(&self, index: usize) -> Option<&ScipSymbolRecord> {
+        self.data.index.symbols.get(index)
+    }
+
+    pub(crate) fn symbol_for_node(&self, node_id: &str) -> Option<&ScipSymbolRecord> {
+        self.data
+            .by_node_id
+            .get(node_id)
+            .and_then(|index| self.symbol_at(*index))
+    }
+
+    pub(crate) fn adjacency(&self, node_id: &str) -> &[ScipTypedAdjacency] {
+        self.data
+            .adjacency_by_node
+            .get(node_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl ScipQueryData {
+    fn build(index: Arc<ScipSymbolsIndex>) -> Result<Self> {
         index
-            .validate_records(generation)
+            .validate_records(&index.generation)
             .map_err(anyhow::Error::new)?;
 
         let normalized_symbols = index
@@ -555,37 +651,6 @@ impl ScipQueryView {
             by_node_id,
             adjacency_by_node,
         })
-    }
-
-    pub(crate) fn index(&self) -> &ScipSymbolsIndex {
-        &self.index
-    }
-
-    pub(crate) fn index_arc(&self) -> Arc<ScipSymbolsIndex> {
-        Arc::clone(&self.index)
-    }
-
-    pub(crate) fn symbols(
-        &self,
-    ) -> impl Iterator<Item = (&ScipSymbolRecord, &ScipNormalizedSymbol)> {
-        self.index.symbols.iter().zip(&self.normalized_symbols)
-    }
-
-    pub(crate) fn symbol_at(&self, index: usize) -> Option<&ScipSymbolRecord> {
-        self.index.symbols.get(index)
-    }
-
-    pub(crate) fn symbol_for_node(&self, node_id: &str) -> Option<&ScipSymbolRecord> {
-        self.by_node_id
-            .get(node_id)
-            .and_then(|index| self.symbol_at(*index))
-    }
-
-    pub(crate) fn adjacency(&self, node_id: &str) -> &[ScipTypedAdjacency] {
-        self.adjacency_by_node
-            .get(node_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
     }
 }
 
@@ -743,8 +808,8 @@ pub(crate) fn reference_defect(
     lookup: &ScipSymbolLookup<'_>,
     source: ScipEvidenceSource,
 ) -> Option<ScipProofDefect> {
-    let target_symbol = proof.target_symbol.as_deref().unwrap_or("").trim();
-    if target_symbol.is_empty() {
+    let target_symbol = proof.target_symbol.as_deref().unwrap_or("");
+    if target_symbol.trim().is_empty() {
         return Some(ScipProofDefect::ReferenceMissingTargetSymbol);
     }
     match source {
@@ -755,7 +820,7 @@ pub(crate) fn reference_defect(
             if proof.edge_kind.is_some() {
                 return Some(ScipProofDefect::ReferenceForgedEdgeKind);
             }
-            (!lookup.has_symbol_named(target_symbol))
+            (!lookup.has_symbol_named(target_symbol.trim()))
                 .then_some(ScipProofDefect::ReferenceTargetSymbolUnknown)
         }
         ScipEvidenceSource::GraphProjection => {
@@ -936,11 +1001,44 @@ pub fn import_precise_semantic_scip_artifact(
 /// reference records for every validated graph adjacency between two emitted
 /// symbols, is stamped with `generation`, and is fully validated before it is
 /// written — an artifact that cannot validate is never published.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
 pub fn emit_scip_artifacts_from_store(
     storage_path: &Path,
     project_dir: &Path,
     generation: &str,
 ) -> Result<Option<String>> {
+    emit_scip_artifacts_from_store_incremental_with_cancel(
+        storage_path,
+        project_dir,
+        generation,
+        None,
+        &|| false,
+        || Ok(()),
+    )
+    .map(|outcome| outcome.revision)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScipIncrementalOutcome {
+    pub revision: Option<String>,
+    pub retained_records: u64,
+    pub inserted_records: u64,
+    pub removed_records: u64,
+    pub reordered_records: u64,
+    pub cloned: bool,
+    pub copied: bool,
+    pub direct_reference: bool,
+}
+
+pub(crate) fn emit_scip_artifacts_from_store_incremental_with_cancel(
+    storage_path: &Path,
+    project_dir: &Path,
+    generation: &str,
+    previous_project_dir: Option<&Path>,
+    cancelled: &dyn Fn() -> bool,
+    mut before_publish: impl FnMut() -> Result<()>,
+) -> Result<ScipIncrementalOutcome> {
     if generation.trim().is_empty() {
         bail!("scip emit requires a non-empty retrieval generation");
     }
@@ -971,6 +1069,9 @@ pub fn emit_scip_artifacts_from_store(
             if row.node_kind == Some(NodeKind::UNKNOWN as i64) {
                 continue;
             }
+            if row.display_name.trim().is_empty() {
+                continue;
+            }
             let Some(file_path) = row.file_path.as_deref().map(normalize_scip_path) else {
                 continue;
             };
@@ -992,7 +1093,16 @@ pub fn emit_scip_artifacts_from_store(
     }
 
     if symbols.is_empty() {
-        return Ok(None);
+        return Ok(ScipIncrementalOutcome {
+            revision: None,
+            retained_records: 0,
+            inserted_records: 0,
+            removed_records: 0,
+            reordered_records: 0,
+            cloned: false,
+            copied: false,
+            direct_reference: false,
+        });
     }
 
     let references = collect_reference_adjacency(&storage, &symbols)
@@ -1013,9 +1123,14 @@ pub fn emit_scip_artifacts_from_store(
     index
         .validate_records(generation)
         .context("validate scip artifact before publication")?;
-    let json = serde_json::to_string_pretty(&index).context("serialize scip symbols index")?;
-    std::fs::write(project_dir.join(SCIP_SYMBOLS_FILE), json)
-        .context("write symbols.index.json")?;
+    let work = publish_scip_component_with_cancel(
+        project_dir,
+        previous_project_dir,
+        &index,
+        cancelled,
+        &mut before_publish,
+    )?;
+    before_publish()?;
     std::fs::write(project_dir.join("revision.txt"), format!("{revision}\n"))
         .context("write scip revision")?;
     // Minimal marker so health treats graph lane as backed by a real artifact
@@ -1026,7 +1141,866 @@ pub fn emit_scip_artifacts_from_store(
     if stub.is_file() {
         std::fs::remove_file(stub).context("remove scip stub marker")?;
     }
-    Ok(Some(revision))
+    seal_produced_scip_graph_health(project_dir, &revision);
+    Ok(ScipIncrementalOutcome {
+        revision: Some(revision),
+        retained_records: work.retained,
+        inserted_records: work.inserted,
+        removed_records: work.removed,
+        reordered_records: work.reordered,
+        cloned: work.cloned,
+        copied: work.copied,
+        direct_reference: work.direct_reference,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn emit_scip_artifacts_from_store_incremental(
+    storage_path: &Path,
+    project_dir: &Path,
+    generation: &str,
+    previous_project_dir: Option<&Path>,
+    before_publish: impl FnMut() -> Result<()>,
+) -> Result<ScipIncrementalOutcome> {
+    emit_scip_artifacts_from_store_incremental_with_cancel(
+        storage_path,
+        project_dir,
+        generation,
+        previous_project_dir,
+        &|| false,
+        before_publish,
+    )
+}
+
+/// Publish a generation envelope over graph bytes already proven equivalent.
+///
+/// The heavy SQLite component is hard-linked from the validated predecessor;
+/// the small revision and marker files are re-emitted for the new generation
+/// directory. The parsed query-view receipt follows the hard link, so a warm
+/// runtime neither streams the core graph nor rereads the unchanged component.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reference_equivalent_scip_generation(
+    previous_project_dir: &Path,
+    project_dir: &Path,
+    previous_generation: &str,
+    generation: &str,
+    expected_revision: &str,
+    mut before_publish: impl FnMut() -> Result<()>,
+) -> Result<Option<ScipIncrementalOutcome>> {
+    if previous_generation.trim().is_empty()
+        || generation.trim().is_empty()
+        || expected_revision.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(previous_view) =
+        load_fresh_scip_query_view(previous_project_dir, expected_revision, previous_generation)?
+    else {
+        return Ok(None);
+    };
+    let previous_path = previous_project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    if !previous_path.is_file() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(project_dir)
+        .with_context(|| format!("create scip dir {}", project_dir.display()))?;
+    let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    if path.exists() {
+        return Ok(None);
+    }
+    let previous_key = previous_path.clone();
+    let previous_artifacts = sqlite_file_with_sidecars(&previous_path);
+    let transferable =
+        SCIP_PARSED_INDEX_RECEIPTS.transferable_receipt(&previous_key, &previous_artifacts);
+    let (temp_path, reserved) =
+        codestory_workspace::atomic_file::create_unique_temp_file(&path, "scip-symbols")?;
+    drop(reserved);
+    std::fs::remove_file(&temp_path)?;
+    if !crate::copy_on_write::reference_file(&previous_path, &temp_path)? {
+        return Ok(None);
+    }
+
+    let result = (|| {
+        before_publish()?;
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
+        before_publish()?;
+        std::fs::write(
+            project_dir.join("revision.txt"),
+            format!("{expected_revision}\n"),
+        )
+        .context("write referenced scip revision")?;
+        write_scip_index_marker(project_dir, expected_revision)?;
+        let stub = project_dir.join(SCIP_STUB_MARKER_FILE);
+        if stub.is_file() {
+            std::fs::remove_file(stub).context("remove scip stub marker")?;
+        }
+        let aliased = if let Some(transferable) = transferable {
+            SCIP_PARSED_INDEX_RECEIPTS.install_hard_link_alias(
+                &previous_key,
+                &previous_artifacts,
+                path.clone(),
+                &sqlite_file_with_sidecars(&path),
+                transferable,
+                Ok::<_, anyhow::Error>,
+            )?
+        } else {
+            false
+        };
+        if !aliased {
+            // A missing or invalid transfer cannot authorize the referenced
+            // bytes. Validate the newly published component before returning.
+            let validated = load_scip_symbols_database(&path)?;
+            if validated.revision != expected_revision {
+                bail!("referenced scip component revision changed");
+            }
+        }
+        seal_produced_scip_graph_health(project_dir, expected_revision);
+        let retained_records = previous_view
+            .symbol_count()
+            .saturating_add(previous_view.proof_count()) as u64;
+        Ok(ScipIncrementalOutcome {
+            revision: Some(expected_revision.to_string()),
+            retained_records,
+            inserted_records: 0,
+            removed_records: 0,
+            reordered_records: 0,
+            cloned: false,
+            copied: false,
+            direct_reference: true,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        for owned in [
+            path,
+            project_dir.join("revision.txt"),
+            project_dir.join(SCIP_INDEX_FILE),
+        ] {
+            let _ = std::fs::remove_file(owned);
+        }
+    }
+    result.map(Some)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScipComponentWork {
+    retained: u64,
+    inserted: u64,
+    removed: u64,
+    reordered: u64,
+    cloned: bool,
+    copied: bool,
+    direct_reference: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ScipComponentRow {
+    key: String,
+    kind: &'static str,
+    record_sha256: String,
+    #[cfg(test)]
+    record_json: String,
+    ordinal: u64,
+}
+
+fn publish_scip_component_with_cancel(
+    project_dir: &Path,
+    previous_project_dir: Option<&Path>,
+    index: &ScipSymbolsIndex,
+    cancelled: &dyn Fn() -> bool,
+    before_publish: &mut dyn FnMut() -> Result<()>,
+) -> Result<ScipComponentWork> {
+    let rows = scip_component_rows(index)?;
+    let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    let (temp_path, reserved) =
+        codestory_workspace::atomic_file::create_unique_temp_file(&path, "scip-symbols")?;
+    drop(reserved);
+    let mut stage_failed = false;
+    let result: Result<ScipComponentWork> = (|| {
+        std::fs::remove_file(&temp_path)?;
+        let mut stage = None;
+        let mut direct_reference = false;
+        if let Some(previous_dir) = previous_project_dir {
+            let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+            if let Ok(previous) = load_scip_symbols_database(&previous_path) {
+                crate::copy_on_write::make_file_immutable(&previous_path)?;
+                if same_physical_scip_component(&previous, index)
+                    && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
+                {
+                    direct_reference = true;
+                } else if scip_component_schema(&previous_path)? == 2 {
+                    stage = Some(
+                        crate::copy_on_write::stage_file(&previous_path, &temp_path, cancelled)
+                            .inspect_err(|_| {
+                                stage_failed = true;
+                            })?,
+                    );
+                }
+            }
+        }
+        let work = if direct_reference {
+            ScipComponentWork {
+                retained: rows.len() as u64,
+                inserted: 0,
+                removed: 0,
+                reordered: 0,
+                cloned: false,
+                copied: false,
+                direct_reference: true,
+            }
+        } else if stage.is_some() {
+            reconcile_scip_component(&temp_path, index, &rows)?
+        } else {
+            write_scip_component(&temp_path, index, &rows)?
+        };
+        // Content-bind the staged bytes: reconstruct digests from on-disk rows
+        // (v2 tables or v1 record payloads) before the publish fence.
+        verify_staged_scip_component(&temp_path, index, &rows)?;
+        before_publish()?;
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
+        let legacy = project_dir.join(SCIP_SYMBOLS_FILE);
+        if legacy.is_file() {
+            std::fs::remove_file(legacy)?;
+        }
+        Ok(ScipComponentWork {
+            cloned: stage.is_some_and(|stage| {
+                stage.strategy == codestory_store::SealedStageStrategy::Cloned
+            }),
+            copied: stage.is_some_and(|stage| {
+                stage.strategy == codestory_store::SealedStageStrategy::Copied
+            }),
+            direct_reference,
+            ..work
+        })
+    })();
+    if result.is_err() && !stage_failed {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(test)]
+fn publish_scip_component(
+    project_dir: &Path,
+    previous_project_dir: Option<&Path>,
+    index: &ScipSymbolsIndex,
+    before_publish: &mut dyn FnMut() -> Result<()>,
+) -> Result<ScipComponentWork> {
+    publish_scip_component_with_cancel(
+        project_dir,
+        previous_project_dir,
+        index,
+        &|| false,
+        before_publish,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn publish_scip_component_for_test(
+    project_dir: &Path,
+    index: &ScipSymbolsIndex,
+) -> Result<()> {
+    publish_scip_component(project_dir, None, index, &mut || Ok(())).map(|_| ())
+}
+
+fn verify_staged_scip_component(
+    path: &Path,
+    index: &ScipSymbolsIndex,
+    rows: &[ScipComponentRow],
+) -> Result<()> {
+    let expected_digest = scip_component_digest_from_rows(rows)?;
+    let connection = Connection::open_with_flags(
+        sqlite_open_path(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("open staged scip component for digest verification")?;
+    let schema: i32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read staged scip component schema")?;
+    let check: String = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .context("quick_check staged scip component")?;
+    if check != "ok" {
+        bail!("staged scip component failed quick_check");
+    }
+    let (generation, revision, symbol_count, proof_count, stored_digest) = connection
+        .query_row(
+            "SELECT generation, revision, symbol_count, proof_count, component_sha256
+             FROM metadata WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .context("read staged scip component metadata")?;
+    drop(connection);
+    if revision != index.revision {
+        bail!(
+            "staged scip component revision mismatch: {} != {}",
+            revision,
+            index.revision
+        );
+    }
+    let expected_symbols =
+        i64::try_from(index.symbols.len()).context("scip symbol cardinality overflow")?;
+    let expected_proofs =
+        i64::try_from(index.proofs.len()).context("scip proof cardinality overflow")?;
+    if symbol_count != expected_symbols || proof_count != expected_proofs {
+        bail!(
+            "staged scip component cardinality mismatch: symbols {symbol_count}/{expected_symbols}, proofs {proof_count}/{expected_proofs}"
+        );
+    }
+    if stored_digest != expected_digest {
+        bail!("staged scip component digest mismatch");
+    }
+    // Generation may differ under hard-link reuse: identical graph bytes are
+    // remapped by the publication envelope (`load_scip_symbols_database_for_generation`),
+    // so content-bind digests + revision, not the stamped metadata generation.
+    let _ = generation;
+    match schema {
+        2 => {
+            // Reconstruct records from on-disk v2 tables and re-hash. Metadata
+            // digest + COUNT alone would miss a cell rewrite that left the
+            // envelope untouched.
+            let decoded = read_v2_scip_component(path)
+                .context("content-bind staged scip v2 component from on-disk rows")?;
+            let observed_rows = scip_component_rows(&decoded.index)
+                .context("rebuild staged scip component rows from on-disk content")?;
+            let observed_digest = scip_component_digest_from_rows(&observed_rows)?;
+            if observed_digest != expected_digest {
+                bail!("staged scip component content digest mismatch");
+            }
+            if decoded.index.revision != index.revision {
+                bail!(
+                    "staged scip component content revision mismatch: {} != {}",
+                    decoded.index.revision,
+                    index.revision
+                );
+            }
+        }
+        1 => {
+            let connection = Connection::open_with_flags(
+                sqlite_open_path(path),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .context("reopen staged scip v1 component for digest verification")?;
+            if scip_component_digest(&connection)? != expected_digest {
+                bail!("staged scip v1 component digest mismatch");
+            }
+        }
+        _ => bail!("staged scip component schema is not current"),
+    }
+    Ok(())
+}
+
+fn scip_component_rows(index: &ScipSymbolsIndex) -> Result<Vec<ScipComponentRow>> {
+    let mut rows = Vec::with_capacity(index.symbols.len() + index.proofs.len());
+    let mut keys = BTreeMap::<String, String>::new();
+    for (ordinal, symbol) in index.symbols.iter().enumerate() {
+        let node_id = symbol
+            .node_id
+            .as_deref()
+            .context("graph-projection scip symbol is missing its node identity")?;
+        let record_json = serde_json::to_string(symbol)?;
+        let record_sha256 = sha256_text(&record_json);
+        let key = format!("symbol:{node_id}");
+        if keys.insert(key.clone(), record_sha256.clone()).is_some() {
+            bail!("duplicate graph-projection scip symbol identity");
+        }
+        rows.push(ScipComponentRow {
+            key,
+            kind: "symbol",
+            record_sha256,
+            #[cfg(test)]
+            record_json,
+            ordinal: ordinal as u64,
+        });
+    }
+    let mut proof_occurrences = HashMap::<String, u32>::new();
+    for (ordinal, proof) in index.proofs.iter().enumerate() {
+        let record_json = serde_json::to_string(proof)?;
+        let record_sha256 = sha256_text(&record_json);
+        let occurrence = proof_occurrences.entry(record_sha256.clone()).or_default();
+        let key = format!("proof:{record_sha256}:{occurrence}");
+        *occurrence = occurrence
+            .checked_add(1)
+            .context("scip proof occurrence overflow")?;
+        if let Some(previous_hash) = keys.insert(key.clone(), record_sha256.clone())
+            && previous_hash != record_sha256
+        {
+            bail!("scip component key collision");
+        }
+        rows.push(ScipComponentRow {
+            key,
+            kind: "proof",
+            record_sha256,
+            #[cfg(test)]
+            record_json,
+            ordinal: ordinal as u64,
+        });
+    }
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(rows)
+}
+
+fn same_physical_scip_component(left: &ScipSymbolsIndex, right: &ScipSymbolsIndex) -> bool {
+    left.revision == right.revision
+        && left.contract == right.contract
+        && left.symbols == right.symbols
+        && left.proofs == right.proofs
+}
+
+fn scip_component_schema(path: &Path) -> Result<i32> {
+    let connection = Connection::open_with_flags(
+        sqlite_open_path(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read scip component schema")
+}
+
+#[derive(Default)]
+struct ScipStringInterner {
+    by_value: HashMap<String, i64>,
+    next_id: i64,
+}
+
+impl ScipStringInterner {
+    fn load(connection: &Connection) -> Result<Self> {
+        let mut interner = Self::default();
+        let mut statement = connection.prepare("SELECT string_id, value FROM strings")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            let value = row.get::<_, String>(1)?;
+            interner
+                .by_value
+                .try_reserve(1)
+                .context("reserve scip string interner entry")?;
+            if id <= 0 || interner.by_value.insert(value, id).is_some() {
+                bail!("scip component string dictionary is invalid");
+            }
+            interner.next_id = interner.next_id.max(id);
+        }
+        Ok(interner)
+    }
+
+    fn intern(&mut self, connection: &Connection, value: &str) -> Result<i64> {
+        if let Some(id) = self.by_value.get(value) {
+            return Ok(*id);
+        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .context("scip string identity overflow")?;
+        connection.execute(
+            "INSERT INTO strings(string_id, value) VALUES (?1, ?2)",
+            params![self.next_id, value],
+        )?;
+        self.by_value.insert(value.to_owned(), self.next_id);
+        Ok(self.next_id)
+    }
+}
+
+fn intern_optional_scip_string(
+    connection: &Connection,
+    strings: &mut ScipStringInterner,
+    value: Option<&str>,
+) -> Result<Option<i64>> {
+    value
+        .map(|value| strings.intern(connection, value))
+        .transpose()
+}
+
+fn insert_v2_symbol(
+    connection: &Connection,
+    strings: &mut ScipStringInterner,
+    storage_id: Option<i64>,
+    ordinal: usize,
+    symbol: &ScipSymbolRecord,
+) -> Result<()> {
+    let node_id = symbol
+        .node_id
+        .as_deref()
+        .context("graph-projection scip symbol is missing its node identity")?;
+    connection.execute(
+        "INSERT INTO symbol_records(storage_id, ordinal, node_id, path, symbol, start_line, end_line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            storage_id,
+            i64::try_from(ordinal).context("scip symbol ordinal overflow")?,
+            strings.intern(connection, node_id)?,
+            strings.intern(connection, &symbol.path)?,
+            strings.intern(connection, &symbol.symbol)?,
+            i64::from(symbol.start_line),
+            i64::from(symbol.end_line),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_v2_proof(
+    connection: &Connection,
+    strings: &mut ScipStringInterner,
+    storage_id: Option<i64>,
+    ordinal: usize,
+    proof: &ScipProofRecord,
+) -> Result<()> {
+    let edge_kind = proof
+        .edge_kind
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    connection.execute(
+        "INSERT INTO proof_records(
+             storage_id, ordinal, role, path, symbol, start_line, start_character_utf16,
+             end_line, end_character_utf16, target_symbol, node_id, target_node_id, edge_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            storage_id,
+            i64::try_from(ordinal).context("scip proof ordinal overflow")?,
+            strings.intern(connection, &proof.role)?,
+            strings.intern(connection, &proof.path)?,
+            strings.intern(connection, &proof.symbol)?,
+            i64::from(proof.start_line),
+            i64::from(proof.start_character_utf16),
+            i64::from(proof.end_line),
+            i64::from(proof.end_character_utf16),
+            intern_optional_scip_string(connection, strings, proof.target_symbol.as_deref())?,
+            intern_optional_scip_string(connection, strings, proof.node_id.as_deref())?,
+            intern_optional_scip_string(connection, strings, proof.target_node_id.as_deref())?,
+            intern_optional_scip_string(connection, strings, edge_kind.as_deref())?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn remove_unreferenced_v2_strings(
+    connection: &Connection,
+    strings: &ScipStringInterner,
+) -> Result<()> {
+    let mut used = HashSet::<i64>::new();
+    for query in [
+        "SELECT node_id, path, symbol FROM symbol_records",
+        "SELECT role, path, symbol FROM proof_records",
+    ] {
+        let mut statement = connection.prepare(query)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            used.insert(row.get(0)?);
+            used.insert(row.get(1)?);
+            used.insert(row.get(2)?);
+        }
+    }
+    let mut statement = connection
+        .prepare("SELECT target_symbol, node_id, target_node_id, edge_kind FROM proof_records")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        for column in 0..4 {
+            if let Some(id) = row.get::<_, Option<i64>>(column)? {
+                used.insert(id);
+            }
+        }
+    }
+    drop(rows);
+    drop(statement);
+    let mut delete = connection.prepare("DELETE FROM strings WHERE string_id = ?1")?;
+    for id in strings.by_value.values().filter(|id| !used.contains(id)) {
+        delete.execute([id])?;
+    }
+    Ok(())
+}
+
+fn write_scip_component(
+    path: &Path,
+    index: &ScipSymbolsIndex,
+    rows: &[ScipComponentRow],
+) -> Result<ScipComponentWork> {
+    let mut connection = Connection::open(sqlite_open_path(path))?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=OFF;
+         PRAGMA synchronous=FULL;
+         PRAGMA user_version=2;
+         CREATE TABLE metadata (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             generation TEXT NOT NULL,
+             revision TEXT NOT NULL,
+             contract_json TEXT NOT NULL,
+             symbol_count INTEGER NOT NULL,
+             proof_count INTEGER NOT NULL,
+             component_sha256 TEXT NOT NULL
+         );
+         CREATE TABLE strings (
+             string_id INTEGER PRIMARY KEY,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE symbol_records (
+             storage_id INTEGER PRIMARY KEY,
+             ordinal INTEGER NOT NULL,
+             node_id INTEGER NOT NULL,
+             path INTEGER NOT NULL,
+             symbol INTEGER NOT NULL,
+             start_line INTEGER NOT NULL,
+             end_line INTEGER NOT NULL
+         );
+         CREATE TABLE proof_records (
+             storage_id INTEGER PRIMARY KEY,
+             ordinal INTEGER NOT NULL,
+             role INTEGER NOT NULL,
+             path INTEGER NOT NULL,
+             symbol INTEGER NOT NULL,
+             start_line INTEGER NOT NULL,
+             start_character_utf16 INTEGER NOT NULL,
+             end_line INTEGER NOT NULL,
+             end_character_utf16 INTEGER NOT NULL,
+             target_symbol INTEGER,
+             node_id INTEGER,
+             target_node_id INTEGER,
+             edge_kind INTEGER
+         );",
+    )?;
+    let transaction = connection.transaction()?;
+    let mut strings = ScipStringInterner::default();
+    for (ordinal, symbol) in index.symbols.iter().enumerate() {
+        insert_v2_symbol(&transaction, &mut strings, None, ordinal, symbol)?;
+    }
+    for (ordinal, proof) in index.proofs.iter().enumerate() {
+        insert_v2_proof(&transaction, &mut strings, None, ordinal, proof)?;
+    }
+    write_scip_component_metadata_with_digest(
+        &transaction,
+        index,
+        &scip_component_digest_from_rows(rows)?,
+    )?;
+    transaction.commit()?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(ScipComponentWork {
+        retained: 0,
+        inserted: rows.len() as u64,
+        removed: 0,
+        reordered: 0,
+        cloned: false,
+        copied: false,
+        direct_reference: false,
+    })
+}
+
+fn reconcile_scip_component(
+    path: &Path,
+    index: &ScipSymbolsIndex,
+    rows: &[ScipComponentRow],
+) -> Result<ScipComponentWork> {
+    let decoded = read_v2_scip_component(path)?;
+    let existing_rows = scip_component_rows(&decoded.index)?;
+    let mut existing = HashMap::<String, (String, i64, u64, &'static str)>::new();
+    for row in &existing_rows {
+        let storage_id = match row.kind {
+            "symbol" => decoded.symbol_storage_ids[row.ordinal as usize],
+            "proof" => decoded.proof_storage_ids[row.ordinal as usize],
+            _ => unreachable!(),
+        };
+        existing.insert(
+            row.key.clone(),
+            (row.record_sha256.clone(), storage_id, row.ordinal, row.kind),
+        );
+    }
+    let desired = rows
+        .iter()
+        .map(|row| (row.key.as_str(), row.record_sha256.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut connection = Connection::open(sqlite_open_path(path))?;
+    let schema: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema != 2 {
+        bail!("cloned scip component schema is not current");
+    }
+    connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=FULL;")?;
+    let mut strings = ScipStringInterner::load(&connection)?;
+    let transaction = connection.transaction()?;
+    let retained = existing
+        .iter()
+        .filter(|(key, (hash, _, _, _))| desired.get(key.as_str()) == Some(&hash.as_str()))
+        .count();
+    for (key, (hash, storage_id, _, kind)) in &existing {
+        if desired.get(key.as_str()) != Some(&hash.as_str()) {
+            let table = if *kind == "symbol" {
+                "symbol_records"
+            } else {
+                "proof_records"
+            };
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE storage_id = ?1"),
+                [storage_id],
+            )?;
+        }
+    }
+    let mut inserted = 0usize;
+    let mut reordered = 0usize;
+    for row in rows {
+        if let Some((hash, storage_id, old_ordinal, kind)) = existing.get(&row.key)
+            && hash == &row.record_sha256
+        {
+            if *old_ordinal != row.ordinal {
+                let table = if *kind == "symbol" {
+                    "symbol_records"
+                } else {
+                    "proof_records"
+                };
+                transaction.execute(
+                    &format!("UPDATE {table} SET ordinal = ?1 WHERE storage_id = ?2"),
+                    params![
+                        i64::try_from(row.ordinal).context("scip record ordinal overflow")?,
+                        storage_id
+                    ],
+                )?;
+                reordered += 1;
+            }
+            continue;
+        }
+        match row.kind {
+            "symbol" => insert_v2_symbol(
+                &transaction,
+                &mut strings,
+                None,
+                row.ordinal as usize,
+                &index.symbols[row.ordinal as usize],
+            )?,
+            "proof" => insert_v2_proof(
+                &transaction,
+                &mut strings,
+                None,
+                row.ordinal as usize,
+                &index.proofs[row.ordinal as usize],
+            )?,
+            _ => unreachable!(),
+        }
+        inserted += 1;
+        reordered += 1;
+    }
+    remove_unreferenced_v2_strings(&transaction, &strings)?;
+    transaction.execute("DELETE FROM metadata", [])?;
+    write_scip_component_metadata_with_digest(
+        &transaction,
+        index,
+        &scip_component_digest_from_rows(rows)?,
+    )?;
+    transaction.commit()?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(ScipComponentWork {
+        retained: retained as u64,
+        inserted: inserted as u64,
+        removed: existing.len().saturating_sub(retained) as u64,
+        reordered: reordered as u64,
+        cloned: true,
+        copied: false,
+        direct_reference: false,
+    })
+}
+
+#[cfg(test)]
+fn write_scip_component_metadata(connection: &Connection, index: &ScipSymbolsIndex) -> Result<()> {
+    let component_sha256 = scip_component_digest(connection)?;
+    write_scip_component_metadata_with_digest(connection, index, &component_sha256)
+}
+
+fn write_scip_component_metadata_with_digest(
+    connection: &Connection,
+    index: &ScipSymbolsIndex,
+    component_sha256: &str,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            index.generation,
+            index.revision,
+            serde_json::to_string(&index.contract)?,
+            i64::try_from(index.symbols.len()).context("scip symbol count overflow")?,
+            i64::try_from(index.proofs.len()).context("scip proof count overflow")?,
+            component_sha256,
+        ],
+    )?;
+    Ok(())
+}
+
+fn scip_component_digest_from_rows(rows: &[ScipComponentRow]) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"codestory-scip-component-v1\0");
+    for row in rows {
+        if row.record_sha256.len() != 64
+            || !row
+                .record_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("scip component row digest is invalid");
+        }
+        digest.update((row.key.len() as u64).to_le_bytes());
+        digest.update(row.key.as_bytes());
+        digest.update(row.record_sha256.as_bytes());
+    }
+    for row in rows {
+        digest.update((row.key.len() as u64).to_le_bytes());
+        digest.update(row.key.as_bytes());
+        digest.update(
+            i64::try_from(row.ordinal)
+                .context("scip record ordinal overflow")?
+                .to_le_bytes(),
+        );
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn scip_component_digest(connection: &Connection) -> Result<String> {
+    let mut statement =
+        connection.prepare("SELECT record_key, record_sha256 FROM records ORDER BY record_key")?;
+    let mut rows = statement.query([])?;
+    let mut digest = Sha256::new();
+    digest.update(b"codestory-scip-component-v1\0");
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, String>(0)?;
+        let hash = row.get::<_, String>(1)?;
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("scip component row digest is invalid");
+        }
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key.as_bytes());
+        digest.update(hash.as_bytes());
+    }
+    drop(rows);
+    drop(statement);
+    let mut order =
+        connection.prepare("SELECT record_key, ordinal FROM record_order ORDER BY record_key")?;
+    let mut rows = order.query([])?;
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, String>(0)?;
+        let ordinal = row.get::<_, i64>(1)?;
+        if ordinal < 0 {
+            bail!("scip component record ordinal is invalid");
+        }
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key.as_bytes());
+        digest.update(ordinal.to_le_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn scip_revision_for_symbols(
@@ -1182,6 +2156,10 @@ fn normalize_scip_path(path: &str) -> String {
 }
 
 pub fn load_scip_symbols(project_dir: &Path) -> Result<Option<ScipSymbolsIndex>> {
+    let database_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+    if database_path.is_file() {
+        return load_scip_symbols_database(&database_path).map(Some);
+    }
     let path = project_dir.join(SCIP_SYMBOLS_FILE);
     if !path.is_file() {
         return Ok(None);
@@ -1192,15 +2170,412 @@ pub fn load_scip_symbols(project_dir: &Path) -> Result<Option<ScipSymbolsIndex>>
     Ok(Some(parsed))
 }
 
-pub(crate) fn load_fresh_scip_symbols(
+fn load_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
+    let index = read_scip_symbols_database(path)?;
+    index
+        .validate_records(&index.generation)
+        .context("validate scip component records")?;
+    Ok(index)
+}
+
+fn restore_scip_record_order<T>(mut records: Vec<(u64, T)>, kind: &str) -> Result<Vec<T>> {
+    records.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    for (expected, (actual, _)) in records.iter().enumerate() {
+        let expected = u64::try_from(expected).context("scip record count overflow")?;
+        if *actual != expected {
+            bail!(
+                "scip {kind} record ordinal is not contiguous: expected {expected}, found {actual}"
+            );
+        }
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve(records.len())
+        .with_context(|| format!("reserve ordered scip {kind} records"))?;
+    ordered.extend(records.into_iter().map(|(_, record)| record));
+    Ok(ordered)
+}
+
+fn read_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
+    match scip_component_schema(path)? {
+        1 => read_v1_scip_symbols_database(path),
+        2 => Ok(read_v2_scip_component(path)?.index),
+        _ => bail!("scip component schema is not current"),
+    }
+}
+
+fn read_v1_scip_symbols_database(path: &Path) -> Result<ScipSymbolsIndex> {
+    let connection = Connection::open_with_flags(
+        sqlite_open_path(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let schema: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema != 1 {
+        bail!("scip component schema is not current");
+    }
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        bail!("scip component failed quick_check");
+    }
+    let (generation, revision, contract_json, symbol_count, proof_count, expected_digest) =
+        connection.query_row(
+            "SELECT generation, revision, contract_json, symbol_count, proof_count,
+                        component_sha256
+                 FROM metadata WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+    if scip_component_digest(&connection)? != expected_digest {
+        bail!("scip component digest mismatch");
+    }
+    let (record_count, order_count, joined_count) = connection.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM records),
+             (SELECT COUNT(*) FROM record_order),
+             (SELECT COUNT(*)
+                FROM records r JOIN record_order o ON o.record_key = r.record_key)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    if record_count != order_count || record_count != joined_count {
+        bail!(
+            "scip component record/order cardinality mismatch: records {record_count}, order {order_count}, joined {joined_count}"
+        );
+    }
+    let mut ordered_symbols = Vec::<(u64, ScipSymbolRecord)>::new();
+    let mut ordered_proofs = Vec::<(u64, ScipProofRecord)>::new();
+    let mut statement = connection.prepare(
+        "SELECT r.kind, r.record_sha256, r.record_json, o.ordinal
+         FROM records r
+         JOIN record_order o ON o.record_key = r.record_key",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let kind = row.get::<_, String>(0)?;
+        let expected_hash = row.get::<_, String>(1)?;
+        let json = row.get::<_, String>(2)?;
+        let ordinal = u64::try_from(row.get::<_, i64>(3)?)
+            .context("scip component record ordinal is invalid")?;
+        if sha256_text(&json) != expected_hash {
+            bail!("scip component record digest mismatch");
+        }
+        match kind.as_str() {
+            "symbol" => {
+                ordered_symbols
+                    .try_reserve(1)
+                    .context("reserve observed scip symbol record")?;
+                ordered_symbols.push((ordinal, serde_json::from_str(&json)?));
+            }
+            "proof" => {
+                ordered_proofs
+                    .try_reserve(1)
+                    .context("reserve observed scip proof record")?;
+                ordered_proofs.push((ordinal, serde_json::from_str(&json)?));
+            }
+            _ => bail!("scip component contains an unknown record kind"),
+        }
+    }
+    let symbols = restore_scip_record_order(ordered_symbols, "symbol")?;
+    let proofs = restore_scip_record_order(ordered_proofs, "proof")?;
+    if i64::try_from(symbols.len()).context("scip symbol cardinality overflow")? != symbol_count
+        || i64::try_from(proofs.len()).context("scip proof cardinality overflow")? != proof_count
+    {
+        bail!("scip component record cardinality mismatch");
+    }
+    Ok(ScipSymbolsIndex {
+        generation,
+        revision,
+        contract: serde_json::from_str(&contract_json)?,
+        symbols,
+        proofs,
+    })
+}
+
+struct DecodedV2ScipComponent {
+    index: ScipSymbolsIndex,
+    symbol_storage_ids: Vec<i64>,
+    proof_storage_ids: Vec<i64>,
+}
+
+fn read_v2_scip_component(path: &Path) -> Result<DecodedV2ScipComponent> {
+    let connection = Connection::open_with_flags(
+        sqlite_open_path(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let schema: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema != 2 {
+        bail!("scip component schema is not current");
+    }
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        bail!("scip component failed quick_check");
+    }
+    let (generation, revision, contract_json, symbol_count, proof_count, expected_digest) =
+        connection.query_row(
+            "SELECT generation, revision, contract_json, symbol_count, proof_count,
+                    component_sha256 FROM metadata WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+    if symbol_count < 0 || proof_count < 0 {
+        bail!("scip component record cardinality mismatch");
+    }
+    let mut strings = HashMap::<i64, String>::new();
+    let mut values = HashSet::<String>::new();
+    let mut statement = connection.prepare("SELECT string_id, value FROM strings")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let value = row.get::<_, String>(1)?;
+        strings
+            .try_reserve(1)
+            .context("reserve scip string dictionary entry")?;
+        values
+            .try_reserve(1)
+            .context("reserve scip string uniqueness entry")?;
+        if id <= 0 || strings.insert(id, value.clone()).is_some() || !values.insert(value) {
+            bail!("scip component string dictionary is invalid");
+        }
+    }
+    drop(rows);
+    drop(statement);
+
+    let required = |id: i64, field: &str| -> Result<String> {
+        strings
+            .get(&id)
+            .cloned()
+            .with_context(|| format!("scip component {field} string reference is missing"))
+    };
+    let optional = |id: Option<i64>, field: &str| -> Result<Option<String>> {
+        id.map(|id| required(id, field)).transpose()
+    };
+    let mut ordered_symbols = Vec::<(u64, (i64, ScipSymbolRecord))>::new();
+    let mut statement = connection.prepare(
+        "SELECT storage_id, ordinal, node_id, path, symbol, start_line, end_line
+         FROM symbol_records",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        ordered_symbols
+            .try_reserve(1)
+            .context("reserve observed scip symbol record")?;
+        let ordinal = u64::try_from(row.get::<_, i64>(1)?)
+            .context("scip component record ordinal is invalid")?;
+        ordered_symbols.push((
+            ordinal,
+            (
+                row.get(0)?,
+                ScipSymbolRecord {
+                    node_id: Some(required(row.get(2)?, "symbol node")?),
+                    path: required(row.get(3)?, "symbol path")?,
+                    symbol: required(row.get(4)?, "symbol name")?,
+                    start_line: u32::try_from(row.get::<_, i64>(5)?)
+                        .context("scip symbol start line is invalid")?,
+                    end_line: u32::try_from(row.get::<_, i64>(6)?)
+                        .context("scip symbol end line is invalid")?,
+                },
+            ),
+        ));
+    }
+    drop(rows);
+    drop(statement);
+    let mut ordered_proofs = Vec::<(u64, (i64, ScipProofRecord))>::new();
+    let mut statement = connection.prepare(
+        "SELECT storage_id, ordinal, role, path, symbol, start_line,
+                start_character_utf16, end_line, end_character_utf16, target_symbol,
+                node_id, target_node_id, edge_kind FROM proof_records",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        ordered_proofs
+            .try_reserve(1)
+            .context("reserve observed scip proof record")?;
+        let ordinal = u64::try_from(row.get::<_, i64>(1)?)
+            .context("scip component record ordinal is invalid")?;
+        let edge_kind_json = optional(row.get(12)?, "proof edge kind")?;
+        ordered_proofs.push((
+            ordinal,
+            (
+                row.get(0)?,
+                ScipProofRecord {
+                    role: required(row.get(2)?, "proof role")?,
+                    path: required(row.get(3)?, "proof path")?,
+                    symbol: required(row.get(4)?, "proof symbol")?,
+                    start_line: u32::try_from(row.get::<_, i64>(5)?)
+                        .context("scip proof start line is invalid")?,
+                    start_character_utf16: u32::try_from(row.get::<_, i64>(6)?)
+                        .context("scip proof start character is invalid")?,
+                    end_line: u32::try_from(row.get::<_, i64>(7)?)
+                        .context("scip proof end line is invalid")?,
+                    end_character_utf16: u32::try_from(row.get::<_, i64>(8)?)
+                        .context("scip proof end character is invalid")?,
+                    target_symbol: optional(row.get(9)?, "proof target symbol")?,
+                    node_id: optional(row.get(10)?, "proof node")?,
+                    target_node_id: optional(row.get(11)?, "proof target node")?,
+                    edge_kind: edge_kind_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?,
+                },
+            ),
+        ));
+    }
+    let symbols_with_ids = restore_scip_record_order(ordered_symbols, "symbol")?;
+    let proofs_with_ids = restore_scip_record_order(ordered_proofs, "proof")?;
+    if i64::try_from(symbols_with_ids.len()).context("scip symbol cardinality overflow")?
+        != symbol_count
+        || i64::try_from(proofs_with_ids.len()).context("scip proof cardinality overflow")?
+            != proof_count
+    {
+        bail!("scip component record cardinality mismatch");
+    }
+    let symbol_storage_ids = symbols_with_ids.iter().map(|(id, _)| *id).collect();
+    let proof_storage_ids = proofs_with_ids.iter().map(|(id, _)| *id).collect();
+    let index = ScipSymbolsIndex {
+        generation,
+        revision,
+        contract: serde_json::from_str(&contract_json)?,
+        symbols: symbols_with_ids
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect(),
+        proofs: proofs_with_ids
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect(),
+    };
+    let component_rows = scip_component_rows(&index)?;
+    if scip_component_digest_from_rows(&component_rows)? != expected_digest {
+        bail!("scip component digest mismatch");
+    }
+    Ok(DecodedV2ScipComponent {
+        index,
+        symbol_storage_ids,
+        proof_storage_ids,
+    })
+}
+
+#[cfg(test)]
+fn load_scip_symbols_database_for_generation(
+    path: &Path,
+    generation: &str,
+) -> Result<ScipSymbolsIndex> {
+    if generation.trim().is_empty() {
+        bail!("scip artifact carries no generation");
+    }
+    let mut index = load_scip_symbols_database(path)?;
+    index.generation = generation.to_string();
+    index
+        .validate_records(generation)
+        .context("validate scip component against its publication envelope")?;
+    Ok(index)
+}
+
+/// Prove a staged SCIP component admits graph readiness without building the
+/// query view.
+///
+/// Activation validation and Full sidecar health only need to know the graph
+/// lane is real (non-stub, marker-bound, non-empty symbols and proofs, fresh
+/// contract). Loading [`ScipQueryView`] materializes every symbol/proof into
+/// adjacency maps and dominated Keycloak-class `validation@90` after publication
+/// started emitting real SCIP. Query execution still uses
+/// [`load_fresh_scip_query_view`].
+///
+/// JSON fixture components are admitted by deserializing the index envelope only
+/// (no adjacency build). SQLite components use the same deep row validation as
+/// query execution once per sealed publication envelope, without materializing
+/// the adjacency view on warm health probes.
+pub(crate) fn scip_component_admits_graph_health(
     project_dir: &Path,
     expected_revision: &str,
     generation: &str,
-) -> Result<Option<Arc<ScipSymbolsIndex>>> {
-    Ok(
-        load_fresh_scip_query_view(project_dir, expected_revision, generation)?
-            .map(|view| view.index_arc()),
-    )
+) -> bool {
+    if generation.trim().is_empty() || expected_revision.trim().is_empty() {
+        return false;
+    }
+    if project_dir.join(SCIP_STUB_MARKER_FILE).is_file() {
+        return false;
+    }
+    let path = scip_symbols_component_path(project_dir);
+    let revision_path = project_dir.join("revision.txt");
+    if !path.is_file() || !revision_path.is_file() {
+        return false;
+    }
+    let Ok(stored_revision) = std::fs::read_to_string(&revision_path) else {
+        return false;
+    };
+    let stored_revision = stored_revision.trim();
+    if stored_revision != expected_revision
+        || parse_scip_index_marker(project_dir, expected_revision).is_err()
+    {
+        return false;
+    }
+    let component_is_json =
+        path.file_name().and_then(|name| name.to_str()) == Some(SCIP_SYMBOLS_FILE);
+    if component_is_json {
+        return scip_json_component_admits_graph_health(&path, expected_revision, generation);
+    }
+    scip_sqlite_component_admits_graph_health(project_dir, &path, expected_revision)
+}
+
+fn scip_json_component_admits_graph_health(
+    path: &Path,
+    expected_revision: &str,
+    generation: &str,
+) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_str::<ScipSymbolsIndex>(&body) else {
+        return false;
+    };
+    // JSON adjacency fixtures stamp generation inside the artifact.
+    index.generation == generation
+        && index.revision == expected_revision
+        && !index.symbols.is_empty()
+        && index.has_required_proof_records()
+        && index.contract.is_fresh_for(expected_revision)
+}
+
+fn scip_sqlite_component_admits_graph_health(
+    project_dir: &Path,
+    path: &Path,
+    expected_revision: &str,
+) -> bool {
+    let artifacts = scip_graph_health_artifacts(project_dir, path);
+    SCIP_GRAPH_HEALTH_RECEIPTS
+        .validate_sealed(path.to_path_buf(), &artifacts, || {
+            let index = load_scip_symbols_database(path)?;
+            if index.symbols.is_empty() || !index.contract.is_fresh_for(&index.revision) {
+                bail!("scip graph component is empty or its producer contract is stale");
+            }
+            Ok::<_, anyhow::Error>(index.revision)
+        })
+        .is_ok_and(|revision| revision == expected_revision)
 }
 
 pub(crate) fn load_fresh_scip_query_view(
@@ -1208,43 +2583,102 @@ pub(crate) fn load_fresh_scip_query_view(
     expected_revision: &str,
     generation: &str,
 ) -> Result<Option<Arc<ScipQueryView>>> {
-    let path = project_dir.join(SCIP_SYMBOLS_FILE);
+    if generation.trim().is_empty() {
+        return Ok(None);
+    }
+    let path = scip_symbols_component_path(project_dir);
     let revision_path = project_dir.join("revision.txt");
     let marker_path = project_dir.join(SCIP_INDEX_FILE);
     if !path.is_file() || !revision_path.is_file() || !marker_path.is_file() {
         return Ok(None);
     }
-    let key = (
+    let stored_revision = std::fs::read_to_string(&revision_path)
+        .context("read scip revision")?
+        .trim()
+        .to_string();
+    if stored_revision != expected_revision
+        || parse_scip_index_marker(project_dir, expected_revision).is_err()
+    {
+        return Ok(None);
+    }
+    let data = SCIP_PARSED_INDEX_RECEIPTS.validate_sealed(
         path.clone(),
-        expected_revision.to_string(),
-        generation.to_string(),
-    );
-    SCIP_PARSED_INDEX_RECEIPTS.validate_sealed(
-        key,
-        &[path.clone(), revision_path.clone(), marker_path],
+        &sqlite_file_with_sidecars(&path),
         || {
-            let stored_revision = std::fs::read_to_string(&revision_path)
-                .context("read scip revision")?
-                .trim()
-                .to_string();
-            if stored_revision != expected_revision {
-                return Ok(None);
-            }
-            if parse_scip_index_marker(project_dir, expected_revision).is_err() {
-                return Ok(None);
-            }
-            let Some(index) = load_scip_symbols(project_dir)? else {
-                return Ok(None);
+            let index = if path.file_name().and_then(|name| name.to_str())
+                == Some(SCIP_SYMBOLS_DATABASE_FILE)
+            {
+                read_scip_symbols_database(&path)?
+            } else {
+                let Some(index) = load_scip_symbols(project_dir)? else {
+                    bail!("scip component disappeared during validation");
+                };
+                index
             };
-            if !index.is_fresh_for(expected_revision, generation) || index.symbols.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(Arc::new(ScipQueryView::build(
-                Arc::new(index),
-                generation,
-            )?)))
+            Ok::<_, anyhow::Error>(Arc::new(ScipQueryData::build(Arc::new(index))?))
         },
-    )
+    )?;
+    if data.index.revision != expected_revision
+        || !data.index.contract.is_fresh_for(expected_revision)
+        || !data.index.has_required_proof_records()
+        || data.index.symbols.is_empty()
+    {
+        return Ok(None);
+    }
+    // JSON adjacency fixtures stamp the generation inside the artifact. A
+    // sealed SQLite component may be hard-linked across graph-equivalent
+    // generations and remapped by the request generation instead.
+    let component_is_json =
+        path.file_name().and_then(|name| name.to_str()) == Some(SCIP_SYMBOLS_FILE);
+    if component_is_json && data.index.generation != generation {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(ScipQueryView::from_data(data, generation)?)))
+}
+
+pub(crate) struct ScipGenerationReceiptRefresh {
+    key: PathBuf,
+    parsed_artifacts: Vec<PathBuf>,
+    parsed_receipt: Option<TransferableReceipt<Arc<ScipQueryData>>>,
+    health_artifacts: Vec<PathBuf>,
+    health_receipt: Option<TransferableReceipt<String>>,
+}
+
+pub(crate) fn capture_scip_generation_receipt(
+    project_dir: &Path,
+) -> Option<ScipGenerationReceiptRefresh> {
+    let key = scip_symbols_component_path(project_dir);
+    let parsed_artifacts = sqlite_file_with_sidecars(&key);
+    let health_artifacts = scip_graph_health_artifacts(project_dir, &key);
+    let parsed_receipt = SCIP_PARSED_INDEX_RECEIPTS.transferable_receipt(&key, &parsed_artifacts);
+    let health_receipt = SCIP_GRAPH_HEALTH_RECEIPTS.transferable_receipt(&key, &health_artifacts);
+    (parsed_receipt.is_some() || health_receipt.is_some()).then_some(ScipGenerationReceiptRefresh {
+        key,
+        parsed_artifacts,
+        parsed_receipt,
+        health_artifacts,
+        health_receipt,
+    })
+}
+
+impl ScipGenerationReceiptRefresh {
+    pub(crate) fn refresh_after_owned_link_cleanup(self) -> bool {
+        let parsed = self.parsed_receipt.is_none_or(|receipt| {
+            SCIP_PARSED_INDEX_RECEIPTS.refresh_after_hard_links(
+                self.key.clone(),
+                &self.parsed_artifacts,
+                receipt,
+            )
+        });
+        let health = self.health_receipt.is_none_or(|receipt| {
+            SCIP_GRAPH_HEALTH_RECEIPTS.refresh_after_hard_links(
+                self.key,
+                &self.health_artifacts,
+                receipt,
+            )
+        });
+        parsed && health
+    }
 }
 
 #[cfg(test)]
@@ -1252,7 +2686,1497 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{Edge, EdgeId, Node, NodeId, NodeKind, ResolutionCertainty};
     use codestory_store::{FileInfo, FileRole, SearchSymbolProjection};
+    use std::time::Instant;
     use tempfile::TempDir;
+
+    fn component_symbol(node_id: &str, path: &str, symbol: &str) -> ScipSymbolRecord {
+        ScipSymbolRecord {
+            node_id: Some(node_id.into()),
+            path: path.into(),
+            symbol: symbol.into(),
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn component_index(generation: &str, mut symbols: Vec<ScipSymbolRecord>) -> ScipSymbolsIndex {
+        symbols.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let mut proofs = symbols
+            .iter()
+            .map(ScipProofRecord::definition)
+            .collect::<Vec<_>>();
+        proofs
+            .sort_by_key(|record| sha256_text(&serde_json::to_string(record).expect("proof json")));
+        let revision = scip_revision_for_symbols(&symbols, &[]);
+        ScipSymbolsIndex {
+            generation: generation.into(),
+            revision: revision.clone(),
+            contract: ScipProofAdapterContract::graph_projection(&revision),
+            symbols,
+            proofs,
+        }
+    }
+
+    fn explicitly_ordered_component(generation: &str) -> ScipSymbolsIndex {
+        let symbols = vec![
+            component_symbol("20", "src/twenty.rs", "twenty"),
+            component_symbol("3", "src/three.rs", "three"),
+            component_symbol("11", "src/eleven.rs", "eleven"),
+        ];
+        let proofs = symbols
+            .iter()
+            .map(ScipProofRecord::definition)
+            .collect::<Vec<_>>();
+        let revision = scip_revision_for_symbols(&symbols, &[]);
+        ScipSymbolsIndex {
+            generation: generation.into(),
+            revision: revision.clone(),
+            contract: ScipProofAdapterContract::graph_projection(&revision),
+            symbols,
+            proofs,
+        }
+    }
+
+    fn write_component_fixture(root: &Path, index: &ScipSymbolsIndex) -> PathBuf {
+        write_v1_component_fixture(root, index)
+    }
+
+    fn write_v1_component_fixture(root: &Path, index: &ScipSymbolsIndex) -> PathBuf {
+        std::fs::create_dir_all(root).expect("v1 component fixture directory");
+        let path = root.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let rows = scip_component_rows(index).expect("v1 component fixture rows");
+        let mut connection = Connection::open(sqlite_open_path(&path)).expect("open v1 fixture");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=OFF;
+                 PRAGMA user_version=1;
+                 CREATE TABLE metadata (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     generation TEXT NOT NULL,
+                     revision TEXT NOT NULL,
+                     contract_json TEXT NOT NULL,
+                     symbol_count INTEGER NOT NULL,
+                     proof_count INTEGER NOT NULL,
+                     component_sha256 TEXT NOT NULL
+                 );
+                 CREATE TABLE records (
+                     record_key TEXT PRIMARY KEY NOT NULL,
+                     kind TEXT NOT NULL,
+                     record_sha256 TEXT NOT NULL,
+                     record_json TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE record_order (
+                     record_key TEXT PRIMARY KEY NOT NULL REFERENCES records(record_key),
+                     ordinal INTEGER NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .expect("create v1 fixture schema");
+        let transaction = connection.transaction().expect("v1 fixture transaction");
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO records(record_key,kind,record_sha256,record_json)
+                     VALUES (?1,?2,?3,?4)",
+                )
+                .expect("prepare v1 fixture record insert");
+            let mut insert_order = transaction
+                .prepare("INSERT INTO record_order(record_key,ordinal) VALUES (?1,?2)")
+                .expect("prepare v1 fixture order insert");
+            for row in &rows {
+                insert
+                    .execute(params![
+                        row.key,
+                        row.kind,
+                        row.record_sha256,
+                        row.record_json
+                    ])
+                    .expect("insert v1 fixture record");
+                insert_order
+                    .execute(params![
+                        row.key,
+                        i64::try_from(row.ordinal).expect("v1 ordinal")
+                    ])
+                    .expect("insert v1 fixture order");
+            }
+        }
+        write_scip_component_metadata(&transaction, index).expect("write v1 fixture metadata");
+        transaction.commit().expect("commit v1 fixture");
+        path
+    }
+
+    fn authenticate_component_rows(connection: &Connection) {
+        let digest = scip_component_digest(connection).expect("digest mutated component rows");
+        connection
+            .execute(
+                "UPDATE metadata SET component_sha256 = ?1 WHERE singleton = 1",
+                [digest],
+            )
+            .expect("authenticate mutated component rows");
+    }
+
+    fn v2_symbol_storage_id(path: &Path, node_id: &str) -> i64 {
+        Connection::open_with_flags(
+            sqlite_open_path(path),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open v2 component")
+        .query_row(
+            "SELECT r.storage_id
+             FROM symbol_records r JOIN strings s ON s.string_id = r.node_id
+             WHERE s.value = ?1",
+            [node_id],
+            |row| row.get(0),
+        )
+        .expect("read v2 symbol storage identity")
+    }
+
+    #[test]
+    fn scip_component_loader_preserves_explicit_record_order() {
+        let root = TempDir::new().expect("tempdir");
+        let expected = explicitly_ordered_component("generation-ordered");
+        let path = write_component_fixture(root.path(), &expected);
+
+        let loaded = load_scip_symbols_database(&path).expect("load ordered component");
+
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded
+                .symbols
+                .iter()
+                .map(|symbol| symbol.node_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("20"), Some("3"), Some("11")],
+            "record_key order must not replace the authenticated ordinal order"
+        );
+    }
+
+    #[test]
+    fn scip_component_loader_rejects_authenticated_invalid_ordinals_and_counts() {
+        let root = TempDir::new().expect("tempdir");
+        let expected = explicitly_ordered_component("generation-hostile-order");
+        let pristine = write_component_fixture(&root.path().join("pristine"), &expected);
+        let cases = [
+            (
+                "duplicate",
+                "UPDATE record_order SET ordinal = 0 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "duplicate-proof",
+                "UPDATE record_order SET ordinal = 0 WHERE record_key = (
+                     SELECT r.record_key
+                     FROM records r JOIN record_order o ON o.record_key = r.record_key
+                     WHERE r.kind = 'proof' AND o.ordinal = 1
+                 )",
+                true,
+                "ordinal",
+            ),
+            (
+                "gapped",
+                "UPDATE record_order SET ordinal = 3 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "negative",
+                "UPDATE record_order SET ordinal = -1 WHERE record_key = 'symbol:3'",
+                false,
+                "ordinal",
+            ),
+            (
+                "out-of-range",
+                "UPDATE record_order SET ordinal = 9223372036854775807 WHERE record_key = 'symbol:3'",
+                true,
+                "ordinal",
+            ),
+            (
+                "record-without-order",
+                "DELETE FROM record_order WHERE record_key = 'symbol:3'",
+                true,
+                "cardinality",
+            ),
+            (
+                "orphan-order",
+                "INSERT INTO record_order(record_key, ordinal) VALUES ('orphan:record', 0)",
+                true,
+                "cardinality",
+            ),
+            (
+                "unknown-kind",
+                "UPDATE records SET kind = 'unknown' WHERE record_key = 'symbol:3'",
+                false,
+                "unknown record kind",
+            ),
+            (
+                "negative-metadata-count",
+                "UPDATE metadata SET symbol_count = -1 WHERE singleton = 1",
+                false,
+                "cardinality",
+            ),
+            (
+                "untrusted-metadata-count",
+                "UPDATE metadata SET symbol_count = 9223372036854775807 WHERE singleton = 1",
+                false,
+                "cardinality",
+            ),
+        ];
+        let mut admitted = Vec::new();
+
+        for (name, mutation, authenticate_rows, expected_error) in cases {
+            let case_dir = root.path().join(name);
+            std::fs::create_dir_all(&case_dir).expect("hostile case directory");
+            let path = case_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+            std::fs::copy(&pristine, &path).expect("copy pristine component");
+            let connection = Connection::open(sqlite_open_path(&path)).expect("open hostile case");
+            if name == "orphan-order" {
+                connection
+                    .execute_batch("PRAGMA foreign_keys=OFF;")
+                    .expect("allow construction of orphan-order fixture");
+            }
+            connection
+                .execute(mutation, [])
+                .expect("mutate hostile case");
+            if authenticate_rows {
+                authenticate_component_rows(&connection);
+            }
+            drop(connection);
+
+            match load_scip_symbols_database(&path) {
+                Ok(_) => admitted.push(name),
+                Err(error) => assert!(
+                    format!("{error:#}").contains(expected_error),
+                    "{name} failed at the wrong boundary: {error:#}"
+                ),
+            }
+        }
+
+        assert!(
+            admitted.is_empty(),
+            "loader admitted invalid authenticated component order/count cases: {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn staged_scip_component_digest_verification_rejects_tampered_metadata() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("scip");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let index = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "a.ts", "alpha")],
+        );
+        let rows = scip_component_rows(&index).expect("rows");
+        let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        write_scip_component(&path, &index, &rows).expect("write component");
+        verify_staged_scip_component(&path, &index, &rows).expect("fresh stage verifies");
+
+        let connection = Connection::open(sqlite_open_path(&path)).expect("open staged");
+        connection
+            .execute(
+                "UPDATE metadata SET component_sha256 = ?1 WHERE singleton = 1",
+                params!["0".repeat(64)],
+            )
+            .expect("tamper digest");
+        drop(connection);
+
+        let error = verify_staged_scip_component(&path, &index, &rows)
+            .expect_err("tampered digest must fail closed");
+        assert!(
+            format!("{error:#}").contains("digest mismatch"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn graph_health_admission_uses_metadata_envelope_without_query_view() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("scip");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let index = component_index(
+            "generation-health",
+            vec![
+                component_symbol("1", "a.ts", "alpha"),
+                component_symbol("2", "b.ts", "beta"),
+            ],
+        );
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(()))
+            .expect("publish health component");
+        std::fs::write(
+            project_dir.join("revision.txt"),
+            format!("{}\n", index.revision),
+        )
+        .expect("revision");
+        write_scip_index_marker(&project_dir, &index.revision).expect("marker");
+
+        assert!(
+            scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "published component must admit content-validated graph health"
+        );
+        let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let initial = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component_path)
+            .expect("first health validation seals the component and envelope");
+        assert_eq!(initial.validations, 1);
+        assert!(
+            scip_component_admits_graph_health(
+                &project_dir,
+                &index.revision,
+                "generation-remapped"
+            ),
+            "sqlite components may remap generation under hard-link reuse"
+        );
+        let warm = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component_path)
+            .expect("warm health keeps its content receipt");
+        assert_eq!(
+            warm.validations, 1,
+            "warm health must avoid another row scan"
+        );
+        assert!(warm.reuses > initial.reuses);
+        assert!(
+            !scip_component_admits_graph_health(
+                &project_dir,
+                "wrong-revision",
+                "generation-health"
+            ),
+            "revision mismatch must refuse graph health"
+        );
+
+        std::fs::write(project_dir.join(SCIP_STUB_MARKER_FILE), b"stub").expect("stub marker");
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "stub marker must refuse graph health"
+        );
+        let _ = std::fs::remove_file(project_dir.join(SCIP_STUB_MARKER_FILE));
+
+        crate::copy_on_write::make_file_owner_writable(&component_path)
+            .expect("make component writable for zero-proof tamper");
+        let connection =
+            Connection::open(sqlite_open_path(&component_path)).expect("open component");
+        connection
+            .execute(
+                "UPDATE metadata SET proof_count = 0 WHERE singleton = 1",
+                [],
+            )
+            .expect("clear proof_count");
+        connection
+            .execute("DELETE FROM proof_records", [])
+            .expect("delete proof rows");
+        drop(connection);
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "zero proofs must refuse graph health"
+        );
+
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(()))
+            .expect("republish after zero-proof tamper");
+        crate::copy_on_write::make_file_owner_writable(&component_path)
+            .expect("make component writable for contract tamper");
+        let connection =
+            Connection::open(sqlite_open_path(&component_path)).expect("open component");
+        let mut stale_contract = ScipProofAdapterContract::graph_projection(&index.revision);
+        stale_contract.freshness = "stale".into();
+        let stale_json = serde_json::to_string(&stale_contract).expect("serialize stale contract");
+        connection
+            .execute(
+                "UPDATE metadata SET contract_json = ?1 WHERE singleton = 1",
+                [stale_json],
+            )
+            .expect("break contract freshness");
+        drop(connection);
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "stale contract_json must refuse graph health"
+        );
+
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(()))
+            .expect("republish after contract tamper");
+        crate::copy_on_write::make_file_owner_writable(&component_path)
+            .expect("make component writable for cardinality tamper");
+        let connection =
+            Connection::open(sqlite_open_path(&component_path)).expect("open component");
+        connection
+            .execute(
+                "UPDATE metadata SET symbol_count = symbol_count + 1 WHERE singleton = 1",
+                [],
+            )
+            .expect("break cardinality");
+        drop(connection);
+        assert!(
+            !scip_component_admits_graph_health(&project_dir, &index.revision, "generation-health"),
+            "cardinality drift must refuse graph health"
+        );
+
+        // JSON fixture components (zero-dense pinned query) must admit without a
+        // query-view build, and still refuse zero-proof / stale-contract envelopes.
+        let json_dir = root.path().join("scip-json");
+        std::fs::create_dir_all(&json_dir).expect("json scip dir");
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&index).expect("serialize json index"),
+        )
+        .expect("write json component");
+        std::fs::write(
+            json_dir.join("revision.txt"),
+            format!("{}\n", index.revision),
+        )
+        .expect("json revision");
+        write_scip_index_marker(&json_dir, &index.revision).expect("json marker");
+        assert!(
+            scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json fixture with symbols and proofs must admit graph health"
+        );
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-remapped"),
+            "json fixtures stamp generation and must refuse remap"
+        );
+        let mut zero_proof = index.clone();
+        zero_proof.proofs.clear();
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&zero_proof).expect("serialize zero-proof json"),
+        )
+        .expect("write zero-proof json");
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json zero proofs must refuse graph health"
+        );
+        let mut stale = index.clone();
+        stale.contract.freshness = "stale".into();
+        std::fs::write(
+            json_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&stale).expect("serialize stale json"),
+        )
+        .expect("write stale json");
+        assert!(
+            !scip_component_admits_graph_health(&json_dir, &index.revision, "generation-health"),
+            "json stale contract must refuse graph health"
+        );
+    }
+
+    #[test]
+    fn graph_health_rejects_same_count_v2_row_drift_after_publication() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let damaged_dir = root.path().join("damaged");
+        std::fs::create_dir_all(&previous_dir).expect("previous directory");
+        std::fs::create_dir_all(&damaged_dir).expect("damaged directory");
+        let index = component_index(
+            "generation-health",
+            vec![
+                component_symbol("1", "a.ts", "alpha"),
+                component_symbol("2", "b.ts", "beta"),
+            ],
+        );
+        for directory in [&previous_dir, &damaged_dir] {
+            publish_scip_component(directory, None, &index, &mut || Ok(()))
+                .expect("publish valid component");
+            std::fs::write(
+                directory.join("revision.txt"),
+                format!("{}\n", index.revision),
+            )
+            .expect("revision");
+            write_scip_index_marker(directory, &index.revision).expect("marker");
+            assert!(scip_component_admits_graph_health(
+                directory,
+                &index.revision,
+                "generation-health"
+            ));
+        }
+
+        let component = damaged_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        crate::copy_on_write::make_file_owner_writable(&component)
+            .expect("allow hostile row rewrite");
+        let connection = Connection::open(sqlite_open_path(&component)).expect("open component");
+        let before: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata");
+        connection
+            .execute(
+                "UPDATE symbol_records SET start_line = start_line + 1 WHERE ordinal = 0",
+                [],
+            )
+            .expect("rewrite valid symbol cell");
+        let after: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reread metadata");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .expect("check SQLite structure");
+        drop(connection);
+        crate::copy_on_write::make_file_immutable(&component)
+            .expect("restore immutable component bit");
+        assert_eq!(before, after, "metadata digest and counts stay unchanged");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            load_fresh_scip_query_view(&damaged_dir, &index.revision, "generation-health").is_err(),
+            "deep query reader must refuse corrupted rows"
+        );
+        assert!(
+            !scip_component_admits_graph_health(&damaged_dir, &index.revision, "generation-health"),
+            "Full graph health cannot admit a component its query reader rejects"
+        );
+        assert!(
+            scip_component_admits_graph_health(&previous_dir, &index.revision, "generation-health"),
+            "the prior valid graph remains available"
+        );
+    }
+
+    #[test]
+    fn staged_scip_component_digest_verification_rejects_tampered_v2_row() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("scip");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let index = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "a.ts", "alpha"),
+                component_symbol("2", "b.ts", "beta"),
+            ],
+        );
+        let rows = scip_component_rows(&index).expect("rows");
+        let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        write_scip_component(&path, &index, &rows).expect("write component");
+        verify_staged_scip_component(&path, &index, &rows).expect("fresh stage verifies");
+
+        let connection = Connection::open(sqlite_open_path(&path)).expect("open staged");
+        let (stored_digest, symbol_count, proof_count): (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read intact metadata");
+        connection
+            .execute(
+                "UPDATE symbol_records SET start_line = start_line + 1 WHERE ordinal = 0",
+                [],
+            )
+            .expect("tamper v2 symbol cell");
+        let (after_digest, after_symbols, after_proofs): (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reread metadata");
+        drop(connection);
+        assert_eq!(
+            after_digest, stored_digest,
+            "metadata digest must stay intact"
+        );
+        assert_eq!(
+            after_symbols, symbol_count,
+            "metadata symbol count must stay intact"
+        );
+        assert_eq!(
+            after_proofs, proof_count,
+            "metadata proof count must stay intact"
+        );
+
+        let error = verify_staged_scip_component(&path, &index, &rows)
+            .expect_err("tampered v2 row must fail closed while metadata envelope is intact");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("digest mismatch") || rendered.contains("content-bind"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn staged_scip_verify_allows_generation_remap_for_identical_hard_linked_component() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "alpha")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let mut current = previous.clone();
+        current.generation = "generation-v2".into();
+        let work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+        })
+        .expect("generation-only churn must reuse identical component bytes");
+        assert!(work.direct_reference);
+        assert_eq!(
+            load_scip_symbols_database_for_generation(
+                &current_dir.join(SCIP_SYMBOLS_DATABASE_FILE),
+                "generation-v2",
+            )
+            .expect("remap envelope"),
+            current
+        );
+    }
+
+    #[test]
+    fn incremental_scip_component_matches_clean_add_change_delete_and_rename() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+                component_symbol("4", "src/kept.rs", "kept"),
+            ],
+        );
+        let previous_work = publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        assert!(!previous_work.cloned);
+        let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let retained_storage_id = v2_symbol_storage_id(&previous_path, "4");
+
+        let current = component_index(
+            "generation-v2",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha_changed"),
+                component_symbol("3", "src/renamed.rs", "beta"),
+                component_symbol("4", "src/kept.rs", "kept"),
+            ],
+        );
+        let work =
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+                .expect("incremental component");
+        if !work.cloned {
+            return;
+        }
+        assert_eq!(work.retained, 2);
+        assert_eq!(work.inserted, 4);
+        assert_eq!(work.removed, 4);
+        assert_eq!(work.reordered, 4);
+        assert_eq!(
+            v2_symbol_storage_id(&current_dir.join(SCIP_SYMBOLS_DATABASE_FILE), "4"),
+            retained_storage_id,
+            "unchanged v2 records retain their physical storage identity"
+        );
+        assert_eq!(
+            load_scip_symbols_database(&current_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("current component"),
+            current
+        );
+    }
+
+    #[test]
+    fn scip_delta_reuses_rows_when_native_clone_is_unavailable() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "old"),
+                component_symbol("2", "src/kept.rs", "kept"),
+            ],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![
+                component_symbol("1", "src/a.rs", "changed"),
+                component_symbol("2", "src/kept.rs", "kept"),
+            ],
+        );
+        let work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+        })
+        .expect("incremental component");
+        assert!(work.copied);
+        assert!(!work.cloned);
+        assert!(work.retained > 0);
+        assert_eq!(
+            load_scip_symbols_database(&current_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("published component"),
+            current
+        );
+    }
+
+    #[test]
+    fn scip_copy_space_refusal_leaves_previous_component_and_no_candidate() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "old")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "changed")],
+        );
+        let error = crate::copy_on_write::with_clone_disabled(|| {
+            codestory_store::with_available_filesystem_bytes_override(0, || {
+                publish_scip_component_with_cancel(
+                    &current_dir,
+                    Some(&previous_dir),
+                    &current,
+                    &|| false,
+                    &mut || Ok(()),
+                )
+                .expect_err("component copy must refuse insufficient space")
+            })
+        });
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<codestory_store::StorageError>(),
+            Some(codestory_store::StorageError::InsufficientSpace {
+                operation: "sealed_component_copy",
+                available_bytes: 0,
+                ..
+            })
+        )));
+        assert!(!current_dir.join(SCIP_SYMBOLS_DATABASE_FILE).exists());
+        assert_eq!(
+            load_scip_symbols_database(&previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("previous publication"),
+            previous
+        );
+        assert_eq!(
+            std::fs::read_dir(&current_dir)
+                .expect("candidate directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn scip_copy_cancellation_preserves_previous_component_and_class() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "old")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "changed")],
+        );
+        let polls = AtomicUsize::new(0);
+        let error = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component_with_cancel(
+                &current_dir,
+                Some(&previous_dir),
+                &current,
+                &|| polls.fetch_add(1, Ordering::SeqCst) >= 1,
+                &mut || Ok(()),
+            )
+            .expect_err("copy is cancelled after destination creation")
+        });
+        assert!(crate::index::is_retrieval_index_cancelled(&error));
+        assert!(polls.load(Ordering::SeqCst) >= 2);
+        assert!(!current_dir.join(SCIP_SYMBOLS_DATABASE_FILE).exists());
+        assert_eq!(
+            load_scip_symbols_database(&previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("previous publication"),
+            previous
+        );
+    }
+
+    #[test]
+    fn identical_scip_records_do_not_rewrite_ordering_rows() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let mut current = previous.clone();
+        current.generation = "generation-v2".into();
+
+        let work =
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+                .expect("incremental component");
+        if !work.cloned {
+            return;
+        }
+        assert_eq!(work.retained, 4);
+        assert_eq!(work.inserted, 0);
+        assert_eq!(work.removed, 0);
+        assert_eq!(work.reordered, 0);
+    }
+
+    #[test]
+    fn publication_only_scip_churn_directly_references_the_component_without_clone() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let mut current = previous.clone();
+        current.generation = "generation-v2".into();
+        let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+
+        let work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+        })
+        .expect("publication-only scip component");
+        assert!(work.direct_reference);
+        assert_eq!(work.retained, 4);
+        assert_eq!(work.inserted, 0);
+        assert_eq!(work.removed, 0);
+        assert_eq!(work.reordered, 0);
+        let current_path = current_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
+        );
+        assert_eq!(
+            load_scip_symbols_database_for_generation(&current_path, "generation-v2")
+                .expect("load current envelope"),
+            current,
+        );
+        assert!(
+            std::fs::metadata(&previous_path)
+                .expect("previous permissions")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            std::fs::metadata(&current_path)
+                .expect("current permissions")
+                .permissions()
+                .readonly()
+        );
+
+        let changed_dir = root.path().join("changed");
+        std::fs::create_dir_all(&changed_dir).expect("changed dir");
+        let changed = component_index(
+            "generation-v3",
+            vec![
+                component_symbol("1", "src/a.rs", "changed-alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        let changed_work =
+            publish_scip_component(&changed_dir, Some(&current_dir), &changed, &mut || Ok(()))
+                .expect("changed component from immutable predecessor");
+        assert!(!changed_work.direct_reference);
+        let changed_path = changed_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert_eq!(
+            load_scip_symbols_database_for_generation(&changed_path, "generation-v3")
+                .expect("load changed component"),
+            changed,
+        );
+        assert!(
+            std::fs::metadata(changed_path)
+                .expect("changed permissions")
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn changed_v1_component_writes_compact_v2_while_identical_v1_stays_reusable() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous-v1");
+        let identical_dir = root.path().join("identical-v1");
+        let changed_dir = root.path().join("changed-v2");
+        for path in [&previous_dir, &identical_dir, &changed_dir] {
+            std::fs::create_dir_all(path).expect("component directory");
+        }
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        let previous_path = write_v1_component_fixture(&previous_dir, &previous);
+        let previous_bytes = std::fs::read(&previous_path).expect("read v1 predecessor");
+        let previous_schema = Connection::open_with_flags(
+            sqlite_open_path(&previous_path),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open v1 predecessor")
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+        .expect("read v1 predecessor schema");
+        assert_eq!(previous_schema, 1, "causal fixture must start at v1");
+
+        let mut identical = previous.clone();
+        identical.generation = "generation-identical".into();
+        let identical_work = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component(&identical_dir, Some(&previous_dir), &identical, &mut || {
+                Ok(())
+            })
+        })
+        .expect("reuse identical v1 component");
+        assert!(identical_work.direct_reference);
+        assert!(!identical_work.cloned);
+        assert_eq!(identical_work.retained, 4);
+        assert_eq!(identical_work.inserted, 0);
+        assert_eq!(identical_work.removed, 0);
+        assert_eq!(identical_work.reordered, 0);
+        let identical_path = identical_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous v1 identity"),
+            codestory_workspace::workspace_path_identity(&identical_path)
+                .expect("identical v1 identity"),
+        );
+        assert_eq!(
+            load_scip_symbols_database_for_generation(&identical_path, "generation-identical")
+                .expect("load directly referenced v1"),
+            identical
+        );
+
+        let changed = component_index(
+            "generation-v2",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha-changed"),
+                component_symbol("2", "src/b.rs", "beta"),
+                component_symbol("3", "src/c.rs", "gamma"),
+            ],
+        );
+        let changed_work =
+            publish_scip_component(&changed_dir, Some(&identical_dir), &changed, &mut || Ok(()))
+                .expect("convert changed v1 component to compact v2");
+
+        assert!(!changed_work.direct_reference);
+        assert!(
+            !changed_work.cloned,
+            "changed v1 must not be reconciled in place"
+        );
+        assert_eq!(changed_work.retained, 0);
+        assert_eq!(changed_work.inserted, 6);
+        assert_eq!(changed_work.removed, 0);
+        assert_eq!(changed_work.reordered, 0);
+        let changed_path = changed_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let changed_schema = Connection::open_with_flags(
+            sqlite_open_path(&changed_path),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open compact successor")
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+        .expect("read compact successor schema");
+        assert_eq!(changed_schema, 2);
+        assert_eq!(
+            load_scip_symbols_database_for_generation(&changed_path, "generation-v2")
+                .expect("load compact successor"),
+            changed
+        );
+        assert_eq!(
+            std::fs::read(&previous_path).expect("reread v1 predecessor"),
+            previous_bytes,
+            "v1 predecessor changed while publishing its v2 successor"
+        );
+    }
+
+    #[test]
+    fn compact_v2_component_interns_repeated_values_below_half_canonical_payload() {
+        let root = TempDir::new().expect("tempdir");
+        let component_dir = root.path().join("compact");
+        std::fs::create_dir_all(&component_dir).expect("component directory");
+        let repeated_path = format!("src/shared/{}.rs", "repeated-segment/".repeat(24));
+        let repeated_symbol = "shared::qualified::symbol".repeat(16);
+        let index = component_index(
+            "generation-compact",
+            (0..512)
+                .map(|node_id| {
+                    component_symbol(&node_id.to_string(), &repeated_path, &repeated_symbol)
+                })
+                .collect(),
+        );
+        let canonical_payload_bytes = scip_component_rows(&index)
+            .expect("canonical component rows")
+            .iter()
+            .map(|row| row.record_json.len())
+            .sum::<usize>();
+
+        let work = publish_scip_component(&component_dir, None, &index, &mut || Ok(()))
+            .expect("write compact component");
+
+        assert!(!work.cloned);
+        assert!(!work.direct_reference);
+        let component_path = component_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let component_bytes = usize::try_from(
+            std::fs::metadata(&component_path)
+                .expect("compact component metadata")
+                .len(),
+        )
+        .expect("component size fits usize");
+        assert!(
+            component_bytes < canonical_payload_bytes / 2,
+            "compact component {component_bytes} bytes did not intern repeated values below half of the {canonical_payload_bytes}-byte canonical JSON payload"
+        );
+        let schema = Connection::open_with_flags(
+            sqlite_open_path(&component_path),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open compact component")
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+        .expect("read compact schema");
+        assert_eq!(schema, 2);
+        assert_eq!(
+            load_scip_symbols_database_for_generation(&component_path, "generation-compact")
+                .expect("round-trip compact component"),
+            index
+        );
+    }
+
+    #[test]
+    fn compact_v2_component_rejects_duplicate_values_and_dangling_references() {
+        let root = TempDir::new().expect("tempdir");
+        let index = component_index(
+            "generation-v2-hostile",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        let pristine_dir = root.path().join("pristine");
+        std::fs::create_dir_all(&pristine_dir).expect("pristine directory");
+        publish_scip_component(&pristine_dir, None, &index, &mut || Ok(()))
+            .expect("publish pristine v2 component");
+        let pristine = pristine_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+
+        for (name, mutation, expected) in [
+            (
+                "duplicate-value",
+                "UPDATE strings SET value = (SELECT value FROM strings ORDER BY string_id LIMIT 1) WHERE string_id = (SELECT string_id FROM strings ORDER BY string_id DESC LIMIT 1)",
+                "string dictionary is invalid",
+            ),
+            (
+                "dangling-reference",
+                "UPDATE symbol_records SET path = 9223372036854775807 WHERE storage_id = (SELECT storage_id FROM symbol_records LIMIT 1)",
+                "string reference is missing",
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.sqlite3"));
+            std::fs::copy(&pristine, &path).expect("copy hostile v2 component");
+            crate::copy_on_write::make_file_owner_writable(&path)
+                .expect("make hostile v2 component writable");
+            Connection::open(sqlite_open_path(&path))
+                .expect("open hostile v2 component")
+                .execute(mutation, [])
+                .expect("mutate hostile v2 component");
+            let error = load_scip_symbols_database(&path)
+                .expect_err("hostile v2 component must fail closed");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{name} failed at the wrong boundary: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_equivalent_generation_reuses_the_parsed_component_receipt() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![
+                component_symbol("1", "src/a.rs", "alpha"),
+                component_symbol("2", "src/b.rs", "beta"),
+            ],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        std::fs::write(
+            previous_dir.join("revision.txt"),
+            format!("{}\n", previous.revision),
+        )
+        .expect("previous revision");
+        write_scip_index_marker(&previous_dir, &previous.revision).expect("previous marker");
+        let previous_view =
+            load_fresh_scip_query_view(&previous_dir, &previous.revision, "generation-v1")
+                .expect("validate predecessor")
+                .expect("predecessor query view");
+
+        let outcome = reference_equivalent_scip_generation(
+            &previous_dir,
+            &current_dir,
+            "generation-v1",
+            "generation-v2",
+            &previous.revision,
+            || Ok(()),
+        )
+        .expect("reference equivalent graph")
+        .expect("hard-link reference supported");
+        assert!(outcome.direct_reference);
+        assert_eq!(outcome.inserted_records, 0);
+        assert_eq!(outcome.removed_records, 0);
+        let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let current_path = current_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
+        );
+        let current_key = current_path;
+        let graph_health = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&current_key)
+            .expect("referenced generation inherits producer-validated graph health");
+        assert_eq!(graph_health.validations, 1);
+        assert!(scip_component_admits_graph_health(
+            &current_dir,
+            &previous.revision,
+            "generation-v2"
+        ));
+        assert_eq!(
+            SCIP_GRAPH_HEALTH_RECEIPTS
+                .stats(&current_key)
+                .expect("referenced graph remains sealed")
+                .validations,
+            1,
+            "warm referenced graph health must avoid another row scan"
+        );
+        let aliased = SCIP_PARSED_INDEX_RECEIPTS
+            .stats(&current_key)
+            .expect("referenced graph inherits parsed receipt");
+        assert_eq!(aliased.validations, 1);
+        let current_view =
+            load_fresh_scip_query_view(&current_dir, &previous.revision, "generation-v2")
+                .expect("reuse current graph")
+                .expect("current query view");
+        assert_eq!(previous_view.generation(), "generation-v1");
+        assert_eq!(current_view.generation(), "generation-v2");
+        assert_eq!(previous_view.symbol_count(), current_view.symbol_count());
+        let reused = SCIP_PARSED_INDEX_RECEIPTS
+            .stats(&current_key)
+            .expect("current graph receipt remains sealed");
+        assert_eq!(reused.validations, 1);
+        assert!(reused.reuses > aliased.reuses);
+
+        let refresh = capture_scip_generation_receipt(&current_dir)
+            .expect("capture current graph receipt before owned cleanup");
+        std::fs::remove_file(&previous_path).expect("retire predecessor graph hard link");
+        assert!(refresh.refresh_after_owned_link_cleanup());
+        load_fresh_scip_query_view(&current_dir, &previous.revision, "generation-v2")
+            .expect("graph after predecessor cleanup")
+            .expect("graph remains available");
+        assert_eq!(
+            SCIP_PARSED_INDEX_RECEIPTS
+                .stats(&current_key)
+                .expect("cleanup refreshed current graph receipt")
+                .validations,
+            1,
+            "owned hard-link cleanup must not force another full graph scan",
+        );
+        assert!(scip_component_admits_graph_health(
+            &current_dir,
+            &previous.revision,
+            "generation-v2"
+        ));
+        assert_eq!(
+            SCIP_GRAPH_HEALTH_RECEIPTS
+                .stats(&current_key)
+                .expect("cleanup refreshed current health receipt")
+                .validations,
+            1,
+            "owned hard-link cleanup must preserve cheap graph health",
+        );
+    }
+
+    #[test]
+    fn scip_publication_envelope_is_rechecked_without_rereading_sealed_component() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("generation");
+        std::fs::create_dir_all(&project_dir).expect("generation dir");
+        let index = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "alpha")],
+        );
+        publish_scip_component(&project_dir, None, &index, &mut || Ok(())).expect("component");
+        let revision_path = project_dir.join("revision.txt");
+        std::fs::write(&revision_path, format!("{}\n", index.revision)).expect("revision");
+        write_scip_index_marker(&project_dir, &index.revision).expect("marker");
+        let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+
+        load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
+            .expect("initial validation")
+            .expect("initial view");
+        let initial = SCIP_PARSED_INDEX_RECEIPTS
+            .stats(&component_path)
+            .expect("sealed physical component");
+        assert_eq!(initial.validations, 1);
+
+        std::fs::write(&revision_path, "wrong-revision\n").expect("damage revision envelope");
+        assert!(
+            load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
+                .expect("revision mismatch is a refusal")
+                .is_none()
+        );
+        std::fs::write(&revision_path, format!("{}\n", index.revision))
+            .expect("restore revision envelope");
+
+        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "damaged-marker\n")
+            .expect("damage marker envelope");
+        assert!(
+            load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
+                .expect("marker mismatch is a refusal")
+                .is_none()
+        );
+        write_scip_index_marker(&project_dir, &index.revision).expect("restore marker envelope");
+
+        let restored = load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
+            .expect("restored envelope")
+            .expect("restored view");
+        assert_eq!(restored.generation(), "generation-v1");
+        let final_stats = SCIP_PARSED_INDEX_RECEIPTS
+            .stats(&component_path)
+            .expect("component receipt survives envelope refusals");
+        assert_eq!(final_stats.validations, 1);
+        assert!(final_stats.reuses > initial.reuses);
+    }
+
+    #[test]
+    fn scip_component_mutation_truncation_and_replacement_never_answer_previous_bytes() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        for damage in ["mutation", "truncation"] {
+            let root = TempDir::new().expect("tempdir");
+            let project_dir = root.path().join(damage);
+            std::fs::create_dir_all(&project_dir).expect("generation dir");
+            let index = component_index(
+                "generation-v1",
+                vec![component_symbol("1", "src/a.rs", "alpha")],
+            );
+            publish_scip_component(&project_dir, None, &index, &mut || Ok(())).expect("component");
+            std::fs::write(
+                project_dir.join("revision.txt"),
+                format!("{}\n", index.revision),
+            )
+            .expect("revision");
+            write_scip_index_marker(&project_dir, &index.revision).expect("marker");
+            let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+            load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
+                .expect("warm component")
+                .expect("warm view");
+
+            crate::copy_on_write::make_file_owner_writable(&component_path)
+                .expect("make component writable for hostile mutation");
+            if damage == "mutation" {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&component_path)
+                    .expect("open component");
+                file.seek(SeekFrom::Start(0)).expect("seek component");
+                file.write_all(b"X").expect("mutate component");
+                file.sync_all().expect("sync mutation");
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&component_path)
+                    .expect("open component")
+                    .set_len(64)
+                    .expect("truncate component");
+            }
+            assert!(
+                load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1").is_err(),
+                "{damage} must force physical revalidation and refusal"
+            );
+        }
+
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("published");
+        let replacement_dir = root.path().join("replacement");
+        std::fs::create_dir_all(&project_dir).expect("published dir");
+        std::fs::create_dir_all(&replacement_dir).expect("replacement dir");
+        let original = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "alpha")],
+        );
+        publish_scip_component(&project_dir, None, &original, &mut || Ok(()))
+            .expect("original component");
+        std::fs::write(
+            project_dir.join("revision.txt"),
+            format!("{}\n", original.revision),
+        )
+        .expect("original revision");
+        write_scip_index_marker(&project_dir, &original.revision).expect("original marker");
+        let component_path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        load_fresh_scip_query_view(&project_dir, &original.revision, "generation-v1")
+            .expect("warm original")
+            .expect("original view");
+
+        let replacement = component_index(
+            "generation-replacement",
+            vec![component_symbol("2", "src/b.rs", "beta")],
+        );
+        publish_scip_component(&replacement_dir, None, &replacement, &mut || Ok(()))
+            .expect("replacement component");
+        let replacement_path = replacement_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        std::fs::remove_file(&component_path).expect("remove original component");
+        std::fs::rename(&replacement_path, &component_path).expect("replace component identity");
+
+        assert!(
+            load_fresh_scip_query_view(&project_dir, &original.revision, "generation-v1")
+                .expect("valid replacement is an envelope refusal")
+                .is_none()
+        );
+
+        std::fs::write(
+            project_dir.join("revision.txt"),
+            format!("{}\n", replacement.revision),
+        )
+        .expect("replacement revision");
+        write_scip_index_marker(&project_dir, &replacement.revision).expect("replacement marker");
+        let admitted =
+            load_fresh_scip_query_view(&project_dir, &replacement.revision, "generation-v1")
+                .expect("replacement envelope")
+                .expect("replacement view");
+        assert_eq!(admitted.generation(), "generation-v1");
+        assert_eq!(admitted.symbol_count(), 1);
+        let replacement_symbol = admitted.symbol_at(0).expect("replacement symbol");
+        assert_eq!(replacement_symbol.node_id.as_deref(), Some("2"));
+        assert_eq!(replacement_symbol.path, "src/b.rs");
+        assert_eq!(replacement_symbol.symbol, "beta");
+    }
+
+    #[test]
+    fn same_generation_scip_retry_replaces_a_readonly_component_before_marker_completion() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("partial");
+        std::fs::create_dir_all(&project_dir).expect("partial dir");
+        let partial = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "partial")],
+        );
+        publish_scip_component(&project_dir, None, &partial, &mut || Ok(()))
+            .expect("publish component before markers");
+        let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert!(
+            std::fs::metadata(&path)
+                .expect("partial permissions")
+                .permissions()
+                .readonly()
+        );
+
+        let repaired = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "repaired")],
+        );
+        publish_scip_component(&project_dir, None, &repaired, &mut || Ok(()))
+            .expect("repair same-generation component");
+
+        assert_eq!(
+            load_scip_symbols_database(&path).expect("load repaired component"),
+            repaired
+        );
+        assert!(
+            std::fs::metadata(path)
+                .expect("repaired permissions")
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn cancelled_scip_component_leaves_no_candidate_database() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let cancelled_dir = root.path().join("cancelled");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&cancelled_dir).expect("cancelled dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "alpha")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "changed")],
+        );
+
+        let error =
+            publish_scip_component(&cancelled_dir, Some(&previous_dir), &current, &mut || {
+                bail!("simulated SCIP cancellation")
+            })
+            .expect_err("cancelled SCIP component must fail");
+
+        assert!(format!("{error:#}").contains("simulated SCIP cancellation"));
+        assert!(!cancelled_dir.join(SCIP_SYMBOLS_DATABASE_FILE).exists());
+        assert_eq!(
+            std::fs::read_dir(&cancelled_dir)
+                .expect("cancelled SCIP directory")
+                .count(),
+            0,
+            "failed SCIP staging must not leak a generation-local clone"
+        );
+    }
+
+    #[test]
+    fn corrupt_scip_predecessor_falls_back_to_a_clean_component() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "old")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let previous_path = previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        crate::copy_on_write::make_file_owner_writable(&previous_path)
+            .expect("authorize hostile corruption");
+        std::fs::write(previous_path, b"not sqlite").expect("corrupt predecessor");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "current")],
+        );
+
+        let work =
+            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
+                .expect("complete fallback");
+
+        assert!(!work.cloned);
+        assert_eq!(
+            load_scip_symbols_database(&current_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("load fallback component"),
+            current
+        );
+    }
 
     #[test]
     fn scip_emit_streams_canonical_pages_independent_of_legacy_projection() {
@@ -1464,6 +4388,21 @@ mod tests {
         let revision = emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
             .expect("emit scip")
             .expect("revision");
+        let component = scip_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        let produced = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component)
+            .expect("published component has producer-validated health receipt");
+        assert_eq!(produced.validations, 1);
+        assert!(scip_component_admits_graph_health(
+            &scip_dir,
+            &revision,
+            "generation-a"
+        ));
+        let warm = SCIP_GRAPH_HEALTH_RECEIPTS
+            .stats(&component)
+            .expect("produced component receipt remains sealed");
+        assert_eq!(warm.validations, 1);
+        assert!(warm.reuses > produced.reuses);
         let index = load_scip_symbols(&scip_dir)
             .expect("load scip")
             .expect("index");
@@ -1507,6 +4446,337 @@ mod tests {
         assert!(
             !index.is_fresh_for(&revision, "generation-b"),
             "the published artifact must be refused for a different generation"
+        );
+    }
+
+    #[test]
+    fn scip_emit_omits_blank_symbols_without_mutating_core_or_named_relationships() {
+        let project = TempDir::new().expect("project");
+        let storage_path = adjacency_fixture_store(&project);
+        let mut storage = Store::open(&storage_path).expect("reopen store");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(5),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: String::new(),
+                    qualified_name: Some(String::new()),
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(70),
+                    start_col: Some(0),
+                    end_line: Some(70),
+                    end_col: Some(0),
+                },
+                Node {
+                    id: NodeId(6),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: " \t".into(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(71),
+                    start_col: Some(0),
+                    end_line: Some(71),
+                    end_col: Some(0),
+                },
+            ])
+            .expect("insert blank annotations");
+        let core_before = storage
+            .get_canonical_search_symbol_detail_batch_after(None, usize::MAX)
+            .expect("core before emit");
+        assert_eq!(core_before.len(), 6);
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
+            .expect("blank identities are not SCIP evidence")
+            .expect("named symbols still produce a revision");
+        let index = load_scip_symbols(&scip_dir)
+            .expect("load scip")
+            .expect("named SCIP artifact");
+
+        assert_eq!(
+            index
+                .symbols
+                .iter()
+                .map(|symbol| symbol.node_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("2"), Some("3"), Some("4")],
+            "only named source symbols enter the SCIP artifact"
+        );
+        let references = index
+            .proofs
+            .iter()
+            .filter(|proof| proof.is_reference())
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].node_id.as_deref(), Some("2"));
+        assert_eq!(references[0].target_node_id.as_deref(), Some("4"));
+
+        let storage = Store::open(&storage_path).expect("reopen core after emit");
+        assert_eq!(
+            storage
+                .get_canonical_search_symbol_detail_batch_after(None, usize::MAX)
+                .expect("core after emit"),
+            core_before,
+            "SCIP admission must not rewrite or remove core nodes"
+        );
+    }
+
+    // Adapted from Terra's independent hostile overlay for #2236.
+    #[test]
+    fn scip_emit_trims_unicode_blank_endpoints_without_normalizing_named_symbols() {
+        let project = TempDir::new().expect("project");
+        let storage_path = adjacency_fixture_store(&project);
+        let mut storage = Store::open(&storage_path).expect("reopen store");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(5),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "\u{2003}".into(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(70),
+                    start_col: Some(0),
+                    end_line: Some(70),
+                    end_col: Some(0),
+                },
+                Node {
+                    id: NodeId(6),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "  padded endpoint  ".into(),
+                    qualified_name: Some("  padded endpoint  ".into()),
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(75),
+                    start_col: Some(0),
+                    end_line: Some(75),
+                    end_col: Some(0),
+                },
+            ])
+            .expect("insert whitespace and padded nodes");
+        storage
+            .insert_edges_batch(&[
+                Edge {
+                    id: EdgeId(2),
+                    source: NodeId(4),
+                    target: NodeId(6),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(55),
+                    resolved_source: Some(NodeId(4)),
+                    resolved_target: Some(NodeId(6)),
+                    confidence: Some(1.0),
+                    certainty: Some(ResolutionCertainty::Certain),
+                    callsite_identity: Some("src/client.rs:55".into()),
+                    candidate_targets: Vec::new(),
+                },
+                Edge {
+                    id: EdgeId(3),
+                    source: NodeId(5),
+                    target: NodeId(2),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(72),
+                    resolved_source: Some(NodeId(5)),
+                    resolved_target: Some(NodeId(2)),
+                    confidence: Some(1.0),
+                    certainty: Some(ResolutionCertainty::Certain),
+                    callsite_identity: Some("src/client.rs:72".into()),
+                    candidate_targets: Vec::new(),
+                },
+            ])
+            .expect("insert named and blank-endpoint edges");
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        emit_scip_artifacts_from_store(&storage_path, &scip_dir, "generation-a")
+            .expect("emit")
+            .expect("named symbols publish");
+        let index = load_scip_symbols(&scip_dir)
+            .expect("load scip")
+            .expect("index");
+
+        assert!(
+            !index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.node_id.as_deref() == Some("5")),
+            "unicode-whitespace identities must not become symbols"
+        );
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.symbol == "  padded endpoint  "),
+            "a nonempty display name is evidence verbatim, not trim-normalized"
+        );
+        assert!(
+            index.proofs.iter().any(|proof| {
+                proof.is_reference()
+                    && proof.node_id.as_deref() == Some("4")
+                    && proof.target_node_id.as_deref() == Some("6")
+                    && proof.target_symbol.as_deref() == Some("  padded endpoint  ")
+            }),
+            "the named endpoint relationship must remain exact"
+        );
+        assert!(
+            !index.proofs.iter().any(|proof| {
+                proof.is_reference()
+                    && (proof.node_id.as_deref() == Some("5")
+                        || proof.target_node_id.as_deref() == Some("5")
+                        || proof.symbol.trim().is_empty()
+                        || proof
+                            .target_symbol
+                            .as_deref()
+                            .is_some_and(|symbol| symbol.trim().is_empty()))
+            }),
+            "a skipped blank endpoint must not be fabricated into adjacency"
+        );
+
+        let mut corrupted = index.clone();
+        corrupted
+            .proofs
+            .iter_mut()
+            .find(|proof| {
+                proof.is_reference()
+                    && proof.node_id.as_deref() == Some("4")
+                    && proof.target_node_id.as_deref() == Some("6")
+            })
+            .expect("padded target reference")
+            .target_symbol = Some(" padded endpoint  ".into());
+        assert!(matches!(
+            corrupted.validate_records("generation-a"),
+            Err(ScipArtifactDefect::InvalidRecord {
+                defect: ScipProofDefect::ReferenceNodeIdentityDisagreesWithSymbol,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn imported_reference_target_lookup_preserves_trimmed_compatibility_and_rejects_blank() {
+        let symbols = vec![component_symbol("1", "src/lib.rs", "target")];
+        let lookup = ScipSymbolLookup::new(&symbols);
+        let mut proof = ScipProofRecord {
+            role: SCIP_REFERENCE_ROLE.into(),
+            path: "src/lib.rs".into(),
+            symbol: "caller".into(),
+            start_line: 1,
+            start_character_utf16: 0,
+            end_line: 1,
+            end_character_utf16: 0,
+            target_symbol: Some("  target  ".into()),
+            node_id: None,
+            target_node_id: None,
+            edge_kind: None,
+        };
+
+        assert_eq!(
+            reference_defect(&proof, &lookup, ScipEvidenceSource::ImportedProof),
+            None,
+            "imported references retain their existing trimmed name lookup"
+        );
+        proof.target_symbol = Some(" \u{2003} ".into());
+        assert_eq!(
+            reference_defect(&proof, &lookup, ScipEvidenceSource::ImportedProof),
+            Some(ScipProofDefect::ReferenceMissingTargetSymbol),
+            "trim-recognized blank imported targets remain inadmissible"
+        );
+    }
+
+    #[test]
+    fn scip_emit_all_blank_symbols_crossing_page_boundary_produces_no_artifact() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        let file_node_id = NodeId(1);
+        storage
+            .insert_file(&FileInfo {
+                id: file_node_id.0,
+                path: project.path().join("blank.json"),
+                language: "json".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 4_100,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: file_node_id,
+                kind: NodeKind::FILE,
+                serialized_name: "blank.json".into(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: None,
+                start_line: Some(1),
+                start_col: Some(0),
+                end_line: Some(4_100),
+                end_col: Some(0),
+            }])
+            .expect("insert file node");
+        let annotations = (0..4_100_i64)
+            .map(|index| Node {
+                id: NodeId(index + 2),
+                kind: NodeKind::ANNOTATION,
+                serialized_name: if index % 2 == 0 {
+                    String::new()
+                } else {
+                    "  ".into()
+                },
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(file_node_id),
+                start_line: Some((index + 1) as u32),
+                start_col: Some(0),
+                end_line: Some((index + 1) as u32),
+                end_col: Some(0),
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&annotations)
+            .expect("insert paginated blank annotations");
+        assert_eq!(storage.get_canonical_search_symbol_count().unwrap(), 4_101);
+        drop(storage);
+
+        let scip_dir = project.path().join("scip");
+        let outcome = emit_scip_artifacts_from_store_incremental(
+            &storage_path,
+            &scip_dir,
+            "generation-a",
+            None,
+            || Ok(()),
+        )
+        .expect("all blank identities produce no SCIP evidence");
+
+        assert_eq!(
+            outcome,
+            ScipIncrementalOutcome {
+                revision: None,
+                retained_records: 0,
+                inserted_records: 0,
+                removed_records: 0,
+                reordered_records: 0,
+                cloned: false,
+                copied: false,
+                direct_reference: false,
+            }
+        );
+        assert!(!scip_symbols_component_path(&scip_dir).exists());
+        assert!(!scip_dir.join("revision.txt").exists());
+        assert!(!scip_dir.join(SCIP_INDEX_FILE).exists());
+        assert_eq!(
+            Store::open(&storage_path)
+                .expect("reopen core")
+                .get_canonical_search_symbol_count()
+                .expect("count core after emit"),
+            4_101,
+            "pagination and filtering must not change the canonical core count"
         );
     }
 
@@ -1911,5 +5181,36 @@ mod tests {
             "an admitted import is bound to the generation that admitted it"
         );
         assert!(!stored.is_fresh_for(revision, "some-other-generation"));
+    }
+
+    /// Offline wall probe against a frozen Keycloak-class core. Not CI.
+    ///
+    /// `CODESTORY_SCIP_PROBE_DB` / `CODESTORY_SCIP_PROBE_OUT` required.
+    #[test]
+    #[ignore = "offline Keycloak SCIP emit wall probe"]
+    fn probe_scip_emit_wall_on_frozen_core() {
+        let db = std::path::PathBuf::from(
+            std::env::var("CODESTORY_SCIP_PROBE_DB").expect("CODESTORY_SCIP_PROBE_DB"),
+        );
+        let out = std::path::PathBuf::from(
+            std::env::var("CODESTORY_SCIP_PROBE_OUT").expect("CODESTORY_SCIP_PROBE_OUT"),
+        );
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).expect("out dir");
+        let started = Instant::now();
+        let outcome =
+            emit_scip_artifacts_from_store_incremental(&db, &out, "probe-generation", None, || {
+                Ok(())
+            });
+        let elapsed = started.elapsed();
+        eprintln!("elapsed_ms={}", elapsed.as_millis());
+        eprintln!("outcome={outcome:?}");
+        let outcome = outcome.expect("scip emit");
+        assert!(outcome.revision.is_some());
+        let component = scip_symbols_component_path(&out);
+        eprintln!(
+            "component_bytes={}",
+            std::fs::metadata(&component).map(|m| m.len()).unwrap_or(0)
+        );
     }
 }

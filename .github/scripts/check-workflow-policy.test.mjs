@@ -58,7 +58,7 @@ import {
 } from "./qualification-driver-artifact.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
-const proofTopology = "proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5";
+const proofTopology = "proof5-v1-f1f03863d1fa5a61a86f02f1e1ca06bc2a619a401ab0f557ec2d74964f34fef0";
 const cacheManifestIdentity = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -82,31 +82,604 @@ function windowsManifestWorkflow() {
   return retrievalSourceWorkflow();
 }
 
-test("packaged qualification dependencies stay outside the benchmark graph", () => {
-  const source = readFileSync(
+const sealedProofAvailabilityBin = `[[bin]]
+name = "codestory-proof-availability"
+path = "src/bin/codestory_proof_availability.rs"
+`;
+
+const legacyBenchmarkManifest = `[package]
+name = "codestory-bench"
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dev-dependencies]
+codestory-cli = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-indexer = { workspace = true }
+codestory-runtime = { workspace = true, features = ["benchmark-support"] }
+codestory-store = { workspace = true }
+criterion = { workspace = true }
+uuid = { workspace = true }
+`;
+
+function benchmarkManifestSource() {
+  return readFileSync(
     path.join(root, "crates", "codestory-bench", "Cargo.toml"),
     "utf8",
   );
+}
+
+function replaceManifestFragment(source, before, after) {
+  assert.ok(source.includes(before), `fixture is missing ${JSON.stringify(before)}`);
+  const result = source.replace(before, after);
+  assert.notEqual(result, source, "fixture mutation must change the manifest");
+  return result;
+}
+
+function assertIsolationViolation(source, pattern, label) {
+  assert.match(
+    benchmarkDependencyIsolationViolations(source).join("\n"),
+    pattern,
+    label,
+  );
+}
+
+test("current qualification manifest satisfies dependency isolation policy", () => {
+  const source = benchmarkManifestSource();
   assert.deepEqual(benchmarkDependencyIsolationViolations(source), []);
+});
+
+test("packaged qualification driver identity is exact", () => {
+  const fixtures = [
+    [
+      "wrong name",
+      `${legacyBenchmarkManifest}\n[[bin]]\nname = "codestory-proof-availability-v2"\npath = "src/bin/codestory_proof_availability.rs"\n`,
+    ],
+    [
+      "wrong path",
+      `${legacyBenchmarkManifest}\n[[bin]]\nname = "codestory-proof-availability"\npath = "src/bin/other.rs"\n`,
+    ],
+    [
+      "legacy dependencies under the sealed driver",
+      `${legacyBenchmarkManifest}\n${sealedProofAvailabilityBin}`,
+    ],
+  ];
+  for (const [label, source] of fixtures) {
+    assertIsolationViolation(
+      source,
+      /sealed codestory-proof-availability bin|exact reviewed feature topology/u,
+      label,
+    );
+  }
+
+  const source = benchmarkManifestSource();
+  assertIsolationViolation(
+    `${source}\n${sealedProofAvailabilityBin}`,
+    /exactly one sealed codestory-proof-availability bin/u,
+    "duplicate sealed bin",
+  );
+});
+
+test("unrelated explicit bins do not select qualification mode", () => {
+  const unrelatedBin = `[[bin]]
+name = "fixture-helper"
+path = "src/bin/fixture_helper.rs"
+`;
+  assert.deepEqual(
+    benchmarkDependencyIsolationViolations(`${legacyBenchmarkManifest}\n${unrelatedBin}`),
+    [],
+    "the legacy contract remains valid beside an unrelated explicit bin",
+  );
+  assert.deepEqual(
+    benchmarkDependencyIsolationViolations(`${benchmarkManifestSource()}\n${unrelatedBin}`),
+    [],
+    "an unrelated explicit bin cannot invalidate the sealed qualification driver",
+  );
+});
+
+test("qualification product dependencies use only the reviewed feature topology", () => {
+  const source = benchmarkManifestSource();
+  const fixtures = [
+    [
+      "agent feature added",
+      replaceManifestFragment(
+        source,
+        "codestory-agent = { workspace = true }",
+        'codestory-agent = { workspace = true, features = ["proof-qualification-support"] }',
+      ),
+    ],
+    [
+      "CLI feature widened",
+      replaceManifestFragment(
+        source,
+        'codestory-cli = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-cli = { workspace = true, features = ["proof-qualification-support", "benchmark-support"] }',
+      ),
+    ],
+    [
+      "runtime qualification feature missing",
+      replaceManifestFragment(
+        source,
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        "codestory-runtime = { workspace = true }",
+      ),
+    ],
+    [
+      "runtime feature widened",
+      replaceManifestFragment(
+        source,
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support", "extra-support"] }',
+      ),
+    ],
+    [
+      "agent dependency attributes widened",
+      replaceManifestFragment(
+        source,
+        "codestory-agent = { workspace = true }",
+        "codestory-agent = { workspace = true, default-features = false }",
+      ),
+    ],
+    [
+      "CLI dependency attributes widened",
+      replaceManifestFragment(
+        source,
+        'codestory-cli = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-cli = { workspace = true, optional = false, features = ["proof-qualification-support"] }',
+      ),
+    ],
+    [
+      "runtime dependency attributes widened",
+      replaceManifestFragment(
+        source,
+        'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+        'codestory-runtime = { workspace = true, default-features = false, features = ["proof-qualification-support"] }',
+      ),
+    ],
+  ];
+  for (const [label, fixture] of fixtures) {
+    assertIsolationViolation(
+      fixture,
+      /qualification dependencies must use the exact reviewed feature topology/u,
+      label,
+    );
+  }
+
+  const reorderedRuntimeAttributes = replaceManifestFragment(
+    source,
+    'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }',
+    'codestory-runtime = { features = ["proof-qualification-support"], workspace = true }',
+  );
+  assert.deepEqual(
+    benchmarkDependencyIsolationViolations(reorderedRuntimeAttributes),
+    [],
+    "TOML inline-table attribute ordering has no policy meaning",
+  );
+});
+
+test("qualification ordinary CodeStory dependencies keep exact workspace-only shape", async (t) => {
+  const source = benchmarkManifestSource();
+  const dependencies = [
+    "codestory-contracts",
+    "codestory-indexer",
+    "codestory-retrieval",
+    "codestory-store",
+    "codestory-workspace",
+  ];
+  const widenings = [
+    ["empty features", "features = []"],
+    ["optional flag", "optional = false"],
+    ["default-features flag", "default-features = false"],
+  ];
+  for (const dependency of dependencies) {
+    for (const [label, attribute] of widenings) {
+      await t.test(`${dependency}: ${label}`, () => {
+        const fixture = replaceManifestFragment(
+          source,
+          `${dependency} = { workspace = true }`,
+          `${dependency} = { workspace = true, ${attribute} }`,
+        );
+        assertIsolationViolation(
+          fixture,
+          /ordinary CodeStory product dependencies must use the exact reviewed workspace-only shape/u,
+          `${dependency} must reject ${attribute}`,
+        );
+      });
+    }
+  }
+});
+
+test("qualification CodeStory package identities have one exact normal dependency record", async (t) => {
+  const source = benchmarkManifestSource();
+  const packageIdentities = [
+    "codestory-agent",
+    "codestory-cli",
+    "codestory-contracts",
+    "codestory-indexer",
+    "codestory-retrieval",
+    "codestory-runtime",
+    "codestory-store",
+    "codestory-workspace",
+  ];
+  const aliases = [
+    [
+      "version alias with empty features",
+      (packageIdentity) =>
+        `${packageIdentity}-extra = { version = "0.16", package = "${packageIdentity}", features = [] }`,
+    ],
+    [
+      "path alias with a boolean attribute",
+      (packageIdentity) =>
+        `${packageIdentity}-extra = { path = "../${packageIdentity}", package = "${packageIdentity}", optional = false }`,
+    ],
+  ];
+  for (const packageIdentity of packageIdentities) {
+    for (const [label, declaration] of aliases) {
+      await t.test(`${packageIdentity}: ${label}`, () => {
+        const fixture = replaceManifestFragment(
+          source,
+          "[dependencies]\n",
+          `[dependencies]\n${declaration(packageIdentity)}\n`,
+        );
+        assertIsolationViolation(
+          fixture,
+          /reviewed CodeStory package identities must have exactly one exact normal dependency record/u,
+          `${packageIdentity} aliases must not widen the reviewed product topology`,
+        );
+      });
+    }
+  }
+});
+
+test("benchmark-only dependencies remain dev-only in qualification mode", () => {
+  const source = benchmarkManifestSource();
+  for (const dependency of ["criterion", "uuid"]) {
+    const declaration = `${dependency} = { workspace = true }\n`;
+    const withoutDevDependency = replaceManifestFragment(source, declaration, "");
+    const inProduct = replaceManifestFragment(
+      withoutDevDependency,
+      "[dependencies]\n",
+      `[dependencies]\n${declaration}`,
+    );
+    assertIsolationViolation(
+      inProduct,
+      /criterion and uuid must remain dev-only/u,
+      `${dependency} moved to product dependencies`,
+    );
+  }
+
+  const retrievalBenchmark =
+    'codestory-retrieval = { workspace = true, features = ["benchmark-support"] }\n';
+  const withoutBenchmarkDevDependency = replaceManifestFragment(
+    source,
+    retrievalBenchmark,
+    "",
+  );
+  const retrievalBenchmarkInProduct = replaceManifestFragment(
+    withoutBenchmarkDevDependency,
+    "codestory-retrieval = { workspace = true }\n",
+    retrievalBenchmark,
+  );
+  assertIsolationViolation(
+    retrievalBenchmarkInProduct,
+    /benchmark-only runtime and retrieval support must remain dev-only|product dependencies must not enable benchmark-support/u,
+    "retrieval benchmark-support moved to product dependencies",
+  );
+
+  const runtimeBenchmark =
+    'codestory-runtime = { workspace = true, features = ["benchmark-support"] }\n';
+  const withoutRuntimeBenchmarkDevDependency = replaceManifestFragment(
+    source,
+    runtimeBenchmark,
+    "",
+  );
+  const runtimeBenchmarkInProduct = replaceManifestFragment(
+    withoutRuntimeBenchmarkDevDependency,
+    'codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }\n',
+    'codestory-runtime = { workspace = true, features = ["benchmark-support", "proof-qualification-support"] }\n',
+  );
+  assertIsolationViolation(
+    runtimeBenchmarkInProduct,
+    /qualification dependencies must use the exact reviewed feature topology|product dependencies must not enable benchmark-support/u,
+    "runtime benchmark-support moved to product dependencies",
+  );
+
+  const storeBenchmarkSupport = replaceManifestFragment(
+    source,
+    "codestory-store = { workspace = true }",
+    'codestory-store = { workspace = true, features = ["benchmark-support"] }',
+  );
+  assertIsolationViolation(
+    storeBenchmarkSupport,
+    /product dependencies must not enable benchmark-support or test-support/u,
+    "unreviewed product dependency enables benchmark-support",
+  );
+  const obscuredStoreBenchmarkSupport = replaceManifestFragment(
+    source,
+    "codestory-store = { workspace = true }",
+    'codestory-store = { workspace = true, default-features = false, features = ["benchmark-support"] }',
+  );
+  assertIsolationViolation(
+    obscuredStoreBenchmarkSupport,
+    /product dependencies must not enable benchmark-support or test-support/u,
+    "extra dependency attributes cannot hide benchmark-support",
+  );
+});
+
+test("later array-table fields cannot forge missing dev dependencies", async (t) => {
+  const modes = [
+    [
+      "qualification",
+      benchmarkManifestSource(),
+      /criterion and uuid must remain dev-only/u,
+    ],
+    [
+      "legacy",
+      legacyBenchmarkManifest,
+      /benchmark-only dependencies must not enter packaged qualification binaries/u,
+    ],
+  ];
+  for (const [mode, source, violation] of modes) {
+    for (const dependency of ["criterion", "uuid"]) {
+      const withoutDependency = replaceManifestFragment(
+        source,
+        `${dependency} = { workspace = true }\n`,
+        "",
+      );
+      const forgedTables = [
+        [
+          "bench",
+          `[[bench]]\nname = "forged-${dependency}"\nharness = false\n${dependency} = "forged"\n`,
+        ],
+        [
+          "bin",
+          `[[bin]]\nname = "forged-${dependency}"\npath = "src/bin/forged_${dependency}.rs"\n${dependency} = "forged"\n`,
+        ],
+      ];
+      for (const [table, forgedTable] of forgedTables) {
+        await t.test(`${mode}: ${dependency} under later ${table}`, () => {
+          assertIsolationViolation(
+            `${withoutDependency}\n${forgedTable}`,
+            violation,
+            `${mode} ${dependency} must be read only from dev-dependencies`,
+          );
+        });
+      }
+    }
+  }
+});
+
+test("normal package aliases cannot hide Criterion or UUID", async (t) => {
+  const modes = [
+    [
+      "qualification",
+      benchmarkManifestSource(),
+      /criterion and uuid must remain dev-only/u,
+    ],
+    [
+      "legacy",
+      legacyBenchmarkManifest,
+      /benchmark-only dependencies must not enter packaged qualification binaries/u,
+    ],
+  ];
+  for (const [mode, source, violation] of modes) {
+    for (const [dependency, version] of [["criterion", "0.5"], ["uuid", "1"]]) {
+      await t.test(`${mode}: ${dependency} package alias`, () => {
+        const fixture = replaceManifestFragment(
+          source,
+          "[dependencies]\n",
+          `[dependencies]\n${dependency}-product = { version = "${version}", package = "${dependency}" }\n`,
+        );
+        assertIsolationViolation(
+          fixture,
+          violation,
+          `${mode} must detect ${dependency} by package identity`,
+        );
+      });
+    }
+  }
+});
+
+test("test-support never enters codestory-bench product dependencies", () => {
+  const source = benchmarkManifestSource();
+  const testSupportInProduct = replaceManifestFragment(
+    source,
+    "codestory-retrieval = { workspace = true }",
+    'codestory-retrieval = { workspace = true, features = ["test-support"] }',
+  );
+  assertIsolationViolation(
+    testSupportInProduct,
+    /product dependencies must not enable benchmark-support or test-support/u,
+    "retrieval test-support",
+  );
+
+  const agentTestSupport = replaceManifestFragment(
+    source,
+    '["proof-qualification-support"]',
+    '["proof-qualification-support", "test-support"]',
+  );
+  assertIsolationViolation(
+    agentTestSupport,
+    /product dependencies must not enable benchmark-support or test-support/u,
+    "agent test-support",
+  );
+
+  const storeQualificationSupport = replaceManifestFragment(
+    source,
+    "codestory-store = { workspace = true }",
+    'codestory-store = { workspace = true, features = ["proof-qualification-support"] }',
+  );
+  assertIsolationViolation(
+    storeQualificationSupport,
+    /qualification dependencies must use the exact reviewed feature topology/u,
+    "unreviewed product dependency enables proof qualification support",
+  );
+  const obscuredStoreQualificationSupport = replaceManifestFragment(
+    source,
+    "codestory-store = { workspace = true }",
+    'codestory-store = { workspace = true, default-features = false, features = ["proof-qualification-support"] }',
+  );
+  assertIsolationViolation(
+    obscuredStoreQualificationSupport,
+    /qualification dependencies must use the exact reviewed feature topology/u,
+    "extra dependency attributes cannot hide proof qualification support",
+  );
+});
+
+test("valid alternative TOML spellings cannot bypass dependency isolation", async (t) => {
+  const source = benchmarkManifestSource();
+  const withoutStore = replaceManifestFragment(
+    source,
+    "codestory-store = { workspace = true }\n",
+    "",
+  );
+  const withoutRetrieval = replaceManifestFragment(
+    source,
+    "codestory-retrieval = { workspace = true }\n",
+    "",
+  );
+  const fixtures = [
+    [
+      "literal-string duplicate sealed bin",
+      `${source}\n[[bin]]\nname = 'codestory-proof-availability'\npath = 'src/bin/codestory_proof_availability.rs'\n`,
+    ],
+    [
+      "literal-string proof-support owner",
+      replaceManifestFragment(
+        source,
+        "codestory-store = { workspace = true }",
+        "codestory-store = { workspace = true, features = ['proof-qualification-support'] }",
+      ),
+    ],
+    [
+      "normal Criterion dotted subtable",
+      `${source}\n[dependencies.criterion]\nworkspace = true\n`,
+    ],
+    [
+      "benchmark-support owner dotted subtable",
+      `${withoutStore}\n[dependencies.codestory-store]\nworkspace = true\nfeatures = ['benchmark-support']\n`,
+    ],
+    [
+      "quoted normal UUID key",
+      replaceManifestFragment(
+        source,
+        "[dependencies]\n",
+        '[dependencies]\n"uuid" = { workspace = true }\n',
+      ),
+    ],
+    [
+      "quoted retrieval subtable with multiline benchmark feature",
+      `${withoutRetrieval}\n[dependencies.'codestory-retrieval']\nworkspace = true\nfeatures = [\n  'benchmark-support',\n]\n`,
+    ],
+    [
+      "quoted product subtable with test-support",
+      `${withoutStore}\n[dependencies."codestory-store"]\nworkspace = true\nfeatures = ["test-support"]\n`,
+    ],
+    [
+      "dotted dependency keys hide proof-support owner",
+      replaceManifestFragment(
+        withoutStore,
+        "[dependencies]\n",
+        '[dependencies]\ncodestory-store.workspace = true\ncodestory-store.features = ["proof-qualification-support"]\n',
+      ),
+    ],
+    [
+      "literal-string partial sealed identity",
+      `${source}\n[[bin]]\nname = 'codestory-proof-availability'\npath = 'src/bin/not_the_driver.rs'\n`,
+    ],
+    [
+      "escaped basic-string duplicate sealed bin",
+      `${source}\n[[bin]]\nname = "codestory-proof-\\u0061vailability"\npath = "src/bin/codestory_proof_\\u0061vailability.rs"\n`,
+    ],
+    [
+      "escaped basic-string proof-support owner",
+      replaceManifestFragment(
+        source,
+        "codestory-store = { workspace = true }",
+        'codestory-store = { workspace = true, features = ["proof-qualification-\\u0073upport"] }',
+      ),
+    ],
+    [
+      "escaped quoted Criterion subtable",
+      `${source}\n[dependencies."crite\\u0072ion"]\nworkspace = true\n`,
+    ],
+    [
+      "quoted inline feature key",
+      replaceManifestFragment(
+        source,
+        "codestory-store = { workspace = true }",
+        'codestory-store = { workspace = true, "features" = ["benchmark-support"] }',
+      ),
+    ],
+    [
+      "commented duplicate sealed bin",
+      `${source}\n[[bin]]\nname = "codestory-proof-availability" # exact duplicate\npath = "src/bin/codestory_proof_availability.rs" # exact duplicate\n`,
+    ],
+    [
+      "multiline basic-string duplicate sealed bin",
+      `${source}\n[[bin]]\nname = """codestory-proof-availability"""\npath = """src/bin/codestory_proof_availability.rs"""\n`,
+    ],
+    [
+      "indented duplicate sealed bin",
+      `${source}\n  [[bin]]\n  name = "codestory-proof-availability"\n  path = "src/bin/codestory_proof_availability.rs"\n`,
+    ],
+  ];
+  for (const [label, fixture] of fixtures) {
+    await t.test(label, () => {
+      assertIsolationViolation(
+        fixture,
+        /canonical TOML syntax/u,
+        `${label} must fail closed before semantic checks`,
+      );
+    });
+  }
+});
+
+test("legacy manifest without a qualification bin keeps benchmark isolation", () => {
+  assert.deepEqual(
+    benchmarkDependencyIsolationViolations(legacyBenchmarkManifest),
+    [],
+  );
 
   const runtimeDependency =
     'codestory-runtime = { workspace = true, features = ["benchmark-support"] }\n';
-  const runtimeInProduct = source
-    .replace(runtimeDependency, "")
-    .replace("[dependencies]\n", `[dependencies]\n${runtimeDependency}`);
+  const runtimeInProduct = replaceManifestFragment(
+    replaceManifestFragment(legacyBenchmarkManifest, runtimeDependency, ""),
+    "[dependencies]\n",
+    `[dependencies]\n${runtimeDependency}`,
+  );
   assert.match(
     benchmarkDependencyIsolationViolations(runtimeInProduct).join("\n"),
     /benchmark-only dependencies|must not enable benchmark-support/u,
   );
+});
 
-  const testSupportInProduct = source.replace(
-    "codestory-retrieval = { workspace = true }",
-    'codestory-retrieval = { workspace = true, features = ["test-support"] }',
-  );
-  assert.match(
-    benchmarkDependencyIsolationViolations(testSupportInProduct).join("\n"),
-    /must not enable benchmark-support or test-support/u,
-  );
+test("legacy manifests cannot enable proof qualification support", async (t) => {
+  const fixtures = [
+    [
+      "direct agent proof support",
+      'codestory-agent = { workspace = true, features = ["proof-qualification-support"] }',
+    ],
+    [
+      "aliased agent proof support",
+      'agent-proof = { path = "../codestory-agent", package = "codestory-agent", features = ["proof-qualification-support"] }',
+    ],
+  ];
+  for (const [label, declaration] of fixtures) {
+    await t.test(label, () => {
+      const fixture = replaceManifestFragment(
+        legacyBenchmarkManifest,
+        "[dependencies]\n",
+        `[dependencies]\n${declaration}\n`,
+      );
+      assertIsolationViolation(
+        fixture,
+        /product dependencies must not enable proof-qualification-support without the sealed qualification driver/u,
+        label,
+      );
+    });
+  }
 });
 
 function draftStep(job, name) {
@@ -1693,31 +2266,43 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
+    ["host production graph includes the driver", packagedFile, workflow => {
+      hostBuild(workflow).run = hostBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "--bin codestory-cli-runtime -p codestory-bench --bin codestory_embedding_qualification",
+      );
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
         'cargo build --release --locked "$@" --target "$RELEASE_RUST_TARGET"\n              /sccache/sccache --show-stats',
       );
-    }, /Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /Linux package must isolate the optional qualification driver from the production Cargo graph/u],
+    ["Linux production graph includes the driver", packagedFile, workflow => {
+      linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime \\",
+        "--bin codestory-cli-runtime -p codestory-bench --bin codestory_embedding_qualification \\",
+      );
+    }, /Linux package must isolate the optional qualification driver from the production Cargo graph/u],
     ["qualification driver cache identity becomes fixed", packagedFile, workflow => {
       draftStep(
         packagedJob(workflow),
@@ -2079,7 +2664,7 @@ test("qualification driver retention breaks a Cargo source hardlink and rejects 
   }
 });
 
-test("Windows packages one release graph into exact public and private artifacts", async (t) => {
+test("Windows packages isolated production and driver graphs into exact public and private artifacts", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const file = "packaged-platform-proof.yml";
   const job = workflow => workflow.jobs.build;
@@ -2102,7 +2687,7 @@ test("Windows packages one release graph into exact public and private artifacts
     ["the one package build invokes Cargo twice", workflow => {
       step(workflow, "Build package and qualification driver").run +=
         "\ncargo build --release --locked -p codestory-cli";
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["the package graph loses release mode", workflow => {
       replaceRun(
         workflow,
@@ -2110,21 +2695,29 @@ test("Windows packages one release graph into exact public and private artifacts
         "cargo build --release --locked",
         "cargo build --locked",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["a source-test target contaminates the package graph", workflow => {
       step(workflow, "Build package and qualification driver").run =
         step(workflow, "Build package and qualification driver").run.replace(
           "timing_dir=\"target/windows-package-build-timing\"",
           'cargo_args+=( -p codestory-workspace --test windows_path_identity )\n            timing_dir="target/windows-package-build-timing"',
         );
-    }, /host package must build only the production bins/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["the host feature contract is removed", workflow => {
       step(workflow, "Build package and qualification driver").run =
         step(workflow, "Build package and qualification driver").run.replace(
           "node .github/scripts/cargo-build-artifacts.mjs features",
           "true",
         );
-    }, /host package must build only the production bins/u],
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
+    ["the Windows selector reads the production stream for the driver", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        'qualification_input=(--qualification-input "$qualification_json")',
+        'qualification_input=(--qualification-input "$cargo_json")',
+      );
+    }, /host package must isolate the optional qualification driver from the production Cargo graph/u],
     ["the Windows runtime probe accepts test support", workflow => {
       step(workflow, "Prove production feature identity on Windows").run =
         step(workflow, "Prove production feature identity on Windows").run.replace(
@@ -2596,6 +3189,31 @@ test("release workflows retain the closeout coordinator contract test", () => {
           && message.includes("scripts/tests/codestory-release-closeout.test.mjs")),
     );
   }
+});
+
+test("plugin static routes and executes the live coordinator adapter suite", () => {
+  const files = [
+    "scripts/lib/release-coordinator-github.mjs",
+    "scripts/lib/release-coordinator-contract.mjs",
+    "scripts/lib/release-coordinator-evidence.mjs",
+    "scripts/lib/read-release-artifact.py",
+    "scripts/tests/codestory-release-live.test.mjs",
+    "scripts/tests/fixtures/release-github.mjs",
+  ];
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const event of ["pull_request", "push"]) {
+    for (const file of files) {
+      const workflows = loadWorkflows();
+      workflows.get("plugin-static.yml").on[event].paths = workflows.get("plugin-static.yml").on[event].paths.filter(path => path !== file);
+      assert.match(validateWorkflows(workflows).join("\n"), /plugin-static\.yml.*paths must cover policy and release surfaces/u);
+    }
+  }
+  const workflows = loadWorkflows();
+  const step = workflows.get("plugin-static.yml").jobs["plugin-static"].steps.find(
+    ({ name }) => name === "Check release claim and evidence contracts",
+  );
+  step.run = step.run.replace("scripts/tests/codestory-release-live.test.mjs", "");
+  assert.match(validateWorkflows(workflows).join("\n"), /scripts\/tests\/codestory-release-live\.test\.mjs/u);
 });
 
 test("plugin static validates both native and plugin-only version surfaces", () => {
@@ -5032,6 +5650,24 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
   }
 });
 
+test("release Linux proof binds the package producer run", () => {
+  const workflows = loadWorkflows();
+  assert.deepEqual(validateWorkflows(workflows), []);
+
+  for (const [name, mutate] of [
+    ["missing binding", job => { delete job.with.package_run_id; }],
+    ["different run", job => { job.with.package_run_id = "${{ inputs.package_run_id }}"; }],
+  ]) {
+    const changed = loadWorkflows();
+    mutate(changed.get("release.yml").jobs["linux-vulkan-proof"]);
+    assert.match(
+      validateWorkflows(changed).join("\n"),
+      /release\.yml Linux proof must bind package_run_id to this release run/u,
+      name,
+    );
+  }
+});
+
 test("standard release paths reject calibration plumbing", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -5209,6 +5845,10 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   for (const [name, mutate] of [
     ["shortened producer timeout", job => {
       job["timeout-minutes"] = 30;
+    }],
+    ["rolling retrieval Rust toolchain", job => {
+      const step = draftStep(job, "Install Rust stable");
+      step.run = step.run.replaceAll("1.97.1", "stable");
     }],
     ["incompatible retrieval path", job => {
       draftStep(job, "Restore Cargo registry, git sources, and build output").with.path = "~/.cargo/registry\ntarget/retrieval\n";

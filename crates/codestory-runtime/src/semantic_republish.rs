@@ -175,7 +175,7 @@ fn prepare_semantic_projection(
     let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
     staged
         .store_mut()
-        .begin_incremental_run()
+        .begin_derived_projection_run()
         .map_err(|error| {
             ApiError::internal(format!(
                 "Failed to fence the staged semantic projection writer: {error}"
@@ -233,6 +233,7 @@ fn prepare_semantic_projection(
 fn stage_semantic_projection_publication(
     staged: &mut StagedSnapshot,
     root: &Path,
+    previous_publication: &IndexPublicationRecord,
     publication: &IndexPublicationRecord,
     source_exclusions: &[SourcePolicyExclusionRecord],
     source_index_policy: &SourceIndexPolicy,
@@ -298,6 +299,14 @@ fn stage_semantic_projection_publication(
         })?;
     staged
         .store_mut()
+        .rebind_proof_resolution_publication(previous_publication, publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to rebind the pinned proof resolution projection: {error}"
+            ))
+        })?;
+    staged
+        .store_mut()
         .put_index_publication(publication)
         .map_err(|error| {
             ApiError::internal(format!(
@@ -352,10 +361,10 @@ fn commit_semantic_projection(
         ensure_indexing_active(cancel_token)?;
         let publish_started = Instant::now();
         let publish_stats = staged.publish_with_stats(storage_path).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to publish staged semantic projections: {error}. Preserved staged snapshot at {}",
-                staged_path.display()
-            ))
+            crate::index_storage_error(
+                &format!("Failed to publish staged semantic projections; preserved staged snapshot at {}", staged_path.display()),
+                error,
+            )
         })?;
         Ok((
             prepared_search_state,
@@ -397,12 +406,21 @@ fn semantic_projection_phase_timings(
     phase_timings
 }
 
+/// A staged-core write that must ride along with the next semantic projection
+/// publication.
+///
+/// Published core generations are immutable, so any caller that needs to change
+/// core rows joins this republish instead of opening the live database. It runs
+/// on the validated clone before the new publication identity is minted.
+pub(super) type StagedCoreMutation<'a> = &'a dyn Fn(&mut Store) -> Result<(), ApiError>;
+
 pub(super) fn semantic_projection_republish_for_runtime(
     root: &Path,
     storage_path: &Path,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    staged_mutation: Option<StagedCoreMutation<'_>>,
 ) -> Result<
     (
         IndexingRunSummary,
@@ -414,7 +432,11 @@ pub(super) fn semantic_projection_republish_for_runtime(
     ApiError,
 > {
     ensure_indexing_active(cancel_token)?;
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve semantic projection core publication: {error}"
+        ))
+    })? {
         return Err(ApiError::new(
             "semantic_projection_core_missing",
             "Semantic projection republish requires an existing complete core publication.",
@@ -454,6 +476,9 @@ pub(super) fn semantic_projection_republish_for_runtime(
             &expected_publication,
             source_index_policy,
         )?;
+        if let Some(mutate) = staged_mutation {
+            mutate(staged.store_mut())?;
+        }
         let publication = next_index_publication(
             Some(&expected_publication),
             IndexPublicationMode::SemanticProjection,
@@ -464,6 +489,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
         let dense_anchor_count = stage_semantic_projection_publication(
             &mut staged,
             root,
+            &expected_publication,
             &publication,
             &source_exclusions,
             source_index_policy,
@@ -492,6 +518,11 @@ pub(super) fn semantic_projection_republish_for_runtime(
             prepared_search_state,
             cancel_token,
         )?;
+        crate::activation_retrieval::apply_core_gc_after_publication(
+            runtime,
+            storage_path,
+            cancel_token,
+        );
         let phase_timings =
             semantic_projection_phase_timings(&prepared, publish_stats, publish_duration);
         Ok((
@@ -503,6 +534,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
                 publication: publication.clone(),
                 prepared_search_state: Some(prepared_search_state),
                 unchanged_publication: false,
+                repository_tracking_digest: None,
             },
             publication,
             prepared.stats.symbol_search_docs_written,

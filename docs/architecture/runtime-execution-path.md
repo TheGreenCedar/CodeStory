@@ -38,15 +38,18 @@ refresh a project, initialize the engine, or mutate status state.
 | Class | Examples | May activate work | Required state |
 | --- | --- | --- | --- |
 | Observational | `status`, `doctor`, retrieval-engine diagnostics | No | readable current state |
-| Local graph | `ground`, `files`, `symbol`, `callers`, `trail`, `snippet` | bounded local refresh | current core publication for the requested surface |
-| Broad retrieval | `packet`, `search`, broad query-based `context` | local refresh, engine init, retrieval finalization | coherent retrieval publication and live policy-compliant engine |
+| Local graph | `ground`, `files`, `symbol`, `callers`, `trail`, `snippet`, explicit `search --repo-text off` | bounded local refresh | current core publication for the requested surface |
+| Broad retrieval | `packet`, ordinary `search`, broad query-based `context` | local refresh, engine init, retrieval finalization | coherent retrieval publication and live policy-compliant engine |
 | Exact target | definition/reference/node and focused context calls | only what the selected operation needs | resolved target plus its declared readiness |
 
 `ground` is the normal first call. It can return a useful local repository map
 after the bounded graph refresh while managed broad-retrieval preparation
-continues. A later `packet` or `search` call either completes that preparation,
-returns `preparing` for a bounded retry, or reports an environment gap. There is
-no user-facing sidecar setup or repair decision.
+continues. A later `packet` or ordinary `search` call either completes that
+preparation, returns `preparing` for a bounded retry, or reports an environment
+gap. Explicit `search --repo-text off` instead searches the complete core symbol
+projection and truthfully reports symbolic retrieval without initializing or
+claiming semantic readiness. There is no user-facing sidecar setup or repair
+decision.
 
 ## Core indexing
 
@@ -111,28 +114,33 @@ Runtime reads graph rows, occurrences, trails, search documents, or grounding
 snapshots from `codestory-store` and assembles contract DTOs. `explore` and
 `serve` reuse those services; adapters do not open SQLite or invent product
 fallbacks. When broad retrieval is unavailable, local graph tools can remain
-usable, but their output must not be presented as a full packet/search result.
+usable. Explicit `search --repo-text off` is one such complete-core operation:
+it returns exact indexed-symbol matches with source evidence, no retrieval
+publication, and a symbolic retrieval state. Its output is never presented as
+full broad or semantic search.
 
 Packet callers may supply tagged probes for an exact project-relative path,
 stable symbol ID, file-scoped symbol, free query, or continuation. CLI and
-stdio normalize those forms and legacy string probes into the same runtime
-resolver. Workspace owns native path containment; runtime resolves exact paths
-and IDs before fuzzy discovery and returns ordered ambiguity candidates rather
-than choosing one. A valid source file outside graph coverage remains a
+stdio accept the same typed forms; retired free-string probes are rejected.
+Workspace owns native path containment. Runtime resolves exact paths and IDs
+through identity indexes, preserves ordered ambiguity instead of choosing one,
+and admits identities before reading source, graph neighborhoods, node bodies,
+or file records. A valid source file outside graph coverage remains a
 `valid_uncovered_path`, and source-range-only text remains distinct from an
 indexed symbol.
 
 Resolved path and symbol probes enter packet evidence as exact citations keyed
 by normalized project path or stable node ID. They do not become display-name
-searches. Exact citations remain explicit inputs and cannot satisfy packet
-sufficiency by themselves.
+searches. Exact selectors enter the packet-wide admission session first;
+remaining candidates follow versioned retrieval-score order. Neither path has
+answer-sufficiency authority.
 
 Continuation probes carry the probe contract version, project identity, core
 generation, and optional retrieval generation. Runtime rejects a continuation
 when any bound identity differs from the selected public operation. Resolved
 free-query probes may add broad packet evidence work, but exact resolutions do
-not. Neither form changes task-class route order or packet sufficiency
-requirements.
+not. A free query receives no protection or materiality authority, and neither
+form can introduce prompt-derived traversal or answer policy after retrieval.
 
 ## Failure boundaries
 

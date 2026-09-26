@@ -117,6 +117,7 @@ Rollout and diagnostic switches. They are not product configuration and may chan
 | `CODESTORY_INDEX_LEGACY_DEDUP` | boolean | `crates/codestory-indexer/src/lib.rs` | Restores the superseded edge de-duplication pass. |
 | `CODESTORY_INDEX_LEGACY_EDGE_IDENTITY` | boolean | `crates/codestory-indexer/src/lib.rs` | Restores the superseded edge identity derivation. |
 | `CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256` | text | `crates/codestory-cli/src/embedding_server_transport.rs` | Expected embedding-server executable digest the transport verifies before connecting. |
+| `CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP` | boolean | `crates/codestory-cli/src/embedding_server_transport.rs` | On macOS, exact value `1` keeps private qualification embedding servers in the caller's invocation group; other present values are rejected. Ignored on other platforms. |
 | `CODESTORY_PACKET_CANDIDATE_TRACE` | text | `crates/codestory-runtime/src/agent/orchestrator.rs` | Symbol filter that turns on packet candidate tracing. |
 | `CODESTORY_PACKET_STEP_TRACE_OUT` | path | `crates/codestory-runtime/src/agent/trace_export.rs` | File that receives the packet step trace. |
 | `CODESTORY_PIPELINE_FLUSH` | boolean | `crates/codestory-indexer/src/lib.rs` | Forces a storage flush after every indexing batch. |
@@ -137,6 +138,8 @@ Only the test suites set these. They drive failure shapes that must never occur 
 
 | Variable | Type | Owner | Meaning |
 | --- | --- | --- | --- |
+| `CODESTORY_TEST_CORE_PUBLICATION_ABORT_POINT` | text | `crates/codestory-store/src/core_generation.rs` | Named crash-injection point during immutable core publication (tests only). |
+| `CODESTORY_TEST_CORE_PUBLICATION_ABORT_SENTINEL` | path | `crates/codestory-store/src/core_generation.rs` | Sentinel path written before aborting an immutable core publication (tests only). |
 | `CODESTORY_TEST_EMBED_ALLOW_CPU` | boolean | `crates/codestory-retrieval/src/config.rs` | Test-support builds only: exercises CPU-shaped embedding failures. |
 | `CODESTORY_TEST_PROMOTION_ABORT_SENTINEL` | path | `crates/codestory-store/src/storage_impl/mod.rs` | Sentinel path that aborts a promotion mid-flight to prove crash recovery. |
 

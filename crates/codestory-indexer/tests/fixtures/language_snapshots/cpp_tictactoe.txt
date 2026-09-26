@@ -42,6 +42,7 @@ node FUNCTION name=HumanPlayer::check qn=HumanPlayer::check canonical=game.cpp:H
 node FUNCTION name=HumanPlayer::input qn=HumanPlayer::input canonical=game.cpp:HumanPlayer::input#0 line=159 col=5 end=161:6 file=FILE:game.cpp@1
 node FUNCTION name=HumanPlayer::turn qn=HumanPlayer::turn canonical=game.cpp:HumanPlayer::turn#0 line=148 col=5 end=156:6 file=FILE:game.cpp@1
 node FUNCTION name=Player::Player qn=Player::Player canonical=game.cpp:Player::Player#0 line=126 col=5 end=126:92 file=FILE:game.cpp@1
+node FUNCTION name=Player::name qn=Player::name canonical=game.cpp:Player::name#0 line=135 col=5 end=137:6 file=FILE:game.cpp@1
 node FUNCTION name=Player::token qn=Player::token canonical=game.cpp:Player::token#0 line=131 col=5 end=133:6 file=FILE:game.cpp@1
 node FUNCTION name=Player::~Player qn=Player::~Player canonical=game.cpp:Player::~Player#0 line=127 col=5 end=127:33 file=FILE:game.cpp@1
 node FUNCTION name=TicTacToe::TicTacToe qn=TicTacToe::TicTacToe canonical=game.cpp:TicTacToe::TicTacToe#0 line=241 col=5 end=241:27 file=FILE:game.cpp@1
@@ -153,15 +154,15 @@ edge CALL src=FUNCTION:TicTacToe::check_winner@249 dst=FUNCTION:Field::same_in_r
 edge CALL src=FUNCTION:TicTacToe::check_winner@249 dst=FUNCTION:Player::token@131 resolved_src=- resolved_dst=FUNCTION:Player::token@131 line=250 confidence=1.0000 certainty=Certain callsite=h0:250:1:h29 candidates=[]
 edge CALL src=FUNCTION:TicTacToe::is_draw@253 dst=FUNCTION:Field::is_draw@64 resolved_src=- resolved_dst=FUNCTION:Field::is_draw@64 line=254 confidence=1.0000 certainty=Certain callsite=h0:254:1:h4 candidates=[]
 edge CALL src=FUNCTION:TicTacToe::run@257 dst=FUNCTION:Field::make_move@90 resolved_src=- resolved_dst=FUNCTION:Field::make_move@90 line=262 confidence=1.0000 certainty=Certain callsite=h0:262:1:h6 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=FUNCTION:Player::name@135 resolved_src=- resolved_dst=FUNCTION:Player::name@135 line=267 confidence=1.0000 certainty=Certain callsite=h0:267:1:h30 candidates=[]
 edge CALL src=FUNCTION:TicTacToe::run@257 dst=FUNCTION:Player::token@131 resolved_src=- resolved_dst=FUNCTION:Player::token@131 line=262 confidence=1.0000 certainty=Certain callsite=h0:262:1:h29 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=METHOD:Player::turn@129 resolved_src=- resolved_dst=METHOD:Player::turn@129 line=261 confidence=1.0000 certainty=Certain callsite=h0:261:1:h30 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:announce@266 resolved_src=- resolved_dst=- line=266 confidence=- certainty=- callsite=h0:266:1:h31 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:announce@271 resolved_src=- resolved_dst=- line=271 confidence=- certainty=- callsite=h0:271:1:h32 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:check_winner@263 resolved_src=- resolved_dst=- line=263 confidence=- certainty=- callsite=h0:263:1:h33 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:check_winner@265 resolved_src=- resolved_dst=- line=265 confidence=- certainty=- callsite=h0:265:1:h34 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:is_draw@264 resolved_src=- resolved_dst=- line=264 confidence=- certainty=- callsite=h0:264:1:h35 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:is_draw@270 resolved_src=- resolved_dst=- line=270 confidence=- certainty=- callsite=h0:270:1:h36 candidates=[]
-edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:name@267 resolved_src=- resolved_dst=- line=267 confidence=- certainty=- callsite=h0:267:1:h37|syntax:cpp-member-call candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=METHOD:Player::turn@129 resolved_src=- resolved_dst=METHOD:Player::turn@129 line=261 confidence=1.0000 certainty=Certain callsite=h0:261:1:h31 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:announce@266 resolved_src=- resolved_dst=- line=266 confidence=- certainty=- callsite=h0:266:1:h32 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:announce@271 resolved_src=- resolved_dst=- line=271 confidence=- certainty=- callsite=h0:271:1:h33 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:check_winner@263 resolved_src=- resolved_dst=- line=263 confidence=- certainty=- callsite=h0:263:1:h34 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:check_winner@265 resolved_src=- resolved_dst=- line=265 confidence=- certainty=- callsite=h0:265:1:h35 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:is_draw@264 resolved_src=- resolved_dst=- line=264 confidence=- certainty=- callsite=h0:264:1:h36 candidates=[]
+edge CALL src=FUNCTION:TicTacToe::run@257 dst=UNKNOWN:is_draw@270 resolved_src=- resolved_dst=- line=270 confidence=- certainty=- callsite=h0:270:1:h37 candidates=[]
 edge CALL src=FUNCTION:TicTacToe::start@243 dst=UNKNOWN:make_unique@244 resolved_src=- resolved_dst=- line=244 confidence=- certainty=- callsite=h0:244:1:h38 candidates=[]
 edge CALL src=FUNCTION:TicTacToe::start@243 dst=UNKNOWN:make_unique@245 resolved_src=- resolved_dst=- line=245 confidence=- certainty=- callsite=h0:245:1:h39 candidates=[]
 edge CALL src=FUNCTION:main@290 dst=FUNCTION:TicTacToe::run@257 resolved_src=- resolved_dst=FUNCTION:TicTacToe::run@257 line=294 confidence=1.0000 certainty=Certain callsite=h0:294:1:h40 candidates=[]
@@ -209,6 +210,7 @@ edge MEMBER src=CLASS:Node@178 dst=FIELD:Node::value@180 resolved_src=- resolved
 edge MEMBER src=CLASS:Player@124 dst=FIELD:Player::name_@141 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Player@124 dst=FIELD:Player::token_@140 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Player@124 dst=FUNCTION:Player::Player@126 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Player@124 dst=FUNCTION:Player::name@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Player@124 dst=FUNCTION:Player::token@131 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Player@124 dst=FUNCTION:Player::~Player@127 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Player@124 dst=METHOD:Player::turn@129 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
@@ -271,6 +273,7 @@ occurrence element=FUNCTION:HumanPlayer::check@163 kind=DEFINITION span=163:5-17
 occurrence element=FUNCTION:HumanPlayer::input@159 kind=DEFINITION span=159:5-161:6
 occurrence element=FUNCTION:HumanPlayer::turn@148 kind=DEFINITION span=148:5-156:6
 occurrence element=FUNCTION:Player::Player@126 kind=DEFINITION span=126:5-126:92
+occurrence element=FUNCTION:Player::name@135 kind=DEFINITION span=135:5-137:6
 occurrence element=FUNCTION:Player::token@131 kind=DEFINITION span=131:5-133:6
 occurrence element=FUNCTION:Player::~Player@127 kind=DEFINITION span=127:5-127:33
 occurrence element=FUNCTION:TicTacToe::TicTacToe@241 kind=DEFINITION span=241:5-241:27
@@ -370,14 +373,15 @@ callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_k
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:HumanPlayer::input", node_id: NodeId(-8945466076844998251), signature_hash: 6160290327990667243, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -7422102815381339974, start_line: 159, end_line: 161 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:HumanPlayer::turn", node_id: NodeId(3535214140666598154), signature_hash: -306840086604760518, normalized_signature: Some("shape:13251784612181120"), body_hash: 4409353235455712035, start_line: 148, end_line: 156 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:Player::Player", node_id: NodeId(-6707452965757007259), signature_hash: 4550575562027393611, normalized_signature: Some("shape:-1825518039466535303"), body_hash: 1233368089821784249, start_line: 126, end_line: 126 }
+callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:Player::name", node_id: NodeId(-8564285562047925225), signature_hash: 2337928819342862641, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -535932332243262681, start_line: 135, end_line: 137 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:Player::token", node_id: NodeId(2297597260245398927), signature_hash: -4748688299950841463, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 1420159333204647503, start_line: 131, end_line: 133 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:Player::~Player", node_id: NodeId(5261213272621912777), signature_hash: 4092509602493783551, normalized_signature: Some("outline:-1793518511152586733"), body_hash: -16421324180773348, start_line: 127, end_line: 127 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::TicTacToe", node_id: NodeId(8436570454300766505), signature_hash: 6289965068366920095, normalized_signature: Some("outline:-1793518511152586733"), body_hash: 3499807729898560125, start_line: 241, end_line: 241 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::check_winner", node_id: NodeId(2059636451327768343), signature_hash: -8165208525270157247, normalized_signature: Some("shape:3685199810936236209"), body_hash: 2436777956544700027, start_line: 249, end_line: 251 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::is_draw", node_id: NodeId(-1332650651018566938), signature_hash: -3877471890058058, normalized_signature: Some("shape:6537664411452163601"), body_hash: -1935880710548064224, start_line: 253, end_line: 255 }
-callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::run", node_id: NodeId(1168160839341222100), signature_hash: -1971120529097408000, normalized_signature: Some("shape:4166757559705214656"), body_hash: -8150260786177582825, start_line: 257, end_line: 277 }
+callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::run", node_id: NodeId(1168160839341222100), signature_hash: -1971120529097408000, normalized_signature: Some("shape:-6502356988073650291"), body_hash: -4340161893706793605, start_line: 257, end_line: 277 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:TicTacToe::start", node_id: NodeId(-1627490076889452683), signature_hash: -7294090493278946021, normalized_signature: Some("shape:-7970075957712933318"), body_hash: -7667770342375933407, start_line: 243, end_line: 247 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:main", node_id: NodeId(-3541657835264805444), signature_hash: -4671339478033693080, normalized_signature: Some("shape:5768144545723247670"), body_hash: -4771657560400400094, start_line: 290, end_line: 297 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "13:probe_check_winner", node_id: NodeId(3899195334577589324), signature_hash: 8230045360579097032, normalized_signature: Some("shape:-5209275596118422264"), body_hash: -7020805036339482730, start_line: 284, end_line: 288 }
 callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "14:Player::turn", node_id: NodeId(1822818414193016855), signature_hash: -7658741235038170420, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 4135080381464109188, start_line: 129, end_line: 129 }
-callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "__file_structural__", node_id: NodeId(-8301684766251967502), signature_hash: 5816621205998537519, normalized_signature: None, body_hash: 2585227465145706207, start_line: 1, end_line: 297 }
+callable_state CallableProjectionState { file_id: -8301684766251967502, symbol_key: "__file_structural__", node_id: NodeId(-8301684766251967502), signature_hash: -8566521835288987629, normalized_signature: None, body_hash: -157048179483698159, start_line: 1, end_line: 297 }

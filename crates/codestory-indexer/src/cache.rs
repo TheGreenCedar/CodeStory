@@ -3,20 +3,40 @@ use crate::{IndexResult, LanguageConfig, intermediate_storage::IntermediateStora
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
 };
+use codestory_contracts::proof_resolution::ExactCallsite;
 use codestory_store::FileInfo;
+use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-// Bumped to 3 with the position-free callable projection format: a cached
-// artifact from version 2 carries node ids minted from declaration lines and
-// projection rows whose `signature_hash` still binds a position, so reusing one
-// would mix two identity formats inside a single file.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Versioned with proof-input semantics so older parser artifacts fail closed.
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 31;
+const INDEX_ARTIFACT_ENCODING_MAGIC: &[u8; 8] = b"\x89CSIDX1\n";
+const INDEX_ARTIFACT_ENCODING_HEADER_BYTES: usize = 16;
+const MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
+const FRAMEWORK_ROUTE_LANGUAGE_NAMES: &[&str] = &[
+    "javascript",
+    "typescript",
+    "python",
+    "java",
+    "rust",
+    "go",
+    "ruby",
+    "php",
+    "csharp",
+    "kotlin",
+    "swift",
+    "dart",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedIndexArtifact {
+    #[serde(default)]
+    pub resolution_input_schema_version: u32,
     pub files: Vec<FileInfo>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -24,11 +44,355 @@ pub(crate) struct CachedIndexArtifact {
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
     pub impl_anchor_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    pub call_resolution_inputs: Vec<CachedCallResolutionInput>,
+    #[serde(default)]
+    pub resolution_file: Option<CachedResolutionFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCallResolutionInput {
+    pub callsite: ExactCallsite,
+    pub caller: Option<NodeId>,
+    pub binding: CachedResolutionBinding,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedResolutionBinding {
+    SameFile {
+        declaration: NodeId,
+        #[serde(default)]
+        rust_glob_local_module: Option<Vec<String>>,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+    ImplicitReceiver {
+        owner: NodeId,
+        declaration: NodeId,
+        owner_name: String,
+    },
+    ConstructorBinding {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
+    ExplicitReceiverType {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
+    RustPath {
+        module_path: Vec<String>,
+        components: Vec<String>,
+        import: Option<CachedRustUseBinding>,
+        associated_owner: Option<NodeId>,
+    },
+    RustImplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: CachedRustUseBinding,
+        declaration: NodeId,
+    },
+    RustExplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: Option<CachedRustUseBinding>,
+        constructor: bool,
+        constructor_record: bool,
+        constructor_method: Option<String>,
+    },
+    GoPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    GoImplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+    },
+    GoExplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+        constructor: bool,
+        constructor_uses_builtin_new: bool,
+    },
+    JavaKotlinImportedReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        import: NodeId,
+        constructor: bool,
+    },
+    JavaKotlinPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    JavaKotlinImportedFunction {
+        package_name: String,
+        owner_name: Option<String>,
+        name: String,
+        import: NodeId,
+    },
+    JavaKotlinPackageReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        constructor: bool,
+    },
+    CCppQualified {
+        components: Vec<NodeId>,
+    },
+    Ambiguous,
+    MissingBinding,
+    Unsupported,
+    IncompleteDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedClassBinding {
+    SameFile {
+        owner: NodeId,
+        owner_name: String,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedResolutionFile {
+    pub file_id: NodeId,
+    pub source_sha256: String,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
+    pub complete: bool,
+    pub lookup_input_complete: bool,
+    pub typescript_module: bool,
+    pub top_level_declarations: Vec<CachedTopLevelDeclaration>,
+    pub inherent_methods: Vec<CachedInherentMethod>,
+    #[serde(default)]
+    pub classes: Vec<CachedClassDeclaration>,
+    pub direct_exports: Vec<CachedDirectExport>,
+    #[serde(default)]
+    pub export_poison_all: bool,
+    #[serde(default)]
+    pub poisoned_export_names: Vec<String>,
+    #[serde(default)]
+    pub rust_modules: Vec<CachedRustModule>,
+    #[serde(default)]
+    pub rust_types: Vec<CachedRustType>,
+    #[serde(default)]
+    pub rust_uses: Vec<CachedRustUseBinding>,
+    #[serde(default)]
+    pub go_package: Option<CachedGoPackage>,
+    #[serde(default)]
+    pub java_kotlin_package: Option<String>,
+    #[serde(default)]
+    pub php_namespace: CachedPhpNamespace,
+    #[serde(default)]
+    pub c_cpp_file: Option<CachedCCppFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppFile {
+    pub source_path: PathBuf,
+    pub source_role: CachedCCppSourceRole,
+    pub namespaces: Vec<CachedCCppNamespace>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub(crate) enum CachedPhpNamespace {
+    Global,
+    Named(String),
+    #[default]
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedCCppSourceRole {
+    Source,
+    Header,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppNamespace {
+    pub path: Vec<String>,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoPackage {
+    pub name: String,
+    pub build_constrained: bool,
+    pub generated: bool,
+    pub package_blockers: Vec<String>,
+    pub types: Vec<CachedGoType>,
+    pub methods: Vec<CachedGoMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoType {
+    pub name: String,
+    pub declaration: NodeId,
+    pub interface: bool,
+    pub generic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
+    pub pointer_receiver: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedTopLevelDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedInherentMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub owner: Option<NodeId>,
+    #[serde(default)]
+    pub has_self: bool,
+    #[serde(default)]
+    pub return_owner: Option<String>,
+    #[serde(default)]
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustModule {
+    pub module_path: Vec<String>,
+    pub declaration: Option<NodeId>,
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub value_blockers: Vec<String>,
+    #[serde(default)]
+    pub incomplete_value_names: Vec<String>,
+    #[serde(default)]
+    pub file_children: Vec<CachedRustFileModule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustFileModule {
+    pub name: String,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustType {
+    pub module_path: Vec<String>,
+    pub name: String,
+    pub declaration: NodeId,
+    pub generic: bool,
+    pub cross_module_visible: bool,
+    pub unit_constructor: bool,
+    pub record_constructor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustUseBinding {
+    pub module_path: Vec<String>,
+    pub local_name: String,
+    pub components: Vec<String>,
+    pub import: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+    pub methods: Vec<CachedClassMethod>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+    #[serde(default)]
+    pub runtime_closed: bool,
+    #[serde(default)]
+    pub super_name: Option<String>,
+    /// Syntactic non-static declarations used only for conservative JVM refusal.
+    /// They remain available when a declaration cannot bind uniquely to a node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_method_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_scope: Option<CachedJavaClassScope>,
+}
+
+/// Refusal-only Java type identity; it does not authorize nested Exact lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedJavaClassScope {
+    pub type_path: Vec<String>,
+    /// Ordered lexical/import/package candidates; equal-priority imports remain
+    /// one group so ambiguity cannot be resolved by iteration order.
+    pub superclass_candidates: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassMethod {
+    pub name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedDirectExport {
+    pub exported_name: String,
+    pub declaration: NodeId,
+    pub is_default: bool,
+    #[serde(default)]
+    pub declaration_kind: CachedDeclarationKind,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedDeclarationKind {
+    #[default]
+    Callable,
+    Class,
 }
 
 impl CachedIndexArtifact {
+    #[cfg(test)]
     pub(crate) fn from_index_result(index_result: IndexResult) -> Self {
+        Self::from_index_result_with_resolution_inputs(index_result, Vec::new(), None)
+    }
+
+    pub(crate) fn from_index_result_with_resolution_inputs(
+        index_result: IndexResult,
+        call_resolution_inputs: Vec<CachedCallResolutionInput>,
+        resolution_file: Option<CachedResolutionFile>,
+    ) -> Self {
         Self {
+            resolution_input_schema_version: 28,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -36,6 +400,8 @@ impl CachedIndexArtifact {
             component_access: index_result.component_access,
             callable_projection_states: index_result.callable_projection_states,
             impl_anchor_node_ids: index_result.impl_anchor_node_ids,
+            call_resolution_inputs,
+            resolution_file,
         }
     }
 
@@ -55,6 +421,239 @@ impl CachedIndexArtifact {
             impl_anchor_node_ids: self.impl_anchor_node_ids,
             errors: Vec::new(),
         }
+    }
+}
+
+pub(crate) fn encode_index_artifact(artifact: &CachedIndexArtifact) -> anyhow::Result<Vec<u8>> {
+    let raw = serde_json::to_vec(artifact)?;
+    Ok(encode_serialized_index_artifact(
+        raw,
+        MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES,
+    ))
+}
+
+fn encode_serialized_index_artifact(raw: Vec<u8>, compressed_decode_limit: usize) -> Vec<u8> {
+    if raw.len() > compressed_decode_limit {
+        return raw;
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(&raw).is_err() {
+        return raw;
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return raw;
+    };
+    if INDEX_ARTIFACT_ENCODING_HEADER_BYTES.saturating_add(compressed.len()) >= raw.len() {
+        return raw;
+    }
+    let Ok(raw_len) = u64::try_from(raw.len()) else {
+        return raw;
+    };
+    let mut encoded = Vec::with_capacity(INDEX_ARTIFACT_ENCODING_HEADER_BYTES + compressed.len());
+    encoded.extend_from_slice(INDEX_ARTIFACT_ENCODING_MAGIC);
+    encoded.extend_from_slice(&raw_len.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    encoded
+}
+
+pub(crate) fn decode_index_artifact(blob: &[u8]) -> anyhow::Result<CachedIndexArtifact> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return serde_json::from_slice(blob).map_err(Into::into);
+    };
+    let (raw_len, compressed) = encoded
+        .split_at_checked(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("compressed parser artifact header is truncated"))?;
+    let expected_len = usize::try_from(u64::from_le_bytes(
+        raw_len
+            .try_into()
+            .expect("split parser artifact length has exact width"),
+    ))
+    .map_err(|_| anyhow::anyhow!("compressed parser artifact length exceeds this platform"))?;
+    if expected_len > MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact declares {expected_len} bytes above the {}-byte limit",
+            MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES
+        ));
+    }
+    let mut decoder = Decompress::new(true);
+    let mut raw = Vec::with_capacity(expected_len.saturating_add(1));
+    loop {
+        let input_before = decoder.total_in();
+        let output_before = decoder.total_out();
+        let input_offset = usize::try_from(input_before).map_err(|_| {
+            anyhow::anyhow!("compressed parser artifact input exceeds this platform")
+        })?;
+        let status = decoder
+            .decompress_vec(
+                &compressed[input_offset..],
+                &mut raw,
+                FlushDecompress::Finish,
+            )
+            .map_err(|error| anyhow::anyhow!("compressed parser artifact is corrupt: {error}"))?;
+        if raw.len() > expected_len {
+            return Err(anyhow::anyhow!(
+                "compressed parser artifact exceeds its declared {expected_len}-byte length"
+            ));
+        }
+        if status == Status::StreamEnd {
+            break;
+        }
+        if decoder.total_in() == input_before && decoder.total_out() == output_before {
+            return Err(anyhow::anyhow!(
+                "compressed parser artifact stream is truncated"
+            ));
+        }
+    }
+    if raw.len() != expected_len {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact length mismatch: decoded={} declared={expected_len}",
+            raw.len()
+        ));
+    }
+    if decoder.total_in() != compressed.len() as u64 {
+        return Err(anyhow::anyhow!(
+            "compressed parser artifact has trailing data"
+        ));
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|error| anyhow::anyhow!("compressed parser artifact JSON is invalid: {error}"))
+}
+
+pub(crate) fn decoded_index_artifact_len(blob: &[u8]) -> Option<usize> {
+    let Some(encoded) = blob.strip_prefix(INDEX_ARTIFACT_ENCODING_MAGIC) else {
+        return Some(blob.len());
+    };
+    let (raw_len, _) = encoded.split_at_checked(std::mem::size_of::<u64>())?;
+    usize::try_from(u64::from_le_bytes(raw_len.try_into().ok()?))
+        .ok()
+        .filter(|length| *length <= MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES)
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use codestory_contracts::graph::NodeKind;
+
+    fn repeated_artifact() -> CachedIndexArtifact {
+        CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: Vec::new(),
+            nodes: (0..512)
+                .map(|index| Node {
+                    id: NodeId(index + 1),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("repeated_package::repeated_function_{index}"),
+                    qualified_name: Some(format!("repeated_package::repeated_function_{index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            edges: Vec::new(),
+            occurrences: Vec::new(),
+            component_access: Vec::new(),
+            callable_projection_states: Vec::new(),
+            impl_anchor_node_ids: Vec::new(),
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        }
+    }
+
+    #[test]
+    fn parser_artifact_encoding_round_trips_exact_json_meaning() -> anyhow::Result<()> {
+        let artifact = repeated_artifact();
+        let raw = serde_json::to_vec(&artifact)?;
+        let encoded = encode_index_artifact(&artifact)?;
+        assert_eq!(encode_index_artifact(&artifact)?, encoded);
+        assert!(encoded.starts_with(INDEX_ARTIFACT_ENCODING_MAGIC));
+        assert!(
+            encoded.len() < raw.len() / 2,
+            "encoded={} raw={}",
+            encoded.len(),
+            raw.len()
+        );
+        assert_eq!(decoded_index_artifact_len(&encoded), Some(raw.len()));
+        let decoded = decode_index_artifact(&encoded)?;
+        assert_eq!(serde_json::to_vec(&decoded)?, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn parser_artifact_decoder_accepts_legacy_and_raw_oversize_fallback() -> anyhow::Result<()> {
+        let artifact = repeated_artifact();
+        let raw = serde_json::to_vec(&artifact)?;
+        assert_eq!(decoded_index_artifact_len(&raw), Some(raw.len()));
+        assert_eq!(serde_json::to_vec(&decode_index_artifact(&raw)?)?, raw);
+
+        let encoded = encode_serialized_index_artifact(raw.clone(), raw.len() - 1);
+        assert_eq!(encoded, raw, "over-limit artifacts must retain raw JSON");
+        decode_index_artifact(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parser_artifact_decoder_rejects_corrupt_bounded_and_trailing_envelopes() -> anyhow::Result<()>
+    {
+        let encoded = encode_index_artifact(&repeated_artifact())?;
+        assert!(encoded.starts_with(INDEX_ARTIFACT_ENCODING_MAGIC));
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[6] = b'2';
+        let mut truncated_header = INDEX_ARTIFACT_ENCODING_MAGIC.to_vec();
+        truncated_header.extend_from_slice(&[0; 7]);
+        let mut corrupt_payload = encoded.clone();
+        corrupt_payload[INDEX_ARTIFACT_ENCODING_HEADER_BYTES + 1] ^= 0xff;
+        let mut inconsistent_length = encoded.clone();
+        let declared = u64::from_le_bytes(
+            inconsistent_length[8..16]
+                .try_into()
+                .expect("encoded length header"),
+        );
+        inconsistent_length[8..16].copy_from_slice(&(declared + 1).to_le_bytes());
+        let mut over_limit = encoded.clone();
+        over_limit[8..16].copy_from_slice(
+            &(MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES as u64 + 1).to_le_bytes(),
+        );
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b"trailing");
+        let mut concatenated_stream = encoded.clone();
+        concatenated_stream.extend_from_slice(&encoded[INDEX_ARTIFACT_ENCODING_HEADER_BYTES..]);
+        let mut concatenated_envelope = encoded.clone();
+        concatenated_envelope.extend_from_slice(&encoded);
+        let truncated_stream = &encoded[..encoded.len() - 1];
+        let invalid_json = encode_serialized_index_artifact(
+            vec![b'x'; 1_024],
+            MAX_COMPRESSED_INDEX_ARTIFACT_DECODE_BYTES,
+        );
+
+        for (name, blob) in [
+            ("version", unsupported_version.as_slice()),
+            ("header", truncated_header.as_slice()),
+            ("payload", corrupt_payload.as_slice()),
+            ("length", inconsistent_length.as_slice()),
+            ("limit", over_limit.as_slice()),
+            ("json", invalid_json.as_slice()),
+            ("trailing", trailing.as_slice()),
+            ("concatenated stream", concatenated_stream.as_slice()),
+            ("concatenated envelope", concatenated_envelope.as_slice()),
+            ("stream", truncated_stream),
+        ] {
+            assert!(
+                decode_index_artifact(blob).is_err(),
+                "{name} corruption was accepted"
+            );
+        }
+        for end in [0, 1, 7, 8, 9, 15, 16] {
+            assert!(
+                decode_index_artifact(&encoded[..end]).is_err(),
+                "truncation at byte {end} was accepted"
+            );
+        }
+        for removed in 1..=4 {
+            assert!(
+                decode_index_artifact(&encoded[..encoded.len() - removed]).is_err(),
+                "truncating {removed} footer bytes was accepted"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -109,9 +708,9 @@ impl CachedStructuralArtifact {
     }
 }
 
-// Bumped to 3 alongside the index artifact cache: the SQL, HTML, and callable
-// projection changes in this wave all reach structural artifacts too.
-pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Bumped to 4 because workspace-relative role classification changes persisted
+// structural file metadata and zero-byte JSON admission.
+pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 4;
 
 pub(crate) fn build_structural_artifact_cache_key(
     cache_path: &Path,
@@ -147,6 +746,21 @@ pub(crate) fn build_index_artifact_cache_key(
     mix_str(&mut state, language_config.language_name);
     mix_str(&mut state, language_config.graph_query);
     mix_optional_str(&mut state, language_config.tags_query);
+    // Rust-side callable identity/scope extraction changed independently of the
+    // graph rules. Invalidate affected languages without discarding unrelated
+    // parser artifacts or changing the shared cache serialization schema.
+    if matches!(
+        language_config.language_name,
+        "c" | "cpp" | "javascript" | "typescript"
+    ) {
+        mix_str(&mut state, "callable-identity-and-scope-v3");
+    }
+    if language_config.language_name == "go" {
+        mix_str(&mut state, "go-method-receiver-capture-v1");
+    }
+    if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&language_config.language_name) {
+        mix_str(&mut state, "framework-route-declaration-identity-v1");
+    }
     mix_bool(&mut state, legacy_edge_identity);
     mix_bool(&mut state, lazy_graph_execution);
     mix_compilation_info(&mut state, root, compilation_info)?;
@@ -364,6 +978,31 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn legacy_class_inventory_keeps_empty_refusal_metadata_serialization() -> anyhow::Result<()> {
+        let legacy = br#"{"name":"Worker","declaration":41,"methods":[{"name":"target","declaration":42,"cross_module_visible":true}],"cross_module_visible":true,"runtime_closed":false,"super_name":null}"#;
+        let mut class: CachedClassDeclaration = serde_json::from_slice(legacy)?;
+        assert!(class.instance_method_names.is_empty());
+        assert!(class.java_scope.is_none());
+        assert_eq!(
+            serde_json::to_vec(&class)?,
+            legacy,
+            "unchanged language inventories must keep their prior serialized bytes and fingerprints"
+        );
+        class.instance_method_names.push("target".to_string());
+        class.java_scope = Some(CachedJavaClassScope {
+            type_path: vec!["Outer".to_string(), "Worker".to_string()],
+            superclass_candidates: vec![vec!["p.Base".to_string()]],
+        });
+        let decoded: CachedClassDeclaration = serde_json::from_slice(&serde_json::to_vec(&class)?)?;
+        assert_eq!(decoded.java_scope, class.java_scope);
+        assert_eq!(
+            decoded, class,
+            "nonempty Java refusal metadata must survive cache persistence"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_artifact_cache_key_is_portable_across_roots() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root_a = temp.path().join("root-a");
@@ -411,6 +1050,186 @@ mod tests {
 
         assert_eq!(key_a, key_b);
         Ok(())
+    }
+
+    #[test]
+    fn parser_cache_key_distinguishes_raw_bytes_with_the_same_lossy_text() {
+        let config = crate::get_language_for_ext("c").expect("C config");
+        let root = Path::new("project");
+        let cache_path = Path::new("src/non-utf8.c");
+        let first = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x80 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("first cache key");
+        let second = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x81 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("second cache key");
+
+        assert_eq!(
+            String::from_utf8_lossy(b"/* \x80 */"),
+            String::from_utf8_lossy(b"/* \x81 */")
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn parser_cache_key_invalidates_changed_callable_extraction_rules() {
+        for extension in ["c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let key = |config: &crate::LanguageConfig| {
+                build_index_artifact_cache_key(
+                    Path::new("project"),
+                    Path::new("source"),
+                    b"unchanged source",
+                    config,
+                    None,
+                    false,
+                    true,
+                )
+                .expect("portable cache key")
+            };
+            let current = key(&config);
+            let old_config = crate::LanguageConfig {
+                graph_query: "(older_callable_rule)",
+                ..config
+            };
+            assert_ne!(
+                current,
+                key(&old_config),
+                "{extension} must not reuse the old projection"
+            );
+        }
+    }
+
+    #[test]
+    fn callable_scope_cache_revision_is_limited_to_affected_languages() {
+        for extension in ["c", "cpp", "js", "ts", "tsx", "rs", "py"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let cache_path = Path::new("source");
+            let source = b"unchanged source";
+            // Reconstruct the current key without the callable rule stamp so
+            // later language-local revisions do not widen this assertion.
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, cache_path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
+                mix_str(&mut previous, "framework-route-declaration-identity-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current = build_index_artifact_cache_key(
+                root, cache_path, source, &config, None, false, true,
+            )
+            .expect("cache key");
+            assert_eq!(
+                current == previous,
+                matches!(extension, "rs" | "py"),
+                "{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_receiver_capture_cache_revision_is_limited_to_go() {
+        for extension in ["go", "rs", "py", "c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let cache_path = Path::new("source");
+            let source = b"unchanged source";
+            // Reconstruct the current key without the Go rule stamp so later
+            // language-local revisions do not widen this assertion.
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, cache_path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if matches!(
+                config.language_name,
+                "c" | "cpp" | "javascript" | "typescript"
+            ) {
+                mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
+                mix_str(&mut previous, "framework-route-declaration-identity-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current = build_index_artifact_cache_key(
+                root, cache_path, source, &config, None, false, true,
+            )
+            .expect("cache key");
+
+            assert_eq!(current != previous, extension == "go", "{extension}");
+        }
+    }
+
+    #[test]
+    fn framework_route_declaration_cache_revision_is_limited_to_route_languages() {
+        for extension in [
+            "js", "ts", "tsx", "py", "java", "rs", "go", "rb", "php", "cs", "kt", "swift", "dart",
+            "c", "cpp", "sh",
+        ] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let cache_path = Path::new("source");
+            let source = b"unchanged source";
+            // Reconstruct the immediately preceding key, including existing
+            // Rust-side stamps but excluding the route declaration rule.
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, cache_path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if matches!(
+                config.language_name,
+                "c" | "cpp" | "javascript" | "typescript"
+            ) {
+                mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if config.language_name == "go" {
+                mix_str(&mut previous, "go-method-receiver-capture-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current = build_index_artifact_cache_key(
+                root, cache_path, source, &config, None, false, true,
+            )
+            .expect("cache key");
+            let route_language = FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name);
+
+            assert_eq!(current != previous, route_language, "{extension}");
+        }
     }
 
     #[test]
@@ -476,5 +1295,38 @@ mod tests {
             assert!(key.is_none(), "{flag} must fail closed");
         }
         Ok(())
+    }
+
+    #[test]
+    fn parser_cache_without_resolution_inputs_decodes_as_an_empty_legacy_projection() {
+        let legacy = serde_json::json!({
+            "files": [],
+            "nodes": [],
+            "edges": [],
+            "occurrences": [],
+            "component_access": [],
+            "callable_projection_states": [],
+            "impl_anchor_node_ids": []
+        });
+
+        let raw = serde_json::to_vec(&legacy).unwrap();
+        let decoded = decode_index_artifact(&raw).unwrap();
+        assert_eq!(decoded.resolution_input_schema_version, 0);
+        assert!(decoded.call_resolution_inputs.is_empty());
+        assert!(decoded.resolution_file.is_none());
+        assert!(
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded,
+                "typescript",
+                &"0".repeat(64),
+                &"0".repeat(64),
+            )
+        );
+        assert!(
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded, "go", "unused", "unused",
+            ),
+            "a legacy cache without proof inputs cannot satisfy the installed Go adapter"
+        );
     }
 }

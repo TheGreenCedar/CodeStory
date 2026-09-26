@@ -1090,6 +1090,23 @@ pub(crate) fn search_symbols_with_scores(
         .collect()
 }
 
+/// Rank canonical core symbols without opening a persisted search generation.
+///
+/// Exact core search uses this adapter after streaming the immutable core's
+/// identity projection. Keeping UTF-32 conversion here preserves the same
+/// matcher and ordering as the resident search engine without acquiring or
+/// creating any search-generation artifact.
+pub(crate) fn search_core_symbol_names_with_scores(
+    symbols: &[(NodeId, String)],
+    query: &str,
+) -> Vec<(NodeId, f32)> {
+    let symbols = symbols
+        .iter()
+        .map(|(id, name)| (Utf32String::from(name.as_str()), *id))
+        .collect::<Vec<_>>();
+    search_symbols_with_scores(&symbols, query)
+}
+
 fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolCandidateRank {
     let query = query.trim().to_ascii_lowercase();
     let display = name.to_string();

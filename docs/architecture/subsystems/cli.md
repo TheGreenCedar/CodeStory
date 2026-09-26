@@ -60,11 +60,12 @@ Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.
 
 The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
-`probes[]` accept the same five kinds; `--extra-probe` and stdio
-`extra_probes[]` remain compatibility inputs and are passed to the same runtime
-resolver without adapter-side inference. Both adapters enforce one combined
-16-probe limit and the shared 240-character field limit. The generated MCP
-schema is a strict tagged union, so fields from another probe kind are rejected.
+`probes[]` accept the same typed probe kinds. The retired free-string
+`--extra-probe` and `extra_probes[]` inputs are rejected; callers that need a
+generic supplemental query use the typed `free_query` probe. Both adapters
+enforce the shared 16-probe limit and 240-character field limit. The generated
+MCP schema is a strict tagged union, so fields from another probe kind are
+rejected.
 Search and definition links bind continuations to the selected project, stable
 node ID, contract version, and evidence generation.
 

@@ -1602,6 +1602,45 @@ export function evaluateReleaseCloseout({
   };
 }
 
+// Revalidate retained ledger decisions without treating a signed container as permission
+// to change the graph's mandatory cells, exception boundary, or non-claim policy.
+export function validateReleaseCloseoutLedger({ graph, phase, ledger, summary }) {
+  const cells = deriveReleaseCells(graph, phase);
+  const rows = ledger.cells;
+  const same = (left, right) => canonicalJson(left) === canonicalJson(right);
+  if (!Array.isArray(rows) || !same(rows.map(row => row.id).sort(), cells.map(cell => cell.id).sort())) {
+    fail("release closeout ledger does not contain exactly the declared cells");
+  }
+  for (const cell of cells) {
+    const row = rows.find(item => item.id === cell.id);
+    if (row.phase !== cell.phase || row.claim !== cell.claim || row.evidence_type !== cell.evidence_type
+      || !["pass", "pass_with_exception", "withheld"].includes(row.status)) fail(`invalid retained release cell ${cell.id}`);
+    if (row.status === "pass_with_exception" && cell.evidence_type !== graph.exception_policy.eligible_evidence_type) {
+      fail(`release cell ${cell.id} does not admit an exception`);
+    }
+    const problems = nonClaimProblems({ graph, cell, withheld: row.status === "withheld",
+      manifest: { non_claim: row.non_claim, evidence: { identity: row.identity } } });
+    if (problems.length) fail(problems.join("; "));
+    if (row.status === "withheld" && !same(row.withheld_claims, releaseCellWithheldClaims(graph, cell))) {
+      fail(`retained withheld claims differ for ${cell.id}`);
+    }
+  }
+  const withheldRows = rows.filter(row => row.status === "withheld");
+  const withheldHosts = [...new Set(withheldRows.map(row => row.non_claim.host))].sort();
+  const withheld = assessWithheldClaims({ graph, cells, ledgerCells: rows, withheldHosts });
+  if (withheld.problems.length) fail(withheld.problems.join("; "));
+  const expected = { withheld_cells: withheldRows.map(row => row.id), withheld_hosts: withheldHosts,
+    withheld_claims: withheld.withheld_claims, partially_withheld_claims: withheld.partially_withheld_claims,
+    withhold_policy: graph.non_claim_policy.withhold_policy };
+  for (const [key, value] of Object.entries(expected)) {
+    if (!same(ledger[key], value) || !same(summary[key], value)) fail(`retained closeout ${key} differs from its cells`);
+  }
+  if (!same(summary.counts, { required: rows.length, passed: rows.length - withheldRows.length,
+    failed: 0, missing: 0, withheld: withheldRows.length })
+    || !same(summary.failed_cells, []) || !same(summary.missing_cells, [])) fail("retained closeout counts differ from its cells");
+  return true;
+}
+
 export function writeReleaseCloseout(outDir, result) {
   const output = path.resolve(outDir);
   if (existsSync(output)) {

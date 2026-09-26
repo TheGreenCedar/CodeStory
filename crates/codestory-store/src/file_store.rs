@@ -44,6 +44,15 @@ impl<'a> FileStore<'a> {
             .storage
             .get_errors(None)?
             .into_iter()
+            .filter(|error| {
+                // Stable format rejection is coverage, not transient failure.
+                // Missing verification or any other error still requires retry.
+                !(error.coverage_reason
+                    == Some(codestory_contracts::graph::FileCoverageReason::Malformed)
+                    && error
+                        .file_id
+                        .is_some_and(|id| content_hashes.contains_key(&id.0)))
+            })
             .filter_map(|error| error.file_id.map(|id| id.0))
             .collect::<HashSet<_>>();
         self.storage
@@ -69,6 +78,51 @@ mod tests {
     use super::*;
     use crate::FileRole;
     use codestory_contracts::graph::{ErrorInfo, FileCoverageReason, IndexStep, NodeId};
+
+    #[test]
+    fn inventory_only_skips_retry_for_verified_format_rejection() {
+        for (reason, verified, retry) in [
+            (FileCoverageReason::Malformed, true, false),
+            (FileCoverageReason::Malformed, false, true),
+            (FileCoverageReason::CollectorFailure, true, true),
+            (FileCoverageReason::SourceChanged, true, true),
+            (FileCoverageReason::Unreadable, false, true),
+        ] {
+            let storage = Store::new_in_memory().unwrap();
+            let file = FileInfo {
+                id: 1,
+                path: PathBuf::from("settings.yml"),
+                language: "yaml".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).unwrap();
+            if verified {
+                storage
+                    .update_file_metadata(&file, Some(&"a".repeat(64)))
+                    .unwrap();
+            }
+            storage
+                .insert_error(&ErrorInfo {
+                    message: "coverage".into(),
+                    file_id: Some(NodeId(1)),
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: IndexStep::Indexing,
+                    coverage_reason: Some(reason),
+                })
+                .unwrap();
+            assert_eq!(
+                storage.files().inventory().unwrap()[0].retry_required,
+                retry,
+                "{reason:?}"
+            );
+        }
+    }
 
     #[test]
     fn inventory_retries_file_errors_but_not_parser_partial_coverage() {

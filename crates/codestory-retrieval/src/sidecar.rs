@@ -5,8 +5,8 @@ use crate::generation::{
     manifest_unavailable_reason_for_runtime,
 };
 use crate::health::{
-    RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health_for_runtime,
-    unavailable_status_report_with_embedding_device,
+    RetrievalStatusReport, attach_manifest_contract, probe_descriptor_sidecar_health_for_runtime,
+    probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_runtime};
 use anyhow::{Context, Result};
@@ -54,6 +54,7 @@ pub fn sidecar_status(
         storage_path,
         false,
         SidecarRuntimeConfig::for_project_auto(project_root),
+        SidecarHealthScope::Full,
     )
 }
 
@@ -67,6 +68,7 @@ pub fn strict_sidecar_status(
         storage_path,
         true,
         SidecarRuntimeConfig::for_project_auto(project_root),
+        SidecarHealthScope::Full,
     )
 }
 
@@ -87,7 +89,31 @@ pub fn strict_sidecar_status_for_runtime(
     storage_path: Option<&Path>,
     runtime: SidecarRuntimeConfig,
 ) -> Result<RetrievalStatusReport> {
-    status_with_runtime(project_root, storage_path, true, runtime)
+    status_with_runtime(
+        project_root,
+        storage_path,
+        true,
+        runtime,
+        SidecarHealthScope::Full,
+    )
+}
+
+/// Strict readiness for the lexical/semantic descriptor lanes only. This
+/// validates the pinned manifest and descriptor artifacts without computing a
+/// repository freshness plan or opening dense-anchor rows. Packet compilation
+/// performs those full checks only after packet-wide admission is sealed.
+pub fn strict_descriptor_sidecar_status_for_runtime(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    runtime: SidecarRuntimeConfig,
+) -> Result<RetrievalStatusReport> {
+    status_with_runtime(
+        project_root,
+        storage_path,
+        true,
+        runtime,
+        SidecarHealthScope::Descriptor,
+    )
 }
 
 /// Observe the current retrieval publication, producer, and live engine
@@ -103,7 +129,9 @@ pub fn ready_retrieval_identity_for_runtime(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<ReadyRetrievalIdentity>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for ready retrieval identity")?
+    {
         return Ok(None);
     }
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
@@ -122,7 +150,9 @@ pub fn observe_ready_retrieval_identity_for_project_id(
     runtime: &SidecarRuntimeConfig,
     project_id: &str,
 ) -> Result<Option<ReadyRetrievalIdentity>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for retained retrieval identity")?
+    {
         return Ok(None);
     }
     let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(runtime);
@@ -171,11 +201,18 @@ pub fn observe_ready_retrieval_identity_for_project_id(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarHealthScope {
+    Full,
+    Descriptor,
+}
+
 fn status_with_runtime(
     project_root: &Path,
     storage_path: Option<&Path>,
     strict: bool,
     runtime: SidecarRuntimeConfig,
+    health_scope: SidecarHealthScope,
 ) -> Result<RetrievalStatusReport> {
     let layout = runtime.layout.clone();
     let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(&runtime);
@@ -190,7 +227,10 @@ fn status_with_runtime(
     let embedding_device = embedding_snapshot.device;
     let project_id = sidecar_project_id_for_runtime(project_root, &runtime)?;
 
-    if let Some(path) = storage_path.filter(|path| path.exists()) {
+    if let Some(path) = storage_path
+        && codestory_store::core_database_exists(path)
+            .context("resolve core publication for retrieval status")?
+    {
         let storage = Store::open_observational(path)
             .context("open storage observationally for retrieval manifest")?;
         let manifest = storage
@@ -219,6 +259,7 @@ fn status_with_runtime(
             ));
         }
         if strict
+            && health_scope == SidecarHealthScope::Full
             && let Some(manifest) = manifest.as_ref()
             && let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
                 project_root,
@@ -257,15 +298,25 @@ fn status_with_runtime(
                 &runtime,
             ));
         }
-        if let Some(manifest) = manifest.as_ref() {
+        if health_scope == SidecarHealthScope::Full
+            && let Some(manifest) = manifest.as_ref()
+        {
             let evidence = storage
                 .get_complete_index_publication()
                 .context("load core publication for retrieval evidence status")?
                 .context("retrieval evidence status requires a complete core publication")
                 .and_then(|publication| {
+                    // Prefer the sealed receipt keyed by the immutable generation
+                    // database. Activation validation@90 used to pass None and
+                    // re-scan every dense-anchor row after finalize had already
+                    // sealed the same publication. Use the active generation
+                    // path (not SQLite generation_id alone) so generation-only
+                    // publications stay observable without a legacy flat DB.
+                    let core_database_path = codestory_store::resolve_core_database_path(path).ok();
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
                         &storage,
+                        core_database_path.as_deref(),
                         manifest,
                         &publication,
                         &runtime,
@@ -287,31 +338,48 @@ fn status_with_runtime(
                 ));
             }
         }
-        return Ok(enrich_stored_status(
-            probe_sidecar_health_for_runtime(
+        let report = match health_scope {
+            SidecarHealthScope::Full => probe_sidecar_health_for_runtime(
                 &layout,
                 &project_id,
                 manifest,
                 &embedding_device,
                 &runtime,
             ),
+            SidecarHealthScope::Descriptor => probe_descriptor_sidecar_health_for_runtime(
+                &layout,
+                &project_id,
+                manifest,
+                &embedding_device,
+                &runtime,
+            ),
+        };
+        return Ok(enrich_stored_status(
+            report,
             project_root,
             &storage,
             &runtime,
         ));
     }
 
-    Ok(enrich_status(
-        attach_manifest_contract(
-            probe_sidecar_health_for_runtime(
-                &layout,
-                &project_id,
-                None,
-                &embedding_device,
-                &runtime,
-            ),
-            project_root,
+    let report = match health_scope {
+        SidecarHealthScope::Full => probe_sidecar_health_for_runtime(
+            &layout,
+            &project_id,
+            None,
+            &embedding_device,
+            &runtime,
         ),
+        SidecarHealthScope::Descriptor => probe_descriptor_sidecar_health_for_runtime(
+            &layout,
+            &project_id,
+            None,
+            &embedding_device,
+            &runtime,
+        ),
+    };
+    Ok(enrich_status(
+        attach_manifest_contract(report, project_root),
         &runtime,
     ))
 }
@@ -516,6 +584,179 @@ fn manifest_contract_drift_should_win(reason: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn status_reads_generation_only_manifest_without_creating_legacy_database() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        crate::test_support::publish_empty_complete_generation_only_core_fixture(
+            project.path(),
+            &storage_path,
+        )
+        .expect("complete generation-only core");
+        let runtime = SidecarRuntimeConfig::local();
+        let project_id =
+            sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
+        let manifest = crate::test_support::retrieval_manifest_fixture(&project_id, "fixture");
+        Store::open_observational(&storage_path)
+            .expect("published store")
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("publish retrieval manifest");
+        assert!(!storage_path.exists());
+        let generation =
+            codestory_store::resolve_core_database_path(&storage_path).expect("active generation");
+        let publication = Store::open_observational(&storage_path)
+            .expect("observational publication")
+            .get_complete_index_publication()
+            .expect("load publication")
+            .expect("complete publication");
+        assert_eq!(
+            generation,
+            codestory_store::resolve_core_generation_database_path(
+                &storage_path,
+                &publication.generation_id,
+            )
+            .expect("publication id must resolve to the active generation file"),
+            "generation-only fixtures must keep SQLite publication id and filesystem generation aligned"
+        );
+
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("status");
+            assert_eq!(
+                report.manifest.as_ref().map(|value| &value.project_id),
+                Some(&project_id)
+            );
+            assert!(
+                !report.is_live_ready(),
+                "a manifest alone cannot establish readiness"
+            );
+            assert!(
+                !storage_path.exists(),
+                "status must not create a legacy database"
+            );
+        }
+
+        std::fs::remove_file(&generation).expect("remove active generation");
+        for strict in [false, true] {
+            assert!(
+                status_with_runtime(
+                    project.path(),
+                    Some(&storage_path),
+                    strict,
+                    runtime.clone(),
+                    SidecarHealthScope::Full,
+                )
+                .is_err(),
+                "a dangling publication must fail closed"
+            );
+        }
+        assert!(!storage_path.exists());
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn status_preserves_legacy_manifest_observation() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        crate::test_support::publish_empty_complete_core_fixture(project.path(), &storage_path)
+            .expect("complete legacy core");
+        let runtime = SidecarRuntimeConfig::local();
+        let project_id =
+            sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
+        let manifest = crate::test_support::retrieval_manifest_fixture(&project_id, "fixture");
+        Store::open(&storage_path)
+            .expect("legacy store")
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("legacy retrieval manifest");
+        let before = std::fs::read(&storage_path).expect("legacy bytes");
+        let cache_entries = || {
+            std::fs::read_dir(cache.path())
+                .expect("cache entries")
+                .map(|entry| entry.expect("cache entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let entries_before = cache_entries();
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("legacy status");
+            assert_eq!(
+                report.manifest.as_ref().map(|value| &value.project_id),
+                Some(&project_id)
+            );
+            assert!(!report.is_live_ready());
+        }
+        assert_eq!(
+            std::fs::read(&storage_path).expect("unchanged legacy bytes"),
+            before
+        );
+        assert_eq!(
+            cache_entries(),
+            entries_before,
+            "status must not create SQLite sidecars"
+        );
+    }
+
+    #[test]
+    fn status_does_not_create_missing_or_repair_corrupt_publications() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = cache.path().join("missing").join("codestory.db");
+        let runtime = SidecarRuntimeConfig::local();
+        for strict in [false, true] {
+            let report = status_with_runtime(
+                project.path(),
+                Some(&storage_path),
+                strict,
+                runtime.clone(),
+                SidecarHealthScope::Full,
+            )
+            .expect("missing status");
+            assert!(report.manifest.is_none());
+            assert!(!report.is_live_ready());
+        }
+        assert!(!storage_path.parent().expect("parent").exists());
+
+        let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+            .expect("layout");
+        let pointer = layout.publication_path();
+        std::fs::create_dir_all(pointer.parent().expect("pointer parent")).expect("parent");
+        std::fs::write(&pointer, "{broken").expect("corrupt pointer");
+        for strict in [false, true] {
+            assert!(
+                status_with_runtime(
+                    project.path(),
+                    Some(&storage_path),
+                    strict,
+                    runtime.clone(),
+                    SidecarHealthScope::Full,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(pointer).expect("unchanged pointer"),
+            "{broken"
+        );
+        assert!(!storage_path.exists());
+    }
 
     #[test]
     fn strict_readiness_ignores_storage_owned_search_metadata() {

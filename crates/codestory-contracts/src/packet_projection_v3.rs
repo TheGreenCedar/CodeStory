@@ -1,8 +1,8 @@
-//! Inert, closed DTO vocabulary for future v3 evidence projections.
+//! Closed public DTO vocabulary for CodeStory v3 evidence projections.
 //!
 //! These types deliberately carry rendered evidence availability, not the
-//! internal planning or proof state that produced it. No production adapter
-//! references this module in the v3 preparation slices.
+//! internal planning or proof state that produced it. Packet, context, and
+//! search adapters serialize only these bounded projections.
 
 use std::fmt;
 
@@ -17,6 +17,7 @@ pub const SUMMARY_MAX_BYTES_V3: usize = 8_192;
 pub const MESSAGE_MAX_BYTES_V3: usize = 4_096;
 pub const EXCERPT_MAX_BYTES_V3: usize = 8_192;
 pub const DIAGNOSTIC_CODE_MAX_BYTES_V3: usize = 128;
+pub const PACKET_EVIDENCE_ROWS_MAX_V3: usize = 16;
 pub const EVIDENCE_ROWS_MAX_V3: usize = 256;
 pub const GAP_ROWS_MAX_V3: usize = 256;
 pub const REFERENCE_ROWS_MAX_V3: usize = 256;
@@ -208,6 +209,7 @@ pub enum EvidenceAvailabilityV3Dto {
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStateV3Dto {
     Full,
+    Symbolic,
     Degraded,
     Unavailable,
 }
@@ -223,6 +225,7 @@ pub struct RetrievalStateDescriptorV3Dto {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKindV3Dto {
     ExactSource,
+    SourceLocation,
     StructuralSource,
     GraphRelation,
     RetrievalExcerpt,
@@ -328,6 +331,8 @@ pub struct DiagnosticReferenceV3Dto {
     pub artifact_id: IdentityTextV3,
     pub sha256: Sha256DigestV3Dto,
     pub byte_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_expiry_epoch_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,10 +351,12 @@ pub enum PacketProjectionV3Dto {
         publication: PublicationIdentityV3Dto,
         status: EvidenceAvailabilityV3Dto,
         retrieval: RetrievalStateDescriptorV3Dto,
-        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, EVIDENCE_ROWS_MAX_V3>,
+        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, PACKET_EVIDENCE_ROWS_MAX_V3>,
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         continuation: Option<ContinuationStateV3Dto>,
         diagnostics: DiagnosticsCapabilityV3Dto,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
     BudgetExceeded {
         schema_version: u16,
@@ -358,8 +365,11 @@ pub enum PacketProjectionV3Dto {
         status: EvidenceAvailabilityV3Dto,
         retrieval: RetrievalStateDescriptorV3Dto,
         diagnostics: DiagnosticsCapabilityV3Dto,
+        gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         maximum_bytes: u64,
         required_complete_bytes: u64,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
 }
 
@@ -382,8 +392,8 @@ pub struct ContextEvidenceRowV3Dto {
     pub identity: EvidenceIdentityV3Dto,
     pub path: PathTextV3,
     pub symbol_id: Option<SymbolIdTextV3>,
-    pub start_line: u32,
-    pub end_line: u32,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
     pub excerpt: Option<ExcerptTextV3>,
 }
 
@@ -527,6 +537,7 @@ mod tests {
             artifact_id: text("diagnostic-1"),
             sha256: Sha256DigestV3Dto::new("c".repeat(64)).expect("artifact digest"),
             byte_length: 512,
+            wall_expiry_epoch_ms: None,
         }
     }
 
@@ -650,6 +661,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -704,6 +716,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let budget_exceeded = PacketProjectionV3Dto::BudgetExceeded {
             schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
@@ -712,8 +725,10 @@ mod tests {
             status: EvidenceAvailabilityV3Dto::Unavailable,
             retrieval: retrieval(RetrievalStateV3Dto::Degraded),
             diagnostics: diagnostics(),
+            gaps: list(vec![gap(GapKindV3Dto::OutputBudgetExceeded)]),
             maximum_bytes: 16_384,
             required_complete_bytes: 16_385,
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -729,8 +744,8 @@ mod tests {
                 identity: evidence_identity("context-evidence-1"),
                 path: text("src/lib.rs"),
                 symbol_id: Some(text("crate::entry")),
-                start_line: 4,
-                end_line: 9,
+                start_line: Some(4),
+                end_line: Some(9),
                 excerpt: Some(text("pub fn entry() { runtime(); }")),
             }]),
             gaps: list(vec![gap(GapKindV3Dto::EvidenceMissing)]),
@@ -785,11 +800,13 @@ mod tests {
             ],
             "retrieval_variants": [
                 RetrievalStateV3Dto::Full,
+                RetrievalStateV3Dto::Symbolic,
                 RetrievalStateV3Dto::Degraded,
                 RetrievalStateV3Dto::Unavailable,
             ],
             "evidence_variants": [
                 EvidenceKindV3Dto::ExactSource,
+                EvidenceKindV3Dto::SourceLocation,
                 EvidenceKindV3Dto::StructuralSource,
                 EvidenceKindV3Dto::GraphRelation,
                 EvidenceKindV3Dto::RetrievalExcerpt,
@@ -820,6 +837,7 @@ mod tests {
             gaps: list(Vec::new()),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         })
         .expect("serialize packet root");
         assert_eq!(packet_json["kind"], "complete");

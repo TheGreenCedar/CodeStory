@@ -56,10 +56,9 @@ pub const FILESYSTEM_OBSERVER_DIRTY_PATH_CAP: usize = 4_096;
 /// rewriting `.git/`, a package install unpacking `node_modules/`. None of it can ever reach a
 /// freshness verdict, because discovery excludes those trees by default — so charging them
 /// against the observation budget spends the whole window's accounting on paths the caller is
-/// about to throw away. The names mirror `default_source_exclude_patterns`, which is what
-/// discovery actually applies.
-const OBSERVER_IGNORED_DIRECTORY_NAMES: &[&str] =
-    &[".git", "node_modules", "target", "dist", "build"];
+/// about to throw away. `build` is deliberately absent: discovery can restore a tracked source
+/// beneath that namespace, so ignoring it could make a raced source mutation look quiet.
+const OBSERVER_IGNORED_DIRECTORY_NAMES: &[&str] = &[".git", "node_modules", "target", "dist"];
 
 /// Which notifier produced a session's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +208,11 @@ impl ObservedScopeFilter {
         Self::default()
     }
 
-    /// Account for everything discovery could admit, and nothing else.
+    /// Account for every path discovery could admit.
+    ///
+    /// Build output is observed conservatively because this filter cannot know whether a path is
+    /// repository-tracked source. That extra churn may make a window indeterminate, but it cannot
+    /// hide an admitted source mutation.
     pub fn source_default() -> Self {
         Self {
             ignored_directory_names: OBSERVER_IGNORED_DIRECTORY_NAMES
@@ -298,8 +301,8 @@ impl ProvenCoverage {
 
     /// No mutation the scope filter admits was observed while the caller's scan ran.
     ///
-    /// Churn the filter refuses — `target/`, `.git/`, the storage cache — never counted, so a
-    /// build running alongside a scan still leaves the window quiet.
+    /// Churn the filter refuses — `target/`, `.git/`, the storage cache — never counted, so those
+    /// writers do not disturb an otherwise quiet window.
     pub fn is_quiet(&self) -> bool {
         self.armed_epoch == self.sealed_epoch
     }
@@ -1265,6 +1268,68 @@ mod tests {
             proven.armed_epoch() + 1,
             "ignored churn advances no epoch, so a lease cannot be invalidated by a build"
         );
+    }
+
+    #[test]
+    fn build_namespace_mutations_are_observed_conservatively() {
+        let (session, sender) = scripted(Path::new("/repo"));
+        let (_, coverage) = session.observe_window(|| {
+            sender
+                .send(mutated(
+                    "/repo/src/main/java/com/example/build/Worker.java",
+                    MutationScope::File,
+                ))
+                .expect("scripted source must accept the event");
+            sender
+                .send(mutated(
+                    "/repo/src/main/java/com/example/build",
+                    MutationScope::Directory,
+                ))
+                .expect("scripted source must accept the event");
+            for ignored in [
+                "/repo/target/debug/output.o",
+                "/repo/.git/index",
+                "/repo/node_modules/dependency/index.js",
+            ] {
+                sender
+                    .send(mutated(ignored, MutationScope::File))
+                    .expect("scripted source must accept the event");
+            }
+        });
+
+        let proven = coverage.proven().expect("no notifier loss was reported");
+        assert_eq!(proven.sealed_epoch(), proven.armed_epoch() + 2);
+        assert_eq!(
+            proven.dirty_paths().iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from(
+                "/repo/src/main/java/com/example/build/Worker.java"
+            )]
+        );
+        assert_eq!(
+            proven.rescan_roots().iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/repo/src/main/java/com/example/build")]
+        );
+    }
+
+    #[test]
+    fn build_output_churn_exhausts_the_window_instead_of_looking_quiet() {
+        let (session, sender) = scripted(Path::new("/repo"));
+        let (_, coverage) = session.observe_window(|| {
+            for index in 0..=FILESYSTEM_OBSERVER_DIRTY_PATH_CAP {
+                sender
+                    .send(mutated(
+                        &format!("/repo/build/classes/output{index}.o"),
+                        MutationScope::File,
+                    ))
+                    .expect("scripted source must accept the event");
+            }
+        });
+
+        assert_eq!(
+            coverage.gap().map(FilesystemObserverGap::id),
+            Some("observer_budget_exhausted")
+        );
+        assert_eq!(session.budget_exhaustion_count(), 1);
     }
 
     #[test]

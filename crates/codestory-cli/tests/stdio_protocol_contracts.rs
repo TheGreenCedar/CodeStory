@@ -13,6 +13,58 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+#[test]
+fn default_navigation_surface_rejects_proof_before_project_activation() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize",
+                "params":{"protocolVersion":revision,"capabilities":{},
+                    "clientInfo":{"name":"navigation-contract","version":"1"}}}),
+        );
+        assert_success_envelope(&initialized, json!("init"));
+        for name in ["verify_indexed_direct_calls", "prove_call_path"] {
+            for arguments in [
+                json!({}),
+                json!({"project":fixture.workspace.path(),
+                "call_path":"call-path/v1\nfrom symbol \"a\"\ndirect-call symbol \"b\"\n"}),
+            ] {
+                let response = send_json(
+                    &mut server,
+                    json!({"jsonrpc":"2.0","id":"proof","method":"tools/call",
+                        "params":{"name":name,"arguments":arguments}}),
+                );
+                assert_eq!(
+                    response.pointer("/error/code"),
+                    Some(&json!(-32602)),
+                    "{response}"
+                );
+                assert_eq!(
+                    response.pointer("/error/message"),
+                    Some(&json!(format!("Unknown tool: {name}"))),
+                    "{response}"
+                );
+            }
+        }
+        let listed = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+        );
+        let tools = assert_success_envelope(&listed, json!("list"))["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 20);
+        assert!(!tools.iter().any(|tool| matches!(
+            tool["name"].as_str(),
+            Some("verify_indexed_direct_calls" | "prove_call_path")
+        )));
+        assert!(!fixture.cache_dir.path().join("core").exists());
+        assert!(!fixture.cache_dir.path().join("search-generations").exists());
+    }
+}
+
 /// Every wire value `GroundingOrientationUncertaintyDto` can serialize to.
 ///
 /// The match is exhaustive on purpose: the declared MCP output schema is
@@ -49,7 +101,7 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
 };
 
 #[test]
-fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
+fn public_v3_negotiates_revision_native_evidence_discovery() {
     let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
         .expect("compatibility profile fixture json");
     let revisions = profiles
@@ -66,8 +118,12 @@ fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
     );
     assert_eq!(
         codestory_contracts::wire::SUPPORTED_MCP_PROTOCOL_VERSIONS,
-        ["2024-11-05"],
-        "profiles are test data only until the public cut changes negotiation"
+        ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "the public v3 cut must advertise exactly the four implemented revisions"
+    );
+    assert_eq!(
+        codestory_contracts::wire::PREFERRED_MCP_PROTOCOL_VERSION,
+        "2025-11-25"
     );
     let batch_contracts = profiles["profiles"]
         .as_array()
@@ -100,8 +156,583 @@ fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
             ("2025-06-18", "reject_invalid_request", 4),
             ("2025-11-25", "reject_invalid_request", 4),
         ],
-        "the fixture owns the future batch and result-form contracts without enabling them"
+        "the fixture owns the public batch and result-form contracts"
     );
+
+    for revision in revisions {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("init-{revision}"),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": revision,
+                    "capabilities": {},
+                    "clientInfo": {"name": "v3-red", "version": "0"}
+                }
+            }),
+        );
+        let initialized = assert_success_envelope(&initialized, json!(format!("init-{revision}")));
+        assert_eq!(initialized["protocolVersion"], revision);
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_protocol/supported"),
+            Some(&json!([
+                "2024-11-05",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25"
+            ]))
+        );
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_protocol/preferred"),
+            Some(&json!("2025-11-25"))
+        );
+        let digest = initialized
+            .pointer("/_meta/codestory_protocol/discovery_contract_sha256")
+            .and_then(Value::as_str)
+            .expect("initialize must bind the evidence-only discovery contract");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_publication/schema_version"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+            Some(&json!(3))
+        );
+
+        let listed = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+        );
+        let tools = assert_success_envelope(&listed, json!("list"))["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 20);
+        for route in ["packet", "context", "search"] {
+            assert_eq!(
+                tools.iter().filter(|tool| tool["name"] == route).count(),
+                1,
+                "{route} must register exactly once"
+            );
+        }
+        let navigation = tools
+            .iter()
+            .find(|tool| tool["name"] == "search")
+            .expect("search tool");
+        assert!(navigation.get("safety").is_none());
+        if revision >= "2025-03-26" {
+            assert_eq!(
+                navigation.pointer("/annotations/readOnlyHint"),
+                Some(&json!(true))
+            );
+        } else {
+            assert!(navigation.get("annotations").is_none());
+        }
+        if revision >= "2025-06-18" {
+            assert_eq!(
+                navigation.pointer("/outputSchema/type"),
+                Some(&json!("object"))
+            );
+        } else {
+            assert!(navigation.get("outputSchema").is_none());
+        }
+        let packet = tools
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool");
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .expect("status tool");
+        assert!(
+            packet
+                .pointer("/inputSchema/properties/include_evidence")
+                .is_none(),
+            "packet include_evidence was removed from v3"
+        );
+        if revision >= "2025-03-26" {
+            assert_eq!(
+                status.pointer("/annotations/readOnlyHint"),
+                Some(&json!(true)),
+                "observational annotations must remain additive in {revision}"
+            );
+            assert_eq!(
+                packet.pointer("/annotations/readOnlyHint"),
+                Some(&json!(true)),
+                "activation-capable packet must still report readOnlyHint=true in {revision}"
+            );
+            assert!(
+                packet.get("annotations").is_some(),
+                "March annotations must remain present in {revision}"
+            );
+        } else {
+            assert!(status.get("annotations").is_none());
+            assert!(packet.get("annotations").is_none());
+        }
+        if revision >= "2025-06-18" {
+            let output = packet.get("outputSchema").expect("modern output schema");
+            assert_eq!(output["type"], "object");
+            assert!(output.get("additionalProperties").is_none());
+            assert!(!output.to_string().contains("disposition"));
+            assert!(!output.to_string().contains("supported"));
+        } else {
+            assert!(packet.get("outputSchema").is_none());
+        }
+
+        let invalid = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"removed-include-evidence",
+                "method":"tools/call",
+                "params": {
+                    "name":"packet",
+                    "arguments": {
+                        "project": fixture.workspace.path(),
+                        "question":"Explain dispatch.",
+                        "include_evidence": true
+                    }
+                }
+            }),
+        );
+        assert_eq!(invalid.pointer("/error/code"), Some(&json!(-32602)));
+    }
+}
+
+#[test]
+fn files_framework_catalog_is_explicit_in_every_mcp_revision() {
+    let fixture = indexed_fixture();
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let mut server = spawn_stdio_server(&fixture);
+        let init = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0", "id":"files-init", "method":"initialize",
+                "params":{"protocolVersion":revision}
+            }),
+        );
+        assert_success_envelope(&init, json!("files-init"));
+        let mut outputs = Vec::new();
+        for (id, requested) in [
+            ("default", None),
+            ("false", Some(false)),
+            ("true", Some(true)),
+        ] {
+            let mut arguments = json!({"project":fixture.workspace.path(), "limit":1});
+            if let Some(requested) = requested {
+                arguments["include_framework_coverage"] = json!(requested);
+            }
+            let response = send_json(
+                &mut server,
+                json!({
+                    "jsonrpc":"2.0", "id":id, "method":"tools/call",
+                    "params":{"name":"files", "arguments":arguments}
+                }),
+            );
+            let result = assert_success_envelope(&response, json!(id));
+            assert_ne!(result.get("isError"), Some(&json!(true)), "{response}");
+            let payload: Value = serde_json::from_str(
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("JSON fallback"),
+            )
+            .expect("file inventory");
+            if revision >= "2025-06-18" {
+                assert_eq!(result["structuredContent"], payload);
+            }
+            assert_eq!(
+                payload["summary"]["framework_route_coverage_included"],
+                json!(requested.unwrap_or(false))
+            );
+            assert_eq!(
+                payload["summary"]["framework_route_coverage"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                requested != Some(true)
+            );
+            outputs.push(payload);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        for field in [
+            "files",
+            "coverage_gaps",
+            "policy_exclusions",
+            "project_root",
+            "usable",
+        ] {
+            assert_eq!(
+                outputs[0].get(field),
+                outputs[2].get(field),
+                "{revision}: {field}"
+            );
+        }
+        for field in [
+            "file_count",
+            "indexed_file_count",
+            "filtered_file_count",
+            "visible_file_count",
+            "incomplete_file_count",
+            "error_file_count",
+            "policy_exclusion_count",
+            "incomplete_reason_counts",
+            "truncated",
+            "language_counts",
+        ] {
+            assert_eq!(
+                outputs[0]["summary"].get(field),
+                outputs[2]["summary"].get(field),
+                "{revision}: {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"initialize",
+                "method":"initialize",
+                "params":{"protocolVersion":revision}
+            }),
+        );
+        assert_eq!(
+            assert_success_envelope(&initialized, json!("initialize"))["protocolVersion"],
+            revision
+        );
+        let project = fixture.workspace.path();
+        let exact_path_probes = (0..16)
+            .map(|index| json!({"kind":"exact_path","path":format!("src/{index}.rs")}))
+            .collect::<Vec<_>>();
+        let mut overflow_probes = exact_path_probes.clone();
+        overflow_probes.push(json!({"kind":"exact_path","path":"src/overflow.rs"}));
+        let cases = vec![
+            (
+                "files-framework-type",
+                "files",
+                json!({"project":project,"include_framework_coverage":"yes"}),
+                "/arguments/include_framework_coverage",
+                "invalid_type",
+            ),
+            (
+                "status-project-type",
+                "status",
+                json!({"project":7}),
+                "/arguments/project",
+                "invalid_type",
+            ),
+            (
+                "packet-root-type",
+                "packet",
+                json!([]),
+                "/arguments",
+                "invalid_type",
+            ),
+            (
+                "packet-question-required",
+                "packet",
+                json!({"project":project}),
+                "/arguments/question",
+                "missing_required",
+            ),
+            (
+                "packet-question-type",
+                "packet",
+                json!({"project":project,"question":7}),
+                "/arguments/question",
+                "invalid_type",
+            ),
+            (
+                "packet-question-bound",
+                "packet",
+                json!({"project":project,"question":""}),
+                "/arguments/question",
+                "below_min_length",
+            ),
+            (
+                "packet-budget-enum",
+                "packet",
+                json!({"project":project,"question":"why","budget":"impossible"}),
+                "/arguments/budget",
+                "invalid_enum_value",
+            ),
+            (
+                "packet-tagged-probe",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","id":"wrong"}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-array-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":overflow_probes}),
+                "/arguments/probes",
+                "above_max_items",
+            ),
+            (
+                "packet-string-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","path":"x".repeat(241)}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-retired-extra-probes",
+                "packet",
+                json!({"project":project,"question":"why","probes":exact_path_probes,"extra_probes":["retired"]}),
+                "/arguments/extra_probes",
+                "unknown_property",
+            ),
+            (
+                "packet-retired-task-class",
+                "packet",
+                json!({"project":project,"question":"why","task_class":"architecture_explanation"}),
+                "/arguments/task_class",
+                "unknown_property",
+            ),
+            (
+                "packet-retired-evidence-opt-out",
+                "packet",
+                json!({"project":project,"question":"why","include_evidence":false}),
+                "/arguments/include_evidence",
+                "unknown_property",
+            ),
+            (
+                "context-selector-required",
+                "context",
+                json!({"project":project}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "context-selector-exclusive",
+                "context",
+                json!({"project":project,"query":"entry","id":"node-1"}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "search-query-type",
+                "search",
+                json!({"project":project,"query":7}),
+                "/arguments/query",
+                "invalid_type",
+            ),
+            (
+                "search-limit-bound",
+                "search",
+                json!({"project":project,"query":"entry","limit":0}),
+                "/arguments/limit",
+                "below_minimum",
+            ),
+            (
+                "search-additional-property",
+                "search",
+                json!({"project":project,"query":"entry","extra":true}),
+                "/arguments/extra",
+                "unknown_property",
+            ),
+        ];
+
+        for (id, tool, arguments, pointer, violation_code) in cases {
+            let response = send_json(
+                &mut server,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{"name":tool,"arguments":arguments}
+                }),
+            );
+            assert_invalid_params(&response, json!(id), tool, pointer, violation_code);
+        }
+    }
+}
+
+#[test]
+fn public_v3_cli_keeps_experimental_verification_out_of_default_help() {
+    let output = test_support::cli_command()
+        .args(["packet", "--help"])
+        .output()
+        .expect("run packet help");
+    assert!(
+        output.status.success(),
+        "packet help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).expect("UTF-8 packet help");
+    assert!(
+        help.contains("--diagnostics-out <DIAGNOSTICS_OUT>"),
+        "{help}"
+    );
+    assert!(!help.contains("--no-evidence"), "{help}");
+    assert!(!help.contains("prove-call-path"), "{help}");
+
+    let output = test_support::cli_command()
+        .args(["verify-indexed-direct-calls", "--help"])
+        .output()
+        .expect("run verify-indexed-direct-calls help");
+    assert!(
+        output.status.success(),
+        "verify-indexed-direct-calls help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).expect("UTF-8 verify-indexed-direct-calls help");
+    assert!(help.contains("--project <ROOT>"), "{help}");
+    assert!(help.contains("--spec <PATH>"), "{help}");
+    for forbidden in [
+        "--profile",
+        "--run-id",
+        "--retrieval-generation",
+        "--latency-budget",
+        "--evidence",
+    ] {
+        assert!(!help.contains(forbidden), "{help}");
+    }
+
+    let output = test_support::cli_command()
+        .args(["prove-call-path", "--help"])
+        .output()
+        .expect("run retired prove-call-path alias");
+    assert!(
+        !output.status.success(),
+        "the retired prove-call-path alias must not resolve: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let output = test_support::cli_command()
+        .args(["--help"])
+        .output()
+        .expect("run top-level help");
+    let top_level = String::from_utf8(output.stdout).expect("UTF-8 top-level help");
+    assert!(!top_level.contains("prove-call-path"), "{top_level}");
+    assert!(
+        !top_level.contains("verify-indexed-direct-calls"),
+        "{top_level}"
+    );
+}
+
+#[test]
+fn verify_indexed_direct_calls_cli_keeps_file_stdin_parity_and_caps_before_parsing() {
+    let workspace = tempfile::tempdir().expect("CLI proof workspace");
+    let cache_root = tempfile::tempdir().expect("CLI proof cache root");
+    let spec_root = tempfile::tempdir().expect("CLI proof spec root");
+    write_tiny_rust_workspace(workspace.path());
+    let mut index = test_support::cli_command();
+    index
+        .args([
+            "index",
+            "--refresh",
+            "full",
+            "--format",
+            "json",
+            "--project",
+        ])
+        .arg(workspace.path())
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+    allow_explicit_cpu_embeddings(&mut index);
+    let indexed = index.output().expect("index CLI proof workspace");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let document = unknown_proof_document();
+    let spec_file = spec_root.path().join("call-path.txt");
+    fs::write(&spec_file, document).expect("write call path document");
+    let mut from_file = test_support::cli_command();
+    from_file
+        .args(["verify-indexed-direct-calls", "--project"])
+        .arg(workspace.path())
+        .arg("--spec")
+        .arg(&spec_file)
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+    let from_file = from_file.output().expect("run file proof");
+    assert!(
+        from_file.status.success(),
+        "file proof failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&from_file.stdout),
+        String::from_utf8_lossy(&from_file.stderr)
+    );
+
+    let mut from_stdin = test_support::cli_command();
+    from_stdin
+        .args(["verify-indexed-direct-calls", "--project"])
+        .arg(workspace.path())
+        .args(["--spec", "-"])
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = from_stdin.spawn().expect("spawn stdin proof");
+    child
+        .stdin
+        .take()
+        .expect("proof stdin")
+        .write_all(document.as_bytes())
+        .expect("write stdin proof");
+    let from_stdin = child.wait_with_output().expect("wait stdin proof");
+    assert!(
+        from_stdin.status.success(),
+        "stdin proof failed: {}",
+        String::from_utf8_lossy(&from_stdin.stderr)
+    );
+    let file_root: Value = serde_json::from_slice(&from_file.stdout).expect("file proof JSON");
+    let stdin_root: Value = serde_json::from_slice(&from_stdin.stdout).expect("stdin proof JSON");
+    assert_eq!(file_root, stdin_root);
+    assert_eq!(
+        file_root.pointer("/disposition/kind"),
+        Some(&json!("unknown"))
+    );
+    assert_eq!(file_root["domain"], "call-path/v1");
+    assert_eq!(file_root["translation_status"], "host_supplied");
+    assert_eq!(file_root["graph_disposition"], "unknown");
+    assert_eq!(file_root["runtime_execution_proven"], false);
+
+    // The cap is a byte bound on the document, enforced before parsing. Padding
+    // is trailing whitespace, which the grammar ignores, so only the size
+    // distinguishes the two cases.
+    for (label, extra, exceeds) in [("cap", 0, false), ("cap-plus-one", 1, true)] {
+        let padding = 8 * 1024 - document.len() + extra;
+        let path = spec_root.path().join(format!("{label}.txt"));
+        fs::write(&path, format!("{document}{}", " ".repeat(padding)))
+            .expect("write capped call path document");
+        let mut command = test_support::cli_command();
+        command
+            .args(["verify-indexed-direct-calls", "--project"])
+            .arg(workspace.path())
+            .arg("--spec")
+            .arg(path)
+            .env("CODESTORY_CACHE_ROOT", cache_root.path())
+            .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+        let output = command.output().expect("run capped call path document");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            combined.contains("exceeds the 8192 byte input limit"),
+            exceeds,
+            "{label}: {combined}"
+        );
+        assert_eq!(output.status.success(), !exceeds, "{label}: {combined}");
+    }
 }
 
 struct StdioFixture {
@@ -480,7 +1111,7 @@ fn initialize_stdio_server(server: &mut StdioServer, id: &str) {
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -527,7 +1158,7 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
         .expect("tools/call success should include structuredContent")
 }
 
-fn assert_tool_error(response: &Value, id: Value) -> &Value {
+fn assert_tool_error(response: &Value, id: Value) -> Value {
     let result = assert_success_envelope(response, id);
     assert_eq!(
         result.get("isError").and_then(Value::as_bool),
@@ -535,34 +1166,60 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
         "tools/call execution errors should be returned as CallToolResult errors: {response}"
     );
     assert_tool_text_content(result, response);
-    result
-        .get("structuredContent")
-        .expect("tools/call error should include structuredContent")
+    assert!(
+        result.get("structuredContent").is_none(),
+        "v3 tool errors must never carry structuredContent: {response}"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("tool error text");
+    serde_json::from_str(text).unwrap_or_else(|_| json!({"message": text}))
 }
 
-fn tool_result_code(response: &Value) -> Option<&str> {
-    response
+fn tool_result_code(response: &Value) -> Option<String> {
+    if response.pointer("/result/structuredContent/kind") == Some(&json!("preparing")) {
+        return Some("codestory_preparing".to_string());
+    }
+    if let Some(code) = response
         .pointer("/result/structuredContent/code")
         .and_then(Value::as_str)
+    {
+        return Some(code.to_string());
+    }
+    response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            if value.get("kind") == Some(&json!("preparing")) {
+                Some("codestory_preparing".to_string())
+            } else {
+                value.get("code").and_then(Value::as_str).map(str::to_owned)
+            }
+        })
 }
 
-fn assert_tool_preparing(response: &Value, id: Value) -> &Value {
-    let result = assert_success_envelope(response, id);
-    assert!(
-        result.get("isError").and_then(Value::as_bool) != Some(true),
-        "preparing tools/call should be a successful structured result: {response}"
-    );
-    assert_tool_text_content(result, response);
-    let content = result
-        .get("structuredContent")
-        .expect("preparing tools/call should include structuredContent");
-    assert_eq!(content["code"], json!("codestory_preparing"));
+fn assert_tool_preparing(response: &Value, id: Value) -> Value {
+    let content = assert_tool_success(response, id).clone();
+    assert_eq!(content["kind"], json!("preparing"));
     assert_eq!(content["state"], json!("preparing"));
+    assert!(
+        content["retry_after_ms"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert!(content["operation"].is_object());
+    assert_eq!(
+        content.pointer("/minimum_next/kind"),
+        Some(&json!("retry_same_request")),
+        "preparing must state the smallest sufficient next action: {content}"
+    );
     content
 }
 
-fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> &Value {
-    if tool_result_code(response) == Some("codestory_preparing") {
+fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> Value {
+    if tool_result_code(response).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(response, id)
     } else {
         assert_tool_error(response, id)
@@ -630,6 +1287,10 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
+fn unknown_proof_document() -> &'static str {
+    "call-path/v1\nfrom symbol \"crate::missing::start\"\ndirect-call symbol \"crate::missing::target\"\n"
+}
+
 /// True when activation terminated instead of staying retryable.
 ///
 /// Activation can end terminally for more than one environment reason: the package may
@@ -671,6 +1332,87 @@ fn assert_search_repaired_before_terminal_activation(
         }),
     );
     assert_tool_success(&ground, json!(ground_id));
+}
+
+fn assert_packet_success_after_search_repair(
+    response: &Value,
+    id: Value,
+    search_generations: &Path,
+) {
+    let packet = assert_tool_success(response, id);
+    let generation = packet
+        .pointer("/publication/core/generation_id")
+        .and_then(Value::as_str)
+        .expect("successful packet names its pinned core generation");
+    let marker_path = search_generations
+        .join(generation)
+        .join(".codestory-complete.json");
+    let marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap_or_else(|error| {
+        panic!(
+            "packet succeeded without completed search generation {}: {error}",
+            marker_path.display()
+        )
+    }))
+    .expect("rebuilt search completion marker is JSON");
+    assert_eq!(marker["schema_version"], json!(1));
+    assert_eq!(marker["generation_id"], json!(generation));
+    assert!(
+        marker["symbol_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "nonempty indexed fixture must rebuild its symbols: {marker}"
+    );
+    assert!(
+        marker["tantivy_doc_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "nonempty indexed fixture must rebuild its search documents: {marker}"
+    );
+}
+
+#[test]
+fn packet_repair_success_assertion_checks_initial_and_retry_generation_identity() {
+    let cache = tempfile::tempdir().expect("isolated assertion fixture");
+    let generation = "1031b690-2c97-496e-8895-093fbf2348a4";
+    let directory = cache.path().join(generation);
+    fs::create_dir(&directory).unwrap();
+    let marker_path = directory.join(".codestory-complete.json");
+    for id in ["packet-search-repair-first", "packet-search-repair-retry-1"] {
+        // This control exercises the shared assertion, not a runtime packet producer.
+        let response = json!({"jsonrpc":"2.0","id":id,"result":{
+            "isError":false,"content":[{"type":"text","text":"packet fixture"}],
+            "structuredContent":{"publication":{"core":{"generation_id":generation}}}}});
+        let complete = json!({"schema_version":1,"generation_id":generation,
+            "symbol_count":2,"tantivy_doc_count":2});
+        fs::write(&marker_path, serde_json::to_vec(&complete).unwrap()).unwrap();
+        assert_packet_success_after_search_repair(&response, json!(id), cache.path());
+        fs::remove_file(&marker_path).unwrap();
+        // The old initial success branch accepted this response; the retry branch
+        // additionally checked only this still-existing parent directory.
+        assert_tool_success(&response, json!(id));
+        assert!(cache.path().is_dir());
+        assert!(
+            std::panic::catch_unwind(|| assert_packet_success_after_search_repair(
+                &response,
+                json!(id),
+                cache.path()
+            ))
+            .is_err(),
+            "{id}: missing completion marker escaped the shared success assertion"
+        );
+        let mut wrong = complete.clone();
+        wrong["generation_id"] = json!("another-generation");
+        fs::write(&marker_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| assert_packet_success_after_search_repair(
+                &response,
+                json!(id),
+                cache.path()
+            ))
+            .is_err(),
+            "{id}: mismatched generation escaped the shared success assertion"
+        );
+    }
 }
 
 fn assert_tool_text_content<'a>(result: &'a Value, response: &Value) -> &'a str {
@@ -738,9 +1480,18 @@ fn required_on_any_branch(schema: &Value, field: &str) -> bool {
         })
 }
 
+fn schema_value<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
+    schema.pointer(pointer).or_else(|| {
+        schema
+            .get("allOf")
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(|branch| schema_value(branch, pointer))
+    })
+}
+
 fn required_fields(schema: &Value) -> BTreeSet<&str> {
-    schema
-        .get("required")
+    schema_value(schema, "/required")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("schema should include required fields: {schema}"))
         .iter()
@@ -753,21 +1504,23 @@ fn required_fields(schema: &Value) -> BTreeSet<&str> {
 }
 
 fn schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
-    schema
-        .pointer(&format!("/properties/{name}"))
+    schema_value(schema, &format!("/properties/{name}"))
         .unwrap_or_else(|| panic!("schema should include property {name}: {schema}"))
 }
 
 fn assert_schema_enum_values(schema: &Value, pointer: &str, expected: &[&str]) {
-    let values: BTreeSet<_> = schema
-        .pointer(pointer)
+    let values: BTreeSet<_> = schema_value(schema, pointer)
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("schema should include enum array at {pointer}: {schema}"))
         .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .unwrap_or_else(|| panic!("enum values should be strings at {pointer}: {schema}"))
+        .filter_map(|value| {
+            if value.is_null() {
+                None
+            } else {
+                Some(value.as_str().unwrap_or_else(|| {
+                    panic!("enum values should be strings or null at {pointer}: {schema}")
+                }))
+            }
         })
         .collect();
     for expected_value in expected {
@@ -964,23 +1717,6 @@ fn assert_ground_activation_call(status: &Value) {
     assert_eq!(calls[0]["activation_required"], json!(true));
 }
 
-fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => strings.push(text),
-        Value::Array(values) => {
-            for child in values {
-                string_values_recursive(child, strings);
-            }
-        }
-        Value::Object(map) => {
-            for child in map.values() {
-                string_values_recursive(child, strings);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn json_resource_content(result: &Value, uri: &str) -> Value {
     let content = result["contents"]
         .as_array()
@@ -1024,24 +1760,27 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
     let observational = name == "status";
+    let safety = tool
+        .pointer("/_meta/com.thegreencedar.codestory~1safety")
+        .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
     let annotations = tool
         .get("annotations")
-        .unwrap_or_else(|| panic!("{name} should include MCP-style annotations: {tool}"));
-    let safety = tool
-        .get("safety")
-        .or_else(|| tool.get("metadata"))
-        .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
+        .unwrap_or_else(|| panic!("{name} should retain additive MCP annotations: {tool}"));
+    assert!(tool.get("title").and_then(Value::as_str).is_some());
+    assert!(tool.get("outputSchema").is_some());
+    assert!(tool.get("safety").is_none());
+    assert!(tool.get("metadata").is_none());
 
-    // Every tool is read-only with respect to the caller's repository, activation or not:
-    // managed activation writes only to a per-user cache outside the checkout. A
-    // non-read-only hint is auto-cancelled by non-interactive clients, which silently
-    // disabled 19 of these 20 tools. Managed activation stays disclosed via `effect`,
-    // `sideEffects`, and `activatesProject`, asserted below.
-    assert!(
-        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true)
-            && safety.get("readOnly").and_then(Value::as_bool) == Some(true),
-        "{name} should report repository-read-only regardless of managed activation: {tool}"
+    assert_eq!(annotations["destructiveHint"], false);
+    assert_eq!(annotations["idempotentHint"], true);
+    assert_eq!(annotations["openWorldHint"], !observational);
+    assert_eq!(
+        annotations["readOnlyHint"], true,
+        "every tool must report readOnlyHint=true so non-interactive hosts do not auto-cancel: {tool}"
     );
+
+    // Managed activation stays explicit in the vendor effect metadata while
+    // standard readOnlyHint stays true for every repository-read-only tool.
     assert_eq!(
         safety.get("effect").and_then(Value::as_str),
         Some(if observational {
@@ -1067,13 +1806,11 @@ fn assert_tool_safety_metadata(tool: &Value) {
         "{name} should not ask the user to confirm managed local preparation: {tool}"
     );
     assert!(
-        annotations.get("destructiveHint").and_then(Value::as_bool) == Some(false)
-            || contains_bool_recursive(safety, &["destructive", "destructiveHint"], false),
+        contains_bool_recursive(safety, &["destructive", "destructiveHint"], false),
         "{name} should declare non-destructive behavior: {tool}"
     );
     assert!(
-        annotations.get("idempotentHint").and_then(Value::as_bool) == Some(true)
-            || contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
+        contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
         "{name} should declare idempotent behavior: {tool}"
     );
     assert_eq!(
@@ -1085,11 +1822,6 @@ fn assert_tool_safety_metadata(tool: &Value) {
         safety.get("openWorld").and_then(Value::as_bool),
         Some(!observational),
         "{name} should disclose automatic managed downloads: {tool}"
-    );
-    assert_eq!(
-        annotations.get("openWorldHint").and_then(Value::as_bool),
-        Some(!observational),
-        "{name} annotations should match managed network behavior: {tool}"
     );
 }
 
@@ -1167,23 +1899,49 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     let agreed = assert_success_envelope(&agreed, json!("init-agreed"));
     assert_eq!(agreed.get("protocolVersion"), Some(&json!("2024-11-05")));
     assert_eq!(
-        agreed.pointer("/_meta/codestory_protocol"),
-        Some(&json!({
-            "requested": "2024-11-05",
-            "negotiated": "2024-11-05",
-            "supported": ["2024-11-05"],
-            "status": "agreed",
-            "compatible": true
-        })),
+        agreed.pointer("/_meta/codestory_protocol/requested"),
+        Some(&json!("2024-11-05")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/negotiated"),
+        Some(&json!("2024-11-05")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/supported"),
+        Some(&json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25"
+        ])),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/preferred"),
+        Some(&json!("2025-11-25")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("agreed")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/compatible"),
+        Some(&json!(true)),
+    );
+    assert_eq!(
+        agreed
+            .pointer("/_meta/codestory_protocol/discovery_contract_sha256")
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(64),
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(2)),
-        "the session-start stamp publishes the v0.17.0 response schema: {agreed}"
+        Some(&json!(3)),
+        "the session-start stamp publishes the evidence-only v3 response schema: {agreed}"
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/served_from"),
@@ -1202,7 +1960,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
             "id": "init-unsupported",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2030-01-01",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -1211,18 +1969,24 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     let unsupported = assert_success_envelope(&unsupported, json!("init-unsupported"));
     assert_eq!(
         unsupported.get("protocolVersion"),
-        Some(&json!("2024-11-05")),
+        Some(&json!("2025-11-25")),
         "an unimplemented revision must not be echoed back as supported: {unsupported}"
     );
     assert_eq!(
-        unsupported.pointer("/_meta/codestory_protocol"),
-        Some(&json!({
-            "requested": "2025-06-18",
-            "negotiated": "2024-11-05",
-            "supported": ["2024-11-05"],
-            "status": "unsupported_client_revision",
-            "compatible": false
-        })),
+        unsupported.pointer("/_meta/codestory_protocol/requested"),
+        Some(&json!("2030-01-01")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/negotiated"),
+        Some(&json!("2025-11-25")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("unsupported_client_revision")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/compatible"),
+        Some(&json!(false)),
     );
 
     let defaulted = send_json(
@@ -1235,7 +1999,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
         }),
     );
     let defaulted = assert_success_envelope(&defaulted, json!("init-defaulted"));
-    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2025-11-25")));
     assert_eq!(
         defaulted.pointer("/_meta/codestory_protocol/status"),
         Some(&json!("defaulted")),
@@ -1275,12 +2039,12 @@ fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
     let result = assert_success_envelope(&response, json!("ground-stamp"));
     assert_eq!(
         result.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
         "a served payload must name the schema its vocabulary belongs to: {response}"
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/served_from"),
@@ -1378,7 +2142,7 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
             "id": "init-unindexed",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -1595,7 +2359,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             .expect("tools array")
             .iter()
             .all(|tool| {
-                tool.pointer("/inputSchema/required")
+                schema_value(&tool["inputSchema"], "/required")
                     .and_then(Value::as_array)
                     .is_some_and(|required| required.contains(&json!("project")))
             }),
@@ -1904,28 +2668,26 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let error = assert_tool_preparing(&response, json!(id));
-        assert_eq!(error["cause_code"], json!("cache_busy"));
-        assert_eq!(error["retry_tool"], json!("packet"));
-        assert!(error["retry_after_ms"].as_u64().is_some());
-        assert!(
-            error["recommended_next_calls"]
-                .as_array()
-                .is_some_and(|calls| {
-                    calls.iter().any(|call| {
-                        call["method"] == "tools/call"
-                            && call["tool"] == "packet"
-                            && call["arguments"]["project"] == json!(project.path())
-                    }) && !calls.iter().any(|call| {
-                        call["tool"] == "affected"
-                            || call["tool"] == "status"
-                            || call["method"] == "resources/read"
-                    })
-                }),
-            "preparing packet must retry the same tool without status or placeholder affected: {error}"
+        let preparing = assert_tool_preparing(&response, json!(id));
+        assert!(preparing["retry_after_ms"].as_u64().is_some());
+        assert_eq!(
+            preparing
+                .as_object()
+                .expect("preparing result object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "kind",
+                "minimum_next",
+                "operation",
+                "retry_after_ms",
+                "state"
+            ]),
+            "preparing is a closed successful v3 result, not a legacy error envelope: {preparing}"
         );
         operation_ids.push(
-            error["operation"]["operation_id"]
+            preparing["operation"]["operation_id"]
                 .as_str()
                 .expect("project activation operation id")
                 .to_string(),
@@ -2017,25 +2779,6 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         !tool_names.iter().any(|name| name.starts_with("codestory_")),
         "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
     );
-    let packet_description = tool_by_name(&tools, "packet")["description"]
-        .as_str()
-        .expect("packet description");
-    assert!(
-        packet_description.contains("broad structural questions")
-            && packet_description.contains("compiled support units")
-            && packet_description.contains("one-round drill")
-            && packet_description.contains("option_ids")
-            && packet_description.contains("before source snippets"),
-        "packet description should route broad questions to compiled support and a typed stop/drill: {packet_description}"
-    );
-    let search_description = tool_by_name(&tools, "search")["description"]
-        .as_str()
-        .expect("search description");
-    assert!(
-        search_description.contains("Discover candidate")
-            && search_description.contains("packet before snippet/source reads"),
-        "search description should label discovery before source proof reads: {search_description}"
-    );
     let ground_description = tool_by_name(&tools, "ground")["description"]
         .as_str()
         .expect("ground description");
@@ -2066,14 +2809,6 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             && affected_description.contains("does not wait for broad search"),
         "affected description should state its last-complete and activation boundary: {affected_description}"
     );
-    let snippet_description = tool_by_name(&tools, "snippet")["description"]
-        .as_str()
-        .expect("snippet description");
-    assert!(
-        snippet_description.contains("after packet, search, or graph evidence"),
-        "snippet description should not be the first stop for broad structural questions: {snippet_description}"
-    );
-
     for tool in tools["tools"].as_array().expect("tools array") {
         assert_tool_safety_metadata(tool);
     }
@@ -2159,23 +2894,13 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         Some(&json!("standard")),
         "packet.budget should document the stdio default: {packet}"
     );
-    assert_schema_enum_values(
-        packet,
-        "/properties/task_class/enum",
-        &[
-            "architecture_explanation",
-            "bug_localization",
-            "change_impact",
-            "route_tracing",
-            "symbol_ownership",
-            "data_flow",
-            "edit_planning",
-        ],
+    assert!(
+        packet.pointer("/properties/task_class").is_none(),
+        "packet.task_class must be absent from the public MCP contract: {packet}"
     );
-    assert_eq!(
-        schema_property(packet, "include_evidence").get("default"),
-        Some(&json!(true)),
-        "packet.include_evidence should document the stdio default: {packet}"
+    assert!(
+        packet.pointer("/properties/include_evidence").is_none(),
+        "packet.include_evidence must be absent from the v3 contract: {packet}"
     );
 
     let ground = tool_input_schema(&tools, "ground");
@@ -2307,12 +3032,14 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "affected.filter should be a string: {affected}"
     );
     assert!(
-        affected.get("anyOf").is_none(),
+        schema_value(affected, "/anyOf").is_none(),
         "affected exact-one input contract should not be described as anyOf: {affected}"
     );
-    let affected_one_of = affected["oneOf"].as_array().unwrap_or_else(|| {
-        panic!("affected should require exactly one path source via oneOf: {affected}")
-    });
+    let affected_one_of = schema_value(affected, "/oneOf")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("affected should require exactly one path source via oneOf: {affected}")
+        });
     assert!(
         affected_one_of
             .iter()
@@ -2433,6 +3160,27 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         Some(&json!(false)),
         "trail.story should document the stdio default: {trail}"
     );
+    for name in [
+        "trail",
+        "trace",
+        "callers",
+        "callees",
+        "neighbors",
+        "query_subgraph",
+        "shortest_path",
+    ] {
+        let schema = tool_input_schema(&tools, name);
+        assert_eq!(
+            schema_property(schema, "caller_scope")["enum"],
+            json!(["production_only", "include_tests_and_benches"]),
+            "{name}.caller_scope must publish the runtime caller-scope choice: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "caller_scope").get("default"),
+            Some(&json!("production_only")),
+            "{name}.caller_scope must keep production-only as the default: {schema}"
+        );
+    }
     for name in ["callers", "callees"] {
         let alias = tool_input_schema(&tools, name);
         assert_eq!(
@@ -2488,7 +3236,90 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
 }
 
 #[test]
-fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
+fn tool_catalog_exposes_closed_v3_evidence_output_schemas() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"catalog-v3-outputs","method":"tools/list"}),
+        ),
+        json!("catalog-v3-outputs"),
+    )
+    .clone();
+
+    for name in ["packet", "context", "search"] {
+        let schema = tool_output_schema(&tools, name);
+        assert_eq!(schema["type"], json!("object"));
+        assert!(
+            !schema.to_string().contains("disposition"),
+            "{name}: {schema}"
+        );
+        assert!(
+            !schema.to_string().contains("proof_status"),
+            "{name}: {schema}"
+        );
+        assert!(
+            !schema.to_string().contains("supported"),
+            "{name}: {schema}"
+        );
+    }
+
+    let packet = tool_output_schema(&tools, "packet");
+    let packet_complete = packet
+        .pointer("/oneOf/0/allOf/0/oneOf/0")
+        .unwrap_or_else(|| panic!("packet success branch: {packet}"));
+    assert_eq!(packet_complete["additionalProperties"], json!(false));
+    for field in [
+        "kind",
+        "schema_version",
+        "identity",
+        "publication",
+        "status",
+        "retrieval",
+        "evidence",
+        "gaps",
+        "continuation",
+        "diagnostics",
+    ] {
+        assert!(
+            required_fields(packet_complete).contains(field),
+            "packet {field}: {packet}"
+        );
+    }
+
+    for name in ["context", "search"] {
+        let schema = tool_output_schema(&tools, name);
+        let success = schema
+            .pointer("/oneOf/0/allOf/0")
+            .unwrap_or_else(|| panic!("{name} success branch: {schema}"));
+        assert_eq!(success["additionalProperties"], json!(false));
+        for field in [
+            "kind",
+            "schema_version",
+            "identity",
+            "publication",
+            "status",
+            "evidence",
+            "gaps",
+            "continuation",
+            "diagnostics",
+        ] {
+            assert!(
+                required_fields(success).contains(field),
+                "{name} {field}: {schema}"
+            );
+        }
+        if name == "search" {
+            assert!(required_fields(success).contains("retrieval"), "{schema}");
+        } else {
+            assert!(required_fields(success).contains("target"), "{schema}");
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn legacy_tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3412,13 +4243,10 @@ fn affected_tool_maps_preferred_paths_without_sidecars() {
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
         .expect("affected compact text");
-    assert!(text.contains("tool: affected"));
-    assert!(text.contains("matched_file_count: 1"));
-    assert!(text.contains("count.changed_paths: 61"));
-    assert!(text.contains("structuredContent: available"));
-    assert!(
-        text.len() < 4 * 1024,
-        "tool text should stay compact while structuredContent carries the bounded result"
+    assert_eq!(
+        serde_json::from_str::<Value>(text).expect("modern tool text is JSON"),
+        *result,
+        "modern profiles mirror structuredContent as identical JSON text"
     );
 }
 
@@ -4037,7 +4865,8 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
         .as_str()
         .expect("cold status storage path");
     assert!(
-        !Path::new(storage_path).exists(),
+        !codestory_runtime::core_database_exists(Path::new(storage_path))
+            .expect("inspect cold core storage"),
         "malformed affected input must not create storage before activation: {cold_status}"
     );
 
@@ -4056,7 +4885,27 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
     let result = assert_tool_success(&legacy, json!("affected-cold-legacy"));
     assert_eq!(result["changed_paths"], json!(["src/runtime.rs"]));
     assert_eq!(result["matched_file_count"], json!(1));
-    assert!(Path::new(storage_path).exists());
+    assert!(
+        codestory_runtime::core_database_exists(Path::new(storage_path))
+            .expect("inspect activated core storage")
+    );
+    let activated_status = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-activated-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let activated_status = json_resource_content(
+        assert_success_envelope(&activated_status, json!("affected-activated-status")),
+        "codestory://status",
+    );
+    assert!(
+        activated_status["index_publication"].is_object(),
+        "the valid retry must publish a complete core generation: {activated_status}"
+    );
 }
 
 #[test]
@@ -4163,12 +5012,10 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         assert_success_envelope(&compact_response, json!("compact-status-tool")),
         &compact_response,
     );
-    assert!(compact_text.contains("tool: status"));
-    assert!(compact_text.contains("state: working_locally"));
-    assert!(compact_text.contains("capability.local_navigation: ready"));
-    assert!(compact_text.contains("next_action:"));
-    assert!(compact_text.contains("retrieval_mode:"));
-    assert!(compact_text.contains("live_ready:"));
+    assert_eq!(
+        serde_json::from_str::<Value>(compact_text).expect("modern status text is JSON"),
+        *compact,
+    );
     let local_summary = "Local repository navigation is ready.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
@@ -5396,7 +6243,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         json!("tool-refresh-catalog"),
     )
     .clone();
-    let snippet_output_schema = tool_output_schema(&tools, "snippet").clone();
+    let snippet_output_schema = tool_output_schema(&tools, "snippet")
+        .pointer("/oneOf/0/allOf/0")
+        .expect("snippet successful output schema")
+        .clone();
 
     let ground_before = send_json(
         &mut server,
@@ -5646,196 +6496,35 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
 }
 
 #[test]
-fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
-    let fixture = indexed_fixture();
+fn resources_read_agent_guide_serves_the_canonical_skill_without_a_parallel_policy() {
+    let fixture = unindexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
-
     let response = send_json(
         &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "agent-guide-resource",
-            "method": "resources/read",
-            "params": {"uri": "codestory://agent-guide"}
-        }),
+        json!({"jsonrpc":"2.0","id":"agent-guide-resource","method":"resources/read",
+            "params":{"uri":"codestory://agent-guide"}}),
     );
-
     let result = assert_success_envelope(&response, json!("agent-guide-resource"));
     let guide = json_resource_content(result, "codestory://agent-guide");
-    let sequence = guide
-        .get("recommended_call_sequence")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("agent guide should include recommended_call_sequence: {guide}"));
-    assert!(
-        sequence
-            .iter()
-            .any(|step| step["action"] == json!("call_matching_tool")
-                && step.pointer("/arguments/project").is_some())
-            && sequence
-                .iter()
-                .any(|step| step["action"] == json!("retry_same_tool"))
-            && sequence.first().is_some_and(|step| {
-                step["action"] == json!("resolve_project_root")
-                    && step.get("tool") != Some(&json!("ground"))
-            })
-            && guide
-                .get("readiness_lanes")
-                .and_then(Value::as_array)
-                .is_some_and(|lanes| lanes.len() >= 2),
-        "agent guide should publish the matching-tool loop, not ground-first: {guide}"
-    );
-    let local_lane = guide["readiness_lanes"]
-        .as_array()
-        .and_then(|lanes| {
-            lanes
-                .iter()
-                .find(|lane| lane["readiness_goal"] == json!("local_navigation"))
-        })
-        .unwrap_or_else(|| panic!("agent guide should include local_navigation lane: {guide}"));
-    let local_surfaces = local_lane["surfaces"]
-        .as_array()
-        .unwrap_or_else(|| panic!("local lane should list surfaces: {guide}"));
-    for expected in [
-        "ground",
-        "files",
-        "symbol",
-        "definition",
-        "get_node",
-        "callers",
-        "callees",
-        "neighbors",
-        "shortest_path",
-        "query_subgraph",
-        "symbols",
-        "snippet",
-        "references",
-        "trace",
-        "trail",
-        "affected",
-    ] {
-        assert!(
-            local_surfaces.iter().any(|surface| surface == expected),
-            "local lane should include {expected}: {guide}"
-        );
-    }
-    assert!(
-        !local_surfaces.iter().any(|surface| surface == "context"),
-        "context is sidecar-backed and should not be in the local lane: {guide}"
-    );
-    let agent_lane = guide["readiness_lanes"]
-        .as_array()
-        .and_then(|lanes| {
-            lanes
-                .iter()
-                .find(|lane| lane["readiness_goal"] == json!("agent_packet_search"))
-        })
-        .unwrap_or_else(|| panic!("agent guide should include agent_packet_search lane: {guide}"));
-    let agent_surfaces = agent_lane["surfaces"]
-        .as_array()
-        .unwrap_or_else(|| panic!("agent lane should list surfaces: {guide}"));
-    for expected in ["packet", "search", "context"] {
-        assert!(
-            agent_surfaces.iter().any(|surface| surface == expected),
-            "agent lane should include {expected}: {guide}"
-        );
-    }
-    let packet_example = agent_lane["calls"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|call| call["tool"] == json!("packet"))
-        .unwrap_or_else(|| panic!("agent lane should include a packet example: {guide}"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/codestory/skills/codestory-grounding/SKILL.md");
     assert_eq!(
-        packet_example["arguments"]["budget"],
-        json!("standard"),
-        "packet example budget must be standard, not compact: {guide}"
+        guide["canonical_skill"]["markdown"],
+        fs::read_to_string(source).expect("canonical skill")
     );
-    let mut strings = Vec::new();
-    string_values_recursive(&guide, &mut strings);
-    for expected in [
-        "ground",
-        "packet",
-        "search",
-        "context",
-        "definition",
-        "snippet",
+    for parallel_policy in [
+        "recommended_call_sequence",
+        "surface_decisions",
+        "safety_notes",
     ] {
         assert!(
-            strings.iter().any(|value| value.contains(expected)),
-            "agent guide should recommend {expected} in its call sequence: {guide}"
+            guide.get(parallel_policy).is_none(),
+            "parallel routing owner: {parallel_policy}"
         );
     }
-    let guide_text = strings.join("\n").to_ascii_lowercase();
-    let unconditional_sequence_text = guide
-        .get("recommended_call_sequence")
-        .and_then(Value::as_array)
-        .map(|calls| Value::Array(calls.clone()).to_string())
-        .unwrap_or_default();
     assert!(
-        !unconditional_sequence_text.contains("\"tool\":\"packet\"")
-            && !unconditional_sequence_text.contains("\"tool\":\"search\""),
-        "packet/search should not be unconditional normal next steps: {guide}"
-    );
-    assert!(
-        guide_text.contains("matching tool") && !guide_text.contains("use ground first"),
-        "agent guide should follow the matching-tool loop instead of requiring ground first: {guide}"
-    );
-    assert!(
-        guide_text.contains("preparing")
-            && guide_text.contains("retry")
-            && guide_text.contains("same tool"),
-        "agent guide should tell agents to retry the intended tool while CodeStory prepares: {guide}"
-    );
-    assert!(
-        guide_text.contains("repo-text hits as navigation clues"),
-        "agent guide should treat repo-text hits as navigation clues: {guide}"
-    );
-    assert!(
-        guide_text.contains("search hits as discovery clues")
-            && guide_text.contains("graph or source evidence"),
-        "agent guide should distinguish discovery clues from evidence: {guide}"
-    );
-    assert!(
-        guide_text.contains("supported")
-            && guide_text.contains("drillonce")
-            && guide_text.contains("option_ids")
-            && guide_text.contains("terminal"),
-        "agent guide should name the typed stop/drill contract: {guide}"
-    );
-    assert!(
-        guide_text.contains("direct_source_reads")
-            && guide_text.contains("unavailable")
-            && guide_text.contains("exact source inspection"),
-        "agent guide should name the direct source-read fallback: {guide}"
-    );
-    assert!(
-        guide_text.contains("ground")
-            && guide_text.contains("files")
-            && guide_text.contains("definition")
-            && guide_text.contains("get_node")
-            && guide_text.contains("neighbors")
-            && guide_text.contains("shortest_path")
-            && guide_text.contains("query_subgraph")
-            && guide_text.contains("symbols")
-            && guide_text.contains("affected")
-            && guide_text.contains("local_navigation"),
-        "agent guide should record local navigation surfaces: {guide}"
-    );
-    assert!(
-        !guide_text.contains("files, affected, cache identity, retrieval status"),
-        "agent guide should not describe allowed files/affected surfaces as deferred: {guide}"
-    );
-    assert!(
-        !guide_text.contains("repo-text hits as evidence"),
-        "agent guide should not present repo-text hits as evidence: {guide}"
-    );
-    assert!(
-        contains_key_recursive(&guide, &["safety_notes", "safety"])
-            || strings.iter().any(|value| {
-                let value = value.to_ascii_lowercase();
-                value.contains("read-only") || value.contains("non-destructive")
-            }),
-        "agent guide should include safety notes: {guide}"
+        !fixture.cache_dir.path().join("core").exists(),
+        "static guidance must not activate a project"
     );
 }
 
@@ -5866,7 +6555,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_preparing_or_unavailable(&search, json!("cold-search-unavailable"));
-    assert_eq!(error["tool"], json!("search"));
+    assert_eq!(error["tool"], json!("search"), "search result: {error}");
     assert!(
         error["diagnostics_uri"]
             .as_str()
@@ -5881,7 +6570,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     // prove -- an embedded model, and a per-user embedding server able to satisfy the
     // device policy. Both outcomes have a contract, and both are asserted; what must never
     // happen is broad search degrading without local navigation surviving it.
-    if activation_terminated(error) {
+    if activation_terminated(&error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
             error["cause_code"]
@@ -5895,9 +6584,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             json!("unavailable")
         );
     } else {
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["kind"], json!("preparing"));
         assert_eq!(error["state"], json!("preparing"));
-        assert_eq!(error["retry_tool"], json!("search"));
         assert_eq!(
             error["operation"]["capabilities"]["broad_search"],
             json!("retryable")
@@ -5937,7 +6625,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     );
     let error =
         assert_tool_preparing_or_unavailable(&response, json!("migration-search-preparing"));
-    if activation_terminated(error) {
+    if activation_terminated(&error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
             error["cause_code"]
@@ -5947,9 +6635,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         );
         assert_eq!(error["retry_tool"], Value::Null);
     } else {
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["kind"], json!("preparing"));
         assert_eq!(error["state"], json!("preparing"));
-        assert_eq!(error["retry_tool"], json!("search"));
     }
 }
 
@@ -5979,17 +6666,21 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
     };
 
     let first = send_json(&mut server, packet_request("packet-search-repair-first"));
-    let first_error = if tool_result_code(&first) == Some("codestory_preparing") {
+    let first_error = if tool_result_code(&first).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(&first, json!("packet-search-repair-first"))
     } else if first.pointer("/result/isError") != Some(&json!(true)) {
-        assert_tool_success(&first, json!("packet-search-repair-first"));
+        assert_packet_success_after_search_repair(
+            &first,
+            json!("packet-search-repair-first"),
+            &search_generations,
+        );
         return;
     } else {
         let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-        if activation_terminated(first_error) {
+        if activation_terminated(&first_error) {
             assert_search_repaired_before_terminal_activation(
                 &mut server,
-                first_error,
+                &first_error,
                 &search_generations,
                 "packet-search-repair-first",
             );
@@ -5997,10 +6688,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         }
         first_error
     };
-    assert_eq!(first_error["code"], json!("codestory_preparing"));
-    assert_eq!(first_error["retry_tool"], json!("packet"));
+    assert_eq!(first_error["kind"], json!("preparing"));
     assert!(first_error["retry_after_ms"].as_u64().is_some());
-    assert!(first_error["cause_code"].as_str().is_some());
     let operation_id = first_error["operation"]["operation_id"]
         .as_str()
         .expect("stable activation operation id")
@@ -6012,9 +6701,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         thread::sleep(Duration::from_millis(retry_after_ms.min(1_000)));
         let id = format!("packet-search-repair-retry-{attempt}");
         let response = send_json(&mut server, packet_request(&id));
-        if tool_result_code(&response) == Some("codestory_preparing") {
+        if tool_result_code(&response).as_deref() == Some("codestory_preparing") {
             let error = assert_tool_preparing(&response, json!(id));
-            assert_eq!(error["retry_tool"], json!("packet"));
             assert_eq!(
                 error["operation"]["operation_id"],
                 json!(operation_id),
@@ -6025,18 +6713,14 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             continue;
         }
         if response.pointer("/result/isError") != Some(&json!(true)) {
-            assert_tool_success(&response, json!(id));
-            assert!(
-                search_generations.is_dir(),
-                "activation must rebuild search state before packet succeeds"
-            );
+            assert_packet_success_after_search_repair(&response, json!(id), &search_generations);
             return;
         }
         let error = assert_tool_error(&response, json!(id));
-        if activation_terminated(error) {
+        if activation_terminated(&error) {
             assert_search_repaired_before_terminal_activation(
                 &mut server,
-                error,
+                &error,
                 &search_generations,
                 &id,
             );
@@ -6599,5 +7283,308 @@ fn unknown_prompt_returns_jsonrpc_error() {
             .expect("error message")
             .contains("Unknown prompt"),
         "unknown prompt message should identify the missing prompt: {response}"
+    );
+}
+
+fn write_python_test_scope_workspace(root: &Path) {
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"test-scope-probe\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write pyproject.toml");
+    let tests = root.join("tests");
+    fs::create_dir_all(&tests).expect("create tests dir");
+    fs::write(
+        tests.join("test_flow.py"),
+        "def leaf():\n    return 1\n\ndef test_entry():\n    return leaf()\n",
+    )
+    .expect("write test_flow.py");
+}
+
+fn indexed_python_test_scope_fixture() -> StdioFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_python_test_scope_workspace(workspace.path());
+
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path());
+    let output = command.output().expect("run index");
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
+        disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
+    }
+}
+
+fn graph_edge_count(payload: &Value) -> usize {
+    payload
+        .pointer("/graph/edges")
+        .or_else(|| payload.pointer("/trail/edges"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn graph_truncated(payload: &Value) -> bool {
+    payload
+        .get("truncated")
+        .or_else(|| payload.pointer("/trail/truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn graph_omitted_edge_count(payload: &Value) -> u64 {
+    payload
+        .pointer("/graph/omitted_edge_count")
+        .or_else(|| payload.pointer("/trail/omitted_edge_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn call_graph_tool(server: &mut StdioServer, id: &str, name: &str, arguments: Value) -> Value {
+    let response = send_json(
+        server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }),
+    );
+    assert_tool_success(&response, json!(id)).clone()
+}
+
+#[test]
+fn mcp_graph_caller_scope_hides_stored_test_call_until_explicitly_included() {
+    let fixture = indexed_python_test_scope_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-scope");
+
+    let test_entry = call_graph_tool(
+        &mut server,
+        "symbol-test-entry",
+        "symbol",
+        json!({
+            "project": fixture.workspace.path(),
+            "query": "test_entry"
+        }),
+    );
+    let test_id = test_entry["node"]["id"]
+        .as_str()
+        .expect("test_entry id")
+        .to_string();
+    let leaf = call_graph_tool(
+        &mut server,
+        "symbol-leaf",
+        "symbol",
+        json!({
+            "project": fixture.workspace.path(),
+            "query": "leaf"
+        }),
+    );
+    let leaf_id = leaf["node"]["id"].as_str().expect("leaf id").to_string();
+
+    for (name, extra) in [
+        (
+            "callees",
+            json!({"id": test_id, "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "trail",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "trace",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "neighbors",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+        (
+            "query_subgraph",
+            json!({"id": test_id, "direction": "outgoing", "depth": 1, "max_nodes": 12}),
+        ),
+    ] {
+        let mut default_args = extra.clone();
+        default_args
+            .as_object_mut()
+            .expect("args")
+            .insert("project".to_string(), json!(fixture.workspace.path()));
+        let default_payload = call_graph_tool(
+            &mut server,
+            &format!("{name}-default"),
+            name,
+            default_args.clone(),
+        );
+        assert_eq!(
+            default_payload["caller_scope"],
+            json!("production_only"),
+            "{name} default must name production-only scope: {default_payload}"
+        );
+        assert_eq!(
+            graph_edge_count(&default_payload),
+            0,
+            "{name} default must hide the stored test CALL: {default_payload}"
+        );
+        assert!(
+            !graph_truncated(&default_payload),
+            "{name} empty production-only view is filtered, not truncated: {default_payload}"
+        );
+        assert_eq!(
+            graph_omitted_edge_count(&default_payload),
+            0,
+            "{name} must not invent omitted-edge counts for caller-scope filtering: {default_payload}"
+        );
+
+        let mut include_args = default_args;
+        include_args.as_object_mut().expect("args").insert(
+            "caller_scope".to_string(),
+            json!("include_tests_and_benches"),
+        );
+        let include_payload =
+            call_graph_tool(&mut server, &format!("{name}-include"), name, include_args);
+        assert_eq!(
+            include_payload["caller_scope"],
+            json!("include_tests_and_benches"),
+            "{name} include-tests must name the selected scope: {include_payload}"
+        );
+        assert_eq!(
+            graph_edge_count(&include_payload),
+            1,
+            "{name} include-tests must expose the stored CALL: {include_payload}"
+        );
+        assert!(
+            !graph_truncated(&include_payload),
+            "{name} single stored CALL must not be reported as truncated: {include_payload}"
+        );
+    }
+
+    let callers_default = call_graph_tool(
+        &mut server,
+        "callers-default",
+        "callers",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": leaf_id,
+            "depth": 1,
+            "max_nodes": 12
+        }),
+    );
+    assert_eq!(callers_default["caller_scope"], json!("production_only"));
+    assert_eq!(graph_edge_count(&callers_default), 0, "{callers_default}");
+
+    let callers_include = call_graph_tool(
+        &mut server,
+        "callers-include",
+        "callers",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": leaf_id,
+            "depth": 1,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(
+        callers_include["caller_scope"],
+        json!("include_tests_and_benches")
+    );
+    assert_eq!(graph_edge_count(&callers_include), 1, "{callers_include}");
+
+    let both_include = call_graph_tool(
+        &mut server,
+        "neighbors-both",
+        "neighbors",
+        json!({
+            "project": fixture.workspace.path(),
+            "id": test_id,
+            "direction": "both",
+            "depth": 1,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(graph_edge_count(&both_include), 1, "{both_include}");
+
+    let path_default = call_graph_tool(
+        &mut server,
+        "path-default",
+        "shortest_path",
+        json!({
+            "project": fixture.workspace.path(),
+            "from_id": test_id,
+            "to_id": leaf_id,
+            "max_depth": 4,
+            "max_nodes": 12
+        }),
+    );
+    assert_eq!(path_default["caller_scope"], json!("production_only"));
+    assert_eq!(graph_edge_count(&path_default), 0, "{path_default}");
+
+    let path_include = call_graph_tool(
+        &mut server,
+        "path-include",
+        "shortest_path",
+        json!({
+            "project": fixture.workspace.path(),
+            "from_id": test_id,
+            "to_id": leaf_id,
+            "max_depth": 4,
+            "max_nodes": 12,
+            "caller_scope": "include_tests_and_benches"
+        }),
+    );
+    assert_eq!(
+        path_include["caller_scope"],
+        json!("include_tests_and_benches")
+    );
+    assert_eq!(graph_edge_count(&path_include), 1, "{path_include}");
+
+    let malformed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "bad-scope",
+            "method": "tools/call",
+            "params": {
+                "name": "callees",
+                "arguments": {
+                    "project": fixture.workspace.path(),
+                    "id": test_id,
+                    "caller_scope": "all"
+                }
+            }
+        }),
+    );
+    assert_invalid_params(
+        &malformed,
+        json!("bad-scope"),
+        "callees",
+        "/arguments/caller_scope",
+        "invalid_enum_value",
     );
 }

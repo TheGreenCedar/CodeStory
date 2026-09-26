@@ -105,10 +105,12 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "codestory-store-{label}-{}-{stamp}.sqlite",
+    let directory = std::env::temp_dir().join(format!(
+        "codestory-store-{label}-{}-{stamp}",
         std::process::id()
-    ))
+    ));
+    fs::create_dir_all(&directory).expect("create isolated store test directory");
+    directory.join("codestory.sqlite")
 }
 
 fn source_policy_identity(
@@ -129,6 +131,18 @@ fn sqlite_index_exists(storage: &Storage, index_name: &str) -> Result<bool, Stor
             [index_name],
             |row| row.get(0),
         )
+        .map_err(StorageError::from)
+}
+
+fn sqlite_index_sql(storage: &Storage, index_name: &str) -> Result<Option<String>, StorageError> {
+    storage
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index_name],
+            |row| row.get(0),
+        )
+        .optional()
         .map_err(StorageError::from)
 }
 
@@ -159,6 +173,8 @@ fn assert_core_promotion_stats_reconcile(stats: &CorePromotionStats) {
         .saturating_add(stats.staged_to_live_restore_ms)
         .saturating_add(stats.promoted_validation_ms)
         .saturating_add(stats.committed_journal_ms)
+        .saturating_add(stats.generation_install_ms)
+        .saturating_add(stats.pointer_publication_ms)
         .saturating_add(stats.cleanup_ms);
     assert_eq!(
         named_ms.saturating_add(stats.unattributed_ms),
@@ -329,6 +345,462 @@ fn canonical_annotation_anchor_lookup_rejects_zero_bind_limit() -> Result<(), St
             .to_string()
             .contains("cannot support canonical-ID lookup"),
         "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_lookup_preserves_exact_strings_collisions_and_limit_one()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let shared_suffix = "s".repeat(32);
+    let unicode_suffix = "🦀".repeat(8);
+    assert_eq!(
+        unicode_suffix.len(),
+        32,
+        "suffix must be exactly 32 UTF-8 bytes"
+    );
+    let left = format!("{}left:{shared_suffix}", "long-prefix-".repeat(12));
+    let right = format!("{}right:{shared_suffix}", "other-prefix-".repeat(12));
+    let unicode_left = format!("日本語-left:{unicode_suffix}");
+    let unicode_right = format!("NFC-café-right:{unicode_suffix}");
+    let nul = format!("nul\0{shared_suffix}");
+    let upper = "CaseSensitive".to_string();
+    let lower = "casesensitive".to_string();
+    let composed = "caf\u{e9}".to_string();
+    let decomposed = "cafe\u{301}".to_string();
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "left-late".to_string(),
+            canonical_id: Some(left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "left-early".to_string(),
+            canonical_id: Some(left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "right".to_string(),
+            canonical_id: Some(right.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(110),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unicode-left".to_string(),
+            canonical_id: Some(unicode_left.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(120),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unicode-right".to_string(),
+            canonical_id: Some(unicode_right.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "empty".to_string(),
+            canonical_id: Some(String::new()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(50),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "null".to_string(),
+            canonical_id: None,
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(60),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nul".to_string(),
+            canonical_id: Some(nul.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(70),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "upper".to_string(),
+            canonical_id: Some(upper.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(80),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "lower".to_string(),
+            canonical_id: Some(lower.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(90),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "composed".to_string(),
+            canonical_id: Some(composed.clone()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "decomposed".to_string(),
+            canonical_id: Some(decomposed.clone()),
+            ..Default::default()
+        },
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)?;
+    assert!(previous_limit >= 1);
+    let lookup = storage.node_ids_by_canonical_ids(&[
+        right.clone(),
+        left.clone(),
+        unicode_right.clone(),
+        unicode_left.clone(),
+        String::new(),
+        "missing".to_string(),
+        nul.clone(),
+        left.clone(),
+        upper.clone(),
+        lower.clone(),
+        composed.clone(),
+        decomposed.clone(),
+    ])?;
+    assert_eq!(
+        lookup,
+        BTreeMap::from([
+            (String::new(), vec![NodeId(40)]),
+            (composed, vec![NodeId(90)]),
+            (decomposed, vec![NodeId(100)]),
+            (left, vec![NodeId(10), NodeId(30)]),
+            (lower, vec![NodeId(80)]),
+            ("missing".to_string(), Vec::new()),
+            (nul, vec![NodeId(60)]),
+            (right, vec![NodeId(20)]),
+            (unicode_left, vec![NodeId(110)]),
+            (unicode_right, vec![NodeId(120)]),
+            (upper, vec![NodeId(70)]),
+        ])
+    );
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_index_shape_and_query_plan_are_exact() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    let index_sql = sqlite_index_sql(&storage, "idx_node_canonical_suffix")?
+        .expect("canonical suffix index SQL");
+    assert!(
+        index_sql.contains("COALESCE(substr(CAST(canonical_id AS BLOB), -32), X'')"),
+        "canonical suffix index was {index_sql}"
+    );
+
+    let plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT canonical_id, id
+             FROM node
+             WHERE COALESCE(substr(CAST(canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+               AND canonical_id = ?1
+             ORDER BY id ASC",
+        )?
+        .query_map(["rust:function:shared"], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("USING INDEX idx_node_canonical_suffix")),
+        "canonical suffix lookup plan was {plan:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_schema_33_migration_preserves_rows_and_replaces_index()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("canonical-suffix-v33-migration");
+    let before = {
+        let mut storage = Storage::open(&path)?;
+        storage.insert_nodes_batch(&[
+            Node {
+                id: NodeId(10),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".to_string(),
+                canonical_id: Some("shared".to_string()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(20),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "second".to_string(),
+                canonical_id: Some("shared".to_string()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(30),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "empty".to_string(),
+                canonical_id: Some(String::new()),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(40),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "null".to_string(),
+                canonical_id: None,
+                ..Default::default()
+            },
+        ])?;
+        storage.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_node_canonical_suffix;
+                 CREATE INDEX IF NOT EXISTS idx_node_canonical_id ON node(canonical_id);",
+        )?;
+        storage.set_schema_version(33)?;
+        storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.canonical_id))
+            .collect::<Vec<_>>()
+    };
+
+    let migrated = Storage::open(&path)?;
+    assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
+    assert!(sqlite_index_exists(&migrated, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&migrated, "idx_node_canonical_id")?);
+    assert_eq!(
+        migrated
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.canonical_id))
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(
+        migrated.node_ids_by_canonical_ids(&["shared".to_string(), String::new()])?,
+        BTreeMap::from([
+            (String::new(), vec![NodeId(30)]),
+            ("shared".to_string(), vec![NodeId(10), NodeId(20)]),
+        ])
+    );
+    drop(migrated);
+
+    let replayed = Storage::open(&path)?;
+    assert_eq!(replayed.schema_version()?, SCHEMA_VERSION);
+    assert!(sqlite_index_exists(&replayed, "idx_node_canonical_suffix")?);
+    assert!(!sqlite_index_exists(&replayed, "idx_node_canonical_id")?);
+    drop(replayed);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_migration_rolls_back_index_and_version_together() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage.conn.execute_batch(
+        "DROP INDEX idx_node_canonical_suffix;
+         CREATE INDEX idx_node_canonical_id ON node(canonical_id);
+         PRAGMA user_version = 33;",
+    )?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::CreateIndex {
+                index_name: "idx_node_canonical_suffix",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+
+    super::schema::migrate_v34_canonical_suffix_index(&storage.conn, true, true)
+        .expect_err("denied replacement index must roll back the migration");
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    assert_eq!(storage.schema_version()?, 33);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
+    Ok(())
+}
+
+#[test]
+fn canonical_suffix_migration_respects_deferred_and_incomplete_fences() -> Result<(), StorageError>
+{
+    let deferred_path = unique_temp_db_path("canonical-suffix-deferred");
+    {
+        let storage = Storage::open(&deferred_path)?;
+        storage.conn.execute_batch(
+            "DROP INDEX idx_node_canonical_suffix;
+             CREATE INDEX idx_node_canonical_id ON node(canonical_id);
+             PRAGMA user_version = 33;",
+        )?;
+    }
+    let deferred = Storage::open_build(&deferred_path)?;
+    assert_eq!(deferred.schema_version()?, SCHEMA_VERSION);
+    assert!(!sqlite_index_exists(&deferred, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(
+        &deferred,
+        "idx_node_canonical_suffix"
+    )?);
+    deferred.create_deferred_secondary_indexes()?;
+    assert!(sqlite_index_exists(&deferred, "idx_node_canonical_suffix")?);
+    drop(deferred);
+    cleanup_sqlite_sidecars(&deferred_path)?;
+
+    let incomplete_path = unique_temp_db_path("canonical-suffix-incomplete");
+    {
+        let storage = Storage::open(&incomplete_path)?;
+        storage.conn.execute_batch(
+            "DROP INDEX idx_node_canonical_suffix;
+             CREATE INDEX idx_node_canonical_id ON node(canonical_id);",
+        )?;
+        storage.begin_incremental_run()?;
+    }
+    let incomplete = Storage::open(&incomplete_path)?;
+    assert_eq!(
+        incomplete.schema_version()?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(!sqlite_index_exists(&incomplete, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(
+        &incomplete,
+        "idx_node_canonical_suffix"
+    )?);
+    incomplete.finish_incremental_run()?;
+    assert_eq!(incomplete.schema_version()?, SCHEMA_VERSION);
+    drop(incomplete);
+    cleanup_sqlite_sidecars(&incomplete_path)?;
+    Ok(())
+}
+
+#[test]
+fn schema_33_journal_less_recovery_authenticates_every_feature_identity() -> Result<(), StorageError>
+{
+    for corruption in [
+        None,
+        Some("source"),
+        Some("structural"),
+        Some("proof"),
+        Some("missing-source"),
+        Some("missing-structural"),
+        Some("missing-proof"),
+    ] {
+        let label = corruption.unwrap_or("valid");
+        let path = unique_temp_db_path(&format!("schema-33-recovery-{label}"));
+        seed_promotion_file(&path, 1, "old.rs")?;
+        {
+            let mut storage = Storage::open(&path)?;
+            let publication = storage
+                .get_complete_index_publication()?
+                .expect("seeded publication");
+            storage.replace_proof_resolution_projection(
+                &publication,
+                &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                    adapter_roster: vec![
+                        codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                            language: "rust".to_string(),
+                            adapter_version: "test".to_string(),
+                        },
+                    ],
+                    facts: Vec::new(),
+                    funnel: Vec::new(),
+                },
+            )?;
+            storage.finalize_staged_snapshot()?;
+            storage.set_schema_version(33)?;
+        }
+        if let Some(corruption) = corruption {
+            let conn = Connection::open(&path)?;
+            match corruption {
+                "source" => conn.execute(
+                    "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "structural" => conn.execute(
+                    "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "proof" => conn.execute(
+                    "UPDATE proof_resolution_publication SET fact_digest = ?1",
+                    ["0".repeat(64)],
+                )?,
+                "missing-source" => {
+                    conn.execute("DELETE FROM source_policy_exclusion_publication", [])?
+                }
+                "missing-structural" => {
+                    conn.execute("DELETE FROM structural_text_unit_publication", [])?
+                }
+                "missing-proof" => {
+                    conn.execute_batch(
+                        "DROP TABLE proof_resolution_fact;
+                         DROP TABLE proof_resolution_publication;",
+                    )?;
+                    0
+                }
+                _ => unreachable!(),
+            };
+        }
+        let publication =
+            read_recovery_database_identity(&path, RecoveryDatabaseContract::LegacyBackup)?
+                .expect("schema-33 publication identity");
+        let result = read_journal_less_recovery_auxiliary_identities(
+            &path,
+            &publication,
+            33,
+            "legacy backup",
+        );
+        match corruption {
+            None => {
+                let identities = result?;
+                assert!(identities.source_policy.is_some());
+                assert!(identities.structural_text.is_some());
+                assert!(identities.proof_resolution.is_some());
+            }
+            Some(_) => assert!(result.is_err(), "{label} corruption must fail recovery"),
+        }
+        cleanup_sqlite_sidecars(&path)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exact_file_identity_check_does_not_materialize_file_metadata() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let path = PathBuf::from("/repo/src/hostile.rs");
+    storage.insert_file(&FileInfo {
+        id: 1,
+        path: path.clone(),
+        language: "rust".into(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    })?;
+    storage
+        .conn
+        .execute("UPDATE file SET language = X'80' WHERE id = 1", [])?;
+
+    assert!(
+        storage.has_complete_indexed_file_path(std::slice::from_ref(&path))?,
+        "identity-only lookup must not decode unrelated file metadata"
+    );
+    assert!(
+        storage.get_files_by_paths(&[path]).is_err(),
+        "fixture must fail if the full file record is materialized"
     );
     Ok(())
 }
@@ -748,6 +1220,32 @@ fn observational_wal_snapshot_pins_frames_during_concurrent_checkpoint() {
         fs::remove_file(shm_path).expect("remove checkpoint SHM fixture");
     }
     fs::remove_file(path).expect("remove checkpoint database fixture");
+}
+
+#[test]
+fn proof_validation_observer_refuses_a_sealed_database_without_sidecars() {
+    let path = unique_temp_db_path("proof-validation-observer");
+    let bootstrap = Storage::open(&path).expect("create proof validation fixture");
+    drop(bootstrap);
+    let database_before = fs::read(&path).expect("read sealed proof validation fixture");
+    assert_no_sqlite_sidecars(&path);
+
+    let error = Storage::open_proof_validation_observer(&path)
+        .err()
+        .expect("a sealed database cannot supply a proof validation observer");
+    assert!(
+        error
+            .to_string()
+            .contains("existing complete WAL sidecar pair"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("read sealed proof validation fixture after refusal"),
+        database_before,
+        "refusing the proof observer must not change database bytes"
+    );
+    assert_no_sqlite_sidecars(&path);
+    let _ = fs::remove_file(path);
 }
 
 #[test]
@@ -1927,24 +2425,26 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
 #[test]
 fn annotation_anchor_and_error_indexes_are_created_and_used() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
-    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
     assert!(sqlite_index_exists(&storage, "idx_error_file")?);
 
     let canonical_plan = storage
         .conn
         .prepare(
             "EXPLAIN QUERY PLAN
-             SELECT canonical_id, id
-             FROM node
-             WHERE canonical_id IN ('rust:function:shared')
-             ORDER BY canonical_id ASC, id ASC",
+             SELECT n.id
+             FROM node AS n
+             WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST('rust:function:shared' AS BLOB), -32), X'')
+               AND n.canonical_id = 'rust:function:shared'
+             ORDER BY n.id ASC",
         )?
         .query_map([], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     assert!(
         canonical_plan
             .iter()
-            .any(|line| line.contains("idx_node_canonical_id")),
+            .any(|line| line.contains("idx_node_canonical_suffix")),
         "canonical lookup plan was {canonical_plan:?}"
     );
 
@@ -1988,9 +2488,9 @@ fn error_file_index_is_available_before_deferred_build_indexes() -> Result<(), S
     let storage = Storage::open_build(&path)?;
 
     assert!(sqlite_index_exists(&storage, "idx_error_file")?);
-    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
     storage.create_deferred_secondary_indexes()?;
-    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_suffix")?);
 
     drop(storage);
     cleanup_sqlite_sidecars(&path)?;
@@ -2675,13 +3175,14 @@ fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
 
 #[test]
 fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), StorageError> {
-    fn profile(storage: &Storage) -> Result<(String, i64, i64, i64), StorageError> {
+    fn profile(storage: &Storage) -> Result<(String, i64, i64, i64, i64), StorageError> {
         let connection = storage.get_connection();
         Ok((
             connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
             connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?,
             connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?,
             connection.query_row("PRAGMA page_size", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))?,
         ))
     }
 
@@ -2696,18 +3197,25 @@ fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), Stor
     let mut incremental_clone = crate::SnapshotStore::clone_live_to_staged(&live_path)?;
 
     for (name, storage) in [("live", &live), ("generic build", &generic_build)] {
-        let (journal_mode, synchronous, _, _) = profile(storage)?;
+        let (journal_mode, synchronous, _, _, journal_size_limit) = profile(storage)?;
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal", "{name}");
         assert_eq!(synchronous, 1, "{name} must retain synchronous=NORMAL");
+        assert_eq!(journal_size_limit, -1, "{name} WAL retention changed");
     }
-    let (journal_mode, synchronous, _, _) = profile(incremental_clone.store_mut())?;
+    let (journal_mode, synchronous, _, _, journal_size_limit) =
+        profile(incremental_clone.store_mut())?;
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(
         synchronous, 1,
         "incremental clone must retain synchronous=NORMAL"
     );
+    assert_eq!(
+        journal_size_limit, -1,
+        "incremental clone WAL retention changed"
+    );
 
-    let (journal_mode, synchronous, checkpoint_pages, page_size) = profile(&disposable)?;
+    let (journal_mode, synchronous, checkpoint_pages, page_size, journal_size_limit) =
+        profile(&disposable)?;
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(synchronous, 0);
     assert_eq!(
@@ -2715,6 +3223,99 @@ fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), Stor
         (DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64 + page_size - 1) / page_size
     );
     assert!(checkpoint_pages > 0);
+    assert_eq!(
+        journal_size_limit,
+        DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64
+    );
+    Ok(())
+}
+
+#[test]
+fn disposable_full_build_reclaims_oversized_wal_only_after_a_safe_reset() -> Result<(), StorageError>
+{
+    const PAYLOAD_ROWS: usize = 68;
+    const PAYLOAD_BYTES: i64 = 1024 * 1024;
+
+    let dir = tempfile::tempdir().map_err(|error| StorageError::Other(error.to_string()))?;
+    let path = dir.path().join("wal-retention.sqlite");
+    let storage = Storage::open_disposable_full_build(&path)?;
+    let connection = storage.get_connection();
+    connection.execute_batch(
+        "CREATE TABLE wal_retention_probe (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+         INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1));",
+    )?;
+
+    let observer = Storage::open_observational(&path)?;
+    let snapshot = observer.read_snapshot()?;
+    let pinned_rows: i64 = snapshot.storage().get_connection().query_row(
+        "SELECT COUNT(*) FROM wal_retention_probe",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(pinned_rows, 1);
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    for _ in 0..PAYLOAD_ROWS {
+        connection.execute(
+            "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(?1))",
+            [PAYLOAD_BYTES],
+        )?;
+    }
+    connection.execute_batch("COMMIT")?;
+
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let oversized_wal = fs::metadata(&wal_path)
+        .map_err(|error| StorageError::Other(error.to_string()))?
+        .len();
+    assert!(
+        oversized_wal > DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "large commit must establish an oversized retained WAL: {oversized_wal}"
+    );
+    assert_eq!(
+        snapshot.storage().get_connection().query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM wal_retention_probe",
+            [],
+            |row| row.get(0),
+        )?,
+        1,
+        "pinned reader must retain its pre-reset snapshot"
+    );
+    assert!(
+        fs::metadata(&wal_path)
+            .map_err(|error| StorageError::Other(error.to_string()))?
+            .len()
+            > DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "active reader must prevent unsafe WAL reclamation"
+    );
+    snapshot.finish()?;
+    drop(observer);
+
+    // The first commit after releasing the reader permits the passive
+    // checkpoint to finish. A following commit can then safely reset the WAL.
+    connection.execute(
+        "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1))",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO wal_retention_probe(payload) VALUES (zeroblob(1))",
+        [],
+    )?;
+    let reclaimed_wal = fs::metadata(&wal_path)
+        .map_err(|error| StorageError::Other(error.to_string()))?
+        .len();
+    assert!(
+        reclaimed_wal <= DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+        "safe reset retained {reclaimed_wal} WAL bytes above the established limit"
+    );
+    let (rows, payload_bytes): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), SUM(length(payload)) FROM wal_retention_probe",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(rows, PAYLOAD_ROWS as i64 + 3);
+    assert_eq!(payload_bytes, PAYLOAD_ROWS as i64 * PAYLOAD_BYTES + 3);
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
     Ok(())
 }
 
@@ -3295,14 +3896,191 @@ fn test_symbol_search_doc_contract_mismatch_detection() -> Result<(), StorageErr
         doc_text: "semantic_doc_version: 6\nsymbol: do_work".to_string(),
         doc_version: 6,
         doc_hash: "symbol-search-hash-500".to_string(),
+        attached_comment_text: Some(String::new()),
+        attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+        attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+        attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            Some(""),
+        ),
         policy_version: "graph_first_v1".to_string(),
         source_provenance: "extracted".to_string(),
         updated_at_epoch_ms: 123,
     }])?;
 
     assert!(!storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?);
+    let mut docs = storage.get_symbol_search_docs_batch_after(None, 10)?;
+    docs[0].attached_comment_text = Some("older declaration comment".into());
+    docs[0].attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+        docs[0].attached_comment_text.as_deref(),
+    );
+    storage.upsert_symbol_search_docs_batch(&docs)?;
+    docs[0].attached_comment_text = Some(String::new());
+    docs[0].attached_comment_hash = SymbolSearchDoc::attached_comment_hash(
+        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+        Some(""),
+    );
+    storage.upsert_symbol_search_docs_batch(&docs)?;
+    assert_eq!(
+        storage.get_symbol_search_docs_batch_after(None, 10)?[0]
+            .attached_comment_text
+            .as_deref(),
+        Some(""),
+        "removing a comment clears lexical evidence without claiming unavailable source"
+    );
     assert!(storage.has_symbol_search_doc_contract_mismatch(5, "graph_first_v1")?);
     assert!(storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v2")?);
+    storage.conn.execute(
+        "UPDATE symbol_search_doc SET attached_comment_hash = 'stale' WHERE node_id = 500",
+        [],
+    )?;
+    assert!(storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?);
+    storage.conn.execute("UPDATE symbol_search_doc SET attached_comment_text = NULL, attached_comment_state = '', attached_comment_policy = '', attached_comment_hash = '' WHERE node_id = 500", [])?;
+    assert!(
+        storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?,
+        "legacy unknown requires source repair"
+    );
+    let unavailable = SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE;
+    storage.conn.execute(
+        "UPDATE symbol_search_doc SET attached_comment_state = ?1, attached_comment_policy = ?2, attached_comment_hash = ?3 WHERE node_id = 500",
+        params![unavailable, SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION, SymbolSearchDoc::attached_comment_hash(unavailable, None)],
+    )?;
+    assert!(
+        !storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?,
+        "current-policy bounded unavailability is admissible"
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_34_symbol_docs_migrate_as_unknown_comment_evidence() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("attached-comment-v35-migration");
+    {
+        let mut storage = Storage::open(&path)?;
+        storage.insert_nodes_batch(&[Node {
+            id: NodeId(51),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".into(),
+            ..Default::default()
+        }])?;
+        let state = SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED;
+        storage.upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+            node_id: NodeId(51),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "run".into(),
+            qualified_name: None,
+            file_path: Some("src/run.go".into()),
+            start_line: Some(2),
+            doc_text: "v10 source".into(),
+            doc_version: 10,
+            doc_hash: "v10-hash".into(),
+            attached_comment_text: Some("source comment".into()),
+            attached_comment_state: state.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                state,
+                Some("source comment"),
+            ),
+            policy_version: "current".into(),
+            source_provenance: "extracted".into(),
+            updated_at_epoch_ms: 1,
+        }])?;
+        for column in [
+            "attached_comment_hash",
+            "attached_comment_policy",
+            "attached_comment_state",
+            "attached_comment_text",
+        ] {
+            storage.conn.execute(
+                &format!("ALTER TABLE symbol_search_doc DROP COLUMN {column}"),
+                [],
+            )?;
+        }
+        storage.set_schema_version(34)?;
+    }
+    let migrated = Storage::open(&path)?;
+    assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
+    let docs = migrated.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].doc_text, "v10 source");
+    assert_eq!(docs[0].doc_hash, "v10-hash");
+    assert_eq!(docs[0].attached_comment_text, None);
+    assert_eq!(docs[0].attached_comment_state, "");
+    assert!(migrated.has_symbol_search_doc_contract_mismatch(10, "current")?);
+    drop(migrated);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn symbol_doc_copy_forward_keeps_verified_comment_and_marks_legacy_unknown()
+-> Result<(), StorageError> {
+    let source_path = unique_temp_db_path("attached-comment-copy-source");
+    let node = Node {
+        id: NodeId(73),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "run".into(),
+        ..Default::default()
+    };
+    {
+        let mut source = Storage::open(&source_path)?;
+        source.insert_nodes_batch(std::slice::from_ref(&node))?;
+        let state = SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED;
+        source.upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+            node_id: node.id,
+            file_node_id: None,
+            kind: node.kind,
+            display_name: "run".into(),
+            qualified_name: None,
+            file_path: Some("run.go".into()),
+            start_line: Some(2),
+            doc_text: "v10 doc".into(),
+            doc_version: 10,
+            doc_hash: "v10 hash".into(),
+            attached_comment_text: Some("commented requirement".into()),
+            attached_comment_state: state.into(),
+            attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+            attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                state,
+                Some("commented requirement"),
+            ),
+            policy_version: "current".into(),
+            source_provenance: "extracted".into(),
+            updated_at_epoch_ms: 1,
+        }])?;
+    }
+    let mut destination = Storage::new_in_memory()?;
+    destination.insert_nodes_batch(std::slice::from_ref(&node))?;
+    assert_eq!(destination.copy_symbol_search_docs_from(&source_path)?, 1);
+    let docs = destination.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(
+        docs[0].attached_comment_text.as_deref(),
+        Some("commented requirement")
+    );
+    assert!(docs[0].attached_comment_is_valid());
+
+    {
+        let source = Storage::open(&source_path)?;
+        for column in [
+            "attached_comment_hash",
+            "attached_comment_policy",
+            "attached_comment_state",
+            "attached_comment_text",
+        ] {
+            source.conn.execute(
+                &format!("ALTER TABLE symbol_search_doc DROP COLUMN {column}"),
+                [],
+            )?;
+        }
+    }
+    assert_eq!(destination.copy_symbol_search_docs_from(&source_path)?, 1);
+    let docs = destination.get_symbol_search_docs_batch_after(None, 10)?;
+    assert_eq!(docs[0].attached_comment_text, None);
+    assert_eq!(docs[0].attached_comment_state, "");
+    assert!(destination.has_symbol_search_doc_contract_mismatch(10, "current")?);
+    let _ = std::fs::remove_file(source_path);
     Ok(())
 }
 
@@ -3541,6 +4319,8 @@ fn dense_anchor_manifest_rebinds_carry_forward_and_detects_mutation() -> Result<
         storage.validate_dense_anchor_publication(&first_publication)?,
         first
     );
+    let first_validation =
+        storage.validate_dense_anchor_publication_contents(&first_publication)?;
     assert_eq!(first.anchor_count, 1);
     assert_eq!(first.anchor_digest.len(), 64);
     assert_eq!(
@@ -3555,17 +4335,94 @@ fn dense_anchor_manifest_rebinds_carry_forward_and_detects_mutation() -> Result<
         mode: IndexPublicationMode::Incremental,
         published_at_epoch_ms: 2,
     };
-    let second = storage.publish_dense_anchor_generation(&second_publication, "dense-anchor-v1")?;
+    let second = storage
+        .rebind_dense_anchor_generation(
+            &first_validation,
+            &first_publication,
+            &second_publication,
+            "dense-anchor-v1",
+        )?
+        .expect("a validated graph-equivalent anchor set rebinds");
     assert_eq!(second.anchor_digest, first.anchor_digest);
+    assert_eq!(second.anchor_source_identity, first.anchor_source_identity);
     assert_eq!(
         storage.get_dense_anchor_inputs_batch_after(None, 10)?[0].source_identity,
-        "core:generation-2:run-2"
+        "core:generation-1:run-1"
+    );
+    storage.put_index_publication(&second_publication)?;
+    assert_eq!(
+        storage.validate_dense_anchor_publication(&second_publication)?,
+        second
     );
 
     let mut changed = storage.get_dense_anchor_inputs_batch_after(None, 10)?;
     changed[0].text.push_str(" changed");
     storage.upsert_dense_anchor_inputs_batch(&changed)?;
     assert!(storage.get_dense_anchor_publication_manifest()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn immutable_dense_anchor_receipt_reuses_then_invalidates_on_row_mutation()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("dense-anchor-receipt");
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "dense-receipt-generation".into(),
+        run_id: "dense-receipt-run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    {
+        let mut storage = Storage::open(&path)?;
+        storage.insert_nodes_batch(&[
+            file_node(710, "src/receipt.rs"),
+            Node {
+                id: NodeId(711),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "receipt_function".to_string(),
+                file_node_id: Some(NodeId(710)),
+                ..Default::default()
+            },
+        ])?;
+        storage.upsert_dense_anchor_inputs_batch(&[dense_anchor(
+            711,
+            Some(710),
+            "core:unpublished:unpublished",
+        )])?;
+        storage.publish_dense_anchor_generation(&publication, "dense-anchor-v1")?;
+        storage.put_index_publication(&publication)?;
+    }
+
+    {
+        let reader = Storage::open_observational(&path)?;
+        reader.validate_dense_anchor_publication_sealed(&path, &publication)?;
+        reader.validate_dense_anchor_publication_sealed(&path, &publication)?;
+    }
+    let reused = Storage::dense_anchor_publication_receipt_stats(&path, &publication)
+        .expect("sealed dense-anchor receipt");
+    assert_eq!(reused.validations, 1);
+    assert_eq!(reused.reuses, 1);
+
+    {
+        let writer = Storage::open(&path)?;
+        writer.get_connection().execute(
+            "UPDATE dense_anchor_input SET document_text = document_text || ' corrupt'",
+            [],
+        )?;
+    }
+    let reader = Storage::open_observational(&path)?;
+    assert!(
+        reader
+            .validate_dense_anchor_publication_sealed(&path, &publication)
+            .is_err(),
+        "row mutation must invalidate the seal and fail deep validation"
+    );
+    assert!(
+        Storage::dense_anchor_publication_receipt_stats(&path, &publication).is_none(),
+        "a failed replacement validation must not remain cached"
+    );
+    cleanup_sqlite_sidecars(&path)?;
     Ok(())
 }
 
@@ -4049,6 +4906,23 @@ fn canonical_search_symbols_page_node_table_independently_of_projection() -> Res
     assert_eq!(details[0].file_path.as_deref(), Some("src/lib.rs"));
     assert_eq!(details[0].start_line, Some(7));
     assert_eq!(details[0].end_line, Some(11));
+    assert_eq!(
+        storage.get_node_file_identities_by_ids(
+            &[NodeId(30), NodeId(10), NodeId(30), NodeId(999)],
+            17,
+        )?,
+        [
+            NodeFileIdentityProjection {
+                node_id: NodeId(10),
+                file_path: Some("src/lib.rs".to_string()),
+            },
+            NodeFileIdentityProjection {
+                node_id: NodeId(30),
+                file_path: Some("src/lib.rs".to_string()),
+            },
+        ],
+        "bounded identity lookup must return only requested existing ids in stable order"
+    );
 
     storage.clear_search_symbol_projection()?;
     assert_eq!(storage.get_search_symbol_projection_count()?, 0);
@@ -4056,6 +4930,148 @@ fn canonical_search_symbols_page_node_table_independently_of_projection() -> Res
         storage.get_canonical_search_symbol_batch_after(None, usize::MAX)?,
         [first_page, second_page].concat()
     );
+    Ok(())
+}
+
+#[test]
+fn node_file_identity_lookup_does_not_decode_symbol_details() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/hostile.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ])?;
+    storage
+        .conn
+        .execute("UPDATE node SET kind = X'80' WHERE id = 10", [])?;
+
+    assert_eq!(
+        storage.get_node_file_identities_by_ids(&[NodeId(10)], 17)?,
+        [NodeFileIdentityProjection {
+            node_id: NodeId(10),
+            file_path: Some("src/hostile.rs".to_string()),
+        }],
+        "pre-admission identity lookup must not decode node kind or source details"
+    );
+    assert!(
+        storage
+            .get_canonical_search_symbol_detail_batch_after(None, 17)
+            .is_err(),
+        "fixture must fail if the full symbol-detail projection is used"
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_symbol_file_identity_pages_use_canonical_names_without_hydration()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "fallback".into(),
+            qualified_name: Some("pkg::exact".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            qualified_name: Some("  ".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            qualified_name: Some("other".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            ..Default::default()
+        },
+    ])?;
+    storage
+        .conn
+        .execute("UPDATE node SET kind = X'80' WHERE id = 10", [])?;
+    storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+        node_id: NodeId(30),
+        display_name: "pkg::exact".into(),
+    }])?;
+    let first = storage.get_exact_symbol_file_identities_after("pkg::exact", None, 1)?;
+    assert_eq!(
+        first,
+        [NodeFileIdentityProjection {
+            node_id: NodeId(10),
+            file_path: Some("src/lib.rs".into())
+        }]
+    );
+    let rest = storage.get_exact_symbol_file_identities_after("pkg::exact", Some(NodeId(10)), 2)?;
+    assert_eq!(
+        rest,
+        [
+            NodeFileIdentityProjection {
+                node_id: NodeId(20),
+                file_path: Some("src/lib.rs".into())
+            },
+            NodeFileIdentityProjection {
+                node_id: NodeId(40),
+                file_path: None
+            },
+        ]
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("pkg::exact", Some(NodeId(40)), 1)?
+            .is_empty()
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("fallback", None, 1)?
+            .is_empty(),
+        "nonempty qualified name owns the canonical label"
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("pkg::ex", None, 1)?
+            .is_empty(),
+        "no fuzzy matching"
+    );
+    assert!(
+        storage
+            .get_canonical_search_symbol_detail_batch_after(None, 1)
+            .is_err(),
+        "fixture proves full-detail hydration would fail"
+    );
+    assert!(matches!(
+        storage.get_exact_symbol_file_identities_after("pkg::exact", None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_exact_symbol_file_identities_after"
+        ))
+    ));
     Ok(())
 }
 
@@ -4569,6 +5585,34 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
 
     let category_id = storage.create_bookmark_category("Favorites")?;
     let _ = storage.add_bookmark(category_id, function_node.id, Some("keep"))?;
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_provenance (
+            provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+         ) VALUES (1, 500, ?1, ?1, '[]')",
+        ["2".repeat(64)],
+    )?;
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 500, 1, 1, 2, 1, 1,
+            'identifier', 'missing', 501, NULL, 'missing_binding',
+            'missing_binding', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2)",
+        params!["1".repeat(64), "2".repeat(64)],
+    )?;
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_publication (
+            id, core_generation_id, core_run_id, fact_schema_version,
+            adapter_roster_json, complete, fact_count, fact_digest,
+            funnel_json, published_at_epoch_ms
+         ) VALUES (1, 'generation', 'run', 1, '[]', 1, 1, ?1, '[]', 1)",
+        ["3".repeat(64)],
+    )?;
 
     // Ensure cache is warm before clear.
     assert!(storage.get_node(function_node.id)?.is_some());
@@ -4577,6 +5621,9 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
 
     for table in [
         "occurrence",
+        "proof_resolution_publication",
+        "proof_resolution_fact",
+        "proof_resolution_provenance",
         "edge",
         "llm_symbol_doc",
         "symbol_summary",
@@ -5217,10 +6264,7 @@ fn test_delete_unowned_projection_for_file_spares_nodes_and_annotations() -> Res
 
 #[test]
 fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
-    let db_path = std::env::temp_dir().join(format!(
-        "codestory-store-v3-migration-{}.db",
-        std::process::id()
-    ));
+    let db_path = unique_temp_db_path("v3-migration");
     let _ = std::fs::remove_file(&db_path);
     {
         let conn = rusqlite::Connection::open(&db_path)?;
@@ -5748,7 +6792,8 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
 fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
 -> Result<(), StorageError> {
     let live_path = unique_temp_db_path("live");
-    let staged_path = unique_temp_db_path("staged");
+    let staged_path = crate::CorePublicationLayout::from_storage_path(&live_path)?
+        .create_staging_database_path()?;
     let backup_path = live_path.with_extension("sqlite.backup");
     let _ = cleanup_sqlite_sidecars(&live_path);
     let _ = cleanup_sqlite_sidecars(&staged_path);
@@ -5824,14 +6869,20 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             staged.finalize_staged_snapshot()?;
         }
 
-        Storage::promote_staged_snapshot(&staged_path, &live_path)?;
+        Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .map_err(|error| StorageError::Other(format!("promote staged snapshot: {error}")))?;
 
-        let live_reader_files = live.get_files()?;
+        let live_reader_files = live
+            .get_files()
+            .map_err(|error| StorageError::Other(format!("read pinned legacy handle: {error}")))?;
         assert_eq!(live_reader_files.len(), 1);
     }
 
-    let promoted = Storage::open(&live_path)?;
-    let promoted_files = promoted.get_files()?;
+    let promoted = Storage::open(&live_path)
+        .map_err(|error| StorageError::Other(format!("open promoted generation: {error}")))?;
+    let promoted_files = promoted
+        .get_files()
+        .map_err(|error| StorageError::Other(format!("read promoted generation: {error}")))?;
     assert_eq!(promoted_files.len(), 1);
     assert_eq!(promoted_files[0].id, 2);
     assert_eq!(promoted_files[0].path, PathBuf::from("staged.rs"));
@@ -5844,6 +6895,178 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
     let _ = cleanup_sqlite_sidecars(&live_path);
     let _ = cleanup_sqlite_sidecars(&staged_path);
     let _ = cleanup_sqlite_sidecars(&backup_path);
+    Ok(())
+}
+
+#[test]
+fn retrieval_publication_names_exact_immutable_core_without_mutating_core_bytes()
+-> Result<(), StorageError> {
+    fn publish_core_fixture(
+        path: &Path,
+        publication: &IndexPublicationRecord,
+        file_id: i64,
+    ) -> Result<(), StorageError> {
+        let mut storage = Storage::open_build(path)?;
+        storage.insert_files_batch(&[FileInfo {
+            id: file_id,
+            path: PathBuf::from(format!("generation-{file_id}.rs")),
+            language: "rust".to_string(),
+            modification_time: file_id,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        }])?;
+        storage.publish_structural_text_unit_generation(publication)?;
+        storage.put_index_publication(publication)?;
+        storage.publish_source_policy_exclusion_generation(
+            publication,
+            "test-project",
+            "test-workspace",
+            source_policy_identity(
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            ),
+            &[],
+        )?;
+        storage.finalize_staged_snapshot()?;
+        Ok(())
+    }
+
+    fn retrieval_manifest(suffix: &str) -> RetrievalIndexManifest {
+        RetrievalIndexManifest {
+            project_id: "test-project".into(),
+            lexical_version: "sqlite-fts5-v1".into(),
+            semantic_generation: format!("semantic-{suffix}"),
+            scip_revision: Some(format!("graph-{suffix}")),
+            built_at_epoch_ms: 1,
+            disk_bytes: Some(1),
+            degraded_modes_json: "[]".into(),
+            embedding_backend: Some("test".into()),
+            embedding_dim: Some(1),
+            sidecar_schema_version: Some(1),
+            sidecar_input_hash: Some(format!("input-{suffix}")),
+            sidecar_generation: Some(format!("sidecar-{suffix}")),
+            projection_count: Some(1),
+            symbol_doc_count: Some(1),
+            dense_projection_count: Some(1),
+            semantic_policy_version: Some("test".into()),
+            graph_artifact_hash: Some(format!("graph-{suffix}")),
+            dense_reason_counts_json: Some("{}".into()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        }
+    }
+
+    let live_path = unique_temp_db_path("bound-retrieval-publication");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path)?;
+    let stage_path = layout.create_staging_database_path()?;
+    let first = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "core-one".into(),
+        run_id: "run-one".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    let second = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "core-two".into(),
+        run_id: "run-two".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 2,
+    };
+
+    publish_core_fixture(&live_path, &first, 1)?;
+    {
+        let mut legacy = Storage::open(&live_path)?;
+        legacy.upsert_retrieval_index_manifest(&retrieval_manifest("one"))?;
+    }
+    publish_core_fixture(&stage_path, &second, 2)?;
+    Storage::promote_staged_snapshot(&stage_path, &live_path)?;
+
+    let pointer = layout.read_pointer()?.expect("core pointer");
+    assert_eq!(pointer.active.generation_id, second.generation_id);
+    assert_eq!(
+        pointer
+            .rollback
+            .as_ref()
+            .map(|identity| identity.generation_id.as_str()),
+        Some(first.generation_id.as_str())
+    );
+    let first_path = layout.resolve_generation_database(&first.generation_id)?;
+    let second_path = layout.resolve_generation_database(&second.generation_id)?;
+    let first_bytes = std::fs::read(&first_path)
+        .map_err(|error| StorageError::Other(format!("read first core: {error}")))?;
+    let second_bytes = std::fs::read(&second_path)
+        .map_err(|error| StorageError::Other(format!("read second core: {error}")))?;
+
+    let mut published = Storage::open(&live_path)?;
+    let retained = published
+        .get_bound_retrieval_index_manifest("test-project")?
+        .expect("migrated retrieval publication");
+    assert_eq!(retained.core.generation_id, first.generation_id);
+    assert_eq!(retained.core.run_id, first.run_id);
+    assert_eq!(
+        published
+            .get_retrieval_index_manifest_bound_to_core(&first.generation_id, &first.run_id)?
+            .expect("exact predecessor core binding"),
+        retained
+    );
+    published.upsert_retrieval_index_manifest(&retrieval_manifest("two"))?;
+    let current = published
+        .get_bound_retrieval_index_manifest("test-project")?
+        .expect("current retrieval publication");
+    assert_eq!(current.core.generation_id, second.generation_id);
+    assert_eq!(current.core.run_id, second.run_id);
+    assert_eq!(
+        published
+            .get_retrieval_index_manifest_bound_to_core(&second.generation_id, &second.run_id)?
+            .expect("exact current core binding"),
+        current
+    );
+    assert!(
+        published
+            .get_retrieval_index_manifest_bound_to_core("missing-core", "missing-run")?
+            .is_none()
+    );
+    drop(published);
+
+    for core_path in [&first_path, &second_path] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !PathBuf::from(format!("{}{suffix}", core_path.display())).exists(),
+                "opening immutable core {} must not materialize {suffix}",
+                core_path.display()
+            );
+        }
+    }
+
+    assert_eq!(
+        std::fs::read(&first_path)
+            .map_err(|error| StorageError::Other(format!("reread first core: {error}")))?,
+        first_bytes
+    );
+    assert_eq!(
+        std::fs::read(&second_path)
+            .map_err(|error| StorageError::Other(format!("reread second core: {error}")))?,
+        second_bytes
+    );
+    assert!(
+        std::fs::metadata(&second_path)
+            .map_err(|error| StorageError::Other(format!("inspect second core: {error}")))?
+            .permissions()
+            .readonly()
+    );
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&second_path)
+            .is_err(),
+        "published core generation must reject direct writes"
+    );
     Ok(())
 }
 
@@ -6018,6 +7241,403 @@ fn seed_promotion_file_with_identity(
 
 fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
     seed_promotion_file_with_identity(path, id, name, true)
+}
+
+fn seed_schema31_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    let current = path.with_extension("current-seed.db");
+    seed_promotion_file(&current, id, name)?;
+    let legacy = Connection::open(path)?;
+    // This DDL comes from the v0.17.5 tag, so the fixture crosses the actual
+    // schema-31 disk layout rather than just restamping a current-schema DB.
+    legacy.execute_batch(include_str!("../../../tests/fixtures/v17_5_schema31.sql"))?;
+    legacy.execute(
+        "ATTACH DATABASE ?1 AS seed",
+        [current.to_string_lossy().as_ref()],
+    )?;
+    let table_names = legacy
+        .prepare(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for table in table_names {
+        let columns = legacy
+            .prepare(&format!("PRAGMA main.table_info(\"{table}\")"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let columns = columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        legacy.execute(
+            &format!("INSERT OR REPLACE INTO main.\"{table}\" ({columns}) SELECT {columns} FROM seed.\"{table}\""),
+            [],
+        )?;
+    }
+    legacy.execute_batch("DETACH DATABASE seed; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(legacy);
+    cleanup_sqlite_sidecars(&current)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_rejects_a_corrupt_candidate_proof_projection() {
+    let live_path = unique_temp_db_path("proof-bound-promotion-live");
+    let staged_path = unique_temp_db_path("proof-bound-promotion-staged");
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged");
+    {
+        let mut storage = Storage::open(&staged_path).expect("open staged");
+        let publication = storage.get_complete_index_publication().unwrap().unwrap();
+        storage
+            .replace_proof_resolution_projection(
+                &publication,
+                &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                    adapter_roster: vec![
+                        codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                            language: "rust".to_string(),
+                            adapter_version: "test".to_string(),
+                        },
+                    ],
+                    facts: Vec::new(),
+                    funnel: Vec::new(),
+                },
+            )
+            .expect("publish empty proof projection");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_publication SET fact_digest = ?1 WHERE id = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        storage.finalize_staged_snapshot().unwrap();
+    }
+
+    let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect_err("corrupt candidate proof projection must reject promotion");
+    assert!(error.to_string().contains("proof resolution"), "{error}");
+    assert_eq!(
+        Storage::open(&live_path)
+            .unwrap()
+            .get_complete_index_publication()
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+
+    cleanup_sqlite_sidecars(&live_path).unwrap();
+    cleanup_sqlite_sidecars(&staged_path).unwrap();
+}
+
+#[test]
+fn proof_rollback_identity_preserves_valid_absence_and_authenticates_receipts() {
+    let path = unique_temp_db_path("proof-rollback-identity");
+    seed_promotion_file(&path, 1, "old.rs").expect("seed publication");
+    let mut storage = Storage::open(&path).expect("open publication");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    assert_eq!(
+        read_proof_resolution_rollback_identity(&path, &publication).unwrap(),
+        None,
+        "schema 32 may explicitly carry no proof projection"
+    );
+
+    let receipt = storage
+        .replace_proof_resolution_projection(
+            &publication,
+            &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                adapter_roster: vec![
+                    codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                        language: "rust".to_string(),
+                        adapter_version: "test".to_string(),
+                    },
+                ],
+                facts: Vec::new(),
+                funnel: Vec::new(),
+            },
+        )
+        .expect("publish empty authenticated projection");
+    storage.finalize_staged_snapshot().unwrap();
+    let identity = read_proof_resolution_rollback_identity(&path, &publication)
+        .unwrap()
+        .expect("authenticated projection identity");
+    assert_eq!(identity.core_generation_id, publication.generation_id);
+    assert_eq!(identity.core_run_id, publication.run_id);
+    assert_eq!(
+        identity.core_published_at_epoch_ms,
+        publication.published_at_epoch_ms
+    );
+    assert_eq!(identity.fact_count, 0);
+    assert_eq!(identity.fact_digest, receipt.fact_digest);
+
+    storage
+        .get_connection()
+        .execute("DELETE FROM proof_resolution_publication", [])
+        .unwrap();
+    drop(storage);
+    assert_eq!(
+        read_proof_resolution_rollback_identity(&path, &publication).unwrap(),
+        None,
+        "removing an empty receipt preserves authenticated absence"
+    );
+
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "INSERT INTO proof_resolution_provenance (
+            provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+         ) VALUES (1, 999, ?1, ?1, '[]')",
+        ["2".repeat(64)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 999, 1, 1, 2, 1, 1,
+            'identifier', 'missing', 999, NULL, 'missing_binding',
+            'missing_binding', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2)",
+        params!["1".repeat(64), "2".repeat(64)],
+    )
+    .unwrap();
+    drop(conn);
+    let error = read_proof_resolution_rollback_identity(&path, &publication)
+        .expect_err("facts without a receipt must fail closed");
+    assert!(error.to_string().contains("no publication"), "{error}");
+
+    cleanup_sqlite_sidecars(&path).unwrap();
+}
+
+#[test]
+fn schema_32_proof_receipt_remains_readable_during_pre_migration_recovery() {
+    let path = unique_temp_db_path("schema-32-proof-rollback-identity");
+    seed_promotion_file(&path, 1, "old.rs").expect("seed publication");
+    let mut storage = Storage::open(&path).expect("open publication");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    let receipt = storage
+        .replace_proof_resolution_projection(
+            &publication,
+            &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                adapter_roster: vec![
+                    codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                        language: "rust".to_string(),
+                        adapter_version: "test".to_string(),
+                    },
+                ],
+                facts: Vec::new(),
+                funnel: Vec::new(),
+            },
+        )
+        .expect("publish authenticated projection");
+    storage.finalize_staged_snapshot().unwrap();
+    drop(storage);
+
+    let conn = Connection::open(&path).expect("open schema conversion");
+    conn.execute_batch(
+        "CREATE TABLE proof_resolution_fact_legacy AS
+         SELECT f.fact_id, f.edge_id, f.raw_edge_target_id,
+                f.raw_callsite_identity, f.file_id, p.source_sha256,
+                f.start_byte, f.end_byte_exclusive, f.line, f.column,
+                f.callee_form, f.raw_target, f.caller_node_id,
+                f.target_node_id, f.status, f.reason, f.evidence_json,
+                p.dependency_json, f.lookup_domain_complete, f.producer,
+                f.fact_schema_version, f.algorithm, f.language_adapter,
+                f.language_adapter_version, p.parser_fingerprint,
+                f.evidence_digest
+         FROM proof_resolution_fact AS f
+         JOIN proof_resolution_provenance AS p
+           ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+         ORDER BY f.rowid;
+         DROP TABLE proof_resolution_fact;
+         ALTER TABLE proof_resolution_fact_legacy RENAME TO proof_resolution_fact;
+         DROP TABLE proof_resolution_provenance;
+         PRAGMA user_version = 32;",
+    )
+    .expect("construct authentic schema-32 proof shape");
+    drop(conn);
+
+    let identity = read_proof_resolution_rollback_identity(&path, &publication)
+        .expect("schema-32 recovery read")
+        .expect("authenticated schema-32 proof identity");
+    assert_eq!(identity.fact_count, 0);
+    assert_eq!(identity.fact_digest, receipt.fact_digest);
+
+    cleanup_sqlite_sidecars(&path).unwrap();
+}
+
+#[test]
+fn schema_33_rejects_two_referenced_duplicate_logical_provenance_groups() {
+    for (case, schema, expected_facts) in [
+        (
+            "duplicate logical groups",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            FOREIGN KEY(provenance_id, file_id)
+                REFERENCES proof_resolution_provenance(provenance_id, file_id)
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]'),
+            (2, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1), ('fact-2', 1, 2);
+         PRAGMA user_version = 32;",
+            2,
+        ),
+        (
+            "partial logical unique",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id)
+         );
+         CREATE UNIQUE INDEX partial_provenance_identity
+           ON proof_resolution_provenance(
+             file_id, source_sha256, parser_fingerprint, dependency_json
+           ) WHERE provenance_id > 0;
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            FOREIGN KEY(provenance_id, file_id)
+                REFERENCES proof_resolution_provenance(provenance_id, file_id)
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1);
+         PRAGMA user_version = 32;",
+            1,
+        ),
+        (
+            "extended provenance foreign key",
+            "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            provenance_scope TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id),
+            UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json),
+            UNIQUE(provenance_id, file_id, provenance_scope)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            provenance_scope TEXT NOT NULL,
+            FOREIGN KEY(provenance_id, file_id, provenance_scope)
+                REFERENCES proof_resolution_provenance(
+                    provenance_id, file_id, provenance_scope
+                )
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]', 'extra');
+         INSERT INTO proof_resolution_fact VALUES ('fact-1', 1, 1, 'extra');
+         PRAGMA user_version = 32;",
+            1,
+        ),
+    ] {
+        let conn = Connection::open_in_memory().expect("database");
+        conn.execute_batch(schema)
+            .unwrap_or_else(|error| panic!("construct {case}: {error}"));
+
+        assert!(
+            super::schema::migrate_v33_proof_resolution_provenance(&conn, true).is_err(),
+            "{case} must not be stamped current"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            32,
+            "{case}"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            expected_facts,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn schema_33_rejects_nonempty_normalized_provenance_beside_legacy_facts() {
+    let conn = Connection::open_in_memory().expect("database");
+    conn.execute_batch(
+        "CREATE TABLE file (id INTEGER PRIMARY KEY);
+         INSERT INTO file (id) VALUES (1);
+         CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id),
+            UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json)
+         );
+         CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY,
+            source_sha256 TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL
+         );
+         INSERT INTO proof_resolution_provenance VALUES
+            (1, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'parser', '[]');
+         INSERT INTO proof_resolution_fact VALUES
+            ('legacy-fact',
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             '[]', 'parser');
+         PRAGMA user_version = 32;",
+    )
+    .expect("construct mixed legacy and normalized shape");
+
+    super::schema::migrate_v33_proof_resolution_provenance(&conn, true)
+        .expect_err("nonempty mixed shape must not be repaired or stamped current");
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
 }
 
 fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> {
@@ -6212,6 +7832,15 @@ fn promotion_journal(
             candidate_path,
             &candidate,
         )?,
+        previous_proof_resolution: previous
+            .as_ref()
+            .map(|publication| read_proof_resolution_rollback_identity(previous_path, publication))
+            .transpose()?
+            .flatten(),
+        candidate_proof_resolution: read_proof_resolution_rollback_identity(
+            candidate_path,
+            &candidate,
+        )?,
         previous,
         candidate,
     })
@@ -6232,6 +7861,10 @@ fn promotion_journal_for_version(
         journal.previous_structural_text = None;
         journal.candidate_structural_text = None;
     }
+    if version < PROMOTION_JOURNAL_VERSION {
+        journal.previous_proof_resolution = None;
+        journal.candidate_proof_resolution = None;
+    }
     Ok(journal)
 }
 
@@ -6240,6 +7873,13 @@ fn restamp_complete_promotion_fixture(
     schema_version: u32,
 ) -> Result<(), StorageError> {
     let conn = Connection::open(path)?;
+    if schema_version < PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS proof_resolution_publication;
+             DROP TABLE IF EXISTS proof_resolution_fact;
+             DROP TABLE IF EXISTS proof_resolution_provenance;",
+        )?;
+    }
     if schema_version < STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
         conn.execute_batch(
             "DROP TABLE IF EXISTS structural_text_unit;
@@ -6333,7 +7973,11 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         RecoveryDatabaseContract::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION);
     let structural_policy_journal =
         RecoveryDatabaseContract::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION);
-    let semantic_projection_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
+    let semantic_projection_journal =
+        RecoveryDatabaseContract::Journal(SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION);
+    let annotation_sidecar_journal =
+        RecoveryDatabaseContract::Journal(ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION);
+    let proof_resolution_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
     let legacy_backup = RecoveryDatabaseContract::LegacyBackup;
 
     for schema_version in
@@ -6358,7 +8002,24 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         semantic_projection_journal
             .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
     );
-    assert!(semantic_projection_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(
+        semantic_projection_journal
+            .supports_complete_schema(SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(
+        !semantic_projection_journal
+            .supports_complete_schema(ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(
+        annotation_sidecar_journal
+            .supports_complete_schema(ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(!annotation_sidecar_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(
+        proof_resolution_journal
+            .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(proof_resolution_journal.supports_complete_schema(SCHEMA_VERSION));
     assert!(current.supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
     assert!(current.supports_complete_schema(SCHEMA_VERSION));
     assert!(legacy_journal.supports_complete_schema(SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
@@ -6381,6 +8042,14 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         ),
         (
             semantic_projection_journal,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (
+            annotation_sidecar_journal,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (
+            proof_resolution_journal,
             STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
         ),
         (legacy_backup, LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1),
@@ -6869,6 +8538,12 @@ fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
             "unsupported schema version",
         ),
         (
+            "invalid-v6-schema32",
+            ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION,
+            SCHEMA_VERSION,
+            "unsupported schema version",
+        ),
+        (
             "unmarked-incomplete-v2",
             SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
             INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
@@ -6904,6 +8579,661 @@ fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
         cleanup_sqlite_sidecars(&backup_path).expect("clean rejected backup");
         cleanup_sqlite_sidecars(&live_path).expect("clean rejected live");
     }
+}
+
+#[test]
+fn immutable_migration_replaces_incomplete_legacy_predecessor_without_rollback() {
+    for retained_publication in [true, false] {
+        let root = tempfile::tempdir().expect("migration root");
+        let live = root.path().join("codestory.db");
+        seed_promotion_file_with_identity(&live, 1, "old.rs", retained_publication)
+            .expect("material legacy predecessor");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live).expect("layout");
+        let candidate = layout.create_staging_database_path().expect("stage");
+        seed_promotion_file(&candidate, 2, "new.rs").expect("complete replacement");
+        {
+            let previous = Storage::open(&live).expect("open predecessor");
+            previous
+                .begin_incremental_run()
+                .expect("mark interrupted writer");
+        }
+        let before = durable_sqlite_state(&live);
+        Storage::promote_staged_snapshot(&candidate, &live)
+            .expect("complete full candidate replaces incomplete predecessor");
+        assert_eq!(durable_sqlite_state(&live), before, "legacy image survives");
+        let pointer = layout
+            .read_pointer()
+            .expect("pointer")
+            .expect("published core");
+        assert_eq!(pointer.active.generation_id, "generation-2");
+        assert!(
+            pointer.rollback.is_none(),
+            "incomplete core cannot be rollback"
+        );
+        assert!(!Storage::database_has_incomplete_incremental_run(&live).unwrap());
+        assert_eq!(
+            Storage::open(&live).unwrap().get_files().unwrap()[0].path,
+            PathBuf::from("new.rs")
+        );
+    }
+}
+
+#[test]
+fn interrupted_schema31_predecessor_retires_only_after_complete_replacement()
+-> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let legacy = Connection::open(&live)?;
+    legacy.execute_batch(&format!(
+        "INSERT INTO incomplete_index_run(id, started_at_epoch_ms) VALUES(1, 1);
+         PRAGMA user_version = {};",
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    ))?;
+    drop(legacy);
+    let original = fs::read(&live).expect("read authentic interrupted source");
+    let annotations_path = root.path().join("annotations.sqlite3");
+    let annotations = crate::AnnotationStore::open_for_write(
+        &annotations_path,
+        &crate::NativeRootBinding::new(Some("test-root".into()), root.path()),
+    )
+    .expect("create annotation sidecar");
+    annotations
+        .create_category("Keep category")
+        .expect("persist annotation");
+    drop(annotations);
+    let annotation_bytes = fs::read(&annotations_path).expect("read annotation sidecar");
+
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let first = layout.create_staging_database_path()?;
+    seed_promotion_file(&first, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+    let error = Storage::promote_staged_snapshot_inner(&first, &live, None, &cancelled)
+        .expect_err("cancellation after receipt write must prevent publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(
+        fs::read(&live).expect("preserved interrupted source"),
+        original
+    );
+    assert_eq!(
+        fs::read(&annotations_path).expect("preserved annotations"),
+        annotation_bytes
+    );
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("uncommitted retirement receipt"))
+            .expect("receipt JSON");
+    assert_eq!(pending["committed"], false);
+
+    let retry = layout.create_staging_database_path()?;
+    seed_promotion_file(&retry, 3, "complete.rs")?;
+    Storage::promote_staged_snapshot(&retry, &live)?;
+    let pointer = layout
+        .read_pointer()?
+        .expect("complete replacement pointer");
+    assert_eq!(pointer.active.generation_id, "generation-3");
+    assert!(
+        pointer.rollback.is_none(),
+        "interrupted predecessor is not rollback eligible"
+    );
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched interrupted source");
+            Ok(true)
+        })?;
+    assert!(retired.retired && !retired.pending);
+    assert!(
+        !live.exists(),
+        "redundant interrupted standalone image is retired"
+    );
+    assert_eq!(
+        fs::read(&annotations_path).expect("preserved sidecar"),
+        annotation_bytes
+    );
+    let categories = crate::AnnotationStore::open_observational(&annotations_path)
+        .expect("read annotations")
+        .expect("sidecar remains")
+        .categories()
+        .expect("read categories");
+    assert!(
+        categories
+            .iter()
+            .any(|category| category.name == "Keep category")
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_unpublished_standalone_core_retires_without_becoming_rollback() -> Result<(), StorageError>
+{
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    drop(Storage::open_build(&live)?);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let pointer = layout.read_pointer()?.expect("replacement pointer");
+    assert!(
+        pointer.rollback.is_none(),
+        "empty standalone core cannot be rollback"
+    );
+    assert!(layout.root().join("legacy-retirement.json").is_file());
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched empty standalone core");
+            Ok(true)
+        })?;
+    assert!(retired.retired);
+    assert!(!live.exists());
+    assert_eq!(
+        Storage::open(&live)?.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    Ok(())
+}
+
+#[test]
+fn immutable_migration_copies_complete_schema31_rollback_without_cow() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs").expect("nonempty schema-31 predecessor");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live).expect("layout");
+    let candidate = layout.create_staging_database_path().expect("stage");
+    seed_promotion_file(&candidate, 2, "new.rs").expect("complete candidate");
+    let before = durable_sqlite_state(&live);
+
+    crate::with_core_clone_disabled(|| Storage::promote_staged_snapshot(&candidate, &live))
+        .expect("one-time legacy rollback copy must not require CoW");
+
+    let pointer = layout.read_pointer()?.expect("published pointer");
+    assert_eq!(pointer.active.generation_id, "generation-2");
+    assert_eq!(
+        pointer.rollback.as_ref().unwrap().generation_id,
+        "generation-1"
+    );
+    let rollback = layout.resolve_generation_database("generation-1")?;
+    assert_eq!(durable_sqlite_state(&live), before, "old image survives");
+    let retained = Connection::open_with_flags(&rollback, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let old_file: String =
+        retained.query_row("SELECT path FROM file WHERE id = 1", [], |row| row.get(0))?;
+    assert_eq!(old_file, "old.rs");
+    let publication_count: i64 =
+        retained.query_row("SELECT COUNT(*) FROM index_publication", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(publication_count, 1);
+    assert_eq!(Storage::database_schema_version(&rollback)?, 31);
+    assert_eq!(
+        Storage::open(&live)?.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    Ok(())
+}
+
+#[test]
+fn first_immutable_publication_records_the_original_legacy_identity_for_retirement()
+-> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&candidate, &live)?;
+
+    assert!(
+        layout.root().join("legacy-retirement.json").is_file(),
+        "first committed migration must retain an identity-bound retirement receipt"
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_accepts_an_unprotected_authentic_schema31_generation() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let first = layout.create_staging_database_path()?;
+    seed_promotion_file(&first, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&first, &live)?;
+    let next = layout.create_staging_database_path()?;
+    seed_promotion_file(&next, 3, "newer.rs")?;
+    Storage::promote_staged_snapshot(&next, &live)?;
+
+    let rollback = layout.generation_database_path("generation-1")?;
+    let reader = super::core_retention::pin_exact_core(&rollback)?
+        .expect("historical generation must have a named reader lease");
+    let deferred =
+        super::core_retention::apply_core_retention(&live, &|| false, |_, _, _, _, _| {
+            panic!("live schema31 reader must block reclamation")
+        })?;
+    assert_eq!(deferred.deferred_pins, 1);
+    drop(reader);
+
+    let mut removed = Vec::new();
+    let report =
+        super::core_retention::apply_core_retention(&live, &|| false, |_, generation, _, _, _| {
+            removed.push(generation.to_owned());
+            Ok(true)
+        })?;
+    assert_eq!(
+        removed,
+        ["generation-1"],
+        "unprotected schema31 should reach owned removal"
+    );
+    assert_eq!(report.reclaimed_images, 1);
+    Ok(())
+}
+
+#[test]
+fn retention_accepts_a_second_supported_previous_schema_but_refuses_unsupported_schema()
+-> Result<(), StorageError> {
+    for (schema, reclaimable) in [
+        (SCHEMA_VERSION - 1, true),
+        (STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION, false),
+    ] {
+        let root = tempfile::tempdir().expect("migration root");
+        let live = root.path().join("codestory.db");
+        seed_promotion_file(&live, 1, "old.rs")?;
+        let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+        for (generation, name) in [(2, "new.rs"), (3, "newer.rs")] {
+            let stage = layout.create_staging_database_path()?;
+            seed_promotion_file(&stage, generation, name)?;
+            Storage::promote_staged_snapshot(&stage, &live)?;
+        }
+        let historical = layout.generation_database_path("generation-1")?;
+        crate::core_generation::make_file_owner_writable(&historical)?;
+        restamp_complete_promotion_fixture(&historical, schema)?;
+        crate::core_generation::make_file_immutable(&historical)?;
+
+        let mut removed = Vec::new();
+        let report = super::core_retention::apply_core_retention(
+            &live,
+            &|| false,
+            |_, generation, _, _, _| {
+                removed.push(generation.to_owned());
+                Ok(true)
+            },
+        )?;
+        assert_eq!(removed == ["generation-1"], reclaimable, "schema {schema}");
+        assert_eq!(report.reclaimed_images == 1, reclaimable, "schema {schema}");
+        if !reclaimable {
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("unsupported schema"))
+            );
+            assert!(historical.is_file());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_legacy_rollback_copy_removes_its_partial_stage() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = std::fs::read(&live).expect("read source");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let calls = std::cell::Cell::new(0);
+    let cancelled = || {
+        let next = calls.get() + 1;
+        calls.set(next);
+        next > 1
+    };
+    let error = crate::with_core_clone_disabled(|| {
+        layout.materialize_existing_generation(&live, "generation-1", &cancelled)
+    })
+    .expect_err("cancelled copy must not install rollback");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(!layout.generation_database_path("generation-1")?.is_file());
+    assert_eq!(std::fs::read(&live).expect("read preserved source"), before);
+    assert_eq!(
+        std::fs::read_dir(layout.staging_root())
+            .expect("read owned staging root")
+            .count(),
+        0,
+        "partial owned stage must be removed"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_legacy_copy_cannot_commit_pointer() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = durable_sqlite_state(&live);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let installed_candidate = layout.generation_database_path("generation-2")?;
+    let cancelled = || installed_candidate.is_file();
+
+    let error = crate::with_core_clone_disabled(|| {
+        Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+    })
+    .expect_err("late cancellation must prevent pointer publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(durable_sqlite_state(&live), before);
+    assert!(!layout.root().join("legacy-retirement.json").exists());
+    assert!(
+        Storage::open(&live)?
+            .get_complete_index_publication()?
+            .is_some(),
+        "old complete publication stays usable"
+    );
+
+    let retry = layout.create_staging_database_path()?;
+    seed_promotion_file(&retry, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&retry, &live).expect("retry publishes complete candidate");
+    assert_eq!(
+        layout
+            .read_pointer()?
+            .expect("retry pointer")
+            .active
+            .generation_id,
+        "generation-2"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_legacy_retirement_receipt_cannot_commit_pointer() -> Result<(), StorageError>
+{
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = durable_sqlite_state(&live);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+
+    let error = Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+        .expect_err("cancellation after receipt fsync must prevent pointer publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(
+        receipt_path.is_file(),
+        "cancel condition must reach the receipt boundary"
+    );
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(durable_sqlite_state(&live), before);
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(observed.pending);
+    assert!(
+        observed
+            .errors
+            .iter()
+            .any(|error| error.contains("awaits a committed"))
+    );
+    Ok(())
+}
+
+#[test]
+fn uncommitted_legacy_receipt_cannot_retire_source() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = fs::read(&live).expect("read source");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+    Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+        .expect_err("cancel after durable receipt");
+    assert!(layout.read_pointer()?.is_none());
+
+    let report =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove source if erroneously authorized");
+            Ok(true)
+        })?;
+    assert!(
+        report.pending && !report.retired,
+        "precommit retirement: {report:?}"
+    );
+    assert_eq!(fs::read(&live).expect("precommit source survives"), before);
+    Ok(())
+}
+
+#[test]
+fn legacy_retirement_waits_for_commit_and_retries_owned_deletion_without_touching_annotations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let annotations = root.path().join("annotations.sqlite3");
+    fs::write(&annotations, b"annotation-owned sentinel").expect("annotation sentinel");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let rollback = layout.resolve_generation_database("generation-1")?;
+
+    let before_observation = fs::read(layout.root().join("legacy-retirement.json"))?;
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(observed.pending && observed.legacy_bytes > 0);
+    assert_eq!(
+        fs::read(layout.root().join("legacy-retirement.json"))?,
+        before_observation
+    );
+    let cancelled = super::core_retention::apply_legacy_retirement(&live, &|| true, |_, _, _| {
+        panic!("cancelled cleanup cannot reach deletion");
+    })?;
+    assert!(cancelled.pending && live.is_file());
+
+    let deferred = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        Err(StorageError::Other("in-use deletion refused".into()))
+    })?;
+    assert!(deferred.pending && !deferred.errors.is_empty());
+    assert!(
+        live.is_file(),
+        "failed cleanup cannot roll back committed publication"
+    );
+    let diagnostic = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(diagnostic.pending);
+    assert!(
+        diagnostic
+            .errors
+            .iter()
+            .any(|error| error.contains("in-use deletion refused"))
+    );
+
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retired.retired && !retired.pending);
+    assert!(!live.exists());
+    let retired_observation = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(retired_observation.retired && !retired_observation.pending);
+    assert!(retired_observation.errors.is_empty());
+    assert!(rollback.is_file(), "migration rollback remains protected");
+    assert_eq!(fs::read(&annotations)?, b"annotation-owned sentinel");
+    Ok(())
+}
+
+#[test]
+fn legacy_retirement_refuses_recreated_native_identity_then_retries_original()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let original = root.path().join("original-held.db");
+    fs::rename(&live, &original)?;
+    fs::write(&live, b"new unowned file")?;
+    let refused = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        panic!("replacement must never reach deletion callback");
+    })?;
+    assert!(refused.pending);
+    assert!(
+        refused
+            .errors
+            .iter()
+            .any(|error| error.contains("replaced native identity"))
+    );
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(
+        observed
+            .errors
+            .iter()
+            .any(|error| error.contains("replaced native identity"))
+    );
+    assert_eq!(
+        observed.legacy_bytes, 0,
+        "replacement bytes are not owned legacy bytes"
+    );
+    assert_eq!(fs::read(&live)?, b"new unowned file");
+    assert!(original.is_file());
+
+    fs::remove_file(&live)?;
+    fs::rename(&original, &live)?;
+    let retried =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retried.retired);
+    assert!(!live.exists());
+    Ok(())
+}
+
+#[test]
+fn legacy_parent_sync_failure_leaves_retirement_receipt_pending() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+
+    let error = crate::sealed_file_stage::with_parent_sync_failure(&live, || {
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })
+        .expect_err("parent sync failure must not confirm retirement")
+    });
+    assert!(
+        error.to_string().contains("sync sealed stage parent"),
+        "{error}"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json"))
+            .expect("read still-pending receipt"),
+    )
+    .expect("pending receipt JSON");
+    assert_eq!(receipt["committed"], true);
+    assert_eq!(
+        receipt["retired"], false,
+        "an unsynced old-directory unlink cannot be final"
+    );
+    assert!(
+        receipt["last_error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("parent directory sync deferred"))
+    );
+    assert!(
+        layout
+            .resolve_generation_database("generation-1")?
+            .is_file()
+    );
+    let retry = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        panic!("the already absent legacy file cannot reach deletion again")
+    })?;
+    assert!(retry.retired && !retry.pending);
+    Ok(())
+}
+
+#[test]
+fn schema31_rollback_snapshot_includes_committed_wal_rows() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let writer = Connection::open(&live)?;
+    writer.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         INSERT INTO bookmark_category (id, name) VALUES (77, 'committed WAL annotation');",
+    )?;
+    let wal = sqlite_sidecar_path(&live, "-wal");
+    assert!(fs::metadata(&wal).expect("live WAL").len() > 0);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+
+    Storage::promote_staged_snapshot(&candidate, &live)?;
+
+    let pointer = layout.read_pointer()?.expect("published pointer");
+    let rollback = layout.resolve_generation_database(&pointer.rollback.unwrap().generation_id)?;
+    assert!(
+        !sqlite_sidecar_path(&rollback, "-wal").exists(),
+        "published rollback contains its committed pages in one database file"
+    );
+    let retained = Connection::open_with_flags(&rollback, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let annotation: String = retained.query_row(
+        "SELECT name FROM bookmark_category WHERE id = 77",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(annotation, "committed WAL annotation");
+    assert_eq!(Storage::database_schema_version(&rollback)?, 31);
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json"))
+            .expect("read migration retirement receipt"),
+    )
+    .expect("parse migration retirement receipt");
+    assert!(
+        receipt["sidecars"]
+            .as_array()
+            .is_some_and(|sidecars| sidecars.iter().any(|sidecar| sidecar["suffix"] == "-wal")),
+        "the retirement receipt must capture the live WAL identity"
+    );
+    let main_before = fs::read(&live).expect("read in-use legacy database");
+    let wal_before = fs::read(&wal).expect("read in-use WAL");
+    let mut deletion_attempts = Vec::new();
+    let deferred =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |_, name, _| {
+            deletion_attempts.push(name.to_owned());
+            Err(StorageError::Other("in-use legacy database".into()))
+        })?;
+    assert!(deferred.pending);
+    assert_eq!(
+        deletion_attempts,
+        ["codestory.db"],
+        "in-use database refusal must precede sidecar deletion"
+    );
+    assert_eq!(
+        fs::read(&live).expect("preserved in-use database"),
+        main_before
+    );
+    assert_eq!(fs::read(&wal).expect("preserved in-use WAL"), wal_before);
+    drop(writer);
+    let retirement =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retirement.retired);
+    assert!(!live.exists());
+    assert!(!wal.exists());
+    assert!(rollback.is_file());
+    Ok(())
 }
 
 #[test]
@@ -7293,6 +9623,8 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
             candidate_source_policy: None,
             previous_structural_text: None,
             candidate_structural_text: None,
+            previous_proof_resolution: None,
+            candidate_proof_resolution: None,
         },
     )
     .expect("write legacy committed journal");
@@ -7329,120 +9661,213 @@ fn staged_promotion_abort_child() {
 }
 
 #[test]
-fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
-    let live_path = unique_temp_db_path("promotion-abort-live");
-    let staged_path = unique_temp_db_path("promotion-abort-staged");
-    let sentinel_path = unique_temp_db_path("promotion-abort-sentinel");
-    let backup_path = live_path.with_extension("sqlite.backup");
-    let prepared_path = promotion_prepared_journal_path(&live_path);
-    let committed_path = promotion_committed_journal_path(&live_path);
-    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
-    seed_disposable_promotion_file(&staged_path, 2, "new.rs")
-        .expect("seed sealed disposable staged generation");
-    publish_nonempty_test_source_policy(&live_path, 1).expect("publish live exclusion identity");
+fn legacy_pointer_write_crash_preserves_source_and_pending_retirement_receipt() {
+    let live_path = unique_temp_db_path("legacy-pointer-write-abort-live");
+    seed_schema31_promotion_file(&live_path, 1, "old.rs").expect("authentic schema31 source");
+    let writer = Connection::open(&live_path).expect("open legacy writer");
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             INSERT INTO bookmark_category (id, name) VALUES (78, 'precommit WAL row');",
+        )
+        .expect("commit WAL row");
+    let wal = sqlite_sidecar_path(&live_path, "-wal");
+    let shm = sqlite_sidecar_path(&live_path, "-shm");
+    let main_before = fs::read(&live_path).expect("read original database");
+    let wal_before = fs::read(&wal).expect("read original WAL");
+    assert!(shm.is_file(), "live writer retains the SHM sidecar");
 
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+    let staged_path = layout.create_staging_database_path().expect("stage");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("replacement candidate");
+    let sentinel_path = unique_temp_db_path("legacy-pointer-write-abort-sentinel");
     let status =
-        std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
+        std::process::Command::new(std::env::current_exe().expect("store test executable"))
             .arg("--exact")
             .arg("storage_impl::tests::staged_promotion_abort_child")
-            .arg("--nocapture")
             .env(PROMOTION_ABORT_LIVE_ENV, &live_path)
             .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
-            .env(PROMOTION_ABORT_SENTINEL_ENV, &sentinel_path)
+            .env(
+                crate::core_generation::CORE_PUBLICATION_ABORT_POINT_ENV,
+                "pointer_write",
+            )
+            .env(
+                crate::core_generation::CORE_PUBLICATION_ABORT_SENTINEL_ENV,
+                &sentinel_path,
+            )
             .status()
-            .expect("run promotion abort child");
-    assert!(
-        !status.success(),
-        "promotion abort child exited successfully"
-    );
+            .expect("run pointer-write abort child");
+    assert!(!status.success(), "child must abort at pointer write");
     assert_eq!(
-        std::fs::read(&sentinel_path).expect("read promotion abort sentinel"),
-        PROMOTION_ABORT_SENTINEL,
-        "ordinary child failure must not satisfy the crash proof"
+        fs::read_to_string(&sentinel_path).expect("abort sentinel"),
+        "pointer_write\n"
     );
-
-    let interrupted = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .expect("open interrupted live generation without recovery");
-    let interrupted_path: String = interrupted
-        .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .expect("read interrupted live generation");
+    assert!(layout.read_pointer().expect("pointer").is_none());
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json")).expect("precommit receipt"),
+    )
+    .expect("receipt JSON");
+    assert_eq!(receipt["committed"], false);
+    assert_eq!(receipt["retired"], false);
     assert_eq!(
-        interrupted_path, "new.rs",
-        "abort hook must run after the live database mutation"
+        fs::read(&live_path).expect("preserved original"),
+        main_before
     );
-    drop(interrupted);
-
-    let live = Storage::open(&live_path).expect("open live generation after abort");
-    assert_eq!(
-        live.get_files().expect("read live generation")[0].path,
-        PathBuf::from("old.rs")
-    );
-    assert_eq!(
-        live.get_source_policy_exclusions()
-            .expect("read rolled-back exclusions")[0]
-            .normalized_path,
-        "vendor/registers-1.h"
-    );
-    drop(live);
-    assert!(
-        staged_path.exists(),
-        "staged generation must remain retryable"
-    );
-    assert!(
-        !backup_path.exists(),
-        "opening live storage must consume the recovery backup"
-    );
-    assert!(!prepared_path.exists(), "rollback must consume its journal");
-    assert!(!committed_path.exists(), "aborted promotion cannot commit");
-
-    let retry_stats = Storage::promote_staged_snapshot(&staged_path, &live_path)
-        .expect("retry promotion after abort");
-    assert_core_promotion_stats_reconcile(&retry_stats);
-    assert!(retry_stats.previous_live_bytes.is_some());
-    assert!(retry_stats.rollback_backup_copy_ms.is_some());
-    assert!(retry_stats.backup_validation_ms.is_some());
-    assert_eq!(
-        retry_stats.rollback_backup_bytes,
-        retry_stats.previous_live_bytes
-    );
-    let live = Storage::open(&live_path).expect("open recovered live generation");
-    assert_eq!(
-        live.get_files().expect("read recovered generation")[0].path,
-        PathBuf::from("new.rs")
-    );
-    assert_eq!(
-        live.get_source_policy_exclusions()
-            .expect("read promoted exclusions")[0]
-            .normalized_path,
-        "vendor/registers-2.h"
-    );
-    drop(live);
-    for artifact in sqlite_sidecar_paths(&staged_path)
-        .into_iter()
-        .chain(sqlite_sidecar_paths(&backup_path))
-    {
-        assert!(
-            !artifact.exists(),
-            "successful retry left promotion artifact {}",
-            artifact.display()
-        );
-    }
-
+    assert_eq!(fs::read(&wal).expect("preserved WAL"), wal_before);
+    assert!(shm.is_file(), "the crash cannot remove the original SHM");
+    let row: String = writer
+        .query_row(
+            "SELECT name FROM bookmark_category WHERE id = 78",
+            [],
+            |row| row.get(0),
+        )
+        .expect("old writer remains usable");
+    assert_eq!(row, "precommit WAL row");
+    drop(writer);
     let _ = cleanup_sqlite_sidecars(&live_path);
-    let _ = cleanup_sqlite_sidecars(&staged_path);
-    let _ = cleanup_sqlite_sidecars(&backup_path);
-    let _ = std::fs::remove_file(prepared_path);
-    let _ = std::fs::remove_file(committed_path);
-    let _ = std::fs::remove_file(&sentinel_path);
+    let _ = fs::remove_dir_all(layout.root());
+    let _ = fs::remove_file(&sentinel_path);
+    let _ = fs::remove_file(&live_path);
 }
 
 #[test]
-fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
+fn immutable_generation_process_crash_matrix_preserves_an_old_or_new_publication() {
+    for point in [
+        "stage_fsync",
+        "generation_rename",
+        "pointer_write",
+        "pointer_replacement",
+        "cleanup",
+    ] {
+        let live_path = unique_temp_db_path(&format!("promotion-abort-{point}-live"));
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let staged_path = layout
+            .create_staging_database_path()
+            .expect("owned staged path");
+        let sentinel_path = unique_temp_db_path(&format!("promotion-abort-{point}-sentinel"));
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+        seed_disposable_promotion_file(&staged_path, 2, "new.rs")
+            .expect("seed sealed disposable staged generation");
+        publish_nonempty_test_source_policy(&live_path, 1)
+            .expect("publish live exclusion identity");
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("resolve store test executable"),
+        )
+        .arg("--exact")
+        .arg("storage_impl::tests::staged_promotion_abort_child")
+        .arg("--nocapture")
+        .env(PROMOTION_ABORT_LIVE_ENV, &live_path)
+        .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
+        .env(
+            crate::core_generation::CORE_PUBLICATION_ABORT_POINT_ENV,
+            point,
+        )
+        .env(
+            crate::core_generation::CORE_PUBLICATION_ABORT_SENTINEL_ENV,
+            &sentinel_path,
+        )
+        .status()
+        .expect("run promotion abort child");
+        assert!(
+            !status.success(),
+            "promotion abort child exited successfully at {point}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel_path).expect("read promotion abort sentinel"),
+            format!("{point}\n"),
+            "ordinary child failure must not satisfy the {point} crash proof"
+        );
+
+        let expects_new = matches!(point, "pointer_replacement" | "cleanup");
+        let live = Storage::open(&live_path).expect("open publication after abort");
+        assert_eq!(
+            live.get_files().expect("read publication")[0].path,
+            PathBuf::from(if expects_new { "new.rs" } else { "old.rs" }),
+            "{point} must expose one complete old-or-new generation"
+        );
+        drop(live);
+        let pointer = layout.read_pointer().expect("observe pointer");
+        assert_eq!(
+            pointer.is_some(),
+            expects_new,
+            "only pointer replacement may make the candidate current at {point}"
+        );
+
+        let candidate = layout
+            .generation_database_path("generation-2")
+            .expect("candidate generation path");
+        if point == "stage_fsync" {
+            assert!(staged_path.is_file(), "stage remains owned before rename");
+            assert!(!candidate.exists(), "candidate has not been installed");
+        } else {
+            assert!(
+                !staged_path.exists(),
+                "installed stage left temporary layout"
+            );
+            let candidate_store =
+                Storage::open_immutable_generation(&candidate).expect("open immutable candidate");
+            assert_eq!(
+                candidate_store.get_files().expect("read candidate")[0].path,
+                PathBuf::from("new.rs")
+            );
+            drop(candidate_store);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                assert!(
+                    !PathBuf::from(format!("{}{suffix}", candidate.display())).exists(),
+                    "exact immutable reader must not materialize {suffix} at {point}"
+                );
+            }
+        }
+
+        let _ = cleanup_sqlite_sidecars(&live_path);
+        let _ = std::fs::remove_dir_all(layout.root());
+        let _ = std::fs::remove_file(&sentinel_path);
+    }
+}
+
+#[test]
+fn static_core_observers_do_not_materialize_sidecars_for_immutable_generations() {
+    let live_path = unique_temp_db_path("immutable-static-observers-live");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+    let staged_path = layout.create_staging_database_path().expect("owned stage");
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+    seed_disposable_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+    publish_nonempty_test_source_policy(&live_path, 1).expect("publish live exclusion identity");
+    Storage::promote_staged_snapshot(&staged_path, &live_path).expect("publish immutable core");
+
+    let active = crate::resolve_core_database_path(&live_path).expect("resolve active generation");
+    assert_no_sqlite_sidecars(&active);
+    assert_eq!(
+        Storage::database_schema_version(&live_path).unwrap(),
+        SCHEMA_VERSION
+    );
+    assert!(!Storage::database_has_incomplete_incremental_run(&live_path).unwrap());
+    assert!(
+        Storage::database_index_publication(&live_path)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        Storage::database_complete_index_publication(&live_path)
+            .unwrap()
+            .is_some()
+    );
+    let _ = Storage::database_legacy_annotation_count(&live_path).unwrap();
+    let _ = database_logical_bytes_at_path(&active).unwrap();
+    assert_no_sqlite_sidecars(&active);
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = std::fs::remove_dir_all(layout.root());
+}
+
+#[test]
+fn post_pointer_cleanup_failure_does_not_block_the_next_generation() {
     let live_path = unique_temp_db_path("promotion-cleanup-failure-live");
-    let staged_path = unique_temp_db_path("promotion-cleanup-failure-staged");
-    let second_staged_path = unique_temp_db_path("promotion-cleanup-failure-second-staged");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+    let staged_path = layout.create_staging_database_path().expect("first stage");
+    let second_staged_path = layout.create_staging_database_path().expect("second stage");
     let backup_path = live_path.with_extension("sqlite.backup");
     let committed_path = promotion_committed_journal_path(&live_path);
     let cleanup_failure_path = promotion_cleanup_failure_path(&live_path);
@@ -7460,38 +9885,47 @@ fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
         .expect("committed promotion tolerates deferred cleanup");
     assert_core_promotion_stats_reconcile(&committed_stats);
     assert!(committed_stats.previous_live_bytes.is_some());
-    assert!(committed_stats.rollback_backup_copy_ms.is_some());
-    assert!(committed_stats.backup_validation_ms.is_some());
+    assert!(committed_stats.rollback_backup_copy_ms.is_none());
+    assert!(committed_stats.backup_validation_ms.is_none());
     assert_eq!(
-        committed_stats.rollback_backup_bytes,
+        committed_stats.rollback_generation_bytes,
         committed_stats.previous_live_bytes
     );
-    let error = Storage::promote_staged_snapshot(&second_staged_path, &live_path)
-        .expect_err("retained committed artifacts must block the next promotion");
-    assert!(error.to_string().contains("prior artifacts remain"));
-    assert!(backup_path.exists() && committed_path.exists());
-    assert!(second_staged_path.exists());
+    assert!(committed_stats.rollback_backup_bytes.is_none());
+    let second_stats = Storage::promote_staged_snapshot(&second_staged_path, &live_path)
+        .expect("cleanup warning must not block the next pointer replacement");
+    assert_core_promotion_stats_reconcile(&second_stats);
+    assert!(second_stats.rollback_backup_copy_ms.is_none());
+    assert!(second_stats.backup_validation_ms.is_none());
+    assert!(!backup_path.exists() && !committed_path.exists());
 
     std::fs::remove_file(&cleanup_failure_path).expect("restore cleanup");
     let reopened = Storage::open(&live_path).expect("reopen committed live generation");
     assert_eq!(
         reopened.get_files().expect("read committed generation")[0].path,
-        PathBuf::from("new.rs")
+        PathBuf::from("newer.rs")
     );
     assert_eq!(
         reopened
             .get_source_policy_exclusions()
             .expect("read committed exclusions")[0]
             .normalized_path,
-        "vendor/registers-2.h"
+        "vendor/registers-3.h"
     );
     drop(reopened);
-    assert!(!backup_path.exists() && !committed_path.exists());
+    let pointer = layout
+        .read_pointer()
+        .expect("read pointer")
+        .expect("active pointer");
+    assert_eq!(pointer.active.generation_id, "generation-3");
+    assert_eq!(
+        pointer.rollback.expect("rollback").generation_id,
+        "generation-2"
+    );
 
     let _ = cleanup_sqlite_sidecars(&live_path);
-    let _ = cleanup_sqlite_sidecars(&staged_path);
-    let _ = cleanup_sqlite_sidecars(&second_staged_path);
     let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_dir_all(layout.root());
 }
 
 #[test]
@@ -7986,6 +10420,65 @@ fn legacy_staged_finalize_builds_complete_secondary_index_set() -> Result<(), St
 }
 
 #[test]
+fn source_identity_rebind_updates_only_the_inherited_file_snapshot() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_files_batch(&[FileInfo {
+        id: 10,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".into(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    }])?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".into(),
+            file_node_id: Some(NodeId(10)),
+            start_line: Some(2),
+            end_line: Some(2),
+            ..Default::default()
+        },
+    ])?;
+    storage.refresh_grounding_snapshots()?;
+    let before = storage.get_grounding_file_summaries()?[0].clone();
+
+    storage.update_file_metadata(
+        &FileInfo {
+            id: 10,
+            path: PathBuf::from("src/lib.rs"),
+            language: "rust".into(),
+            modification_time: 2,
+            indexed: true,
+            complete: true,
+            line_count: before.file.line_count + 1,
+            file_role: FileRole::Source,
+        },
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    )?;
+    assert!(!storage.has_ready_grounding_snapshots()?);
+
+    storage.rebind_grounding_file_snapshots(&[10])?;
+    assert!(storage.has_ready_grounding_snapshots()?);
+    let after = storage.get_grounding_file_summaries()?[0].clone();
+    assert_eq!(after.file.line_count, before.file.line_count + 1);
+    assert_eq!(after.symbol_count, before.symbol_count);
+    assert_eq!(after.best_node_rank, before.best_node_rank);
+    Ok(())
+}
+
+#[test]
 fn test_occurrence_insert() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     let nodes = vec![
@@ -8174,6 +10667,167 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn bounded_raw_incident_edges_do_not_open_endpoint_nodes_or_files() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "admitted".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "unadmitted".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(1),
+        source: NodeId(1),
+        target: NodeId(2),
+        kind: EdgeKind::CALL,
+        resolved_target: Some(NodeId(2)),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    }])?;
+
+    storage.conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TABLE node;
+         DROP TABLE file;",
+    )?;
+
+    let incident = storage.get_bounded_raw_incident_edges(NodeId(1), 8)?;
+    assert_eq!(incident.edges.len(), 1);
+    assert_eq!(incident.edges[0].id, EdgeId(1));
+    assert!(!incident.truncated);
+    Ok(())
+}
+
+#[test]
+fn induced_certain_edge_representatives_keep_connectors_after_dense_early_edges()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(
+        &(1..=16)
+            .map(|id| Node {
+                id: NodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("node_{id}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut edges = (1..=20)
+        .map(|id| Edge {
+            id: EdgeId(id),
+            source: NodeId(1),
+            target: NodeId(1),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    edges.extend((2..=16).map(|target| Edge {
+        id: EdgeId(100 + target),
+        source: NodeId(target - 1),
+        target: NodeId(target),
+        kind: EdgeKind::MEMBER,
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    }));
+    storage.insert_edges_batch(&edges)?;
+
+    let selected = storage.get_certain_edge_representatives_between_node_ids(
+        &(1..=16).map(NodeId).collect::<Vec<_>>(),
+    )?;
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.source != edge.target)
+            .count(),
+        15,
+        "dense self edges hid the connecting forest"
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.source == edge.target)
+            .count(),
+        1,
+        "parallel self edges were not represented once"
+    );
+    Ok(())
+}
+
+#[test]
+fn induced_certain_edge_representatives_preserve_distinct_kinds_for_one_pair()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "source".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::MEMBER,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+    ])?;
+
+    let selected =
+        storage.get_certain_edge_representatives_between_node_ids(&[NodeId(1), NodeId(2)])?;
+    assert_eq!(selected.len(), 2);
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .count(),
+        1
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER)
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -10362,6 +13016,22 @@ fn raw_call_edges_by_effective_source_match_the_broad_edge_filter() -> Result<()
         vec![EdgeId(1), EdgeId(2), EdgeId(5)],
         "selective route lookup lost deterministic edge-id order across branches"
     );
+    let exact_cap = storage.get_bounded_raw_call_edges_by_effective_source(NodeId(10), 3)?;
+    assert_eq!(exact_cap.edges, selective);
+    assert!(!exact_cap.truncated, "the exact cap is complete");
+    let cap_plus_one = storage.get_bounded_raw_call_edges_by_effective_source(NodeId(10), 2)?;
+    assert_eq!(
+        cap_plus_one
+            .edges
+            .iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2)]
+    );
+    assert!(
+        cap_plus_one.truncated,
+        "the query observes cap + 1 without returning an unbounded collection"
+    );
 
     // The trail accessor is not a substitute: its policy clears exactly the
     // resolution fields the route-handler DTO reports, for both the uncertain
@@ -10709,7 +13379,12 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+    const {
+        assert!(
+            CURRENT_SCHEMA_VERSION >= ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION,
+            "the current writer barrier must include the annotation cutover"
+        );
+    }
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");
@@ -11175,6 +13850,8 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
         read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
     let candidate_structural_text =
         read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
+    let candidate_proof_resolution =
+        read_proof_resolution_rollback_identity(&staged_path, &candidate)?;
     let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
 
     let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
@@ -11192,6 +13869,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
             &candidate,
             &candidate_source_policy,
             &candidate_structural_text,
+            &candidate_proof_resolution,
             Some(candidate_image),
         )?,
         PromotedValidation::ReusedCandidateReceipt,
@@ -11204,6 +13882,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
             &candidate,
             &candidate_source_policy,
             &candidate_structural_text,
+            &candidate_proof_resolution,
             None,
         )?,
         PromotedValidation::Revalidated,
@@ -11225,6 +13904,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
         &candidate,
         &candidate_source_policy,
         &candidate_structural_text,
+        &candidate_proof_resolution,
         Some(candidate_image),
     )
     .expect_err("a corrupted restore must fail the post-restore fence");

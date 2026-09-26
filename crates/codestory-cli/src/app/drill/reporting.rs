@@ -2,7 +2,7 @@ use super::summary_decision::{drill_suite_retrieval_label, ensure_trailing_newli
 use crate::args;
 use crate::args::{
     DrillOutput, DrillSuiteOutput, DrillSuiteRepoOutput, DrillSuiteRetrievalBlockerOutput,
-    DrillSummaryBridgesOutput, DrillSummarySourceTruthOutput,
+    DrillSummaryBridgesOutput, DrillSummaryEvidenceReviewOutput,
 };
 use crate::display;
 use crate::runtime;
@@ -61,8 +61,8 @@ pub(super) fn render_drill_suite_header(markdown: &mut String, output: &DrillSui
     let _ = writeln!(markdown, "- output_dir: `{}`", output.output_dir);
     let _ = writeln!(
         markdown,
-        "- repos: {} total, {} ready, {} degraded, {} blocked",
-        output.repo_count, output.ready_count, output.degraded_count, output.blocked_count
+        "- repos: {} total, {} available, {} partial, {} unavailable",
+        output.repo_count, output.available_count, output.partial_count, output.unavailable_count
     );
 }
 
@@ -92,7 +92,7 @@ pub(super) fn render_drill_suite_repo_table(markdown: &mut String, repos: &[Dril
     let _ = writeln!(markdown);
     let _ = writeln!(
         markdown,
-        "| repo | verdict | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
+        "| repo | availability | freshness | retrieval | anchors | bridges | evidence review | reports | next action |"
     );
     let _ = writeln!(markdown, "|---|---|---|---|---:|---:|---|---|---|");
     for repo in repos {
@@ -101,7 +101,7 @@ pub(super) fn render_drill_suite_repo_table(markdown: &mut String, repos: &[Dril
             markdown,
             "| `{}` | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
             repo.slug,
-            repo.summary.verdict.status,
+            repo.summary.availability.status,
             repo.summary
                 .mechanical
                 .freshness_status
@@ -111,9 +111,9 @@ pub(super) fn render_drill_suite_repo_table(markdown: &mut String, repos: &[Dril
             repo.summary.anchors.resolved,
             repo.summary.anchors.requested,
             drill_suite_bridge_label(&repo.summary.bridges),
-            drill_suite_source_truth_label(&repo.summary.source_truth),
+            drill_suite_evidence_review_label(&repo.summary.evidence_review),
             reports,
-            repo.summary.verdict.next_action.replace('|', "\\|")
+            repo.summary.availability.next_action.replace('|', "\\|")
         );
     }
 }
@@ -200,23 +200,15 @@ pub(super) fn drill_suite_bridge_label(bridges: &DrillSummaryBridgesOutput) -> S
     )
 }
 
-pub(super) fn drill_suite_source_truth_label(
-    source_truth: &DrillSummarySourceTruthOutput,
+pub(super) fn drill_suite_evidence_review_label(
+    evidence_review: &DrillSummaryEvidenceReviewOutput,
 ) -> String {
-    if source_truth.required
-        || source_truth.pending_check_count > 0
-        || source_truth.verified_check_count > 0
-    {
-        return format!(
-            "{} targets / {} verified / {} pending",
-            source_truth.target_file_count,
-            source_truth.verified_check_count,
-            source_truth.pending_check_count
-        );
-    }
     format!(
-        "{} targets / {} checks",
-        source_truth.target_file_count, source_truth.check_count
+        "{} evidence / {} gaps / {} targets / {} pending",
+        evidence_review.evidence_count,
+        evidence_review.gap_count,
+        evidence_review.target_file_count,
+        evidence_review.pending_target_count
     )
 }
 

@@ -1,8 +1,12 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
+use crate::content_addressed_vector_cache::{
+    ContentAddressedVectorCache, StagedVectorBatch, VectorCacheBatchInput, VectorCacheBatchLookup,
+    VectorCacheStagingLookup,
+};
 use crate::embedded_vector::{
-    AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
-    VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
-    producer_evidence_mismatches, vector_compatibility_identity,
+    AttestedSemanticPoint, CurrentVectorAnchor, EmbeddedVectorIndex, ExpectedVectorAnchor,
+    SemanticPoint, VectorEvidenceContract, VectorGenerationManifest,
+    build_vector_producer_evidence, producer_evidence_mismatches, vector_compatibility_identity,
     vector_producer_compatibility_identity,
 };
 use crate::generation::{
@@ -11,8 +15,10 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::lexical_index::{
-    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard,
-    finish_lexical_input_for_store, lexical_source_input,
+    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, PreparedLexicalInput,
+    build_prepared_lexical_shard_with_cancel, capture_lexical_generation_receipts,
+    finish_lexical_input_for_store, lexical_source_input, prepare_bounded_lexical_input,
+    prepare_lexical_input_for_store,
 };
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -21,29 +27,175 @@ use crate::retention::{
     scan_retention_protection, write_retention_marker,
 };
 use crate::scip_index::{
-    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
-    import_precise_semantic_scip_artifact,
+    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, capture_scip_generation_receipt,
+    emit_scip_artifacts_from_store_incremental_with_cancel, import_precise_semantic_scip_artifact,
+    reference_equivalent_scip_generation,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
+use codestory_contracts::validation_receipts::ArtifactSeal;
+use codestory_contracts::workspace::SourceIndexPolicy;
 #[cfg(test)]
 use codestory_store::LlmSymbolDoc;
 use codestory_store::{
-    DenseAnchorInput, FileRole, RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store,
-    SymbolSearchDoc,
+    DenseAnchorInput, FileRole, IndexPublicationRecord, RetrievalIndexManifest,
+    RetrievalIndexRollbackRecord, Store, SymbolSearchDoc,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(any(not(feature = "test-support"), test))]
 use std::fs::{self, File, OpenOptions};
 #[cfg(any(not(feature = "test-support"), test))]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(not(feature = "test-support"), test))]
+use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+thread_local! {
+    static FINALIZE_PHASE_TIMINGS: std::cell::RefCell<Option<(Instant, Vec<AccumulatedPhaseTiming>)>> =
+        const { std::cell::RefCell::new(None) };
+    static FINALIZE_COMPONENT_WORK: std::cell::RefCell<Vec<FinalizeComponentWork>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const INCREMENTAL_RETRIEVAL_RECEIPT_CAPACITY: usize = 128;
+
+/// Exact core-refresh evidence that permits a bounded retrieval transition.
+///
+/// Runtime constructs this only from a complete `RefreshExecutionPlan` after
+/// the new immutable core generation commits. Retrieval consumes it once and
+/// independently revalidates both core publications and the previous sidecar;
+/// it is never a readiness or freshness signal by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalRetrievalRefreshReceipt {
+    pub project_root: PathBuf,
+    pub storage_path: PathBuf,
+    pub previous_core: IndexPublicationRecord,
+    pub current_core: IndexPublicationRecord,
+    pub changed_existing_sources: Vec<String>,
+    /// Exact source identities captured by the complete core discovery pass.
+    /// Retrieval consumes these instead of walking the repository again while
+    /// preparing its bounded lexical transition.
+    pub source_seals: Vec<ArtifactSeal>,
+    pub source_policy: SourceIndexPolicy,
+    pub graph_projection_changed: bool,
+}
+
+impl IncrementalRetrievalRefreshReceipt {
+    pub fn validate(&self) -> Result<()> {
+        if self.project_root.as_os_str().is_empty()
+            || self.storage_path.as_os_str().is_empty()
+            || self.previous_core == self.current_core
+            || self.changed_existing_sources.is_empty()
+            || self.source_seals.is_empty()
+            || self.graph_projection_changed
+        {
+            bail!("incremental retrieval refresh receipt is not source-identity-only");
+        }
+        let mut previous: Option<&str> = None;
+        for path in &self.changed_existing_sources {
+            let candidate = Path::new(path);
+            if path.trim().is_empty()
+                || candidate.is_absolute()
+                || candidate
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                || previous.is_some_and(|previous| previous >= path.as_str())
+            {
+                bail!("incremental retrieval refresh receipt paths are not canonical");
+            }
+            previous = Some(path.as_str());
+        }
+        let mut previous_path: Option<&Path> = None;
+        for seal in &self.source_seals {
+            let path = seal.path();
+            if !path.is_absolute()
+                || !path.starts_with(&self.project_root)
+                || previous_path.is_some_and(|previous| previous >= path)
+            {
+                bail!("incremental retrieval source seals are not canonical");
+            }
+            previous_path = Some(path);
+        }
+        Ok(())
+    }
+}
+
+static INCREMENTAL_RETRIEVAL_RECEIPTS: LazyLock<
+    Mutex<HashMap<PathBuf, IncrementalRetrievalRefreshReceipt>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Install one bounded-refresh receipt after the named core publication has
+/// committed. A later publication on the same storage replaces stale work.
+pub fn install_incremental_retrieval_refresh_receipt(
+    receipt: IncrementalRetrievalRefreshReceipt,
+) -> Result<()> {
+    receipt.validate()?;
+    let mut receipts = INCREMENTAL_RETRIEVAL_RECEIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if receipts.len() >= INCREMENTAL_RETRIEVAL_RECEIPT_CAPACITY
+        && !receipts.contains_key(&receipt.storage_path)
+    {
+        receipts.clear();
+    }
+    receipts.insert(receipt.storage_path.clone(), receipt);
+    Ok(())
+}
+
+/// Clear any unconsumed receipt when a caller knows a non-incremental
+/// publication superseded it.
+pub fn clear_incremental_retrieval_refresh_receipt(storage_path: &Path) {
+    INCREMENTAL_RETRIEVAL_RECEIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(storage_path);
+}
+
+fn take_incremental_retrieval_refresh_receipt(
+    project_root: &Path,
+    storage_path: &Path,
+    current_core: &IndexPublicationRecord,
+) -> Option<IncrementalRetrievalRefreshReceipt> {
+    let receipt = INCREMENTAL_RETRIEVAL_RECEIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(storage_path)?;
+    (receipt.project_root == project_root
+        && receipt.storage_path == storage_path
+        && &receipt.current_core == current_core
+        && receipt.validate().is_ok())
+    .then_some(receipt)
+}
+
+#[derive(Debug)]
+struct AccumulatedPhaseTiming {
+    phase: String,
+    elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizePhaseTiming {
+    pub phase: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeComponentWork {
+    pub component: String,
+    pub mode: String,
+    pub retained: Option<u64>,
+    pub inserted: Option<u64>,
+    pub removed: Option<u64>,
+    pub reordered: Option<u64>,
+    pub predecessor_bytes: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub attested_bytes: Option<u64>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizeIndexOutcome {
@@ -53,6 +205,149 @@ pub struct FinalizeIndexOutcome {
     pub scip_stubbed: bool,
     pub generation_retention_plan: GenerationRetentionPlan,
     pub generation_retention: GenerationRetentionApplyReport,
+    #[serde(skip)]
+    pub phase_timings: Vec<FinalizePhaseTiming>,
+    #[serde(skip)]
+    pub component_work: Vec<FinalizeComponentWork>,
+}
+
+fn begin_finalize_phase_timings() {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        *state.borrow_mut() = Some((Instant::now(), Vec::new()));
+    });
+    FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+}
+
+fn record_finalize_component_work(
+    component: &'static str,
+    mode: &'static str,
+    retained: Option<u64>,
+    inserted: Option<u64>,
+    removed: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        state.borrow_mut().push(FinalizeComponentWork {
+            component: component.to_string(),
+            mode: mode.to_string(),
+            retained,
+            inserted,
+            removed,
+            reordered: None,
+            predecessor_bytes: None,
+            output_bytes: None,
+            attested_bytes: None,
+        });
+    });
+}
+
+fn record_finalize_component_details(
+    component: &'static str,
+    reordered: Option<u64>,
+    predecessor_bytes: Option<u64>,
+    output_bytes: Option<u64>,
+    attested_bytes: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        if let Some(work) = state
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|work| work.component == component)
+        {
+            work.reordered = reordered;
+            work.predecessor_bytes = predecessor_bytes;
+            work.output_bytes = output_bytes;
+            work.attested_bytes = attested_bytes;
+        }
+    });
+}
+
+fn component_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn finish_finalize_component_work() -> Vec<FinalizeComponentWork> {
+    FINALIZE_COMPONENT_WORK.with(|state| std::mem::take(&mut *state.borrow_mut()))
+}
+
+pub(crate) fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        if let Some((_, timings)) = state.borrow_mut().as_mut() {
+            if let Some(timing) = timings.iter_mut().find(|timing| timing.phase == phase) {
+                timing.elapsed = timing.elapsed.saturating_add(elapsed);
+            } else {
+                timings.push(AccumulatedPhaseTiming {
+                    phase: phase.to_string(),
+                    elapsed,
+                });
+            }
+        }
+    });
+    info!(phase, elapsed_ms, "retrieval finalization phase completed");
+}
+
+fn finish_finalize_phase_timings() -> Vec<FinalizePhaseTiming> {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        let Some((started, mut accumulated)) = state.borrow_mut().take() else {
+            return Vec::new();
+        };
+        let vector_total = accumulated
+            .iter()
+            .filter(|timing| {
+                matches!(
+                    timing.phase.as_str(),
+                    "embedded vectors" | "incremental embedded vectors"
+                )
+            })
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let vector_subphases = accumulated
+            .iter()
+            .filter(|timing| timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        if !vector_total.is_zero() {
+            accumulated.push(AccumulatedPhaseTiming {
+                phase: "vector ipc and orchestration".to_string(),
+                elapsed: vector_total.saturating_sub(vector_subphases),
+            });
+        }
+        let attributed = accumulated
+            .iter()
+            .filter(|timing| !timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let total = started.elapsed();
+        let mut timings = accumulated
+            .into_iter()
+            .map(|timing| FinalizePhaseTiming {
+                phase: timing.phase,
+                elapsed_ms: u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX),
+            })
+            .collect::<Vec<_>>();
+        timings.push(FinalizePhaseTiming {
+            phase: "unattributed".to_string(),
+            elapsed_ms: u64::try_from(total.saturating_sub(attributed).as_millis())
+                .unwrap_or(u64::MAX),
+        });
+        timings
+    })
+}
+
+fn record_embedding_vector_timings(timings: crate::per_user_embedding::EmbeddingVectorTimings) {
+    record_finalize_phase_timing(
+        "vector tokenization",
+        Duration::from_nanos(timings.tokenization_ns),
+    );
+    record_finalize_phase_timing(
+        "vector native encode",
+        Duration::from_nanos(timings.native_encode_ns),
+    );
+    record_finalize_phase_timing(
+        "vector normalization",
+        Duration::from_nanos(timings.normalization_ns),
+    );
 }
 
 /// Typed signal that source-derived retrieval input drifted during preparation.
@@ -81,7 +376,7 @@ impl SidecarInputChanged {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("retrieval index cancelled before {boundary}")]
 pub struct RetrievalIndexCancelled {
-    boundary: &'static str,
+    pub(crate) boundary: &'static str,
 }
 
 pub fn is_retrieval_index_cancelled(error: &anyhow::Error) -> bool {
@@ -115,6 +410,25 @@ struct LeaseMemoizedSidecarInputFingerprint {
     embedding_dim: i32,
     producer_compatibility_identity: String,
     fingerprint: SidecarInputFingerprint,
+}
+
+impl LeaseMemoizedSidecarInputFingerprint {
+    fn matches(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        project_id: &str,
+        embedding_backend: &str,
+        embedding_dim: i32,
+        producer_compatibility_identity: &str,
+    ) -> bool {
+        self.project_root == project_root
+            && self.storage_path == storage_path
+            && self.project_id == project_id
+            && self.embedding_backend == embedding_backend
+            && self.embedding_dim == embedding_dim
+            && self.producer_compatibility_identity == producer_compatibility_identity
+    }
 }
 
 const LEASE_SIDECAR_INPUT_FINGERPRINT_KEY: &str = "sidecar-input-fingerprint-v1";
@@ -151,7 +465,16 @@ struct GenerationRetentionContext<'a> {
     previous_manifest: Option<&'a RetrievalIndexManifest>,
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
     embedding_residency: crate::embeddings::ProductEmbeddingResidencyLease,
-    producer_compatibility_identity: String,
+    pinned_core_publication: codestory_store::IndexPublicationRecord,
+    graph_equivalent_predecessor: Option<GraphEquivalentPredecessor>,
+}
+
+#[derive(Debug, Clone)]
+struct GraphEquivalentPredecessor {
+    manifest: RetrievalIndexManifest,
+    core_publication: IndexPublicationRecord,
+    core_database_path: PathBuf,
+    dense_anchor_manifest: codestory_store::DenseAnchorPublicationManifest,
 }
 
 struct PreparedGenerationRetention {
@@ -542,28 +865,31 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
+    begin_finalize_phase_timings();
     ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
     let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
     let project_id = project_identity.artifact_scope_id;
     let workspace_id = project_identity.workspace_id;
     let global_gc_state_file = global_generation_gc_state_file(runtime);
-    // Both waits can sit behind a sibling's whole publication pass. The
-    // finalize caller's cancellation flag is in scope here, so pass it: a
-    // cancelled activation must leave these waits at once instead of holding
-    // an eviction or shutdown open for the peer's commit.
+    // Keep global cleanup from retiring the predecessor while this build still
+    // references it. This shared lock never excludes packet readers.
     let _global_gc_lock = GenerationRetentionLock::acquire_shared_with_cancel(
         &global_gc_state_file,
         GLOBAL_GENERATION_GC_LOCK_SCOPE,
         Some(cancelled),
     )
     .context("coordinate sidecar publication with global generation cleanup")?;
-    let _generation_lock = GenerationRetentionLock::acquire_with_cancel(
+    // Finalizers for one project still serialize, but on a writer-only scope.
+    // Packet readers hold the project retention scope and therefore continue
+    // serving the old coherent publication while the new components build.
+    let writer_scope = format!("writer-{project_id}");
+    let _writer_lock = GenerationRetentionLock::acquire_with_cancel(
         &layout.state_file,
-        &project_id,
+        &writer_scope,
         Some(cancelled),
     )
-    .context("lock sidecar generation publication and retention")?;
+    .context("lock sidecar generation construction")?;
     layout.ensure_data_dirs()?;
     let embedding_residency =
         crate::embeddings::acquire_product_embedding_residency_for_runtime(runtime)
@@ -582,9 +908,8 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         u32::try_from(embedding_dim).context("negative embedding dimension")?,
     )?;
 
+    let fingerprint_started = Instant::now();
     let storage = Store::open(storage_path).context("open storage for retrieval sidecar input")?;
-    let lexical_source =
-        lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
     let input_snapshot = storage
         .read_snapshot()
         .context("open coherent sidecar input snapshot")?;
@@ -593,21 +918,154 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         dimension: embedding_dim,
         producer_compatibility_identity: &producer_compatibility_identity,
     };
-    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
+    let pinned_core_publication = input_snapshot
+        .storage()
+        .get_complete_index_publication()
+        .context("load pinned core publication for retrieval finalization")?
+        .context("retrieval finalization requires a complete core publication")?;
+    let bounded_receipt = take_incremental_retrieval_refresh_receipt(
+        project_root,
+        storage_path,
+        &pinned_core_publication,
+    );
+    let first_external_publication =
+        external_retrieval_publication_is_physically_absent(storage_path)?;
+    let (previous_manifest, previous_bound_manifest) = if first_external_publication {
+        (None, None)
+    } else {
+        let exact_core_predecessor = bounded_receipt
+            .as_ref()
+            .map(|receipt| {
+                storage.get_retrieval_index_manifest_bound_to_core(
+                    &receipt.previous_core.generation_id,
+                    &receipt.previous_core.run_id,
+                )
+            })
+            .transpose()
+            .context("load retrieval publication for the exact predecessor core")?
+            .flatten();
+        let previous_manifest = exact_core_predecessor
+            .as_ref()
+            .map(|bound| bound.manifest.clone())
+            .map(Some)
+            .unwrap_or(physical_predecessor_manifest(&storage, &project_id)?);
+        let previous_bound_manifest = match exact_core_predecessor.as_ref() {
+            Some(bound) => Some(bound.clone()),
+            None => storage
+                .get_bound_retrieval_index_manifest(&project_id)
+                .context("load exact predecessor retrieval publication")?,
+        };
+        (previous_manifest, previous_bound_manifest)
+    };
+    let graph_equivalent_predecessor = bounded_receipt
+        .as_ref()
+        .zip(previous_bound_manifest.as_ref())
+        .and_then(|(receipt, bound)| {
+            let manifest = &bound.manifest;
+            if bound.core.generation_id != receipt.previous_core.generation_id
+                || bound.core.run_id != receipt.previous_core.run_id
+                || !manifest_has_current_sidecar_contract(&manifest.project_id, manifest)
+                || manifest.lexical_version != LEXICAL_INDEX_VERSION
+            {
+                return None;
+            }
+            let core_database_path = codestory_store::resolve_core_generation_database_path(
+                storage_path,
+                &receipt.previous_core.generation_id,
+            )
+            .ok()?;
+            let previous_core = Store::open_immutable_generation(&core_database_path).ok()?;
+            if previous_core
+                .get_complete_index_publication()
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(&receipt.previous_core)
+            {
+                return None;
+            }
+            let dense_anchor_manifest = previous_core
+                .validate_dense_anchor_publication_sealed(
+                    &core_database_path,
+                    &receipt.previous_core,
+                )
+                .ok()?
+                .manifest;
+            Some(GraphEquivalentPredecessor {
+                manifest: manifest.clone(),
+                core_publication: receipt.previous_core.clone(),
+                core_database_path,
+                dense_anchor_manifest,
+            })
+        });
+    let bounded_preparation = bounded_receipt
+        .as_ref()
+        .zip(graph_equivalent_predecessor.as_ref())
+        .and_then(|(receipt, predecessor)| {
+            let manifest = &predecessor.manifest;
+            let graph = GraphProjectionIdentity {
+                symbol_doc_count: manifest.symbol_doc_count?,
+                graph_artifact_hash: manifest.graph_artifact_hash.clone()?,
+                semantic_policy_version: manifest.semantic_policy_version.clone(),
+            };
+            let previous_generation = manifest.sidecar_generation.as_deref()?;
+            prepare_bounded_lexical_input(
+                project_root,
+                input_snapshot.storage(),
+                storage_path,
+                &predecessor.core_database_path,
+                &layout.lexical_data_dir,
+                previous_generation,
+                &receipt.changed_existing_sources,
+                &receipt.source_seals,
+                &receipt.source_policy,
+            )
+            .ok()
+            .flatten()
+            .map(|prepared| (prepared, graph))
+        });
+    let (prepared_lexical, precomputed_graph) = match bounded_preparation {
+        Some((prepared, graph)) => (prepared, Some(graph)),
+        None => {
+            let lexical_source = lexical_source_input(project_root, storage_path)
+                .context("hash lexical source input")?;
+            (
+                prepare_lexical_input_for_store(
+                    lexical_source,
+                    project_root,
+                    input_snapshot.storage(),
+                )
+                .context("prepare pinned lexical input")?,
+                None,
+            )
+        }
+    };
+    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_fingerprint(
         input_snapshot.storage(),
         project_root,
+        storage_path,
         &project_id,
         &embedding_contract,
-        lexical_source,
+        prepared_lexical.fingerprint.clone(),
+        precomputed_graph.as_ref(),
+    )?;
+    let sidecar_input = memoize_pinned_sidecar_input_fingerprint(
+        project_root,
+        storage_path,
+        &project_id,
+        &embedding_backend,
+        embedding_dim,
+        &producer_compatibility_identity,
+        sidecar_input,
     )?;
     input_snapshot
         .finish()
         .context("finish coherent sidecar input snapshot")?;
-    let previous_manifest = storage
-        .get_retrieval_index_manifest(&project_id)
-        .context("load previous retrieval_index_manifest")?;
-    let mut previous_manifest_unavailable_reason =
-        previous_manifest.as_ref().and_then(|manifest| {
+    record_finalize_phase_timing("input fingerprint", fingerprint_started.elapsed());
+    let mut previous_manifest_unavailable_reason = previous_manifest
+        .as_ref()
+        .filter(|manifest| manifest.project_id == project_id)
+        .and_then(|manifest| {
             manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
         });
     if previous_manifest_unavailable_reason.is_none()
@@ -624,9 +1082,15 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             .context("load complete core publication for retrieval reuse")?
             .context("retrieval reuse requires a complete core publication")
             .and_then(|publication| {
-                crate::embedded_vector::validate_generation_evidence_for_publication(
+                let core_path = codestory_store::resolve_core_generation_database_path(
+                    storage_path,
+                    &publication.generation_id,
+                )
+                .context("resolve reusable retrieval core generation")?;
+                crate::embedded_vector::validate_sealed_generation_evidence_for_publication(
                     &layout,
                     &storage,
+                    &core_path,
                     manifest,
                     &publication,
                     runtime,
@@ -648,7 +1112,8 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         previous_manifest: previous_manifest.as_ref(),
         embedding_device: &embedding_device,
         embedding_residency,
-        producer_compatibility_identity,
+        pinned_core_publication,
+        graph_equivalent_predecessor,
     };
 
     if let Some(previous) = previous_manifest.as_ref() {
@@ -682,14 +1147,60 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             };
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
             if unchanged_generation_is_reusable(&status, semantic_point_count) {
+                record_finalize_component_work(
+                    "lexical",
+                    "reused",
+                    Some(prepared_lexical.document_count()),
+                    Some(0),
+                    Some(0),
+                );
+                record_finalize_component_work(
+                    "vectors",
+                    "reused",
+                    semantic_point_count,
+                    Some(0),
+                    Some(0),
+                );
+                let vector_bytes = component_size(&crate::embedded_vector::index_path(
+                    &layout,
+                    &previous.semantic_generation,
+                ));
+                record_finalize_component_details(
+                    "vectors",
+                    None,
+                    None,
+                    vector_bytes,
+                    vector_bytes,
+                );
+                record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
                 let mut manifest = previous.clone();
                 if let Some(generation) = manifest.sidecar_generation.clone() {
                     let scip_dir = layout.scip_project_dir(&generation);
+                    let lexical_bytes = crate::lexical_index::lexical_component_bytes(
+                        &crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, &generation),
+                    );
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        None,
+                        lexical_bytes,
+                        lexical_bytes,
+                    );
+                    let graph_bytes =
+                        component_size(&crate::scip_index::scip_symbols_component_path(&scip_dir));
+                    record_finalize_component_details(
+                        "graph",
+                        Some(0),
+                        None,
+                        graph_bytes,
+                        graph_bytes,
+                    );
                     if update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?
                     {
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
+                            &prepared_lexical,
                             &retention_context,
                             cancelled,
                             &sidecar_input,
@@ -711,6 +1222,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
                 return persist_finalized_manifest(
                     project_root,
                     storage_path,
+                    &prepared_lexical,
                     &retention_context,
                     cancelled,
                     &sidecar_input,
@@ -774,61 +1286,157 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
-        ensure_lexical_generation(
-            project_root,
-            storage_path,
-            &layout,
-            &generation,
-            &LexicalInputFingerprint {
-                file_count: sidecar_input.lexical_file_count,
-                hash: sidecar_input.lexical_hash.clone(),
-                coverage: sidecar_input.lexical_coverage.clone(),
-            },
-            &sidecar_input.hash,
-            lexical_ready,
-        )
-    })?;
+    // Lexical shards, dense vectors, and SCIP graph artifacts are independent once
+    // the pinned core + sidecar fingerprint are fixed. Keycloak-class cores spend
+    // ~40s on SCIP alone after embed; overlapping the three under publication@75
+    // is what keeps the frozen 180s prep budget reachable.
+    progress("lexical sidecar");
+    progress("graph artifact");
+    let previous_sidecar_generation = previous_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_generation.as_deref());
+    let previous_scip_dir =
+        previous_sidecar_generation.map(|previous| layout.scip_project_dir(previous));
+    let mut graph_manifest = manifest.clone();
+    let (lexical_outcome, _semantic_point_count, graph_revision) = thread::scope(|scope| {
+        let lexical_handle = scope.spawn(|| {
+            FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+            let started = Instant::now();
+            let result = ensure_lexical_generation(
+                &layout,
+                &generation,
+                &prepared_lexical,
+                &sidecar_input.hash,
+                previous_sidecar_generation,
+                cancelled,
+                lexical_ready,
+            );
+            let work = finish_finalize_component_work();
+            (result, started.elapsed(), work)
+        });
+        let graph_handle = scope.spawn(|| {
+            FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+            let started = Instant::now();
+            let result = ensure_scip_artifacts(
+                storage_path,
+                &scip_dir,
+                &project_id,
+                &generation,
+                previous_scip_dir.clone(),
+                previous_manifest.as_ref(),
+                &sidecar_input,
+                cancelled,
+                scip_ready,
+                &mut graph_manifest,
+            );
+            let work = finish_finalize_component_work();
+            let revision = graph_manifest.scip_revision.clone();
+            (result, started.elapsed(), work, revision)
+        });
 
-    let _semantic_point_count = ensure_semantic_index(
-        storage_path,
-        &project_id,
-        &semantic_generation,
-        semantic_ready_points,
-        &retention_context,
-        cancelled,
-        &mut progress,
-    )?;
-
-    with_finalize_progress(&mut progress, "graph artifact", || {
-        ensure_scip_artifacts(
+        let semantic_point_count = ensure_semantic_index(
             storage_path,
-            &scip_dir,
             &project_id,
-            &generation,
-            scip_ready,
-            &mut manifest,
-        )
+            &semantic_generation,
+            semantic_ready_points,
+            &retention_context,
+            cancelled,
+            &mut progress,
+        );
+
+        let (lexical_result, lexical_elapsed, lexical_work) =
+            lexical_handle.join().unwrap_or_else(|_| {
+                (
+                    Err(anyhow::anyhow!("lexical sidecar worker panicked")),
+                    Duration::ZERO,
+                    Vec::new(),
+                )
+            });
+        let (graph_result, graph_elapsed, graph_work, graph_revision) =
+            graph_handle.join().unwrap_or_else(|_| {
+                (
+                    Err(anyhow::anyhow!("graph artifact worker panicked")),
+                    Duration::ZERO,
+                    Vec::new(),
+                    None,
+                )
+            });
+
+        record_finalize_phase_timing("lexical sidecar", lexical_elapsed);
+        record_finalize_phase_timing("graph artifact", graph_elapsed);
+        FINALIZE_COMPONENT_WORK.with(|state| {
+            let mut work = state.borrow_mut();
+            work.extend(lexical_work);
+            work.extend(graph_work);
+        });
+
+        let lexical_outcome = lexical_result?;
+        graph_result?;
+        let semantic_point_count = semantic_point_count?;
+        Ok::<_, anyhow::Error>((lexical_outcome, semantic_point_count, graph_revision))
     })?;
+    manifest.scip_revision = graph_revision.or(manifest.scip_revision);
     update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?;
 
     manifest.lexical_version = lexical_outcome.version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
-    with_finalize_progress(&mut progress, "manifest write", || {
-        persist_finalized_manifest(
-            project_root,
-            storage_path,
-            &retention_context,
-            cancelled,
-            &sidecar_input,
-            project_id,
-            manifest,
-            degraded_modes,
-            SidecarStubFlags { scip_stubbed },
-        )
-    })
+    progress("manifest write");
+    persist_finalized_manifest(
+        project_root,
+        storage_path,
+        &prepared_lexical,
+        &retention_context,
+        cancelled,
+        &sidecar_input,
+        project_id,
+        manifest,
+        degraded_modes,
+        SidecarStubFlags { scip_stubbed },
+    )
+}
+
+fn physical_predecessor_manifest(
+    storage: &Store,
+    project_id: &str,
+) -> Result<Option<RetrievalIndexManifest>> {
+    if let Some(manifest) = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load previous retrieval_index_manifest")?
+    {
+        return Ok(Some(manifest));
+    }
+    Ok(storage
+        .list_retrieval_index_manifests()
+        .context("load physical predecessor retrieval manifests")?
+        .into_iter()
+        .filter(|manifest| manifest_has_current_sidecar_contract(&manifest.project_id, manifest))
+        .max_by(|left, right| {
+            left.built_at_epoch_ms
+                .cmp(&right.built_at_epoch_ms)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+        }))
+}
+
+/// Distinguish the first external retrieval publication from every strict-read failure.
+///
+/// Production callers hold the project finalization lock. Embedded legacy storage deliberately
+/// returns false so its existing manifest-row semantics remain authoritative.
+fn external_retrieval_publication_is_physically_absent(storage_path: &Path) -> Result<bool> {
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+        .context("resolve core publication layout for retrieval finalization")?;
+    if layout
+        .read_pointer()
+        .context("read core publication layout for retrieval finalization")?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        std::fs::symlink_metadata(layout.retrieval_publication_path()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ))
 }
 
 fn with_finalize_progress<T>(
@@ -837,32 +1445,101 @@ fn with_finalize_progress<T>(
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     progress(phase);
-    action()
+    let started = Instant::now();
+    let result = action();
+    record_finalize_phase_timing(phase, started.elapsed());
+    result
 }
 
 fn ensure_lexical_generation(
-    project_root: &Path,
-    storage_path: &Path,
     layout: &SidecarLayout,
     generation: &str,
-    expected: &LexicalInputFingerprint,
+    expected: &PreparedLexicalInput,
     sidecar_input_hash: &str,
+    previous_generation: Option<&str>,
+    cancelled: &AtomicBool,
     mut lexical_ready: bool,
 ) -> Result<LexicalGenerationOutcome> {
+    let output_shard = crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, generation);
     if lexical_ready {
         info!(sidecar_generation = %generation, "SQLite lexical shard reused");
+        record_finalize_component_work(
+            "lexical",
+            "reused",
+            Some(expected.document_count()),
+            Some(0),
+            Some(0),
+        );
+        let output_bytes = crate::lexical_index::lexical_component_bytes(&output_shard);
+        record_finalize_component_details("lexical", None, None, output_bytes, output_bytes);
     } else {
-        match build_lexical_shard(
-            project_root,
-            Some(storage_path),
+        match build_prepared_lexical_shard_with_cancel(
             &layout.lexical_data_dir,
             generation,
             expected,
             sidecar_input_hash,
+            previous_generation,
+            &|| cancelled.load(Ordering::Acquire),
+            || ensure_retrieval_index_not_cancelled(cancelled, "lexical shard publication"),
         ) {
-            Ok(_) => {
+            Ok((_, work)) => {
                 lexical_ready = true;
-                info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                if let Some(work) = work {
+                    record_finalize_component_work(
+                        "lexical",
+                        work.mode(),
+                        Some(work.retained),
+                        Some(work.inserted),
+                        Some(work.removed),
+                    );
+                    let predecessor_bytes = previous_generation.and_then(|previous| {
+                        crate::lexical_index::lexical_component_bytes(
+                            &crate::lexical_index::shard_dir_for(
+                                &layout.lexical_data_dir,
+                                previous,
+                            ),
+                        )
+                    });
+                    let output_bytes = crate::lexical_index::lexical_component_bytes(&output_shard);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        predecessor_bytes,
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(
+                        sidecar_generation = %generation,
+                        retained_document_count = work.retained,
+                        inserted_document_count = work.inserted,
+                        removed_document_count = work.removed,
+                        "SQLite lexical shard reconciled from immutable predecessor"
+                    );
+                } else {
+                    record_finalize_component_work(
+                        "lexical",
+                        "complete",
+                        Some(0),
+                        Some(expected.document_count()),
+                        Some(0),
+                    );
+                    let output_bytes = crate::lexical_index::lexical_component_bytes(&output_shard);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        previous_generation.and_then(|previous| {
+                            crate::lexical_index::lexical_component_bytes(
+                                &crate::lexical_index::shard_dir_for(
+                                    &layout.lexical_data_dir,
+                                    previous,
+                                ),
+                            )
+                        }),
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                }
             }
             Err(error) => {
                 bail!("mandatory SQLite lexical shard build failed for {generation}: {error}")
@@ -873,8 +1550,8 @@ fn ensure_lexical_generation(
         || !crate::lexical_index::shard_matches_lexical_input(
             &layout.lexical_data_dir,
             generation,
-            expected.file_count,
-            &expected.hash,
+            expected.fingerprint.file_count,
+            &expected.fingerprint.hash,
             sidecar_input_hash,
         )
     {
@@ -904,8 +1581,140 @@ fn ensure_semantic_index(
         .get_complete_index_publication()
         .context("read pinned core publication for vector generation")?
         .context("dense anchor inputs require a complete core publication")?;
-    let expected_source_identity =
-        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let dense_publication = snapshot
+        .storage()
+        .get_dense_anchor_publication_manifest()
+        .context("load pinned dense-anchor publication")?
+        .context("dense anchor inputs require a complete dense-anchor publication")?;
+    if !dense_publication.complete
+        || dense_publication.schema_version
+            != codestory_store::DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+        || dense_publication.core_generation_id != publication.generation_id
+        || dense_publication.core_run_id != publication.run_id
+        || dense_publication.anchor_source_identity.trim().is_empty()
+    {
+        bail!("dense-anchor publication does not match the pinned core generation");
+    }
+    let core_database_path = codestory_store::resolve_core_generation_database_path(
+        storage_path,
+        &publication.generation_id,
+    )
+    .context("resolve immutable core for vector generation")?;
+    let dense_validation = snapshot
+        .storage()
+        .validate_dense_anchor_publication_sealed(&core_database_path, &publication)
+        .context("validate pinned dense-anchor publication")?;
+    if dense_validation.manifest != dense_publication
+        || i64::try_from(dense_validation.anchors.len()).unwrap_or(i64::MAX)
+            != semantic.expected_points
+    {
+        bail!("sealed dense-anchor publication does not match vector input");
+    }
+    let evidence = build_vector_producer_evidence(
+        retention.embedding_device,
+        retention.embedding_residency.identity(),
+        u32::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: semantic.generation.to_string(),
+            retrieval_input_hash: semantic.input_hash.to_string(),
+            semantic_generation: semantic.collection.to_string(),
+        },
+    );
+    let compatibility_identity = vector_compatibility_identity(&evidence)?;
+    let dimension =
+        usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?;
+    let contract = VectorEvidenceContract::new(
+        semantic.embedding_backend,
+        dimension,
+        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+        &compatibility_identity,
+    );
+    let expected_anchors = dense_validation
+        .anchors
+        .iter()
+        .map(|anchor| ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    if semantic_ready_points.is_none()
+        && let Some(predecessor) = retention.graph_equivalent_predecessor.as_ref()
+        && predecessor.manifest.semantic_generation != semantic.collection
+        && predecessor.core_publication.generation_id
+            == predecessor.dense_anchor_manifest.core_generation_id
+        && predecessor.core_publication.run_id == predecessor.dense_anchor_manifest.core_run_id
+        && let Some((attestation, work)) =
+            with_finalize_progress(progress, "incremental embedded vectors", || {
+                EmbeddedVectorIndex::try_reference_graph_equivalent_with_cancel(
+                    crate::embedded_vector::AttestedVectorPublication {
+                        layout: semantic.layout,
+                        collection: semantic.collection,
+                        generation: semantic.generation,
+                        input_hash: semantic.input_hash,
+                        contract: &contract,
+                        expected_anchors: &expected_anchors,
+                    },
+                    &predecessor.manifest.semantic_generation,
+                    &evidence,
+                    &predecessor.dense_anchor_manifest,
+                    &dense_validation.manifest,
+                    || {
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "graph-equivalent vector publication",
+                        )
+                    },
+                )
+            })?
+    {
+        let point_count = attestation.point_count;
+        record_finalize_component_work("vectors", "reused", Some(work.retained), Some(0), Some(0));
+        let predecessor_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            &predecessor.manifest.semantic_generation,
+        ));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
+        let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
+        snapshot
+            .finish()
+            .context("finish graph-equivalent dense anchor input generation")?;
+        return Ok(point_count);
+    }
+
+    let expected_source_identity = dense_publication.anchor_source_identity;
     let mut anchors = Vec::<DenseAnchorInput>::new();
     let mut after = None;
     loop {
@@ -936,32 +1745,18 @@ fn ensure_semantic_index(
             anchors.len()
         );
     }
-    let evidence = build_vector_producer_evidence(
-        retention.embedding_device,
-        retention.embedding_residency.identity(),
-        u32::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
-        EmbeddingVectorPublicationIdentityDto {
-            core_generation_id: publication.generation_id.clone(),
-            core_run_id: publication.run_id.clone(),
-            retrieval_generation: semantic.generation.to_string(),
-            retrieval_input_hash: semantic.input_hash.to_string(),
-            semantic_generation: semantic.collection.to_string(),
-        },
-    );
-    let compatibility_identity = vector_compatibility_identity(&evidence)?;
-    let dimension =
-        usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?;
-    let contract = VectorEvidenceContract::new(
-        semantic.embedding_backend,
-        dimension,
-        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-        &compatibility_identity,
-    );
-    let expected_anchors = anchors
+    let current_vector_anchors = anchors
         .iter()
-        .map(|anchor| ExpectedVectorAnchor {
+        .map(|anchor| CurrentVectorAnchor {
             node_id: anchor.node_id.0.to_string(),
             document_hash: anchor.document_hash.clone(),
+            display_name: anchor
+                .qualified_name
+                .clone()
+                .unwrap_or_else(|| anchor.display_name.clone()),
+            file_path: anchor.file_path.clone(),
+            file_role: Some(anchor.file_role),
+            dense_reason: Some(anchor.selection_reason.clone()),
         })
         .collect::<Vec<_>>();
 
@@ -1001,14 +1796,174 @@ fn ensure_semantic_index(
             }
         }
     });
+    let mut content_vector_cache = if reusable_point_count.is_none() {
+        match ContentAddressedVectorCache::open(
+            retention.runtime,
+            project_id,
+            &compatibility_identity,
+            dimension,
+        ) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    error = %format!("{error:#}"),
+                    "content-addressed vector reuse is unavailable"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dense_anchor_canonical_ids = if content_vector_cache.is_some() {
+        ensure_retrieval_index_not_cancelled(cancelled, "resolving dense anchor cache identities")?;
+        load_dense_anchor_canonical_ids_for_cache(
+            snapshot.storage(),
+            &anchors,
+            project_id,
+            &mut content_vector_cache,
+        )
+    } else {
+        None
+    };
+    if content_vector_cache.is_some() {
+        ensure_retrieval_index_not_cancelled(cancelled, "planning dense anchor cache identities")?;
+    }
 
     let point_count = if let Some(point_count) = reusable_point_count {
+        record_finalize_component_work("vectors", "reused", Some(point_count), Some(0), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details("vectors", None, None, output_bytes, output_bytes);
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
             point_count,
             "attested vector generation reused"
         );
+        point_count
+    } else if let Some((attestation, work)) = retention
+        .previous_manifest
+        .filter(|previous| previous.semantic_generation != semantic.collection)
+        .map(|previous| {
+            with_finalize_progress(progress, "incremental embedded vectors", || {
+                EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                    crate::embedded_vector::AttestedVectorPublication {
+                        layout: semantic.layout,
+                        collection: semantic.collection,
+                        generation: semantic.generation,
+                        input_hash: semantic.input_hash,
+                        contract: &contract,
+                        expected_anchors: &expected_anchors,
+                    },
+                    &previous.semantic_generation,
+                    &evidence,
+                    &current_vector_anchors,
+                    &|| cancelled.load(Ordering::Acquire),
+                    || {
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "incremental vector database publication",
+                        )
+                    },
+                    |missing, visit| {
+                        produce_missing_dense_anchors(
+                            &anchors,
+                            missing,
+                            dense_anchor_canonical_ids.as_ref(),
+                            retention.runtime,
+                            cancelled,
+                            &mut content_vector_cache,
+                            visit,
+                        )
+                    },
+                )
+            })
+        })
+        .transpose()?
+        .flatten()
+    {
+        record_finalize_component_work(
+            "vectors",
+            if work.direct_reference {
+                "reused"
+            } else if work
+                .stage
+                .is_some_and(|stage| stage.strategy == codestory_store::SealedStageStrategy::Copied)
+            {
+                "copied"
+            } else {
+                "copy_on_write"
+            },
+            Some(work.retained),
+            Some(work.inserted),
+            Some(work.removed),
+        );
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
+        if let Some(stage) = work.stage {
+            info!(
+                project_id = %project_id,
+                sidecar_generation = %semantic.generation,
+                strategy = ?stage.strategy,
+                fallback_reason = stage.fallback_reason.unwrap_or("none"),
+                native_error_code = stage.native_error_code,
+                source_bytes = stage.source_bytes,
+                cloned_bytes = stage.cloned_bytes,
+                copied_bytes = stage.copied_bytes,
+                wall_ms = stage.wall_ms,
+                "vector generation staged from immutable predecessor"
+            );
+        }
+        info!(
+            project_id = %project_id,
+            sidecar_generation = %semantic.generation,
+            retained_point_count = work.retained,
+            embedded_point_count = work.inserted,
+            removed_point_count = work.removed,
+            "vector generation reconciled from immutable predecessor"
+        );
+        let point_count = attestation.point_count;
+        let generation_manifest =
+            VectorGenerationManifest::new(evidence.clone(), attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
         point_count
     } else {
         let reusable_vectors = retention
@@ -1049,6 +2004,25 @@ fn ensure_semantic_index(
                 "compatible unchanged vectors retained for candidate generation"
             );
         }
+        let ordered_anchors = canonical_dense_anchor_order(
+            anchors.iter().collect::<Vec<_>>(),
+            dense_anchor_canonical_ids.as_ref(),
+            &mut content_vector_cache,
+        );
+        let embed_batch_size = retention.runtime.retrieval.llm_doc_embed_batch_size.max(1);
+        let maximum_staging_allocation_bytes = content_vector_cache
+            .as_ref()
+            .map(ContentAddressedVectorCache::maximum_staging_allocation_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let mut staged_batches = preload_dense_anchor_batches(
+            &ordered_anchors,
+            embed_batch_size,
+            &reusable_vectors,
+            maximum_staging_allocation_bytes,
+            cancelled,
+            &mut content_vector_cache,
+        )?;
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1062,32 +2036,22 @@ fn ensure_semantic_index(
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
-                    for batch in
-                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    for (batch_index, batch) in ordered_anchors.chunks(embed_batch_size).enumerate()
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
-                        let missing = batch
-                            .iter()
-                            .filter(|anchor| {
-                                !reusable_vectors.contains_key(&(
-                                    anchor.node_id.0.to_string(),
-                                    anchor.document_hash.clone(),
-                                ))
-                            })
-                            .collect::<Vec<_>>();
-                        let texts = missing
-                            .iter()
-                            .map(|anchor| anchor.text.clone())
-                            .collect::<Vec<_>>();
-                        let vectors = if texts.is_empty() {
-                            Vec::new()
-                        } else {
-                            client
-                                .embed_documents_with_control(&texts, None, &|| {
-                                    cancelled.load(Ordering::Acquire)
-                                })
-                                .context("embed pinned dense anchor batch")?
-                        };
+                        let missing = missing_dense_anchor_batch(batch, &reusable_vectors);
+                        let staged = staged_batches
+                            .as_mut()
+                            .and_then(|batches| batches.get_mut(batch_index))
+                            .and_then(Option::take);
+                        let vectors = resolve_dense_anchor_batch(
+                            &missing,
+                            &client,
+                            cancelled,
+                            &mut content_vector_cache,
+                            staged,
+                            "embed pinned dense anchor batch",
+                        )?;
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
                             "persisting an embedding batch",
@@ -1099,12 +2063,15 @@ fn ensure_semantic_index(
                                 missing.len()
                             );
                         }
-                        let mut embedded =
-                            missing.into_iter().zip(vectors).map(|(anchor, vector)| {
-                                Ok::<_, anyhow::Error>((anchor.node_id, normalize_vector(vector)?))
-                            });
+                        let normalized = missing
+                            .into_iter()
+                            .zip(vectors)
+                            .map(|(cached, vector)| (cached.anchor.node_id, vector))
+                            .collect::<Vec<_>>();
+                        let mut embedded = normalized.into_iter().map(Ok::<_, anyhow::Error>);
                         let mut next_embedded = embedded.next().transpose()?;
-                        for anchor in batch {
+                        for cached in batch {
+                            let anchor = cached.anchor;
                             ensure_retrieval_index_not_cancelled(
                                 cancelled,
                                 "persisting an embedded vector",
@@ -1146,6 +2113,24 @@ fn ensure_semantic_index(
             )
         })?;
         let point_count = attestation.point_count;
+        record_finalize_component_work("vectors", "complete", Some(0), Some(point_count), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
         let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
         EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
             semantic.layout,
@@ -1169,6 +2154,15 @@ fn ensure_semantic_index(
         )?;
         point_count
     };
+    if let Some(cache) = content_vector_cache.as_ref() {
+        let (hit_batches, miss_batches) = cache.activity();
+        info!(
+            project_id = %project_id,
+            hit_batches,
+            miss_batches,
+            "content-addressed vector batch reuse completed"
+        );
+    }
     snapshot
         .finish()
         .context("finish pinned dense anchor input generation")?;
@@ -1185,6 +2179,414 @@ fn ensure_semantic_index(
         "embedded SQLite vector generation published"
     );
     Ok(point_count)
+}
+
+#[derive(Clone)]
+struct CacheableDenseAnchor<'a> {
+    anchor: &'a DenseAnchorInput,
+    identity: String,
+}
+
+fn missing_dense_anchor_batch<'a>(
+    batch: &[CacheableDenseAnchor<'a>],
+    reusable_vectors: &HashMap<(String, String), Vec<f32>>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    batch
+        .iter()
+        .filter(|cached| {
+            let anchor = cached.anchor;
+            !reusable_vectors
+                .contains_key(&(anchor.node_id.0.to_string(), anchor.document_hash.clone()))
+        })
+        .cloned()
+        .collect()
+}
+
+fn dense_anchor_cache_batch<'a>(
+    batch: &'a [CacheableDenseAnchor<'_>],
+) -> Vec<VectorCacheBatchInput<'a>> {
+    batch
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect()
+}
+
+fn preload_dense_anchor_batches<'a>(
+    ordered_anchors: &[CacheableDenseAnchor<'a>],
+    batch_size: usize,
+    reusable_vectors: &HashMap<(String, String), Vec<f32>>,
+    maximum_allocation_bytes: usize,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Result<Option<Vec<Option<StagedVectorBatch>>>> {
+    if content_vector_cache.is_none() {
+        return Ok(None);
+    }
+    match content_vector_cache
+        .as_ref()
+        .expect("cache availability checked above")
+        .has_retained_batches()
+    {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache staging probe failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return Ok(None);
+        }
+    }
+    let batch_size = batch_size.max(1);
+    let batch_count = ordered_anchors.chunks(batch_size).len();
+    let slot_bytes = batch_count
+        .checked_mul(std::mem::size_of::<Option<StagedVectorBatch>>())
+        .context("dense vector staging slot size overflow")?;
+    if slot_bytes > maximum_allocation_bytes {
+        return Ok(None);
+    }
+    let mut remaining_allocation_bytes = maximum_allocation_bytes - slot_bytes;
+    let mut staged = Vec::with_capacity(batch_count);
+    for batch in ordered_anchors.chunks(batch_size) {
+        ensure_retrieval_index_not_cancelled(cancelled, "preloading embedding batch")?;
+        let missing = missing_dense_anchor_batch(batch, reusable_vectors);
+        if missing.is_empty() {
+            staged.push(None);
+            continue;
+        }
+        let cache_batch = dense_anchor_cache_batch(&missing);
+        let cache_started = Instant::now();
+        let inspected = content_vector_cache
+            .as_mut()
+            .expect("cache availability checked above")
+            .inspect_batch_for_staging(&cache_batch, remaining_allocation_bytes);
+        record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+        match inspected {
+            Ok(VectorCacheStagingLookup::Lookup(VectorCacheBatchLookup::Hit(hit))) => {
+                remaining_allocation_bytes = remaining_allocation_bytes
+                    .checked_sub(hit.allocation_bytes())
+                    .expect("staging inspection enforced the remaining allocation bound");
+                staged.push(Some(hit));
+            }
+            Ok(VectorCacheStagingLookup::Lookup(
+                VectorCacheBatchLookup::Absent | VectorCacheBatchLookup::Invalid,
+            )) => staged.push(None),
+            Ok(VectorCacheStagingLookup::BudgetExceeded) => {
+                staged.resize_with(batch_count, || None);
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "content-addressed vector cache staging failed; continuing without staged reuse"
+                );
+                *content_vector_cache = None;
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(staged))
+}
+
+fn canonical_dense_anchor_order<'a>(
+    anchors: Vec<&'a DenseAnchorInput>,
+    canonical_ids: Option<&HashMap<i64, String>>,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    let mut current = anchors
+        .into_iter()
+        .map(|anchor| CacheableDenseAnchor {
+            anchor,
+            identity: canonical_ids
+                .and_then(|canonical_ids| canonical_ids.get(&anchor.node_id.0))
+                .map(|canonical_id| stable_dense_anchor_identity(anchor, canonical_id))
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let inputs = current
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let order = match content_vector_cache.as_mut() {
+        Some(cache) => cache.canonical_order(&inputs),
+        None => return current,
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector corpus planning failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return current;
+        }
+    };
+    let mut available = current.drain(..).map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| {
+            available
+                .get_mut(index)
+                .and_then(Option::take)
+                .expect("validated vector corpus order")
+        })
+        .collect()
+}
+
+fn stable_dense_anchor_identity(anchor: &DenseAnchorInput, canonical_id: &str) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, "codestory-stable-dense-anchor-v3");
+    hash_part(&mut digest, &(anchor.kind as i32).to_string());
+    hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .start_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .end_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_part(&mut digest, canonical_id);
+    format!("{:x}", digest.finalize())
+}
+
+fn load_dense_anchor_canonical_ids(
+    storage: &Store,
+    anchors: &[DenseAnchorInput],
+) -> Result<HashMap<i64, String>> {
+    let mut requested_ids = anchors
+        .iter()
+        .map(|anchor| anchor.node_id)
+        .collect::<Vec<_>>();
+    requested_ids.sort_unstable_by_key(|node_id| node_id.0);
+    requested_ids.dedup();
+    let canonical_ids = storage
+        .get_node_canonical_ids_by_ids_no_cache(&requested_ids)
+        .context("load dense anchor canonical identities")?;
+    if canonical_ids.len() != requested_ids.len()
+        || canonical_ids.keys().any(|node_id| {
+            requested_ids
+                .binary_search_by_key(&node_id.0, |requested| requested.0)
+                .is_err()
+        })
+    {
+        bail!("dense anchor canonical identity lookup coverage mismatch");
+    }
+
+    requested_ids
+        .into_iter()
+        .map(|node_id| {
+            let canonical_id = canonical_ids
+                .get(&node_id)
+                .context("dense anchor canonical identity lookup omitted a requested node")?
+                .clone()
+                .context("dense anchor node has no canonical identity")?;
+            Ok((node_id.0, canonical_id))
+        })
+        .collect()
+}
+
+fn load_dense_anchor_canonical_ids_for_cache(
+    storage: &Store,
+    anchors: &[DenseAnchorInput],
+    project_id: &str,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Option<HashMap<i64, String>> {
+    match load_dense_anchor_canonical_ids(storage, anchors) {
+        Ok(canonical_ids) => Some(canonical_ids),
+        Err(error) => {
+            warn!(
+                project_id = %project_id,
+                error = %format!("{error:#}"),
+                "dense anchor canonical identities are incomplete; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            None
+        }
+    }
+}
+
+fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_part(hasher, "some");
+            hash_part(hasher, value);
+        }
+        None => hash_part(hasher, "none"),
+    }
+}
+
+fn produce_missing_dense_anchors(
+    anchors: &[DenseAnchorInput],
+    missing: &[ExpectedVectorAnchor],
+    canonical_ids: Option<&HashMap<i64, String>>,
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    visit: &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
+) -> Result<()> {
+    let anchors_by_node = anchors
+        .iter()
+        .map(|anchor| (anchor.node_id.0.to_string(), anchor))
+        .collect::<BTreeMap<_, _>>();
+    let missing_anchors = missing
+        .iter()
+        .map(|expected| {
+            let anchor = anchors_by_node
+                .get(&expected.node_id)
+                .with_context(|| format!("missing dense anchor {}", expected.node_id))?;
+            if anchor.document_hash != expected.document_hash {
+                bail!(
+                    "dense anchor document hash changed for {}",
+                    expected.node_id
+                );
+            }
+            Ok(*anchor)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let missing_anchors =
+        canonical_dense_anchor_order(missing_anchors, canonical_ids, content_vector_cache);
+    let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
+    for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
+        ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
+        let vectors = resolve_dense_anchor_batch(
+            batch,
+            &client,
+            cancelled,
+            content_vector_cache,
+            None,
+            "embed changed dense anchor batch",
+        )?;
+        ensure_retrieval_index_not_cancelled(
+            cancelled,
+            "persisting an incremental embedding batch",
+        )?;
+        if vectors.len() != batch.len() {
+            bail!(
+                "embedding engine returned {} vectors for {} changed anchors",
+                vectors.len(),
+                batch.len()
+            );
+        }
+        for (cached, vector) in batch.iter().zip(vectors) {
+            let anchor = cached.anchor;
+            visit(AttestedSemanticPoint {
+                point: SemanticPoint {
+                    display_name: anchor
+                        .qualified_name
+                        .clone()
+                        .unwrap_or_else(|| anchor.display_name.clone()),
+                    node_id: anchor.node_id.0.to_string(),
+                    file_path: anchor.file_path.clone(),
+                    file_role: Some(anchor.file_role),
+                    dense_reason: Some(anchor.selection_reason.clone()),
+                    vector,
+                },
+                document_hash: anchor.document_hash.clone(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_dense_anchor_batch(
+    batch: &[CacheableDenseAnchor<'_>],
+    client: &crate::embeddings::ProductEmbeddingClient,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    staged: Option<StagedVectorBatch>,
+    embedding_context: &'static str,
+) -> Result<Vec<Vec<f32>>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cache_batch = dense_anchor_cache_batch(batch);
+    let cache_started = Instant::now();
+    let cached = match content_vector_cache.as_mut() {
+        Some(cache) => cache.load_batch_detailed(&cache_batch),
+        None => Ok(VectorCacheBatchLookup::Absent),
+    };
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match cached {
+        Ok(VectorCacheBatchLookup::Hit(hit)) => return Ok(hit.into_vectors()),
+        Ok(VectorCacheBatchLookup::Absent) => {
+            if let (Some(cache), Some(staged)) = (content_vector_cache.as_ref(), staged) {
+                ensure_retrieval_index_not_cancelled(cancelled, "reusing staged embedding batch")?;
+                let cache_key = cache.batch_cache_key(&cache_batch)?;
+                return staged.into_vectors_for(&cache_key);
+            }
+        }
+        Ok(VectorCacheBatchLookup::Invalid) => {}
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache read failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+        }
+    }
+
+    let texts = batch
+        .iter()
+        .map(|cached| cached.anchor.text.clone())
+        .collect::<Vec<_>>();
+    let (vectors, timings) = client
+        .embed_documents_with_control_and_timings(&texts, None, &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+        .with_context(|| embedding_context)?;
+    record_embedding_vector_timings(timings);
+    ensure_retrieval_index_not_cancelled(cancelled, "normalizing an embedding batch")?;
+    if vectors.len() != batch.len() {
+        bail!(
+            "embedding engine returned {} vectors for {} anchors",
+            vectors.len(),
+            batch.len()
+        );
+    }
+    let normalization_started = Instant::now();
+    let normalized = vectors
+        .into_iter()
+        .map(normalize_vector)
+        .collect::<Result<Vec<_>>>()?;
+    record_finalize_phase_timing("vector normalization", normalization_started.elapsed());
+
+    let cache_started = Instant::now();
+    let canonical = content_vector_cache
+        .as_mut()
+        .map(|cache| cache.publish_batch(&cache_batch, &normalized))
+        .transpose();
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match canonical {
+        Ok(Some(vectors)) => Ok(vectors),
+        Ok(None) => Ok(normalized),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache publication failed; using fresh vectors"
+            );
+            *content_vector_cache = None;
+            Ok(normalized)
+        }
+    }
 }
 
 fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
@@ -1205,31 +2607,148 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     Ok(vector)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_scip_artifacts(
     storage_path: &Path,
     scip_dir: &Path,
     project_id: &str,
     generation: &str,
+    previous_project_dir: Option<PathBuf>,
+    previous_manifest: Option<&RetrievalIndexManifest>,
+    sidecar_input: &SidecarInputFingerprint,
+    cancelled: &AtomicBool,
     scip_ready: bool,
     manifest: &mut RetrievalIndexManifest,
 ) -> Result<()> {
     if scip_ready {
         info!(project_id = %project_id, sidecar_generation = %generation, "SCIP graph artifacts reused");
+        record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
+        let output_bytes =
+            component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+        record_finalize_component_details("graph", Some(0), None, output_bytes, output_bytes);
         return Ok(());
     }
-    match emit_scip_artifacts_from_store(storage_path, scip_dir, generation) {
-        Ok(Some(revision)) => {
+    if let (Some(previous), Some(previous_dir)) =
+        (previous_manifest, previous_project_dir.as_deref())
+        && scip_predecessor_is_reference_equivalent(previous, sidecar_input)
+        && let (Some(previous_generation), Some(previous_revision)) = (
+            previous.sidecar_generation.as_deref(),
+            previous.scip_revision.as_deref(),
+        )
+        && let Some(outcome) = reference_equivalent_scip_generation(
+            previous_dir,
+            scip_dir,
+            previous_generation,
+            generation,
+            previous_revision,
+            || ensure_retrieval_index_not_cancelled(cancelled, "SCIP component publication"),
+        )?
+    {
+        record_finalize_component_work(
+            "graph",
+            "reused",
+            Some(outcome.retained_records),
+            Some(0),
+            Some(0),
+        );
+        let predecessor_bytes = component_size(&crate::scip_index::scip_symbols_component_path(
+            previous_dir,
+        ));
+        let output_bytes =
+            component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+        record_finalize_component_details(
+            "graph",
+            Some(0),
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
+        let revision = outcome
+            .revision
+            .expect("equivalent graph reference retains its revision");
+        manifest.scip_revision = Some(revision.clone());
+        info!(
+            project_id = %project_id,
+            sidecar_generation = %generation,
+            %revision,
+            retained_record_count = outcome.retained_records,
+            "SCIP graph generation referenced from graph-equivalent predecessor"
+        );
+        return Ok(());
+    }
+    match emit_scip_artifacts_from_store_incremental_with_cancel(
+        storage_path,
+        scip_dir,
+        generation,
+        previous_project_dir.as_deref(),
+        &|| cancelled.load(Ordering::Acquire),
+        || ensure_retrieval_index_not_cancelled(cancelled, "SCIP component publication"),
+    ) {
+        Ok(outcome) if outcome.revision.is_some() => {
+            record_finalize_component_work(
+                "graph",
+                if outcome.direct_reference {
+                    "reused"
+                } else if outcome.cloned {
+                    "copy_on_write"
+                } else if outcome.copied {
+                    "copied"
+                } else {
+                    "complete"
+                },
+                Some(outcome.retained_records),
+                Some(outcome.inserted_records),
+                Some(outcome.removed_records),
+            );
+            let predecessor_bytes = previous_project_dir.as_deref().and_then(|previous| {
+                component_size(&crate::scip_index::scip_symbols_component_path(previous))
+            });
+            let output_bytes =
+                component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+            record_finalize_component_details(
+                "graph",
+                Some(outcome.reordered_records),
+                predecessor_bytes,
+                output_bytes,
+                output_bytes,
+            );
+            let revision = outcome.revision.expect("matched present revision");
             manifest.scip_revision = Some(revision.clone());
-            info!(project_id = %project_id, sidecar_generation = %generation, %revision, "SCIP graph artifacts emitted from store");
+            info!(
+                project_id = %project_id,
+                sidecar_generation = %generation,
+                %revision,
+                retained_record_count = outcome.retained_records,
+                inserted_record_count = outcome.inserted_records,
+                removed_record_count = outcome.removed_records,
+                reordered_record_count = outcome.reordered_records,
+                cloned = outcome.cloned,
+                "SCIP graph artifacts emitted from store"
+            );
             Ok(())
         }
-        Ok(None) => {
+        Ok(_) => {
             bail!("mandatory SCIP graph artifacts unavailable for {project_id}");
         }
         Err(error) => {
             bail!("mandatory SCIP graph artifact emit failed for {project_id}: {error}");
         }
     }
+}
+
+fn scip_predecessor_is_reference_equivalent(
+    previous: &RetrievalIndexManifest,
+    sidecar_input: &SidecarInputFingerprint,
+) -> bool {
+    previous.graph_artifact_hash.as_deref() == Some(sidecar_input.graph_artifact_hash.as_str())
+        && previous
+            .sidecar_generation
+            .as_deref()
+            .is_some_and(|generation| !generation.trim().is_empty())
+        && previous
+            .scip_revision
+            .as_deref()
+            .is_some_and(|revision| !revision.trim().is_empty())
 }
 
 fn update_precise_semantic_import_status(
@@ -1388,6 +2907,37 @@ fn with_embedding_publication_residency<T>(
 fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
+    prepared_lexical: &PreparedLexicalInput,
+    retention_context: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
+    sidecar_input: &SidecarInputFingerprint,
+    project_id: String,
+    manifest: RetrievalIndexManifest,
+    degraded_modes: Vec<String>,
+    stub_flags: SidecarStubFlags,
+) -> Result<FinalizeIndexOutcome> {
+    persist_finalized_manifest_with_hooks(
+        project_root,
+        storage_path,
+        prepared_lexical,
+        retention_context,
+        cancelled,
+        sidecar_input,
+        project_id,
+        manifest,
+        degraded_modes,
+        stub_flags,
+        validate_candidate_generation,
+        || {},
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_finalized_manifest_with_hooks(
+    project_root: &Path,
+    storage_path: &Path,
+    prepared_lexical: &PreparedLexicalInput,
     retention_context: &GenerationRetentionContext<'_>,
     cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
@@ -1395,127 +2945,168 @@ fn persist_finalized_manifest(
     mut manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
+    validate_candidate: impl FnOnce(
+        &str,
+        &SidecarInputFingerprint,
+        &RetrievalIndexManifest,
+        &GenerationRetentionContext<'_>,
+        &Store,
+        &Path,
+    ) -> Result<()>,
+    after_pointer_write: impl FnOnce(),
+    after_marker: impl FnOnce(),
 ) -> Result<FinalizeIndexOutcome> {
+    let manifest_started = Instant::now();
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
     let mut storage = Store::open(storage_path).context("open storage for retrieval manifest")?;
-    let embedding_backend =
-        crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
-    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
-        .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     #[cfg(not(feature = "test-support"))]
     let mut publication_qualification = PublicationQualificationHook::from_environment()?;
     let prepared_retention_result = with_embedding_publication_residency(
         &retention_context.embedding_residency,
         || {
-            promote_retrieval_manifest_with_cancel(
-                &mut storage,
+            ensure_retrieval_index_not_cancelled(cancelled, "retrieval candidate validation")?;
+            validate_candidate(
+                &project_id,
                 sidecar_input,
                 &manifest,
-                |storage| {
-                    let lexical_source = lexical_source_input(project_root, storage_path)
-                        .context("rescan lexical source at publication fence")?;
-                    let embedding_contract = SidecarEmbeddingContract {
-                        backend: &embedding_backend,
-                        dimension: embedding_dim,
-                        producer_compatibility_identity: &retention_context
-                            .producer_compatibility_identity,
-                    };
-                    let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
-                        storage,
-                        project_root,
-                        &project_id,
-                        &embedding_contract,
-                        lexical_source,
-                    )?;
-                    if let Some(reason) = manifest_unavailable_reason_for_runtime(
-                        &project_id,
-                        storage,
-                        &manifest,
-                        retention_context.runtime,
-                    ) {
-                        bail!(
-                            "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-                        );
-                    }
-                    Ok(current_input)
-                },
-                |storage| {
-                    validate_candidate_generation(
-                        &project_id,
-                        sidecar_input,
-                        &manifest,
-                        retention_context,
-                        storage,
-                    )
-                },
-                |storage| {
-                    prepare_generation_retention(retention_context, &project_id, &manifest, storage)
-                },
-                |prepared| Ok(prepared.verified_previous.clone()),
-                || {
-                    ensure_retrieval_index_not_cancelled(
-                        cancelled,
-                        "retrieval publication commit",
-                    )?;
-                    #[cfg(not(feature = "test-support"))]
-                    {
-                        if let Some(hook) = publication_qualification.as_mut() {
-                            hook.pause_before_lease_revalidation()?;
-                        }
-                        let lease_identity =
-                            match retention_context.embedding_residency.revalidate() {
-                                Ok(identity) => identity,
-                                Err(error) => {
-                                    if let Some(hook) = publication_qualification.as_mut() {
-                                        hook.record("lease_revalidation", "failed")?;
-                                    }
-                                    return Err(error).context(
-                                        "revalidate embedding server lease before publication",
-                                    );
-                                }
-                            };
-                        let lease_matches = embedding_identity_matches(
-                            retention_context
-                                .embedding_residency
-                                .identity()
-                                .context("embedding publication fence is missing its identity")?,
-                            &lease_identity,
-                        );
-                        if let Some(hook) = publication_qualification.as_mut() {
-                            hook.record(
-                                "lease_revalidation",
-                                if lease_matches { "matched" } else { "changed" },
-                            )?;
-                        }
-                        if !lease_matches {
-                            bail!(
-                                "embedding engine load generation changed before manifest publication"
-                            );
-                        }
-                    }
-                    Ok(())
-                },
+                retention_context,
+                &storage,
+                storage_path,
+            )?;
+            let prepared_retention = prepare_generation_retention(
+                retention_context,
+                &project_id,
+                &manifest,
+                &storage,
+                storage_path,
+            )?;
+            let sidecar_generation = manifest
+                .sidecar_generation
+                .as_deref()
+                .context("candidate retrieval manifest is missing its generation")?;
+            let lexical_receipt_refresh = capture_lexical_generation_receipts(
+                &retention_context.layout.lexical_data_dir,
+                sidecar_generation,
+            )?;
+            let scip_receipt_refresh = capture_scip_generation_receipt(
+                &retention_context
+                    .layout
+                    .scip_project_dir(sidecar_generation),
+            );
+
+            // This is the only project-retention exclusive window. Candidate
+            // construction and validation have finished, so packet readers are
+            // excluded only for the atomic pointer commit and bounded cleanup.
+            let publication_lock = GenerationRetentionLock::acquire_with_cancel(
+                &retention_context.layout.state_file,
+                &project_id,
+                Some(cancelled),
             )
+            .context("lock retrieval publication commit")?;
+            let mut publication = storage
+                .retrieval_publication_transaction()
+                .context("lock sidecar input and manifest publication")?;
+            prepared_lexical
+                .revalidate_source_seals(project_root, storage_path)
+                .context("revalidate lexical source identities at publication fence")?;
+            let current_core_publication = Store::database_index_publication(storage_path)
+                .context("read active core pointer at retrieval publication fence")?;
+            if current_core_publication.as_ref() != Some(&retention_context.pinned_core_publication)
+            {
+                let expected = format!(
+                    "{}:{}",
+                    retention_context.pinned_core_publication.generation_id,
+                    retention_context.pinned_core_publication.run_id,
+                );
+                let observed = current_core_publication.map_or_else(
+                    || "<missing>".to_string(),
+                    |publication| format!("{}:{}", publication.generation_id, publication.run_id),
+                );
+                return Err(
+                    SidecarInputChanged::new("core publication fence", expected, observed).into(),
+                );
+            }
+            if let Some(reason) = manifest_unavailable_reason_for_runtime(
+                &project_id,
+                publication.storage(),
+                &manifest,
+                retention_context.runtime,
+            ) {
+                bail!(
+                    "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+                );
+            }
+            ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit")?;
+            #[cfg(not(feature = "test-support"))]
+            {
+                if let Some(hook) = publication_qualification.as_mut() {
+                    hook.pause_before_lease_revalidation()?;
+                }
+                let lease_identity = match retention_context.embedding_residency.revalidate() {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        if let Some(hook) = publication_qualification.as_mut() {
+                            hook.record("lease_revalidation", "failed")?;
+                        }
+                        return Err(error)
+                            .context("revalidate embedding server lease before publication");
+                    }
+                };
+                let lease_matches = embedding_identity_matches(
+                    retention_context
+                        .embedding_residency
+                        .identity()
+                        .context("embedding publication fence is missing its identity")?,
+                    &lease_identity,
+                );
+                if let Some(hook) = publication_qualification.as_mut() {
+                    hook.record(
+                        "lease_revalidation",
+                        if lease_matches { "matched" } else { "changed" },
+                    )?;
+                }
+                if !lease_matches {
+                    bail!("embedding engine load generation changed before manifest publication");
+                }
+            }
+            publication
+                .publish_retrieval_index_publication(
+                    &manifest,
+                    prepared_retention.verified_previous.as_ref(),
+                )
+                .context("persist atomic retrieval current and rollback pointers")?;
+            after_pointer_write();
+            ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit")?;
+            publication
+                .finish()
+                .context("commit retrieval manifest publication")?;
+            Ok((
+                prepared_retention,
+                publication_lock,
+                lexical_receipt_refresh,
+                scip_receipt_refresh,
+            ))
         },
     );
-    match prepared_retention_result {
-        Ok(_prepared_retention) =>
-        {
-            #[cfg(not(feature = "test-support"))]
-            if let Some(hook) = publication_qualification.as_mut() {
-                hook.record("manifest_commit", "committed")?;
+    let (_prepared_retention, _publication_lock, lexical_receipt_refresh, scip_receipt_refresh) =
+        match prepared_retention_result {
+            Ok(prepared) => {
+                #[cfg(not(feature = "test-support"))]
+                if let Some(hook) = publication_qualification.as_mut() {
+                    hook.record("manifest_commit", "committed")?;
+                }
+                prepared
             }
-        }
-        Err(error) => {
-            #[cfg(not(feature = "test-support"))]
-            if let Some(hook) = publication_qualification.as_mut() {
-                hook.record("manifest_commit", "returned_error")?;
+            Err(error) => {
+                #[cfg(not(feature = "test-support"))]
+                if let Some(hook) = publication_qualification.as_mut() {
+                    hook.record("manifest_commit", "returned_error")?;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    }
+        };
 
     let marker_error = match publish_derived_retention_marker(
         &storage,
@@ -1531,9 +3122,13 @@ fn persist_finalized_manifest(
             Some(error)
         }
     };
-
+    after_marker();
     let (generation_retention_plan, generation_retention) =
-        retain_published_generations(storage_path, retention_context, &project_id, marker_error)?;
+        retain_published_generations(storage_path, retention_context, &project_id, marker_error);
+    let _ = lexical_receipt_refresh.refresh_after_owned_link_cleanup();
+    if let Some(receipt) = scip_receipt_refresh {
+        let _ = receipt.refresh_after_owned_link_cleanup();
+    }
 
     info!(
         project_id = %project_id,
@@ -1544,6 +3139,7 @@ fn persist_finalized_manifest(
         "retrieval index manifest persisted"
     );
 
+    record_finalize_phase_timing("manifest write", manifest_started.elapsed());
     Ok(FinalizeIndexOutcome {
         project_id,
         manifest,
@@ -1551,9 +3147,12 @@ fn persist_finalized_manifest(
         scip_stubbed: stub_flags.scip_stubbed,
         generation_retention_plan,
         generation_retention,
+        phase_timings: finish_finalize_phase_timings(),
+        component_work: finish_finalize_component_work(),
     })
 }
 
+#[cfg(test)]
 fn ensure_sidecar_input_unchanged(
     expected: &SidecarInputFingerprint,
     current: &SidecarInputFingerprint,
@@ -1592,6 +3191,7 @@ fn promote_retrieval_manifest<T>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn promote_retrieval_manifest_with_cancel<T>(
     storage: &mut Store,
     expected: &SidecarInputFingerprint,
@@ -1606,14 +3206,13 @@ fn promote_retrieval_manifest_with_cancel<T>(
     validate_candidate(storage)?;
     let prepared = prepare_publication(storage)?;
     let mut publication = storage
-        .write_transaction()
+        .retrieval_publication_transaction()
         .context("lock sidecar input and manifest publication")?;
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
     let rollback = publication_rollback(&prepared)?;
     ensure_not_cancelled()?;
     publication
-        .storage_mut()
         .publish_retrieval_index_publication(manifest, rollback.as_ref())
         .context("persist atomic retrieval current and rollback pointers")?;
     ensure_not_cancelled()?;
@@ -1776,6 +3375,7 @@ fn validate_candidate_generation(
     manifest: &RetrievalIndexManifest,
     context: &GenerationRetentionContext<'_>,
     storage: &Store,
+    storage_path: &Path,
 ) -> Result<()> {
     let generation = manifest
         .sidecar_generation
@@ -1785,16 +3385,6 @@ fn validate_candidate_generation(
     let embedding_identity_before =
         crate::embedding_server_compat::product_embedding_identity(context.runtime)
             .context("validate managed per-user embedding server identity before final probes")?;
-    let semantic_generation = SemanticGeneration {
-        layout: context.layout,
-        collection: &manifest.semantic_generation,
-        generation,
-        input_hash: &sidecar_input.hash,
-        embedding_backend: manifest.embedding_backend.as_deref().unwrap_or_default(),
-        embedding_dim: manifest.embedding_dim.unwrap_or_default(),
-        expected_points: sidecar_input.projection_count,
-    };
-    let semantic_points = semantic_ready_point_count(&semantic_generation);
     let embedding_accelerator_smoke =
         crate::embeddings::ensure_embedding_accelerator_smoke_for_runtime(context.runtime)
             .context("validate candidate embedding accelerator with a fresh timed smoke")?;
@@ -1825,6 +3415,28 @@ fn validate_candidate_generation(
     } else if !cfg!(feature = "test-support") {
         bail!("embedding publication fence is missing its residency lease identity");
     }
+    let core_publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication at retrieval publication fence")?
+        .context("retrieval publication requires a complete core publication")?;
+    let core_path = codestory_store::resolve_core_generation_database_path(
+        storage_path,
+        &core_publication.generation_id,
+    )
+    .context("resolve candidate retrieval core generation")?;
+    let vector_manifest =
+        crate::embedded_vector::validate_sealed_generation_evidence_for_publication(
+            context.layout,
+            storage,
+            &core_path,
+            manifest,
+            &core_publication,
+            context.runtime,
+            &embedding_device,
+            Some(&embedding_identity_after),
+        )
+        .context("deep-validate vector generation at retrieval publication fence")?;
+    let semantic_points = Some(vector_manifest.vectors.point_count);
     let evidence = CandidateGenerationEvidence {
         lexical_matches: crate::lexical_index::shard_matches_lexical_input(
             &context.layout.lexical_data_dir,
@@ -1857,20 +3469,6 @@ fn validate_candidate_generation(
         context.runtime,
         &evidence,
     )?;
-    let core_publication = storage
-        .get_complete_index_publication()
-        .context("load complete core publication at retrieval publication fence")?
-        .context("retrieval publication requires a complete core publication")?;
-    crate::embedded_vector::validate_generation_evidence_for_publication(
-        context.layout,
-        storage,
-        manifest,
-        &core_publication,
-        context.runtime,
-        &evidence.embedding_device,
-        Some(&evidence.embedding_identity_after),
-    )
-    .context("deep-validate vector generation at retrieval publication fence")?;
     Ok(())
 }
 
@@ -1879,8 +3477,17 @@ fn prepare_generation_retention(
     project_id: &str,
     active: &RetrievalIndexManifest,
     storage: &Store,
+    storage_path: &Path,
 ) -> Result<PreparedGenerationRetention> {
+    if external_retrieval_publication_is_physically_absent(storage_path)? {
+        return Ok(PreparedGenerationRetention {
+            verified_previous: None,
+        });
+    }
     let now = Utc::now().timestamp_millis();
+    let bound_previous = storage
+        .get_bound_retrieval_index_manifest(project_id)
+        .context("load exact core binding for rollback validation")?;
     let active_generation = active.sidecar_generation.as_deref();
     let mut candidates = Vec::new();
     if let Some(previous) = context.previous_manifest {
@@ -1903,57 +3510,73 @@ fn prepare_generation_retention(
     candidates.sort_by_key(|candidate| candidate.built_at_epoch_ms);
     candidates.dedup_by(|left, right| left.sidecar_generation == right.sidecar_generation);
 
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load complete core publication for rollback validation")?;
-    let verified_previous = publication.and_then(|publication| {
-        candidates.into_iter().rev().find_map(|candidate| {
-            let validation = crate::embedded_vector::validate_generation_evidence_for_publication(
+    let verified_previous = candidates.into_iter().rev().find_map(|candidate| {
+        let validation = (|| {
+            let core = bound_previous
+                .as_ref()
+                .filter(|bound| bound.manifest == candidate)
+                .map(|bound| &bound.core)
+                .context("rollback candidate has no exact immutable core binding")?;
+            let core_path = codestory_store::resolve_core_generation_database_path(
+                storage_path,
+                &core.generation_id,
+            )
+            .context("resolve rollback candidate core generation")?;
+            let candidate_storage = Store::open_immutable_generation(&core_path)
+                .context("open rollback candidate core generation")?;
+            let publication = candidate_storage
+                .get_complete_index_publication()
+                .context("load rollback candidate core publication")?
+                .context("rollback candidate core publication is incomplete")?;
+            if publication.generation_id != core.generation_id || publication.run_id != core.run_id
+            {
+                bail!("rollback retrieval generation does not match its immutable core");
+            }
+            crate::embedded_vector::validate_sealed_generation_evidence_for_publication(
                 context.layout,
-                storage,
+                &candidate_storage,
+                &core_path,
                 &candidate,
                 &publication,
                 context.runtime,
                 context.embedding_device,
                 context.embedding_residency.identity(),
             )
-            .context("validate rollback vector bytes, producer evidence, and anchor coverage")
-            .and_then(|_| {
-                let status = probe_sidecar_health_for_runtime(
-                    context.layout,
-                    project_id,
-                    Some(candidate.clone()),
-                    context.embedding_device,
-                    context.runtime,
+            .context("validate rollback vector bytes, producer evidence, and anchor coverage")?;
+            let status = probe_sidecar_health_for_runtime(
+                context.layout,
+                project_id,
+                Some(candidate.clone()),
+                context.embedding_device,
+                context.runtime,
+            );
+            // Same manifest override as the reuse branch: a rollback pointer
+            // must name a generation whose artifacts are live healthy right
+            // now, not one whose manifest says so.
+            if !status.is_live_ready() {
+                bail!(
+                    "rollback generation is not full: {} {:?}",
+                    status.retrieval_mode,
+                    status.degraded_reason
                 );
-                // Same manifest override as the reuse branch: a rollback
-                // pointer must name a generation whose artifacts are live
-                // healthy right now, not one whose manifest says so.
-                if !status.is_live_ready() {
-                    bail!(
-                        "rollback generation is not full: {} {:?}",
-                        status.retrieval_mode,
-                        status.degraded_reason
-                    );
-                }
-                Ok(())
-            });
-            match validation {
-                Ok(()) => Some(RetrievalIndexRollbackRecord {
-                    manifest: candidate,
-                    verified_at_epoch_ms: now,
-                }),
-                Err(error) => {
-                    warn!(
-                        project_id = %project_id,
-                        sidecar_generation = ?candidate.sidecar_generation,
-                        error = %format!("{error:#}"),
-                        "retrieval rollback candidate failed deep validation"
-                    );
-                    None
-                }
             }
-        })
+            Ok(())
+        })();
+        match validation {
+            Ok(()) => Some(RetrievalIndexRollbackRecord {
+                manifest: candidate,
+                verified_at_epoch_ms: now,
+            }),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    sidecar_generation = ?candidate.sidecar_generation,
+                    error = %format!("{error:#}"),
+                    "retrieval rollback candidate failed deep validation"
+                );
+                None
+            }
+        }
     });
 
     Ok(PreparedGenerationRetention { verified_previous })
@@ -1964,7 +3587,7 @@ fn retain_published_generations(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     marker_error: Option<String>,
-) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
+) -> (GenerationRetentionPlan, GenerationRetentionApplyReport) {
     let mut protection = scan_retention_protection(
         &crate::config::user_cache_root(),
         Some(storage_path),
@@ -1974,9 +3597,17 @@ fn retain_published_generations(
         protection.errors.push(error);
     }
     let plan = plan_generation_retention(context.layout, project_id, &protection);
-    let mut remover = FsGenerationRemover::new(context.layout)?;
-    let apply = apply_generation_retention(&plan, &mut remover);
-    Ok((plan, apply))
+    let apply = match FsGenerationRemover::new(context.layout) {
+        Ok(mut remover) => apply_generation_retention(&plan, &mut remover),
+        Err(error) => {
+            let error = format!(
+                "cleanup deferred after committed retrieval publication: open owned generation remover: {error:#}"
+            );
+            warn!(project_id = %project_id, error = %error, "generation retention setup failed after SQLite publication");
+            GenerationRetentionApplyReport::cleanup_deferred(&plan, error)
+        }
+    };
+    (plan, apply)
 }
 
 pub(crate) fn compute_sidecar_input_fingerprint(
@@ -1993,13 +3624,14 @@ pub(crate) fn compute_sidecar_input_fingerprint(
         |memoized: Option<&LeaseMemoizedSidecarInputFingerprint>| {
             let precomputed = memoized
                 .filter(|memoized| {
-                    memoized.project_root == project_root
-                        && memoized.storage_path == storage_path
-                        && memoized.project_id == project_id
-                        && memoized.embedding_backend == embedding_backend
-                        && memoized.embedding_dim == embedding_dim
-                        && memoized.producer_compatibility_identity
-                            == producer_compatibility_identity
+                    memoized.matches(
+                        project_root,
+                        storage_path,
+                        project_id,
+                        embedding_backend,
+                        embedding_dim,
+                        producer_compatibility_identity,
+                    )
                 })
                 .map(|memoized| &memoized.fingerprint);
             let fingerprint = compute_sidecar_input_fingerprint_with_precomputed(
@@ -2038,6 +3670,50 @@ pub(crate) fn compute_sidecar_input_fingerprint(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn memoize_pinned_sidecar_input_fingerprint(
+    project_root: &Path,
+    storage_path: &Path,
+    project_id: &str,
+    embedding_backend: &str,
+    embedding_dim: i32,
+    producer_compatibility_identity: &str,
+    fingerprint: SidecarInputFingerprint,
+) -> Result<SidecarInputFingerprint> {
+    let supplied = LeaseMemoizedSidecarInputFingerprint {
+        project_root: project_root.to_path_buf(),
+        storage_path: storage_path.to_path_buf(),
+        project_id: project_id.to_string(),
+        embedding_backend: embedding_backend.to_string(),
+        embedding_dim,
+        producer_compatibility_identity: producer_compatibility_identity.to_string(),
+        fingerprint,
+    };
+    let Some(memoized) = codestory_workspace::with_lease_memoized_value(
+        LEASE_SIDECAR_INPUT_FINGERPRINT_KEY,
+        |existing: Option<&LeaseMemoizedSidecarInputFingerprint>| {
+            Ok::<_, anyhow::Error>(
+                existing
+                    .filter(|existing| {
+                        existing.matches(
+                            project_root,
+                            storage_path,
+                            project_id,
+                            embedding_backend,
+                            embedding_dim,
+                            producer_compatibility_identity,
+                        ) && existing.fingerprint == supplied.fingerprint
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| supplied.clone()),
+            )
+        },
+    ) else {
+        return Ok(supplied.fingerprint);
+    };
+    memoized.map(|memoized| memoized.fingerprint)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_sidecar_input_fingerprint_with_precomputed(
     storage: &Store,
     project_root: &Path,
@@ -2066,25 +3742,54 @@ fn compute_sidecar_input_fingerprint_with_precomputed(
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
         project_root,
+        storage_path,
         project_id,
         &embedding_contract,
         lexical_source,
+        None,
     )
 }
 
 fn compute_sidecar_input_fingerprint_with_lexical_source(
     storage: &Store,
     project_root: &Path,
+    storage_path: &Path,
     project_id: &str,
     embedding: &SidecarEmbeddingContract<'_>,
     lexical_source: crate::lexical_index::LexicalSourceInput,
+    graph_projection: Option<&GraphProjectionIdentity>,
 ) -> Result<SidecarInputFingerprint> {
     let lexical = finish_lexical_input_for_store(lexical_source, project_root, storage)
         .context("hash lexical symbol input")?;
+    compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+        storage,
+        project_root,
+        storage_path,
+        project_id,
+        embedding,
+        lexical,
+        graph_projection,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphProjectionIdentity {
+    symbol_doc_count: i64,
+    graph_artifact_hash: String,
+    semantic_policy_version: Option<String>,
+}
+
+fn compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+    storage: &Store,
+    project_root: &Path,
+    storage_path: &Path,
+    project_id: &str,
+    embedding: &SidecarEmbeddingContract<'_>,
+    lexical: LexicalInputFingerprint,
+    precomputed_graph: Option<&GraphProjectionIdentity>,
+) -> Result<SidecarInputFingerprint> {
     let mut hasher = Sha256::new();
-    let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v10");
-    hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
+    hash_part(&mut hasher, "codestory-sidecar-input-v11");
     hash_part(&mut hasher, project_id);
     let core_publication = storage
         .get_complete_index_publication()
@@ -2113,48 +3818,79 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     hash_part(&mut hasher, "dense-anchor-inputs-v1");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
-    let mut symbol_doc_count = 0_i64;
     let mut policy_versions = BTreeSet::<String>::new();
-    let mut after_symbol_doc = None;
-    loop {
-        let batch = storage
-            .get_symbol_search_docs_batch_after(after_symbol_doc, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load symbol search docs for sidecar hash")?;
-        if batch.is_empty() {
-            break;
+    let graph_projection = match precomputed_graph {
+        Some(graph) => graph.clone(),
+        None => {
+            let mut graph_hasher = Sha256::new();
+            hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
+            let mut symbol_doc_count = 0_i64;
+            let mut after_symbol_doc = None;
+            loop {
+                let batch = storage
+                    .get_symbol_search_docs_batch_after(after_symbol_doc, SIDECAR_INPUT_BATCH_SIZE)
+                    .context("load symbol search docs for sidecar hash")?;
+                if batch.is_empty() {
+                    break;
+                }
+                after_symbol_doc = batch.last().map(|doc| doc.node_id);
+                symbol_doc_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
+                for doc in batch {
+                    if !doc.attached_comment_is_valid() {
+                        anyhow::bail!(
+                            "symbol search document {} has invalid attached-comment evidence",
+                            doc.node_id.0
+                        );
+                    }
+                    observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
+                    hash_symbol_search_doc_detail(&mut graph_hasher, project_root, &doc);
+                }
+            }
+            GraphProjectionIdentity {
+                symbol_doc_count,
+                graph_artifact_hash: format!("{:x}", graph_hasher.finalize()),
+                semantic_policy_version: policy_version_from_observed(&policy_versions),
+            }
         }
-        after_symbol_doc = batch.last().map(|doc| doc.node_id);
-        symbol_doc_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
-        for doc in batch {
-            observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
-            hash_symbol_search_doc_detail(&mut graph_hasher, project_root, &doc);
-        }
-    }
-    let graph_artifact_hash = format!("{:x}", graph_hasher.finalize());
-    hash_part(&mut hasher, &symbol_doc_count.to_string());
-    hash_part(&mut hasher, &graph_artifact_hash);
+    };
+    observe_policy_version(
+        &mut policy_versions,
+        graph_projection.semantic_policy_version.as_deref(),
+    );
+    hash_part(&mut hasher, &graph_projection.symbol_doc_count.to_string());
+    hash_part(&mut hasher, &graph_projection.graph_artifact_hash);
 
-    let mut dense_projection_count = 0_i64;
-    let mut dense_reason_counts = BTreeMap::<String, i64>::new();
-    let mut after = None;
-    loop {
-        let batch = storage
-            .get_dense_anchor_inputs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load dense anchor inputs for sidecar hash")?;
-        if batch.is_empty() {
-            break;
-        }
-        after = batch.last().map(|doc| doc.node_id);
-        dense_projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
-        for doc in batch {
-            observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
-            let reason = doc.selection_reason.clone();
-            *dense_reason_counts.entry(reason).or_insert(0) += 1;
-            hash_dense_anchor_input(&mut hasher, project_root, &doc);
-        }
+    let publication = core_publication.context("complete core publication for sidecar hash")?;
+    // Seal against the active generation file the observational store already
+    // pinned. Resolving only by SQLite `generation_id` breaks when a first
+    // publish used rehydrate naming while the sealed publication id stayed on
+    // the staged identity; status fingerprint must still observe the live
+    // generation without inventing a legacy flat database.
+    let core_database_path = codestory_store::resolve_core_database_path(storage_path)
+        .context("resolve immutable core for dense-anchor hash")?;
+    let dense_validation = storage
+        .validate_dense_anchor_publication_sealed(&core_database_path, &publication)
+        .context("validate dense-anchor publication for sidecar hash")?;
+    let dense_stats = storage
+        .dense_anchor_input_stats()
+        .context("load dense-anchor aggregate for sidecar hash")?;
+    let dense_projection_count =
+        i64::try_from(dense_validation.manifest.anchor_count).unwrap_or(i64::MAX);
+    if dense_stats.doc_count as i64 != dense_projection_count {
+        bail!("dense-anchor aggregate does not match its sealed publication");
     }
+    observe_policy_version(
+        &mut policy_versions,
+        Some(dense_validation.manifest.policy_version.as_str()),
+    );
+    let dense_reason_counts = dense_stats
+        .selection_reason_counts
+        .into_iter()
+        .map(|(reason, count)| (reason, i64::from(count)))
+        .collect::<BTreeMap<_, _>>();
     let dense_reason_counts_json =
         serde_json::to_string(&dense_reason_counts).unwrap_or_else(|_| "{}".into());
+    hash_part(&mut hasher, &dense_validation.manifest.anchor_digest);
     let semantic_policy_version = policy_version_from_observed(&policy_versions)
         .or_else(|| Some(crate::generation::SEMANTIC_POLICY_VERSION.into()));
     hash_part(
@@ -2166,11 +3902,11 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
 
     Ok(SidecarInputFingerprint {
         hash: format!("{:x}", hasher.finalize()),
-        symbol_doc_count,
+        symbol_doc_count: graph_projection.symbol_doc_count,
         projection_count: dense_projection_count,
         dense_projection_count,
         semantic_policy_version,
-        graph_artifact_hash,
+        graph_artifact_hash: graph_projection.graph_artifact_hash,
         dense_reason_counts_json,
         lexical_file_count: lexical.file_count,
         lexical_hash: lexical.hash,
@@ -2223,45 +3959,12 @@ fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: 
     );
     hash_part(hasher, &doc.doc_version.to_string());
     hash_part(hasher, &doc.doc_hash);
+    hash_part(hasher, &doc.attached_comment_policy);
+    hash_part(hasher, &doc.attached_comment_state);
+    hash_part(hasher, &doc.attached_comment_hash);
+    hash_part(hasher, doc.attached_comment_text.as_deref().unwrap_or(""));
     hash_part(hasher, &doc.policy_version);
     hash_part(hasher, &doc.source_provenance);
-}
-
-fn hash_dense_anchor_input(hasher: &mut Sha256, project_root: &Path, doc: &DenseAnchorInput) {
-    let file_path = doc
-        .file_path
-        .as_deref()
-        .and_then(|path| normalize_sidecar_file_path(path, project_root).ok())
-        .unwrap_or_default();
-    let file_role = if file_path.is_empty() {
-        ""
-    } else {
-        FileRole::classify_path(Path::new(&file_path)).as_str()
-    };
-    hash_part(hasher, &doc.node_id.0.to_string());
-    hash_part(hasher, &(doc.kind as i32).to_string());
-    hash_part(hasher, &doc.display_name);
-    hash_part(hasher, doc.qualified_name.as_deref().unwrap_or(""));
-    hash_part(hasher, &file_path);
-    hash_part(hasher, file_role);
-    hash_part(
-        hasher,
-        &doc.start_line
-            .map(|line| line.to_string())
-            .unwrap_or_default(),
-    );
-    hash_part(
-        hasher,
-        &doc.end_line
-            .map(|line| line.to_string())
-            .unwrap_or_default(),
-    );
-    hash_part(hasher, doc.file_role.as_str());
-    hash_part(hasher, &doc.source_provenance);
-    hash_part(hasher, &doc.text);
-    hash_part(hasher, &doc.document_hash);
-    hash_part(hasher, &doc.selection_reason);
-    hash_part(hasher, &doc.policy_version);
 }
 
 #[cfg(test)]
@@ -2298,8 +4001,39 @@ mod tests {
     use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{SearchSymbolProjection, SearchSymbolProjectionDetail};
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    struct RestoreOwnedRoot {
+        root: PathBuf,
+        parked: PathBuf,
+        restored: bool,
+    }
+
+    #[cfg(unix)]
+    impl RestoreOwnedRoot {
+        fn restore(&mut self) -> std::io::Result<()> {
+            if !self.restored {
+                match fs::symlink_metadata(&self.root) {
+                    Ok(_) => fs::remove_file(&self.root)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                fs::rename(&self.parked, &self.root)?;
+                self.restored = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreOwnedRoot {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
 
     fn secure_test_directory(path: &Path) {
         #[cfg(unix)]
@@ -2322,6 +4056,1069 @@ mod tests {
         serde_json::to_writer(&mut file, value).expect("write private control");
         file.write_all(b"\n").expect("terminate private control");
         file.sync_all().expect("sync private control");
+    }
+
+    #[test]
+    fn finalization_receipt_includes_manifest_time_and_component_bytes() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("input fingerprint", Duration::from_millis(2));
+        record_finalize_component_work("vectors", "copy_on_write", Some(4), Some(1), Some(1));
+        record_finalize_component_details("vectors", None, Some(1_024), Some(1_100), Some(1_100));
+        record_finalize_phase_timing("manifest write", Duration::from_millis(3));
+
+        let timings = finish_finalize_phase_timings();
+        let work = finish_finalize_component_work();
+
+        assert!(
+            timings
+                .iter()
+                .any(|timing| timing.phase == "manifest write" && timing.elapsed_ms == 3)
+        );
+        assert_eq!(work[0].predecessor_bytes, Some(1_024));
+        assert_eq!(work[0].output_bytes, Some(1_100));
+        assert_eq!(work[0].attested_bytes, Some(1_100));
+    }
+
+    #[test]
+    fn graph_equivalent_predecessor_survives_artifact_scope_rotation() {
+        let mut previous =
+            crate::test_support::retrieval_manifest_fixture("artifact-scope-before", "input-a");
+        previous.graph_artifact_hash = Some("unchanged-graph".into());
+        previous.sidecar_generation = Some("generation-before".into());
+        previous.scip_revision = Some("revision-before".into());
+        let input = SidecarInputFingerprint {
+            hash: "input-b".into(),
+            symbol_doc_count: 1,
+            projection_count: 1,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: "unchanged-graph".into(),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 1,
+            lexical_hash: "changed-source".into(),
+            lexical_coverage: Default::default(),
+        };
+
+        assert_ne!(previous.project_id, "artifact-scope-after");
+        assert!(scip_predecessor_is_reference_equivalent(&previous, &input));
+
+        previous.graph_artifact_hash = Some("changed-graph".into());
+        assert!(!scip_predecessor_is_reference_equivalent(&previous, &input));
+    }
+
+    #[test]
+    fn writer_scope_does_not_exclude_the_project_query_lease() {
+        let directory = TempDir::new().expect("retention lock directory");
+        let state_file = directory.path().join("state.json");
+        let project_id = "project-a";
+        let writer_scope = format!("writer-{project_id}");
+        let _writer = GenerationRetentionLock::acquire(&state_file, &writer_scope)
+            .expect("acquire writer-only finalization lock");
+
+        assert!(
+            GenerationRetentionLock::try_acquire_shared(&state_file, &writer_scope)
+                .expect("probe writer scope")
+                .is_none(),
+            "the test must observe the active finalizer lock"
+        );
+        assert!(
+            GenerationRetentionLock::try_acquire_shared(&state_file, project_id)
+                .expect("acquire packet query lease")
+                .is_some(),
+            "candidate construction must not exclude queries pinned to the old publication"
+        );
+    }
+
+    #[test]
+    fn vector_subphases_reconcile_without_double_counting_the_total() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("embedded vectors", Duration::from_millis(100));
+        record_finalize_phase_timing("vector tokenization", Duration::from_millis(10));
+        record_finalize_phase_timing("vector native encode", Duration::from_millis(40));
+        record_finalize_phase_timing("vector normalization", Duration::from_millis(5));
+        record_finalize_phase_timing("vector content cache", Duration::from_millis(5));
+        record_finalize_phase_timing("vector sqlite persistence", Duration::from_millis(20));
+        record_finalize_phase_timing("vector hashing", Duration::from_millis(5));
+        record_finalize_phase_timing("vector final validation", Duration::from_millis(10));
+
+        let timings = finish_finalize_phase_timings();
+        let remainder = timings
+            .iter()
+            .find(|timing| timing.phase == "vector ipc and orchestration")
+            .expect("vector timing remainder");
+
+        assert_eq!(remainder.elapsed_ms, 5);
+        assert_eq!(
+            timings
+                .iter()
+                .find(|timing| timing.phase == "unattributed")
+                .expect("top-level remainder")
+                .elapsed_ms,
+            0,
+            "nested vector subphases must not be subtracted from the top-level clock twice"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_ignores_store_local_publication_identity() {
+        let mut anchor = DenseAnchorInput {
+            node_id: NodeId(1),
+            file_node_id: Some(NodeId(2)),
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(4),
+            end_line: Some(8),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "function do_work semantic document".into(),
+            document_hash: "document-hash".into(),
+            selection_reason: "public_api".into(),
+            policy_version: "graph_first_v3".into(),
+            source_identity: "core:generation-a:run-a".into(),
+            updated_at_epoch_ms: 1,
+        };
+        let canonical_id = "rust:function:pkg::do_work";
+        let expected = stable_dense_anchor_identity(&anchor, canonical_id);
+
+        anchor.node_id = NodeId(99);
+        anchor.file_node_id = Some(NodeId(100));
+        anchor.display_name = "renamed_document_label".into();
+        anchor.qualified_name = Some("other::rendered::label".into());
+        anchor.text = "different exact prepared document".into();
+        anchor.document_hash = "different-document-hash".into();
+        anchor.source_identity = "core:generation-b:run-b".into();
+        anchor.updated_at_epoch_ms = 2;
+        assert_eq!(
+            stable_dense_anchor_identity(&anchor, canonical_id),
+            expected
+        );
+
+        anchor.start_line = Some(5);
+        assert_ne!(
+            stable_dense_anchor_identity(&anchor, canonical_id),
+            expected
+        );
+    }
+
+    fn dense_anchor_identity_fixture(
+        node_id: i64,
+        canonical_id: &str,
+        start_line: u32,
+    ) -> (DenseAnchorInput, String) {
+        (
+            DenseAnchorInput {
+                node_id: NodeId(node_id),
+                file_node_id: Some(NodeId(500)),
+                kind: NodeKind::FUNCTION,
+                display_name: format!("anchor-{node_id}"),
+                qualified_name: Some(format!("fixture::anchor_{node_id}")),
+                file_path: Some("src/shared.py".into()),
+                start_line: Some(start_line),
+                end_line: Some(start_line + 2),
+                file_role: FileRole::Source,
+                source_provenance: "parser".into(),
+                text: format!("prepared anchor {canonical_id}"),
+                document_hash: format!("document-{canonical_id}"),
+                selection_reason: "public_api".into(),
+                policy_version: "graph_first_v3".into(),
+                source_identity: "core:generation-a:run-a".into(),
+                updated_at_epoch_ms: 1,
+            },
+            canonical_id.into(),
+        )
+    }
+
+    fn current_dense_anchor_identity_for_canonical(
+        anchor: &DenseAnchorInput,
+        canonical_id: &str,
+    ) -> String {
+        stable_dense_anchor_identity(anchor, canonical_id)
+    }
+
+    fn legacy_dense_anchor_identity_v2(anchor: &DenseAnchorInput) -> String {
+        let mut digest = Sha256::new();
+        hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+        hash_part(&mut digest, &(anchor.kind as i32).to_string());
+        hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+        hash_optional_dense_anchor_part(
+            &mut digest,
+            anchor
+                .start_line
+                .as_ref()
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        hash_optional_dense_anchor_part(
+            &mut digest,
+            anchor
+                .end_line
+                .as_ref()
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        format!("{:x}", digest.finalize())
+    }
+
+    fn vector_cache_runtime(cache: &TempDir) -> SidecarRuntimeConfig {
+        use crate::config::{
+            SidecarProcessDefaults, SidecarProfile, SidecarRuntimeDefaults,
+            SidecarRuntimeOverrides, private_cache_directory,
+        };
+
+        let private_root = cache.path().join("private");
+        private_cache_directory(&private_root).expect("private cache root");
+        let defaults = SidecarProcessDefaults::new(private_root, SidecarRuntimeDefaults::default());
+        SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            SidecarProfile::Local,
+            None,
+            &defaults,
+            &SidecarRuntimeOverrides::default(),
+        )
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_distinguishes_co_located_canonical_anchors() {
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (mut second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 20);
+        second.text = first.text.clone();
+        second.document_hash = first.document_hash.clone();
+
+        assert_ne!(first_canonical, second_canonical);
+        assert_ne!(
+            current_dense_anchor_identity_for_canonical(&first, &first_canonical),
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical),
+            "distinct repository identities at one legitimate source span must not disable cache planning"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_reuses_exact_batch_after_node_id_remap() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (mut second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 20);
+        second.text = first.text.clone();
+        second.document_hash = first.document_hash.clone();
+        let first_identity = current_dense_anchor_identity_for_canonical(&first, &first_canonical);
+        let second_identity =
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical);
+        let first_batch = [
+            VectorCacheBatchInput {
+                anchor_identity: &first_identity,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &second_identity,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        let exact_vectors = vec![vec![1.0, -0.0], vec![0.0, 1.0]];
+        let mut owner = ContentAddressedVectorCache::open(
+            &runtime,
+            "scope-a",
+            "producer-a",
+            exact_vectors[0].len(),
+        )
+        .expect("open vector cache");
+        assert_eq!(
+            owner.canonical_order(&first_batch).expect("first plan"),
+            [0, 1]
+        );
+        assert_eq!(
+            owner
+                .publish_batch(&first_batch, &exact_vectors)
+                .expect("publish exact batch"),
+            exact_vectors
+        );
+
+        let (remapped_first, remapped_first_canonical) =
+            dense_anchor_identity_fixture(901, "python:function:pkg.first", 20);
+        let (mut remapped_second, remapped_second_canonical) =
+            dense_anchor_identity_fixture(902, "python:function:pkg.second", 20);
+        remapped_second.text = remapped_first.text.clone();
+        remapped_second.document_hash = remapped_first.document_hash.clone();
+        let remapped_first_identity =
+            current_dense_anchor_identity_for_canonical(&remapped_first, &remapped_first_canonical);
+        let remapped_second_identity = current_dense_anchor_identity_for_canonical(
+            &remapped_second,
+            &remapped_second_canonical,
+        );
+        let reversed_after_remap = [
+            VectorCacheBatchInput {
+                anchor_identity: &remapped_second_identity,
+                document_hash: &remapped_second.document_hash,
+                text: &remapped_second.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &remapped_first_identity,
+                document_hash: &remapped_first.document_hash,
+                text: &remapped_first.text,
+            },
+        ];
+        let order = owner
+            .canonical_order(&reversed_after_remap)
+            .expect("reproduce canonical plan after node remap");
+        assert_eq!(order, [1, 0]);
+        let canonical_after_remap = order
+            .into_iter()
+            .map(|index| VectorCacheBatchInput {
+                anchor_identity: reversed_after_remap[index].anchor_identity,
+                document_hash: reversed_after_remap[index].document_hash,
+                text: reversed_after_remap[index].text,
+            })
+            .collect::<Vec<_>>();
+        let reused = owner
+            .load_batch(&canonical_after_remap)
+            .expect("load cached batch")
+            .expect("exact cache hit after remap");
+        assert_eq!(reused, exact_vectors);
+        assert_eq!(reused[0][1].to_bits(), (-0.0_f32).to_bits());
+    }
+
+    #[test]
+    fn dense_anchor_staged_hits_survive_eviction_before_canonical_visit() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (a, a_canonical) = dense_anchor_identity_fixture(1, "python:function:pkg.a", 10);
+        let (b, b_canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let (c, c_canonical) = dense_anchor_identity_fixture(3, "python:function:pkg.c", 30);
+        let ordered = vec![
+            CacheableDenseAnchor {
+                anchor: &a,
+                identity: current_dense_anchor_identity_for_canonical(&a, &a_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &b,
+                identity: current_dense_anchor_identity_for_canonical(&b, &b_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &c,
+                identity: current_dense_anchor_identity_for_canonical(&c, &c_canonical),
+            },
+        ];
+        let a_vectors = vec![vec![1.0, -0.0]];
+        let b_vectors = vec![vec![0.0, 1.0]];
+        let c_vectors = vec![vec![-1.0, 0.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                2,
+            )
+            .expect("open bounded cache"),
+        );
+        for (batch, vectors) in [
+            (&ordered[0..1], a_vectors.as_slice()),
+            (&ordered[1..2], b_vectors.as_slice()),
+            (&ordered[2..3], c_vectors.as_slice()),
+        ] {
+            content_vector_cache
+                .as_mut()
+                .expect("cache")
+                .publish_batch(&dense_anchor_cache_batch(batch), vectors)
+                .expect("seed exact batch");
+        }
+
+        let reusable_vectors = HashMap::new();
+        let maximum_allocation_bytes = content_vector_cache
+            .as_ref()
+            .expect("cache")
+            .maximum_staging_allocation_bytes()
+            .expect("staging limit");
+        let cancelled = AtomicBool::new(false);
+        let mut staged = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            maximum_allocation_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )?
+        .expect("staging plan");
+        assert!(staged[0].is_none());
+        assert!(staged[1].is_some());
+        assert!(staged[2].is_some());
+        let slot_bytes = std::mem::size_of::<Option<StagedVectorBatch>>() * staged.len();
+        let staged_allocation_bytes = staged
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(StagedVectorBatch::allocation_bytes)
+            .sum::<usize>();
+        assert!(slot_bytes + staged_allocation_bytes <= maximum_allocation_bytes);
+
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&dense_anchor_cache_batch(&ordered[0..1]), &a_vectors)
+            .expect("publish resumed a");
+        let client = crate::embeddings::ProductEmbeddingClient::new(&runtime);
+        let resolved_b = resolve_dense_anchor_batch(
+            &ordered[1..2],
+            &client,
+            &cancelled,
+            &mut content_vector_cache,
+            staged[1].take(),
+            "unexpected b embedding",
+        )?;
+        let resolved_c = resolve_dense_anchor_batch(
+            &ordered[2..3],
+            &client,
+            &cancelled,
+            &mut content_vector_cache,
+            staged[2].take(),
+            "unexpected c embedding",
+        )?;
+        assert_eq!(resolved_b.len(), 1);
+        assert_eq!(resolved_c.len(), 1);
+        for (observed, expected) in resolved_b[0].iter().zip(&b_vectors[0]) {
+            assert_eq!(observed.to_bits(), expected.to_bits());
+        }
+        for (observed, expected) in resolved_c[0].iter().zip(&c_vectors[0]) {
+            assert_eq!(observed.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            content_vector_cache.as_ref().expect("cache").activity(),
+            (1, 1)
+        );
+
+        let overflow = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            slot_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )?
+        .expect("bounded staging plan");
+        assert!(overflow.iter().all(Option::is_none));
+
+        let cancelled = AtomicBool::new(true);
+        let error = preload_dense_anchor_batches(
+            &ordered,
+            1,
+            &reusable_vectors,
+            maximum_allocation_bytes,
+            &cancelled,
+            &mut content_vector_cache,
+        )
+        .err()
+        .expect("cancelled staging must fail closed");
+        assert!(error.to_string().contains("cancel"));
+        Ok(())
+    }
+
+    fn stage_only_dense_anchor_batch(
+        ordered: &[CacheableDenseAnchor<'_>],
+        cancelled: &AtomicBool,
+        content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    ) -> Result<StagedVectorBatch> {
+        let maximum_allocation_bytes = content_vector_cache
+            .as_ref()
+            .expect("cache")
+            .maximum_staging_allocation_bytes()?;
+        let mut staged = preload_dense_anchor_batches(
+            ordered,
+            1,
+            &HashMap::new(),
+            maximum_allocation_bytes,
+            cancelled,
+            content_vector_cache,
+        )?
+        .expect("staging plan");
+        staged
+            .pop()
+            .flatten()
+            .context("expected staged vector batch")
+    }
+
+    #[test]
+    fn dense_anchor_resolver_rejects_staged_vectors_after_row_corruption() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (anchor, canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [CacheableDenseAnchor {
+            anchor: &anchor,
+            identity: current_dense_anchor_identity_for_canonical(&anchor, &canonical),
+        }];
+        let exact_vectors = vec![vec![0.0, 1.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let cache_batch = dense_anchor_cache_batch(&ordered);
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&cache_batch, &exact_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered, &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .corrupt_batch_digest_for_test(&cache_batch)?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered,
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "cancelled fresh embedding after corrupt cache row",
+        );
+        assert!(
+            visitor_result.is_err(),
+            "staged vectors reached the visitor"
+        );
+        let error = format!("{:#}", visitor_result.unwrap_err());
+        assert!(
+            error.contains("embedding_server_transport_unavailable"),
+            "unexpected fresh-path error: {error}"
+        );
+        assert!(matches!(
+            content_vector_cache
+                .as_mut()
+                .expect("cache remains enabled after invalid row")
+                .load_batch_detailed(&cache_batch)?,
+            VectorCacheBatchLookup::Absent
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dense_anchor_resolver_rejects_staged_vectors_after_lookup_error() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (anchor, canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [CacheableDenseAnchor {
+            anchor: &anchor,
+            identity: current_dense_anchor_identity_for_canonical(&anchor, &canonical),
+        }];
+        let exact_vectors = vec![vec![0.0, 1.0]];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let cache_batch = dense_anchor_cache_batch(&ordered);
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&cache_batch, &exact_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered, &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .remove_batch_table_for_test()?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered,
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "cancelled fresh embedding after cache lookup error",
+        );
+        assert!(
+            visitor_result.is_err(),
+            "staged vectors reached the visitor"
+        );
+        let error = format!("{:#}", visitor_result.unwrap_err());
+        assert!(
+            error.contains("embedding_server_transport_unavailable"),
+            "unexpected fresh-path error: {error}"
+        );
+        assert!(
+            content_vector_cache.is_none(),
+            "lookup error did not disable cache reuse"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_anchor_resolver_cancellation_precedes_staged_absent_reuse() -> Result<()> {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (a, a_canonical) = dense_anchor_identity_fixture(1, "python:function:pkg.a", 10);
+        let (b, b_canonical) = dense_anchor_identity_fixture(2, "python:function:pkg.b", 20);
+        let ordered = [
+            CacheableDenseAnchor {
+                anchor: &a,
+                identity: current_dense_anchor_identity_for_canonical(&a, &a_canonical),
+            },
+            CacheableDenseAnchor {
+                anchor: &b,
+                identity: current_dense_anchor_identity_for_canonical(&b, &b_canonical),
+            },
+        ];
+        let mut content_vector_cache = Some(
+            ContentAddressedVectorCache::open_for_test_with_batch_capacity(
+                &runtime,
+                "scope-a",
+                "producer-a",
+                2,
+                1,
+                1,
+            )?,
+        );
+        let b_vectors = vec![vec![0.0, 1.0]];
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(&dense_anchor_cache_batch(&ordered[1..2]), &b_vectors)?;
+        let cancelled = AtomicBool::new(false);
+        let staged =
+            stage_only_dense_anchor_batch(&ordered[1..2], &cancelled, &mut content_vector_cache)?;
+        content_vector_cache
+            .as_mut()
+            .expect("cache")
+            .publish_batch(
+                &dense_anchor_cache_batch(&ordered[0..1]),
+                &[vec![1.0, -0.0]],
+            )?;
+
+        cancelled.store(true, Ordering::Release);
+        let visitor_result = resolve_dense_anchor_batch(
+            &ordered[1..2],
+            &crate::embeddings::ProductEmbeddingClient::new(&runtime),
+            &cancelled,
+            &mut content_vector_cache,
+            Some(staged),
+            "native embedding must remain unreachable",
+        );
+        let error = visitor_result.expect_err("cancelled staged vectors reached the visitor");
+        assert!(error.to_string().contains("reusing staged embedding batch"));
+        assert_eq!(
+            content_vector_cache.as_ref().expect("cache").activity(),
+            (0, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_keeps_repeated_canonical_strings_at_distinct_spans() {
+        let (first, canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.overload", 20);
+        let (second, repeated_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.overload", 40);
+
+        assert_eq!(canonical, repeated_canonical);
+        assert_ne!(
+            current_dense_anchor_identity_for_canonical(&first, &canonical),
+            current_dense_anchor_identity_for_canonical(&second, &repeated_canonical)
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_preserves_exact_canonical_bytes() {
+        let (anchor, _) = dense_anchor_identity_fixture(1, "unused", 20);
+        let canonical_ids = [
+            "",
+            "python:function:pkg.a\0b",
+            "python:function:pkg.ab",
+            "python:function:pkg.é",
+            "python:function:pkg.e\u{301}",
+        ];
+        let identities = canonical_ids
+            .iter()
+            .map(|canonical_id| stable_dense_anchor_identity(&anchor, canonical_id))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(identities.len(), canonical_ids.len());
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_requires_complete_non_null_mapping() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 40);
+        let anchors = [first, second];
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".into(),
+                canonical_id: Some(first_canonical),
+                ..Default::default()
+            }])
+            .expect("insert first node");
+        let mut missing_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "missing", "producer-a", 2)
+                .expect("open missing-node cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &storage,
+                &anchors,
+                "project-a",
+                &mut missing_cache,
+            )
+            .is_none()
+        );
+        assert!(missing_cache.is_none(), "missing node disables reuse");
+
+        storage
+            .insert_node(&Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "second".into(),
+                canonical_id: None,
+                ..Default::default()
+            })
+            .expect("insert node without canonical identity");
+        let mut null_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "null", "producer-a", 2)
+                .expect("open null-identity cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &storage,
+                &anchors,
+                "project-a",
+                &mut null_cache,
+            )
+            .is_none()
+        );
+        assert!(
+            null_cache.is_none(),
+            "null canonical identity disables reuse"
+        );
+
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "second".into(),
+                    canonical_id: Some(second_canonical),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(99),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "foreign".into(),
+                    canonical_id: Some("python:function:foreign".into()),
+                    ..Default::default()
+                },
+            ])
+            .expect("complete requested nodes");
+        let observed = load_dense_anchor_canonical_ids(&storage, &anchors)
+            .expect("complete canonical mapping");
+        assert_eq!(observed.len(), anchors.len());
+        assert!(!observed.contains_key(&99));
+
+        let broken = Store::new_in_memory().expect("broken store fixture");
+        broken
+            .insert_node(&Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "first".into(),
+                canonical_id: Some("python:function:pkg.first".into()),
+                ..Default::default()
+            })
+            .expect("insert node before lookup failure");
+        broken
+            .get_connection()
+            .execute("DROP TABLE node", [])
+            .expect("inject canonical lookup failure");
+        let mut failed_lookup_cache = Some(
+            ContentAddressedVectorCache::open(&runtime, "lookup-error", "producer-a", 2)
+                .expect("open lookup-error cache"),
+        );
+        assert!(
+            load_dense_anchor_canonical_ids_for_cache(
+                &broken,
+                &anchors[..1],
+                "project-a",
+                &mut failed_lookup_cache,
+            )
+            .is_none()
+        );
+        assert!(
+            failed_lookup_cache.is_none(),
+            "SQL lookup failure disables reuse"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_reads_the_active_snapshot_not_node_cache() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "anchor".into(),
+                canonical_id: Some("python:function:cached".into()),
+                ..Default::default()
+            }])
+            .expect("insert cached node");
+        assert_eq!(
+            storage
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("prime node cache")
+                .get(&NodeId(1))
+                .and_then(|node| node.canonical_id.as_deref()),
+            Some("python:function:cached")
+        );
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = 'python:function:snapshot' WHERE id = 1",
+                [],
+            )
+            .expect("change database without updating node cache");
+        let (anchor, _) = dense_anchor_identity_fixture(1, "unused", 20);
+
+        let snapshot = storage.read_snapshot().expect("pin active database view");
+        let observed = load_dense_anchor_canonical_ids(snapshot.storage(), &[anchor])
+            .expect("load identity from pinned snapshot");
+
+        assert_eq!(
+            observed.get(&1).map(String::as_str),
+            Some("python:function:snapshot"),
+            "cache reuse identity must come from the same SQLite snapshot as dense inputs"
+        );
+        snapshot.finish().expect("finish snapshot");
+        assert_eq!(
+            storage
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("read original cache after snapshot")
+                .get(&NodeId(1))
+                .and_then(|node| node.canonical_id.as_deref()),
+            Some("python:function:cached"),
+            "snapshot-safe lookup must not rewrite the ordinary node cache"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_canonical_lookup_crosses_store_batch_boundary() {
+        let mut storage = Store::new_in_memory().expect("in-memory store");
+        let fixtures = (1..=405)
+            .map(|node_id| {
+                dense_anchor_identity_fixture(
+                    node_id,
+                    &format!("python:function:pkg.anchor_{node_id}"),
+                    u32::try_from(node_id).expect("fixture line"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let anchors = fixtures
+            .iter()
+            .map(|(anchor, _)| anchor.clone())
+            .collect::<Vec<_>>();
+        let nodes = fixtures
+            .iter()
+            .map(|(anchor, canonical_id)| Node {
+                id: anchor.node_id,
+                kind: anchor.kind,
+                serialized_name: anchor.display_name.clone(),
+                canonical_id: Some(canonical_id.clone()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert nodes beyond one lookup batch");
+
+        let observed =
+            load_dense_anchor_canonical_ids(&storage, &anchors).expect("bounded canonical lookup");
+        assert_eq!(observed.len(), anchors.len());
+        for (anchor, canonical_id) in fixtures {
+            assert_eq!(observed.get(&anchor.node_id.0), Some(&canonical_id));
+        }
+    }
+
+    #[test]
+    fn actual_duplicate_dense_anchor_identity_disables_cache_without_dropping_coverage() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.duplicate", 20);
+        let (mut duplicate, duplicate_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.duplicate", 20);
+        duplicate.text = first.text.clone();
+        duplicate.document_hash = first.document_hash.clone();
+        assert_eq!(canonical, duplicate_canonical);
+        assert_eq!(
+            current_dense_anchor_identity_for_canonical(&first, &canonical),
+            current_dense_anchor_identity_for_canonical(&duplicate, &duplicate_canonical)
+        );
+        let canonical_ids = HashMap::from([
+            (first.node_id.0, canonical),
+            (duplicate.node_id.0, duplicate_canonical),
+        ]);
+
+        let mut owner = Some(
+            ContentAddressedVectorCache::open(&runtime, "scope-a", "producer-a", 2)
+                .expect("open vector cache"),
+        );
+        let ordered = canonical_dense_anchor_order(
+            vec![&first, &duplicate],
+            Some(&canonical_ids),
+            &mut owner,
+        );
+
+        assert!(owner.is_none(), "ambiguous logical identity disables reuse");
+        assert_eq!(ordered.len(), 2, "fallback keeps every dense anchor");
+        assert_eq!(ordered[0].anchor.node_id, first.node_id);
+        assert_eq!(ordered[1].anchor.node_id, duplicate.node_id);
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_namespace_does_not_reuse_v2_corpus_plan() {
+        let cache = TempDir::new().expect("cache root");
+        let runtime = vector_cache_runtime(&cache);
+        let (first, first_canonical) =
+            dense_anchor_identity_fixture(1, "python:function:pkg.first", 20);
+        let (second, second_canonical) =
+            dense_anchor_identity_fixture(2, "python:function:pkg.second", 40);
+        let legacy_first = legacy_dense_anchor_identity_v2(&first);
+        let legacy_second = legacy_dense_anchor_identity_v2(&second);
+        let legacy = [
+            VectorCacheBatchInput {
+                anchor_identity: &legacy_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &legacy_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        let mut owner = ContentAddressedVectorCache::open(&runtime, "scope-a", "producer-a", 2)
+            .expect("open vector cache");
+        assert_eq!(owner.canonical_order(&legacy).expect("legacy plan"), [0, 1]);
+        owner
+            .publish_batch(&legacy, &[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("legacy batch");
+
+        let current_first = current_dense_anchor_identity_for_canonical(&first, &first_canonical);
+        let current_second =
+            current_dense_anchor_identity_for_canonical(&second, &second_canonical);
+        assert_ne!(current_first, legacy_first);
+        assert_ne!(current_second, legacy_second);
+        let current_forward = [
+            VectorCacheBatchInput {
+                anchor_identity: &current_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &current_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+        ];
+        assert!(
+            owner
+                .load_batch(&current_forward)
+                .expect("new namespace lookup")
+                .is_none(),
+            "a legacy v2 batch must not be returned for corrected identities"
+        );
+        let current_reversed = [
+            VectorCacheBatchInput {
+                anchor_identity: &current_second,
+                document_hash: &second.document_hash,
+                text: &second.text,
+            },
+            VectorCacheBatchInput {
+                anchor_identity: &current_first,
+                document_hash: &first.document_hash,
+                text: &first.text,
+            },
+        ];
+        assert_eq!(
+            owner
+                .canonical_order(&current_reversed)
+                .expect("new namespace plan"),
+            [0, 1],
+            "an old identity plan must be a cache miss rather than control the corrected namespace"
+        );
+    }
+
+    #[test]
+    fn vector_publication_reports_persistence_hashing_and_validation_subphases() {
+        let directory = TempDir::new().expect("vector timing directory");
+        let layout = SidecarLayout {
+            lexical_data_dir: directory.path().join("lexical"),
+            semantic_data_dir: directory.path().join("semantic"),
+            scip_artifacts_root: directory.path().join("scip"),
+            state_file: directory.path().join("state.json"),
+        };
+        let contract = VectorEvidenceContract::new("backend", 2, "producer", "evidence");
+        let expected = vec![ExpectedVectorAnchor {
+            node_id: "node-1".into(),
+            document_hash: "document-1".into(),
+        }];
+
+        begin_finalize_phase_timings();
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "collection",
+            "generation",
+            "input",
+            &contract,
+            &expected,
+            |visit| {
+                visit(AttestedSemanticPoint {
+                    point: SemanticPoint {
+                        display_name: "symbol".into(),
+                        node_id: "node-1".into(),
+                        file_path: Some("src/lib.rs".into()),
+                        file_role: Some(FileRole::Source),
+                        dense_reason: Some("public_api".into()),
+                        vector: vec![1.0, 0.0],
+                    },
+                    document_hash: "document-1".into(),
+                })
+            },
+        )
+        .expect("publish vector database");
+        let timings = finish_finalize_phase_timings();
+
+        for phase in [
+            "vector sqlite persistence",
+            "vector hashing",
+            "vector final validation",
+        ] {
+            assert!(
+                timings.iter().any(|timing| timing.phase == phase),
+                "missing vector construction phase {phase}: {timings:?}"
+            );
+        }
     }
 
     #[test]
@@ -2623,6 +5420,826 @@ mod tests {
         assert!(!storage_path.exists());
     }
 
+    #[cfg(feature = "test-support")]
+    struct FirstRetrievalPublicationFixture {
+        project: TempDir,
+        _cache: TempDir,
+        _storage_dir: TempDir,
+        storage_path: PathBuf,
+        runtime: SidecarRuntimeConfig,
+        publication: IndexPublicationRecord,
+        core_database_path: PathBuf,
+        core_database_bytes: Vec<u8>,
+        core_pointer_path: PathBuf,
+        core_pointer_bytes: Vec<u8>,
+        retrieval_pointer_path: PathBuf,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl FirstRetrievalPublicationFixture {
+        fn new() -> Self {
+            let project = TempDir::new().expect("project");
+            let cache = TempDir::new().expect("cache");
+            let storage_dir = TempDir::new().expect("storage dir");
+            let storage_path = storage_dir.path().join("codestory.db");
+            fs::write(
+                project.path().join("fixture.rs"),
+                "pub fn first_retrieval_publication_fixture() {}\n",
+            )
+            .expect("write source fixture");
+
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-2222-4333-8444-555555555555".into(),
+                run_id: "first-retrieval-publication-run".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            let mut staged =
+                codestory_store::SnapshotStore::open_disposable_full_refresh(&storage_path)
+                    .expect("open staged core fixture");
+            staged
+                .store_mut()
+                .insert_file(&codestory_store::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("fixture.rs"),
+                    language: "rust".into(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert staged source fixture");
+            staged
+                .store_mut()
+                .insert_nodes_batch(&[
+                    Node {
+                        id: NodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: "fixture.rs".into(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: NodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "first_retrieval_publication_fixture".into(),
+                        qualified_name: Some("fixture::first_retrieval_publication_fixture".into()),
+                        file_node_id: Some(NodeId(1)),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert staged graph fixture");
+            staged
+                .store_mut()
+                .publish_structural_text_unit_generation(&publication)
+                .expect("publish complete staged structural text fixture");
+            crate::test_support::publish_complete_core_fixture(
+                staged.store_mut(),
+                project.path(),
+                &publication,
+            )
+            .expect("publish complete staged core fixture");
+            staged
+                .publish(&storage_path)
+                .expect("publish immutable core fixture");
+
+            let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("resolve core publication layout");
+            let core_database_path = layout
+                .generation_database_path(&publication.generation_id)
+                .expect("resolve immutable core database");
+            let core_database_bytes = fs::read(&core_database_path).expect("read immutable core");
+            let core_pointer_path = layout.publication_path();
+            let core_pointer_bytes = fs::read(&core_pointer_path).expect("read core pointer");
+            let retrieval_pointer_path = layout.retrieval_publication_path();
+            fs::remove_file(&retrieval_pointer_path)
+                .expect("remove initial empty retrieval publication pointer");
+            assert!(
+                matches!(
+                    fs::symlink_metadata(&retrieval_pointer_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ),
+                "fixture must begin with a physically absent retrieval pointer"
+            );
+
+            let runtime = crate::config::with_test_cache_root(cache.path(), || {
+                SidecarRuntimeConfig::for_project_profile(
+                    Some(project.path()),
+                    crate::SidecarProfile::Local,
+                )
+            });
+            Self {
+                project,
+                _cache: cache,
+                _storage_dir: storage_dir,
+                storage_path,
+                runtime,
+                publication,
+                core_database_path,
+                core_database_bytes,
+                core_pointer_path,
+                core_pointer_bytes,
+                retrieval_pointer_path,
+            }
+        }
+
+        fn assert_core_unchanged(&self) {
+            assert_eq!(
+                fs::read(&self.core_database_path).expect("read immutable core after finalization"),
+                self.core_database_bytes,
+                "retrieval finalization must not rewrite the immutable core database"
+            );
+            assert_eq!(
+                fs::read(&self.core_pointer_path).expect("read core pointer after finalization"),
+                self.core_pointer_bytes,
+                "retrieval finalization must not republish the core pointer"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_reaches_native_commit_fence_without_predecessor() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured_phases = std::rc::Rc::clone(&phases);
+
+        let error = finalize_index_for_runtime_with_progress_and_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+            move |phase| captured_phases.borrow_mut().push(phase),
+        )
+        .expect_err("source-only proof must stop at the managed native identity fence");
+        let rendered = format!("{error:#}");
+
+        fixture.assert_core_unchanged();
+        assert_eq!(
+            &*phases.borrow(),
+            &[
+                "lexical sidecar",
+                "graph artifact",
+                "embedded vectors",
+                "manifest write",
+            ],
+            "concurrent finalize announces lexical+graph before embed work, then reaches the existing commit fence"
+        );
+        assert!(
+            rendered.contains(
+                "validate managed per-user embedding server identity before final probes"
+            ) && rendered.contains("embedding_server_transport_unavailable"),
+            "unexpected downstream publication-fence failure: {rendered}"
+        );
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "a source-only run stopped at the native fence must not create the external pointer"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_rejects_corrupt_existing_pointer() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let corrupt = b"not a retrieval publication database";
+        fs::write(&fixture.retrieval_pointer_path, corrupt).expect("write corrupt pointer");
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+        )
+        .expect_err("a corrupt existing pointer must not become first-publication absence");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("load previous retrieval_index_manifest"),
+            "unexpected corrupt-pointer failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("file is not a database"),
+            "strict predecessor read did not diagnose corruption: {rendered}"
+        );
+        assert_eq!(
+            fs::read(&fixture.retrieval_pointer_path).expect("read preserved corrupt pointer"),
+            corrupt
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn first_retrieval_publication_rejects_dangling_pointer_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let target = fixture
+            .retrieval_pointer_path
+            .with_file_name("missing-retrieval-publication-target");
+        symlink(&target, &fixture.retrieval_pointer_path).expect("create dangling pointer symlink");
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(false),
+        )
+        .expect_err("a dangling pointer symlink must not become first-publication absence");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("load previous retrieval_index_manifest"),
+            "unexpected symlink failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("Retrieval publication pointer is not a regular file"),
+            "strict predecessor read did not reject the symlink: {rendered}"
+        );
+        assert!(
+            fs::symlink_metadata(&fixture.retrieval_pointer_path)
+                .expect("inspect preserved pointer symlink")
+                .file_type()
+                .is_symlink(),
+            "failed finalization must preserve the hostile pointer"
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_pre_cancel_preserves_absent_pointer_and_core() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+
+        let error = finalize_index_for_runtime_with_cancel(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            &AtomicBool::new(true),
+        )
+        .expect_err("pre-cancelled first publication must fail before construction");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("cancelled before preflight"),
+            "unexpected pre-cancel failure: {rendered}"
+        );
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "pre-cancelled finalization must not create a retrieval pointer"
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn first_retrieval_publication_retention_has_no_rollback_predecessor() {
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let storage = Store::open(&fixture.storage_path).expect("open immutable core fixture");
+        let project_id = sidecar_project_id_for_runtime(fixture.project.path(), &fixture.runtime)
+            .expect("resolve fixture project identity");
+        let active = crate::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test embedding residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "first-retrieval-publication-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+
+        let prepared = prepare_generation_retention(
+            &context,
+            &project_id,
+            &active,
+            &storage,
+            &fixture.storage_path,
+        )
+        .expect("a physically absent first publication has no rollback predecessor");
+
+        assert!(prepared.verified_previous.is_none());
+        assert!(
+            matches!(
+                fs::symlink_metadata(&fixture.retrieval_pointer_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "retention preparation must remain observational before atomic publication"
+        );
+        fixture.assert_core_unchanged();
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn postcommit_remover_setup_failure_preserves_publication_and_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let previous = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("publish first complete retrieval generation");
+        fs::write(
+            fixture.project.path().join("next.rs"),
+            "pub fn next_generation() {}\n",
+        )
+        .expect("write changed source for the next generation");
+        let previous_current = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("publish second complete retrieval generation");
+        assert_ne!(
+            previous.sidecar_generation, previous_current.sidecar_generation,
+            "fixture needs distinct artifact generations"
+        );
+        let current = previous;
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: previous_current,
+            verified_at_epoch_ms: 5_252,
+        };
+        let mut storage = Store::open(&fixture.storage_path).expect("open committed core");
+        storage
+            .publish_retrieval_index_publication(&current, Some(&rollback))
+            .expect("commit replacement current and rollback pointers");
+        publish_derived_retention_marker(
+            &storage,
+            &fixture.runtime.layout,
+            "postcommit-fixture-workspace",
+            fixture.project.path(),
+            &current.project_id,
+        )
+        .expect("publish marker before cleanup");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication(&current.project_id)
+                .expect("read committed pointer"),
+            Some((current.clone(), Some(rollback.clone())))
+        );
+        drop(storage);
+
+        let generations = [&current, &rollback.manifest];
+        let artifacts = generations
+            .into_iter()
+            .flat_map(|manifest| {
+                let generation = manifest.sidecar_generation.as_deref().expect("generation");
+                [
+                    crate::lexical_index::shard_dir_for(
+                        &fixture.runtime.layout.lexical_data_dir,
+                        generation,
+                    )
+                    .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                    crate::scip_index::scip_symbols_component_path(
+                        &fixture.runtime.layout.scip_project_dir(generation),
+                    ),
+                    crate::embedded_vector::index_path(
+                        &fixture.runtime.layout,
+                        &manifest.semantic_generation,
+                    ),
+                ]
+            })
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap_or_else(|error| {
+                    panic!("read committed artifact {}: {error}", path.display())
+                });
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        let pointer_bytes = fs::read(&fixture.retrieval_pointer_path)
+            .expect("read committed retrieval pointer bytes");
+
+        let root = fixture
+            .runtime
+            .layout
+            .lexical_data_dir
+            .parent()
+            .expect("sidecar root");
+        let parked = root.with_extension("parked");
+        fs::rename(root, &parked).expect("park owned sidecar root after commit");
+        let mut restore = RestoreOwnedRoot {
+            root: root.to_path_buf(),
+            parked: parked.clone(),
+            restored: false,
+        };
+        symlink(&parked, root).expect("replace owned root with unsafe symlink");
+        let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+            retain_published_generations(
+                &fixture.storage_path,
+                &GenerationRetentionContext {
+                    runtime: &fixture.runtime,
+                    layout: &fixture.runtime.layout,
+                    workspace_id: "postcommit-fixture-workspace",
+                    previous_manifest: Some(&rollback.manifest),
+                    embedding_device: &crate::embeddings::embedding_device_readiness_for_runtime(
+                        &fixture.runtime,
+                    ),
+                    embedding_residency:
+                        crate::embeddings::acquire_product_embedding_residency_for_runtime(
+                            &fixture.runtime,
+                        )
+                        .expect("acquire test residency"),
+                    pinned_core_publication: fixture.publication.clone(),
+                    graph_equivalent_predecessor: None,
+                },
+                &current.project_id,
+                None,
+            )
+        });
+        restore.restore().expect("restore owned sidecar root");
+
+        assert_eq!(
+            Store::open(&fixture.storage_path)
+                .expect("reopen committed store")
+                .get_retrieval_index_publication(&current.project_id)
+                .expect("read publication after cleanup failure"),
+            Some((current, Some(rollback)))
+        );
+        assert_eq!(
+            fs::read(&fixture.retrieval_pointer_path).expect("read retained pointer bytes"),
+            pointer_bytes
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(
+                fs::read(&path).expect("read retained artifact"),
+                bytes,
+                "{}",
+                path.display()
+            );
+        }
+        let (_plan, report) = result;
+        assert!(report.pruning_suppressed);
+        assert_eq!(report.removed_bytes, 0);
+        assert!(report.removals.is_empty());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("cleanup deferred")
+                    && error.contains("owned sidecar root")),
+            "missing explicit postcommit cleanup diagnostic: {:?}",
+            report.errors
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalized_manifest_external_pointer_cancellation_preserves_commit_boundary() {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let candidate = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("prepare complete candidate artifacts");
+        let generation = candidate.sidecar_generation.as_deref().expect("generation");
+        let artifacts = [
+            crate::lexical_index::shard_dir_for(
+                &fixture.runtime.layout.lexical_data_dir,
+                generation,
+            )
+            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+            crate::scip_index::scip_symbols_component_path(
+                &fixture.runtime.layout.scip_project_dir(generation),
+            ),
+            crate::embedded_vector::index_path(
+                &fixture.runtime.layout,
+                &candidate.semantic_generation,
+            ),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read candidate artifact before commit");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        fs::remove_file(&fixture.retrieval_pointer_path)
+            .expect("reset prepared candidate to an absent first-publication pointer");
+
+        let storage = Store::open(&fixture.storage_path).expect("open candidate core");
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_dim = candidate.embedding_dim.expect("embedding dimension");
+        let producer = crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).expect("positive dimension"),
+        )
+        .expect("producer compatibility identity");
+        let sidecar_input = compute_sidecar_input_fingerprint(
+            &storage,
+            fixture.project.path(),
+            &fixture.storage_path,
+            &candidate.project_id,
+            candidate.embedding_backend.as_deref().expect("backend"),
+            embedding_dim,
+            &producer,
+        )
+        .expect("compute exact candidate input");
+        assert_eq!(
+            candidate.sidecar_input_hash.as_deref(),
+            Some(sidecar_input.hash.as_str()),
+            "test validator must not admit a stale candidate"
+        );
+        let prepared_lexical = prepare_lexical_input_for_store(
+            lexical_source_input(fixture.project.path(), &fixture.storage_path)
+                .expect("scan lexical source"),
+            fixture.project.path(),
+            &storage,
+        )
+        .expect("prepare lexical source seals");
+        drop(storage);
+        let residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "external-commit-finalizer-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency: residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+        for cancel_after_write in [true, false] {
+            let cancelled = AtomicBool::new(false);
+            let writes = std::cell::Cell::new(0_u8);
+            let markers = std::cell::Cell::new(0_u8);
+            let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+                persist_finalized_manifest_with_hooks(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                    &prepared_lexical,
+                    &context,
+                    &cancelled,
+                    &sidecar_input,
+                    candidate.project_id.clone(),
+                    candidate.clone(),
+                    Vec::new(),
+                    SidecarStubFlags {
+                        scip_stubbed: false,
+                    },
+                    |project_id, input, manifest, context, storage, _storage_path| {
+                        // Substitute backend validation only; retain the real
+                        // input/core/source fence, pointer write and finalizer.
+                        assert_eq!(project_id, manifest.project_id);
+                        assert_eq!(
+                            manifest.sidecar_input_hash.as_deref(),
+                            Some(input.hash.as_str())
+                        );
+                        assert_eq!(
+                            storage.get_complete_index_publication()?,
+                            Some(context.pinned_core_publication.clone())
+                        );
+                        assert!(crate::lexical_index::shard_matches_lexical_input(
+                            &context.layout.lexical_data_dir,
+                            manifest.sidecar_generation.as_deref().expect("generation"),
+                            input.lexical_file_count,
+                            &input.lexical_hash,
+                            &input.hash,
+                        ));
+                        Ok(())
+                    },
+                    || {
+                        writes.set(writes.get() + 1);
+                        cancelled.store(cancel_after_write, std::sync::atomic::Ordering::Release);
+                    },
+                    || markers.set(markers.get() + 1),
+                )
+            });
+            assert_eq!(
+                writes.get(),
+                1,
+                "actual staged pointer write hook must execute"
+            );
+            let observed = Store::open(&fixture.storage_path)
+                .expect("reopen authoritative finalizer pointer")
+                .get_retrieval_index_publication(&candidate.project_id)
+                .expect("read finalizer current+rollback pair");
+            if cancel_after_write {
+                let error = result.expect_err("precommit cancellation must reject candidate");
+                assert!(
+                    is_retrieval_index_cancelled(&error),
+                    "typed cancellation lost: {error:#}"
+                );
+                assert_eq!(
+                    markers.get(),
+                    0,
+                    "cancelled staging cannot enter postcommit cleanup"
+                );
+                assert!(
+                    observed.is_none(),
+                    "cancelled external candidate became authoritative: {observed:?}"
+                );
+            } else {
+                let outcome =
+                    result.expect("healthy external commit must return committed outcome");
+                assert_eq!(markers.get(), 1);
+                assert_eq!(
+                    outcome.manifest.sidecar_generation,
+                    candidate.sidecar_generation
+                );
+                let (manifest, rollback) = observed.expect("healthy pointer commit missing");
+                assert_eq!(manifest, outcome.manifest);
+                assert!(rollback.is_none());
+            }
+            fixture.assert_core_unchanged();
+            for (path, bytes) in &artifacts {
+                assert_eq!(
+                    &fs::read(path).expect("read candidate artifact after finalizer"),
+                    bytes
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn finalized_manifest_returns_committed_outcome_when_cleanup_setup_fails() {
+        use std::os::unix::fs::symlink;
+
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let candidate = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("prepare complete candidate artifacts");
+        let generation = candidate.sidecar_generation.as_deref().expect("generation");
+        let artifacts = [
+            crate::lexical_index::shard_dir_for(
+                &fixture.runtime.layout.lexical_data_dir,
+                generation,
+            )
+            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+            crate::scip_index::scip_symbols_component_path(
+                &fixture.runtime.layout.scip_project_dir(generation),
+            ),
+            crate::embedded_vector::index_path(
+                &fixture.runtime.layout,
+                &candidate.semantic_generation,
+            ),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read candidate artifact before commit");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        fs::remove_file(&fixture.retrieval_pointer_path)
+            .expect("reset prepared candidate to an absent first-publication pointer");
+
+        let storage = Store::open(&fixture.storage_path).expect("open candidate core");
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_dim = candidate.embedding_dim.expect("embedding dimension");
+        let producer = crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).expect("positive dimension"),
+        )
+        .expect("producer compatibility identity");
+        let sidecar_input = compute_sidecar_input_fingerprint(
+            &storage,
+            fixture.project.path(),
+            &fixture.storage_path,
+            &candidate.project_id,
+            candidate.embedding_backend.as_deref().expect("backend"),
+            embedding_dim,
+            &producer,
+        )
+        .expect("compute exact candidate input");
+        assert_eq!(
+            candidate.sidecar_input_hash.as_deref(),
+            Some(sidecar_input.hash.as_str()),
+            "test validator must not admit a stale candidate"
+        );
+        let prepared_lexical = prepare_lexical_input_for_store(
+            lexical_source_input(fixture.project.path(), &fixture.storage_path)
+                .expect("scan lexical source"),
+            fixture.project.path(),
+            &storage,
+        )
+        .expect("prepare lexical source seals");
+        drop(storage);
+        let residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "postcommit-finalizer-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency: residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+        let root = fixture
+            .runtime
+            .layout
+            .lexical_data_dir
+            .parent()
+            .expect("sidecar root");
+        let parked = root.with_extension("parked");
+        let mut restore = None;
+        let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+            persist_finalized_manifest_with_hooks(
+                fixture.project.path(),
+                &fixture.storage_path,
+                &prepared_lexical,
+                &context,
+                &AtomicBool::new(false),
+                &sidecar_input,
+                candidate.project_id.clone(),
+                candidate.clone(),
+                Vec::new(),
+                SidecarStubFlags {
+                    scip_stubbed: false,
+                },
+                |project_id, input, manifest, context, storage, _storage_path| {
+                    assert_eq!(project_id, manifest.project_id);
+                    assert_eq!(
+                        manifest.sidecar_input_hash.as_deref(),
+                        Some(input.hash.as_str())
+                    );
+                    assert_eq!(
+                        storage.get_complete_index_publication()?,
+                        Some(context.pinned_core_publication.clone())
+                    );
+                    assert!(crate::lexical_index::shard_matches_lexical_input(
+                        &context.layout.lexical_data_dir,
+                        manifest.sidecar_generation.as_deref().expect("generation"),
+                        input.lexical_file_count,
+                        &input.lexical_hash,
+                        &input.hash,
+                    ));
+                    Ok(())
+                },
+                || {},
+                || {
+                    fs::rename(root, &parked).expect("park sidecar root after marker");
+                    restore = Some(RestoreOwnedRoot {
+                        root: root.to_path_buf(),
+                        parked: parked.clone(),
+                        restored: false,
+                    });
+                    symlink(&parked, root).expect("replace sidecar root before remover open");
+                },
+            )
+        });
+        restore
+            .as_mut()
+            .expect("post-marker hook ran")
+            .restore()
+            .expect("restore candidate sidecar root");
+        let outcome = result.expect("committed publication must survive cleanup setup failure");
+        assert_eq!(outcome.manifest.project_id, candidate.project_id);
+        assert_eq!(
+            outcome.manifest.sidecar_generation,
+            candidate.sidecar_generation
+        );
+        assert!(outcome.generation_retention.pruning_suppressed);
+        assert_eq!(outcome.generation_retention.removed_bytes, 0);
+        assert!(outcome.generation_retention.errors.iter().any(|error| {
+            error.contains("cleanup deferred") && error.contains("owned sidecar root")
+        }));
+        assert_eq!(
+            Store::open(&fixture.storage_path)
+                .expect("reopen publication")
+                .get_retrieval_index_publication(&candidate.project_id)
+                .expect("read committed publication")
+                .map(|(manifest, rollback)| (manifest.sidecar_generation, rollback)),
+            Some((candidate.sidecar_generation, None))
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(fs::read(&path).expect("read candidate artifact"), bytes);
+        }
+    }
+
     #[test]
     fn finalize_progress_is_emitted_before_blocking_work() {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -2808,6 +6425,162 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
+    fn pointer_backed_publication_cancellation_case(cancel_at: Option<u8>) {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let mut storage =
+            Store::open(&fixture.storage_path).expect("open real pointer-backed immutable core");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("complete core"),
+            Some(fixture.publication.clone())
+        );
+        assert!(fixture.core_pointer_path.is_file());
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input("11111111111111111111111111111111");
+        let current_input = input("22222222222222222222222222222222");
+        let candidate_input = input("33333333333333333333333333333333");
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        storage
+            .publish_retrieval_index_publication(&rollback_manifest, None)
+            .expect("bind first external retrieval publication to pinned core");
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest,
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+        assert!(fixture.retrieval_pointer_path.is_file());
+        {
+            let mut transaction = storage
+                .retrieval_publication_transaction()
+                .expect("stage hostile rollback binding");
+            let wrong_rollback = prior
+                .as_ref()
+                .and_then(|(_, rollback)| rollback.as_ref())
+                .expect("prior rollback fixture");
+            let error = transaction
+                .publish_retrieval_index_publication(&candidate_manifest, Some(wrong_rollback))
+                .expect_err("a non-current rollback must not substitute the bound predecessor");
+            assert!(
+                error.to_string().contains("currently bound publication"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read after wrong binding"),
+            prior,
+            "wrong rollback binding changed the prior pointer pair"
+        );
+        let checks = std::cell::Cell::new(0_u8);
+
+        let result = promote_retrieval_manifest_with_cancel(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if Some(next) == cancel_at {
+                    return Err(RetrievalIndexCancelled {
+                        boundary: "fixture authoritative pointer commit",
+                    }
+                    .into());
+                }
+                Ok(())
+            },
+        );
+        fixture.assert_core_unchanged();
+        let observed = Store::open(&fixture.storage_path)
+            .expect("independently reopen pointer-backed core")
+            .get_retrieval_index_publication("proj")
+            .expect("read authoritative publication after cancellation fence");
+        if let Some(cancel_at) = cancel_at {
+            let error = result.expect_err("cancellation before commit must reject publication");
+            assert!(is_retrieval_index_cancelled(&error), "{error:#}");
+            assert_eq!(checks.get(), cancel_at, "cancellation callback census");
+            assert_eq!(
+                observed, prior,
+                "cancelled transaction changed current or rollback pointers"
+            );
+        } else {
+            result.expect("uncancelled pointer publication must commit");
+            assert_eq!(checks.get(), 3, "all cancellation fences must execute");
+            assert_eq!(
+                observed,
+                Some((
+                    candidate_manifest,
+                    Some(RetrievalIndexRollbackRecord {
+                        manifest: current_manifest,
+                        verified_at_epoch_ms: 3,
+                    })
+                ))
+            );
+            let bound = Store::open(&fixture.storage_path)
+                .expect("reopen committed binding")
+                .get_bound_retrieval_index_manifest("proj")
+                .expect("read committed binding")
+                .expect("committed binding exists");
+            assert_eq!(bound.core.generation_id, fixture.publication.generation_id);
+            assert_eq!(bound.core.run_id, fixture.publication.run_id);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn pointer_backed_cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
+        pointer_backed_publication_cancellation_case(Some(3));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn pointer_backed_publication_preserves_prewrite_cancellation_and_healthy_commit() {
+        pointer_backed_publication_cancellation_case(Some(2));
+        pointer_backed_publication_cancellation_case(None);
+    }
+
     #[test]
     fn partial_zero_dense_vector_candidate_repairs_then_promotes_without_weakening_prior() {
         let _env = crate::test_support::env_lock();
@@ -2854,12 +6627,6 @@ mod tests {
             full_retrieval_allowed: true,
             degraded_reason: None,
         };
-        let producer_compatibility_identity = vector_producer_compatibility_identity(
-            &device,
-            residency.identity(),
-            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-        )
-        .expect("producer compatibility identity");
         let input = |hash: &str| SidecarInputFingerprint {
             hash: hash.into(),
             symbol_doc_count: 0,
@@ -2981,6 +6748,7 @@ mod tests {
             crate::embedded_vector::validate_generation_evidence_for_publication(
                 &runtime.layout,
                 &storage,
+                None,
                 prior_manifest,
                 &publication,
                 &runtime,
@@ -3016,7 +6784,8 @@ mod tests {
             previous_manifest: Some(&current_manifest),
             embedding_device: &device,
             embedding_residency: residency,
-            producer_compatibility_identity,
+            pinned_core_publication: publication.clone(),
+            graph_equivalent_predecessor: None,
         };
         let cancelled = AtomicBool::new(false);
         ensure_semantic_index(
@@ -3032,6 +6801,7 @@ mod tests {
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &runtime.layout,
             &storage,
+            None,
             &candidate_manifest,
             &publication,
             &runtime,
@@ -3049,6 +6819,7 @@ mod tests {
                 crate::embedded_vector::validate_generation_evidence_for_publication(
                     &runtime.layout,
                     storage,
+                    None,
                     &candidate_manifest,
                     &publication,
                     &runtime,
@@ -3215,6 +6986,58 @@ mod tests {
     }
 
     #[test]
+    fn finalized_pinned_input_seeds_the_ready_lease_without_a_second_fingerprint_pass() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let storage = Store::open(&storage_path).expect("storage");
+        let expected = SidecarInputFingerprint {
+            hash: "pinned-sidecar-input".into(),
+            symbol_doc_count: 17,
+            projection_count: 11,
+            dense_projection_count: 11,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: "pinned-graph".into(),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 3,
+            lexical_hash: "pinned-lexical".into(),
+            lexical_coverage: crate::lexical_index::LexicalCoverage::default(),
+        };
+        let _lease_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            codestory_workspace::SourceFreshnessMemo::default(),
+        );
+        memoize_pinned_sidecar_input_fingerprint(
+            project.path(),
+            &storage_path,
+            "project-identity",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+            expected.clone(),
+        )
+        .expect("seed pinned fingerprint");
+
+        let observed = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            &storage_path,
+            "project-identity",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("reuse pinned fingerprint");
+
+        assert_eq!(observed, expected);
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("lease scope")
+                .readiness_fingerprint_passes,
+            0,
+            "the finalizer's pinned input must satisfy later strict validation"
+        );
+    }
+
+    #[test]
     fn canonical_sidecar_generation_is_stable_across_clean_roots_with_same_input() {
         let Some(first_project) = git_project() else {
             return;
@@ -3353,6 +7176,36 @@ mod tests {
     }
 
     #[test]
+    fn dirty_identity_reuses_the_latest_valid_physical_predecessor() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval manifest store");
+        let mut canonical =
+            crate::test_support::retrieval_manifest_fixture("repo-v2-clean", "canonical-input");
+        canonical.built_at_epoch_ms = 7;
+        storage
+            .upsert_retrieval_index_manifest(&canonical)
+            .expect("publish canonical manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select physical predecessor")
+            .expect("canonical predecessor");
+        assert_eq!(selected, canonical);
+
+        let mut dirty =
+            crate::test_support::retrieval_manifest_fixture("workspace-dirty", "dirty-input");
+        dirty.built_at_epoch_ms = 1;
+        storage
+            .upsert_retrieval_index_manifest(&dirty)
+            .expect("publish dirty manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select current identity manifest")
+            .expect("dirty predecessor");
+        assert_eq!(selected, dirty, "the exact identity must win over recency");
+    }
+
+    #[test]
     fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
         let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
@@ -3468,6 +7321,12 @@ mod tests {
             .upsert_dense_anchor_inputs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
+        storage
+            .publish_dense_anchor_generation(
+                &second_publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("republish dense-anchor after content drift");
         let second = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
@@ -3504,9 +7363,11 @@ mod tests {
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
+                    &storage_path,
                     "proj",
                     &embedding_contract,
                     lexical_source,
+                    None,
                 )
             },
             |_| Ok(()),
@@ -3776,9 +7637,11 @@ mod tests {
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
+                    &storage_path,
                     "proj",
                     &embedding_contract,
                     lexical_source,
+                    None,
                 )
             },
             |_| {
@@ -3816,9 +7679,11 @@ mod tests {
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
+                    &storage_path,
                     "proj",
                     &embedding_contract,
                     lexical_source,
+                    None,
                 )
             },
             |_| {
@@ -3867,9 +7732,11 @@ mod tests {
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
+                    &storage_path,
                     "proj",
                     &embedding_contract,
                     lexical_source,
+                    None,
                 )
             },
             |_| {
@@ -3974,12 +7841,6 @@ mod tests {
                 crate::embeddings::acquire_product_embedding_residency_for_runtime(&runtime)
                     .expect("acquire test residency");
             let device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
-            let producer_compatibility_identity = vector_producer_compatibility_identity(
-                &device,
-                residency.identity(),
-                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-            )
-            .expect("producer compatibility identity");
             let context = GenerationRetentionContext {
                 runtime: &runtime,
                 layout: &runtime.layout,
@@ -3987,11 +7848,18 @@ mod tests {
                 previous_manifest: Some(&previous),
                 embedding_device: &device,
                 embedding_residency: residency,
-                producer_compatibility_identity,
+                pinned_core_publication: publication.clone(),
+                graph_equivalent_predecessor: None,
             };
-            prepare_generation_retention(&context, &previous.project_id, &active, storage)
-                .expect("prepare retention")
-                .verified_previous
+            prepare_generation_retention(
+                &context,
+                &previous.project_id,
+                &active,
+                storage,
+                &storage_path,
+            )
+            .expect("prepare retention")
+            .verified_previous
         };
 
         let storage = Store::open(&storage_path).expect("open candidate storage");
@@ -4001,6 +7869,8 @@ mod tests {
         );
         let vector_path =
             crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)
@@ -4296,6 +8166,79 @@ mod tests {
     }
 
     #[test]
+    fn reuse_refuses_same_count_scip_row_drift_after_publication() {
+        let fixture = publish_healthy_generation("reuse-scip-row-drift");
+        let json_path = fixture.scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE);
+        let index: crate::scip_index::ScipSymbolsIndex = serde_json::from_slice(
+            &std::fs::read(&json_path).expect("read published graph fixture"),
+        )
+        .expect("decode published graph fixture");
+        crate::scip_index::publish_scip_component_for_test(&fixture.scip_dir, &index)
+            .expect("publish the same graph through the real SQLite producer");
+        assert!(
+            !json_path.exists(),
+            "SQLite publication replaces the JSON fixture"
+        );
+
+        let semantic_point_count = Some(0);
+        let healthy = probe(&fixture, "reuse-scip-row-drift");
+        assert!(healthy.scip.capabilities.graph);
+        assert!(unchanged_generation_is_reusable(
+            &healthy,
+            semantic_point_count
+        ));
+
+        let component = crate::scip_index::scip_symbols_component_path(&fixture.scip_dir);
+        crate::copy_on_write::make_file_owner_writable(&component)
+            .expect("allow hostile row rewrite");
+        let connection = rusqlite::Connection::open(&component).expect("open published graph");
+        let before: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read graph envelope");
+        connection
+            .execute(
+                "UPDATE symbol_records SET start_line = start_line + 1 WHERE ordinal = 0",
+                [],
+            )
+            .expect("rewrite one symbol cell without changing row counts");
+        let after: (String, i64, i64) = connection
+            .query_row(
+                "SELECT component_sha256, symbol_count, proof_count FROM metadata WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reread graph envelope");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .expect("check SQLite structure");
+        drop(connection);
+        crate::copy_on_write::make_file_immutable(&component)
+            .expect("restore immutable component bit");
+        assert_eq!(before, after);
+        assert_eq!(quick_check, "ok");
+
+        let damaged = probe(&fixture, "reuse-scip-row-drift");
+        assert_eq!(
+            damaged.retrieval_mode, "full",
+            "manifest classification is unchanged"
+        );
+        assert!(
+            !damaged.scip.capabilities.graph,
+            "damaged rows revoke graph health"
+        );
+        assert!(damaged.degraded_reason.is_some());
+        assert!(!unchanged_generation_is_reusable(
+            &damaged,
+            semantic_point_count
+        ));
+        assert!(!damaged.is_live_ready());
+    }
+
+    #[test]
     fn reuse_refuses_a_generation_whose_lexical_shard_was_damaged_after_publication() {
         let fixture = publish_healthy_generation("reuse-lexical");
         let semantic_point_count = Some(0);
@@ -4395,10 +8338,11 @@ mod tests {
     ///
     /// The reuse branch returns before the first phase, so an empty phase list
     /// *is* the reuse decision as the product renders it: no lexical, semantic,
-    /// or graph work was scheduled. Every rebuild announces `lexical sidecar`
-    /// first. Both passes stop at the publication fence in this environment —
-    /// there is no per-user embedding server — which is downstream of the
-    /// decision under test and identical for both legs.
+    /// or graph work was scheduled. Rebuilds announce `lexical sidecar` first,
+    /// then `graph artifact` alongside embed work under concurrent finalize.
+    /// Both passes stop at the publication fence in this environment — there is
+    /// no per-user embedding server — which is downstream of the decision under
+    /// test and identical for both legs.
     #[cfg(feature = "test-support")]
     fn finalize_phases(fixture: &PublishedGeneration) -> (Vec<&'static str>, String) {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -4448,6 +8392,7 @@ mod tests {
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &fixture.runtime.layout,
             &storage,
+            None,
             &fixture.manifest,
             &publication,
             &fixture.runtime,
@@ -4538,12 +8483,6 @@ mod tests {
             .expect("acquire test residency");
             let device =
                 crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
-            let producer_compatibility_identity = vector_producer_compatibility_identity(
-                &device,
-                residency.identity(),
-                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-            )
-            .expect("producer compatibility identity");
             let context = GenerationRetentionContext {
                 runtime: &fixture.runtime,
                 layout: &fixture.runtime.layout,
@@ -4551,11 +8490,21 @@ mod tests {
                 previous_manifest: Some(&fixture.manifest),
                 embedding_device: &device,
                 embedding_residency: residency,
-                producer_compatibility_identity,
+                pinned_core_publication: storage
+                    .get_complete_index_publication()
+                    .expect("read complete core publication")
+                    .expect("complete core publication"),
+                graph_equivalent_predecessor: None,
             };
-            prepare_generation_retention(&context, &fixture.manifest.project_id, &active, storage)
-                .expect("prepare retention")
-                .verified_previous
+            prepare_generation_retention(
+                &context,
+                &fixture.manifest.project_id,
+                &active,
+                storage,
+                &fixture.storage_path,
+            )
+            .expect("prepare retention")
+            .verified_previous
         };
 
         let storage = Store::open(&fixture.storage_path).expect("open candidate storage");

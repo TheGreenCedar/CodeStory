@@ -137,7 +137,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: excerpt.map(str::to_string),
         }

@@ -7,11 +7,13 @@ use super::{
 #[cfg(test)]
 use super::{
     EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, HybridSearchConfig, HybridSearchHit, RetrievalModeDto,
-    RetrievalScoreBreakdownDto, SearchEngine, apply_hybrid_limits,
-    compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_hit,
-    looks_like_standalone_symbol_query, mixed_natural_language_query, normalized_hybrid_weights,
-    query_mentions_non_primary_source,
+    SearchEngine, apply_hybrid_limits, compare_search_hits_with_project_root,
+    exact_symbol_query_terms, is_non_primary_source_hit, looks_like_standalone_symbol_query,
+    mixed_natural_language_query, normalized_hybrid_weights, query_mentions_non_primary_source,
 };
+#[cfg(test)]
+use codestory_contracts::api::RetrievalScoreBreakdownDto;
+
 use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
 #[cfg(test)]
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
@@ -344,12 +346,24 @@ impl AppController {
             .cloned()
             .unwrap_or_else(|| node_display_name(&node));
 
-        let mut file_path = Self::file_path_for_node(storage, &node).ok().flatten();
+        let mut file_path = if node.kind == codestory_contracts::graph::NodeKind::FILE {
+            // FILE nodes have no parent file_node_id. Resolve their location by
+            // the same pinned file identity used by the core publication.
+            storage
+                .get_file_by_id(id.0)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load indexed file identity: {error}"))
+                })?
+                .map(|file| file.path.to_string_lossy().into_owned())
+        } else {
+            Self::file_path_for_node(storage, &node).ok().flatten()
+        };
         let mut line = node.start_line;
         if let Ok(occs) = storage.get_occurrences_for_node(id)
             && let Some(occ) = preferred_occurrence(&occs)
         {
             if file_path.is_none()
+                && node.kind != codestory_contracts::graph::NodeKind::FILE
                 && let Ok(Some(file_node)) = storage.get_node(occ.location.file_node_id)
             {
                 file_path = Some(file_node.serialized_name);
@@ -395,7 +409,6 @@ impl AppController {
             resolution_status: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(false),
             source_excerpt: None,
@@ -442,6 +455,7 @@ impl AppController {
     }
 
     fn expanded_symbol_matches(&self, query: &str) -> Result<ExpandedSymbolMatches, ApiError> {
+        self.ensure_search_state()?;
         let mut s = self.state.lock();
         let engine = s.search_engine.as_mut().ok_or_else(|| {
             ApiError::invalid_argument("Search engine not initialized. Open a project first.")

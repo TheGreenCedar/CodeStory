@@ -60,6 +60,29 @@ cargo test --locked -p codestory-agent
 
 ## Draft source checks
 
+Experiment-validity changes use the core-only exact-search cases in
+`cli_golden_path`, plus these harness contracts:
+
+```sh
+node --test scripts/tests/codestory-control-row-audit.test.mjs
+node --test scripts/tests/builder-operation-canary.test.mjs
+node --test scripts/tests/codestory-evidence-compiler-ablation.test.mjs
+node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
+```
+
+The builder runs deterministic operation canaries through the pinned Codex
+macOS sandbox before launching any model sessions. Missing operation telemetry,
+failed commands, or invalid output shapes invalidate the experiment; quality
+aggregation cannot convert them into a packet `stop` or `advance`. Canaries
+retain commands, exit statuses, durations, and output digests. They do not count
+as installed-product acceptance.
+
+For a historical control audit, run
+`node scripts/codestory-control-row-audit.mjs --run-dir <preserved-receipt> --out-dir <new-external-directory>`.
+It authenticates the run ledger against the original receipt and reads only
+preserved transcript copies. The checksummed erratum withdraws affected
+comparisons without replacing the original receipt or its decision.
+
 Run the relevant focused commands while implementing. A typical Rust lane is:
 
 ```sh

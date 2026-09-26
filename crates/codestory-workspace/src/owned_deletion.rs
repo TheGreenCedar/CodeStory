@@ -5,15 +5,17 @@ use remove_dir_all::RemoveDir as _;
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io,
+    io::{self, Read},
     path::{Component, Path},
 };
 
 /// A deletion boundary pinned to one open directory handle.
 ///
 /// Callers establish ownership of `root` before opening this boundary, then
-/// pass only owned relative names. Traversal and removal stay relative to the
-/// open handle even if the ambient pathname is renamed or replaced.
+/// pass only owned relative names. Traversal stays relative to the open
+/// handle even if the ambient pathname is renamed or replaced. On Unix,
+/// recursive directory removal still ends in a name-based `rmdir`; use the
+/// empty-only operations for identity-sensitive final directory cleanup.
 #[derive(Debug)]
 pub struct OwnedDeletionRoot {
     root: File,
@@ -25,10 +27,200 @@ impl OwnedDeletionRoot {
         open_root(root).map(|root| Self { root })
     }
 
+    /// Pin a child directory below this boundary without following a link.
+    pub fn open_child_directory(&self, relative: &Path) -> io::Result<Self> {
+        let mut child = self.root.try_clone()?;
+        for part in relative_owned_parts(relative)? {
+            child = open_child_dir(&child, &part)?;
+        }
+        Ok(Self { root: child })
+    }
+
+    /// Read a bounded regular direct child from this pinned directory.
+    pub fn read_regular_file_bounded(
+        &self,
+        name: &Path,
+        max_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(file) = self.open_regular_file(name)? else {
+            return Ok(None);
+        };
+        if file.metadata()?.len() > max_bytes {
+            return Err(io::Error::other(
+                "owned deletion child exceeds its byte limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(io::Error::other(
+                "owned deletion child exceeds its byte limit",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Open a direct regular child without following a link. The returned
+    /// handle may be held across a consumer's own path-based open.
+    pub fn open_regular_file(&self, name: &Path) -> io::Result<Option<File>> {
+        let parts = relative_owned_parts(name)?;
+        if parts.len() != 1 {
+            return Err(invalid_relative_path(name));
+        }
+        let mut options = AtOpenOptions::default();
+        options.read(true).follow(false);
+        let file = match options.open_at(&self.root, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        reject_windows_reparse(&metadata)?;
+        if !metadata.is_file() {
+            return Err(io::Error::other(
+                "owned deletion child is not a regular file",
+            ));
+        }
+        Ok(Some(file))
+    }
+
+    /// Enumerate direct regular children from the pinned directory.
+    /// Unknown names or nonregular children return `None`.
+    pub fn known_regular_file_bytes(&self, allowed: &[&str]) -> io::Result<Option<u64>> {
+        let mut directory = self.root.try_clone()?;
+        let mut total = 0_u64;
+        for entry in fs_at::read_dir(&mut directory)? {
+            let entry = entry?;
+            let name = entry.name();
+            if name == OsStr::new(".") || name == OsStr::new("..") {
+                continue;
+            }
+            if !allowed.iter().any(|allowed| name == OsStr::new(allowed)) {
+                return Ok(None);
+            }
+            let mut options = AtOpenOptions::default();
+            options.read(true).follow(false);
+            let file = options.open_at(&self.root, Path::new(name))?;
+            let metadata = file.metadata()?;
+            reject_windows_reparse(&metadata)?;
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| io::Error::other("owned deletion byte count overflow"))?;
+        }
+        Ok(Some(total))
+    }
+
+    /// Compare this pinned directory to its current ambient pathname.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+        reject_windows_reparse(&metadata)?;
+        Ok(crate::workspace_file_identity(&self.root)? == crate::workspace_path_identity(path)?)
+    }
+
+    /// Compare this pinned directory with a directory handle authenticated
+    /// before a caller's publication or retention validation.
+    pub fn matches_open_directory(&self, expected: &File) -> io::Result<bool> {
+        Ok(
+            crate::workspace_file_identity(&self.root)?
+                == crate::workspace_file_identity(expected)?,
+        )
+    }
+
+    /// Remove one direct regular file only when its native identity still
+    /// matches an authenticated open handle. Windows deletes through the same
+    /// handle used for this comparison. Unix unlinks by name after the last
+    /// comparison, so callers must exclude cooperating writers through their
+    /// own publication or ownership lock for that final interval.
+    pub fn remove_regular_file_matching(&self, name: &Path, expected: &File) -> io::Result<bool> {
+        let parts = relative_owned_parts(name)?;
+        if parts.len() != 1 {
+            return Err(invalid_relative_path(name));
+        }
+        #[cfg(unix)]
+        {
+            let Some(opened) = self.open_regular_file(name)? else {
+                return Ok(false);
+            };
+            if crate::workspace_file_identity(&opened)? != crate::workspace_file_identity(expected)?
+            {
+                return Ok(false);
+            }
+            remove_file_entry(&self.root, &parts[0])
+        }
+        #[cfg(windows)]
+        {
+            use fs_at::os::windows::{FileExt as _, OpenOptionsExt as _};
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+            let mut options = AtOpenOptions::default();
+            options
+                .desired_access(DELETE | FILE_READ_ATTRIBUTES)
+                .follow(false);
+            let opened = match options.open_at(&self.root, name) {
+                Ok(opened) => opened,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let metadata = opened.metadata()?;
+            reject_windows_reparse(&metadata)?;
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            if crate::workspace_file_identity(&opened)? != crate::workspace_file_identity(expected)?
+            {
+                return Ok(false);
+            }
+            opened
+                .delete_by_handle()
+                .map(|()| true)
+                .map_err(|(_, error)| error)
+        }
+    }
+
+    /// Remove this already-open directory only when empty. Unix retains it
+    /// because `rmdir` cannot bind its last name lookup to this handle.
+    pub fn remove_pinned_empty_directory(self) -> io::Result<bool> {
+        let mut directory = self.root.try_clone()?;
+        for entry in fs_at::read_dir(&mut directory)? {
+            let entry = entry?;
+            if entry.name() != OsStr::new(".") && entry.name() != OsStr::new("..") {
+                return Err(io::Error::new(
+                    io::ErrorKind::DirectoryNotEmpty,
+                    "owned deletion directory is not empty",
+                ));
+            }
+        }
+        #[cfg(unix)]
+        {
+            Ok(false)
+        }
+        #[cfg(windows)]
+        {
+            use fs_at::os::windows::FileExt as _;
+            self.root
+                .delete_by_handle()
+                .map(|()| true)
+                .map_err(|(_, error)| error)
+        }
+    }
+
     /// Remove one owned file or directory below this boundary.
     ///
     /// Missing entries are already removed and return `false`. Absolute paths,
     /// parent traversal, and an empty/root path are always rejected.
+    /// On Unix a directory's final `rmdir` remains name-based after its
+    /// children are removed, so this is not a final-leaf identity guarantee.
     pub fn remove(&self, relative: &Path) -> io::Result<bool> {
         let parts = relative_owned_parts(relative)?;
         let (leaf, ancestors) = parts
@@ -48,6 +240,31 @@ impl OwnedDeletionRoot {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(_) => remove_file_entry(&parent, leaf),
         }
+    }
+
+    /// Remove one owned directory only when it is empty.
+    ///
+    /// Unlike [`Self::remove`], this never removes children. Callers that
+    /// recognize a closed set of owned files can delete those entries first,
+    /// then use this operation without risking an unknown file that appeared
+    /// between inspection and removal. Windows deletes by the opened handle.
+    /// Unix cannot remove an opened directory by identity, so a verified empty
+    /// directory is retained and this returns `false`.
+    pub fn remove_empty_directory(&self, relative: &Path) -> io::Result<bool> {
+        let parts = relative_owned_parts(relative)?;
+        let (leaf, ancestors) = parts
+            .split_last()
+            .expect("relative_owned_parts rejects an empty path");
+        let mut parent = self.root.try_clone()?;
+        for ancestor in ancestors {
+            parent = open_child_dir(&parent, ancestor)?;
+        }
+        let target = match open_child_dir(&parent, leaf) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        remove_open_empty_directory(&parent, leaf, target)
     }
 }
 
@@ -153,6 +370,17 @@ fn remove_open_directory(_: &File, _: &OsStr, target: File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn remove_open_empty_directory(_: &File, _: &OsStr, target: File) -> io::Result<bool> {
+    OwnedDeletionRoot { root: target }.remove_pinned_empty_directory()
+}
+
+#[cfg(windows)]
+fn remove_open_empty_directory(parent: &File, leaf: &OsStr, target: File) -> io::Result<bool> {
+    remove_open_directory(parent, leaf, target)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
 fn remove_file_entry(parent: &File, leaf: &OsStr) -> io::Result<bool> {
     match AtOpenOptions::default().unlink_at(parent, Path::new(leaf)) {
         Ok(()) => Ok(true),
@@ -195,6 +423,131 @@ mod tests {
     #[cfg(windows)]
     use std::process::Command;
     use tempfile::tempdir;
+
+    #[test]
+    fn empty_only_removal_refuses_unknown_children() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        fs::create_dir_all(owned.join("scope")).expect("create owned scope");
+        fs::write(owned.join("scope/unknown"), b"keep").expect("write unknown child");
+        let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+
+        deletion
+            .remove_empty_directory("scope".as_ref())
+            .expect_err("non-empty scope must be refused");
+        assert_eq!(
+            fs::read(owned.join("scope/unknown")).expect("unknown child survives"),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn matching_file_removal_refuses_replaced_db_and_lease_leaves() {
+        let temp = tempdir().expect("create temp root");
+        for (case, name) in ["candidate.db", ".codestory-core-lease.lock"]
+            .into_iter()
+            .enumerate()
+        {
+            let owned = temp.path().join(format!("owned-{case}"));
+            fs::create_dir_all(&owned).expect("create owned root");
+            let leaf = owned.join(name);
+            fs::write(&leaf, b"original").expect("write owned leaf");
+            let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+            let validated = deletion
+                .open_regular_file(name.as_ref())
+                .expect("open validated file")
+                .expect("validated file exists");
+            fs::rename(&leaf, owned.join("moved-original")).expect("move validated file");
+            fs::write(&leaf, b"replacement").expect("install replacement");
+
+            assert!(
+                !deletion
+                    .remove_regular_file_matching(name.as_ref(), &validated)
+                    .expect("refuse changed leaf")
+            );
+            assert_eq!(fs::read(&leaf).unwrap(), b"replacement");
+            assert_eq!(fs::read(owned.join("moved-original")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn pinned_empty_directory_removal_never_targets_a_replacement_name() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        let original = owned.join("scope");
+        let moved = owned.join("moved-original");
+        fs::create_dir_all(&original).expect("create owned scope");
+        let root = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+        let validated = root
+            .open_child_directory("scope".as_ref())
+            .expect("pin original directory");
+        fs::rename(&original, &moved).expect("move pinned directory");
+        fs::create_dir(&original).expect("replace directory name");
+
+        let removed = validated
+            .remove_pinned_empty_directory()
+            .expect("remove only pinned directory if supported");
+        assert!(original.is_dir(), "replacement directory must survive");
+        #[cfg(unix)]
+        {
+            assert!(!removed, "Unix retains the pinned empty directory");
+            assert!(moved.is_dir());
+        }
+        #[cfg(windows)]
+        {
+            assert!(removed, "Windows deletes the pinned directory handle");
+            assert!(!moved.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_only_removal_refuses_replaced_leaf_after_open() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        let original = owned.join("scope");
+        let moved = owned.join("moved-scope");
+        fs::create_dir_all(&original).expect("create owned scope");
+        let parent = super::open_root(&owned).expect("pin parent");
+        let target = super::open_child_dir(&parent, "scope".as_ref()).expect("pin leaf");
+        fs::rename(&original, &moved).expect("move pinned leaf");
+        fs::create_dir(&original).expect("install unowned replacement");
+
+        // This is the final removal seam, after the target handle was opened.
+        assert!(
+            !super::remove_open_empty_directory(&parent, "scope".as_ref(), target)
+                .expect("retain opened empty directory"),
+            "a replaced leaf must not be reported removed"
+        );
+        assert!(original.is_dir(), "replacement leaf survives");
+        assert!(
+            moved.is_dir(),
+            "pinned leaf survives when identity cannot be guaranteed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_only_removal_stays_bound_to_the_pinned_root() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        let pinned = temp.path().join("pinned-owned");
+        fs::create_dir_all(owned.join("scope")).expect("create owned scope");
+        let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+        fs::rename(&owned, &pinned).expect("move ambient owned root");
+        fs::create_dir_all(owned.join("scope")).expect("install replacement scope");
+
+        assert!(
+            !deletion
+                .remove_empty_directory("scope".as_ref())
+                .expect("retain pinned empty scope")
+        );
+        assert!(pinned.join("scope").is_dir());
+        assert!(
+            owned.join("scope").exists(),
+            "replacement scope was removed"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

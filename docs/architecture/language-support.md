@@ -17,8 +17,8 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
 | Structural source-proof | Dedicated extractor emits exact source anchors and publishes `structural_text` / `source_range_only` result metadata. | Parser-backed graph extraction, semantic code navigation, or packet semantic proof. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
-| Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
-| Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
+| Packet evidence qualification | An installed-agent artifact measures bounded packet usefulness, factual correctness, and efficiency for the measured tasks. | Answer sufficiency or public product-grade language quality. |
+| Installed packet acceptance | Task success, factual integrity, source-work reduction, context, and timing gates pass in one coherent fresh run. | A change to parser-backed or structural language coverage. |
 | Development comparison | A reused-baseline or local-real artifact informs tuning and diagnosis. | Fresh publishable promotion proof. |
 
 A parser-backed file can be publishable even when the selected grammar reports
@@ -36,7 +36,7 @@ inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, Terraform/HCL (`.tf` and `.tfvars`), basename-scoped TypeScript/JavaScript config JSONC, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
@@ -55,10 +55,10 @@ routing and structural source-proof only.
 | `source_graph_extraction` | `graph_fixture` | Fidelity or tictactoe graph fixture | Typed semantic resolution. |
 | `structural_source_proof` | `structural_collector_fixture` | Structural collector fixture with exact source spans | Parser-backed graph extraction or semantic proof. |
 | `typed_semantic_edges` | `semantic_resolver_fixture` | Targeted resolver regression | Broad semantic parity. |
-| `packet_sufficient_answer_quality` | `packet_runtime_artifact` | Publishable packet-runtime artifact | Runtime language support. |
+| `packet_evidence_product_quality` | `installed_packet_artifact` | Fresh installed-agent acceptance artifact | Runtime language support or answer sufficiency. |
 
 No current language profile claims `typed_semantic_edges` or
-`packet_sufficient_answer_quality` from the profile registry alone.
+`packet_evidence_product_quality` from the profile registry alone.
 
 ## Agent-Facing Evidence
 
@@ -96,16 +96,31 @@ Generic Markdown/MDX emits heading, link/reference-definition, and fenced-block
 labels while suppressing heading/reference syntax inside fences. Generic YAML
 emits conservative block mapping keys without treating URL colons or block
 scalar bodies as mappings; generic TOML emits table and key labels outside
-multiline strings; generic JSON emits object keys in source order. The shell
+multiline strings; generic JSON emits object keys in source order. Only
+`tsconfig.json`, `tsconfig.<suffix>.json`, `jsconfig.json`, and
+`jsconfig.<suffix>.json` admit JSONC comments and trailing commas, under native
+basename case rules; that parser still rejects every other JSON extension and
+emits quoted property-key spans from its AST. Other `.json` files remain strict
+JSON. The shell
 fallback emits function and import anchors outside heredocs only for `.zsh`,
 `.ksh`, and `.command`; `.sh` and `.bash` remain parser-backed Bash. PowerShell
 `.ps1` and `.psm1` emit function and module/dot-source anchors outside block
 comments. These collectors do not interpret references, substitutions,
 imports, execution behavior, or typed targets.
 
+Terraform `.tf` and `.tfvars` files emit conservative block-header,
+assignment-key, and simple unquoted object-key anchors from an error-free HCL
+concrete syntax tree. A block-header span runs from its first through last real
+header token: trailing comments are excluded, while comments interleaved among
+header tokens remain verbatim in the exact declaration range and are never
+separate anchors. Those exact spans do not evaluate HCL expressions or
+interpolation, construct a resource graph, resolve providers or modules,
+inspect state or plans, or supply the source of external modules.
+
 Dedicated routing wins before generic collection: workflow and Compose paths
-keep their YAML producers, `Cargo.toml` keeps its manifest producer, and
-OpenAPI/Swagger JSON or YAML keeps its `exact_source` endpoint path. Structural
+keep their YAML producers, `Cargo.toml` keeps its manifest producer, recognized
+TypeScript/JavaScript config names keep their JSONC producer, and OpenAPI/Swagger
+JSON or YAML keeps its `exact_source` endpoint path. Structural
 admission evaluates only workspace-relative paths and rejects
 generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
 descendants before inventory metadata or content reads. Repository ancestors
@@ -117,16 +132,18 @@ does not publish reusable units. Cache identity v2 invalidates pre-limit
 artifacts, and cache hits independently enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
-cited source span; their `source_range_only` status and non-sufficient result
-flag must not be upgraded into graph or semantic proof. OpenAPI endpoint anchors
+cited source span; their `source_range_only` status must not be upgraded into
+graph or semantic proof. Public packets always report
+`answer_sufficiency: not_asserted`. OpenAPI endpoint anchors
 prove only that a schema declares the method/path at the cited source range.
-Packet-runtime is implemented and
-can complete measured suites, but publishable agent-facing packet quality is not
-promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
-green. Run-specific scorecards belong in PRs, issues, release notes, or ignored
+Packet-runtime is implemented and can complete measured suites, but
+agent-facing packet quality is not promoted until one coherent fresh run passes
+the preregistered task-success, factual-integrity, source-work, context, and
+timing gates. Run-specific scorecards belong in PRs, issues, release notes, or ignored
 `target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
-SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, GitHub
-Actions workflows, Docker Compose manifests, and Cargo manifests remain
+SQL, Markdown/MDX, generic YAML/TOML/JSON, Terraform `.tf`/`.tfvars`, basename-scoped TypeScript/JavaScript
+config JSONC, non-parser shell, PowerShell, GitHub Actions workflows, Docker
+Compose manifests, and Cargo manifests remain
 structural source-proof collectors; OpenAPI schemas remain a dedicated
 schema-anchor path.
 
@@ -168,7 +185,7 @@ Workspace parser policy:
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
 GitHub Actions workflows, Docker Compose manifests, Markdown/MDX, generic
-YAML/TOML/JSON, non-parser shell, and PowerShell remain structural runtime
+YAML/TOML/JSON, Terraform `.tf`/`.tfvars`, non-parser shell, and PowerShell remain structural runtime
 paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |

@@ -127,7 +127,7 @@ Check:
 - `symbol_search_docs_written`, `semantic_dense_docs_skipped`, dense reason counters, `semantic_docs.reused`, `semantic_docs.embedded`, `semantic_docs.pending`, and `semantic_docs.stale`
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol symbol-doc set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
-- whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
+- whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `1024`
 - whether retrieval reports `retrieval_mode=full` according to `doctor`
   and `retrieval status`
 - whether engine initialization, batch embedding, or materialization dominates
@@ -202,6 +202,34 @@ process ID and the correlation ID passed by the plugin launcher. A panic keeps
 only typed payload metadata and its code location. An embedding-server
 fail-stop makes one best-effort marker attempt in a fixed bounded slot and
 aborts after a short fixed deadline even if the cache filesystem stalls.
+
+Packet entry emits one bounded numeric timing record when its outer allowance
+scope exits. Pair `packet_entry_observation_id` with the process correlation ID;
+nested calls reuse the outer record. The phase mask distinguishes an unreached
+boundary from one reached within the first millisecond. Entry timestamps share
+the allowance clock, and the first source-scope and admission-check observations
+remain intact across nested calls. Repeated ready probes retain a count and
+cumulative duration; their subphase timestamps describe the last probe.
+Activation return means the call returned, including an error, so use the public
+response to determine its outcome. The retrieval-probe bucket combines live
+embedding identity and manifest observation.
+
+Public-operation fields distinguish admission checks reached, passed and
+refused, attempts started, and the two existing
+whole-operation retry causes. The first and last admission timestamps expose a
+second check without replacing the first. Each operation span has started and
+succeeded counts because a zero duration can mean either sub-millisecond work or
+an unreached boundary. Span durations are cumulative. The core snapshot duration
+covers the complete snapshot call, including its callback and post-callback
+publication validation; `retrieval_pin_ms` likewise includes its build callback
+and final pin revalidation. Those inclusive durations overlap the named inner
+spans. Freshness, build callback, pin begin and pin revalidation durations cover
+their named calls. Nested public operations do not add a second outer attempt
+or retry decision.
+
+The record excludes its own diagnostic write and is not a hard deadline or a
+success receipt. No question text, source content or project path is retained.
+Ordinary non-packet operations produce no packet-entry record.
 
 `CODESTORY_LOG=error` narrows tracing records to errors.
 `CODESTORY_LOG=off` suppresses ordinary tracing records, but command failures,

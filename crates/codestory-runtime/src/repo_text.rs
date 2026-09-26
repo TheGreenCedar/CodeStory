@@ -368,7 +368,6 @@ impl AppController {
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
             ),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: Some(false),
             source_excerpt,
             verification_targets: Vec::new(),

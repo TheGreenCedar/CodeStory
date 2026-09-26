@@ -47,14 +47,6 @@ fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     }
 }
 
-fn from_api_repo_text_mode(mode: SearchRepoTextMode) -> RepoTextMode {
-    match mode {
-        SearchRepoTextMode::Auto => RepoTextMode::Auto,
-        SearchRepoTextMode::On => RepoTextMode::On,
-        SearchRepoTextMode::Off => RepoTextMode::Off,
-    }
-}
-
 fn drill_read_only_jobs(requested: usize, refresh: args::RefreshMode) -> usize {
     if refresh == args::RefreshMode::None {
         normalize_drill_jobs(requested)
@@ -87,6 +79,7 @@ mod drill;
 mod ground_smoke;
 mod index_command;
 mod lifecycle;
+mod prove_call_path;
 mod readiness_commands;
 pub(crate) mod rendering;
 pub(crate) mod resolution;
@@ -94,17 +87,17 @@ mod search_command;
 mod server;
 mod source_commands;
 
-pub(crate) use agent_context::packet_sufficiency_label;
 #[cfg(test)]
 use agent_context::{
-    build_task_brief_output, packet_budget_mode_label, packet_task_class_label,
-    render_packet_markdown, render_task_brief_markdown,
+    build_task_brief_output, packet_budget_mode_label, render_packet_markdown,
+    render_task_brief_markdown,
 };
 #[cfg(test)]
 use index_command::validate_index_watch_output_file;
 #[cfg(test)]
 use lifecycle::{
     embedding_client_transport_mode, map_embedding_preflight_error, open_agent_surface,
+    open_search_surface,
 };
 pub(crate) use readiness_commands::{
     attach_complete_publication, local_refresh_output_from_summary,
@@ -210,6 +203,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => agent_context::run_context(cmd),
         Command::Packet(cmd) => agent_context::run_packet(cmd),
+        Command::VerifyIndexedDirectCalls(cmd) => {
+            prove_call_path::run_verify_indexed_direct_calls(cmd)
+        }
         Command::Task(cmd) => agent_context::run_task(cmd),
         Command::Doctor(cmd) => readiness_commands::run_doctor(cmd),
         Command::Ready(cmd) => readiness_commands::run_ready(cmd),

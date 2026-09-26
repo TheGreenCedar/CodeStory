@@ -1,11 +1,15 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn write_tiny_rust_workspace(root: &Path) {
     fs::write(
@@ -232,6 +236,391 @@ fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value
     serde_json::from_str(line).expect("parse stdio response")
 }
 
+#[derive(Debug)]
+enum StdioToolPayload {
+    SchemaV3Structured(Value),
+    SchemaV3Text(Value),
+    FrozenV2Preparing(Value),
+    FrozenV2Error(Value),
+}
+
+impl StdioToolPayload {
+    fn value(&self) -> &Value {
+        match self {
+            Self::SchemaV3Structured(value)
+            | Self::SchemaV3Text(value)
+            | Self::FrozenV2Preparing(value)
+            | Self::FrozenV2Error(value) => value,
+        }
+    }
+
+    fn is_preparing(&self) -> bool {
+        matches!(self, Self::SchemaV3Structured(value) | Self::SchemaV3Text(value) if value["kind"] == "preparing")
+            || matches!(self, Self::FrozenV2Preparing(_))
+    }
+}
+
+fn stdio_tool_text(result: &serde_json::Map<String, Value>) -> Result<&str, String> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "stdio tool result must include string TextContent".to_string())
+}
+
+fn validate_schema_v3_preparing(
+    result: &serde_json::Map<String, Value>,
+    payload: &Value,
+) -> Result<(), String> {
+    if result.get("isError") != Some(&Value::Bool(false)) {
+        return Err("schema-v3 preparing result must set isError=false".to_string());
+    }
+    if payload.get("state").and_then(Value::as_str) != Some("preparing") {
+        return Err("schema-v3 preparing result must set state=preparing".to_string());
+    }
+    if payload
+        .get("retry_after_ms")
+        .and_then(Value::as_u64)
+        .is_none_or(|retry_after_ms| retry_after_ms == 0)
+    {
+        return Err("schema-v3 preparing result must include a positive retry delay".to_string());
+    }
+    if !payload.get("operation").is_some_and(Value::is_object) {
+        return Err("schema-v3 preparing result must include an operation object".to_string());
+    }
+    Ok(())
+}
+
+fn decode_stdio_tool_payload(response: &Value) -> Result<StdioToolPayload, String> {
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "stdio response must include an object tool result".to_string())?;
+
+    match result.get("structuredContent") {
+        Some(structured) if structured.get("kind").is_some() => {
+            let kind = structured
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "modern stdio tool kind must be a string".to_string())?;
+            let text = stdio_tool_text(result)?;
+            let text_payload = serde_json::from_str::<Value>(text)
+                .map_err(|error| format!("modern stdio tool text mirror must be JSON: {error}"))?;
+            if structured != &text_payload {
+                return Err("modern structured and text payload mirrors must agree".to_string());
+            }
+            if kind == "preparing" {
+                validate_schema_v3_preparing(result, structured)?;
+            }
+            Ok(StdioToolPayload::SchemaV3Structured(structured.clone()))
+        }
+        Some(structured)
+            if structured.get("code").and_then(Value::as_str) == Some("codestory_preparing") =>
+        {
+            stdio_tool_text(result)?;
+            if !matches!(result.get("isError"), None | Some(Value::Bool(false))) {
+                return Err("legacy preparing result must not set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::FrozenV2Preparing(structured.clone()))
+        }
+        Some(structured) if structured.get("code").and_then(Value::as_str).is_some() => {
+            stdio_tool_text(result)?;
+            if result.get("isError") != Some(&Value::Bool(true)) {
+                return Err("legacy structured semantic error must set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::FrozenV2Error(structured.clone()))
+        }
+        Some(_) => Err("unrecognized structured stdio tool result shape".to_string()),
+        None => {
+            let text = stdio_tool_text(result)?;
+            let payload = serde_json::from_str::<Value>(text)
+                .map_err(|error| format!("stdio semantic error text must be JSON: {error}"))?;
+            if !payload.is_object() {
+                return Err("stdio text-only payload must be a JSON object".to_string());
+            }
+            if payload.get("kind").and_then(Value::as_str) == Some("preparing") {
+                validate_schema_v3_preparing(result, &payload)?;
+            } else if result.get("isError") != Some(&Value::Bool(true)) {
+                return Err("stdio text-only semantic error must set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::SchemaV3Text(payload))
+        }
+    }
+}
+
+fn stdio_tool_payload(response: &Value) -> StdioToolPayload {
+    decode_stdio_tool_payload(response).unwrap_or_else(|error| panic!("{error}: {response:#}"))
+}
+
+#[test]
+fn stdio_tool_payload_rejects_invalid_modern_result_boundaries() {
+    let accepted_hostile_cases = [
+        (
+            "mismatched mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":251,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "malformed mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{"type": "text", "text": "{"}]
+                }
+            }),
+        ),
+        (
+            "modern preparing missing text mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    }
+                }
+            }),
+        ),
+        (
+            "modern preparing missing isError",
+            serde_json::json!({
+                "result": {
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "modern preparing missing operation",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250}"#
+                    }]
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, response)| {
+        decode_stdio_tool_payload(&response).is_ok().then_some(name)
+    })
+    .collect::<Vec<_>>();
+
+    assert!(
+        accepted_hostile_cases.is_empty(),
+        "decoder accepted hostile dual-mirror cases: {accepted_hostile_cases:?}"
+    );
+}
+
+#[test]
+fn stdio_tool_payload_accepts_revision_native_preparing_and_text_only_errors() {
+    let frozen_transcripts: Value = serde_json::from_str(include_str!(
+        "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
+    ))
+    .expect("frozen v2 transcript fixture");
+    let frozen_v2 = serde_json::json!({
+        "result": frozen_transcripts["native_v2"]["preparing"].clone()
+    });
+    assert_eq!(
+        frozen_v2.pointer("/result/content/0/text"),
+        Some(&serde_json::json!("CodeStory is preparing managed search.")),
+        "fixture must retain the frozen human TextContent"
+    );
+    let frozen_v2 = stdio_tool_payload(&frozen_v2);
+    assert!(matches!(frozen_v2, StdioToolPayload::FrozenV2Preparing(_)));
+    assert_eq!(frozen_v2.value()["code"], "codestory_preparing");
+
+    let modern = serde_json::json!({
+        "result": {
+            "isError": false,
+            "structuredContent": {
+                "kind": "preparing",
+                "state": "preparing",
+                "retry_after_ms": 250,
+                "operation": {}
+            },
+            "content": [{
+                "type": "text",
+                "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+            }]
+        }
+    });
+    let modern = stdio_tool_payload(&modern);
+    assert!(matches!(modern, StdioToolPayload::SchemaV3Structured(_)));
+    assert_eq!(modern.value()["kind"], "preparing");
+
+    let modern_text_only = serde_json::json!({
+        "result": {
+            "isError": false,
+            "content": [{
+                "type": "text",
+                "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+            }]
+        }
+    });
+    let modern_text_only = stdio_tool_payload(&modern_text_only);
+    assert!(matches!(
+        modern_text_only,
+        StdioToolPayload::SchemaV3Text(_)
+    ));
+    assert_eq!(modern_text_only.value()["kind"], "preparing");
+
+    for fixture_name in ["unavailable", "tool_error"] {
+        let legacy_error = serde_json::json!({
+            "result": frozen_transcripts["native_v2"][fixture_name].clone()
+        });
+        let legacy_error = stdio_tool_payload(&legacy_error);
+        assert!(matches!(legacy_error, StdioToolPayload::FrozenV2Error(_)));
+        assert!(legacy_error.value()["code"].as_str().is_some());
+    }
+
+    let unavailable = serde_json::json!({
+        "result": {
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": r#"{"code":"codestory_unavailable","state":"unavailable"}"#
+            }]
+        }
+    });
+    let unavailable = stdio_tool_payload(&unavailable);
+    assert!(matches!(unavailable, StdioToolPayload::SchemaV3Text(_)));
+    assert_eq!(unavailable.value()["code"], "codestory_unavailable");
+}
+
+#[test]
+fn stdio_tool_payload_rejects_invalid_result_state_and_text_error_boundaries() {
+    let accepted_hostile_cases = [
+        (
+            "modern preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "text-only error marked successful",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"code":"codestory_unavailable","state":"unavailable"}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "malformed text-only error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{"type": "text", "text": "{"}]
+                }
+            }),
+        ),
+        (
+            "text-only preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "text-only semantic error is not an object",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{"type": "text", "text": "[]"}]
+                }
+            }),
+        ),
+        (
+            "legacy preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "code": "codestory_preparing",
+                        "message": "CodeStory is preparing managed search.",
+                        "state": "preparing",
+                        "retry_after_ms": 250
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "CodeStory is preparing managed search."
+                    }]
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, response)| {
+        decode_stdio_tool_payload(&response).is_ok().then_some(name)
+    })
+    .collect::<Vec<_>>();
+
+    assert!(
+        accepted_hostile_cases.is_empty(),
+        "decoder accepted hostile result-state cases: {accepted_hostile_cases:?}"
+    );
+}
+
 fn string_field<'a>(value: &'a Value, path: &[&str]) -> &'a str {
     value_at_path(value, path)
         .as_str()
@@ -291,6 +680,59 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         return generations.pop().expect("published search generation");
     }
     parent.join(format!("{stem}.search"))
+}
+
+fn search_catalog_lock_for_storage(storage_path: &Path) -> PathBuf {
+    let parent = storage_path.parent().expect("storage parent");
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("storage file stem");
+    parent.join(format!("{stem}.search-generations.lock"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CacheFileSnapshot {
+    relative_path: PathBuf,
+    byte_len: u64,
+    sha256: String,
+    modified: SystemTime,
+}
+
+fn cache_file_snapshots(root: &Path) -> Vec<CacheFileSnapshot> {
+    fn visit(root: &Path, current: &Path, snapshots: &mut Vec<CacheFileSnapshot>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read cache directory")
+            .map(|entry| entry.expect("read cache entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = entry.metadata().expect("read cache entry metadata");
+            if metadata.is_dir() {
+                visit(root, &path, snapshots);
+            } else if metadata.is_file() {
+                snapshots.push(CacheFileSnapshot {
+                    relative_path: path
+                        .strip_prefix(root)
+                        .expect("cache entry below root")
+                        .to_path_buf(),
+                    byte_len: metadata.len(),
+                    sha256: format!(
+                        "{:x}",
+                        Sha256::digest(fs::read(&path).expect("read cache file"))
+                    ),
+                    modified: metadata.modified().expect("read cache file mtime"),
+                });
+            }
+        }
+    }
+
+    let mut snapshots = Vec::new();
+    if root.is_dir() {
+        visit(root, root, &mut snapshots);
+    }
+    snapshots
 }
 
 fn find_index_freshness(value: &Value) -> Option<&Value> {
@@ -1007,7 +1449,7 @@ fn app_controller_opens_project() {
         None,
     );
     search_dir_snapshot.assert_unchanged("ground symbol");
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "AppController",
@@ -1039,7 +1481,7 @@ fn app_controller_opens_project() {
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("files and affected");
 
-    assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
+    assert_query_search_uses_core_without_full_sidecars(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("query search");
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("packet");
@@ -1098,9 +1540,9 @@ fn snippet_exact_id_navigates_openapi_diagnostic_evidence_but_query_stays_typed(
         snippet["resolution"]["resolved"]["resolution_status"],
         "source_range_only"
     );
-    assert_eq!(
-        snippet["resolution"]["resolved"]["eligible_for_sufficiency"],
-        false
+    assert!(
+        snippet["resolution"]["resolved"]["eligible_for_sufficiency"].is_null(),
+        "source navigation must not expose answer-sufficiency authority: {snippet:#}"
     );
     assert!(
         snippet["snippet"]["snippet"]
@@ -1147,6 +1589,49 @@ fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
         workspace.path(),
         cache_dir.path(),
         &["files", "--refresh", "none", "--format", "json"],
+    );
+
+    assert_eq!(
+        files["summary"]["framework_route_coverage_included"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        files["summary"]["framework_route_coverage"],
+        serde_json::json!([])
+    );
+    let full = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "files",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--include-framework-coverage",
+        ],
+    );
+    assert_eq!(
+        full["summary"]["framework_route_coverage_included"],
+        serde_json::json!(true)
+    );
+    assert!(
+        full["summary"]["framework_route_coverage"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    for field in [
+        "files",
+        "coverage_gaps",
+        "policy_exclusions",
+        "project_root",
+        "usable",
+    ] {
+        assert_eq!(files.get(field), full.get(field), "{field}");
+    }
+    assert_eq!(
+        files["summary"]["language_counts"],
+        full["summary"]["language_counts"]
     );
 
     assert!(
@@ -1257,7 +1742,7 @@ fn ground_symbol_node_id_from_existing_cache(
     string_field(hit, &["id"]).to_string()
 }
 
-fn assert_product_search_fails_closed_without_full_sidecars(
+fn assert_exact_search_uses_core_without_full_sidecars(
     workspace: &Path,
     cache_dir: &Path,
     query: &str,
@@ -1280,10 +1765,150 @@ fn assert_product_search_fails_closed_without_full_sidecars(
         ],
     );
     assert!(
-        !output.status.success(),
-        "product search should fail closed without full retrieval"
+        output.status.success(),
+        "exact search should use the complete core without retrieval sidecars: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_retrieval_failure_output(output);
+    let search: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse exact-search output: {error}; output={output:#?}"));
+    assert_eq!(search["schema_version"], 3, "{search:#}");
+    assert_eq!(search["kind"], "complete", "{search:#}");
+    assert_eq!(search["status"], "available", "{search:#}");
+    assert_eq!(search["retrieval"]["state"], "symbolic", "{search:#}");
+    assert!(
+        search["retrieval"]["generation_id"].is_null()
+            && search["publication"]["retrieval"].is_null(),
+        "exact search must not imply a sidecar publication: {search:#}"
+    );
+    assert!(
+        search["gaps"].as_array().is_some_and(Vec::is_empty),
+        "an intentionally symbolic search must not report retrieval unavailable: {search:#}"
+    );
+    assert!(
+        search["evidence"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["path"]
+                    .as_str()
+                    .is_some_and(|path| !path.starts_with('/'))
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains(query))
+            })
+        }),
+        "exact search must return project-relative source evidence for {query}: {search:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    let index = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let storage_path = PathBuf::from(string_field(&index, &["storage_path"]));
+    let catalog_lock = search_catalog_lock_for_storage(&storage_path);
+    assert!(
+        catalog_lock.is_file(),
+        "index should publish a catalog lock"
+    );
+    fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o400))
+        .expect("make search catalog lock read-only");
+    let before = cache_file_snapshots(cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o600))
+        .expect("restore search catalog lock permissions");
+    assert!(
+        output.status.success(),
+        "core-only exact search must not open the search-generation catalog: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let search: Value = serde_json::from_slice(&output.stdout).expect("parse exact search JSON");
+    assert!(
+        search["evidence"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["excerpt"]
+                    .as_str()
+                    .is_some_and(|excerpt| excerpt.contains("AppController"))
+            })),
+        "core-only exact search should return source evidence: {search:#}"
+    );
+    assert_eq!(
+        cache_file_snapshots(cache_dir.path()),
+        before,
+        "core-only exact search must not mutate cache bytes or mtimes"
+    );
+}
+
+#[test]
+fn cold_exact_search_returns_project_unavailable_without_creating_cache_files() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    let before = cache_file_snapshots(cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "cold exact search must fail closed"
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse cold exact-search failure: {error}; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        failure["error"]["code"], "project_unavailable",
+        "{failure:#}"
+    );
+    assert_eq!(
+        cache_file_snapshots(cache_dir.path()),
+        before,
+        "cold exact search must not create cache files"
+    );
 }
 
 fn assert_product_search_fails_closed_on_stale_core(
@@ -1319,7 +1944,7 @@ fn assert_product_search_fails_closed_on_stale_core(
         "{failure:#}"
     );
     assert_eq!(
-        failure["error"]["message"], "search requires a fresh complete core publication",
+        failure["error"]["message"], "exact_search requires a fresh complete core publication",
         "{failure:#}"
     );
 }
@@ -1697,8 +2322,32 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
                 && item["claim_label"] == "parser-backed graph, fidelity-gated")),
         "files JSON should include language counts with support tiers: {files:#}"
     );
+    assert_eq!(
+        files["summary"]["framework_route_coverage_included"],
+        serde_json::json!(false),
+        "default files JSON should omit the framework route catalog: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["framework_route_coverage"],
+        serde_json::json!([]),
+        "default files JSON should omit the framework route catalog: {files:#}"
+    );
+    let files_with_routes = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--role",
+            "test",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--include-framework-coverage",
+        ],
+    );
     assert!(
-        files["summary"]["framework_route_coverage"]
+        files_with_routes["summary"]["framework_route_coverage"]
             .as_array()
             .is_some_and(
                 |items| items.iter().any(|item| item["framework"] == "express"
@@ -1711,7 +2360,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
                     && items.iter().any(|item| item["framework"] == "gin"
                         && item["handler_link_support"] == "not_claimed_text_only")
             ),
-        "files JSON should include framework route coverage matrix: {files:#}"
+        "opt-in files JSON should include framework route coverage matrix: {files_with_routes:#}"
     );
     assert!(
         files["files"]
@@ -1771,6 +2420,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             "none",
             "--format",
             "markdown",
+            "--include-framework-coverage",
         ],
     );
     assert!(
@@ -2095,7 +2745,7 @@ fn run_git(workspace: &Path, args: &[&str]) {
     );
 }
 
-fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
+fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
     let output = run_cli(
         workspace,
         cache_dir,
@@ -2109,10 +2759,22 @@ fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cach
         ],
     );
     assert!(
-        !output.status.success(),
-        "query search DSL should fail closed without full sidecars"
+        output.status.success(),
+        "query search DSL should use the complete core without sidecars: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_retrieval_failure_output(output);
+    let query: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse query-search output: {error}; output={output:#?}"));
+    assert!(
+        query["items"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["display_name"] == "AppController"
+                    && item["source"] == "search"
+                    && item["file_path"] == "src/lib.rs"
+            })
+        }),
+        "query search DSL should return the exact core symbol: {query:#}"
+    );
 }
 
 fn assert_context_id_fails_closed_without_full_sidecars(
@@ -2168,8 +2830,6 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         "Explain how AppController routes project opening through normalize_project",
         "--budget",
         "tiny",
-        "--task-class",
-        "architecture-explanation",
         "--format",
         "json",
     ];
@@ -2190,9 +2850,17 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         packet["budget"]["requested"], "tiny",
         "packet should honor the requested budget: {packet:#}"
     );
+    assert!(
+        packet.pointer("/plan/task_class").is_none(),
+        "public packet JSON must not expose task_class: {packet:#}"
+    );
     assert_eq!(
-        packet["plan"]["task_class"], "architecture_explanation",
-        "packet should expose the planner task class: {packet:#}"
+        packet["answer_sufficiency"], "not_asserted",
+        "public packets must not assert semantic sufficiency: {packet:#}"
+    );
+    assert!(
+        packet.get("compilation_status").is_none(),
+        "Horizon A retrieval-first packets must omit compilation_status: {packet:#}"
     );
     assert!(
         array_is_non_empty(&packet, &["plan", "queries"]),
@@ -2233,20 +2901,33 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     })
     .to_string();
     let stdio = run_stdio_request(workspace, cache_dir, &request);
-    let structured = &stdio["result"]["structuredContent"];
-    let code = structured["code"].as_str();
+    let decoded = stdio_tool_payload(&stdio);
+    let payload = decoded.value();
+    let code = payload["code"].as_str();
+    let preparing = decoded.is_preparing();
     assert!(
-        matches!(
-            code,
-            Some("codestory_tool_blocked" | "codestory_preparing" | "codestory_unavailable")
-        ),
-        "stdio context --id should fail closed with a typed retrieval error: {stdio:#}"
+        preparing
+            || matches!(
+                code,
+                Some("codestory_tool_blocked" | "codestory_unavailable")
+            ),
+        "stdio context --id should fail closed with a typed unavailable or preparing result: {stdio:#}"
     );
-    if code == Some("codestory_preparing") {
+    if preparing {
         assert_ne!(
-            stdio["result"].get("isError"),
-            Some(&serde_json::json!(true)),
+            stdio["result"].get("isError").and_then(Value::as_bool),
+            Some(true),
             "preparing should be a successful structured result: {stdio:#}"
+        );
+        assert_eq!(
+            payload["state"], "preparing",
+            "preparing should retain the revision-native state tag: {stdio:#}"
+        );
+        assert!(
+            payload["retry_after_ms"]
+                .as_u64()
+                .is_some_and(|retry_after_ms| retry_after_ms > 0),
+            "preparing should include a positive retry delay: {stdio:#}"
         );
     } else {
         assert_eq!(
@@ -2255,7 +2936,7 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
         );
     }
     if code == Some("codestory_tool_blocked") {
-        let status = structured["status"].as_str();
+        let status = payload["status"].as_str();
         assert!(
             status.is_some_and(|status| matches!(status, "repair_setup" | "blocked")),
             "stdio context --id should fail closed before serving context: {stdio:#}"
@@ -2299,7 +2980,7 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         &["index", "--refresh", "full", "--format", "json"],
     );
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "normalize_project",
@@ -2486,7 +3167,7 @@ fn context_json_reports_deep_trace_by_default() {
         "index should discover investigation fixture symbols"
     );
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_exact_search_uses_core_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "parse_investigation_event",

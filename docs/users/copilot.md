@@ -93,11 +93,13 @@ available. They do not install the CLI, start MCP, or create an index.
    ```markdown
    # CodeStory Grounding
 
-   Use CodeStory proactively for repository questions. Do not wait for the user
-   to mention it by name.
+   Use CodeStory when the task is repository discovery, relationship tracing,
+   change-impact analysis, or CodeStory retrieval / installed-plugin
+   validation. Do not wait for the user to mention it by name. Skip that loop
+   only for bounded inspection or editing of named files that does not require
+   those operations; naming a file does not by itself forbid CodeStory.
 
-   Before making source claims, planning edits, choosing tests, or reviewing
-   changes in this repository:
+   When that loop applies:
 
    1. Call the CodeStory tool that matches the task and pass the repository's
       absolute root as `project`.
@@ -107,6 +109,8 @@ available. They do not install the CLI, start MCP, or create an index.
       unexpectedly slow call.
    4. If MCP is missing, inspect source normally and report that CodeStory was
       unavailable for the task.
+   5. Qualify CodeStory results as retrieval or installed-plugin evidence, not
+      as live runtime behavior, unless the matching proof exists.
    ```
 
 2. If the editor supports MCP, configure the host-neutral CodeStory server

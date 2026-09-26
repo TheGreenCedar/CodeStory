@@ -1675,7 +1675,7 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "7eb0812b601c3f06d5885b741d4dd1775b85c10619b18fc680dbb77a9ccc13b4",
+        "job_manifest_sha256": "43c178977aec468d1c21a74167ac797db73c6e4d7a318476aae0ba976ac95f4b",
         "phases": {
           "source_stabilization": {
             "known_future_source_changes": [
@@ -1773,13 +1773,13 @@
       "packaged_platform_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-proof.yml",
-        "sha256": "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa",
+        "sha256": "3aff2cbb04ae5388ac295029fa582da7070a96f6c69143b80237bdc13c97c3b1",
         "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
       },
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "111a730a2ea35476aa94ee2fdb16d5795b5230e4e6002664ac3ff2d913a23c31",
+        "sha256": "8444a37b82dd47b62a86ff49102d064393df7eeeac73005f18afcc8e243218e1",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
@@ -1826,7 +1826,7 @@
         "file": "packaged-platform-proof.yml",
         "job": "build",
         "step": "Build Linux x64 at the glibc 2.31 baseline",
-        "sha256": "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f",
+        "sha256": "d6dd1da4c317c9ec7da15a3f66bfbe712284e400fd49c4b25079154d4358425b",
         "reason": "Linux owns its compiler server inside Docker while macOS and Windows own one in the host shell; both executable programs are pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
       },
       "packaged_compile_clock_stop": {
@@ -2023,9 +2023,10 @@
         "fragments": [
           "scripts/tests/codestory-release-claims.test.mjs",
           "scripts/tests/codestory-release-closeout.test.mjs",
-          "scripts/tests/codestory-release-evidence-gate.test.mjs"
+          "scripts/tests/codestory-release-evidence-gate.test.mjs",
+          "scripts/tests/codestory-release-live.test.mjs"
         ],
-        "reason": "The release claim graph, the closeout, and the evidence gate are the programs that decide whether a release may ship; their suites must run in the lane that gates every policy and graph edit, so a claims regression cannot merge unproven."
+        "reason": "The release claim graph, closeout, evidence gate, and live coordinator adapter decide whether a release may proceed; their suites must run in the lane that gates policy and graph edits."
       },
       "plugin_static_ci_proof_routing": {
         "kind": "require",
@@ -4263,7 +4264,7 @@
           "cargo test --locked -p codestory-cli --test native_launcher_contracts",
           "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
           "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
-          "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+          "cargo test --locked -p codestory-store immutable_generation_process_crash_matrix_preserves_an_old_or_new_publication -- --nocapture"
         ],
         "reason": "The draft lane's publication proof is this exact serial command sequence: the two locked llama-sys staging harnesses, the CLI native-launcher and stdio-protocol contracts, and the runtime and store publication-atomicity proofs. The sequence is owned here so a workflow edit alone cannot drop, reorder, or dilute a proof target; the checker keeps only the sequence-equality predicate and its reviewed messages."
       },
@@ -4276,7 +4277,7 @@
           "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
           "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
           "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
-          "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+          "cargo test --locked -p codestory-store --no-run immutable_generation_process_crash_matrix_preserves_an_old_or_new_publication -- --nocapture"
         ],
         "reason": "The retrieval producer seeds the draft proof's test-profile artifacts with the --no-run counterparts of the focused targets, and this list is also the digest input for the shared proof5 cache topology: the checker derives the draft and retrieval cache keys from these graph-declared seed commands, so cache identity and seeded content cannot drift apart through a checker edit alone."
       }

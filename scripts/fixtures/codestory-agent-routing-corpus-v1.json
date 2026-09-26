@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "named_file_direct_read",
+      "prompt": "Read the user-named file src/lib.rs directly and report only what that source establishes.",
+      "request": {
+        "named_files": [
+          "src/lib.rs"
+        ],
+        "selected_target": null,
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "exact_symbol_search",
+      "prompt": "Find discovery candidates only for the exact symbol name start. Pass `start` unchanged as the query. Do not select or verify one in this turn.",
+      "request": {
+        "named_files": [],
+        "selected_target": null,
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "ambiguous_symbol_then_context",
+      "prompt": "Get the candidate list for Thing first. Then choose the returned identity whose path is src/one.rs and give focused evidence for that exact identity. Do not combine the name and path into a free-text target.",
+      "request": {
+        "named_files": [],
+        "selected_target": "src/one.rs",
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "selected_target_context",
+      "prompt": "Give me focused evidence for the already selected exact symbol dynamic_start. Use that exact selector without discovering or broadening. This selected value is a name, not a returned stable identity: use it as query, never as id.",
+      "request": {
+        "named_files": [],
+        "selected_target": "dynamic_start",
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "broad_packet",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Explain how routing_fixture::start reaches finish across the project.\" Preserve every returned evidence gap in the response.",
+      "request": {
+        "named_files": [],
+        "selected_target": null,
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "packet_single_continuation",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.\" The path is fallback-only: on the initial broad request, do not add probes or continuation pins. If the evidence surface offers one bounded continuation, follow that exact offer once.",
+      "request": {
+        "named_files": [
+          "src/unread.rs"
+        ],
+        "selected_target": null,
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "packet_gap_to_focused_source",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Investigate the missing route branch.\" Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read. If no exact path-authorized read succeeds, preserve the missing branch as unknown rather than calling partial evidence supported.",
+      "request": {
+        "named_files": [],
+        "selected_target": null,
+        "gap_source_paths": [
+          "src/gap.rs"
+        ],
+        "proof_contract": null
+      }
+    },
+    {
+      "id": "packet_named_fallback_to_source",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Explain how the routing catalog works.\" Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the completed broad result does not establish that exact file, read it once and preserve every returned gap.",
+      "request": {
+        "named_files": [
+          "src/fallback.rs"
+        ],
+        "selected_target": null,
+        "gap_source_paths": [],
+        "proof_contract": null
+      }
+    }
+  ]
+}

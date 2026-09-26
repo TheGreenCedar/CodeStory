@@ -209,6 +209,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
         anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
         anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+        anchor_source_identity TEXT NOT NULL CHECK(length(anchor_source_identity) > 0),
         policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
         migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
         published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
@@ -252,6 +253,10 @@ const TABLE_STATEMENTS: &[&str] = &[
         doc_text TEXT NOT NULL,
         doc_version INTEGER NOT NULL DEFAULT 0,
         doc_hash TEXT NOT NULL DEFAULT '',
+        attached_comment_text TEXT,
+        attached_comment_state TEXT NOT NULL DEFAULT '',
+        attached_comment_policy TEXT NOT NULL DEFAULT '',
+        attached_comment_hash TEXT NOT NULL DEFAULT '',
         policy_version TEXT NOT NULL,
         source_provenance TEXT NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL,
@@ -346,6 +351,75 @@ const TABLE_STATEMENTS: &[&str] = &[
         artifact_blob BLOB NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS proof_resolution_provenance (
+        provenance_id INTEGER PRIMARY KEY CHECK(provenance_id > 0),
+        file_id INTEGER NOT NULL,
+        source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+        parser_fingerprint TEXT NOT NULL CHECK(length(parser_fingerprint) > 0),
+        dependency_json TEXT NOT NULL,
+        UNIQUE(provenance_id, file_id),
+        UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json),
+        FOREIGN KEY(file_id) REFERENCES file(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
+        fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+        edge_id INTEGER,
+        raw_edge_target_id INTEGER,
+        raw_callsite_identity TEXT,
+        file_id INTEGER NOT NULL,
+        provenance_id INTEGER NOT NULL,
+        start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+        end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+        line INTEGER NOT NULL CHECK(line > 0),
+        column INTEGER NOT NULL CHECK(column > 0),
+        callee_form TEXT NOT NULL CHECK(callee_form IN (
+            'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+            'implicit_receiver', 'constructor', 'dynamic_access'
+        )),
+        raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+        caller_node_id INTEGER NOT NULL,
+        target_node_id INTEGER,
+        status TEXT NOT NULL CHECK(status IN (
+            'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+        )),
+        reason TEXT NOT NULL CHECK(reason IN (
+            'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+            'missing_binding', 'lookup_domain_incomplete'
+        )),
+        evidence_json TEXT NOT NULL,
+        lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+        producer TEXT NOT NULL,
+        fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+        algorithm TEXT NOT NULL,
+        language_adapter TEXT NOT NULL,
+        language_adapter_version TEXT NOT NULL,
+        evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+        UNIQUE(file_id, start_byte, end_byte_exclusive),
+        CHECK(status != 'exact' OR (
+            target_node_id IS NOT NULL AND edge_id IS NOT NULL
+            AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+            AND lookup_domain_complete = 1
+        )),
+        FOREIGN KEY(edge_id) REFERENCES edge(id),
+        FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
+        FOREIGN KEY(file_id) REFERENCES file(id),
+        FOREIGN KEY(provenance_id, file_id)
+            REFERENCES proof_resolution_provenance(provenance_id, file_id),
+        FOREIGN KEY(caller_node_id) REFERENCES node(id),
+        FOREIGN KEY(target_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS proof_resolution_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+        adapter_roster_json TEXT NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        fact_count INTEGER NOT NULL CHECK(fact_count >= 0),
+        fact_digest TEXT NOT NULL CHECK(length(fact_digest) = 64),
+        funnel_json TEXT NOT NULL,
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS resolution_support_snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         snapshot_version INTEGER NOT NULL,
@@ -416,7 +490,7 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_line ON node(file_node_id, kind, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_name ON node(file_node_id, kind, qualified_name, serialized_name)",
-    "CREATE INDEX IF NOT EXISTS idx_node_canonical_id ON node(canonical_id)",
+    NODE_CANONICAL_SUFFIX_INDEX,
     "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",
@@ -450,6 +524,14 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
+     ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_file
+     ON proof_resolution_fact(file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_provenance
+     ON proof_resolution_fact(provenance_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_caller_target
+     ON proof_resolution_fact(caller_node_id, target_node_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_file
      ON structural_text_unit(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_content
@@ -461,6 +543,9 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
+
+const NODE_CANONICAL_SUFFIX_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_node_canonical_suffix
+     ON node(COALESCE(substr(CAST(canonical_id AS BLOB), -32), X''))";
 
 const GROUNDING_FILE_SNAPSHOT_PATH_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)";
@@ -717,6 +802,18 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 31 {
         storage.set_schema_version(31)?;
     }
+    migrate_v32_proof_resolution_projection(&storage.conn)?;
+    if stored_version < 32 {
+        storage.set_schema_version(32)?;
+    }
+    migrate_v33_proof_resolution_provenance(
+        &storage.conn,
+        stored_version < PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION,
+    )?;
+    // The proof provenance rewrite advances the core schema to v33. Existing
+    // immutable generations are CoW-cloned and migrated by the incremental
+    // writer before their sentinel is cleared.
+    migrate_dense_anchor_content_identity(&storage.conn)?;
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -725,11 +822,74 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     } else {
         StorageOpenMode::Live
     };
+    if stored_version < CANONICAL_SUFFIX_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        migrate_v34_canonical_suffix_index(
+            &storage.conn,
+            matches!(index_mode, StorageOpenMode::Live),
+            stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+        )?;
+    }
+    if stored_version < ATTACHED_COMMENT_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        migrate_v35_attached_comment_evidence(&storage.conn)?;
+    }
     create_indexes(&storage.conn, index_mode)?;
 
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
     }
+    Ok(())
+}
+
+fn migrate_v35_attached_comment_evidence(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "symbol_search_doc", "attached_comment_text TEXT")?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_state TEXT NOT NULL DEFAULT ''",
+    )?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_policy TEXT NOT NULL DEFAULT ''",
+    )?;
+    try_add_column(
+        conn,
+        "symbol_search_doc",
+        "attached_comment_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+/// Replace the full canonical string index with a bounded suffix bucket while
+/// keeping the complete string in the table as the identity authority.
+///
+/// Live migrations create the replacement and advance the writer barrier in
+/// one transaction. Build stores defer secondary index creation to their
+/// existing finalization fence. Interrupted incremental stores retain their
+/// sentinel until `finish_incremental_run` commits.
+pub(super) fn migrate_v34_canonical_suffix_index(
+    conn: &Connection,
+    create_suffix_index: bool,
+    stamp_current_version: bool,
+) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DROP INDEX IF EXISTS idx_node_canonical_id", [])?;
+    tx.execute("DROP INDEX IF EXISTS idx_node_canonical_suffix", [])?;
+    if create_suffix_index {
+        tx.execute(NODE_CANONICAL_SUFFIX_INDEX, [])?;
+    }
+    if stamp_current_version {
+        tx.pragma_update(
+            None,
+            "user_version",
+            CANONICAL_SUFFIX_SCHEMA_VERSION.to_string(),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1041,6 +1201,14 @@ pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<
     Ok(())
 }
 
+pub(super) fn migrate_dense_anchor_content_identity(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "dense_anchor_publication",
+        "anchor_source_identity TEXT NOT NULL DEFAULT ''",
+    )
+}
+
 pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), StorageError> {
     try_add_column(
         conn,
@@ -1287,6 +1455,461 @@ pub(super) fn migrate_v31_annotation_sidecar_cutover(
         ],
     )?;
     Ok(())
+}
+
+/// Add the exact-resolution overlay without manufacturing a completeness row.
+///
+/// Navigation can keep using a migrated schema-31 graph, but proof remains
+/// unavailable until an indexing run rematerializes facts and writes the lone
+/// complete publication receipt.
+pub(super) fn migrate_v32_proof_resolution_projection(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
+        fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+        edge_id INTEGER,
+        raw_edge_target_id INTEGER,
+        raw_callsite_identity TEXT,
+        file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+            start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+            end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+            line INTEGER NOT NULL CHECK(line > 0),
+            column INTEGER NOT NULL CHECK(column > 0),
+            callee_form TEXT NOT NULL CHECK(callee_form IN (
+                'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+                'implicit_receiver', 'constructor', 'dynamic_access'
+            )),
+            raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+            caller_node_id INTEGER NOT NULL,
+            target_node_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN (
+                'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+            )),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+                'missing_binding', 'lookup_domain_incomplete'
+            )),
+            evidence_json TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+            producer TEXT NOT NULL,
+            fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+            algorithm TEXT NOT NULL,
+            language_adapter TEXT NOT NULL,
+            language_adapter_version TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+            UNIQUE(file_id, start_byte, end_byte_exclusive),
+            CHECK(status != 'exact' OR (
+                target_node_id IS NOT NULL AND edge_id IS NOT NULL
+                AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+                AND lookup_domain_complete = 1
+            )),
+            FOREIGN KEY(edge_id) REFERENCES edge(id),
+            FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
+            FOREIGN KEY(file_id) REFERENCES file(id),
+            FOREIGN KEY(caller_node_id) REFERENCES node(id),
+            FOREIGN KEY(target_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS proof_resolution_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+            adapter_roster_json TEXT NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            fact_count INTEGER NOT NULL CHECK(fact_count >= 0),
+            fact_digest TEXT NOT NULL CHECK(length(fact_digest) = 64),
+            funnel_json TEXT NOT NULL,
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
+         ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proof_resolution_file
+         ON proof_resolution_fact(file_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proof_resolution_caller_target
+         ON proof_resolution_fact(caller_node_id, target_node_id, status)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Normalize the three file/projection-bound provenance fields while keeping
+/// every sealed fact row and publication receipt intact.
+///
+/// The fact rewrite and schema-33 writer barrier commit together. An
+/// interrupted incremental database retains its sentinel version until its
+/// existing finish fence commits, but still receives the idempotent shape
+/// migration before any current writer can use it.
+pub(super) fn migrate_v33_proof_resolution_provenance(
+    conn: &Connection,
+    stamp_current_version: bool,
+) -> Result<(), StorageError> {
+    let fact_columns = table_columns(conn, "proof_resolution_fact")?;
+    let already_normalized = fact_columns.iter().any(|column| column == "provenance_id")
+        && !fact_columns.iter().any(|column| column == "source_sha256")
+        && !fact_columns
+            .iter()
+            .any(|column| column == "dependency_json")
+        && !fact_columns
+            .iter()
+            .any(|column| column == "parser_fingerprint");
+    if already_normalized {
+        let provenance_columns = table_columns(conn, "proof_resolution_provenance")?;
+        if ![
+            "provenance_id",
+            "file_id",
+            "source_sha256",
+            "parser_fingerprint",
+            "dependency_json",
+        ]
+        .iter()
+        .all(|required| provenance_columns.iter().any(|column| column == required))
+        {
+            return Err(StorageError::Other(
+                "normalized proof facts are missing their provenance table".to_string(),
+            ));
+        }
+        if !has_unique_index_columns(
+            conn,
+            "proof_resolution_provenance",
+            &["provenance_id", "file_id"],
+        )? || !has_unique_index_columns(
+            conn,
+            "proof_resolution_provenance",
+            &[
+                "file_id",
+                "source_sha256",
+                "parser_fingerprint",
+                "dependency_json",
+            ],
+        )? || !has_composite_provenance_foreign_key(conn)?
+        {
+            return Err(StorageError::Other(
+                "normalized proof provenance is missing its identity constraints".to_string(),
+            ));
+        }
+        let duplicate_groups: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM proof_resolution_provenance
+                GROUP BY file_id, source_sha256, parser_fingerprint, dependency_json
+                HAVING COUNT(*) > 1
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if duplicate_groups != 0 {
+            return Err(StorageError::Other(
+                "normalized proof provenance contains duplicate logical groups".to_string(),
+            ));
+        }
+        if stamp_current_version {
+            conn.pragma_update(
+                None,
+                "user_version",
+                PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION.to_string(),
+            )?;
+        }
+        return Ok(());
+    }
+    if !["source_sha256", "dependency_json", "parser_fingerprint"]
+        .iter()
+        .all(|required| fact_columns.iter().any(|column| column == required))
+    {
+        return Err(StorageError::Other(
+            "proof fact provenance schema is neither legacy nor normalized".to_string(),
+        ));
+    }
+    let provenance_columns = table_columns(conn, "proof_resolution_provenance")?;
+    let precreated_provenance_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_provenance",
+        [],
+        |row| row.get(0),
+    )?;
+    if ![
+        "provenance_id",
+        "file_id",
+        "source_sha256",
+        "parser_fingerprint",
+        "dependency_json",
+    ]
+    .iter()
+    .all(|required| provenance_columns.iter().any(|column| column == required))
+        || !has_unique_index_columns(
+            conn,
+            "proof_resolution_provenance",
+            &["provenance_id", "file_id"],
+        )?
+        || !has_unique_index_columns(
+            conn,
+            "proof_resolution_provenance",
+            &[
+                "file_id",
+                "source_sha256",
+                "parser_fingerprint",
+                "dependency_json",
+            ],
+        )?
+        || precreated_provenance_count != 0
+    {
+        return Err(StorageError::Other(
+            "legacy proof facts coexist with nonempty or malformed normalized provenance"
+                .to_string(),
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DROP TABLE IF EXISTS proof_resolution_provenance", [])?;
+    tx.execute(
+        "ALTER TABLE proof_resolution_fact RENAME TO proof_resolution_fact_v32",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE proof_resolution_provenance (
+            provenance_id INTEGER PRIMARY KEY CHECK(provenance_id > 0),
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+            parser_fingerprint TEXT NOT NULL CHECK(length(parser_fingerprint) > 0),
+            dependency_json TEXT NOT NULL,
+            UNIQUE(provenance_id, file_id),
+            UNIQUE(file_id, source_sha256, parser_fingerprint, dependency_json),
+            FOREIGN KEY(file_id) REFERENCES file(id)
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO proof_resolution_provenance (
+            provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+         )
+         SELECT ROW_NUMBER() OVER (
+                    ORDER BY file_id, source_sha256, parser_fingerprint, dependency_json
+                ),
+                file_id, source_sha256, parser_fingerprint, dependency_json
+         FROM (
+            SELECT DISTINCT file_id, source_sha256, parser_fingerprint, dependency_json
+            FROM proof_resolution_fact_v32
+         )",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+            edge_id INTEGER,
+            raw_edge_target_id INTEGER,
+            raw_callsite_identity TEXT,
+            file_id INTEGER NOT NULL,
+            provenance_id INTEGER NOT NULL,
+            start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+            end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+            line INTEGER NOT NULL CHECK(line > 0),
+            column INTEGER NOT NULL CHECK(column > 0),
+            callee_form TEXT NOT NULL CHECK(callee_form IN (
+                'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+                'implicit_receiver', 'constructor', 'dynamic_access'
+            )),
+            raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+            caller_node_id INTEGER NOT NULL,
+            target_node_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN (
+                'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+            )),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+                'missing_binding', 'lookup_domain_incomplete'
+            )),
+            evidence_json TEXT NOT NULL,
+            lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+            producer TEXT NOT NULL,
+            fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+            algorithm TEXT NOT NULL,
+            language_adapter TEXT NOT NULL,
+            language_adapter_version TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+            UNIQUE(file_id, start_byte, end_byte_exclusive),
+            CHECK(status != 'exact' OR (
+                target_node_id IS NOT NULL AND edge_id IS NOT NULL
+                AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+                AND lookup_domain_complete = 1
+            )),
+            FOREIGN KEY(edge_id) REFERENCES edge(id),
+            FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
+            FOREIGN KEY(file_id) REFERENCES file(id),
+            FOREIGN KEY(provenance_id, file_id)
+                REFERENCES proof_resolution_provenance(provenance_id, file_id),
+            FOREIGN KEY(caller_node_id) REFERENCES node(id),
+            FOREIGN KEY(target_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, evidence_digest
+         )
+         SELECT f.fact_id, f.edge_id, f.raw_edge_target_id, f.raw_callsite_identity,
+                f.file_id, p.provenance_id, f.start_byte, f.end_byte_exclusive,
+                f.line, f.column, f.callee_form, f.raw_target, f.caller_node_id,
+                f.target_node_id, f.status, f.reason, f.evidence_json,
+                f.lookup_domain_complete, f.producer, f.fact_schema_version, f.algorithm,
+                f.language_adapter, f.language_adapter_version, f.evidence_digest
+         FROM proof_resolution_fact_v32 AS f
+         JOIN proof_resolution_provenance AS p
+           ON p.file_id = f.file_id
+          AND p.source_sha256 = f.source_sha256
+          AND p.parser_fingerprint = f.parser_fingerprint
+          AND p.dependency_json = f.dependency_json
+         ORDER BY f.rowid",
+        [],
+    )?;
+
+    let legacy_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact_v32",
+        [],
+        |row| row.get(0),
+    )?;
+    let migrated_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+            row.get(0)
+        })?;
+    let published_count = tx
+        .query_row(
+            "SELECT fact_count FROM proof_resolution_publication WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if legacy_count != migrated_count
+        || (legacy_count > 0 && published_count.is_none())
+        || published_count.is_some_and(|count| count != legacy_count)
+    {
+        return Err(StorageError::Other(
+            "proof provenance migration cannot preserve the complete publication".to_string(),
+        ));
+    }
+
+    tx.execute("DROP TABLE proof_resolution_fact_v32", [])?;
+    tx.execute(
+        "CREATE UNIQUE INDEX idx_proof_resolution_exact_edge
+         ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_proof_resolution_file ON proof_resolution_fact(file_id)",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_proof_resolution_provenance ON proof_resolution_fact(provenance_id)",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_proof_resolution_caller_target
+         ON proof_resolution_fact(caller_node_id, target_node_id, status)",
+        [],
+    )?;
+    if stamp_current_version {
+        tx.pragma_update(
+            None,
+            "user_version",
+            PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION.to_string(),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn has_unique_index_columns(
+    conn: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<bool, StorageError> {
+    let mut indexes = conn.prepare(&format!("PRAGMA index_list(\"{table}\")"))?;
+    let unique_names = indexes
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .filter_map(|row| match row {
+            Ok((name, 1, 0)) => Some(Ok(name)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(indexes);
+    for name in unique_names {
+        let mut columns = conn.prepare(&format!("PRAGMA index_info(\"{name}\")"))?;
+        let columns = columns
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_composite_provenance_foreign_key(conn: &Connection) -> Result<bool, StorageError> {
+    let mut statement = conn.prepare("PRAGMA foreign_key_list(proof_resolution_fact)")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut groups = BTreeMap::<i64, Vec<(i64, String, String, String)>>::new();
+    for (id, sequence, table, from, to) in rows {
+        groups
+            .entry(id)
+            .or_default()
+            .push((sequence, table, from, to));
+    }
+    Ok(groups.into_values().any(|mut group| {
+        group.sort_by_key(|(sequence, _, _, _)| *sequence);
+        group
+            == vec![
+                (
+                    0,
+                    "proof_resolution_provenance".to_string(),
+                    "provenance_id".to_string(),
+                    "provenance_id".to_string(),
+                ),
+                (
+                    1,
+                    "proof_resolution_provenance".to_string(),
+                    "file_id".to_string(),
+                    "file_id".to_string(),
+                ),
+            ]
+    }))
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

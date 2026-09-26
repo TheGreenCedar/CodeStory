@@ -409,6 +409,8 @@ pub(super) const FLOW_NEIGHBORS_PER_SEED: usize = 8;
 pub(super) const DOC_IDENTITY_BUDGET: usize = 32;
 pub(super) const DOC_SOURCE_BUDGET: usize = 48;
 pub(super) const DOC_GRAPH_BUDGET: usize = 48;
+pub(super) const ATTACHED_COMMENT_MAX_LINES: usize = 64;
+pub(super) const ATTACHED_COMMENT_MAX_UNITS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DenseAnchorReason {
@@ -2060,6 +2062,85 @@ pub(super) fn comment_block_before(lines: &[&str], start_idx: usize, limit: usiz
     block
 }
 
+/// Return source-ordered, bounded lexical evidence for the declaration's
+/// attached comment. `None` means the bounded source bytes were unavailable;
+/// `Some("")` proves that those bytes contain no attached comment.
+pub(super) fn attached_comment_for_symbol(
+    node: &GraphNode,
+    file_path: Option<&str>,
+    file_text_cache: &HashMap<String, Option<String>>,
+) -> Option<String> {
+    let path = file_path?;
+    let start_line = node.start_line?;
+    if start_line == 0 {
+        return None;
+    }
+    let contents = file_text_cache.get(path)?.as_deref()?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start_idx = start_line.saturating_sub(1) as usize;
+    if start_idx >= lines.len() {
+        return None;
+    }
+    let hash_comments = path.ends_with(".py") || path.ends_with(".sh") || path.ends_with(".rb");
+    let mut block = Vec::new();
+    let mut in_block_comment = false;
+    for line in lines[..start_idx].iter().rev() {
+        if block.len() >= ATTACHED_COMMENT_MAX_LINES {
+            break;
+        }
+        let trimmed = line.trim();
+        if block.is_empty() && trimmed.starts_with('@') {
+            continue;
+        }
+        if trimmed.is_empty() && !in_block_comment {
+            break;
+        }
+        if in_block_comment {
+            block.push(trimmed);
+            if trimmed.contains("/*") {
+                break;
+            }
+        } else if trimmed.starts_with("//") || (hash_comments && trimmed.starts_with('#')) {
+            block.push(trimmed);
+        } else if (trimmed.starts_with("/*") || trimmed.starts_with('*')) && trimmed.ends_with("*/")
+        {
+            block.push(trimmed);
+            if trimmed.contains("/*") {
+                break;
+            }
+            in_block_comment = true;
+        } else {
+            break;
+        }
+    }
+    block.reverse();
+    let mut remaining =
+        ATTACHED_COMMENT_MAX_UNITS.saturating_sub(semantic_doc_budget_cost("comments:"));
+    let mut selected = Vec::new();
+    'lines: for line in block {
+        let cleaned = line
+            .trim_start_matches(['/', '*', '#', ' '])
+            .trim_end_matches("*/")
+            .trim();
+        let mut words = Vec::new();
+        for word in cleaned.split_whitespace() {
+            let cost = semantic_doc_budget_cost(word);
+            if cost > remaining {
+                if !words.is_empty() {
+                    selected.push(words.join(" "));
+                }
+                break 'lines;
+            }
+            words.push(word);
+            remaining -= cost;
+        }
+        if !words.is_empty() {
+            selected.push(words.join(" "));
+        }
+    }
+    Some(selected.join("\n"))
+}
+
 pub(super) fn symbol_excerpt(
     node: &codestory_contracts::graph::Node,
     file_path: Option<&str>,
@@ -2329,7 +2410,16 @@ pub(super) fn dense_anchor_score(
 pub(super) fn dense_anchor_is_central(
     graph_context: &SemanticDocGraphContext,
     node_id: GraphNodeId,
+    kind: codestory_contracts::graph::NodeKind,
 ) -> bool {
+    // Callables with many edges are common on JVM/protobuf-class graphs and
+    // previously forced Keycloak-scale finalize to embed ~9k METHOD hubs alone
+    // during publication@75. Dense centrality is reserved for type-like public
+    // kinds; callables stay lexical/graph discoverable unless another reason
+    // admits them.
+    if !dense_anchor_public_kind(kind) {
+        return false;
+    }
     let centrality = graph_context
         .centrality
         .get(&node_id)
@@ -2497,8 +2587,6 @@ pub(super) fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
         || normalized.contains("/controllers/")
         || normalized.starts_with("components/")
         || normalized.contains("/components/")
-        || normalized.contains("/src/main/java/")
-        || normalized.contains("/src/main/kotlin/")
 }
 
 pub(super) fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -2507,7 +2595,6 @@ pub(super) fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKin
         codestory_contracts::graph::NodeKind::STRUCT
             | codestory_contracts::graph::NodeKind::CLASS
             | codestory_contracts::graph::NodeKind::INTERFACE
-            | codestory_contracts::graph::NodeKind::ANNOTATION
             | codestory_contracts::graph::NodeKind::UNION
             | codestory_contracts::graph::NodeKind::ENUM
             | codestory_contracts::graph::NodeKind::TYPEDEF
@@ -2546,20 +2633,34 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     // production and what the widened generalization lint now refuses. Those
     // files still qualify through the markers below whenever the repository
     // actually lays them out as a package surface.
-    normalized.split('/').any(|segment| {
-        matches!(
-            segment,
-            "lib"
-                | "src"
-                | "pkg"
-                | "packages"
-                | "routes"
-                | "router"
-                | "controllers"
-                | "middleware"
-                | "sources"
-        )
+    // Deliberately omit the generic `src` segment. Treating every callable under
+    // `src/` as dense public API (restored by #2094 for coverage) makes cold
+    // retrieval finalize embed 40k–100k+ anchors on Keycloak/protobuf-class
+    // roots and stalls activation at publication@75 for the full frozen 180s
+    // prep window. Package-surface markers stay the explicit layout roots.
+    //
+    // Also omit `lib` for `.py` files. Case-insensitive `lib` matched CPython's
+    // top-level stdlib `Lib/` and selected ~22k callables as dense public_api,
+    // so publication@75 embed could not finish under the same frozen 180s prep
+    // that Keycloak (~7k anchors) clears. Ruby/JS/`lib/` and non-`lib` Python
+    // markers (`pkg`, `packages`, …) stay intact; Python callables still enter
+    // dense via entrypoint/central/documented/public-surface paths.
+    let python_source = file_name.ends_with(".py");
+    normalized.split('/').any(|segment| match segment {
+        "lib" if python_source => false,
+        "lib" | "pkg" | "packages" | "routes" | "router" | "controllers" | "middleware"
+        | "sources" => true,
+        _ => false,
     })
+}
+
+fn semantic_file_is_jvm_source(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    file_name.ends_with(".java") || file_name.ends_with(".kt") || file_name.ends_with(".kts")
 }
 
 pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
@@ -2583,12 +2684,15 @@ fn base_dense_anchor_reason_for_node(
     let file_role = file_path
         .map(retrieval_file_role_from_path)
         .unwrap_or(RetrievalFileRole::Source);
-    let central = dense_anchor_is_central(graph_context, node.id);
+    let central = dense_anchor_is_central(graph_context, node.id, node.kind);
 
     if file_role == RetrievalFileRole::Docs {
         return Some(DenseAnchorReason::UnstructuredDoc);
     }
-    if file_role.is_non_primary() && !central {
+    // Non-primary roles (test/vendor/generated) must stay sparse even when the
+    // graph degree is high. E3 Keycloak measured 3886 test-role centrals that
+    // still entered the publication@75 embed set via the old centrality escape.
+    if file_role.is_non_primary() {
         return None;
     }
     if semantic_file_is_entrypoint(file_path, display_name) {
@@ -2600,6 +2704,16 @@ fn base_dense_anchor_reason_for_node(
     if dense_anchor_public_kind(node.kind)
         && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
             || semantic_file_is_public_surface(file_path))
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    // Annotations are not in dense_anchor_public_kind: C preprocessor
+    // definitions share the ANNOTATION kind and must not become dense merely
+    // because C has no private access. JVM annotation declarations still
+    // qualify when access is public/protected.
+    if node.kind == codestory_contracts::graph::NodeKind::ANNOTATION
+        && matches!(access, Some(AccessKind::Public | AccessKind::Protected))
+        && semantic_file_is_jvm_source(file_path)
     {
         return Some(DenseAnchorReason::PublicApi);
     }
@@ -2656,14 +2770,17 @@ pub(super) fn dense_anchor_reason_for_node_with_flow_neighbors(
     })
 }
 
-fn dense_anchor_reason_is_flow_seed(reason: Option<DenseAnchorReason>) -> bool {
+pub(super) fn dense_anchor_reason_is_flow_seed(reason: Option<DenseAnchorReason>) -> bool {
+    // Central hubs must not seed flow expansion: on Keycloak-class graphs each
+    // central seed admitted up to FLOW_NEIGHBORS_PER_SEED callables and the
+    // E3 corpus planned 7129 flow_neighbor embeds after #2285. Flow fills gaps
+    // around intentional API/entrypoint/documented seeds only.
     matches!(
         reason,
         Some(
             DenseAnchorReason::Entrypoint
                 | DenseAnchorReason::PublicApi
                 | DenseAnchorReason::DocumentedNontrivial
-                | DenseAnchorReason::CentralGraphNode
         )
     )
 }
@@ -3077,6 +3194,14 @@ impl ComponentReportAccumulator {
                     doc_text: doc_text.clone(),
                     doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
                     doc_hash: doc_hash.clone(),
+                    attached_comment_text: Some(String::new()),
+                    attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+                    attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION
+                        .into(),
+                    attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+                        SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                        Some(""),
+                    ),
                     policy_version: SEMANTIC_POLICY_VERSION.to_string(),
                     source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                     updated_at_epoch_ms,
@@ -3211,7 +3336,7 @@ fn build_semantic_symbol_docs(
                 .graph_context
                 .file_path_for_node(node)
                 .map(ToString::to_string);
-            let doc_text = if let Some(stored_docs) = context.stored_docs {
+            let (doc_text, attached_comment_text, attached_comment_state, attached_comment_hash) = if let Some(stored_docs) = context.stored_docs {
                 let stored = stored_docs.get(&node.id).ok_or_else(|| {
                     ApiError::new(
                         "semantic_projection_migration_required",
@@ -3235,6 +3360,7 @@ fn build_semantic_symbol_docs(
                             &stored.doc_text,
                             context.semantic_alias_mode,
                         )
+                    || !stored.attached_comment_is_valid()
                 {
                     return Err(ApiError::new(
                         "semantic_projection_migration_required",
@@ -3244,9 +3370,9 @@ fn build_semantic_symbol_docs(
                         ),
                     ));
                 }
-                stored.doc_text.clone()
+                (stored.doc_text.clone(), stored.attached_comment_text.clone(), stored.attached_comment_state.clone(), stored.attached_comment_hash.clone())
             } else {
-                build_llm_symbol_doc_text_with_policy(
+                let doc_text = build_llm_symbol_doc_text_with_policy(
                     context.graph_context,
                     node,
                     &display_name,
@@ -3254,7 +3380,15 @@ fn build_semantic_symbol_docs(
                     context.file_text_cache,
                     context.semantic_alias_mode,
                     context.semantic_max_tokens,
-                )
+                );
+                let attached_comment_text = attached_comment_for_symbol(node, file_path.as_deref(), context.file_text_cache);
+                let attached_comment_state = if attached_comment_text.is_some() {
+                    SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED
+                } else {
+                    SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE
+                };
+                let attached_comment_hash = SymbolSearchDoc::attached_comment_hash(attached_comment_state, attached_comment_text.as_deref());
+                (doc_text, attached_comment_text, attached_comment_state.into(), attached_comment_hash)
             };
             let doc_hash =
                 llm_symbol_doc_hash_with_alias(&doc_text, context.semantic_alias_mode);
@@ -3278,6 +3412,10 @@ fn build_semantic_symbol_docs(
                 doc_text: doc_text.clone(),
                 doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
                 doc_hash: doc_hash.clone(),
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+                attached_comment_hash,
                 policy_version: SEMANTIC_POLICY_VERSION.to_string(),
                 source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                 updated_at_epoch_ms: context.updated_at_epoch_ms,

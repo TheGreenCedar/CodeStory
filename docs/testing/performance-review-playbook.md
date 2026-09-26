@@ -84,7 +84,7 @@ regression risk, but it is not answer-quality proof.
 | Repeat refresh | Promoted stats require `repeat_semantic_docs_embedded == 0` and record wall-clock telemetry with living-baseline warnings. Release evidence separately requires repeat graph `< 20s`, repeat semantic reuse `< 3s`, and full-refresh convergence within the approved machine-profile budget. | Set `CODESTORY_EMBED_MODEL_SOURCE` to the output of `node scripts/prepare-embedded-model.mjs`, run `cargo build --release --locked -p codestory-cli`, then run `cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` for correctness and telemetry; use `scripts/codestory-release-evidence-gate.mjs` for hardware-bound timing proof. | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `scripts/codestory-release-evidence-gate.mjs`, `benchmarks/release-evidence/repo-stats-contract.json`, `benchmarks/release-evidence/approved-baselines.json` |
 | Retrieval status | After retrieval indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and engine identity. Non-`full` status is diagnostic only. | `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-engine.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
 | Packet runtime | Product retrieval query budget defaults to `1,500ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
-| Benchmark promotion | `--publishable` requires at least 3 repeats, full retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
+| Packet development comparison | Builder-visible ablations measure task success, source work, context, and installed wall time while the agent remains free to inspect source and adapt. Packet evidence never asserts answer sufficiency. The historical `--publishable` packet-runtime lane and its 18-task corpus are contaminated development diagnostics and cannot authorize 0.18 promotion. | Use the preregistered ablation receipt for the frozen development task set; do not use a historical holdout command as release evidence. | `docs/architecture/packet-generalization.md`, `scripts/codestory-agent-ab-benchmark.mjs`, `benchmarks/tasks/` |
 
 Current telemetry snapshot from `docs/testing/codestory-e2e-stats-log.md`
 (2026-06-18 `d8d59e9e+wt`, #41 hardening row): `retrieval_mode full`,
@@ -318,39 +318,19 @@ markers listed, and its declared `total_marker_occurrences` must equal the sum o
 their counts, so neither the number of surfaces nor the number of production
 lines they occupy can move without a reviewable diff that restates both numbers.
 
-The same file carries the `pending_claim_profiles` ratchet: how many product
-claim profiles still ship without an anti-overfit contract and fixture triple.
-The registry itself is checked-in, schema-versioned data
-(`crates/codestory-agent/src/data/claim_profiles.v2.json`), seeded into
-the lint by name because the directory walk collects Rust only — so the document
-carries the same banned-marker pass as the code beside it. The lint counts the
-pending rows in that document, so a new uncontracted profile cannot land without
-raising a stated number and migrating one cannot land without lowering it and
-the matching `PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. The
-ratchet is auditable in both directions as well as bounded: `ratchet_ceiling`
-records the high-water the burn-down started from and `burn_down` must name one
-migration, with its issue and its measured evidence, for every profile between
-the ceiling and the count. Leaving the pending set costs a measured fixture
-triple — the profile has to fire on its fitted example, fire on a second example
-of a different file type with a different claim, and measure zero on a helper —
-read from the same fire-rate counters the field trace publishes.
+The same file keeps `pending_claim_profiles` at a zero ratchet. The checked-in
+`crates/codestory-agent/src/data/claim_profiles.v2.json` file is an empty
+tombstone, not a production registry: no packet loader, fire-rate telemetry,
+prompt classifier, or source-text claim profile survives. The lint fails if a
+pending row or production reference returns.
 
-Every packet also publishes the contract version, per-profile fire rates, and
-per-layer claim counts on the typed
-`retrieval_trace.packet_claim_profile_telemetry` field, so which profiles fired
-— and whether the packet fell back to name-derived templates — is observable in
-the field. The loader fails closed, so the same field reports what it refused:
-`rejected_profiles` with its distinct `rejected_reasons`, and `registry_error`
-when a whole document was refused and the registry loaded empty. Those counters
-carry static profile ids, static reason codes, and integers only; no citation
-name, path, or source text enters them.
-
-The telemetry deliberately does not travel in `retrieval_trace.annotations`.
-Annotations are the packet's evidence channel: consumers scan the free text for
-gap markers and downgrade packet confidence when one matches. Always-on
-telemetry published there is read as a permanent evidence gap on every packet,
-so counters get a typed field rather than wording chosen to dodge a substring
-heuristic.
+The packet generalization boundary adds behavior-shaped counterexamples for
+renamed prompt classifiers, answer-shape seed tables, result-deletion passes,
+basename identity, and magic evidence roles. It also fails when it scans no
+production files or when a comment merely looks like a `cfg(test)` boundary.
+Repository-derived compilation receives admitted identities, bounded source,
+typed relations, ambiguity, parser completeness, and publication identity; it
+cannot receive the raw question or the retired policy fields.
 
 The inventory is executable rather than documentation-only. Supported text and
 configuration files under `scripts/`, `.github/scripts/`,

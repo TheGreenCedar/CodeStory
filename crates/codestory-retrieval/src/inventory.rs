@@ -129,7 +129,17 @@ fn build_generation_retention_plan(
     let layout = &runtime.layout;
     let mut protection =
         scan_retention_protection(cache_root, Some(storage_path), &layout.state_file);
-    let manifest = if storage_path.is_file() {
+    let storage_exists = match codestory_store::core_database_exists(storage_path) {
+        Ok(exists) => exists,
+        Err(error) => {
+            protection.protection_incomplete = true;
+            protection
+                .errors
+                .push(format!("resolve active storage for retention: {error:#}"));
+            false
+        }
+    };
+    let manifest = if storage_exists {
         // Planning retention is observation, including of the caller's own
         // store: a plan must never be the thing that migrates or recovers the
         // database it is reasoning about.

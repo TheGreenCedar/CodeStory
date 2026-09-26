@@ -2,53 +2,891 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::packet_candidate::PacketSearchHit;
-#[cfg(test)]
-use super::packet_candidate::merge_packet_candidate_graph;
-use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
+use super::packet_plan::packet_plan_query_is_typed_free_query;
 use super::packet_scoring::{
     normalize_identifier, packet_stage_citation_carry_limit, packet_subquery_hit_limit,
 };
-#[cfg(test)]
-use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
-use super::packet_terms::packet_probe_terms;
 use super::packet_trace::merge_packet_fused_subquery_batch;
-#[cfg(test)]
-use super::packet_trace::{
-    append_packet_query_timing_fields, packet_query_diagnostic, packet_query_duration_ms,
-};
-#[cfg(test)]
-use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
-use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
-use codestory_agent::packet_obligations::{
-    PacketProofEvidenceExtras, preview_packet_obligation_plan_before_budget,
-};
-use codestory_agent::packet_plan::packet_owner_member_probe_queries;
-pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
-use codestory_agent::planning::{
-    PACKET_ADJACENT_VARIANT_QUERY_PURPOSE, PACKET_CONCRETE_FILE_QUERY_PURPOSE,
-    PACKET_FLOW_ROLE_QUERY_PURPOSE, PACKET_GENERIC_TERM_QUERY_PURPOSE,
-    PACKET_OWNER_MEMBER_QUERY_PURPOSE, packet_plan_query_is_exact_symbol_identity,
-};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
-    PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, RetrievalAnnotationDto,
+    PacketSidecarQueryDiagnosticDto, RetrievalAnnotationDto,
 };
-#[cfg(test)]
-use codestory_contracts::api::{
-    AgentRetrievalStepDto, NodeKind, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
-};
+use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
-const PACKET_OWNER_MEMBER_QUERY_LIMIT: usize = 4;
+const MIN_PACKET_HANDOFF_MS: u128 = 1_000;
+/// Bound the ranked-pool digests retained on the private packet-entry receipt.
+/// All admitted identities are always retained even when they fall outside the
+/// top-N prefix, matching the telemetry-first co-presence design.
+const RAF_RANKED_RECORD_CAP: usize = 48;
+const RAF_IDENTITY_DIGEST_HEX_LEN: usize = 16;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
     pub(crate) target_ms: u128,
+}
+
+thread_local! {
+    static ACTIVE_PACKET_LATENCY_BUDGET: Cell<Option<PacketLatencyBudget>> = const {
+        Cell::new(None)
+    };
+    static ACTIVE_PACKET_ENTRY_OBSERVATION: Cell<Option<PacketEntryObservation>> = const {
+        Cell::new(None)
+    };
+    static ACTIVE_RAF_COPRESENCE_DIGESTS: RefCell<Option<RafCopresenceDigestSets>> = const {
+        RefCell::new(None)
+    };
+    static PACKET_PUBLIC_OPERATION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static PACKET_PUBLIC_OPERATION_OWNER_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[derive(Debug, Clone, Default)]
+struct RafCopresenceDigestSets {
+    ranked_identity_digests: String,
+    admitted_identity_digests: String,
+    final_identity_digests: String,
+}
+
+static NEXT_PACKET_ENTRY_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PacketEntryObservation {
+    id: u64,
+    target_ms: u64,
+    phase_mask: u64,
+    activation_branch_mask: u64,
+    activation_join_count: u64,
+    activation_join_ms: u64,
+    ready_probe_count: u64,
+    ready_probe_total_ms: u64,
+    post_probe_join_count: u64,
+    project_selection_started_ms: u64,
+    project_selection_completed_ms: u64,
+    activation_started_ms: u64,
+    ready_probe_started_ms: u64,
+    ready_probe_configuration_ms: u64,
+    ready_probe_retrieval_ms: u64,
+    ready_probe_core_ms: u64,
+    ready_probe_source_ms: u64,
+    ready_probe_completed_ms: u64,
+    post_probe_join_ms: u64,
+    activation_returned_ms: u64,
+    source_scope_started_ms: u64,
+    source_scope_completed_ms: u64,
+    public_admission_check_ms: u64,
+    public_admission_reached_count: u64,
+    public_admission_passed_count: u64,
+    public_admission_refused_count: u64,
+    last_public_admission_ms: u64,
+    attempt_started_count: u64,
+    retry_publication_changed_count: u64,
+    retry_cache_busy_count: u64,
+    descriptor_preadmission_observed_count: u64,
+    descriptor_preadmission_query_count: u64,
+    descriptor_health_resolution_wall_ms: u64,
+    descriptor_query_batch_wall_ms: u64,
+    descriptor_query_plan_wall_ms: u64,
+    descriptor_lexical_wall_ms: u64,
+    descriptor_dense_semantic_wall_ms: u64,
+    descriptor_admission_seal_wall_ms: u64,
+    descriptor_deferred_readiness_wall_ms: u64,
+    descriptor_remaining_before_handoff_ms: u64,
+    descriptor_preadmit_runtime_phases_observed_count: u64,
+    raf_ranked_admitted_observed_count: u64,
+    raf_ranked_pool_count: u64,
+    raf_ranked_recorded_count: u64,
+    raf_admitted_count: u64,
+    raf_final_observed_count: u64,
+    raf_final_support_count: u64,
+    raf_final_recorded_count: u64,
+    complete_core_snapshot: PacketOperationSpanObservation,
+    uncached_freshness: PacketOperationSpanObservation,
+    retrieval_pin: PacketOperationSpanObservation,
+    build_callback: PacketOperationSpanObservation,
+    post_build_freshness: PacketOperationSpanObservation,
+    pin_begin: PacketOperationSpanObservation,
+    pin_revalidation: PacketOperationSpanObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PacketOperationSpanObservation {
+    started_count: u64,
+    succeeded_count: u64,
+    total_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PacketOperationObservationSpan {
+    CompleteCoreSnapshot,
+    UncachedFreshness,
+    RetrievalPin,
+    BuildCallback,
+    PostBuildFreshness,
+    PinBegin,
+    PinRevalidation,
+}
+
+fn packet_operation_span_mut(
+    observation: &mut PacketEntryObservation,
+    span: PacketOperationObservationSpan,
+) -> &mut PacketOperationSpanObservation {
+    match span {
+        PacketOperationObservationSpan::CompleteCoreSnapshot => {
+            &mut observation.complete_core_snapshot
+        }
+        PacketOperationObservationSpan::UncachedFreshness => &mut observation.uncached_freshness,
+        PacketOperationObservationSpan::RetrievalPin => &mut observation.retrieval_pin,
+        PacketOperationObservationSpan::BuildCallback => &mut observation.build_callback,
+        PacketOperationObservationSpan::PostBuildFreshness => &mut observation.post_build_freshness,
+        PacketOperationObservationSpan::PinBegin => &mut observation.pin_begin,
+        PacketOperationObservationSpan::PinRevalidation => &mut observation.pin_revalidation,
+    }
+}
+
+fn packet_operation_observation_is_owned() -> bool {
+    PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| {
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| {
+            let depth = depth.get();
+            depth != 0 && owner.get() == depth
+        })
+    })
+}
+
+fn update_packet_operation_observation(update: impl FnOnce(&mut PacketEntryObservation)) {
+    if !packet_operation_observation_is_owned() {
+        return;
+    }
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        if let Some(mut observation) = active.get() {
+            update(&mut observation);
+            active.set(Some(observation));
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_packet_descriptor_preadmission(
+    query_count: u64,
+    health_resolution_wall_ms: u64,
+    query_batch_wall_ms: u64,
+    query_plan_wall_ms: u64,
+    lexical_wall_ms: u64,
+    dense_semantic_wall_ms: u64,
+    admission_seal_wall_ms: u64,
+    deferred_readiness_wall_ms: u64,
+) {
+    if query_count == 0 {
+        return;
+    }
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_preadmission_observed_count != 0 {
+            return;
+        }
+        observation.descriptor_preadmission_observed_count = 1;
+        observation.descriptor_preadmission_query_count = query_count;
+        observation.descriptor_health_resolution_wall_ms = health_resolution_wall_ms;
+        observation.descriptor_query_batch_wall_ms = query_batch_wall_ms;
+        observation.descriptor_query_plan_wall_ms = query_plan_wall_ms;
+        observation.descriptor_lexical_wall_ms = lexical_wall_ms;
+        observation.descriptor_dense_semantic_wall_ms = dense_semantic_wall_ms;
+        observation.descriptor_admission_seal_wall_ms = admission_seal_wall_ms;
+        observation.descriptor_deferred_readiness_wall_ms = deferred_readiness_wall_ms;
+    });
+}
+
+/// Record ordered runtime sub-phase walls when the descriptor batch itself did
+/// not produce a complete `#2272` observation (empty queries / zero slots).
+///
+/// First owned write wins. Does not set `descriptor_preadmission_observed_count`.
+pub(crate) fn observe_packet_descriptor_preadmit_runtime_phases(
+    query_plan_wall_ms: u64,
+    admission_seal_wall_ms: u64,
+    deferred_readiness_wall_ms: u64,
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_preadmit_runtime_phases_observed_count != 0
+            || observation.descriptor_preadmission_observed_count != 0
+        {
+            return;
+        }
+        observation.descriptor_preadmit_runtime_phases_observed_count = 1;
+        observation.descriptor_query_plan_wall_ms = query_plan_wall_ms;
+        observation.descriptor_admission_seal_wall_ms = admission_seal_wall_ms;
+        observation.descriptor_deferred_readiness_wall_ms = deferred_readiness_wall_ms;
+    });
+}
+
+/// Record remaining packet-entry budget after descriptor preadmission, before the
+/// next orchestrator handoff (`exact probe citation resolution`).
+///
+/// First owned write wins. Empty/cancel paths may leave this at zero.
+pub(crate) fn observe_packet_descriptor_remaining_before_handoff(remaining_ms: u64) {
+    update_packet_operation_observation(|observation| {
+        if observation.descriptor_remaining_before_handoff_ms != 0 {
+            return;
+        }
+        observation.descriptor_remaining_before_handoff_ms = remaining_ms;
+    });
+}
+
+/// Retain private ranked/admitted identity digests for offline co-presence analysis.
+///
+/// Digests are SHA-256 prefixes of stable packet identities only. Prompt text,
+/// paths, scores, and public DTOs stay out of this observation. First owned
+/// packet observation wins; nested or non-packet callers cannot overwrite.
+pub(crate) fn observe_packet_raf_ranked_admitted(
+    ranked_identities: &[String],
+    admitted_identities: &[String],
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_ranked_admitted_observed_count != 0 {
+            return;
+        }
+        let recorded = capped_raf_ranked_identities(ranked_identities, admitted_identities);
+        observation.raf_ranked_admitted_observed_count = 1;
+        observation.raf_ranked_pool_count =
+            u64::try_from(ranked_identities.len()).unwrap_or(u64::MAX);
+        observation.raf_ranked_recorded_count = u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        observation.raf_admitted_count =
+            u64::try_from(admitted_identities.len()).unwrap_or(u64::MAX);
+        ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+            if let Some(sets) = slot.borrow_mut().as_mut() {
+                sets.ranked_identity_digests = join_raf_identity_digests(&recorded);
+                sets.admitted_identity_digests = join_raf_identity_digests(admitted_identities);
+            }
+        });
+    });
+}
+
+/// Retain private final-support identity digests after compile/projection.
+///
+/// Joins the earlier ranked/admitted observation on the same packet-entry
+/// receipt. First write wins; callers without an owned packet observation are
+/// ignored.
+pub(crate) fn observe_packet_raf_final_support(final_identities: &[String]) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_final_observed_count != 0 {
+            return;
+        }
+        let mut recorded = Vec::new();
+        let mut seen = HashSet::new();
+        for identity in final_identities {
+            if identity.is_empty() || !seen.insert(identity.as_str()) {
+                continue;
+            }
+            recorded.push(identity.clone());
+        }
+        observation.raf_final_observed_count = 1;
+        observation.raf_final_support_count =
+            u64::try_from(final_identities.len()).unwrap_or(u64::MAX);
+        observation.raf_final_recorded_count = u64::try_from(recorded.len()).unwrap_or(u64::MAX);
+        ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+            if let Some(sets) = slot.borrow_mut().as_mut() {
+                sets.final_identity_digests = join_raf_identity_digests(&recorded);
+            }
+        });
+    });
+}
+
+fn capped_raf_ranked_identities(
+    ranked_identities: &[String],
+    admitted_identities: &[String],
+) -> Vec<String> {
+    let mut recorded = Vec::new();
+    let mut included = HashSet::new();
+    for identity in ranked_identities.iter().take(RAF_RANKED_RECORD_CAP) {
+        if identity.is_empty() || !included.insert(identity.as_str()) {
+            continue;
+        }
+        recorded.push(identity.clone());
+    }
+    let admitted: HashSet<&str> = admitted_identities
+        .iter()
+        .map(String::as_str)
+        .filter(|identity| !identity.is_empty())
+        .collect();
+    for identity in ranked_identities {
+        if !admitted.contains(identity.as_str()) {
+            continue;
+        }
+        if !included.insert(identity.as_str()) {
+            continue;
+        }
+        recorded.push(identity.clone());
+    }
+    recorded
+}
+
+fn raf_identity_digest(stable_identity: &str) -> String {
+    let digest = Sha256::digest(stable_identity.as_bytes());
+    let mut out = String::with_capacity(RAF_IDENTITY_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(RAF_IDENTITY_DIGEST_HEX_LEN / 2) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn join_raf_identity_digests(identities: &[String]) -> String {
+    identities
+        .iter()
+        .map(|identity| raf_identity_digest(identity))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+pub(crate) fn raf_identity_digest_for_test(stable_identity: &str) -> String {
+    raf_identity_digest(stable_identity)
+}
+
+pub(crate) struct PacketPublicOperationObservationGuard {
+    previous_depth: u32,
+    previous_owner_depth: u32,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for PacketPublicOperationObservationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| owner.set(self.previous_owner_depth));
+        PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| depth.set(self.previous_depth));
+    }
+}
+
+pub(crate) fn enter_packet_public_operation_observation(
+    operation: &str,
+) -> PacketPublicOperationObservationGuard {
+    let active = ACTIVE_PACKET_ENTRY_OBSERVATION.with(|observation| observation.get().is_some());
+    if !active {
+        return PacketPublicOperationObservationGuard {
+            previous_depth: 0,
+            previous_owner_depth: 0,
+            active: false,
+            _thread_bound: PhantomData,
+        };
+    }
+    let previous_depth = PACKET_PUBLIC_OPERATION_DEPTH.with(|depth| {
+        let previous = depth.get();
+        depth.set(previous.saturating_add(1));
+        previous
+    });
+    let previous_owner_depth = PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(Cell::get);
+    if operation == "packet" && previous_owner_depth == 0 {
+        PACKET_PUBLIC_OPERATION_OWNER_DEPTH.with(|owner| owner.set(previous_depth + 1));
+    }
+    PacketPublicOperationObservationGuard {
+        previous_depth,
+        previous_owner_depth,
+        active: true,
+        _thread_bound: PhantomData,
+    }
+}
+
+pub(crate) fn observe_packet_public_admission_reached() {
+    let elapsed_ms = active_packet_latency_budget()
+        .map(|budget| clamp_u128_to_u32(budget.started_at.elapsed().as_millis()) as u64)
+        .unwrap_or(0);
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_reached_count =
+            observation.public_admission_reached_count.saturating_add(1);
+        if observation.public_admission_reached_count == 1 {
+            observation.public_admission_check_ms = elapsed_ms;
+        }
+        observation.last_public_admission_ms = elapsed_ms;
+    });
+}
+
+pub(crate) fn observe_packet_public_admission_passed() {
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_passed_count =
+            observation.public_admission_passed_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_public_admission_refused() {
+    update_packet_operation_observation(|observation| {
+        observation.public_admission_refused_count =
+            observation.public_admission_refused_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_attempt_started() {
+    update_packet_operation_observation(|observation| {
+        observation.attempt_started_count = observation.attempt_started_count.saturating_add(1);
+    });
+}
+
+pub(crate) fn observe_packet_retry_cause(code: &str) {
+    update_packet_operation_observation(|observation| match code {
+        "publication_changed" => {
+            observation.retry_publication_changed_count = observation
+                .retry_publication_changed_count
+                .saturating_add(1);
+        }
+        "cache_busy" => {
+            observation.retry_cache_busy_count =
+                observation.retry_cache_busy_count.saturating_add(1);
+        }
+        _ => {}
+    });
+}
+
+pub(crate) struct PacketOperationObservationSpanGuard {
+    span: PacketOperationObservationSpan,
+    started_at: Option<Instant>,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl PacketOperationObservationSpanGuard {
+    pub(crate) fn finish_success(&mut self) {
+        if self.active {
+            self.finish(true);
+        }
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        let Some(started_at) = self.started_at.take() else {
+            self.active = false;
+            return;
+        };
+        let elapsed_ms = clamp_u128_to_u32(started_at.elapsed().as_millis()) as u64;
+        update_packet_operation_observation(|observation| {
+            let span = packet_operation_span_mut(observation, self.span);
+            span.total_ms = span.total_ms.saturating_add(elapsed_ms);
+            if succeeded {
+                span.succeeded_count = span.succeeded_count.saturating_add(1);
+            }
+        });
+        self.active = false;
+    }
+}
+
+impl Drop for PacketOperationObservationSpanGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.finish(false);
+        }
+    }
+}
+
+pub(crate) fn observe_packet_operation_span(
+    span: PacketOperationObservationSpan,
+) -> PacketOperationObservationSpanGuard {
+    let active = packet_operation_observation_is_owned();
+    if active {
+        update_packet_operation_observation(|observation| {
+            let span = packet_operation_span_mut(observation, span);
+            span.started_count = span.started_count.saturating_add(1);
+        });
+    }
+    PacketOperationObservationSpanGuard {
+        span,
+        started_at: active.then(Instant::now),
+        active,
+        _thread_bound: PhantomData,
+    }
+}
+
+/// Fixed request-side boundaries retained by the active packet allowance.
+///
+/// The diagnostic receipt contains only numeric timings and branch flags. It
+/// never records a project path, query, source text, or request payload.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum PacketEntryObservationPhase {
+    ProjectSelectionStarted = 0,
+    ProjectSelectionCompleted = 1,
+    ActivationStarted = 2,
+    ActivationJoinedRunning = 3,
+    ActivationReadyProbeStarted = 4,
+    ReadyProbeConfigurationCompleted = 5,
+    ReadyProbeRetrievalCompleted = 6,
+    ReadyProbeCoreCompleted = 7,
+    ReadyProbeSourceCompleted = 8,
+    ActivationReadyProbeCompleted = 9,
+    ActivationPostProbeJoin = 10,
+    ActivationStartedWorker = 11,
+    ActivationReturned = 12,
+    SourceScopeStarted = 13,
+    SourceScopeCompleted = 14,
+    PublicAdmissionCheck = 15,
+}
+
+/// Record one request-side boundary against the active packet allowance.
+/// Non-packet callers have no active observation and pay only a TLS lookup.
+#[doc(hidden)]
+pub fn observe_packet_entry_phase(phase: PacketEntryObservationPhase) {
+    let Some(packet_latency) = active_packet_latency_budget() else {
+        return;
+    };
+    let elapsed_ms = clamp_u128_to_u32(packet_latency.started_at.elapsed().as_millis()) as u64;
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        let Some(mut observation) = active.get() else {
+            return;
+        };
+        let bit = 1_u64 << (phase as u8);
+        let was_recorded = observation.phase_mask & bit != 0;
+        observation.phase_mask |= bit;
+        match phase {
+            PacketEntryObservationPhase::ProjectSelectionStarted => {
+                if !was_recorded {
+                    observation.project_selection_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ProjectSelectionCompleted => {
+                if !was_recorded {
+                    observation.project_selection_completed_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationStarted => {
+                if !was_recorded {
+                    observation.activation_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationJoinedRunning => {
+                observation.activation_branch_mask |= 1;
+                observation.activation_join_count =
+                    observation.activation_join_count.saturating_add(1);
+                if !was_recorded {
+                    observation.activation_join_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::ActivationReadyProbeStarted => {
+                observation.activation_branch_mask |= 2;
+                observation.ready_probe_count = observation.ready_probe_count.saturating_add(1);
+                observation.ready_probe_started_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeConfigurationCompleted => {
+                observation.ready_probe_configuration_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeRetrievalCompleted => {
+                observation.ready_probe_retrieval_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeCoreCompleted => {
+                observation.ready_probe_core_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ReadyProbeSourceCompleted => {
+                observation.ready_probe_source_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationReadyProbeCompleted => {
+                observation.ready_probe_total_ms = observation
+                    .ready_probe_total_ms
+                    .saturating_add(elapsed_ms.saturating_sub(observation.ready_probe_started_ms));
+                observation.ready_probe_completed_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationPostProbeJoin => {
+                observation.activation_branch_mask |= 4;
+                observation.post_probe_join_count =
+                    observation.post_probe_join_count.saturating_add(1);
+                observation.post_probe_join_ms = elapsed_ms;
+            }
+            PacketEntryObservationPhase::ActivationStartedWorker => {
+                observation.activation_branch_mask |= 8;
+            }
+            PacketEntryObservationPhase::ActivationReturned => {
+                if !was_recorded {
+                    observation.activation_returned_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::SourceScopeStarted => {
+                if !was_recorded {
+                    observation.source_scope_started_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::SourceScopeCompleted => {
+                if !was_recorded {
+                    observation.source_scope_completed_ms = elapsed_ms;
+                }
+            }
+            PacketEntryObservationPhase::PublicAdmissionCheck => {
+                if !was_recorded {
+                    observation.public_admission_check_ms = elapsed_ms;
+                }
+            }
+        }
+        active.set(Some(observation));
+    });
+}
+
+/// Restores the packet allowance that was active before this synchronous scope.
+///
+/// The guard is deliberately thread-bound because it restores thread-local state.
+#[doc(hidden)]
+pub struct PacketLatencyScopeGuard {
+    previous: Option<PacketLatencyBudget>,
+    owns_observation: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for PacketLatencyScopeGuard {
+    fn drop(&mut self) {
+        let total_elapsed_ms = active_packet_latency_budget()
+            .map(|budget| clamp_u128_to_u32(budget.started_at.elapsed().as_millis()) as u64)
+            .unwrap_or(0);
+        ACTIVE_PACKET_LATENCY_BUDGET.with(|active| active.set(self.previous));
+        if self.owns_observation {
+            let observation = ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| active.take());
+            let digests = ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow_mut().take());
+            if let Some(observation) = observation {
+                let digests = digests.unwrap_or_default();
+                tracing::warn!(
+                    packet_entry_observation_id = observation.id,
+                    target_ms = observation.target_ms,
+                    total_elapsed_ms,
+                    phase_mask = observation.phase_mask,
+                    activation_branch_mask = observation.activation_branch_mask,
+                    activation_join_count = observation.activation_join_count,
+                    activation_join_ms = observation.activation_join_ms,
+                    ready_probe_count = observation.ready_probe_count,
+                    ready_probe_total_ms = observation.ready_probe_total_ms,
+                    post_probe_join_count = observation.post_probe_join_count,
+                    project_selection_started_ms = observation.project_selection_started_ms,
+                    project_selection_completed_ms = observation.project_selection_completed_ms,
+                    activation_started_ms = observation.activation_started_ms,
+                    ready_probe_started_ms = observation.ready_probe_started_ms,
+                    ready_probe_configuration_ms = observation.ready_probe_configuration_ms,
+                    ready_probe_retrieval_ms = observation.ready_probe_retrieval_ms,
+                    ready_probe_core_ms = observation.ready_probe_core_ms,
+                    ready_probe_source_ms = observation.ready_probe_source_ms,
+                    ready_probe_completed_ms = observation.ready_probe_completed_ms,
+                    post_probe_join_ms = observation.post_probe_join_ms,
+                    activation_returned_ms = observation.activation_returned_ms,
+                    source_scope_started_ms = observation.source_scope_started_ms,
+                    source_scope_completed_ms = observation.source_scope_completed_ms,
+                    public_admission_check_ms = observation.public_admission_check_ms,
+                    last_public_admission_ms = observation.last_public_admission_ms,
+                    public_admission_reached_count = observation.public_admission_reached_count,
+                    public_admission_passed_count = observation.public_admission_passed_count,
+                    public_admission_refused_count = observation.public_admission_refused_count,
+                    attempt_started_count = observation.attempt_started_count,
+                    retry_publication_changed_count = observation.retry_publication_changed_count,
+                    retry_cache_busy_count = observation.retry_cache_busy_count,
+                    descriptor_preadmission_observed_count =
+                        observation.descriptor_preadmission_observed_count,
+                    descriptor_preadmission_query_count =
+                        observation.descriptor_preadmission_query_count,
+                    descriptor_health_resolution_wall_ms =
+                        observation.descriptor_health_resolution_wall_ms,
+                    descriptor_query_batch_wall_ms = observation.descriptor_query_batch_wall_ms,
+                    descriptor_query_plan_wall_ms = observation.descriptor_query_plan_wall_ms,
+                    descriptor_lexical_wall_ms = observation.descriptor_lexical_wall_ms,
+                    descriptor_dense_semantic_wall_ms =
+                        observation.descriptor_dense_semantic_wall_ms,
+                    descriptor_admission_seal_wall_ms =
+                        observation.descriptor_admission_seal_wall_ms,
+                    descriptor_deferred_readiness_wall_ms =
+                        observation.descriptor_deferred_readiness_wall_ms,
+                    descriptor_remaining_before_handoff_ms =
+                        observation.descriptor_remaining_before_handoff_ms,
+                    descriptor_preadmit_runtime_phases_observed_count =
+                        observation.descriptor_preadmit_runtime_phases_observed_count,
+                    raf_ranked_admitted_observed_count =
+                        observation.raf_ranked_admitted_observed_count,
+                    raf_ranked_pool_count = observation.raf_ranked_pool_count,
+                    raf_ranked_recorded_count = observation.raf_ranked_recorded_count,
+                    raf_admitted_count = observation.raf_admitted_count,
+                    raf_final_observed_count = observation.raf_final_observed_count,
+                    raf_final_support_count = observation.raf_final_support_count,
+                    raf_final_recorded_count = observation.raf_final_recorded_count,
+                    raf_ranked_identity_digests = digests.ranked_identity_digests.as_str(),
+                    raf_admitted_identity_digests = digests.admitted_identity_digests.as_str(),
+                    raf_final_identity_digests = digests.final_identity_digests.as_str(),
+                    complete_core_snapshot_started_count =
+                        observation.complete_core_snapshot.started_count,
+                    complete_core_snapshot_succeeded_count =
+                        observation.complete_core_snapshot.succeeded_count,
+                    complete_core_snapshot_ms = observation.complete_core_snapshot.total_ms,
+                    uncached_freshness_started_count = observation.uncached_freshness.started_count,
+                    uncached_freshness_succeeded_count =
+                        observation.uncached_freshness.succeeded_count,
+                    uncached_freshness_ms = observation.uncached_freshness.total_ms,
+                    retrieval_pin_started_count = observation.retrieval_pin.started_count,
+                    retrieval_pin_succeeded_count = observation.retrieval_pin.succeeded_count,
+                    retrieval_pin_ms = observation.retrieval_pin.total_ms,
+                    build_callback_started_count = observation.build_callback.started_count,
+                    build_callback_succeeded_count = observation.build_callback.succeeded_count,
+                    build_callback_ms = observation.build_callback.total_ms,
+                    post_build_freshness_started_count =
+                        observation.post_build_freshness.started_count,
+                    post_build_freshness_succeeded_count =
+                        observation.post_build_freshness.succeeded_count,
+                    post_build_freshness_ms = observation.post_build_freshness.total_ms,
+                    pin_begin_started_count = observation.pin_begin.started_count,
+                    pin_begin_succeeded_count = observation.pin_begin.succeeded_count,
+                    pin_begin_ms = observation.pin_begin.total_ms,
+                    pin_revalidation_started_count = observation.pin_revalidation.started_count,
+                    pin_revalidation_succeeded_count = observation.pin_revalidation.succeeded_count,
+                    pin_revalidation_ms = observation.pin_revalidation.total_ms,
+                    "packet entry observation"
+                );
+            }
+        }
+    }
+}
+
+/// Start one packet allowance unless an outer packet entry already owns it.
+///
+/// Nested public-operation wrappers inherit the outer start instant. This is a
+/// runtime integration surface for adapters; the request DTO remains unchanged.
+#[doc(hidden)]
+pub fn enter_packet_latency_scope(requested_ms: Option<u32>) -> PacketLatencyScopeGuard {
+    ACTIVE_PACKET_LATENCY_BUDGET.with(|active| {
+        let previous = active.get();
+        let budget = previous.unwrap_or_else(|| PacketLatencyBudget::new(requested_ms));
+        active.set(Some(budget));
+        let owns_observation = previous.is_none();
+        if owns_observation {
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(|observation| {
+                observation.set(Some(PacketEntryObservation {
+                    id: NEXT_PACKET_ENTRY_OBSERVATION_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                    target_ms: clamp_u128_to_u32(budget.target_ms) as u64,
+                    ..PacketEntryObservation::default()
+                }));
+            });
+            ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| {
+                *slot.borrow_mut() = Some(RafCopresenceDigestSets::default());
+            });
+        }
+        PacketLatencyScopeGuard {
+            previous,
+            owns_observation,
+            _thread_bound: PhantomData,
+        }
+    })
+}
+
+pub(crate) fn active_packet_latency_budget() -> Option<PacketLatencyBudget> {
+    ACTIVE_PACKET_LATENCY_BUDGET.with(Cell::get)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PacketOperationObservationTestSnapshot {
+    pub(crate) public_admission_reached_count: u64,
+    pub(crate) public_admission_passed_count: u64,
+    pub(crate) public_admission_refused_count: u64,
+    pub(crate) first_public_admission_ms: u64,
+    pub(crate) last_public_admission_ms: u64,
+    pub(crate) attempt_started_count: u64,
+    pub(crate) retry_publication_changed_count: u64,
+    pub(crate) retry_cache_busy_count: u64,
+    pub(crate) descriptor_preadmission_observed_count: u64,
+    pub(crate) descriptor_preadmission_query_count: u64,
+    pub(crate) descriptor_health_resolution_wall_ms: u64,
+    pub(crate) descriptor_query_batch_wall_ms: u64,
+    pub(crate) descriptor_query_plan_wall_ms: u64,
+    pub(crate) descriptor_lexical_wall_ms: u64,
+    pub(crate) descriptor_dense_semantic_wall_ms: u64,
+    pub(crate) descriptor_admission_seal_wall_ms: u64,
+    pub(crate) descriptor_deferred_readiness_wall_ms: u64,
+    pub(crate) descriptor_remaining_before_handoff_ms: u64,
+    pub(crate) descriptor_preadmit_runtime_phases_observed_count: u64,
+    pub(crate) raf_ranked_admitted_observed_count: u64,
+    pub(crate) raf_ranked_pool_count: u64,
+    pub(crate) raf_ranked_recorded_count: u64,
+    pub(crate) raf_admitted_count: u64,
+    pub(crate) raf_final_observed_count: u64,
+    pub(crate) raf_final_support_count: u64,
+    pub(crate) raf_final_recorded_count: u64,
+    pub(crate) raf_ranked_identity_digests: String,
+    pub(crate) raf_admitted_identity_digests: String,
+    pub(crate) raf_final_identity_digests: String,
+    pub(crate) complete_core_snapshot_started_count: u64,
+    pub(crate) complete_core_snapshot_succeeded_count: u64,
+    pub(crate) uncached_freshness_started_count: u64,
+    pub(crate) uncached_freshness_succeeded_count: u64,
+    pub(crate) retrieval_pin_started_count: u64,
+    pub(crate) retrieval_pin_succeeded_count: u64,
+    pub(crate) build_callback_started_count: u64,
+    pub(crate) build_callback_succeeded_count: u64,
+    pub(crate) post_build_freshness_started_count: u64,
+    pub(crate) post_build_freshness_succeeded_count: u64,
+    pub(crate) pin_begin_started_count: u64,
+    pub(crate) pin_begin_succeeded_count: u64,
+    pub(crate) pin_revalidation_started_count: u64,
+    pub(crate) pin_revalidation_succeeded_count: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn packet_operation_observation_for_test()
+-> Option<PacketOperationObservationTestSnapshot> {
+    ACTIVE_PACKET_ENTRY_OBSERVATION.with(|active| {
+        active.get().map(|observation| {
+            let digests = ACTIVE_RAF_COPRESENCE_DIGESTS
+                .with(|slot| slot.borrow().clone())
+                .unwrap_or_default();
+            PacketOperationObservationTestSnapshot {
+                public_admission_reached_count: observation.public_admission_reached_count,
+                public_admission_passed_count: observation.public_admission_passed_count,
+                public_admission_refused_count: observation.public_admission_refused_count,
+                first_public_admission_ms: observation.public_admission_check_ms,
+                last_public_admission_ms: observation.last_public_admission_ms,
+                attempt_started_count: observation.attempt_started_count,
+                retry_publication_changed_count: observation.retry_publication_changed_count,
+                retry_cache_busy_count: observation.retry_cache_busy_count,
+                descriptor_preadmission_observed_count: observation
+                    .descriptor_preadmission_observed_count,
+                descriptor_preadmission_query_count: observation
+                    .descriptor_preadmission_query_count,
+                descriptor_health_resolution_wall_ms: observation
+                    .descriptor_health_resolution_wall_ms,
+                descriptor_query_batch_wall_ms: observation.descriptor_query_batch_wall_ms,
+                descriptor_query_plan_wall_ms: observation.descriptor_query_plan_wall_ms,
+                descriptor_lexical_wall_ms: observation.descriptor_lexical_wall_ms,
+                descriptor_dense_semantic_wall_ms: observation.descriptor_dense_semantic_wall_ms,
+                descriptor_admission_seal_wall_ms: observation.descriptor_admission_seal_wall_ms,
+                descriptor_deferred_readiness_wall_ms: observation
+                    .descriptor_deferred_readiness_wall_ms,
+                descriptor_remaining_before_handoff_ms: observation
+                    .descriptor_remaining_before_handoff_ms,
+                descriptor_preadmit_runtime_phases_observed_count: observation
+                    .descriptor_preadmit_runtime_phases_observed_count,
+                raf_ranked_admitted_observed_count: observation.raf_ranked_admitted_observed_count,
+                raf_ranked_pool_count: observation.raf_ranked_pool_count,
+                raf_ranked_recorded_count: observation.raf_ranked_recorded_count,
+                raf_admitted_count: observation.raf_admitted_count,
+                raf_final_observed_count: observation.raf_final_observed_count,
+                raf_final_support_count: observation.raf_final_support_count,
+                raf_final_recorded_count: observation.raf_final_recorded_count,
+                raf_ranked_identity_digests: digests.ranked_identity_digests,
+                raf_admitted_identity_digests: digests.admitted_identity_digests,
+                raf_final_identity_digests: digests.final_identity_digests,
+                complete_core_snapshot_started_count: observation
+                    .complete_core_snapshot
+                    .started_count,
+                complete_core_snapshot_succeeded_count: observation
+                    .complete_core_snapshot
+                    .succeeded_count,
+                uncached_freshness_started_count: observation.uncached_freshness.started_count,
+                uncached_freshness_succeeded_count: observation.uncached_freshness.succeeded_count,
+                retrieval_pin_started_count: observation.retrieval_pin.started_count,
+                retrieval_pin_succeeded_count: observation.retrieval_pin.succeeded_count,
+                build_callback_started_count: observation.build_callback.started_count,
+                build_callback_succeeded_count: observation.build_callback.succeeded_count,
+                post_build_freshness_started_count: observation.post_build_freshness.started_count,
+                post_build_freshness_succeeded_count: observation
+                    .post_build_freshness
+                    .succeeded_count,
+                pin_begin_started_count: observation.pin_begin.started_count,
+                pin_begin_succeeded_count: observation.pin_begin.succeeded_count,
+                pin_revalidation_started_count: observation.pin_revalidation.started_count,
+                pin_revalidation_succeeded_count: observation.pin_revalidation.succeeded_count,
+            }
+        })
+    })
 }
 
 impl PacketLatencyBudget {
@@ -61,6 +899,10 @@ impl PacketLatencyBudget {
         }
     }
 
+    pub(crate) fn inherited_or_new(requested_ms: Option<u32>) -> Self {
+        active_packet_latency_budget().unwrap_or_else(|| Self::new(requested_ms))
+    }
+
     fn elapsed_ms(&self) -> u128 {
         self.started_at.elapsed().as_millis()
     }
@@ -69,16 +911,9 @@ impl PacketLatencyBudget {
         self.elapsed_ms() >= self.target_ms
     }
 
-    pub(crate) fn remaining_ms(&self) -> u32 {
-        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(1_000))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn budget_usage_percent(&self, consumed_trace_ms: u32) -> u128 {
-        (consumed_trace_ms as u128)
-            .saturating_mul(100)
-            .checked_div(self.target_ms.max(1))
-            .unwrap_or(100)
+    pub(crate) fn remaining_for_handoff(self) -> Option<u32> {
+        let remaining_ms = self.target_ms.saturating_sub(self.elapsed_ms());
+        (remaining_ms >= MIN_PACKET_HANDOFF_MS).then(|| clamp_u128_to_u32(remaining_ms))
     }
 
     pub(crate) fn apply_to_trace(self, answer: &mut AgentAnswerDto) {
@@ -89,16 +924,329 @@ impl PacketLatencyBudget {
     }
 }
 
+#[cfg(test)]
+mod packet_latency_budget_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::time::Duration;
+
+    #[test]
+    fn packet_budget_handoff_charges_elapsed_work_and_refuses_an_exhausted_floor() {
+        let partially_spent = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(700))
+                .expect("backdate packet start"),
+            target_ms: 2_000,
+        };
+        let remaining = partially_spent
+            .remaining_for_handoff()
+            .expect("partially spent packet allowance");
+        assert!(
+            (1_250..=1_300).contains(&remaining),
+            "descriptor elapsed time must reduce the downstream allowance: {remaining}"
+        );
+
+        let below_retrieval_minimum = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(700))
+                .expect("backdate sub-minimum packet start"),
+            target_ms: 1_000,
+        };
+        assert_eq!(
+            below_retrieval_minimum.remaining_for_handoff(),
+            None,
+            "a sub-minimum remainder must stop before downstream retrieval instead of granting a fresh 1000 ms phase"
+        );
+
+        let exhausted = PacketLatencyBudget {
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(1_001))
+                .expect("backdate exhausted packet start"),
+            target_ms: 1_000,
+        };
+        assert_eq!(
+            exhausted.remaining_for_handoff(),
+            None,
+            "an exhausted packet must stop before a downstream stage instead of renewing the 1000 ms floor"
+        );
+    }
+
+    #[test]
+    fn packet_latency_scope_inherits_outer_identity_and_restores_after_unwind() {
+        assert!(active_packet_latency_budget().is_none());
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _outer = enter_packet_latency_scope(Some(2_000));
+            let outer = active_packet_latency_budget().expect("outer packet allowance");
+            assert_eq!(outer.target_ms, 2_000);
+
+            {
+                let _inner = enter_packet_latency_scope(Some(120_000));
+                let inherited = active_packet_latency_budget().expect("inherited allowance");
+                assert_eq!(inherited.started_at, outer.started_at);
+                assert_eq!(inherited.target_ms, outer.target_ms);
+            }
+            let restored = active_packet_latency_budget().expect("restored outer allowance");
+            assert_eq!(restored.started_at, outer.started_at);
+            assert_eq!(restored.target_ms, outer.target_ms);
+            panic!("exercise packet allowance unwind cleanup");
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            active_packet_latency_budget().is_none(),
+            "unwind must restore the prior thread-local packet allowance"
+        );
+
+        let _independent = enter_packet_latency_scope(None);
+        assert_eq!(
+            active_packet_latency_budget()
+                .expect("independent packet allowance")
+                .target_ms,
+            DEFAULT_SLA_TARGET_MS as u128
+        );
+    }
+
+    #[test]
+    fn packet_entry_observation_is_outer_scope_correlated_and_nonpacket_safe() {
+        observe_packet_entry_phase(PacketEntryObservationPhase::ProjectSelectionStarted);
+        observe_packet_public_admission_reached();
+        observe_packet_public_admission_passed();
+        observe_packet_attempt_started();
+        observe_packet_retry_cause("publication_changed");
+        drop(observe_packet_operation_span(
+            PacketOperationObservationSpan::BuildCallback,
+        ));
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+
+        {
+            let _outer = enter_packet_latency_scope(Some(2_000));
+            observe_packet_entry_phase(PacketEntryObservationPhase::ProjectSelectionStarted);
+            let first = ACTIVE_PACKET_ENTRY_OBSERVATION
+                .with(Cell::get)
+                .expect("outer packet observation");
+            assert_ne!(first.id, 0);
+
+            {
+                let _nested = enter_packet_latency_scope(Some(120_000));
+                observe_packet_entry_phase(PacketEntryObservationPhase::ActivationJoinedRunning);
+                let nested = ACTIVE_PACKET_ENTRY_OBSERVATION
+                    .with(Cell::get)
+                    .expect("nested packet observation");
+                assert_eq!(nested.id, first.id);
+                assert_eq!(nested.target_ms, 2_000);
+                assert_eq!(nested.activation_join_count, 1);
+            }
+
+            assert_eq!(
+                ACTIVE_PACKET_ENTRY_OBSERVATION
+                    .with(Cell::get)
+                    .expect("restored packet observation")
+                    .id,
+                first.id
+            );
+        }
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn packet_descriptor_preadmission_observation_is_owned_initial_only_and_drop_safe() {
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+        {
+            let _latency = enter_packet_latency_scope(Some(2_000));
+            observe_packet_descriptor_preadmission(0, 3, 5, 1, 2, 3, 4, 5);
+            let empty = packet_operation_observation_for_test()
+                .expect("outer packet observation exists before product work");
+            assert_eq!(empty.descriptor_preadmission_observed_count, 0);
+
+            {
+                let _nonpacket = enter_packet_public_operation_observation("search");
+                observe_packet_descriptor_preadmission(7, 11, 13, 1, 2, 3, 4, 5);
+            }
+            let nonpacket = packet_operation_observation_for_test()
+                .expect("non-packet operation leaves the packet receipt active");
+            assert_eq!(nonpacket.descriptor_preadmission_observed_count, 0);
+
+            {
+                let _packet = enter_packet_public_operation_observation("packet");
+                observe_packet_descriptor_preadmission(2, 17, 19, 3, 7, 11, 13, 17);
+                {
+                    let _nested = enter_packet_public_operation_observation("packet");
+                    observe_packet_descriptor_preadmission(9, 23, 29, 31, 37, 41, 43, 47);
+                }
+                observe_packet_descriptor_preadmission(4, 31, 37, 53, 59, 61, 67, 71);
+            }
+
+            let observed = packet_operation_observation_for_test()
+                .expect("initial descriptor observation survives operation exit");
+            assert_eq!(observed.descriptor_preadmission_observed_count, 1);
+            assert_eq!(observed.descriptor_preadmission_query_count, 2);
+            assert_eq!(observed.descriptor_health_resolution_wall_ms, 17);
+            assert_eq!(observed.descriptor_query_batch_wall_ms, 19);
+            assert_eq!(observed.descriptor_query_plan_wall_ms, 3);
+            assert_eq!(observed.descriptor_lexical_wall_ms, 7);
+            assert_eq!(observed.descriptor_dense_semantic_wall_ms, 11);
+            assert_eq!(observed.descriptor_admission_seal_wall_ms, 13);
+            assert_eq!(observed.descriptor_deferred_readiness_wall_ms, 17);
+        }
+        assert!(
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
+            "outer latency-scope drop must clear the descriptor observation"
+        );
+    }
+
+    #[test]
+    fn packet_raf_copresence_observation_is_owned_initial_only_and_drop_safe() {
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+        assert!(ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow().is_none()));
+        {
+            let _latency = enter_packet_latency_scope(Some(2_000));
+            observe_packet_raf_ranked_admitted(
+                &[String::from("node:1"), String::from("node:2")],
+                &[String::from("node:1")],
+            );
+            let without_owner = packet_operation_observation_for_test()
+                .expect("outer packet observation exists before product work");
+            assert_eq!(without_owner.raf_ranked_admitted_observed_count, 0);
+            assert!(without_owner.raf_ranked_identity_digests.is_empty());
+
+            {
+                let _nonpacket = enter_packet_public_operation_observation("search");
+                observe_packet_raf_ranked_admitted(
+                    &[String::from("node:9")],
+                    &[String::from("node:9")],
+                );
+                observe_packet_raf_final_support(&[String::from("node:9")]);
+            }
+            let nonpacket = packet_operation_observation_for_test()
+                .expect("non-packet operation leaves the packet receipt active");
+            assert_eq!(nonpacket.raf_ranked_admitted_observed_count, 0);
+            assert_eq!(nonpacket.raf_final_observed_count, 0);
+
+            {
+                let _packet = enter_packet_public_operation_observation("packet");
+                observe_packet_raf_ranked_admitted(
+                    &[
+                        String::from("node:high"),
+                        String::from("node:low"),
+                        String::from("node:extra"),
+                    ],
+                    &[String::from("node:high")],
+                );
+                {
+                    let _nested = enter_packet_public_operation_observation("packet");
+                    observe_packet_raf_ranked_admitted(
+                        &[String::from("node:overwrite")],
+                        &[String::from("node:overwrite")],
+                    );
+                    observe_packet_raf_final_support(&[String::from("node:overwrite")]);
+                }
+                observe_packet_raf_final_support(&[
+                    String::from("node:high"),
+                    String::from("node:missing"),
+                ]);
+                observe_packet_raf_ranked_admitted(
+                    &[String::from("node:later")],
+                    &[String::from("node:later")],
+                );
+            }
+
+            let observed = packet_operation_observation_for_test()
+                .expect("initial raf observation survives operation exit");
+            assert_eq!(observed.raf_ranked_admitted_observed_count, 1);
+            assert_eq!(observed.raf_ranked_pool_count, 3);
+            assert_eq!(observed.raf_ranked_recorded_count, 3);
+            assert_eq!(observed.raf_admitted_count, 1);
+            assert_eq!(observed.raf_final_observed_count, 1);
+            assert_eq!(observed.raf_final_support_count, 2);
+            assert_eq!(observed.raf_final_recorded_count, 2);
+            assert_eq!(
+                observed.raf_ranked_identity_digests,
+                [
+                    raf_identity_digest_for_test("node:high"),
+                    raf_identity_digest_for_test("node:low"),
+                    raf_identity_digest_for_test("node:extra"),
+                ]
+                .join(",")
+            );
+            assert_eq!(
+                observed.raf_admitted_identity_digests,
+                raf_identity_digest_for_test("node:high")
+            );
+            assert_eq!(
+                observed.raf_final_identity_digests,
+                [
+                    raf_identity_digest_for_test("node:high"),
+                    raf_identity_digest_for_test("node:missing"),
+                ]
+                .join(",")
+            );
+        }
+        assert!(
+            ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
+            "outer latency-scope drop must clear the raf observation"
+        );
+        assert!(
+            ACTIVE_RAF_COPRESENCE_DIGESTS.with(|slot| slot.borrow().is_none()),
+            "outer latency-scope drop must clear private identity digests"
+        );
+    }
+
+    #[test]
+    fn packet_operation_observation_is_owned_by_the_outer_packet_operation() {
+        let _latency = enter_packet_latency_scope(Some(2_000));
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _outer = enter_packet_public_operation_observation("packet");
+            observe_packet_public_admission_reached();
+            observe_packet_public_admission_passed();
+            observe_packet_attempt_started();
+            {
+                let _nested = enter_packet_public_operation_observation("packet");
+                observe_packet_public_admission_reached();
+                observe_packet_public_admission_refused();
+                observe_packet_attempt_started();
+                observe_packet_retry_cause("cache_busy");
+                let mut nested =
+                    observe_packet_operation_span(PacketOperationObservationSpan::BuildCallback);
+                nested.finish_success();
+            }
+            let mut outer =
+                observe_packet_operation_span(PacketOperationObservationSpan::BuildCallback);
+            outer.finish_success();
+            panic!("exercise packet operation observation unwind");
+        }));
+        assert!(unwind.is_err());
+
+        let observation = packet_operation_observation_for_test()
+            .expect("outer packet entry observation survives operation unwind");
+        assert_eq!(observation.public_admission_reached_count, 1);
+        assert_eq!(observation.public_admission_passed_count, 1);
+        assert_eq!(observation.public_admission_refused_count, 0);
+        assert_eq!(observation.attempt_started_count, 1);
+        assert_eq!(observation.retry_cache_busy_count, 0);
+        assert_eq!(observation.descriptor_preadmission_observed_count, 0);
+        assert_eq!(observation.descriptor_preadmission_query_count, 0);
+        assert_eq!(observation.raf_ranked_admitted_observed_count, 0);
+        assert_eq!(observation.raf_final_observed_count, 0);
+        assert_eq!(observation.build_callback_started_count, 1);
+        assert_eq!(observation.build_callback_succeeded_count, 1);
+
+        {
+            let _next = enter_packet_public_operation_observation("packet");
+            observe_packet_public_admission_reached();
+        }
+        let observation = packet_operation_observation_for_test()
+            .expect("same outer entry observation remains active");
+        assert_eq!(observation.public_admission_reached_count, 2);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_packet_planned_subqueries(
     controller: &AppController,
-    question: &str,
     plan: &PacketPlanDto,
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
     include_evidence: bool,
     packet_latency: PacketLatencyBudget,
-    rank_terms: &[String],
     answer: &mut AgentAnswerDto,
 ) -> Result<(), ApiError> {
     let limit = packet_subquery_limit(budget);
@@ -113,7 +1261,7 @@ pub(crate) fn run_packet_planned_subqueries(
         return Ok(());
     }
 
-    let adaptive_queries = packet_adaptive_material_queries(question, plan, answer, limit);
+    let adaptive_queries = packet_free_queries(plan, answer, limit);
     let pending = adaptive_queries
         .iter()
         .enumerate()
@@ -122,7 +1270,7 @@ pub(crate) fn run_packet_planned_subqueries(
     if pending.is_empty() {
         return Ok(());
     }
-    if packet_latency.exhausted() {
+    let Some(remaining_ms) = packet_latency.remaining_for_handoff() else {
         answer.retrieval_trace.sla_missed = true;
         answer
             .retrieval_trace
@@ -132,7 +1280,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 pending.len()
             )));
         return Ok(());
-    }
+    };
 
     let per_query_limit = packet_subquery_hit_limit(limits);
     let stage_carry_limit = packet_stage_citation_carry_limit(limits);
@@ -150,19 +1298,36 @@ pub(crate) fn run_packet_planned_subqueries(
         )));
 
     let started_at = Instant::now();
-    let outcome =
-        match controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms())) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                answer
-                    .retrieval_trace
-                    .annotations
-                    .push(RetrievalAnnotationDto::gap(format!(
-                        "packet_fused_subquery_batch_failed error={error:?}"
-                    )));
-                return Err(error);
-            }
-        };
+    let outcome = match controller.search_packet_fused_batch(&batch, Some(remaining_ms)) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::gap(format!(
+                    "packet_fused_subquery_batch_failed error={error:?}"
+                )));
+            return Err(error);
+        }
+    };
+    if !packet_fused_retry_is_live() {
+        return Err(ApiError::new(
+            "cancelled",
+            "packet fused batch was cancelled before merging results",
+        ));
+    }
+    if !outcome.retained_deadline_queries.is_empty() {
+        let retained_hits = outcome
+            .results
+            .iter()
+            .filter(|(query, _)| outcome.retained_deadline_queries.contains(query))
+            .map(|(_, hits)| hits.len())
+            .sum::<usize>();
+        answer.retrieval_trace.annotations.push(RetrievalAnnotationDto::observation(format!(
+            "packet_fused_deadline_retry_omitted reason=sealed_descriptor count={} retained_hits={retained_hits}",
+            outcome.retained_deadline_queries.len(),
+        )));
+    }
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace
@@ -190,16 +1355,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 "packet fused retry was cancelled before dispatch",
             ));
         }
-        if packet_latency.exhausted() {
-            // The retry never ran, so those queries contributed no evidence.
-            answer
-                .retrieval_trace
-                .annotations
-                .push(RetrievalAnnotationDto::gap(format!(
-                    "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
-                    retry_pending.len()
-                )));
-        } else {
+        if let Some(remaining_ms) = packet_latency.remaining_for_handoff() {
             answer
                 .retrieval_trace
                 .annotations
@@ -213,7 +1369,7 @@ pub(crate) fn run_packet_planned_subqueries(
                 .collect::<Vec<_>>();
             let retry_started_at = Instant::now();
             let retry_outcome = controller
-                .search_packet_fused_batch(&retry_batch, Some(packet_latency.remaining_ms()))
+                .search_packet_fused_batch(&retry_batch, Some(remaining_ms))
                 .map_err(|error| {
                     answer
                         .retrieval_trace
@@ -254,6 +1410,15 @@ pub(crate) fn run_packet_planned_subqueries(
                         retry_outcome.retryable_queries.len()
                     )));
             }
+        } else {
+            // The retry never ran, so those queries contributed no evidence.
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::gap(format!(
+                    "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
+                    retry_pending.len()
+                )));
         }
     }
 
@@ -264,9 +1429,7 @@ pub(crate) fn run_packet_planned_subqueries(
         total_duration_ms,
         &effective_diagnostics,
         include_evidence,
-        rank_terms,
         stage_carry_limit,
-        &packet_flow_requirements_for_terms(&packet_probe_terms(question), plan.task_class),
     );
     packet_latency.apply_to_trace(answer);
     Ok(())
@@ -348,33 +1511,6 @@ fn annotate_packet_batch_timing(
         .push(RetrievalAnnotationDto::observation(annotation));
 }
 
-#[cfg(test)]
-fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
-    let Some(diagnostic) = diagnostic else {
-        return String::new();
-    };
-    match (
-        diagnostic.sidecar_query_ms,
-        diagnostic.candidate_resolution_ms,
-        diagnostic.total_elapsed_ms,
-        diagnostic.batch_query_wall_ms,
-    ) {
-        (Some(query_ms), Some(resolution_ms), Some(total_ms), Some(batch_ms)) => format!(
-            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={} batch_query_wall_ms={}",
-            query_ms, resolution_ms, total_ms, batch_ms
-        ),
-        (Some(query_ms), Some(resolution_ms), Some(total_ms), None) => format!(
-            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={}",
-            query_ms, resolution_ms, total_ms
-        ),
-        (_, _, Some(total_ms), Some(batch_ms)) => {
-            format!(" total_elapsed_ms={total_ms} batch_query_wall_ms={batch_ms}")
-        }
-        (_, _, Some(total_ms), None) => format!(" total_elapsed_ms={total_ms}"),
-        _ => String::new(),
-    }
-}
-
 fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 0,
@@ -384,117 +1520,23 @@ fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
-fn packet_adaptive_material_queries(
-    question: &str,
+fn packet_free_queries(
     plan: &PacketPlanDto,
     answer: &AgentAnswerDto,
     limit: usize,
 ) -> Vec<PacketPlanQueryDto> {
-    // Pre-cap preview proving; stage 4 threads the runtime's real evidence
-    // extras here alongside the other proving sites.
-    let preview = preview_packet_obligation_plan_before_budget(
-        question,
-        plan.task_class,
-        &plan.obligations,
-        answer,
-        &PacketProofEvidenceExtras::default(),
-    );
-    let mut queries = Vec::new();
-    let mut seen = HashSet::<String>::new();
-
-    let mut push = |query: &str, purpose: String| {
-        let query = query.trim();
-        let key = normalize_identifier(query);
-        if query.is_empty()
-            || packet_query_completed(answer, query)
-            || (!key.is_empty() && !seen.insert(key))
-            || queries.len() >= limit
-        {
-            return false;
-        }
-        queries.push(PacketPlanQueryDto {
-            query: query.to_string(),
-            purpose,
-        });
-        true
-    };
-
-    let missing_material = preview
-        .claim_obligations
+    let mut seen = HashSet::new();
+    plan.queries
         .iter()
-        .filter(|obligation| {
-            obligation.material
-                && obligation.proof_status
-                    != codestory_contracts::api::PacketObligationProofStatusDto::Proven
+        .filter(|query| packet_plan_query_is_typed_free_query(query))
+        .filter(|query| !packet_query_completed(answer, &query.query))
+        .filter(|query| {
+            let key = normalize_identifier(&query.query);
+            key.is_empty() || seen.insert(key)
         })
-        .collect::<Vec<_>>();
-    let mut obligation_added_query = vec![false; missing_material.len()];
-
-    let structural_schema_flow = missing_material
-        .iter()
-        .any(|obligation| obligation.id.starts_with("sql_"));
-    let owner_member_queries = if !missing_material.is_empty() && !structural_schema_flow {
-        packet_owner_member_probe_queries(
-            question,
-            &answer.citations,
-            limit.min(PACKET_OWNER_MEMBER_QUERY_LIMIT),
-        )
-    } else {
-        Vec::new()
-    };
-
-    // Reserve the bounded owner/member slice, then spread the rest across open claims before
-    // considering any claim's fallback paths.
-    let first_material_query_limit = limit.saturating_sub(owner_member_queries.len());
-    for (index, obligation) in missing_material
-        .iter()
-        .enumerate()
-        .take(first_material_query_limit)
-    {
-        if let Some(query) = obligation.open_next_candidates.first() {
-            obligation_added_query[index] |=
-                push(query, format!("material obligation {}", obligation.id));
-        }
-    }
-
-    for query in owner_member_queries {
-        let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
-    }
-
-    for (index, obligation) in missing_material.iter().enumerate() {
-        for query in obligation.open_next_candidates.iter().skip(1) {
-            obligation_added_query[index] |=
-                push(query, format!("material obligation {}", obligation.id));
-        }
-    }
-
-    for obligation in plan
-        .obligations
-        .query_obligations
-        .iter()
-        .filter(|obligation| obligation.material)
-    {
-        let _ = push(
-            &obligation.query,
-            format!("material query obligation {}", obligation.id),
-        );
-    }
-
-    for (index, obligation) in missing_material.iter().enumerate() {
-        for query in &obligation.carrier_paths {
-            obligation_added_query[index] |=
-                push(query, format!("material obligation {}", obligation.id));
-        }
-    }
-
-    let missing_material_without_query = obligation_added_query.iter().any(|added| !added);
-    if missing_material_without_query {
-        for query in packet_anchor_probe_queries(plan) {
-            let _ = push(&query, "unresolved material behavior anchor".to_string());
-        }
-    }
-
-    queries
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 fn packet_query_completed(answer: &AgentAnswerDto, query: &str) -> bool {
@@ -515,1297 +1557,4 @@ fn packet_query_completed(answer: &AgentAnswerDto, query: &str) -> bool {
                     .iter()
                     .any(|field| field.key == "query" && field.value == query)
         })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) fn run_packet_anchor_expansion(
-    controller: &AppController,
-    plan: &PacketPlanDto,
-    budget: PacketBudgetModeDto,
-    limits: &PacketBudgetLimitsDto,
-    include_evidence: bool,
-    packet_latency: PacketLatencyBudget,
-    rank_terms: &[String],
-    answer: &mut AgentAnswerDto,
-) -> Result<(), ApiError> {
-    let consumed_ms = answer.retrieval_trace.total_latency_ms;
-    let query_limit = packet_anchor_probe_limit_for_budget(budget, packet_latency, consumed_ms);
-    if query_limit == 0 {
-        let reason = if packet_anchor_probe_limit(budget) == 0 {
-            "budget=tiny"
-        } else if packet_latency.exhausted() || consumed_ms as u128 >= packet_latency.target_ms {
-            "latency_budget_exhausted"
-        } else {
-            "reduced_probe_budget"
-        };
-        // Anchor probes never dispatched, so their evidence is genuinely absent.
-        answer
-            .retrieval_trace
-            .annotations
-            .push(RetrievalAnnotationDto::gap(format!(
-                "packet_anchor_probes skipped reason={reason}"
-            )));
-        if reason == "latency_budget_exhausted" {
-            answer.retrieval_trace.sla_missed = true;
-        }
-        return Ok(());
-    }
-
-    let mut citation_keys = answer
-        .citations
-        .iter()
-        .map(packet_citation_key)
-        .collect::<HashSet<_>>();
-    let per_query_limit = packet_subquery_hit_limit(limits).min(packet_anchor_per_query_limit(
-        limits,
-        packet_latency,
-        consumed_ms,
-    ));
-    let stage_carry_limit = packet_stage_citation_carry_limit(limits);
-
-    let queries = packet_anchor_probe_queries(plan)
-        .into_iter()
-        .take(query_limit)
-        .collect::<Vec<_>>();
-    if queries.is_empty() {
-        return Ok(());
-    }
-    if query_limit < packet_anchor_probe_limit(budget) {
-        answer
-            .retrieval_trace
-            .annotations
-            .push(RetrievalAnnotationDto::observation(format!(
-                "packet_anchor_probes reduced query_limit={query_limit} usage_pct={}",
-                packet_latency.budget_usage_percent(consumed_ms)
-            )));
-    }
-
-    let started_at = Instant::now();
-    let batch = queries
-        .iter()
-        .map(|query| (query.clone(), per_query_limit))
-        .collect::<Vec<_>>();
-    let result = controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms()));
-    let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
-    answer.retrieval_trace.total_latency_ms = answer
-        .retrieval_trace
-        .total_latency_ms
-        .saturating_add(duration_ms);
-    match result {
-        Ok(outcome) => {
-            answer
-                .retrieval_trace
-                .packet_sidecar_diagnostics
-                .extend(outcome.sidecar_diagnostics.clone());
-            let diagnostics = outcome.sidecar_diagnostics;
-            annotate_packet_batch_timing(
-                answer,
-                "packet_anchor_probe_batch",
-                duration_ms,
-                &diagnostics,
-            );
-            let results = outcome.results;
-            let per_step_duration = duration_ms / results.len().max(1) as u32;
-            for (diagnostic_index, (query, hits)) in results.into_iter().enumerate() {
-                let diagnostic = packet_query_diagnostic(&diagnostics, diagnostic_index, &query);
-                let step_duration =
-                    packet_query_duration_ms(diagnostic).unwrap_or(per_step_duration);
-                let mut added = 0usize;
-                let mut citations = hits
-                    .iter()
-                    .filter(|hit| packet_anchor_hit_is_relevant(&query, hit))
-                    .map(|hit| (hit.citation(include_evidence), hit))
-                    .collect::<Vec<_>>();
-                sort_by_cached_rank_desc(&mut citations, |(citation, _)| {
-                    packet_citation_rank(citation, rank_terms, true)
-                });
-                for (citation, hit) in citations.into_iter().take(stage_carry_limit) {
-                    if include_evidence {
-                        merge_packet_candidate_graph(answer, hit);
-                    }
-                    if citation_keys.insert(packet_citation_key(&citation)) {
-                        answer.citations.push(citation);
-                        added = added.saturating_add(1);
-                    }
-                }
-                let mut output = vec![
-                    field("hits", hits.len().to_string()),
-                    field("accepted_hits", added.to_string()),
-                    field("stage_carry_limit", stage_carry_limit.to_string()),
-                    field("mode", "symbolic_packet_anchor_probe"),
-                ];
-                append_packet_query_timing_fields(&mut output, diagnostic);
-                answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
-                    kind: AgentRetrievalStepKindDto::Search,
-                    status: AgentRetrievalStepStatusDto::Ok,
-                    duration_ms: step_duration,
-                    input: vec![field("query", query.clone())],
-                    output,
-                    message: Some("Packet symbol probe expanded broad task wording.".to_string()),
-                });
-                let timing_note = packet_anchor_timing_annotation(diagnostic);
-                // Echoes prompt-derived probe text: telemetry about the run, not a gap.
-                answer
-                    .retrieval_trace
-                    .annotations
-                    .push(RetrievalAnnotationDto::observation(format!(
-                        "packet_anchor_probe query=`{}` hits={} added={}{}",
-                        query.replace('`', "'"),
-                        hits.len(),
-                        added,
-                        timing_note
-                    )));
-            }
-        }
-        Err(error) => {
-            let message = error.message.clone();
-            for query in queries {
-                answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
-                    kind: AgentRetrievalStepKindDto::Search,
-                    status: AgentRetrievalStepStatusDto::Error,
-                    duration_ms: 0,
-                    input: vec![field("query", query.clone())],
-                    output: Vec::new(),
-                    message: Some(message.clone()),
-                });
-                answer
-                    .retrieval_trace
-                    .annotations
-                    .push(RetrievalAnnotationDto::gap(format!(
-                        "packet_anchor_probe_failed query=`{}` error={}",
-                        query.replace('`', "'"),
-                        message
-                    )));
-            }
-            return Err(error);
-        }
-    }
-    packet_latency.apply_to_trace(answer);
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
-    match budget {
-        PacketBudgetModeDto::Tiny => 0,
-        PacketBudgetModeDto::Compact => 12,
-        PacketBudgetModeDto::Standard => 40,
-        PacketBudgetModeDto::Deep => 40,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn packet_anchor_probe_limit_for_budget(
-    budget: PacketBudgetModeDto,
-    packet_latency: PacketLatencyBudget,
-    consumed_trace_ms: u32,
-) -> usize {
-    let base = packet_anchor_probe_limit(budget);
-    if base == 0 {
-        return 0;
-    }
-    if packet_latency.exhausted() || consumed_trace_ms as u128 >= packet_latency.target_ms {
-        return 0;
-    }
-    let usage_pct = packet_latency.budget_usage_percent(consumed_trace_ms);
-    if usage_pct >= 75 {
-        (base / 4).max(1)
-    } else if usage_pct >= 50 || (budget == PacketBudgetModeDto::Compact && usage_pct >= 25) {
-        (base / 2).max(1)
-    } else {
-        base
-    }
-}
-
-#[cfg(test)]
-fn packet_anchor_per_query_limit(
-    limits: &PacketBudgetLimitsDto,
-    packet_latency: PacketLatencyBudget,
-    consumed_trace_ms: u32,
-) -> usize {
-    let base = limits.max_anchors.clamp(5, 10) as usize;
-    let usage_pct = packet_latency.budget_usage_percent(consumed_trace_ms);
-    if usage_pct >= 75 {
-        base.min(5)
-    } else if usage_pct >= 50 {
-        base.min(7)
-    } else {
-        base
-    }
-}
-
-pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
-    let required_probes = packet_anchor_required_probe_keys(plan);
-    let mut ranked = plan
-        .queries
-        .iter()
-        .skip(1)
-        .enumerate()
-        .filter(|query| {
-            let query = query.1;
-            !packet_anchor_probe_is_instruction_noise(query)
-                && (query.purpose.contains("symbol probe")
-                    || packet_task_seed_anchor_probe(&query.query)
-                    || query.purpose.contains("concrete symbol")
-                    || is_packet_code_like_term(&query.query))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by_key(|(index, query)| {
-        (
-            !required_probes.contains(&normalize_identifier(&query.query)),
-            packet_anchor_probe_priority(query),
-            *index,
-        )
-    });
-    let mut seen = HashSet::<String>::new();
-    let mut queries = ranked
-        .into_iter()
-        .filter_map(|(_, query)| {
-            if is_packet_path_like_query(&query.query) {
-                return Some(query.query.clone());
-            }
-            let key = normalize_identifier(&query.query);
-            if key.len() < 2 || seen.insert(key) {
-                Some(query.query.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    reserve_architecture_main_anchor_probe(plan, &required_probes, &mut queries);
-    queries
-}
-
-fn reserve_architecture_main_anchor_probe(
-    plan: &PacketPlanDto,
-    required_probes: &HashSet<String>,
-    queries: &mut Vec<String>,
-) {
-    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation
-        || !required_probes.contains("searchentrypoint")
-    {
-        return;
-    }
-    queries.retain(|query| normalize_identifier(query) != "main");
-    let insert_at = queries
-        .iter()
-        .take_while(|query| required_probes.contains(&normalize_identifier(query)))
-        .count();
-    queries.insert(insert_at, "main".to_string());
-}
-
-fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
-    let Some(prompt) = plan.queries.first() else {
-        return HashSet::new();
-    };
-    let terms = packet_probe_terms(&prompt.query);
-    packet_sufficiency_required_probe_queries_from_terms(&terms, plan.task_class)
-        .into_iter()
-        .map(|query| normalize_identifier(&query))
-        .filter(|query| !query.is_empty())
-        .collect()
-}
-
-fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
-    if packet_plan_query_is_exact_symbol_identity(query) {
-        0
-    } else if matches!(
-        query.purpose.as_str(),
-        PACKET_FLOW_ROLE_QUERY_PURPOSE | PACKET_CONCRETE_FILE_QUERY_PURPOSE
-    ) || (packet_anchor_probe_has_strong_code_shape(&query.query)
-        && !matches!(
-            query.purpose.as_str(),
-            PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
-        ))
-    {
-        1
-    } else if query.purpose.contains("concrete symbol") {
-        2
-    } else if packet_task_seed_anchor_probe(&query.query) {
-        3
-    } else if matches!(
-        query.purpose.as_str(),
-        PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
-    ) {
-        5
-    } else {
-        4
-    }
-}
-
-fn packet_anchor_probe_is_instruction_noise(query: &PacketPlanQueryDto) -> bool {
-    if packet_plan_query_is_exact_symbol_identity(query)
-        || packet_anchor_probe_has_strong_code_shape(&query.query)
-    {
-        return false;
-    }
-    matches!(
-        normalize_identifier(&query.query).as_str(),
-        "answer"
-            | "cite"
-            | "cites"
-            | "explain"
-            | "file"
-            | "files"
-            | "name"
-            | "names"
-            | "source"
-            | "sources"
-            | "supporting"
-            | "symbol"
-            | "symbols"
-            | "trace"
-    )
-}
-
-fn packet_task_seed_anchor_probe(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "main" | "run" | "entrypoint"
-    )
-}
-
-fn packet_anchor_probe_has_strong_code_shape(query: &str) -> bool {
-    let trimmed = query.trim();
-    trimmed.contains("::")
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('.')
-        || trimmed.contains('_')
-        || trimmed.contains('-')
-        || (trimmed.chars().any(|ch| ch.is_ascii_lowercase())
-            && trimmed.chars().skip(1).any(|ch| ch.is_ascii_uppercase()))
-}
-
-#[cfg(test)]
-pub(crate) fn packet_anchor_hit_is_relevant(query: &str, hit: &SearchHit) -> bool {
-    if hit.origin != SearchHitOrigin::IndexedSymbol || !hit.resolvable {
-        return false;
-    }
-    if hit.kind == NodeKind::FILE
-        && !is_packet_path_like_query(query)
-        && !packet_file_stem_matches_query(query, hit.file_path.as_deref())
-    {
-        return false;
-    }
-    matches!(
-        hit.match_quality,
-        Some(
-            SearchMatchQualityDto::Exact
-                | SearchMatchQualityDto::NormalizedExact
-                | SearchMatchQualityDto::Prefix
-        )
-    ) || hit
-        .score_breakdown
-        .as_ref()
-        .is_some_and(|breakdown| breakdown.lexical >= 0.25 || breakdown.graph >= 0.25)
-}
-
-fn is_packet_path_like_query(query: &str) -> bool {
-    query.contains('/') || query.contains('\\') || query.contains('.')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codestory_contracts::api::{
-        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto,
-        PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto, RetrievalAnnotationKindDto,
-    };
-
-    /// EV-6c (#1775) helpers. Every gap producer in this module writes onto the answer's
-    /// retrieval trace, so the tests below drive the real production entry points
-    /// (`run_packet_planned_subqueries`, `run_packet_anchor_probes`) and read back the kind the
-    /// producer stamped. Nothing here hand-builds an annotation.
-    fn empty_answer() -> AgentAnswerDto {
-        AgentAnswerDto {
-            source_coverage: Vec::new(),
-            answer_id: "ev6c".to_string(),
-            prompt: "ev6c packet".to_string(),
-            summary: String::new(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: Vec::new(),
-            subgraph_ids: Vec::new(),
-            retrieval_version: "test".to_string(),
-            graphs: Vec::new(),
-            retrieval_trace: AgentRetrievalTraceDto {
-                request_id: "ev6c".to_string(),
-                retrieval_publication: None,
-                resolved_profile: AgentRetrievalPresetDto::Architecture,
-                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 0,
-                sla_target_ms: None,
-                sla_missed: false,
-                semantic_fallback_count: 0,
-                semantic_fallbacks: Vec::new(),
-                semantic_stage_timeout_zero_hits: 0,
-                semantic_abstained_count: 0,
-                annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
-                source_freshness_telemetry: None,
-                steps: Vec::new(),
-                packet_sidecar_diagnostics: Vec::new(),
-                retrieval_shadow: None,
-            },
-        }
-    }
-
-    fn anchor_citation(display_name: &str) -> codestory_contracts::api::AgentCitationDto {
-        codestory_contracts::api::AgentCitationDto {
-            node_id: codestory_contracts::api::NodeId(display_name.to_string()),
-            display_name: display_name.to_string(),
-            kind: codestory_contracts::api::NodeKind::FUNCTION,
-            file_path: Some("src/site.rb".to_string()),
-            line: Some(1),
-            score: 1.0,
-            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            target: None,
-            resolvable: true,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: None,
-            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-            evidence_producer: Some("test".to_string()),
-            resolution_status: Some(
-                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
-            ),
-            loss_reason: None,
-            coverage_role: None,
-            eligible_for_sufficiency: Some(true),
-            source_excerpt: None,
-        }
-    }
-
-    fn ev6c_limits() -> PacketBudgetLimitsDto {
-        PacketBudgetLimitsDto {
-            max_anchors: 8,
-            max_files: 8,
-            max_snippets: 8,
-            max_trail_edges: 8,
-            max_output_bytes: 64_000,
-        }
-    }
-
-    fn ev6c_plan() -> PacketPlanDto {
-        let question = "Trace how StringUtils normalizes request routes";
-        let task_class = PacketTaskClassDto::RouteTracing;
-        let queries = vec![
-            PacketPlanQueryDto {
-                query: question.to_string(),
-                purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                    .to_string(),
-            },
-            PacketPlanQueryDto {
-                query: "StringUtils".to_string(),
-                purpose: "concrete symbol, file, route, or code term".to_string(),
-            },
-            PacketPlanQueryDto {
-                query: "CharSequenceUtils".to_string(),
-                purpose: "concrete symbol, file, route, or code term".to_string(),
-            },
-        ];
-        PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question, task_class, &queries,
-            ),
-            queries,
-            probe_resolutions: Vec::new(),
-            trace: Vec::new(),
-        }
-    }
-
-    /// Every annotation the run produced, as `(kind, text)`, in emission order.
-    fn classified(answer: &AgentAnswerDto) -> Vec<(RetrievalAnnotationKindDto, String)> {
-        answer
-            .retrieval_trace
-            .annotations
-            .iter()
-            .map(|annotation| (annotation.kind, annotation.text.clone()))
-            .collect()
-    }
-
-    fn kind_of(answer: &AgentAnswerDto, prefix: &str) -> RetrievalAnnotationKindDto {
-        let matches = answer
-            .retrieval_trace
-            .annotations
-            .iter()
-            .filter(|annotation| annotation.text.starts_with(prefix))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            matches.len(),
-            1,
-            "expected exactly one annotation starting with `{prefix}`, got {:?}",
-            classified(answer)
-        );
-        matches[0].kind
-    }
-
-    #[test]
-    fn packet_subqueries_skipped_by_budget_is_published_as_an_evidence_gap() {
-        // EV-6c (#1775). A tiny budget means the planned subqueries never ran, so the evidence
-        // they would have produced is genuinely absent. Reclassifying this producer as an
-        // observation would leave `agent_confidence` at high for a packet that skipped its
-        // supplemental retrieval outright.
-        let mut answer = empty_answer();
-        run_packet_planned_subqueries(
-            &AppController::new(),
-            "Trace how StringUtils normalizes request routes",
-            &ev6c_plan(),
-            PacketBudgetModeDto::Tiny,
-            &ev6c_limits(),
-            false,
-            PacketLatencyBudget::new(Some(120_000)),
-            &[],
-            &mut answer,
-        )
-        .expect("skipping subqueries on a tiny budget is not an error");
-
-        assert_eq!(
-            classified(&answer),
-            vec![(
-                RetrievalAnnotationKindDto::Gap,
-                "packet_subqueries skipped budget=tiny".to_string()
-            )],
-            "the skipped-subquery producer must publish an evidence gap"
-        );
-    }
-
-    #[test]
-    fn material_queries_dropped_for_latency_are_published_as_an_evidence_gap() {
-        // The material queries were planned but never dispatched, so the packet must report
-        // missing evidence and the missed SLA instead of retaining clean confidence.
-        let mut answer = empty_answer();
-        let packet_latency = PacketLatencyBudget {
-            started_at: Instant::now() - std::time::Duration::from_secs(2),
-            target_ms: 1_000,
-        };
-        run_packet_planned_subqueries(
-            &AppController::new(),
-            "Trace how StringUtils normalizes request routes",
-            &ev6c_plan(),
-            PacketBudgetModeDto::Compact,
-            &ev6c_limits(),
-            false,
-            packet_latency,
-            &[],
-            &mut answer,
-        )
-        .expect("dropping material queries for latency is not an execution error");
-
-        assert_eq!(
-            kind_of(
-                &answer,
-                "packet_material_queries skipped reason=latency_budget_exhausted count="
-            ),
-            RetrievalAnnotationKindDto::Gap,
-            "an SLA-driven material-query drop must publish an evidence gap"
-        );
-        assert!(answer.retrieval_trace.sla_missed);
-    }
-
-    #[test]
-    fn failed_fused_subquery_batch_is_published_as_an_evidence_gap() {
-        // EV-6c (#1775). The fused batch failing means none of the planned subqueries returned
-        // evidence. The sibling `packet_subqueries fused_batch=` note on the same path is
-        // routine telemetry, so this also pins that the two are not classified alike.
-        let mut answer = empty_answer();
-        let error = run_packet_planned_subqueries(
-            &AppController::new(),
-            "Trace how StringUtils normalizes request routes",
-            &ev6c_plan(),
-            PacketBudgetModeDto::Compact,
-            &ev6c_limits(),
-            false,
-            PacketLatencyBudget::new(Some(120_000)),
-            &[],
-            &mut answer,
-        )
-        .expect_err("an unopened controller cannot serve a fused packet batch");
-        assert!(
-            !error.message.is_empty(),
-            "fail-closed batch error must carry a reason"
-        );
-
-        assert_eq!(
-            kind_of(&answer, "packet_fused_subquery_batch_failed error="),
-            RetrievalAnnotationKindDto::Gap,
-            "a failed subquery batch is missing evidence, not telemetry: {:?}",
-            classified(&answer)
-        );
-        assert_eq!(
-            kind_of(&answer, "packet_material_queries fused_batch="),
-            RetrievalAnnotationKindDto::Observation,
-            "batch sizing is routine telemetry: {:?}",
-            classified(&answer)
-        );
-    }
-
-    #[test]
-    fn anchor_probes_skipped_by_budget_are_published_as_an_evidence_gap() {
-        // EV-6c (#1775). Anchor probes never dispatched: the anchors they would have found are
-        // absent from the packet, so the reason string must ride a `Gap`.
-        let mut answer = empty_answer();
-        run_packet_anchor_expansion(
-            &AppController::new(),
-            &ev6c_plan(),
-            PacketBudgetModeDto::Tiny,
-            &ev6c_limits(),
-            false,
-            PacketLatencyBudget::new(Some(120_000)),
-            &[],
-            &mut answer,
-        )
-        .expect("skipping anchor probes on a tiny budget is not an error");
-
-        assert_eq!(
-            classified(&answer),
-            vec![(
-                RetrievalAnnotationKindDto::Gap,
-                "packet_anchor_probes skipped reason=budget=tiny".to_string()
-            )],
-            "the skipped-anchor-probe producer must publish an evidence gap"
-        );
-    }
-
-    #[test]
-    fn anchor_probes_dropped_for_latency_are_published_as_an_evidence_gap() {
-        // EV-6c (#1775). The other reason this producer fires: the latency budget was already
-        // spent. This is the reclassification that would hurt most — an answer that silently
-        // dropped its anchor expansion to hit an SLA must not also report clean confidence.
-        let mut answer = empty_answer();
-        answer.retrieval_trace.total_latency_ms = 5_000;
-        run_packet_anchor_expansion(
-            &AppController::new(),
-            &ev6c_plan(),
-            PacketBudgetModeDto::Compact,
-            &ev6c_limits(),
-            false,
-            PacketLatencyBudget::new(Some(1_000)),
-            &[],
-            &mut answer,
-        )
-        .expect("dropping anchor probes for latency is not an error");
-
-        assert_eq!(
-            classified(&answer),
-            vec![(
-                RetrievalAnnotationKindDto::Gap,
-                "packet_anchor_probes skipped reason=latency_budget_exhausted".to_string()
-            )],
-            "an SLA-driven anchor-probe drop must publish an evidence gap"
-        );
-        assert!(
-            answer.retrieval_trace.sla_missed,
-            "the latency-driven drop must also record the missed SLA"
-        );
-    }
-
-    #[test]
-    fn failed_anchor_probes_are_published_as_evidence_gaps_per_query() {
-        // EV-6c (#1775). One gap per unanswered probe query, so the packet cannot claim the
-        // anchors it asked for.
-        let plan = ev6c_plan();
-        let expected_queries = packet_anchor_probe_queries(&plan);
-        assert!(
-            !expected_queries.is_empty(),
-            "fixture plan must yield anchor probe queries"
-        );
-
-        let mut answer = empty_answer();
-        run_packet_anchor_expansion(
-            &AppController::new(),
-            &plan,
-            PacketBudgetModeDto::Compact,
-            &ev6c_limits(),
-            false,
-            PacketLatencyBudget::new(Some(120_000)),
-            &[],
-            &mut answer,
-        )
-        .expect_err("an unopened controller cannot serve anchor probes");
-
-        let failures = answer
-            .retrieval_trace
-            .annotations
-            .iter()
-            .filter(|annotation| {
-                annotation
-                    .text
-                    .starts_with("packet_anchor_probe_failed query=")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            failures.len(),
-            expected_queries.len(),
-            "every unanswered probe query must be reported: {:?}",
-            classified(&answer)
-        );
-        for failure in failures {
-            assert_eq!(
-                failure.kind,
-                RetrievalAnnotationKindDto::Gap,
-                "a probe query that returned no evidence is a gap: {}",
-                failure.text
-            );
-        }
-    }
-
-    #[test]
-    fn packet_latency_budget_preserves_advertised_range_and_default() {
-        assert_eq!(PacketLatencyBudget::new(None).target_ms, 18_000);
-        assert_eq!(PacketLatencyBudget::new(Some(10)).target_ms, 1_000);
-        assert_eq!(PacketLatencyBudget::new(Some(120_001)).target_ms, 120_000);
-        assert!(PacketLatencyBudget::new(Some(1_000)).remaining_ms() >= 1_000);
-    }
-
-    #[test]
-    fn packet_fused_retry_uses_only_reported_blocking_deadlines() {
-        let first = PacketPlanQueryDto {
-            query: "ordinary empty".to_string(),
-            purpose: "supplemental".to_string(),
-        };
-        let second = PacketPlanQueryDto {
-            query: "timed out".to_string(),
-            purpose: "required flow anchor".to_string(),
-        };
-        let pending = vec![(1, &first), (2, &second)];
-
-        assert!(packet_fused_retry_pending(&pending, &[]).is_empty());
-        let retry = packet_fused_retry_pending(&pending, &["timed out".to_string()]);
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].0, 2);
-        assert_eq!(retry[0].1.query, "timed out");
-    }
-
-    #[test]
-    fn adaptive_queries_follow_missing_material_obligations_and_skip_completed_work() {
-        let question = "Explain the indexing runtime, persistence, and snapshot flow.";
-        let task_class = PacketTaskClassDto::ArchitectureExplanation;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-        let mut answer = empty_answer();
-
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            queries.first().map(String::as_str),
-            Some("indexing runtime")
-        );
-        for expected in [
-            "indexing entrypoint",
-            "file discovery",
-            "symbol extraction",
-            "storage persistence",
-        ] {
-            assert!(queries.iter().any(|query| query == expected), "{queries:?}");
-        }
-
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(PacketSidecarQueryDiagnosticDto {
-                query: "indexing entrypoint".to_string(),
-                completion: codestory_contracts::api::PacketQueryCompletionDto::Completed,
-                retrieval_mode: "full".to_string(),
-                sidecar_query_ms: Some(1),
-                candidate_resolution_ms: Some(0),
-                total_elapsed_ms: Some(1),
-                sidecar_stage_count: 1,
-                sidecar_stage_total_ms: Some(1),
-                batch_query_wall_ms: Some(1),
-                candidate_count: 1,
-                resolved_hit_count: 1,
-                unresolved_candidate_count: 0,
-                blocking_unresolved_candidate_count: 0,
-                semantic_stage_timeout_zero_hits: false,
-                semantic_abstained: false,
-                diagnostic: None,
-            });
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-        assert!(!queries.contains(&"indexing entrypoint".to_string()));
-        assert_eq!(
-            queries.first().map(String::as_str),
-            Some("indexing runtime")
-        );
-    }
-
-    #[test]
-    fn adaptive_queries_use_retrieved_owners_for_missing_lifecycle_members() {
-        let question = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.";
-        let task_class = PacketTaskClassDto::RouteTracing;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-        let mut answer = empty_answer();
-        answer.citations.push(anchor_citation("Jekyll::Site.posts"));
-
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-
-        for expected in ["Site.read", "Site.generate", "Site.render", "Site.write"] {
-            assert!(
-                queries.iter().any(|query| query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        assert!(queries.len() <= 16);
-    }
-
-    #[test]
-    fn adaptive_queries_reserve_batch_space_for_explicit_owner_members() {
-        let question = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
-        let task_class = PacketTaskClassDto::DataFlow;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16);
-
-        for expected in ["BaseRequest.finalize", "IOClient.send"] {
-            assert!(
-                queries.iter().any(|query| query.query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        let owner_probe_indexes = queries
-            .iter()
-            .enumerate()
-            .filter(|(_, query)| query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        assert_eq!(owner_probe_indexes.len(), PACKET_OWNER_MEMBER_QUERY_LIMIT);
-        let last_owner_probe = *owner_probe_indexes.last().expect("owner probes");
-        assert!(
-            queries.iter().skip(last_owner_probe + 1).any(|query| {
-                query.purpose.starts_with("material obligation ")
-                    || query.purpose.starts_with("material query obligation ")
-            }),
-            "owner probes starved the remaining material queries: {queries:?}"
-        );
-        assert!(queries.len() <= 16);
-    }
-
-    #[test]
-    fn adaptive_sql_queries_reserve_the_named_schema_entities() {
-        let question = "Explain schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL scripts.";
-        let task_class = PacketTaskClassDto::DataFlow;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-
-        for expected in [
-            "public.artist",
-            "public.album",
-            "public.track",
-            "public.invoice",
-            "public.invoiceline",
-        ] {
-            assert!(
-                queries.iter().any(|query| query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        assert!(!queries.iter().any(|query| query.starts_with("Chinook.")));
-        assert!(queries.len() <= 16);
-    }
-
-    #[test]
-    fn packet_anchor_probe_queries_prioritize_symbol_probes_under_reduced_windows() {
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Explain request JSONL flow".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "CLI".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "JSONL".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "EventProcessorWithJsonOutput".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "ThreadStartParams".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "exec_events.rs".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "workspace/app/src/lib.rs".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-            ],
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_anchor_probe_queries(&plan);
-
-        assert_eq!(
-            &queries[..4],
-            &[
-                "EventProcessorWithJsonOutput".to_string(),
-                "ThreadStartParams".to_string(),
-                "exec_events.rs".to_string(),
-                "workspace/app/src/lib.rs".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn packet_anchor_probe_queries_count_normalized_variants_once() {
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Explain predicate helpers".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "isBlank".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "is_blank".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "StringUtils.java isBlank".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-            ],
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_anchor_probe_queries(&plan);
-
-        assert_eq!(
-            queries,
-            [
-                "isBlank".to_string(),
-                "StringUtils.java isBlank".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn packet_anchor_probe_queries_keep_path_like_normalized_matches() {
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Explain library entrypoints".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "src/lib.rs".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "src_lib_rs".to_string(),
-                    purpose: "symbol probe expanded from task wording".to_string(),
-                },
-            ],
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_anchor_probe_queries(&plan);
-
-        assert_eq!(
-            queries,
-            ["src/lib.rs".to_string(), "src_lib_rs".to_string()]
-        );
-    }
-
-    #[test]
-    fn compact_packet_anchor_probe_limit_stays_bounded() {
-        assert_eq!(packet_anchor_probe_limit(PacketBudgetModeDto::Compact), 12);
-        assert_eq!(
-            packet_anchor_probe_limit_for_budget(
-                PacketBudgetModeDto::Compact,
-                PacketLatencyBudget::new(None),
-                0,
-            ),
-            12
-        );
-    }
-
-    #[test]
-    fn compact_packet_anchor_probe_limit_tapers_under_budget_pressure() {
-        let latency = PacketLatencyBudget::new(Some(18_000));
-        assert_eq!(
-            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 4_500,),
-            6
-        );
-        assert_eq!(
-            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 9_000,),
-            6
-        );
-        assert_eq!(
-            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 13_500,),
-            3
-        );
-    }
-
-    #[test]
-    fn packet_anchor_probe_queries_execute_entrypoint_seed_queries() {
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Explain the runtime flow".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "architecture entrypoint".to_string(),
-                    purpose: "task-class retrieval seed".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "main".to_string(),
-                    purpose: "task-class retrieval seed".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "run".to_string(),
-                    purpose: "task-class retrieval seed".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "entrypoint".to_string(),
-                    purpose: "task-class retrieval seed".to_string(),
-                },
-            ],
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_anchor_probe_queries(&plan);
-
-        assert!(queries.contains(&"main".to_string()));
-        assert!(queries.contains(&"run".to_string()));
-        assert!(queries.contains(&"entrypoint".to_string()));
-        assert!(!queries.contains(&"architecture entrypoint".to_string()));
-    }
-
-    #[test]
-    fn packet_anchor_probe_queries_keep_distinct_late_phases_ahead_of_synthetic_variants() {
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::RouteTracing,
-            inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Trace how Jekyll builds a site through reading, rendering, and writing"
-                        .to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "Trace".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "Jekyll".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "build".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "reading".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "rendering".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "writing".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "build_site".to_string(),
-                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "reading_rendering".to_string(),
-                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "cite".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-            ],
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_anchor_probe_queries(&plan);
-
-        assert_eq!(
-            &queries[..5],
-            &[
-                "Jekyll".to_string(),
-                "build".to_string(),
-                "reading".to_string(),
-                "rendering".to_string(),
-                "writing".to_string(),
-            ]
-        );
-        assert!(!queries.contains(&"Trace".to_string()));
-        assert!(!queries.contains(&"cite".to_string()));
-        assert!(
-            queries.iter().position(|query| query == "writing")
-                < queries.iter().position(|query| query == "build_site")
-        );
-    }
-
-    #[test]
-    fn compact_flow_anchor_window_prioritizes_roles_over_generated_variants() {
-        let mut queries = vec![PacketPlanQueryDto {
-            query: "Explain the command execution flow".to_string(),
-            purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                .to_string(),
-        }];
-        for query in [
-            "execution entrypoint",
-            "dispatch boundary",
-            "result rendering",
-        ] {
-            queries.push(PacketPlanQueryDto {
-                query: query.to_string(),
-                purpose: PACKET_FLOW_ROLE_QUERY_PURPOSE.to_string(),
-            });
-        }
-        for index in 0..15 {
-            queries.push(PacketPlanQueryDto {
-                query: format!("GeneratedVariant{index}"),
-                purpose: "symbol probe expanded from task wording".to_string(),
-            });
-        }
-        let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: false,
-            queries,
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        };
-
-        let selected = packet_anchor_probe_queries(&plan)
-            .into_iter()
-            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
-            .collect::<Vec<_>>();
-
-        assert_eq!(selected.len(), 12);
-        assert!(selected.starts_with(&[
-            "execution entrypoint".to_string(),
-            "dispatch boundary".to_string(),
-            "result rendering".to_string(),
-        ]));
-        assert!(!selected.contains(&"GeneratedVariant14".to_string()));
-    }
-}
-
-fn is_packet_code_like_term(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    token.contains("::")
-        || token.contains('/')
-        || token.contains('\\')
-        || token.contains('.')
-        || token.contains('_')
-        || token.contains('-')
-        || token.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
 }

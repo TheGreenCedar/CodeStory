@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 0.17.6
+
+### A rebuilt evidence engine for coding agents
+
+CodeStory 0.17.6 rebuilds how your agent finds code, follows relationships and keeps its understanding current. Search reaches into declaration comments. Source inspection preserves the code behind a result. Index updates publish complete generations, so an investigation can stay tied to one coherent view of your repository while files change.
+
+That work reaches deep into the engine: language resolution, incremental indexing, storage, retrieval and recovery. Your agent gets a richer local code map and can distinguish verified source, navigation leads and missing coverage.
+
+### Find the code behind the question
+
+- Search declarations through their attached comments, even when the relevant words fall outside a symbol's short summary. Symbol, file and repository-text matches remain available through the agent-facing search response.
+- Open verified source ranges and complete short files directly from results. Larger files remain navigable with an explicit follow-up, and truncation is visible. Qualified names such as `Owner.method` resolve with file and ambiguity checks.
+- Keep the full definition when inspecting pointer-returning C and C++ functions or functions assigned to JavaScript, TypeScript and TSX variables.
+- Keep results in relevance order, with file matching scoped to the selected project, including extensionless files and supported source symlinks.
+- Explore Terraform `.tf` and `.tfvars` blocks and assignments alongside application code. Route and OpenAPI declarations stay attached to their own files and handlers, even when methods and paths repeat.
+
+### Follow relationships with the source in view
+
+Calls and imports survive both full indexing and parser-cache reuse. Go navigation follows package aliases and concrete factory returns into receiver methods. Rust preserves library module navigation beside a binary crate root. Across supported languages, resolution accounts for scope, visibility, receiver bindings and explicit mutations rather than treating a matching name as enough evidence.
+
+Graph navigation can include test and benchmark callers through `caller_scope`; production callers remain the default. Affected-code results explain graph-backed relationships and suggest tests from the same package. File-scoped symbol lookup stays focused on the selected file even when the repository contains many declarations with the same name.
+
+### Keep the map current without starting over
+
+Incremental updates reuse unchanged work across supported filesystems, including those without database cloning. When cache space is short, CodeStory reports the required and available bytes before starting a full-size index stage. Indexes, parser caches and stored source provenance use compression and deduplication. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
+
+Complete immutable index generations keep readers on a coherent snapshot during updates. Cancellation before publication preserves the previous generation, and cleanup reclaims older images only after their readers release them. After a successful cache upgrade, CodeStory retires the redundant old database while retaining its rollback generation. Bookmarks and annotations remain available, including on filesystems without database cloning; recovery can rebuild derived caches without removing user-authored annotations.
+
+### Handle the repositories you actually work in
+
+- C and C++ indexing handles deeply nested syntax without overflowing the stack. Rust async closures, interface-only Java packages, Java type visibility, duplicate OpenAPI fixtures and empty property names are handled correctly.
+- Git-tracked source inside directories named `build` remains discoverable. Symlinks and unreadable paths receive explicit coverage diagnostics; incomplete discovery cannot silently erase the previous inventory.
+- Malformed text configuration no longer blocks the whole index. JSONC comments and trailing commas are accepted in `tsconfig*` and `jsconfig*` files; ordinary JSON remains strict.
+- Windows can sync a staged core database without the previous `Access is denied` failure. Managed CLI recovery removes owned extraction files left by interruptions.
+- `doctor` and plain `ready` inspect caches without creating or upgrading them. Bookmarks keep their last verified binding when lookup or refresh fails, and a completed retrieval update stays successful when only later cleanup must be deferred.
+
+### Upgrading
+
+**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must handle evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Install matching CLI and plugin versions and start a fresh host session.
+
+Obsolete packet arguments are rejected. `--diagnostics-out` replaces `--step-trace-out`; search `--why` and `--plan-details` are retired. File listings default to project coverage, with the framework catalog available on request.
+
+Read the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback. Preserve a complete pre-upgrade cache before upgrading; restoring it later does not restore annotations added after that snapshot.
+
+Packets remain experimental, limited to sixteen evidence rows and 16 KiB. They expose evidence and navigation gaps, not a verdict that an investigation is complete. Terraform coverage describes source structure rather than resource-graph or expression semantics.
+
 ## 0.17.5
 
 Cursor still dropped `files`, `snippet`, and preparing `packet`/`search`/`context` results: empty `policy_exclusions` were omitted, batched snippets used a ranges document, and the shared `codestory_preparing` envelope was undeclared.

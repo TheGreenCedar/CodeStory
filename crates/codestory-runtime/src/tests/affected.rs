@@ -1,10 +1,11 @@
 use super::{
     AffectedCompletenessInput, AffectedConfidenceFloor, AffectedEvidenceGapCategory,
-    AffectedGraphEvidence, AffectedOperationIdentityIndex, AffectedPathMetadataObservation,
-    AffectedPathTieStep, AffectedRelevantEvidenceGapInput, AffectedRelevantEvidenceGaps,
-    AffectedResolvedInput, AffectedUnmatchedPathObservation, IndexFreshnessObservation,
-    affected_follow_ups, affected_relevant_evidence_gaps, affected_reverse_walk,
-    affected_route_confidence, classify_matched_affected_input, classify_unmatched_affected_input,
+    AffectedGraphEvidence, AffectedGraphIndex, AffectedOperationIdentityIndex,
+    AffectedPathMetadataObservation, AffectedPathTieStep, AffectedRelevantEvidenceGapInput,
+    AffectedRelevantEvidenceGaps, AffectedResolvedInput, AffectedUnmatchedPathObservation,
+    IndexFreshnessObservation, affected_follow_ups, affected_relevant_evidence_gaps,
+    affected_reverse_walk, affected_route_confidence, affected_test_impacts,
+    classify_matched_affected_input, classify_unmatched_affected_input,
     classify_unmatched_affected_input_with_metadata, compose_affected_completeness,
     compose_affected_evidence_gaps, match_affected_file_identities, normalized_affected_input,
 };
@@ -13,11 +14,12 @@ use crate::route_coverage::{RouteHandlerCandidate, compare_route_handler_candida
 use crate::tests::assert_no_staged_publication_artifacts;
 use crate::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
-    AffectedInputClassificationDto, AffectedMatchedFileDto, AffectedUncoveredInputDto, ApiError,
-    AppController, FileInfo, HashMap, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexedFileRoleDto, PublicationTestAction,
-    PublicationTestBoundary, RefreshExecutionPlan, SourceIndexPolicy, Storage, Uuid,
-    WorkspaceManifest, arm_after_index_freshness_fence_test_hook, arm_publication_test_fault,
+    AffectedInputClassificationDto, AffectedMatchedFileDto, AffectedSymbolDto,
+    AffectedUncoveredInputDto, ApiError, AppController, FileInfo, HashMap,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
+    IndexFreshnessStatusDto, IndexedFileRoleDto, PublicationTestAction, PublicationTestBoundary,
+    RefreshExecutionPlan, SourceIndexPolicy, Storage, Uuid, WorkspaceManifest,
+    arm_after_index_freshness_fence_test_hook, arm_publication_test_fault,
     compare_optional_confidence_desc, index_freshness_from_storage, indexable_source_path,
     indexable_source_path_in_workspace, not_checked_index_freshness, process_env_test_lock,
     resolve_project_file_path_from_root, stored_file_coverage_diagnostics,
@@ -1640,6 +1642,231 @@ fn affected_reverse_walk_is_total_across_every_edge_and_seed_permutation() {
         "bounded",
         "a previous-identity proxy must remain bounded across traversal"
     );
+}
+
+#[test]
+fn affected_test_hints_preserve_graph_provenance_when_same_package_fallback_overlaps() {
+    let project = tempdir().expect("project");
+    fs::write(
+        project.path().join("pyproject.toml"),
+        "[project]\nname='fixture'\n",
+    )
+    .expect("write package marker");
+    let source_path = project.path().join("src/service.py");
+    let deep_path = project.path().join("tests/test_deep.py");
+    let near_path = project.path().join("tests/test_near.py");
+    let file_path = project.path().join("tests/test_file_only.py");
+    let fallback_path = project.path().join("tests/test_fallback.py");
+    let graph_only_path = project.path().join("other/tests/test_external.py");
+    fs::create_dir_all(source_path.parent().expect("source parent"))
+        .expect("create source directory");
+    fs::create_dir_all(deep_path.parent().expect("test parent")).expect("create test directory");
+    fs::create_dir_all(graph_only_path.parent().expect("external test parent"))
+        .expect("create external test directory");
+    fs::write(
+        project.path().join("other/pyproject.toml"),
+        "[project]\nname='other'\n",
+    )
+    .expect("write other package marker");
+    for path in [
+        &fallback_path,
+        &file_path,
+        &near_path,
+        &source_path,
+        &graph_only_path,
+        &deep_path,
+    ] {
+        fs::write(path, "# indexed fixture\n").expect("write indexed fixture");
+    }
+
+    let file_info = |id, path: &Path, role| FileInfo {
+        id,
+        path: path.to_path_buf(),
+        language: "python".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: role,
+    };
+    let files = vec![
+        file_info(5, &fallback_path, codestory_store::FileRole::Test),
+        file_info(4, &file_path, codestory_store::FileRole::Test),
+        file_info(3, &near_path, codestory_store::FileRole::Test),
+        file_info(1, &source_path, codestory_store::FileRole::Source),
+        file_info(6, &graph_only_path, codestory_store::FileRole::Test),
+        file_info(2, &deep_path, codestory_store::FileRole::Test),
+    ];
+    let matched_files = vec![AffectedMatchedFileDto {
+        path: "src/service.py".to_string(),
+        role: IndexedFileRoleDto::Source,
+        indexed: true,
+        complete: true,
+        change_kind: None,
+        change_status: None,
+        previous_path: None,
+        error_count: 0,
+    }];
+    let symbols = vec![
+        AffectedSymbolDto {
+            node_id: CoreNodeId(20).into(),
+            display_name: "test_deep".to_string(),
+            kind: NodeKind::FUNCTION.into(),
+            file_path: Some("tests/test_deep.py".to_string()),
+            line: Some(1),
+            distance: 3,
+            graph_depth: 3,
+            reason: "deep graph witness".to_string(),
+            confidence: "probable".to_string(),
+        },
+        AffectedSymbolDto {
+            node_id: CoreNodeId(30).into(),
+            display_name: "test_near".to_string(),
+            kind: NodeKind::FUNCTION.into(),
+            file_path: Some("tests/test_near.py".to_string()),
+            line: Some(1),
+            distance: 1,
+            graph_depth: 1,
+            reason: "near graph witness".to_string(),
+            confidence: "direct".to_string(),
+        },
+        AffectedSymbolDto {
+            node_id: CoreNodeId(31).into(),
+            display_name: "test_farther_in_same_file".to_string(),
+            kind: NodeKind::FUNCTION.into(),
+            file_path: Some("tests/test_near.py".to_string()),
+            line: Some(2),
+            distance: 2,
+            graph_depth: 2,
+            reason: "farther graph witness".to_string(),
+            confidence: "graph".to_string(),
+        },
+        AffectedSymbolDto {
+            node_id: CoreNodeId(60).into(),
+            display_name: "test_external".to_string(),
+            kind: NodeKind::FUNCTION.into(),
+            file_path: Some("other/tests/test_external.py".to_string()),
+            line: Some(1),
+            distance: 2,
+            graph_depth: 2,
+            reason: "other-package graph witness".to_string(),
+            confidence: "graph".to_string(),
+        },
+        AffectedSymbolDto {
+            node_id: CoreNodeId(70).into(),
+            display_name: "ordinary_source".to_string(),
+            kind: NodeKind::FUNCTION.into(),
+            file_path: Some("src/service.py".to_string()),
+            line: Some(1),
+            distance: 1,
+            graph_depth: 1,
+            reason: "non-test graph witness".to_string(),
+            confidence: "direct".to_string(),
+        },
+    ];
+    let file_node_id = CoreNodeId(40);
+    let graph = AffectedGraphIndex {
+        labels: HashMap::new(),
+        file_path_by_id: HashMap::from([(file_node_id, "tests/test_file_only.py".to_string())]),
+        nodes_by_id: HashMap::from([(
+            file_node_id,
+            Node {
+                id: file_node_id,
+                kind: NodeKind::FILE,
+                serialized_name: "tests/test_file_only.py".to_string(),
+                ..Default::default()
+            },
+        )]),
+        node_ids_by_file: HashMap::new(),
+    };
+    let distances = BTreeMap::from([(file_node_id, 4)]);
+    let mut file_evidence = AffectedGraphEvidence::seed(
+        file_node_id,
+        "file node reached by graph walk",
+        AffectedConfidenceFloor::from_label("probable"),
+        false,
+    );
+    file_evidence.distance = 4;
+    let evidence = BTreeMap::from([(file_node_id, file_evidence)]);
+
+    let impacts = affected_test_impacts(
+        &symbols,
+        &distances,
+        &evidence,
+        &graph,
+        project.path(),
+        &files,
+        &matched_files,
+    );
+    let repeated = affected_test_impacts(
+        &symbols,
+        &distances,
+        &evidence,
+        &graph,
+        project.path(),
+        &files,
+        &matched_files,
+    );
+    assert_eq!(
+        serde_json::to_value(&impacts).expect("serialize impacts"),
+        serde_json::to_value(&repeated).expect("serialize repeated impacts"),
+        "identical evidence must produce identical test hints"
+    );
+
+    assert_eq!(
+        impacts
+            .iter()
+            .map(|impact| impact.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "other/tests/test_external.py",
+            "tests/test_deep.py",
+            "tests/test_fallback.py",
+            "tests/test_file_only.py",
+            "tests/test_near.py",
+        ],
+        "graph and fallback membership must remain deterministic"
+    );
+    let impact = |path: &str| {
+        impacts
+            .iter()
+            .find(|impact| impact.path == path)
+            .expect("expected impacted test")
+    };
+    let deep = impact("tests/test_deep.py");
+    assert_eq!(deep.distance, 3);
+    assert_eq!(deep.graph_depth, 3);
+    assert_eq!(deep.confidence, "probable");
+    assert_eq!(deep.impacted_symbol_count, 1);
+    assert!(deep.reason.contains("affected graph walk"));
+
+    let graph_only = impact("other/tests/test_external.py");
+    assert_eq!(graph_only.distance, 2);
+    assert_eq!(graph_only.graph_depth, 2);
+    assert_eq!(graph_only.confidence, "graph");
+    assert_eq!(graph_only.impacted_symbol_count, 1);
+    assert!(graph_only.reason.contains("affected graph walk"));
+
+    let file_only = impact("tests/test_file_only.py");
+    assert_eq!(file_only.distance, 4);
+    assert_eq!(file_only.graph_depth, 4);
+    assert_eq!(file_only.confidence, "probable");
+    assert_eq!(file_only.impacted_symbol_count, 1);
+    assert!(file_only.reason.contains("affected graph walk"));
+
+    let near = impact("tests/test_near.py");
+    assert_eq!(near.distance, 1);
+    assert_eq!(near.graph_depth, 1);
+    assert_eq!(near.confidence, "direct");
+    assert_eq!(near.impacted_symbol_count, 2);
+    assert!(near.reason.contains("affected graph walk"));
+
+    let fallback = impact("tests/test_fallback.py");
+    assert_eq!(fallback.distance, 1);
+    assert_eq!(fallback.graph_depth, 1);
+    assert_eq!(fallback.confidence, "bounded");
+    assert_eq!(fallback.impacted_symbol_count, 0);
+    assert!(fallback.reason.contains("same package"));
 }
 
 #[test]

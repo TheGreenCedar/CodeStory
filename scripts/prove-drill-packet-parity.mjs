@@ -10,26 +10,35 @@ import { fileURLToPath } from "node:url";
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
 
-function citationKeys(packet) {
-  const citations = packet.answer?.citations ?? [];
-  return [...new Set(citations.map((citation) => JSON.stringify([
-    citation.node_id,
-    citation.file_path ?? null,
-    citation.line ?? null,
-    citation.display_name,
+function evidenceKeys(packet) {
+  const evidence = packet.evidence ?? [];
+  return [...new Set(evidence.map((row) => JSON.stringify([
+    row.kind,
+    row.path ?? null,
+    row.symbol_id ?? null,
+    row.start_line ?? null,
+    row.end_line ?? null,
+    row.summary ?? null,
   ])))].sort();
 }
 
-function requestedProbes(packet, anchors, label) {
-  const queries = (packet.plan?.queries ?? []).map(({ query }) => query.trim().toLowerCase());
+function reportedProbes(report, anchors) {
+  const reported = (report.anchors ?? [])
+    .map(({ anchor }) => String(anchor ?? "").trim().toLowerCase());
   for (const anchor of anchors) {
-    assert.ok(queries.includes(anchor.trim().toLowerCase()), `${label} omitted requested probe ${anchor}`);
+    assert.ok(
+      reported.includes(anchor.trim().toLowerCase()),
+      `drill report omitted requested probe ${anchor}`,
+    );
   }
-  assert.ok(
-    (packet.plan?.trace ?? []).includes(`explicit_extra_probes=${anchors.length} source=request`),
-    `${label} did not trace requested probe provenance`,
-  );
   return [...anchors].sort();
+}
+
+function gapKeys(packet) {
+  return (packet.gaps ?? []).map((gap) => JSON.stringify([
+    gap.kind,
+    gap.message ?? null,
+  ])).sort();
 }
 
 export class FullRetrievalBlockedError extends Error {}
@@ -55,14 +64,22 @@ export function verifyDrillPacketParity({ packet, report, summary, markdown, anc
   assert.deepEqual(generation(afterStatus), generation(beforeStatus), "retrieval generation changed during proof");
 
   const drillPacket = report.evidence_packet;
-  assert.deepEqual(drillPacket.disposition, packet.disposition, "disposition differs");
-  assert.deepEqual(citationKeys(drillPacket), citationKeys(packet), "citations differ");
-  assert.deepEqual(requestedProbes(drillPacket, anchors, "drill packet"), [...anchors].sort());
-  assert.deepEqual(requestedProbes(packet, anchors, "paired packet"), [...anchors].sort());
-  const optionIds = (packet.disposition?.drill?.options ?? []).map((option) => option.id);
-  assert.deepEqual(report.next_commands, optionIds, "drill report option ids differ");
+  assert.equal(drillPacket.kind, packet.kind, "projection kind differs");
+  assert.equal(drillPacket.schema_version, packet.schema_version, "schema version differs");
+  assert.equal(drillPacket.status, packet.status, "evidence availability differs");
+  assert.deepEqual(drillPacket.publication, packet.publication, "publication differs");
+  assert.deepEqual(drillPacket.retrieval, packet.retrieval, "retrieval state differs");
+  assert.deepEqual(evidenceKeys(drillPacket), evidenceKeys(packet), "evidence differs");
+  assert.deepEqual(gapKeys(drillPacket), gapKeys(packet), "gaps differ");
+  assert.deepEqual(report.next_commands, [], "drill report exposed hidden follow-up commands");
+  assert.deepEqual(reportedProbes(report, anchors), [...anchors].sort());
 
   assert.equal(report.question_search?.command, "packet", "drill did not report packet execution");
+  assert.equal(
+    report.question_search?.status,
+    drillPacket.status,
+    "drill question status differs from closed-v3 packet availability",
+  );
   assert.deepEqual(report.question_supplemental_searches ?? [], [], "drill ran supplemental searches");
   assert.ok((report.anchors ?? []).every((anchor) => (anchor.commands ?? []).length === 0), "drill ran anchor commands");
   assert.deepEqual((report.execution_boundaries ?? []).map(({ command }) => command), ["packet"], "drill execution boundary is not exactly one packet");
@@ -75,10 +92,10 @@ export function verifyDrillPacketParity({ packet, report, summary, markdown, anc
   assert.match(markdown, /evidence_packet:/);
   return {
     generation: generation(beforeStatus),
-    sufficiency: packet.disposition?.kind,
-    citation_count: citationKeys(packet).length,
-    explicit_probes: requestedProbes(packet, anchors, "paired packet"),
-    follow_up_commands: optionIds,
+    availability: packet.status,
+    evidence_count: evidenceKeys(packet).length,
+    explicit_probes: [...anchors].sort(),
+    follow_up_commands: [],
     packet_execution_count: 1,
     artifacts: [...artifacts].sort(),
   };

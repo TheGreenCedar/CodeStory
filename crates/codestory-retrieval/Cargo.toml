@@ -1,10 +1,10 @@
 [package]
 name = "codestory-retrieval"
-version = "0.17.5"
+version = "0.17.6"
 edition = "2024"
 
 [features]
-test-support = []
+test-support = ["codestory-store/test-support"]
 # Measurement-only surface for the offline vector-backend bake-off. No product
 # binary enables this.
 benchmark-support = []
@@ -21,6 +21,8 @@ codestory-llama-sys = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 directories = { workspace = true }
+parking_lot = { workspace = true }
+flate2 = "=1.1.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -32,6 +34,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+codestory-store = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

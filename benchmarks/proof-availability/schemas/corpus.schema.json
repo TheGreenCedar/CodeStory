@@ -1,0 +1,161 @@
+{
+  "$defs": {
+    "CohortV1": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "path_count": {
+          "const": 30,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path_file": {
+          "type": "string"
+        },
+        "path_file_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "path_length_distribution": {
+          "items": {
+            "$ref": "#/$defs/LengthDistributionEntryV1"
+          },
+          "type": "array"
+        },
+        "positive_step_count": {
+          "const": 78,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "source_tree_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "repository",
+        "commit",
+        "workspace",
+        "path_file",
+        "path_file_sha256",
+        "source_tree_sha256",
+        "path_count",
+        "positive_step_count",
+        "path_length_distribution"
+      ],
+      "type": "object"
+    },
+    "LengthDistributionEntryV1": {
+      "additionalProperties": false,
+      "properties": {
+        "path_count": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path_length": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path_length",
+        "path_count"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "codestory.proof-availability-corpus/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cohorts": {
+      "items": {
+        "$ref": "#/$defs/CohortV1"
+      },
+      "maxItems": 4,
+      "minItems": 4,
+      "type": "array"
+    },
+    "corpus_id": {
+      "type": "string"
+    },
+    "curator": {
+      "type": "string"
+    },
+    "methodology_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "negative_request_count": {
+      "const": 240,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "positive_request_count": {
+      "const": 120,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "positive_step_count": {
+      "const": 312,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "review_date": {
+      "type": "string"
+    },
+    "reviewer": {
+      "type": "string"
+    },
+    "schema": {
+      "const": "codestory.proof-availability-corpus/v1",
+      "type": "string"
+    },
+    "thresholds_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "corpus_id",
+    "thresholds_sha256",
+    "methodology_sha256",
+    "curator",
+    "reviewer",
+    "review_date",
+    "cohorts",
+    "positive_request_count",
+    "positive_step_count",
+    "negative_request_count"
+  ],
+  "title": "CorpusV1",
+  "type": "object"
+}

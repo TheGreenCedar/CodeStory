@@ -40,6 +40,7 @@ pub(in crate::app) fn command_failure_envelope(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         },
     ))
@@ -69,6 +70,9 @@ pub(in crate::app) fn json_output_requested(args: &[OsString]) -> bool {
     args.windows(2)
         .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
         || args.iter().any(|arg| arg == OsStr::new("--format=json"))
+        || args
+            .iter()
+            .any(|arg| arg == OsStr::new("verify-indexed-direct-calls"))
 }
 
 pub(in crate::app) fn requested_output_file(args: &[OsString]) -> Option<&Path> {

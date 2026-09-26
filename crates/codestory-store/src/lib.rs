@@ -7,9 +7,13 @@
 //! upgrade structural source proof into parser-backed graph evidence.
 
 mod annotations;
+mod core_generation;
+mod core_session;
 mod file_store;
 mod projection_store;
+mod sealed_file_stage;
 mod snapshot_store;
+mod sqlite_observation;
 mod sqlite_path;
 mod storage_impl;
 
@@ -21,34 +25,71 @@ pub use annotations::{
     NativeRootBinding, OrphanReason, ResolutionStatus, anchor_evidence, legacy_bookmark_uuid,
     resolve_bookmark,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use core_generation::with_core_clone_disabled;
+pub use core_generation::{
+    CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY, CORE_PUBLICATION_FILE,
+    CORE_STAGING_DIRECTORY, CorePublicationCommitV1, CorePublicationDurabilityReasonV1,
+    CorePublicationDurabilityV1, CorePublicationLayout, core_database_exists,
+    make_file_owner_writable, remove_staging_database, resolve_core_database_path,
+    resolve_core_generation_database_path,
+};
+pub use core_session::{CorePublishTransaction, CoreReadSession};
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
+#[cfg(any(test, feature = "test-support"))]
+pub use sealed_file_stage::with_native_clone_disabled;
+pub use sealed_file_stage::{SealedStageStats, SealedStageStrategy, stage_sealed_file};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
     StagedSnapshotPublishStats,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use sqlite_observation::with_available_filesystem_bytes_override;
+pub use sqlite_observation::{
+    CompactRehydratePeakSpace, FULL_SIZE_WRITE_RESERVE_BYTES, SqliteDatabaseObservation,
+    SqliteVacuumIntoStats, available_filesystem_bytes, compact_candidate_size_limit,
+    compact_rehydrate_remaining_space_required, compact_rehydrate_space_required,
+    database_upper_bound, ensure_compact_rehydrate_peak_space, ensure_full_size_write_capacity,
+    is_insufficient_compact_rehydrate_space, measure_compact_rehydrate_peak_space,
+    observe_sqlite_database, vacuum_into_database,
+};
 pub use storage_impl::{
-    BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BuildNodeLookup,
-    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, CorePromotionStats,
-    DENSE_ANCHOR_MIGRATION_STATE_NATIVE, DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
-    DatabaseSnapshotCopyStats, DenseAnchorInput, DenseAnchorInputReuseMetadata,
-    DenseAnchorInputStats, DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash,
-    FileInfo, FileProjectionRemovalSummary, FileRole, GroundingCallDegree, GroundingEdgeKindCount,
-    GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
+    BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
+    BoundedRawCallEdges, BoundedRawIncidentEdges, BuildNodeLookup, CORE_LEASE_FILE,
+    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, CorePromotionStats, CoreResetExclusion,
+    CoreRetentionReport, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorContentIdentity,
+    DenseAnchorInput, DenseAnchorInputReuseMetadata, DenseAnchorInputStats,
+    DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, DenseReasonCounts,
+    ExactCallEdgeProjection, FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole,
+    GroundingCallDegree, GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord,
+    GroundingSnapshotMetadata, GroundingSnapshotState, IndexArtifactCacheEntry,
     IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
-    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,
-    PromotedValidation, RehydratedCacheRebaseStats, RetrievalIndexManifest,
-    RetrievalIndexRollbackRecord, SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
-    STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION, STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE,
-    STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION, SearchSymbolProjection,
-    SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
+    IndexPublicationRecord, LegacyRetirementReport, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
+    LlmSymbolDocStats, NodeFileIdentityProjection, ProjectionFlushBreakdown,
+    ProjectionPersistenceFamilyStats, ProjectionPersistenceStats, PromotedValidation,
+    ProofResolutionPublication, RehydratedCacheRebaseStats, RetrievalCoreGenerationBinding,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
+    SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+    STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
+    SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
     SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
     StorageError, StorageOpenMode, StorageStats, StoredVectorEncoding,
     StructuralTextArtifactCacheWrite, StructuralTextProjection,
     StructuralTextPublicationCompatibility, StructuralTextUnit,
     StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    UnownedProjectionRemovalSummary, stored_vector_encoding, structural_text_unit_digest,
+    UnownedProjectionRemovalSummary, apply_core_retention, apply_legacy_retirement,
+    observe_legacy_retirement, seal_call_resolution_fact, stored_vector_encoding,
+    structural_text_unit_digest,
+};
+#[cfg(debug_assertions)]
+pub use storage_impl::{
+    BashStoreResolutionWork, bash_store_resolution_work, reset_bash_store_resolution_work,
+    reset_store_replay_work, store_replay_work,
+};
+pub(crate) use storage_impl::{
+    ProofResolutionPublicationValidation, StructuralTextPublicationValidation,
 };
 
 impl Store {

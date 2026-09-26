@@ -30,7 +30,7 @@ test("suite ledger scoring preserves the extracted production report contract", 
   rmSync(outputDir, { recursive: true, force: true });
 });
 
-test("single drill scoring keeps the existing evaluator contract", () => {
+test("single drill scoring consumes the closed v3 evidence contract", () => {
   const dir = mkdtempSync(join(tmpdir(), "codestory-drill-ledger-"));
   const report = join(dir, "drill.json");
   const ledger = join(dir, "ledger.json");
@@ -38,9 +38,10 @@ test("single drill scoring keeps the existing evaluator contract", () => {
     report,
     JSON.stringify({
       evidence_packet: {
-        packet_id: "packet-1",
-        sufficiency: { status: "sufficient" },
-        answer: { citations: [{ file_path: "src/a.rs" }] },
+        kind: "complete",
+        identity: { packet_id: "packet-1" },
+        status: "available",
+        evidence: [{ path: "src/a.rs" }],
       },
     }),
   );
@@ -65,7 +66,7 @@ test("single drill scoring keeps the existing evaluator contract", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {
     packet_id: "packet-1",
-    packet_sufficiency: "sufficient",
+    packet_availability: "available",
     claim_count: 2,
     correct: 1,
     partial: 1,

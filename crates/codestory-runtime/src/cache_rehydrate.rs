@@ -1,14 +1,34 @@
 use anyhow::{Context, Result, bail};
-use codestory_store::{CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store};
+use codestory_store::{
+    CURRENT_SCHEMA_VERSION, CompactRehydratePeakSpace, CorePublicationLayout,
+    CorePublishTransaction, RehydratedCacheRebaseStats, SqliteVacuumIntoStats, Store,
+    ensure_compact_rehydrate_peak_space, measure_compact_rehydrate_peak_space,
+    remove_staging_database, vacuum_into_database,
+};
 use codestory_workspace::{
     RefreshInputs, SourceIndexPolicy, WorkspaceInventory, WorkspaceInventoryOutcome,
-    WorkspaceManifest,
-    atomic_file::{create_unique_temp_file, publish_existing_file_atomic},
-    read_repository_metadata,
+    WorkspaceManifest, read_repository_metadata,
 };
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SOURCE_WRITER_GUARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_TARGET_WRITER_GUARD_AVAILABLE_BYTES: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_source_writer_guard_hook() {
+    BEFORE_SOURCE_WRITER_GUARD.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Debug, Clone)]
 /// Request to copy a compatible CodeStory cache between sibling worktrees.
@@ -56,6 +76,15 @@ pub struct CacheRehydrateOutput {
     pub retrieval_next_command: Option<String>,
     pub retrieval: String,
     pub next_commands: Vec<String>,
+    pub peak_space_required_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub source_logical_bytes: Option<u64>,
+    pub source_file_bytes: Option<u64>,
+    pub source_freelist_count: Option<u64>,
+    pub candidate_logical_bytes: Option<u64>,
+    pub candidate_file_bytes: Option<u64>,
+    pub candidate_freelist_count: Option<u64>,
+    pub freelist_pages_reclaimed: Option<u64>,
 }
 
 /// Copy a compatible cache, rebase path-bound rows, and invalidate copied retrieval manifests.
@@ -63,8 +92,16 @@ pub struct CacheRehydrateOutput {
 /// Skipped results are intentional safety outcomes, not hard failures. They preserve correctness
 /// when cache identity, freshness, or directory boundaries are not strong enough.
 pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydrateOutput> {
-    let source_db = request.source_cache_dir.join("codestory.db");
-    let target_db = request.target_cache_dir.join("codestory.db");
+    let logical_source = request.source_cache_dir.join("codestory.db");
+    let logical_target = request.target_cache_dir.join("codestory.db");
+    let source_layout = CorePublicationLayout::from_storage_path(&logical_source)
+        .with_context(|| format!("resolve source cache layout {}", logical_source.display()))?;
+    let target_layout = CorePublicationLayout::from_storage_path(&logical_target)
+        .with_context(|| format!("resolve target cache layout {}", logical_target.display()))?;
+    let source_exists_before_guard = source_layout
+        .resolve_active_database()
+        .with_context(|| format!("inspect source core database {}", logical_source.display()))?
+        .is_some();
     let rebuild = rebuild_commands(request.target_project);
 
     if request.source_cache_dir == request.target_cache_dir {
@@ -74,10 +111,10 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
             rebuild,
         ));
     }
-    if !source_db.is_file() {
+    if !source_exists_before_guard {
         return Ok(skipped(
             request,
-            "source cache has no codestory.db",
+            "source cache has no published core database",
             rebuild,
         ));
     }
@@ -88,43 +125,70 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
             rebuild,
         ));
     }
+    #[cfg(test)]
+    run_before_source_writer_guard_hook();
     let _source_writer_guard = if request.dry_run {
         None
     } else {
-        Some(match super::IndexWriterGuard::try_acquire(&source_db) {
-            Ok(guard) => guard,
-            Err(error) if error.code == "cache_busy" => {
-                return Ok(skipped(
-                    request,
-                    format!("source cache is busy: {}", error.message),
-                    rebuild,
-                ));
-            }
-            Err(error) => bail!(
-                "failed to acquire source cache writer lock: {}",
-                error.message
-            ),
-        })
+        Some(
+            match super::IndexWriterGuard::try_acquire(&logical_source) {
+                Ok(guard) => guard,
+                Err(error) if error.code == "cache_busy" => {
+                    return Ok(skipped(
+                        request,
+                        format!("source cache is busy: {}", error.message),
+                        rebuild,
+                    ));
+                }
+                Err(error) => bail!(
+                    "failed to acquire source cache writer lock: {}",
+                    error.message
+                ),
+            },
+        )
     };
-    let _target_writer_guard = if request.dry_run {
+    // The pre-lock observation only avoids creating a lock for an absent
+    // source. A writer may replace that pointer before this guard; all reads
+    // and the copy below must use the generation selected under the guard.
+    let source_db = match source_layout.resolve_active_database().with_context(|| {
+        format!(
+            "resolve locked source core database {}",
+            logical_source.display()
+        )
+    })? {
+        Some(source_db) => source_db,
+        None => {
+            return Ok(skipped(
+                request,
+                "source cache has no published core database",
+                rebuild,
+            ));
+        }
+    };
+    let target_was_present = request.target_cache_dir.exists();
+    let mut _target_writer_guard = if request.dry_run || !target_was_present {
         None
     } else {
-        Some(match super::IndexWriterGuard::try_acquire(&target_db) {
-            Ok(guard) => guard,
-            Err(error) if error.code == "cache_busy" => {
-                return Ok(skipped(
-                    request,
-                    format!("target cache is busy: {}", error.message),
-                    rebuild,
-                ));
-            }
-            Err(error) => bail!(
-                "failed to acquire target cache writer lock: {}",
-                error.message
-            ),
-        })
+        Some(
+            match super::IndexWriterGuard::try_acquire(&logical_target) {
+                Ok(guard) => guard,
+                Err(error) if error.code == "cache_busy" => {
+                    return Ok(skipped(
+                        request,
+                        format!("target cache is busy: {}", error.message),
+                        rebuild,
+                    ));
+                }
+                Err(error) => bail!(
+                    "failed to acquire target cache writer lock: {}",
+                    error.message
+                ),
+            },
+        )
     };
-    if target_cache_has_contents(request.target_cache_dir)? {
+    if (request.dry_run || _target_writer_guard.is_some())
+        && target_cache_has_contents(request.target_cache_dir)?
+    {
         return Ok(skipped(request, "target cache dir is not empty", rebuild));
     }
 
@@ -155,8 +219,8 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         ));
     }
 
-    let schema_version = Store::database_schema_version(&source_db)
-        .with_context(|| format!("read source cache schema {}", source_db.display()))?;
+    let schema_version = Store::database_schema_version_observational(&source_db)
+        .with_context(|| format!("read source cache schema {}", logical_source.display()))?;
     if schema_version != CURRENT_SCHEMA_VERSION {
         return Ok(skipped_with_git_schema(
             request,
@@ -172,7 +236,8 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
     }
 
     let source_file_count = {
-        let storage = Store::open(&source_db).context("open source cache for stats")?;
+        let storage =
+            Store::open_observational(&source_db).context("open pinned source cache for stats")?;
         storage.get_stats()?.file_count
     };
     if source_file_count == 0 {
@@ -187,20 +252,21 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         ));
     }
 
-    let source_freshness = match source_cache_freshness(request.source_project, &source_db) {
-        Ok(freshness) => freshness,
-        Err(error) => {
-            return Ok(skipped_with_git_schema(
-                request,
-                format!("source cache freshness check failed: {error}"),
-                source_git,
-                target_git,
-                Some(schema_version),
-                Some(source_file_count),
-                rebuild,
-            ));
-        }
-    };
+    let source_freshness =
+        match source_cache_freshness(request.source_project, &logical_source, &source_db) {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                return Ok(skipped_with_git_schema(
+                    request,
+                    format!("source cache freshness check failed: {error}"),
+                    source_git,
+                    target_git,
+                    Some(schema_version),
+                    Some(source_file_count),
+                    rebuild,
+                ));
+            }
+        };
     if source_freshness.changed_or_new_files > 0 || source_freshness.removed_files > 0 {
         return Ok(skipped_with_git_schema(
             request,
@@ -218,46 +284,113 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
 
     let mut invalidated_retrieval_manifests = 0;
     let mut rebase_stats = RehydratedCacheRebaseStats::default();
+    let mut vacuum_stats = None;
+    let destination_parent = existing_filesystem_parent(request.target_cache_dir);
+    let mut peak_space = measure_compact_rehydrate_peak_space(&source_db, destination_parent)
+        .context("measure compact rehydrate peak space")?;
     if !request.dry_run {
-        (invalidated_retrieval_manifests, rebase_stats) = publish_rehydrated_database(
+        if peak_space.available_bytes < peak_space.peak_space_required_bytes {
+            return Ok(insufficient_space_output(
+                request,
+                peak_space,
+                source_git,
+                target_git,
+                Some(schema_version),
+                Some(source_file_count),
+                rebuild,
+            ));
+        }
+        if _target_writer_guard.is_none() {
+            // An absent target must remain absent when the first capacity
+            // check refuses it. After acquiring its persistent writer lock,
+            // recheck both contents and capacity before any stage allocation.
+            _target_writer_guard = Some(
+                match super::IndexWriterGuard::try_acquire(&logical_target) {
+                    Ok(guard) => guard,
+                    Err(error) if error.code == "cache_busy" => {
+                        return Ok(skipped(
+                            request,
+                            format!("target cache is busy: {}", error.message),
+                            rebuild,
+                        ));
+                    }
+                    Err(error) => bail!(
+                        "failed to acquire target cache writer lock: {}",
+                        error.message
+                    ),
+                },
+            );
+            if target_cache_has_contents(request.target_cache_dir)? {
+                return Ok(skipped(request, "target cache dir is not empty", rebuild));
+            }
+            let locked_target_git = match git_identity(request.target_project) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(skipped(request, error.to_string(), rebuild)),
+            };
+            if locked_target_git.remote != source_git.remote {
+                return Ok(skipped_with_git(
+                    request,
+                    "git remote mismatch",
+                    source_git,
+                    locked_target_git,
+                    rebuild,
+                ));
+            }
+            if locked_target_git.tree != source_git.tree {
+                return Ok(skipped_with_git(
+                    request,
+                    "git tree mismatch",
+                    source_git,
+                    locked_target_git,
+                    rebuild,
+                ));
+            }
+            peak_space = measure_compact_rehydrate_peak_space(
+                &source_db,
+                existing_filesystem_parent(request.target_cache_dir),
+            )
+            .context("recheck compact rehydrate peak space under target lock")?;
+            #[cfg(test)]
+            AFTER_TARGET_WRITER_GUARD_AVAILABLE_BYTES.with(|bytes| {
+                if let Some(available) = bytes.take() {
+                    peak_space.available_bytes = available;
+                }
+            });
+            if peak_space.available_bytes < peak_space.peak_space_required_bytes {
+                return Ok(insufficient_space_output(
+                    request,
+                    peak_space,
+                    source_git,
+                    locked_target_git,
+                    Some(schema_version),
+                    Some(source_file_count),
+                    rebuild,
+                ));
+            }
+        }
+        let published = publish_rehydrated_database(
             &source_db,
-            &target_db,
+            &target_layout,
+            &logical_target,
             request.source_project,
             request.target_project,
         )?;
+        invalidated_retrieval_manifests = published.invalidated_retrieval_manifests;
+        rebase_stats = published.rebase_stats;
+        vacuum_stats = Some(published.vacuum_stats);
     }
 
-    Ok(CacheRehydrateOutput {
-        status: if request.dry_run {
-            "would_rehydrate".into()
-        } else {
-            "rehydrated".into()
-        },
-        reason: None,
-        source_project: display_path(request.source_project),
-        target_project: display_path(request.target_project),
-        source_cache_dir: display_path(request.source_cache_dir),
-        target_cache_dir: display_path(request.target_cache_dir),
-        source_remote: Some(source_git.remote),
-        target_remote: Some(target_git.remote),
-        source_tree: Some(source_git.tree),
-        target_tree: Some(target_git.tree),
-        schema_version: Some(schema_version),
-        source_file_count: Some(source_file_count),
-        copied: !request.dry_run,
-        dry_run: request.dry_run,
+    Ok(rehydrate_success_output(
+        request,
+        source_git,
+        target_git,
+        schema_version,
+        source_file_count,
         invalidated_retrieval_manifests,
-        invalidated_index_artifact_rows: rebase_stats.invalidated_index_artifact_rows,
-        invalidated_semantic_rows: rebase_stats.invalidated_semantic_rows,
-        rebased_path_bound_rows: rebase_stats.rebased_path_bound_rows,
-        carried_policy_exclusion_rows: rebase_stats.carried_policy_exclusion_rows,
-        preserved_scope: "core_graph_file_inventory_and_policy_exclusions_only".into(),
-        retrieval_status: retrieval_rehydrate_status(request.dry_run),
-        retrieval_reason: retrieval_rehydrate_reason(),
-        retrieval_next_command: Some(retrieval_next_command(request.target_project)),
-        retrieval: retrieval_rehydrate_policy(request.dry_run),
-        next_commands: rehydrate_next_commands(request.target_project),
-    })
+        rebase_stats,
+        Some(peak_space),
+        vacuum_stats,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -272,11 +405,18 @@ struct SourceCacheFreshness {
     removed_files: usize,
 }
 
-fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCacheFreshness> {
-    let workspace =
-        WorkspaceManifest::open_with_storage_owned_exclusions(project.to_path_buf(), source_db)
-            .with_context(|| format!("open source workspace {}", project.display()))?;
-    let storage = Store::open(source_db).context("open source cache for freshness")?;
+fn source_cache_freshness(
+    project: &Path,
+    logical_source: &Path,
+    source_db: &Path,
+) -> Result<SourceCacheFreshness> {
+    let workspace = WorkspaceManifest::open_with_storage_owned_exclusions(
+        project.to_path_buf(),
+        logical_source,
+    )
+    .with_context(|| format!("open source workspace {}", project.display()))?;
+    let storage =
+        Store::open_observational(source_db).context("open pinned source cache for freshness")?;
     if storage
         .has_incomplete_incremental_run()
         .context("inspect source cache incomplete index marker")?
@@ -417,13 +557,21 @@ fn absolutize_lexical_path(path: &Path) -> Result<PathBuf> {
 
 fn publish_rehydrated_database(
     source_db: &Path,
-    target_db: &Path,
+    target_layout: &CorePublicationLayout,
+    logical_target: &Path,
     source_project: &Path,
     target_project: &Path,
-) -> Result<(usize, RehydratedCacheRebaseStats)> {
-    let (stage_path, stage_file) = create_unique_temp_file(target_db, "rehydrate-stage")?;
-    drop(stage_file);
-    let mut publish_path = None;
+) -> Result<PublishedRehydrate> {
+    // Fail closed before allocating the stage copy so insufficient_space never
+    // mutates the target cache. Measure the same file the snapshot copy reads.
+    let destination_parent = existing_filesystem_parent(logical_target);
+    ensure_compact_rehydrate_peak_space(source_db, destination_parent)
+        .context("preflight compact rehydrate peak space before stage copy")?;
+
+    let stage_path = target_layout
+        .create_staging_database_path()
+        .context("create rehydrate stage under the target core layout")?;
+    let mut candidate_path = None;
     let result = (|| {
         Store::copy_database_snapshot(source_db, &stage_path)
             .context("copy source database into rehydrate stage")?;
@@ -438,34 +586,57 @@ fn publish_rehydrated_database(
             (invalidated_retrieval_manifests, rebase_stats)
         };
 
-        let (candidate_path, candidate_file) =
-            create_unique_temp_file(target_db, "rehydrate-publish")?;
-        drop(candidate_file);
-        publish_path = Some(candidate_path.clone());
-        Store::copy_database_snapshot(&stage_path, &candidate_path)
-            .context("seal rehydrate stage into publish candidate")?;
-        remove_database_temp(&stage_path).context("remove rehydrate stage")?;
-        validate_rehydrated_database(&candidate_path)
-            .context("validate rehydrate publish candidate")?;
+        let compacted = target_layout
+            .create_staging_database_path()
+            .context("create compact rehydrate candidate under the target core layout")?;
+        candidate_path = Some(compacted.clone());
+        let vacuum_stats = vacuum_into_database(&stage_path, &compacted)
+            .context("compact rehydrate stage with VACUUM INTO")?;
+        remove_staging_database(&stage_path).context("remove rehydrate stage")?;
+        validate_rehydrated_database(&compacted).context("validate rehydrate publish candidate")?;
         fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&candidate_path)
+            .open(&compacted)
             .and_then(|file| file.sync_all())
-            .with_context(|| format!("sync rehydrate candidate {}", candidate_path.display()))?;
-        publish_existing_file_atomic(&candidate_path, target_db)
-            .context("publish rehydrated database")?;
-        remove_database_sidecars(&candidate_path).context("remove rehydrate candidate sidecars")?;
-        Ok((invalidated_retrieval_manifests, rebase_stats))
+            .with_context(|| format!("sync rehydrate candidate {}", compacted.display()))?;
+        CorePublishTransaction::begin_from_stage(logical_target, compacted)
+            .context("begin rehydrate publish transaction")?
+            .commit_rehydrate(logical_target)
+            .context("publish rehydrated generation and swap the publication pointer")?;
+        let retrieval_runtime =
+            codestory_retrieval::SidecarRuntimeConfig::for_project_auto(target_project);
+        crate::activation_retrieval::apply_core_gc_after_publication(
+            &retrieval_runtime,
+            logical_target,
+            None,
+        );
+        Ok(PublishedRehydrate {
+            invalidated_retrieval_manifests,
+            rebase_stats,
+            vacuum_stats,
+        })
     })();
 
     if result.is_err() {
-        remove_database_temp_best_effort(&stage_path);
-        if let Some(path) = publish_path.as_deref() {
-            remove_database_temp_best_effort(path);
+        let _ = remove_staging_database(&stage_path);
+        if let Some(path) = candidate_path.as_deref() {
+            let _ = remove_staging_database(path);
         }
     }
     result
+}
+
+fn existing_filesystem_parent(path: &Path) -> &Path {
+    path.ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+struct PublishedRehydrate {
+    invalidated_retrieval_manifests: usize,
+    rebase_stats: RehydratedCacheRebaseStats,
+    vacuum_stats: SqliteVacuumIntoStats,
 }
 
 fn validate_rehydrated_database(path: &Path) -> Result<()> {
@@ -544,38 +715,6 @@ fn validate_rehydrated_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_database_temp(path: &Path) -> Result<()> {
-    remove_database_sidecars(path)?;
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    }
-}
-
-fn remove_database_sidecars(path: &Path) -> Result<()> {
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar_name = path
-            .file_name()
-            .context("database temporary path has no file name")?
-            .to_os_string();
-        sidecar_name.push(suffix);
-        let sidecar = path.with_file_name(sidecar_name);
-        match fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("remove {}", sidecar.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn remove_database_temp_best_effort(path: &Path) {
-    let _ = remove_database_temp(path);
-}
-
 fn skipped(
     request: CacheRehydrateRequest<'_>,
     reason: impl Into<String>,
@@ -607,7 +746,112 @@ fn skipped(
         retrieval_next_command: None,
         retrieval: "not rehydrated; normal index/retrieval rebuild required".into(),
         next_commands,
+        peak_space_required_bytes: None,
+        available_bytes: None,
+        source_logical_bytes: None,
+        source_file_bytes: None,
+        source_freelist_count: None,
+        candidate_logical_bytes: None,
+        candidate_file_bytes: None,
+        candidate_freelist_count: None,
+        freelist_pages_reclaimed: None,
     }
+}
+
+fn insufficient_space_output(
+    request: CacheRehydrateRequest<'_>,
+    peak_space: CompactRehydratePeakSpace,
+    source_git: GitIdentity,
+    target_git: GitIdentity,
+    schema_version: Option<u32>,
+    source_file_count: Option<i64>,
+    next_commands: Vec<String>,
+) -> CacheRehydrateOutput {
+    let mut output = skipped_with_git_schema(
+        request,
+        format!(
+            "insufficient space for compact rehydrate: need at least {} bytes, available {} bytes",
+            peak_space.peak_space_required_bytes, peak_space.available_bytes
+        ),
+        source_git,
+        target_git,
+        schema_version,
+        source_file_count,
+        next_commands,
+    );
+    output.status = "insufficient_space".into();
+    output.peak_space_required_bytes = Some(peak_space.peak_space_required_bytes);
+    output.available_bytes = Some(peak_space.available_bytes);
+    output.source_logical_bytes = Some(peak_space.candidate_upper_bytes);
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rehydrate_success_output(
+    request: CacheRehydrateRequest<'_>,
+    source_git: GitIdentity,
+    target_git: GitIdentity,
+    schema_version: u32,
+    source_file_count: i64,
+    invalidated_retrieval_manifests: usize,
+    rebase_stats: RehydratedCacheRebaseStats,
+    peak_space: Option<CompactRehydratePeakSpace>,
+    vacuum_stats: Option<SqliteVacuumIntoStats>,
+) -> CacheRehydrateOutput {
+    let mut output = CacheRehydrateOutput {
+        status: if request.dry_run {
+            "would_rehydrate".into()
+        } else {
+            "rehydrated".into()
+        },
+        reason: None,
+        source_project: display_path(request.source_project),
+        target_project: display_path(request.target_project),
+        source_cache_dir: display_path(request.source_cache_dir),
+        target_cache_dir: display_path(request.target_cache_dir),
+        source_remote: Some(source_git.remote),
+        target_remote: Some(target_git.remote),
+        source_tree: Some(source_git.tree),
+        target_tree: Some(target_git.tree),
+        schema_version: Some(schema_version),
+        source_file_count: Some(source_file_count),
+        copied: !request.dry_run,
+        dry_run: request.dry_run,
+        invalidated_retrieval_manifests,
+        invalidated_index_artifact_rows: rebase_stats.invalidated_index_artifact_rows,
+        invalidated_semantic_rows: rebase_stats.invalidated_semantic_rows,
+        rebased_path_bound_rows: rebase_stats.rebased_path_bound_rows,
+        carried_policy_exclusion_rows: rebase_stats.carried_policy_exclusion_rows,
+        preserved_scope: "core_graph_file_inventory_and_policy_exclusions_only".into(),
+        retrieval_status: retrieval_rehydrate_status(request.dry_run),
+        retrieval_reason: retrieval_rehydrate_reason(),
+        retrieval_next_command: Some(retrieval_next_command(request.target_project)),
+        retrieval: retrieval_rehydrate_policy(request.dry_run),
+        next_commands: rehydrate_next_commands(request.target_project),
+        peak_space_required_bytes: peak_space
+            .as_ref()
+            .map(|space| space.peak_space_required_bytes),
+        available_bytes: peak_space.as_ref().map(|space| space.available_bytes),
+        source_logical_bytes: None,
+        source_file_bytes: None,
+        source_freelist_count: None,
+        candidate_logical_bytes: None,
+        candidate_file_bytes: None,
+        candidate_freelist_count: None,
+        freelist_pages_reclaimed: None,
+    };
+    if let Some(stats) = vacuum_stats {
+        output.source_logical_bytes = Some(stats.source_logical_bytes);
+        output.source_file_bytes = Some(stats.source_file_bytes);
+        output.source_freelist_count = Some(stats.source_freelist_count);
+        output.candidate_logical_bytes = Some(stats.candidate_logical_bytes);
+        output.candidate_file_bytes = Some(stats.candidate_file_bytes);
+        output.candidate_freelist_count = Some(stats.candidate_freelist_count);
+        output.freelist_pages_reclaimed = Some(stats.freelist_pages_reclaimed);
+    } else if let Some(space) = peak_space {
+        output.source_logical_bytes = Some(space.candidate_upper_bytes);
+    }
+    output
 }
 
 fn skipped_with_git(
@@ -746,7 +990,13 @@ mod tests {
         .expect("rehydrate");
 
         assert_eq!(output.status, "rehydrated");
-        assert!(target_cache_path.join("codestory.db").is_file());
+        assert!(
+            !target_cache_path.join("codestory.db").exists(),
+            "rehydrate must publish a generation, not replace the legacy target file"
+        );
+        let published = resolved_core_database(&target_cache_path)
+            .expect("rehydrate must install a published generation");
+        assert!(published.is_file());
         assert!(
             target_cache_path
                 .join("codestory.index-writer.lock")
@@ -796,17 +1046,10 @@ mod tests {
             !target_cache_path.join("semantic-generation").exists(),
             "source cache sidecars are not portable rehydrate input"
         );
-        let unexpected_files = fs::read_dir(&target_cache_path)
-            .expect("read target cache")
-            .map(|entry| entry.expect("target cache entry").file_name())
-            .filter(|name| {
-                let name = name.to_string_lossy();
-                name.contains("rehydrate-stage") || name.contains("rehydrate-publish")
-            })
-            .collect::<Vec<_>>();
+        let unexpected_files = leftover_rehydrate_temps(&target_cache_path);
         assert!(unexpected_files.is_empty(), "{unexpected_files:?}");
         for suffix in ["-wal", "-shm", "-journal"] {
-            let database = target_cache_path.join("codestory.db");
+            let database = published.clone();
             let mut sidecar_name = database
                 .file_name()
                 .expect("database file name")
@@ -817,7 +1060,7 @@ mod tests {
                 "the atomically published database must be self-contained before activation"
             );
         }
-        let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
+        let storage = Store::open_observational(&published).expect("open published target");
         assert!(
             storage
                 .list_retrieval_semantic_generations()
@@ -1155,8 +1398,8 @@ mod tests {
         )
         .expect("generation metadata");
 
-        let freshness =
-            source_cache_freshness(project.path(), &source_db).expect("fresh source cache");
+        let freshness = source_cache_freshness(project.path(), &source_db, &source_db)
+            .expect("fresh source cache");
         assert_eq!(freshness.changed_or_new_files, 0);
         assert_eq!(freshness.removed_files, 0);
     }
@@ -1328,6 +1571,465 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_rehydrate_publishes_zero_freelist_database() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let target_cache_path = target_cache.path().join("empty");
+        fs::create_dir_all(&target_cache_path).expect("create target cache");
+        fs::write(target_cache_path.join("codestory.index-writer.lock"), b"")
+            .expect("seed persistent target lock");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "rehydrated");
+        assert!(
+            output
+                .peak_space_required_bytes
+                .is_some_and(|bytes| bytes > 0),
+            "receipt should surface peak space: {output:?}"
+        );
+        assert!(
+            output.available_bytes.is_some(),
+            "receipt should surface available bytes"
+        );
+        assert_eq!(output.candidate_freelist_count, Some(0));
+        assert!(
+            output.freelist_pages_reclaimed.is_some(),
+            "receipt should surface vacuum reclaim stats"
+        );
+        let observation = codestory_store::observe_sqlite_database(
+            &resolved_core_database(&target_cache_path)
+                .expect("compact rehydrate must publish a generation"),
+        )
+        .expect("observe compact rehydrate target");
+        assert_eq!(observation.freelist_count, 0);
+        assert_eq!(observation.wal_bytes, 0);
+        assert_eq!(observation.shm_bytes, 0);
+    }
+
+    #[test]
+    fn compact_rehydrate_reports_insufficient_space_before_stage_copy() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let target_cache_path = target_cache.path().join("empty");
+        fs::create_dir_all(&target_cache_path).expect("create target cache");
+        fs::write(target_cache_path.join("codestory.index-writer.lock"), b"")
+            .expect("seed persistent target lock");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+
+        let output = codestory_store::with_available_filesystem_bytes_override(0, || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "insufficient_space");
+        assert!(
+            output
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("insufficient space for compact rehydrate")),
+            "unexpected reason: {output:?}"
+        );
+        assert!(!output.copied);
+        assert!(
+            output
+                .peak_space_required_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert_eq!(output.available_bytes, Some(0));
+        assert!(
+            resolved_core_database(&target_cache_path).is_none(),
+            "insufficient_space must not publish a target generation"
+        );
+        assert!(
+            !target_cache_path.join("codestory.db").exists(),
+            "insufficient_space must not publish a target database"
+        );
+        let leftover_temps = leftover_rehydrate_temps(&target_cache_path);
+        assert!(
+            leftover_temps.is_empty(),
+            "insufficient_space must not allocate stage/candidate temps: {leftover_temps:?}"
+        );
+    }
+
+    #[test]
+    fn absent_target_insufficient_space_does_not_create_lock_and_can_retry() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_parent = tempdir().expect("target parent");
+        let target_cache_path = target_parent.path().join("absent-cache");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+        assert!(!target_cache_path.exists(), "target starts absent");
+
+        let refused = codestory_store::with_available_filesystem_bytes_override(0, || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
+        })
+        .expect("insufficient-space result");
+        assert_eq!(refused.status, "insufficient_space");
+        assert!(!refused.copied);
+        assert_eq!(refused.available_bytes, Some(0));
+        assert!(
+            !target_cache_path.exists(),
+            "preflight refusal must leave the target directory and writer lock absent"
+        );
+
+        let retried = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("retry after capacity returns");
+        assert_eq!(retried.status, "rehydrated");
+        assert!(resolved_core_database(&target_cache_path).is_some());
+    }
+
+    #[test]
+    fn absent_target_capacity_drop_under_lock_refuses_before_stage() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_parent = tempdir().expect("target parent");
+        let target_cache_path = target_parent.path().join("absent-cache");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+        let source_hash = Sha256::digest(fs::read(&source_db).expect("read source before attempt"));
+        AFTER_TARGET_WRITER_GUARD_AVAILABLE_BYTES.with(|bytes| bytes.set(Some(0)));
+
+        let refused = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("capacity drop result");
+        assert_eq!(refused.status, "insufficient_space");
+        assert_eq!(refused.available_bytes, Some(0));
+        assert!(!refused.copied);
+        assert!(
+            target_cache_path
+                .join("codestory.index-writer.lock")
+                .exists(),
+            "the second capacity check occurs after target lock creation"
+        );
+        assert!(resolved_core_database(&target_cache_path).is_none());
+        assert!(leftover_rehydrate_temps(&target_cache_path).is_empty());
+        assert_eq!(
+            Sha256::digest(fs::read(&source_db).expect("read source after attempt")),
+            source_hash,
+            "the failed target attempt must not alter its source"
+        );
+
+        let retried = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("retry after capacity returns");
+        assert_eq!(retried.status, "rehydrated");
+    }
+
+    #[test]
+    fn rehydrate_refuses_nonempty_target_without_replacing_its_file() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let existing = target_cache.path().join("user-data.txt");
+        fs::write(&existing, b"keep this").expect("existing target file");
+        seed_cache(
+            &source_cache.path().join("codestory.db"),
+            source_project.path(),
+        );
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("nonempty target refusal");
+        assert_eq!(output.status, "skipped");
+        assert_eq!(
+            output.reason.as_deref(),
+            Some("target cache dir is not empty")
+        );
+        assert_eq!(
+            fs::read(existing).expect("retained target file"),
+            b"keep this"
+        );
+        assert!(resolved_core_database(target_cache.path()).is_none());
+    }
+
+    #[test]
+    fn rehydrate_pins_the_source_generation_after_writer_guard() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_parent = tempdir().expect("target parent");
+        let target_cache_path = target_parent.path().join("target-cache");
+        let logical_source = source_cache.path().join("codestory.db");
+        seed_cache(&logical_source, source_project.path());
+        let layout = CorePublicationLayout::from_storage_path(&logical_source).expect("layout");
+        let staged_a = layout.create_staging_database_path().expect("stage A");
+        fs::copy(&logical_source, &staged_a).expect("copy A");
+        CorePublishTransaction::begin_from_stage(&logical_source, staged_a)
+            .expect("begin A")
+            .commit_rehydrate(&logical_source)
+            .expect("publish A");
+        let physical_a = layout
+            .resolve_active_database()
+            .expect("resolve A")
+            .expect("A published");
+
+        let new_source = "pub fn run() { let changed = 2; }\n";
+        let extra_source = "pub fn extra() {}\n";
+        for project in [source_project.path(), target_project.path()] {
+            fs::write(project.join("src.rs"), new_source).expect("update source");
+            fs::write(project.join("extra.rs"), extra_source).expect("add source");
+            git(project, &["add", "-A"]);
+            git(project, &["commit", "-m", "fresh source"]);
+        }
+        let b_seed_dir = tempdir().expect("B seed directory");
+        let b_seed = b_seed_dir.path().join("fresh-source.db");
+        seed_cache(&b_seed, source_project.path());
+        let extra_path = source_project.path().join("extra.rs");
+        let extra_mtime = fs::metadata(&extra_path)
+            .expect("extra source metadata")
+            .modified()
+            .expect("extra source modified")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("extra source mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let extra_hash = format!("{:x}", Sha256::digest(extra_source.as_bytes()));
+        let b_store = Store::open(&b_seed).expect("open B seed");
+        b_store
+            .insert_file(&codestory_store::FileInfo {
+                id: 2,
+                path: extra_path,
+                language: "rust".into(),
+                modification_time: extra_mtime,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("B extra file inventory");
+        b_store
+            .get_connection()
+            .execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = 2",
+                [&extra_hash],
+            )
+            .expect("B extra content hash");
+        b_store
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "source-generation-b".into(),
+                run_id: "source-run-b".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("B complete core publication");
+        drop(b_store);
+        let staged_b = layout.create_staging_database_path().expect("stage B");
+        Store::copy_database_snapshot(&b_seed, &staged_b).expect("snapshot B into stage");
+        let b_connection = rusqlite::Connection::open(&staged_b).expect("open B stage directly");
+        b_connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .expect("seal B stage without WAL");
+        drop(b_connection);
+        // SQLite may leave an empty sidecar after closing on this host.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = staged_b.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.is_file() {
+                assert_eq!(
+                    fs::metadata(&sidecar).expect("sidecar metadata").len(),
+                    0,
+                    "B backup must not retain WAL content"
+                );
+                fs::remove_file(sidecar).expect("remove empty backup sidecar");
+            }
+        }
+        let b_logical_bytes = fs::metadata(&staged_b).expect("staged B metadata").len();
+        let rollback = layout
+            .read_pointer()
+            .expect("read A pointer")
+            .expect("A pointer")
+            .active;
+        let expected_hash = format!("{:x}", Sha256::digest(new_source.as_bytes()));
+        let hook_source = logical_source.clone();
+        BEFORE_SOURCE_WRITER_GUARD.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                CorePublishTransaction::begin_from_stage(&hook_source, staged_b)
+                    .expect("begin B")
+                    .commit_pointer(
+                        codestory_contracts::core_publication::CoreGenerationIdentityV1 {
+                            generation_id: "source-generation-b".into(),
+                            run_id: "source-run-b".into(),
+                            logical_bytes: b_logical_bytes,
+                            published_at_epoch_ms: 2,
+                        },
+                        Some(rollback),
+                    )
+                    .expect("publish B between resolution and source lock");
+            }));
+        });
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate after source publication swap");
+        assert_eq!(output.status, "rehydrated");
+        assert_eq!(output.source_file_count, Some(2));
+        let physical_b = layout
+            .resolve_active_database()
+            .expect("resolve B")
+            .expect("B published");
+        assert_ne!(physical_a, physical_b);
+        let copied = resolved_core_database(&target_cache_path).expect("target published");
+        let copied_store = Store::open_observational(&copied).expect("open copied target");
+        assert_eq!(
+            copied_store.get_stats().expect("target stats").file_count,
+            output
+                .source_file_count
+                .expect("reported source file count"),
+            "reported file-count metric and copied inventory must share B"
+        );
+        let copied_hash: String = copied_store
+            .get_connection()
+            .query_row("SELECT content_hash FROM file WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("copied source digest");
+        assert_eq!(
+            copied_hash, expected_hash,
+            "copied bytes must match locked B"
+        );
+        assert_eq!(output.retrieval_status, "invalidated_requires_rebuild");
+        assert!(
+            copied_store
+                .get_complete_index_publication()
+                .expect("target publication")
+                .is_none(),
+            "rehydrate still requires a full target refresh"
+        );
+    }
+
+    fn resolved_core_database(cache_dir: &Path) -> Option<PathBuf> {
+        CorePublicationLayout::from_storage_path(&cache_dir.join("codestory.db"))
+            .ok()?
+            .resolve_active_database()
+            .ok()
+            .flatten()
+    }
+
+    fn leftover_rehydrate_temps(cache_dir: &Path) -> Vec<PathBuf> {
+        let mut leftover = Vec::new();
+        let staging = cache_dir.join("core").join("staging");
+        if let Ok(entries) = fs::read_dir(&staging) {
+            leftover.extend(
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path()),
+            );
+        }
+        leftover
+    }
+
+    /// A leftover legacy `codestory.db` is not the published image. Preflight
+    /// and copy must measure the generation `CorePublicationLayout` selects.
+    #[test]
+    fn rehydrate_copies_the_published_generation_not_a_leftover_legacy_file() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let target_cache_path = target_cache.path().join("empty");
+        let logical_source = source_cache.path().join("codestory.db");
+        seed_cache(&logical_source, source_project.path());
+        let layout = CorePublicationLayout::from_storage_path(&logical_source).expect("layout");
+        let staged = layout
+            .create_staging_database_path()
+            .expect("stage the seeded image");
+        fs::copy(&logical_source, &staged).expect("copy seed into staging");
+        CorePublishTransaction::begin_from_stage(&logical_source, staged)
+            .expect("begin seeded publish")
+            .commit_rehydrate(&logical_source)
+            .expect("publish the seeded image as a generation");
+        fs::write(&logical_source, b"stale-leftover").expect("leave a wrong leftover file");
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "rehydrated");
+        assert_eq!(output.source_file_count, Some(1));
+        let published =
+            resolved_core_database(&target_cache_path).expect("target generation published");
+        let observation =
+            codestory_store::observe_sqlite_database(&published).expect("observe target");
+        assert!(
+            observation.logical_bytes > b"stale-leftover".len() as u64,
+            "the leftover legacy file must not be the measured or copied image: {observation:?}"
+        );
+        let storage = Store::open_observational(&published).expect("open target");
+        assert_eq!(storage.get_stats().expect("stats").file_count, 1);
+    }
+
     fn matching_git_projects() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
         if !git_available() {
             return None;
@@ -1469,6 +2171,15 @@ mod tests {
                 doc_text: format!("source file: {absolute_source_text}"),
                 doc_version: 1,
                 doc_hash: "symbol-doc-hash".into(),
+                attached_comment_text: Some(String::new()),
+                attached_comment_state: codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED
+                    .into(),
+                attached_comment_policy:
+                    codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+                attached_comment_hash: codestory_store::SymbolSearchDoc::attached_comment_hash(
+                    codestory_store::SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+                    Some(""),
+                ),
                 policy_version: "test".into(),
                 source_provenance: absolute_source_text.clone(),
                 updated_at_epoch_ms: 1,

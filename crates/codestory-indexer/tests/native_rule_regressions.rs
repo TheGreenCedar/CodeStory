@@ -193,6 +193,380 @@ use crate::{Action, Thing};
 }
 
 #[test]
+fn go_method_identity_covers_standalone_grouped_and_cross_file_receivers() -> anyhow::Result<()> {
+    let cross_file_source = concat!(
+        "package proof\r\n",
+        "// λ keeps byte and column accounting honest\r\n",
+        "func (*Context) BindWith() {}\r\n",
+        "func caller(value *Context) { value.BindWith(); value.BindWith() }",
+    );
+    let (nodes, edges, occurrences) = index_project_with_occurrences(&[
+        (
+            "standalone.go",
+            concat!(
+                "package proof\n",
+                "type Standalone struct{}\n",
+                "func (value Standalone) NamedValue() {}\n",
+                "func (Standalone) UnnamedValue() {}\n",
+                "func (value *Standalone) NamedPointer() {}\n",
+                "func (*Standalone) UnnamedPointer() {}\n",
+            ),
+        ),
+        (
+            "grouped.go",
+            concat!(
+                "package proof\n",
+                "func (Before) BeforeOwner() {}\n",
+                "type (\n",
+                "    Before struct{}\n",
+                "    Alpha struct{}\n",
+                "    Beta struct{}\n",
+                ")\n",
+                "func (Alpha) Shared() {}\n",
+                "func (*Beta) Shared() {}\n",
+            ),
+        ),
+        ("owner.go", "package proof\ntype Context struct{}\n"),
+        ("method.go", cross_file_source),
+    ])?;
+
+    let exact_method = |name: &str| {
+        let matches = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one exact method `{name}`: {matches:#?}"
+        );
+        matches[0]
+    };
+    let exact_owner = |name: &str| {
+        nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::STRUCT && node.serialized_name == name)
+            .unwrap_or_else(|| panic!("missing exact Go owner `{name}`"))
+    };
+    let has_exact_member = |owner: &str, method: &str| {
+        let owner = exact_owner(owner);
+        let method = exact_method(method);
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == owner.id && edge.target == method.id
+        })
+    };
+
+    for (owner, method) in [
+        ("Standalone", "Standalone.NamedValue"),
+        ("Standalone", "Standalone.UnnamedValue"),
+        ("Standalone", "Standalone.NamedPointer"),
+        ("Standalone", "Standalone.UnnamedPointer"),
+        ("Before", "Before.BeforeOwner"),
+        ("Alpha", "Alpha.Shared"),
+        ("Beta", "Beta.Shared"),
+    ] {
+        let method_node = exact_method(method);
+        assert_eq!(method_node.qualified_name.as_deref(), Some(method));
+        assert!(
+            has_exact_member(owner, method),
+            "missing exact same-file MEMBER {owner} -> {method}"
+        );
+    }
+
+    let cross_file_method = exact_method("Context.BindWith");
+    assert_eq!(
+        cross_file_method.qualified_name.as_deref(),
+        Some("Context.BindWith")
+    );
+    assert!(
+        !has_exact_member("Context", "Context.BindWith"),
+        "receiver syntax must not fabricate a cross-file MEMBER edge"
+    );
+    assert_eq!(cross_file_method.start_line, Some(3));
+    assert_eq!(cross_file_method.start_col, Some(1));
+    assert!(occurrences.iter().any(|occurrence| {
+        occurrence.kind == OccurrenceKind::DEFINITION
+            && occurrence.element_id == cross_file_method.id.0
+            && occurrence.location.start_line == 3
+            && occurrence.location.start_col == 1
+    }));
+
+    let mut repeated_calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL && edge.effective_target() == cross_file_method.id
+        })
+        .collect::<Vec<_>>();
+    repeated_calls.sort_by(|left, right| left.callsite_identity.cmp(&right.callsite_identity));
+    assert_eq!(repeated_calls.len(), 2, "{repeated_calls:#?}");
+    assert_ne!(
+        repeated_calls[0].callsite_identity,
+        repeated_calls[1].callsite_identity
+    );
+    assert!(
+        repeated_calls
+            .iter()
+            .all(|edge| edge.file_node_id == cross_file_method.file_node_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn go_method_identity_keeps_duplicate_owners_distinct_and_unsupported_surfaces_leaf_named()
+-> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "identity.go",
+        concat!(
+            "package proof\n",
+            "type (\n",
+            "    Left struct{}\n",
+            "    Right struct{}\n",
+            "    Generic[T any] struct{}\n",
+            ")\n",
+            "func (Left) Same() {}\n",
+            "func (*Right) Same() {}\n",
+            "func (Left) Duplicate() {}\n",
+            "func (*Left) Duplicate() {}\n",
+            "func (Generic[T]) GenericMethod() {}\n",
+            "func (external.Left) QualifiedMethod() {}\n",
+            "func (**Left) MultiplyIndirectMethod() {}\n",
+            "func ([]Left) CompositeMethod() {}\n",
+            "func (first, second Left) MultipleNamesMethod() {}\n",
+            "func (first Left, second Right) MultipleParametersMethod() {}\n",
+            "func () MissingReceiverMethod() {}\n",
+            "func plain() {}\n",
+            "type Contract interface { InterfaceMethod() }\n",
+            "func (Left) BrokenMethod( {}\n",
+        ),
+    )])?;
+
+    let method_nodes = |name: &str| {
+        nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name == name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(method_nodes("Left.Same").len(), 1);
+    assert_eq!(method_nodes("Right.Same").len(), 1);
+    let duplicates = method_nodes("Left.Duplicate");
+    assert_eq!(duplicates.len(), 2, "{duplicates:#?}");
+    assert_ne!(duplicates[0].id, duplicates[1].id);
+    assert_ne!(duplicates[0].canonical_id, duplicates[1].canonical_id);
+
+    for unsupported in [
+        "Generic.GenericMethod",
+        "Left.QualifiedMethod",
+        "Left.MultiplyIndirectMethod",
+        "Left.CompositeMethod",
+        "Left.MultipleNamesMethod",
+        "Right.MultipleParametersMethod",
+        "Left.MissingReceiverMethod",
+        "Left.BrokenMethod",
+    ] {
+        assert!(
+            nodes.iter().all(|node| {
+                node.serialized_name != unsupported
+                    && node.qualified_name.as_deref() != Some(unsupported)
+            }),
+            "unsupported receiver syntax gained identity `{unsupported}`"
+        );
+        assert!(
+            edges.iter().all(|edge| {
+                edge.kind != EdgeKind::MEMBER
+                    || nodes.iter().all(|node| {
+                        node.id != edge.target
+                            || node.serialized_name != unsupported
+                            || node.qualified_name.as_deref() != Some(unsupported)
+                    })
+            }),
+            "unsupported receiver syntax gained MEMBER `{unsupported}`"
+        );
+    }
+    assert!(has_node_kind(&nodes, "plain", NodeKind::FUNCTION));
+    assert!(has_node_kind(
+        &nodes,
+        "Contract.InterfaceMethod",
+        NodeKind::METHOD
+    ));
+    assert!(edge_between(
+        &nodes,
+        &edges,
+        EdgeKind::MEMBER,
+        "Contract",
+        "Contract.InterfaceMethod"
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn go_method_identity_is_stable_across_file_order() -> anyhow::Result<()> {
+    let owners = "package proof\ntype (\n    First struct{}\n    Second struct{}\n)\n";
+    let methods = concat!(
+        "package proof\n",
+        "func (First) Same() {}\n",
+        "func (*Second) Same() {}\n",
+    );
+    let (forward, _) = index_project(&[("owners.go", owners), ("methods.go", methods)])?;
+    let (reverse, _) = index_project(&[("methods.go", methods), ("owners.go", owners)])?;
+
+    let identities = |nodes: &[Node]| {
+        let mut rows = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::METHOD
+                    && matches!(node.serialized_name.as_str(), "First.Same" | "Second.Same")
+            })
+            .map(|node| {
+                (
+                    node.serialized_name.clone(),
+                    node.qualified_name.clone(),
+                    node.canonical_id.as_deref().and_then(|canonical_id| {
+                        canonical_id
+                            .split_once("methods.go:")
+                            .map(|(_, identity)| identity.to_string())
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            rows.len(),
+            2,
+            "missing receiver-qualified identities: {rows:#?}"
+        );
+        rows
+    };
+    assert_eq!(identities(&forward), identities(&reverse));
+    Ok(())
+}
+
+#[test]
+fn go_method_member_ownership_ignores_local_type_shadows_in_both_orders() -> anyhow::Result<()> {
+    for source in [
+        concat!(
+            "package proof\n",
+            "func local() { type Owner struct{} }\n",
+            "func (Owner) Before() {}\n",
+            "type (\n",
+            "    Owner struct{}\n",
+            "    Sibling struct{}\n",
+            ")\n",
+            "func (*Owner) After() {}\n",
+            "func (Sibling) SiblingMethod() {}\n",
+        ),
+        concat!(
+            "package proof\n",
+            "func (Owner) Before() {}\n",
+            "type (\n",
+            "    Sibling struct{}\n",
+            "    Owner struct{}\n",
+            ")\n",
+            "func local() { type Owner struct{} }\n",
+            "func (*Owner) After() {}\n",
+            "func (Sibling) SiblingMethod() {}\n",
+        ),
+    ] {
+        let (nodes, edges) = index_project(&[("owners.go", source)])?;
+        for method in ["Owner.Before", "Owner.After", "Sibling.SiblingMethod"] {
+            assert!(
+                edge_between(
+                    &nodes,
+                    &edges,
+                    EdgeKind::MEMBER,
+                    method.split('.').next().unwrap(),
+                    method
+                ),
+                "package owner lost exact MEMBER for {method}: {edges:#?}"
+            );
+        }
+    }
+
+    let (local_only_nodes, local_only_edges) = index_project(&[(
+        "local-only.go",
+        concat!(
+            "package proof\n",
+            "func local() { type LocalOnly struct{} }\n",
+            "func (LocalOnly) Method() {}\n",
+        ),
+    )])?;
+    assert!(has_node_kind(
+        &local_only_nodes,
+        "LocalOnly.Method",
+        NodeKind::METHOD
+    ));
+    assert!(
+        !edge_between(
+            &local_only_nodes,
+            &local_only_edges,
+            EdgeKind::MEMBER,
+            "LocalOnly",
+            "LocalOnly.Method"
+        ),
+        "a block-local type must not own a package method"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_cross_file_identity_ignores_local_shadows_and_duplicate_package_owners() -> anyhow::Result<()>
+{
+    let cross_files = [
+        (
+            "local.go",
+            "package proof\nfunc local() { type CrossOwner struct{} }\n",
+        ),
+        ("owner.go", "package proof\ntype CrossOwner struct{}\n"),
+        (
+            "method.go",
+            "package proof\nfunc (*CrossOwner) CrossFile() {}\n",
+        ),
+    ];
+    for files in [
+        cross_files,
+        [cross_files[2], cross_files[1], cross_files[0]],
+    ] {
+        let (nodes, edges) = index_project(&files)?;
+        assert!(has_node_kind(
+            &nodes,
+            "CrossOwner.CrossFile",
+            NodeKind::METHOD
+        ));
+        assert!(!edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::MEMBER,
+            "CrossOwner",
+            "CrossOwner.CrossFile"
+        ));
+    }
+
+    let (duplicate_nodes, duplicate_edges) = index_project(&[(
+        "duplicate.go",
+        concat!(
+            "package proof\n",
+            "type Duplicate struct{}\n",
+            "type Duplicate struct{}\n",
+            "func (Duplicate) Method() {}\n",
+        ),
+    )])?;
+    assert!(has_node_kind(
+        &duplicate_nodes,
+        "Duplicate.Method",
+        NodeKind::METHOD
+    ));
+    assert!(!edge_between(
+        &duplicate_nodes,
+        &duplicate_edges,
+        EdgeKind::MEMBER,
+        "Duplicate",
+        "Duplicate.Method"
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_rust_cross_file_inherent_impl_attaches_members_to_declared_type() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[
         ("main.rs", "mod a; mod b;\n"),

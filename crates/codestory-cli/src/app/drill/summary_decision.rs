@@ -1,33 +1,42 @@
 use super::super::resolution::quote_command_path;
-use super::summary_evidence::drill_bridge_status_is_graph;
+use super::summary_evidence::{
+    drill_bridge_command_status_is_unavailable, drill_bridge_status_is_graph,
+};
 use crate::args::{
-    DrillOutput, DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput,
-    DrillSummaryVerdictOutput, VerificationTargetOutput,
+    DrillOutput, DrillSummaryAvailabilityOutput, DrillSummaryEvidenceTargetOutput,
+    DrillSummaryStatsOutput, VerificationTargetOutput,
 };
 use codestory_contracts::api::{IndexFreshnessDto, IndexFreshnessStatusDto};
+use codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto;
 use std::fmt::Write as _;
 
-pub(super) struct DrillVerdictEvidence {
+pub(super) struct DrillAvailabilityEvidence {
     pub(super) resolved_anchors: usize,
     pub(super) graph_path_bridges: usize,
     pub(super) partial_bridges: usize,
     pub(super) unresolved_or_error_bridges: usize,
-    pub(super) needs_source_truth: bool,
-    pub(super) open_gap_friendly: bool,
+    pub(super) packet_availability: EvidenceAvailabilityV3Dto,
+    pub(super) evidence_count: usize,
+    pub(super) gap_count: usize,
+    pub(super) continuation_available: bool,
+    pub(super) pending_target_count: usize,
     pub(super) stale_freshness: bool,
 }
 
-pub(super) fn drill_summary_verdict(
+pub(super) fn drill_summary_availability(
     output: &DrillOutput,
-    evidence: DrillVerdictEvidence,
-) -> DrillSummaryVerdictOutput {
-    let DrillVerdictEvidence {
+    evidence: DrillAvailabilityEvidence,
+) -> DrillSummaryAvailabilityOutput {
+    let DrillAvailabilityEvidence {
         resolved_anchors,
         graph_path_bridges,
         partial_bridges,
         unresolved_or_error_bridges,
-        needs_source_truth,
-        open_gap_friendly,
+        packet_availability,
+        evidence_count,
+        gap_count,
+        continuation_available,
+        pending_target_count,
         stale_freshness,
     } = evidence;
     let failed_anchor_commands = output
@@ -38,58 +47,97 @@ pub(super) fn drill_summary_verdict(
         .count();
     let unresolved_anchors = output.anchors.len().saturating_sub(resolved_anchors);
     if output.mechanical.after_files == 0 || output.mechanical.after_errors > 0 {
-        return DrillSummaryVerdictOutput {
-            status: "blocked".to_string(),
-            reason: "index is not ready or contains indexing errors".to_string(),
-            next_action: "inspect doctor/index output before trusting drill evidence".to_string(),
+        return DrillSummaryAvailabilityOutput {
+            status: "unavailable".to_string(),
+            reason: "indexed evidence is unavailable or indexing errors were observed".to_string(),
+            next_action: "inspect doctor/index output before using drill evidence".to_string(),
+        };
+    }
+    if matches!(
+        &packet_availability,
+        EvidenceAvailabilityV3Dto::Unavailable | EvidenceAvailabilityV3Dto::NoUsefulEvidence
+    ) {
+        let packet_availability = match packet_availability {
+            EvidenceAvailabilityV3Dto::NoUsefulEvidence => "no_useful_evidence",
+            EvidenceAvailabilityV3Dto::Unavailable => "unavailable",
+            EvidenceAvailabilityV3Dto::Available
+            | EvidenceAvailabilityV3Dto::ContinuationAvailable => unreachable!(),
+        };
+        return DrillSummaryAvailabilityOutput {
+            status: "unavailable".to_string(),
+            reason: format!(
+                "packet_availability={packet_availability} evidence={evidence_count} gaps={gap_count}"
+            ),
+            next_action: "inspect the published packet gaps and collect additional evidence"
+                .to_string(),
         };
     }
     if unresolved_anchors > 0 || failed_anchor_commands > 0 {
-        return DrillSummaryVerdictOutput {
-            status: "blocked".to_string(),
+        return DrillSummaryAvailabilityOutput {
+            status: if evidence_count == 0 {
+                "unavailable"
+            } else {
+                "partial"
+            }
+            .to_string(),
             reason: format!(
-                "unresolved_anchors={unresolved_anchors} failed_anchor_commands={failed_anchor_commands}"
+                "packet_evidence={evidence_count} unresolved_anchors={unresolved_anchors} failed_anchor_commands={failed_anchor_commands}"
             ),
-            next_action: "repair anchor selection or inspect command errors before answering"
+            next_action: "inspect anchor selection and command errors before using the evidence"
                 .to_string(),
         };
     }
     if stale_freshness {
-        return DrillSummaryVerdictOutput {
-            status: "degraded".to_string(),
+        return DrillSummaryAvailabilityOutput {
+            status: "partial".to_string(),
             reason: format!(
-                "index_freshness=stale source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
-                needs_source_truth,
+                "index_freshness=stale packet_evidence={evidence_count} packet_gaps={gap_count} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_evidence_targets={pending_target_count}",
                 output.bridges.len(),
-                output.verification_targets.len()
             ),
             next_action: drill_stale_freshness_next_action(output),
         };
     }
-    if needs_source_truth || open_gap_friendly || unresolved_or_error_bridges > 0 {
-        return DrillSummaryVerdictOutput {
-            status: "degraded".to_string(),
+    if packet_availability == EvidenceAvailabilityV3Dto::ContinuationAvailable
+        || continuation_available
+        || gap_count > 0
+        || unresolved_or_error_bridges > 0
+    {
+        let partial_evidence = DrillAvailabilityEvidence {
+            resolved_anchors,
+            graph_path_bridges,
+            partial_bridges,
+            unresolved_or_error_bridges,
+            packet_availability,
+            evidence_count,
+            gap_count,
+            continuation_available,
+            pending_target_count,
+            stale_freshness,
+        };
+        return DrillSummaryAvailabilityOutput {
+            status: "partial".to_string(),
             reason: format!(
-                "source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
-                needs_source_truth,
+                "packet_evidence={evidence_count} packet_gaps={gap_count} continuation_available={continuation_available} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_evidence_targets={pending_target_count}",
                 output.bridges.len(),
-                output.verification_targets.len()
             ),
-            next_action: drill_degraded_next_action(output, unresolved_or_error_bridges),
+            next_action: drill_partial_next_action(output, &partial_evidence),
         };
     }
-    DrillSummaryVerdictOutput {
-        status: "ready".to_string(),
-        reason: "all anchors resolved and no open source-truth blockers were reported".to_string(),
-        next_action: "answer from the evidence packet and keep source verification focused"
-            .to_string(),
+    DrillSummaryAvailabilityOutput {
+        status: "available".to_string(),
+        reason: format!(
+            "closed_v3_packet_availability=available evidence={evidence_count} gaps={gap_count}"
+        ),
+        next_action:
+            "review the published evidence rows; availability does not establish answer correctness"
+                .to_string(),
     }
 }
 
 pub(super) fn drill_stale_freshness_next_action(output: &DrillOutput) -> String {
     let project = quote_command_path(std::path::Path::new(&output.project));
     let mut action = format!(
-        "refresh stale index evidence first with `codestory-cli index --project {project} --refresh incremental`, then rerun drill before finalizing"
+        "refresh stale index evidence first with `codestory-cli index --project {project} --refresh incremental`, then rerun drill before using the evidence"
     );
     if let Some(freshness) = output.mechanical.freshness.as_ref() {
         let samples = freshness
@@ -105,26 +153,29 @@ pub(super) fn drill_stale_freshness_next_action(output: &DrillOutput) -> String 
     action
 }
 
-pub(super) fn drill_degraded_next_action(
+pub(super) fn drill_partial_next_action(
     output: &DrillOutput,
-    unresolved_or_error_bridges: usize,
+    evidence: &DrillAvailabilityEvidence,
 ) -> String {
     let failed_bridge_count = output
         .bridges
         .iter()
-        .filter(|bridge| bridge.command.status != "ok" || bridge.evidence.status == "error")
+        .filter(|bridge| {
+            drill_bridge_command_status_is_unavailable(&bridge.command.status)
+                || bridge.evidence.status == "error"
+        })
         .count();
     if failed_bridge_count > 0 {
         return format!(
-            "repair or rerun {failed_bridge_count} failed bridge evidence command(s) before treating degraded bridges as verification targets"
+            "inspect or rerun {failed_bridge_count} failed bridge evidence command(s) before using those bridge observations"
         );
     }
-    let degraded_bridge_count = output
+    let partial_bridge_count = output
         .bridges
         .iter()
         .filter(|bridge| !drill_bridge_status_is_graph(&bridge.evidence.status))
         .count()
-        .max(unresolved_or_error_bridges);
+        .max(evidence.unresolved_or_error_bridges);
     let mut files = output
         .verification_targets
         .iter()
@@ -132,38 +183,25 @@ pub(super) fn drill_degraded_next_action(
         .collect::<Vec<_>>();
     dedupe_and_rank_drill_files(&mut files);
 
-    let mut action = "write a CodeStory-only draft".to_string();
-    let pending_claim_count = output.evidence_packet.disposition.omission_receipts.len();
-    if pending_claim_count > 0 && degraded_bridge_count > 0 {
-        let _ = write!(
-            action,
-            ", then verify {pending_claim_count} pending claim(s), starting with {degraded_bridge_count} degraded bridge(s)"
-        );
-    } else if pending_claim_count > 0 {
-        let _ = write!(
-            action,
-            ", then verify {pending_claim_count} pending claim(s)"
-        );
-    } else if degraded_bridge_count > 0 {
-        let _ = write!(
-            action,
-            ", then verify {degraded_bridge_count} degraded bridge(s)"
-        );
+    let mut action = if evidence.continuation_available {
+        "request the published packet continuation".to_string()
+    } else if evidence.gap_count > 0 {
+        format!("inspect {} published packet gap(s)", evidence.gap_count)
+    } else if partial_bridge_count > 0 {
+        format!("inspect {partial_bridge_count} partial bridge observation(s)")
     } else {
-        action.push_str(", then verify source-truth targets");
+        "inspect the partial packet evidence".to_string()
+    };
+    if evidence.pending_target_count > 0 {
+        let _ = write!(
+            action,
+            ", including {} evidence target(s)",
+            evidence.pending_target_count
+        );
     }
     if !files.is_empty() {
         let preview = files.into_iter().take(3).collect::<Vec<_>>().join("; ");
         let _ = write!(action, " including {preview}");
-    }
-    if output
-        .evidence_packet
-        .disposition
-        .drill
-        .as_ref()
-        .is_some_and(|drill| !drill.options.is_empty())
-    {
-        action.push_str("; execute the listed packet drill option ids once before finalizing");
     }
     action
 }
@@ -229,24 +267,24 @@ pub(super) fn drill_suite_retrieval_label(status: Option<&str>) -> &str {
     }
 }
 
-pub(super) fn drill_summary_source_truth_target_details(
+pub(super) fn drill_summary_evidence_target_details(
     target_files: &[String],
     targets: &[VerificationTargetOutput],
-) -> Vec<DrillSummarySourceTruthTargetOutput> {
+) -> Vec<DrillSummaryEvidenceTargetOutput> {
     target_files
         .iter()
         .map(|path| {
-            let check_reasons = targets
+            let evidence_reasons = targets
                 .iter()
                 .filter(|target| normalize_drill_path(&target.path) == normalize_drill_path(path))
                 .map(|target| target.reason.clone())
                 .collect::<Vec<_>>();
-            let role = drill_source_truth_target_role(path, &check_reasons);
-            DrillSummarySourceTruthTargetOutput {
+            let role = drill_source_truth_target_role(path, &evidence_reasons);
+            DrillSummaryEvidenceTargetOutput {
                 path: path.clone(),
                 role: role.clone(),
                 rank_reason: drill_source_truth_target_rank_reason(path, &role),
-                check_reasons,
+                evidence_reasons,
             }
         })
         .collect()

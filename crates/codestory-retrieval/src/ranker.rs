@@ -271,7 +271,6 @@ fn build_rank_features(
         + 0.25 * definition_quality)
         .clamp(0.0, 1.0);
     let requested_role_agreement = requested_role_agreement(
-        &query.intent.evidence_roles,
         &query.intent.structural_kinds,
         &path_lower,
         &symbol_lower,
@@ -301,16 +300,12 @@ fn candidate_has_typed_graph_support(candidate: &CandidateHit) -> bool {
 }
 
 fn requested_role_agreement(
-    evidence_roles: &[String],
     structural_kinds: &[String],
     path_lower: &str,
     symbol_lower: &str,
     structural_kind: Option<NodeKind>,
 ) -> f32 {
-    let requested = evidence_roles
-        .iter()
-        .chain(structural_kinds)
-        .collect::<Vec<_>>();
+    let requested = structural_kinds.iter().collect::<Vec<_>>();
     if requested.is_empty() {
         return 0.0;
     }
@@ -654,6 +649,10 @@ mod tests {
         let features = classify_query("UserService class method");
         let mut structural = CandidateHit::lexical_stub("schema/users.sql", 0.99);
         let mut graph = CandidateHit::lexical_stub("src/user_service.rs", 0.8);
+        // Overlap is identity on the indexed symbol, not a prompt role taxonomy
+        // matching path stems such as `users`.
+        graph.symbol_name = Some("UserService".to_string());
+        graph.node_id = Some("42".to_string());
         structural.source = CandidateSource::Lexical;
         graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);

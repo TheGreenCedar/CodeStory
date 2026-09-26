@@ -64,9 +64,41 @@ pub(crate) fn install_process_diagnostics() {
 /// process records evidence and stops.
 fn install_activation_fail_stop_hook() {
     codestory_runtime::set_activation_fail_stop_hook(Some(Arc::new(|reason_code: &str| {
-        record_fail_stop(reason_code);
-        std::process::abort();
+        fail_stop_process(reason_code);
     })));
+}
+
+/// Record best-effort fail-stop evidence, then make this process observably gone.
+///
+/// On Windows, CRT `abort()` can stall inside Windows Error Reporting once
+/// native accelerator libraries are loaded. Packaged qualification waits for
+/// the exact PID to exit after an accepted `crash_server`, so fail-stop must
+/// terminate without CRT teardown. Unix keeps `abort()`.
+pub(crate) fn fail_stop_process(reason_code: &str) -> ! {
+    record_fail_stop(reason_code);
+    immediate_process_abort();
+}
+
+fn immediate_process_abort() -> ! {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // STATUS_FATAL_APP_EXIT — recognizable, non-success, and unused by the
+        // crash-exit waiter (which only needs the process object to end).
+        const FAIL_STOP_EXIT_CODE: u32 = 0x4000_0001;
+        unsafe {
+            let _ = TerminateProcess(GetCurrentProcess(), FAIL_STOP_EXIT_CODE);
+        }
+        // TerminateProcess is requested asynchronously for the calling thread
+        // until the kernel finishes tearing the process down.
+        loop {
+            std::thread::park();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::abort()
+    }
 }
 
 pub(crate) fn record_command_failure(error: &anyhow::Error) {
@@ -95,7 +127,7 @@ pub(crate) fn record_fail_stop(reason_code: &str) {
             "reason_code": reason_code,
         }));
         // Fail-stop evidence never waits for or appends to the rotating log.
-        // The caller aborts after the fixed outer deadline even when this
+        // The caller terminates after the fixed outer deadline even when this
         // best-effort marker attempt is stalled in the filesystem.
         let _ = sink.write_fail_stop_marker(&record);
     });
@@ -424,7 +456,11 @@ impl Visit for DiagnosticVisitor {
         self.insert_typed(field, Value::from(value));
     }
 
-    fn record_str(&mut self, field: &Field, _value: &str) {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if is_raf_identity_digest_field(field.name()) && is_raf_identity_digest_list(value) {
+            self.insert_typed(field, Value::from(value));
+            return;
+        }
         self.insert_redacted(field);
     }
 
@@ -466,6 +502,27 @@ fn safe_diagnostic_token(value: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')))
     .then_some(value)
+}
+
+fn is_raf_identity_digest_field(name: &str) -> bool {
+    matches!(
+        name,
+        "raf_ranked_identity_digests"
+            | "raf_admitted_identity_digests"
+            | "raf_final_identity_digests"
+    )
+}
+
+fn is_raf_identity_digest_list(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    value.split(',').all(|part| {
+        part.len() == 16
+            && part
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 fn bounded_text(value: &str) -> String {
@@ -674,6 +731,185 @@ mod tests {
         assert_eq!(rows[0]["fields"]["numeric_code"], 17);
         assert_eq!(rows[0]["fields"]["retryable"], true);
         assert_eq!(rows[0]["correlation_id"], "test-correlation");
+        Ok(())
+    }
+
+    #[test]
+    fn packet_entry_observation_emits_one_typed_outer_scope_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-correlation".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        tracing::subscriber::with_default(subscriber, || {
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+            let _outer = codestory_runtime::enter_packet_latency_scope(Some(2_000));
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+            {
+                let _nested = codestory_runtime::enter_packet_latency_scope(Some(120_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationJoinedRunning,
+                );
+            }
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(rows.len(), 1, "only the outer packet scope emits a receipt");
+        let fields = &rows[0]["fields"];
+        assert!(
+            fields["packet_entry_observation_id"]
+                .as_u64()
+                .is_some_and(|id| id > 0)
+        );
+        assert_eq!(fields["target_ms"], 2_000);
+        assert_eq!(fields["activation_join_count"], 1);
+        assert_eq!(fields["public_admission_reached_count"], 0);
+        assert_eq!(fields["public_admission_passed_count"], 0);
+        assert_eq!(fields["public_admission_refused_count"], 0);
+        assert_eq!(fields["attempt_started_count"], 0);
+        assert_eq!(fields["retry_publication_changed_count"], 0);
+        assert_eq!(fields["retry_cache_busy_count"], 0);
+        assert_eq!(fields["descriptor_preadmission_observed_count"], 0);
+        assert_eq!(fields["descriptor_preadmission_query_count"], 0);
+        assert_eq!(fields["descriptor_health_resolution_wall_ms"], 0);
+        assert_eq!(fields["descriptor_query_batch_wall_ms"], 0);
+        assert_eq!(fields["descriptor_query_plan_wall_ms"], 0);
+        assert_eq!(fields["descriptor_lexical_wall_ms"], 0);
+        assert_eq!(fields["descriptor_dense_semantic_wall_ms"], 0);
+        assert_eq!(fields["descriptor_admission_seal_wall_ms"], 0);
+        assert_eq!(fields["descriptor_deferred_readiness_wall_ms"], 0);
+        assert_eq!(fields["descriptor_remaining_before_handoff_ms"], 0);
+        assert_eq!(
+            fields["descriptor_preadmit_runtime_phases_observed_count"],
+            0
+        );
+        assert_eq!(fields["raf_ranked_admitted_observed_count"], 0);
+        assert_eq!(fields["raf_ranked_pool_count"], 0);
+        assert_eq!(fields["raf_ranked_recorded_count"], 0);
+        assert_eq!(fields["raf_admitted_count"], 0);
+        assert_eq!(fields["raf_final_observed_count"], 0);
+        assert_eq!(fields["raf_final_support_count"], 0);
+        assert_eq!(fields["raf_final_recorded_count"], 0);
+        assert_eq!(fields["raf_ranked_identity_digests"], "");
+        assert_eq!(fields["raf_admitted_identity_digests"], "");
+        assert_eq!(fields["raf_final_identity_digests"], "");
+        assert_eq!(fields["complete_core_snapshot_started_count"], 0);
+        assert_eq!(fields["complete_core_snapshot_succeeded_count"], 0);
+        assert_eq!(fields["complete_core_snapshot_ms"], 0);
+        assert_eq!(fields["uncached_freshness_started_count"], 0);
+        assert_eq!(fields["uncached_freshness_succeeded_count"], 0);
+        assert_eq!(fields["uncached_freshness_ms"], 0);
+        assert_eq!(fields["retrieval_pin_started_count"], 0);
+        assert_eq!(fields["retrieval_pin_succeeded_count"], 0);
+        assert_eq!(fields["retrieval_pin_ms"], 0);
+        assert_eq!(fields["build_callback_started_count"], 0);
+        assert_eq!(fields["build_callback_succeeded_count"], 0);
+        assert_eq!(fields["build_callback_ms"], 0);
+        assert_eq!(fields["post_build_freshness_started_count"], 0);
+        assert_eq!(fields["post_build_freshness_succeeded_count"], 0);
+        assert_eq!(fields["post_build_freshness_ms"], 0);
+        assert_eq!(fields["pin_begin_started_count"], 0);
+        assert_eq!(fields["pin_begin_succeeded_count"], 0);
+        assert_eq!(fields["pin_begin_ms"], 0);
+        assert_eq!(fields["pin_revalidation_started_count"], 0);
+        assert_eq!(fields["pin_revalidation_succeeded_count"], 0);
+        assert_eq!(fields["pin_revalidation_ms"], 0);
+        assert_ne!(fields["phase_mask"], 0);
+        assert_eq!(fields["message"], REDACTED);
+        assert_eq!(rows[0]["correlation_id"], "packet-entry-correlation");
+        Ok(())
+    }
+
+    #[test]
+    fn packet_entry_raf_identity_digest_lists_survive_diagnostic_redaction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-raf".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        let ranked = "0123456789abcdef,fedcba9876543210";
+        let admitted = "0123456789abcdef";
+        let final_support = "0123456789abcdef,aaaaaaaaaaaaaaaa";
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                raf_ranked_identity_digests = ranked,
+                raf_admitted_identity_digests = admitted,
+                raf_final_identity_digests = final_support,
+                query = "must stay redacted",
+                "packet entry observation"
+            );
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(rows.len(), 1);
+        let fields = &rows[0]["fields"];
+        assert_eq!(fields["raf_ranked_identity_digests"], ranked);
+        assert_eq!(fields["raf_admitted_identity_digests"], admitted);
+        assert_eq!(fields["raf_final_identity_digests"], final_support);
+        assert_eq!(fields["query"], "[redacted]");
+        assert_eq!(fields["message"], REDACTED);
+        Ok(())
+    }
+
+    #[test]
+    fn packet_entry_observation_unwind_isolates_the_next_outer_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sink = Arc::new(DiagnosticSink::new(
+            directory.path().to_path_buf(),
+            "packet-entry-unwind".into(),
+            DEFAULT_LOG_BYTES,
+        ));
+        let subscriber = Registry::default()
+            .with(DiagnosticLayer::new(Arc::clone(&sink)).with_filter(LevelFilter::WARN));
+        tracing::subscriber::with_default(subscriber, || {
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _first = codestory_runtime::enter_packet_latency_scope(Some(2_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+                );
+                panic!("exercise packet observation unwind cleanup");
+            }));
+            assert!(unwind.is_err());
+
+            {
+                let _second = codestory_runtime::enter_packet_latency_scope(Some(4_000));
+                codestory_runtime::observe_packet_entry_phase(
+                    codestory_runtime::PacketEntryObservationPhase::ActivationJoinedRunning,
+                );
+            }
+            codestory_runtime::observe_packet_entry_phase(
+                codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
+            );
+        });
+
+        let rows = read_jsonl(&sink.log_path())?;
+        assert_eq!(
+            rows.len(),
+            2,
+            "nonpacket observation must not emit a receipt"
+        );
+        let first = &rows[0]["fields"];
+        let second = &rows[1]["fields"];
+        assert_eq!(first["target_ms"], 2_000);
+        assert_eq!(first["phase_mask"], 1);
+        assert_eq!(second["target_ms"], 4_000);
+        assert_eq!(second["phase_mask"], 1_u64 << 3);
+        assert_eq!(second["activation_join_count"], 1);
+        assert_ne!(
+            first["packet_entry_observation_id"], second["packet_entry_observation_id"],
+            "each outer packet scope needs a distinct request sequence"
+        );
+        assert_eq!(second["project_selection_completed_ms"], 0);
         Ok(())
     }
 

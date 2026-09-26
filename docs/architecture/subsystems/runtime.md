@@ -16,8 +16,12 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - grounding, trails, symbol workflows, target context, search, and packet
   assembly;
 - one packet-probe normalization and resolution path for exact paths, stable
-  symbol IDs, file-scoped symbols, free queries, and generation-bound
-  continuations;
+  symbol IDs, qualified symbols, file-scoped symbols, free queries, and
+  generation-bound continuations;
+- one descriptor-only admission pass across the unchanged question and all
+  typed free queries before candidate source or graph hydration;
+- assembly of `PacketCompilationInputV1` and projection of the pure compiler's
+  bounded evidence product;
 - managed retrieval preparation and user-facing gap mapping;
 - generation-coherent candidate resolution and one bounded publication retry.
 
@@ -33,11 +37,26 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Publication contract
 
+A complete core publication may retain verified malformed UTF-8 source with a
+`malformed` coverage gap. It retains the file identity and content digest, not
+structural units, symbol documents, or proof facts. Both full and incremental
+refresh reverify those bytes before publication. A transition from valid to
+malformed removes the old projection; unchanged malformed source does not
+trigger a retry. Unreadable source, incomplete discovery, source drift, and
+collector failures still prevent publication.
+
 Runtime publishes the core index through store, then asks retrieval to finalize
 immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
 requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
+
+Cache rehydrate selects its source's physical core generation after taking the
+source writer guard. Schema, file count, freshness, space accounting, and the
+snapshot copy use that one database; workspace-owned exclusions still use the
+logical cache path. An absent target is checked for capacity through an
+existing filesystem ancestor before its persistent writer lock is created,
+then checked again under that lock before staging.
 
 Work that one publication fixes is cached against that publication's identity
 rather than repeated per pin. The canonical symbol-name map is the example: it
@@ -58,6 +77,13 @@ convention: `index_full_for_runtime` and `index_incremental_for_runtime` demand
 an `AnnotationsOwned`, which only
 `ensure_annotations_owned_before_core_replacement` can mint. A future refresh
 entry point that forgets the cutover does not compile.
+
+The controller rebinding pass runs after a committed core independently of
+resident cache refresh. If it fails, the saved annotation evidence remains at
+its last verified generation; full, incremental, and semantic-only core writers
+must catch up against the current complete core before advancing again. Legacy
+or interrupted standalone cores without a complete generation remain eligible
+for managed recovery.
 
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
@@ -92,8 +118,9 @@ retrieval index command publishes a matching generation.
 - keep command parsing/rendering in CLI and persistence in store;
 - extend packet/search through the existing retrieval-primary path rather than
   creating a second scoring or readiness system.
-- keep probe resolution metadata diagnostic: a requested probe may add evidence
-  work but cannot promote sufficiency or invent route order.
+- keep probe resolution metadata diagnostic: a requested probe may constrain
+  exact identity resolution but cannot promote rank, materiality, sufficiency,
+  or an answer-stage order.
 
 ## Failure signatures
 
@@ -101,3 +128,19 @@ retrieval index command publishes a matching generation.
 - candidate IDs resolve against whatever core database is current;
 - core indexing success is reported as full retrieval readiness;
 - a project operation mutates per-user server or process defaults.
+
+## Indexed call-path verification
+
+The hidden call-path kernel shares one request budget across strict search,
+exclusion-tolerant search, reachable prefixes and final fact/state scans. Its
+32,768 work units include deterministic ordering allowances; sorting and
+retained prefix storage are limited to 1,024 entries. Prefixes retain complete
+receipt and edge histories, with quota reserved before copying them. Exhaustion
+returns `Unknown` with `kernel_search_budget_exceeded` and no connected receipts;
+an incomplete search establishes neither a longest prefix nor a refutation.
+Known input unavailability precedes exploration. An input exceeding the budget
+just to scan fails closed without inferring an unscanned unavailable suffix.
+The public `verify_indexed_direct_calls` operation uses this kernel; the
+qualification driver inspects its detailed traces through an optional feature.
+The bound applies to call-path verification, not packet/search latency or
+runtime execution.

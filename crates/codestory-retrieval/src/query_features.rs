@@ -50,8 +50,6 @@ pub struct QueryIntent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ordered_flow_stages: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_roles: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structural_kinds: Vec<String>,
     #[serde(default)]
     pub lookup_mode: QueryLookupMode,
@@ -188,36 +186,6 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         && normalized_tokens
             .iter()
             .any(|token| ORDERED_FLOW_WORDS.contains(&token.as_str()));
-    let evidence_roles = unique_labels(
-        normalized_tokens
-            .iter()
-            .filter(|token| {
-                matches!(
-                    token.as_str(),
-                    "adapter"
-                        | "controller"
-                        | "dispatch"
-                        | "dispatcher"
-                        | "driver"
-                        | "entrypoint"
-                        | "executor"
-                        | "handler"
-                        | "indexer"
-                        | "parser"
-                        | "reader"
-                        | "retrieval"
-                        | "router"
-                        | "runner"
-                        | "search"
-                        | "service"
-                        | "storage"
-                        | "store"
-                        | "worker"
-                        | "writer"
-                )
-            })
-            .cloned(),
-    );
     let structural_kinds = unique_labels(
         normalized_tokens
             .iter()
@@ -233,7 +201,6 @@ pub fn classify_query(query: &str) -> QueryFeatures {
                         | "method"
                         | "module"
                         | "namespace"
-                        | "route"
                         | "struct"
                         | "trait"
                 )
@@ -247,7 +214,6 @@ pub fn classify_query(query: &str) -> QueryFeatures {
                 token.len() >= 3
                     && !QUERY_STOPWORDS.contains(&token.as_str())
                     && !relations.iter().any(|relation| relation == *token)
-                    && !evidence_roles.iter().any(|role| role == *token)
                     && !structural_kinds.iter().any(|kind| kind == *token)
             })
             .cloned(),
@@ -273,7 +239,6 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         concepts,
         relations,
         ordered_flow_stages,
-        evidence_roles,
         structural_kinds,
         lookup_mode,
     };
@@ -549,12 +514,7 @@ mod tests {
         assert_eq!(features.intent.exact_symbols, ["SearchWorker"]);
         assert_eq!(features.intent.paths, ["src/worker.rs"]);
         assert!(features.intent.relations.contains(&"calls".to_string()));
-        assert!(
-            features
-                .intent
-                .evidence_roles
-                .contains(&"worker".to_string())
-        );
+        assert!(features.intent.concepts.contains(&"worker".to_string()));
         assert_eq!(features.intent.lookup_mode, QueryLookupMode::Relation);
     }
 
@@ -565,18 +525,8 @@ mod tests {
         );
 
         assert_eq!(features.intent.lookup_mode, QueryLookupMode::OrderedFlow);
-        assert!(
-            features
-                .intent
-                .evidence_roles
-                .contains(&"driver".to_string())
-        );
-        assert!(
-            features
-                .intent
-                .evidence_roles
-                .contains(&"worker".to_string())
-        );
+        assert!(features.intent.concepts.contains(&"driver".to_string()));
+        assert!(features.intent.concepts.contains(&"worker".to_string()));
         assert!(
             features
                 .intent

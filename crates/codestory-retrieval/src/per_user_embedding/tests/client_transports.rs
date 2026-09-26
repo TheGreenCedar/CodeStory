@@ -48,7 +48,8 @@ impl EmbeddingClientTransport for ClientTestTransport {
             ScriptOutcome::Success
         };
         Ok(EmbeddingConnectOutcome::Connected(Box::new(
-            ScriptStream::new(outcome, self.compatibility.clone()),
+            ScriptStream::new(outcome, self.compatibility.clone())
+                .with_server_instance(format!("server-{attempt}")),
         )))
     }
 
@@ -142,6 +143,8 @@ pub(super) enum BootstrapConnectOutcome {
     Loss,
     WriteDisconnect,
     HelloLoss,
+    HelloCapacity,
+    HelloHandlerCapacity,
     NoOwner,
     OwnerUnresponsive,
 }
@@ -246,15 +249,19 @@ impl EmbeddingClientTransport for DeadlineBudgetTransport {
         _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
     ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
         let attempt = self.connect_count.fetch_add(1, Ordering::AcqRel) + 1;
+        let server_generation = self.spawn_count.load(Ordering::Acquire) + 1;
         Ok(match attempt {
-            1 => EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
-                ScriptOutcome::TimedBulk {
-                    hello_delay: Duration::from_millis(200),
-                    exchange_delay: Duration::from_millis(100),
-                    lose_exchange: true,
-                },
-                self.compatibility.clone(),
-            ))),
+            1 => EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(
+                    ScriptOutcome::TimedBulk {
+                        hello_delay: Duration::from_millis(200),
+                        exchange_delay: Duration::from_millis(100),
+                        lose_exchange: true,
+                    },
+                    self.compatibility.clone(),
+                )
+                .with_server_instance(format!("server-{server_generation}")),
+            )),
             2 => EmbeddingConnectOutcome::NoOwner,
             3 => {
                 thread::sleep(Duration::from_millis(75));
@@ -263,14 +270,17 @@ impl EmbeddingClientTransport for DeadlineBudgetTransport {
                     message: "the fail-stopped owner is releasing authority".into(),
                 })
             }
-            _ => EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
-                ScriptOutcome::TimedBulk {
-                    hello_delay: Duration::ZERO,
-                    exchange_delay: Duration::from_millis(100),
-                    lose_exchange: false,
-                },
-                self.compatibility.clone(),
-            ))),
+            _ => EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(
+                    ScriptOutcome::TimedBulk {
+                        hello_delay: Duration::ZERO,
+                        exchange_delay: Duration::from_millis(100),
+                        lose_exchange: false,
+                    },
+                    self.compatibility.clone(),
+                )
+                .with_server_instance(format!("server-{server_generation}")),
+            )),
         })
     }
 
@@ -306,6 +316,15 @@ impl BootstrapTestTransport {
         fallback: BootstrapConnectOutcome,
         spawn: Duration,
     ) -> Arc<Self> {
+        Self::with_connect_budget(outcomes, fallback, Duration::from_millis(1), spawn)
+    }
+
+    pub(super) fn with_connect_budget(
+        outcomes: impl IntoIterator<Item = BootstrapConnectOutcome>,
+        fallback: BootstrapConnectOutcome,
+        connect: Duration,
+        spawn: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             clock: TestClock::new(),
             connect_count: AtomicUsize::new(0),
@@ -313,7 +332,7 @@ impl BootstrapTestTransport {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             fallback,
             budgets: EmbeddingClientBudgets {
-                connect: Duration::from_millis(1),
+                connect,
                 spawn,
                 retry_after: Duration::from_millis(1),
                 query_request: Duration::from_secs(1),
@@ -338,22 +357,39 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
             .expect("bootstrap outcome script")
             .pop_front()
             .unwrap_or(self.fallback);
+        let server_generation = self.spawn_count.load(Ordering::Acquire) + 1;
         Ok(match outcome {
             BootstrapConnectOutcome::Connected => EmbeddingConnectOutcome::Connected(Box::new(
-                ScriptStream::new(ScriptOutcome::Success, self.compatibility.clone()),
+                ScriptStream::new(ScriptOutcome::Success, self.compatibility.clone())
+                    .with_server_instance(format!("server-{server_generation}")),
             )),
             BootstrapConnectOutcome::Loss => EmbeddingConnectOutcome::Connected(Box::new(
-                ScriptStream::new(ScriptOutcome::Loss, self.compatibility.clone()),
+                ScriptStream::new(ScriptOutcome::Loss, self.compatibility.clone())
+                    .with_server_instance(format!("server-{server_generation}")),
             )),
             BootstrapConnectOutcome::WriteDisconnect => {
-                EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
-                    ScriptOutcome::WriteDisconnect,
-                    self.compatibility.clone(),
-                )))
+                EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(ScriptOutcome::WriteDisconnect, self.compatibility.clone())
+                        .with_server_instance(format!("server-{server_generation}")),
+                ))
             }
             BootstrapConnectOutcome::HelloLoss => EmbeddingConnectOutcome::Connected(Box::new(
-                ScriptStream::new(ScriptOutcome::HelloLoss, self.compatibility.clone()),
+                ScriptStream::new(ScriptOutcome::HelloLoss, self.compatibility.clone())
+                    .with_server_instance(format!("server-{server_generation}")),
             )),
+            BootstrapConnectOutcome::HelloCapacity => EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(ScriptOutcome::HelloCapacity, self.compatibility.clone())
+                    .with_server_instance(format!("server-{server_generation}")),
+            )),
+            BootstrapConnectOutcome::HelloHandlerCapacity => {
+                EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(
+                        ScriptOutcome::HelloHandlerCapacity,
+                        self.compatibility.clone(),
+                    )
+                    .with_server_instance(format!("server-{server_generation}")),
+                ))
+            }
             BootstrapConnectOutcome::NoOwner => EmbeddingConnectOutcome::NoOwner,
             BootstrapConnectOutcome::OwnerUnresponsive => {
                 EmbeddingConnectOutcome::OwnerUnresponsive(EmbeddingTransportFailure {

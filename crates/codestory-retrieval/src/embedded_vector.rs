@@ -11,25 +11,62 @@ use codestory_contracts::api::{
     EmbeddingVectorProducerEvidenceDto, EmbeddingVectorPublicationIdentityDto,
     EmbeddingVectorSemanticsDto,
 };
+use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
+use codestory_contracts::validation_receipts::SealedReceiptCache;
 use codestory_store::{FileRole, Store};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const VECTOR_INDEX_SCHEMA_VERSION: i64 =
     crate::embedding_contract::EMBEDDING_VECTOR_SCHEMA_VERSION as i64;
 const VECTOR_INDEX_FILE: &str = "vectors.sqlite3";
 const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
-const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const VECTOR_COMPONENT_SCHEMA_VERSION: u32 = 2;
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
+const VECTOR_COMPONENT_DIGEST_DOMAIN: &[u8] = b"codestory-vector-component-v2\0";
 const VECTOR_NORM_TOLERANCE: f64 = 1.0e-3;
+/// Maximum number of immutable vector generations whose deep-validation facts
+/// may be retained by one process.
+const VECTOR_DATABASE_RECEIPT_CAPACITY: usize = 256;
+const VECTOR_PUBLICATION_RECEIPT_CAPACITY: usize = 64;
+
+/// Process-local receipts for immutable vector databases.
+///
+/// The cached value is a content-derived description of the artifact, not an
+/// admission verdict. Generation, producer, schema, anchor, and manifest
+/// expectations are compared against these facts on every call. The seal
+/// covers the SQLite file and every sidecar identity, so ordinary mutation,
+/// truncation, replacement, or sidecar creation forces another deep read.
+static VECTOR_DATABASE_RECEIPTS: SealedReceiptCache<PathBuf, VectorDatabaseContents> =
+    SealedReceiptCache::new(VECTOR_DATABASE_RECEIPT_CAPACITY);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VectorPublicationReceiptKey {
+    core_database_path: PathBuf,
+    core_generation_id: String,
+    core_run_id: String,
+    retrieval_generation: String,
+    retrieval_input_hash: String,
+    semantic_generation: String,
+}
+
+/// Whole-publication admission is more than a vector-byte verdict: it binds
+/// one immutable core's dense anchors to one immutable vector generation.
+/// Cache that relation only while every owning file keeps the same native
+/// identity and metadata seal.
+static VECTOR_PUBLICATION_RECEIPTS: SealedReceiptCache<
+    VectorPublicationReceiptKey,
+    VectorGenerationManifest,
+> = SealedReceiptCache::new(VECTOR_PUBLICATION_RECEIPT_CAPACITY);
 /// Minimum cosine supported by the source-backed development calibration.
 const DENSE_ABSTENTION_ABSOLUTE_FLOOR: f32 = 0.30;
 /// Maximum distance from the lane's best cosine supported by that calibration.
@@ -77,6 +114,25 @@ pub(crate) struct AttestedSemanticPoint {
 pub(crate) struct ExpectedVectorAnchor {
     pub node_id: String,
     pub document_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentVectorAnchor {
+    pub node_id: String,
+    pub document_hash: String,
+    pub display_name: String,
+    pub file_path: Option<String>,
+    pub file_role: Option<FileRole>,
+    pub dense_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IncrementalVectorWork {
+    pub retained: u64,
+    pub inserted: u64,
+    pub removed: u64,
+    pub direct_reference: bool,
+    pub stage: Option<codestory_store::SealedStageStats>,
 }
 
 pub(crate) struct AttestedVectorPublication<'a> {
@@ -252,12 +308,21 @@ pub(crate) fn producer_evidence_mismatches(
     expected.compatibility_with(observed).mismatches
 }
 
+fn vector_component_is_compatible(
+    expected: &EmbeddingVectorProducerEvidenceDto,
+    observed: &EmbeddingVectorProducerEvidenceDto,
+) -> Result<bool> {
+    Ok(vector_compatibility_identity(expected)? == vector_compatibility_identity(observed)?)
+}
+
 /// Content attestation returned before the candidate database is published.
 ///
-/// `vector_digest` is independent of SQLite layout and hashes canonical rows
-/// ordered by node id. `database_sha256` binds the exact SQLite bytes that are
-/// atomically renamed into the generation and is intended to be copied into
-/// the retrieval manifest.
+/// In the current component schema, `vector_digest`, `component_sha256`, and
+/// the legacy-named `database_sha256` all bind the canonical physical rows,
+/// independent of SQLite layout and publication identity. The generation and
+/// input hash remain a separate authenticated envelope. Schema-v1 manifests
+/// retain their historical whole-file `database_sha256` interpretation and
+/// are never admitted for copy-on-write reuse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VectorDatabaseAttestation {
     pub schema_version: i64,
@@ -270,6 +335,16 @@ pub(crate) struct VectorDatabaseAttestation {
     pub evidence_contract_identity: String,
     pub vector_digest: String,
     pub database_sha256: String,
+    #[serde(default = "legacy_vector_component_schema_version")]
+    pub component_schema_version: u32,
+    #[serde(default)]
+    pub component_sha256: String,
+    #[serde(default)]
+    pub database_size_bytes: u64,
+}
+
+const fn legacy_vector_component_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +375,13 @@ impl VectorGenerationManifest {
         if vectors.evidence_contract_identity != compatibility_sha256 {
             bail!("vector attestation does not match producer evidence");
         }
+        if vectors.component_schema_version != VECTOR_COMPONENT_SCHEMA_VERSION
+            || vectors.component_sha256.len() != 64
+            || vectors.database_sha256 != vectors.component_sha256
+            || vectors.database_size_bytes == 0
+        {
+            bail!("vector attestation has incompatible physical component evidence");
+        }
         Ok(Self {
             schema_version: VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION,
             evidence,
@@ -310,8 +392,28 @@ impl VectorGenerationManifest {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.schema_version != VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            1 | VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION
+        ) {
             bail!("unsupported vector generation manifest schema");
+        }
+        if self.schema_version == 1 {
+            if self.vectors.component_schema_version != 1
+                || !self.vectors.component_sha256.is_empty()
+            {
+                bail!("legacy vector manifest has incompatible component metadata");
+            }
+            let evidence_sha256 = hex_digest(Sha256::digest(
+                serde_json::to_vec(&self.evidence)
+                    .context("serialize legacy vector producer evidence")?,
+            ));
+            if evidence_sha256 != self.evidence_sha256
+                || vector_compatibility_identity(&self.evidence)? != self.compatibility_sha256
+            {
+                bail!("legacy vector generation manifest digest mismatch");
+            }
+            return Ok(());
         }
         let expected = Self::new(self.evidence.clone(), self.vectors.clone())?;
         if expected.evidence_sha256 != self.evidence_sha256 {
@@ -324,9 +426,11 @@ impl VectorGenerationManifest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_generation_evidence_for_publication(
     layout: &SidecarLayout,
     storage: &Store,
+    core_database_path: Option<&Path>,
     manifest: &codestory_store::RetrievalIndexManifest,
     publication: &codestory_store::IndexPublicationRecord,
     runtime: &SidecarRuntimeConfig,
@@ -380,16 +484,25 @@ pub(crate) fn validate_generation_evidence_for_publication(
     {
         bail!("retrieval vector generation evidence is incompatible with the publication");
     }
-    let dense_publication = storage
-        .validate_dense_anchor_publication(publication)
-        .context("validate dense-anchor publication for vector admission")?;
-    if dense_publication.anchor_count != expected_points {
+    let dense_validation = match core_database_path {
+        Some(path) => storage.validate_dense_anchor_publication_sealed(path, publication),
+        None => storage.validate_dense_anchor_publication_contents(publication),
+    }
+    .context("validate dense-anchor publication for vector admission")?;
+    if dense_validation.manifest.anchor_count != expected_points {
         bail!(
             "retrieval vector anchor cardinality mismatch: manifest={expected_points} core={}",
-            dense_publication.anchor_count
+            dense_validation.manifest.anchor_count
         );
     }
-    let expected_anchors = expected_vector_anchors(storage, publication)?;
+    let expected_anchors = dense_validation
+        .anchors
+        .into_iter()
+        .map(|anchor| ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash,
+        })
+        .collect::<Vec<_>>();
     if u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX) != expected_points {
         bail!(
             "retrieval vector anchor cardinality mismatch: manifest={expected_points} core={}",
@@ -415,38 +528,77 @@ pub(crate) fn validate_generation_evidence_for_publication(
     Ok(vector_manifest)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_sealed_generation_evidence_for_publication(
+    layout: &SidecarLayout,
+    storage: &Store,
+    core_database_path: &Path,
+    manifest: &codestory_store::RetrievalIndexManifest,
+    publication: &codestory_store::IndexPublicationRecord,
+    runtime: &SidecarRuntimeConfig,
+    embedding_device: &EmbeddingDeviceReadiness,
+    live_identity: Option<&ProductEmbeddingIdentity>,
+) -> Result<VectorGenerationManifest> {
+    let key = vector_publication_receipt_key(core_database_path, manifest, publication)?;
+    let vector_database_path = index_path(layout, &manifest.semantic_generation);
+    let mut artifacts = sqlite_file_with_sidecars(core_database_path);
+    artifacts.extend(sqlite_file_with_sidecars(&vector_database_path));
+    artifacts.push(generation_manifest_path(
+        layout,
+        &manifest.semantic_generation,
+    ));
+    VECTOR_PUBLICATION_RECEIPTS.validate_sealed(key, &artifacts, || {
+        validate_generation_evidence_for_publication(
+            layout,
+            storage,
+            Some(core_database_path),
+            manifest,
+            publication,
+            runtime,
+            embedding_device,
+            live_identity,
+        )
+    })
+}
+
+fn vector_publication_receipt_key(
+    core_database_path: &Path,
+    manifest: &codestory_store::RetrievalIndexManifest,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<VectorPublicationReceiptKey> {
+    let retrieval_generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .context("retrieval manifest is missing its generation")?;
+    let retrieval_input_hash = manifest
+        .sidecar_input_hash
+        .as_deref()
+        .context("retrieval manifest is missing its input hash")?;
+    Ok(VectorPublicationReceiptKey {
+        core_database_path: core_database_path.to_path_buf(),
+        core_generation_id: publication.generation_id.clone(),
+        core_run_id: publication.run_id.clone(),
+        retrieval_generation: retrieval_generation.to_string(),
+        retrieval_input_hash: retrieval_input_hash.to_string(),
+        semantic_generation: manifest.semantic_generation.clone(),
+    })
+}
+
+#[cfg(test)]
 fn expected_vector_anchors(
     storage: &Store,
     publication: &codestory_store::IndexPublicationRecord,
 ) -> Result<Vec<ExpectedVectorAnchor>> {
-    let expected_source_identity =
-        format!("core:{}:{}", publication.generation_id, publication.run_id);
-    let mut anchors = Vec::new();
-    let mut after = None;
-    loop {
-        let batch = storage
-            .get_dense_anchor_inputs_batch_after(after, 4_096)
-            .context("load dense anchors for vector attestation")?;
-        if batch.is_empty() {
-            break;
-        }
-        after = batch.last().map(|anchor| anchor.node_id);
-        for anchor in batch {
-            if anchor.source_identity != expected_source_identity {
-                bail!(
-                    "dense anchor {} belongs to source identity {}, expected {}",
-                    anchor.node_id.0,
-                    anchor.source_identity,
-                    expected_source_identity
-                );
-            }
-            anchors.push(ExpectedVectorAnchor {
-                node_id: anchor.node_id.0.to_string(),
-                document_hash: anchor.document_hash,
-            });
-        }
-    }
-    Ok(anchors)
+    Ok(storage
+        .validate_dense_anchor_publication_contents(publication)
+        .context("load validated dense anchors for vector attestation")?
+        .anchors
+        .into_iter()
+        .map(|anchor| ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash,
+        })
+        .collect())
 }
 
 fn validate_execution_evidence_for_runtime(
@@ -628,6 +780,282 @@ impl EmbeddedVectorIndex {
         )
     }
 
+    /// Reconcile a new immutable vector generation from one fully attested
+    /// predecessor without rewriting unchanged vector blobs.
+    ///
+    /// `Ok(None)` is the deliberate first-upgrade/corruption/filesystem
+    /// fallback: callers must use the complete staged builder. Once a clone is
+    /// established, cancellation or candidate construction failure is
+    /// returned rather than hidden behind a second build attempt.
+    pub(crate) fn try_build_incremental_with_cancel(
+        publication: AttestedVectorPublication<'_>,
+        previous_collection: &str,
+        expected_evidence: &EmbeddingVectorProducerEvidenceDto,
+        current_anchors: &[CurrentVectorAnchor],
+        cancelled: &dyn Fn() -> bool,
+        before_publish: impl FnOnce() -> Result<()>,
+        produce_missing: impl FnOnce(
+            &[ExpectedVectorAnchor],
+            &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
+        ) -> Result<()>,
+    ) -> Result<Option<(VectorDatabaseAttestation, IncrementalVectorWork)>> {
+        let expected_anchors = expected_anchor_map(publication.expected_anchors)?;
+        let current_anchors = current_vector_anchor_map(current_anchors, &expected_anchors)?;
+        let previous_manifest =
+            match Self::load_generation_manifest(publication.layout, previous_collection) {
+                Ok(manifest) => manifest,
+                Err(_) => return Ok(None),
+            };
+        if previous_manifest.schema_version != VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION
+            || previous_manifest.vectors.component_schema_version != VECTOR_COMPONENT_SCHEMA_VERSION
+        {
+            return Ok(None);
+        }
+        if !vector_component_is_compatible(expected_evidence, &previous_manifest.evidence)? {
+            return Ok(None);
+        }
+        let previous_path = index_path(publication.layout, previous_collection);
+        let previous_anchors = match read_vector_anchor_map(&previous_path) {
+            Ok(anchors) => anchors,
+            Err(_) => return Ok(None),
+        };
+        if validate_database(
+            &previous_path,
+            &previous_manifest.vectors.generation,
+            &previous_manifest.vectors.input_hash,
+            publication.contract,
+            &previous_anchors,
+            Some(&previous_manifest.vectors),
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+        crate::copy_on_write::make_file_immutable(&previous_path)?;
+
+        let previous_current_anchors = match read_current_vector_anchor_map(&previous_path) {
+            Ok(anchors) => anchors,
+            Err(_) => return Ok(None),
+        };
+
+        let path = index_path(publication.layout, publication.collection);
+        let parent = path
+            .parent()
+            .context("embedded vector index has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create embedded vector directory {}", parent.display()))?;
+        let (temp_path, reserved) =
+            codestory_workspace::atomic_file::create_unique_temp_file(&path, "vector-index")?;
+        drop(reserved);
+        std::fs::remove_file(&temp_path)
+            .with_context(|| format!("release vector clone reservation {}", temp_path.display()))?;
+        let previous_artifacts = sqlite_file_with_sidecars(&previous_path);
+        let transferable =
+            VECTOR_DATABASE_RECEIPTS.transferable_receipt(&previous_path, &previous_artifacts);
+        if cancelled() {
+            return Err(crate::index::RetrievalIndexCancelled {
+                boundary: "vector staging",
+            }
+            .into());
+        }
+        if previous_anchors == expected_anchors
+            && previous_current_anchors == current_anchors
+            && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
+        {
+            let result = (|| {
+                let mut attestation = previous_manifest.vectors.clone();
+                attestation.generation = publication.generation.to_string();
+                attestation.input_hash = publication.input_hash.to_string();
+                if cancelled() {
+                    return Err(crate::index::RetrievalIndexCancelled {
+                        boundary: "vector reference publication",
+                    }
+                    .into());
+                }
+                before_publish()?;
+                crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
+                if let Some(transferable) = transferable {
+                    let _ = VECTOR_DATABASE_RECEIPTS.install_hard_link_alias(
+                        &previous_path,
+                        &previous_artifacts,
+                        path.clone(),
+                        &sqlite_file_with_sidecars(&path),
+                        transferable,
+                        Ok::<_, anyhow::Error>,
+                    )?;
+                }
+                Ok((
+                    attestation,
+                    IncrementalVectorWork {
+                        retained: u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX),
+                        inserted: 0,
+                        removed: 0,
+                        direct_reference: true,
+                        stage: None,
+                    },
+                ))
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            return result.map(Some);
+        }
+        let stage = crate::copy_on_write::stage_file(&previous_path, &temp_path, cancelled)?;
+
+        let result = (|| {
+            crate::copy_on_write::make_file_owner_writable(&temp_path)?;
+            let mut work = reconcile_cloned_database(
+                &temp_path,
+                publication.generation,
+                publication.input_hash,
+                publication.contract,
+                &expected_anchors,
+                &current_anchors,
+                produce_missing,
+            )?;
+            work.stage = Some(stage);
+            let validation_started = Instant::now();
+            let attestation = validate_database(
+                &temp_path,
+                publication.generation,
+                publication.input_hash,
+                publication.contract,
+                &expected_anchors,
+                None,
+            )?;
+            crate::index::record_finalize_phase_timing(
+                "vector final validation",
+                validation_started.elapsed(),
+            );
+            if cancelled() {
+                return Err(crate::index::RetrievalIndexCancelled {
+                    boundary: "vector publication",
+                }
+                .into());
+            }
+            before_publish()?;
+            crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
+            Ok((attestation, work))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result.map(Some)
+    }
+
+    /// Directly reference an immutable vector component when the core has
+    /// published the exact same dense-anchor contents under a new generation.
+    ///
+    /// Unlike the general incremental builder this path does not need to page
+    /// current anchor display metadata: equality of the sealed dense-anchor
+    /// digest proves those fields unchanged, while `expected_anchors` binds the
+    /// new core's exact node/document identities. Any missing or incompatible
+    /// predecessor returns `Ok(None)` before candidate ownership begins.
+    pub(crate) fn try_reference_graph_equivalent_with_cancel(
+        publication: AttestedVectorPublication<'_>,
+        previous_collection: &str,
+        expected_evidence: &EmbeddingVectorProducerEvidenceDto,
+        previous_dense: &codestory_store::DenseAnchorPublicationManifest,
+        current_dense: &codestory_store::DenseAnchorPublicationManifest,
+        before_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<(VectorDatabaseAttestation, IncrementalVectorWork)>> {
+        if previous_dense.schema_version != codestory_store::DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+            || current_dense.schema_version
+                != codestory_store::DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+            || !previous_dense.complete
+            || !current_dense.complete
+            || previous_dense.anchor_count != current_dense.anchor_count
+            || previous_dense.anchor_digest != current_dense.anchor_digest
+            || previous_dense.anchor_source_identity != current_dense.anchor_source_identity
+            || previous_dense.policy_version != current_dense.policy_version
+            || previous_dense.migration_state != current_dense.migration_state
+        {
+            return Ok(None);
+        }
+        let expected_anchors = expected_anchor_map(publication.expected_anchors)?;
+        if u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX) != current_dense.anchor_count {
+            return Ok(None);
+        }
+        let previous_manifest =
+            match Self::load_generation_manifest(publication.layout, previous_collection) {
+                Ok(manifest) => manifest,
+                Err(_) => return Ok(None),
+            };
+        if previous_manifest.schema_version != VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION
+            || previous_manifest.vectors.component_schema_version != VECTOR_COMPONENT_SCHEMA_VERSION
+            || !vector_component_is_compatible(expected_evidence, &previous_manifest.evidence)?
+        {
+            return Ok(None);
+        }
+        let previous_path = index_path(publication.layout, previous_collection);
+        if validate_database(
+            &previous_path,
+            &previous_manifest.vectors.generation,
+            &previous_manifest.vectors.input_hash,
+            publication.contract,
+            &expected_anchors,
+            Some(&previous_manifest.vectors),
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+        crate::copy_on_write::make_file_immutable(&previous_path)?;
+
+        let path = index_path(publication.layout, publication.collection);
+        let parent = path
+            .parent()
+            .context("embedded vector index has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create embedded vector directory {}", parent.display()))?;
+        let (temp_path, reserved) =
+            codestory_workspace::atomic_file::create_unique_temp_file(&path, "vector-index")?;
+        drop(reserved);
+        std::fs::remove_file(&temp_path).with_context(|| {
+            format!(
+                "release vector reference reservation {}",
+                temp_path.display()
+            )
+        })?;
+        let previous_artifacts = sqlite_file_with_sidecars(&previous_path);
+        let transferable =
+            VECTOR_DATABASE_RECEIPTS.transferable_receipt(&previous_path, &previous_artifacts);
+        if !crate::copy_on_write::reference_file(&previous_path, &temp_path)? {
+            return Ok(None);
+        }
+        let result = (|| {
+            let mut attestation = previous_manifest.vectors.clone();
+            attestation.generation = publication.generation.to_string();
+            attestation.input_hash = publication.input_hash.to_string();
+            before_publish()?;
+            crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
+            if let Some(transferable) = transferable {
+                let _ = VECTOR_DATABASE_RECEIPTS.install_hard_link_alias(
+                    &previous_path,
+                    &previous_artifacts,
+                    path.clone(),
+                    &sqlite_file_with_sidecars(&path),
+                    transferable,
+                    Ok::<_, anyhow::Error>,
+                )?;
+            }
+            Ok((
+                attestation,
+                IncrementalVectorWork {
+                    retained: u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX),
+                    inserted: 0,
+                    removed: 0,
+                    direct_reference: true,
+                    stage: None,
+                },
+            ))
+        })();
+        if result.is_err() && temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result.map(Some)
+    }
+
     /// Revalidate a published database against manifest-carried evidence.
     ///
     /// Readers should call this before admitting a candidate generation. The
@@ -643,14 +1071,20 @@ impl EmbeddedVectorIndex {
         expected_attestation: &VectorDatabaseAttestation,
     ) -> Result<VectorDatabaseAttestation> {
         let expected_anchors = expected_anchor_map(expected_anchors)?;
-        validate_database(
+        let validation_started = Instant::now();
+        let result = validate_database(
             &index_path(layout, collection),
             generation,
             input_hash,
             contract,
             &expected_anchors,
             Some(expected_attestation),
-        )
+        );
+        crate::index::record_finalize_phase_timing(
+            "vector final validation",
+            validation_started.elapsed(),
+        );
+        result
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -721,12 +1155,8 @@ impl EmbeddedVectorIndex {
         contract: &VectorEvidenceContract,
     ) -> Result<HashMap<(String, String), Vec<f32>>> {
         let manifest = Self::load_generation_manifest(layout, collection)?;
-        let mismatches = producer_evidence_mismatches(expected_evidence, &manifest.evidence);
-        if !mismatches.is_empty() {
-            bail!(
-                "reusable vector producer evidence is incompatible: {}",
-                mismatches.join(", ")
-            );
+        if !vector_component_is_compatible(expected_evidence, &manifest.evidence)? {
+            bail!("reusable vector producer evidence is incompatible");
         }
         let path = index_path(layout, collection);
         let connection = open_read_only(&path)?;
@@ -882,6 +1312,26 @@ pub(crate) fn index_path(layout: &SidecarLayout, collection: &str) -> PathBuf {
         .join(VECTOR_INDEX_FILE)
 }
 
+/// Receipt accounting for tests that prove unchanged vector generations avoid
+/// another deep read while identity drift invalidates the receipt.
+#[cfg(test)]
+fn vector_database_receipt_stats(
+    layout: &SidecarLayout,
+    collection: &str,
+) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
+    VECTOR_DATABASE_RECEIPTS.stats(&index_path(layout, collection))
+}
+
+#[cfg(test)]
+fn vector_publication_receipt_stats(
+    core_database_path: &Path,
+    manifest: &codestory_store::RetrievalIndexManifest,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
+    let key = vector_publication_receipt_key(core_database_path, manifest, publication).ok()?;
+    VECTOR_PUBLICATION_RECEIPTS.stats(&key)
+}
+
 fn generation_manifest_path(layout: &SidecarLayout, collection: &str) -> PathBuf {
     index_path(layout, collection)
         .parent()
@@ -889,7 +1339,7 @@ fn generation_manifest_path(layout: &SidecarLayout, collection: &str) -> PathBuf
         .join(VECTOR_GENERATION_MANIFEST_FILE)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DatabaseMetadata {
     schema_version: i64,
     generation: String,
@@ -900,6 +1350,22 @@ struct DatabaseMetadata {
     producer_identity: String,
     evidence_contract_identity: String,
     vector_digest: String,
+    component_schema_version: u32,
+    component_sha256: String,
+}
+
+/// Facts established by one complete validation of an immutable vector file.
+///
+/// This deliberately contains no caller-supplied generation or contract
+/// decision. Those expectations may vary while the artifact's bytes do not.
+#[derive(Debug, Clone)]
+struct VectorDatabaseContents {
+    metadata: DatabaseMetadata,
+    anchors: BTreeMap<String, String>,
+    vector_digest: String,
+    database_sha256: String,
+    component_sha256: String,
+    database_size_bytes: u64,
 }
 
 fn build_and_publish_database(
@@ -938,6 +1404,7 @@ fn build_and_publish_database(
             produce,
         )?;
         let authoritative_anchors = expected_anchors.unwrap_or(&actual_anchors);
+        let validation_started = Instant::now();
         let attestation = validate_database(
             &temp_path,
             generation,
@@ -946,8 +1413,12 @@ fn build_and_publish_database(
             authoritative_anchors,
             None,
         )?;
+        crate::index::record_finalize_phase_timing(
+            "vector final validation",
+            validation_started.elapsed(),
+        );
         before_publish()?;
-        codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
         Ok(attestation)
     })();
     if result.is_err() {
@@ -964,15 +1435,21 @@ fn write_database(
     expected_anchors: Option<&BTreeMap<String, String>>,
     produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
+    let mut persistence_elapsed = Duration::ZERO;
+    let mut hashing_elapsed = Duration::ZERO;
+    let persistence_started = Instant::now();
     let mut connection = Connection::open(sqlite_open_path(path))
         .with_context(|| format!("create embedded vector index {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
     // The staged file is deleted on any failure and only published after
     // `validate_database` passes, so a rollback journal adds no durability.
     // Keeping it off also matches the lexical shard builder and avoids the
     // derived `-journal` sibling, the longest path SQLite would create here.
+    let persistence_started = Instant::now();
     connection
         .execute_batch(
-            "PRAGMA journal_mode=OFF;
+            "PRAGMA page_size=16384;
+         PRAGMA journal_mode=OFF;
          PRAGMA synchronous=FULL;
          CREATE TABLE metadata (
              singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -984,7 +1461,9 @@ fn write_database(
              point_count INTEGER NOT NULL,
              producer_identity TEXT NOT NULL,
              evidence_contract_identity TEXT NOT NULL,
-             vector_digest TEXT NOT NULL
+             vector_digest TEXT NOT NULL,
+             component_schema_version INTEGER NOT NULL,
+             component_sha256 TEXT NOT NULL
          );
          CREATE TABLE vectors (
              node_id TEXT PRIMARY KEY NOT NULL,
@@ -993,22 +1472,34 @@ fn write_database(
              file_path TEXT,
              file_role TEXT,
              dense_reason TEXT,
-             vector BLOB NOT NULL
-         ) WITHOUT ROWID;",
+             vector BLOB NOT NULL,
+             vector_sha256 TEXT NOT NULL
+         );
+         CREATE TRIGGER vectors_vector_update_guard
+         AFTER UPDATE OF vector ON vectors
+         BEGIN
+             UPDATE vectors SET vector_sha256 = 'invalid' WHERE node_id = NEW.node_id;
+         END;",
         )
         .with_context(|| format!("create embedded vector schema {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
+    let persistence_started = Instant::now();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .with_context(|| format!("begin embedded vector write transaction {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
     let mut actual_anchors = BTreeMap::new();
     {
+        let persistence_started = Instant::now();
         let mut insert = transaction
             .prepare(
                 "INSERT INTO vectors (
-                 node_id, document_hash, display_name, file_path, file_role, dense_reason, vector
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 node_id, document_hash, display_name, file_path, file_role, dense_reason,
+                 vector, vector_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .with_context(|| format!("prepare embedded vector insert {}", path.display()))?;
+        persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
         let mut visit = |attested: AttestedSemanticPoint| -> Result<()> {
             let AttestedSemanticPoint {
                 point,
@@ -1037,6 +1528,11 @@ fn write_database(
             {
                 bail!("duplicate embedded vector anchor {}", point.node_id);
             }
+            let hashing_started = Instant::now();
+            let bytes = vector_bytes(&point.vector);
+            let vector_sha256 = hex_digest(Sha256::digest(&bytes));
+            hashing_elapsed = hashing_elapsed.saturating_add(hashing_started.elapsed());
+            let persistence_started = Instant::now();
             insert
                 .execute(params![
                     point.node_id,
@@ -1045,9 +1541,11 @@ fn write_database(
                     point.file_path,
                     point.file_role.map(|role| role.as_str()),
                     point.dense_reason,
-                    vector_bytes(&point.vector),
+                    bytes,
+                    vector_sha256,
                 ])
                 .with_context(|| format!("write embedded vector index {}", path.display()))?;
+            persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
             Ok(())
         };
         produce(&mut visit)?;
@@ -1068,11 +1566,16 @@ fn write_database(
             missing
         );
     }
-    let vector_digest = canonical_vector_digest(&transaction, contract.embedding_dim)
-        .with_context(|| format!("digest embedded vector index {}", path.display()))?;
+    let hashing_started = Instant::now();
+    let vector_digest = canonical_vector_component_digest(&transaction)
+        .with_context(|| format!("digest embedded vector component {}", path.display()))?;
+    hashing_elapsed = hashing_elapsed.saturating_add(hashing_started.elapsed());
+    let persistence_started = Instant::now();
     transaction
         .execute(
-            "INSERT INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO metadata VALUES (
+                1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+             )",
             params![
                 VECTOR_INDEX_SCHEMA_VERSION,
                 generation,
@@ -1082,6 +1585,8 @@ fn write_database(
                 actual_anchors.len() as i64,
                 contract.producer_identity,
                 contract.evidence_contract_identity,
+                vector_digest,
+                VECTOR_COMPONENT_SCHEMA_VERSION,
                 vector_digest,
             ],
         )
@@ -1099,7 +1604,273 @@ fn write_database(
         .with_context(|| format!("open embedded vector index for sync {}", path.display()))?
         .sync_all()
         .with_context(|| format!("sync embedded vector index {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
+    crate::index::record_finalize_phase_timing("vector sqlite persistence", persistence_elapsed);
+    crate::index::record_finalize_phase_timing("vector hashing", hashing_elapsed);
     Ok(actual_anchors)
+}
+
+fn current_vector_anchor_map(
+    current_anchors: &[CurrentVectorAnchor],
+    expected_anchors: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, CurrentVectorAnchor>> {
+    let mut current = BTreeMap::new();
+    for anchor in current_anchors {
+        if anchor.node_id.trim().is_empty() || anchor.document_hash.trim().is_empty() {
+            bail!("current embedded vector anchor identities must be non-empty");
+        }
+        if expected_anchors.get(&anchor.node_id) != Some(&anchor.document_hash) {
+            bail!(
+                "current embedded vector anchor {} does not match the expected publication",
+                anchor.node_id
+            );
+        }
+        if current
+            .insert(anchor.node_id.clone(), anchor.clone())
+            .is_some()
+        {
+            bail!(
+                "duplicate current embedded vector anchor {}",
+                anchor.node_id
+            );
+        }
+    }
+    if current.len() != expected_anchors.len() {
+        bail!(
+            "current embedded vector anchor coverage mismatch: expected {}, found {}",
+            expected_anchors.len(),
+            current.len()
+        );
+    }
+    Ok(current)
+}
+
+fn read_vector_anchor_map(path: &Path) -> Result<BTreeMap<String, String>> {
+    let connection = open_read_only(path)?;
+    let mut statement =
+        connection.prepare("SELECT node_id, document_hash FROM vectors ORDER BY node_id ASC")?;
+    let mut rows = statement.query([])?;
+    let mut anchors = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let node_id = row.get::<_, String>(0)?;
+        let document_hash = row.get::<_, String>(1)?;
+        if anchors.insert(node_id.clone(), document_hash).is_some() {
+            bail!("duplicate embedded vector row {node_id}");
+        }
+    }
+    Ok(anchors)
+}
+
+fn read_current_vector_anchor_map(path: &Path) -> Result<BTreeMap<String, CurrentVectorAnchor>> {
+    let connection = open_read_only(path)?;
+    let mut statement = connection.prepare(
+        "SELECT node_id, document_hash, display_name, file_path, file_role, dense_reason
+         FROM vectors ORDER BY node_id ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut anchors = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let node_id = row.get::<_, String>(0)?;
+        let file_role = row
+            .get::<_, Option<String>>(4)?
+            .map(|role| FileRole::from_db_value(&role));
+        let anchor = CurrentVectorAnchor {
+            node_id: node_id.clone(),
+            document_hash: row.get(1)?,
+            display_name: row.get(2)?,
+            file_path: row.get(3)?,
+            file_role,
+            dense_reason: row.get(5)?,
+        };
+        if anchors.insert(node_id.clone(), anchor).is_some() {
+            bail!("duplicate embedded vector row {node_id}");
+        }
+    }
+    Ok(anchors)
+}
+
+fn reconcile_cloned_database(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    contract: &VectorEvidenceContract,
+    expected_anchors: &BTreeMap<String, String>,
+    current_anchors: &BTreeMap<String, CurrentVectorAnchor>,
+    produce_missing: impl FnOnce(
+        &[ExpectedVectorAnchor],
+        &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
+    ) -> Result<()>,
+) -> Result<IncrementalVectorWork> {
+    let mut connection = Connection::open(sqlite_open_path(path))
+        .with_context(|| format!("open cloned embedded vector index {}", path.display()))?;
+    connection
+        .execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=FULL;")
+        .with_context(|| format!("configure cloned embedded vector index {}", path.display()))?;
+    validate_sqlite_quick_check(&connection).with_context(|| {
+        format!(
+            "quick-check cloned embedded vector index {}",
+            path.display()
+        )
+    })?;
+    let cloned_metadata = read_metadata(&connection)?;
+    if cloned_metadata.component_schema_version != VECTOR_COMPONENT_SCHEMA_VERSION
+        || cloned_metadata.component_sha256.is_empty()
+    {
+        bail!("cloned vector database does not support incremental reconciliation");
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .with_context(|| format!("begin cloned vector reconciliation {}", path.display()))?;
+
+    let existing = {
+        let mut statement = transaction.prepare(
+            "SELECT node_id, document_hash, display_name, file_path, file_role, dense_reason
+             FROM vectors ORDER BY node_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let removed = existing
+        .iter()
+        .filter(|(node_id, document_hash, ..)| expected_anchors.get(node_id) != Some(document_hash))
+        .count();
+    let retained = existing.len().saturating_sub(removed);
+    let retained_anchors = existing
+        .iter()
+        .filter(|(node_id, document_hash, ..)| expected_anchors.get(node_id) == Some(document_hash))
+        .map(|(node_id, document_hash, ..)| (node_id.as_str(), document_hash.as_str()))
+        .collect::<HashSet<_>>();
+
+    for (node_id, document_hash, ..) in &existing {
+        if expected_anchors.get(node_id) != Some(document_hash) {
+            transaction.execute("DELETE FROM vectors WHERE node_id = ?1", params![node_id])?;
+        }
+    }
+    for anchor in current_anchors.values() {
+        let changed = transaction.execute(
+            "UPDATE vectors
+             SET display_name = ?2, file_path = ?3, file_role = ?4, dense_reason = ?5
+             WHERE node_id = ?1 AND document_hash = ?6
+               AND (display_name IS NOT ?2 OR file_path IS NOT ?3
+                    OR file_role IS NOT ?4 OR dense_reason IS NOT ?5)",
+            params![
+                anchor.node_id,
+                anchor.display_name,
+                anchor.file_path,
+                anchor.file_role.map(|role| role.as_str()),
+                anchor.dense_reason,
+                anchor.document_hash,
+            ],
+        )?;
+        debug_assert!(changed <= 1);
+    }
+
+    let missing = expected_anchors
+        .iter()
+        .filter(|(node_id, document_hash)| {
+            !retained_anchors.contains(&(node_id.as_str(), document_hash.as_str()))
+        })
+        .map(|(node_id, document_hash)| ExpectedVectorAnchor {
+            node_id: node_id.clone(),
+            document_hash: document_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    let missing_map = expected_anchor_map(&missing)?;
+    let mut inserted = BTreeMap::new();
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO vectors (
+                node_id, document_hash, display_name, file_path, file_role, dense_reason,
+                vector, vector_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        let mut visit = |attested: AttestedSemanticPoint| -> Result<()> {
+            let AttestedSemanticPoint {
+                point,
+                document_hash,
+            } = attested;
+            let expected_hash = missing_map
+                .get(&point.node_id)
+                .with_context(|| format!("unexpected incremental vector {}", point.node_id))?;
+            if expected_hash != &document_hash {
+                bail!(
+                    "incremental vector document hash mismatch for node {}",
+                    point.node_id
+                );
+            }
+            validate_vector(&point.node_id, &point.vector, contract.embedding_dim)?;
+            if inserted
+                .insert(point.node_id.clone(), document_hash.clone())
+                .is_some()
+            {
+                bail!("duplicate incremental embedded vector {}", point.node_id);
+            }
+            let bytes = vector_bytes(&point.vector);
+            let vector_sha256 = hex_digest(Sha256::digest(&bytes));
+            insert.execute(params![
+                point.node_id,
+                document_hash,
+                point.display_name,
+                point.file_path,
+                point.file_role.map(|role| role.as_str()),
+                point.dense_reason,
+                bytes,
+                vector_sha256,
+            ])?;
+            Ok(())
+        };
+        produce_missing(&missing, &mut visit)?;
+    }
+    if inserted != missing_map {
+        bail!(
+            "incremental embedded vector coverage mismatch: expected {}, found {}",
+            missing_map.len(),
+            inserted.len()
+        );
+    }
+
+    let vector_digest = canonical_vector_component_digest(&transaction)?;
+    transaction.execute("DELETE FROM metadata", [])?;
+    transaction.execute(
+        "INSERT INTO metadata VALUES (
+            1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+         )",
+        params![
+            VECTOR_INDEX_SCHEMA_VERSION,
+            generation,
+            input_hash,
+            contract.embedding_backend,
+            contract.embedding_dim as i64,
+            expected_anchors.len() as i64,
+            contract.producer_identity,
+            contract.evidence_contract_identity,
+            vector_digest,
+            VECTOR_COMPONENT_SCHEMA_VERSION,
+            vector_digest,
+        ],
+    )?;
+    transaction.commit()?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(IncrementalVectorWork {
+        retained: u64::try_from(retained).unwrap_or(u64::MAX),
+        inserted: u64::try_from(missing.len()).unwrap_or(u64::MAX),
+        removed: u64::try_from(removed).unwrap_or(u64::MAX),
+        direct_reference: false,
+        stage: None,
+    })
 }
 
 pub(crate) fn validate_database(
@@ -1111,14 +1882,20 @@ pub(crate) fn validate_database(
     expected_attestation: Option<&VectorDatabaseAttestation>,
 ) -> Result<VectorDatabaseAttestation> {
     contract.validate()?;
-    let connection = open_read_only(path)?;
-    validate_sqlite_quick_check(&connection)
-        .with_context(|| format!("quick-check embedded vector index {}", path.display()))?;
-    let metadata = read_metadata(&connection)
-        .with_context(|| format!("read embedded vector metadata {}", path.display()))?;
+    let contents = VECTOR_DATABASE_RECEIPTS.validate_sealed(
+        path.to_path_buf(),
+        &sqlite_file_with_sidecars(path),
+        || verify_vector_database_contents(path),
+    )?;
+    let metadata = &contents.metadata;
+    let physical_envelope_is_compatible =
+        if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            !metadata.generation.trim().is_empty() && !metadata.input_hash.trim().is_empty()
+        } else {
+            metadata.generation == generation && metadata.input_hash == input_hash
+        };
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
-        || metadata.generation != generation
-        || metadata.input_hash != input_hash
+        || !physical_envelope_is_compatible
         || metadata.embedding_backend != contract.embedding_backend
         || metadata.embedding_dim != contract.embedding_dim as i64
         || metadata.point_count < 0
@@ -1128,34 +1905,31 @@ pub(crate) fn validate_database(
     {
         bail!("embedded vector metadata does not match the evidence contract");
     }
-    let actual_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))
-        .with_context(|| format!("count embedded vector rows {}", path.display()))?;
-    if actual_count < 0 || actual_count as usize != expected_anchors.len() {
-        bail!(
-            "embedded vector count mismatch: expected {}, found {}",
-            expected_anchors.len(),
-            actual_count.max(0)
-        );
+    if &contents.anchors != expected_anchors {
+        bail!("embedded vector anchors do not match the evidence contract");
     }
-    let (vector_digest, actual_anchors) =
-        validate_and_digest_vectors(&connection, contract.embedding_dim, expected_anchors)
-            .with_context(|| format!("validate embedded vector rows {}", path.display()))?;
-    if actual_anchors != expected_anchors.len() || vector_digest != metadata.vector_digest {
-        bail!("embedded vector canonical digest does not match metadata");
-    }
-    let database_sha256 = sha256_file(path)?;
     let attestation = VectorDatabaseAttestation {
         schema_version: metadata.schema_version,
-        generation: metadata.generation,
-        input_hash: metadata.input_hash,
-        embedding_backend: metadata.embedding_backend,
+        generation: if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            generation.to_string()
+        } else {
+            metadata.generation.clone()
+        },
+        input_hash: if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            input_hash.to_string()
+        } else {
+            metadata.input_hash.clone()
+        },
+        embedding_backend: metadata.embedding_backend.clone(),
         embedding_dim: metadata.embedding_dim as usize,
         point_count: metadata.point_count as u64,
-        producer_identity: metadata.producer_identity,
-        evidence_contract_identity: metadata.evidence_contract_identity,
-        vector_digest,
-        database_sha256,
+        producer_identity: metadata.producer_identity.clone(),
+        evidence_contract_identity: metadata.evidence_contract_identity.clone(),
+        vector_digest: contents.vector_digest.clone(),
+        database_sha256: contents.database_sha256.clone(),
+        component_schema_version: metadata.component_schema_version,
+        component_sha256: contents.component_sha256.clone(),
+        database_size_bytes: contents.database_size_bytes,
     };
     if let Some(expected) = expected_attestation
         && expected != &attestation
@@ -1163,6 +1937,77 @@ pub(crate) fn validate_database(
         bail!("embedded vector database attestation does not match the manifest");
     }
     Ok(attestation)
+}
+
+/// Deep-validate facts that depend only on the vector database's own bytes.
+///
+/// Caller-specific generation, producer, anchor, and manifest comparisons stay
+/// in `validate_database`, after the process-local receipt lookup.
+fn verify_vector_database_contents(path: &Path) -> Result<VectorDatabaseContents> {
+    let connection = open_read_only(path)?;
+    validate_sqlite_quick_check(&connection)
+        .with_context(|| format!("quick-check embedded vector index {}", path.display()))?;
+    let metadata = read_metadata(&connection)
+        .with_context(|| format!("read embedded vector metadata {}", path.display()))?;
+    if metadata.point_count < 0
+        || metadata.embedding_dim <= 0
+        || metadata.generation.trim().is_empty()
+        || metadata.input_hash.trim().is_empty()
+        || metadata.embedding_backend.trim().is_empty()
+        || metadata.producer_identity.trim().is_empty()
+        || metadata.evidence_contract_identity.trim().is_empty()
+    {
+        bail!("embedded vector metadata contains invalid artifact facts");
+    }
+    let actual_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))
+        .with_context(|| format!("count embedded vector rows {}", path.display()))?;
+    if actual_count < 0 || actual_count != metadata.point_count {
+        bail!(
+            "embedded vector count mismatch: metadata={}, found {}",
+            metadata.point_count,
+            actual_count.max(0)
+        );
+    }
+    let (vector_digest, anchors, database_sha256, component_sha256) = if metadata
+        .component_schema_version
+        == VECTOR_COMPONENT_SCHEMA_VERSION
+    {
+        let (digest, anchors) = digest_vector_component_facts(&connection)
+            .with_context(|| format!("validate embedded vector component {}", path.display()))?;
+        if digest != metadata.component_sha256 {
+            bail!(
+                "embedded vector document hash mismatch or physical component digest does not match metadata"
+            );
+        }
+        (digest.clone(), anchors, digest.clone(), digest)
+    } else if metadata.component_schema_version == 1 {
+        let embedding_dim = usize::try_from(metadata.embedding_dim)
+            .context("embedded vector dimension is not representable")?;
+        let (digest, anchors) = digest_vector_facts(&connection, embedding_dim)
+            .with_context(|| format!("validate embedded vector rows {}", path.display()))?;
+        (digest, anchors, sha256_file(path)?, String::new())
+    } else {
+        bail!("unsupported embedded vector component schema");
+    };
+    if anchors.len() != metadata.point_count as usize || vector_digest != metadata.vector_digest {
+        bail!("embedded vector document hash mismatch or canonical digest does not match metadata");
+    }
+    let database_size_bytes = if metadata.component_schema_version == 1 {
+        0
+    } else {
+        std::fs::metadata(path)
+            .with_context(|| format!("inspect embedded vector database {}", path.display()))?
+            .len()
+    };
+    Ok(VectorDatabaseContents {
+        metadata,
+        anchors,
+        vector_digest,
+        database_sha256,
+        component_sha256,
+        database_size_bytes,
+    })
 }
 
 fn validate_health_database(
@@ -1173,11 +2018,16 @@ fn validate_health_database(
     embedding_backend: &str,
     embedding_dim: usize,
 ) -> Result<u64> {
-    let connection = open_read_only(path)?;
-    let metadata = read_metadata(&connection)?;
+    let contents = VECTOR_DATABASE_RECEIPTS.validate_sealed(
+        path.to_path_buf(),
+        &sqlite_file_with_sidecars(path),
+        || verify_vector_database_contents(path),
+    )?;
+    let metadata = &contents.metadata;
+    let envelope_matches =
+        vector_publication_envelope_matches(path, metadata, generation, input_hash)?;
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
-        || metadata.generation != generation
-        || metadata.input_hash != input_hash
+        || !envelope_matches
         || metadata.embedding_backend != embedding_backend
         || metadata.embedding_dim != embedding_dim as i64
         || metadata.point_count < 0
@@ -1185,14 +2035,47 @@ fn validate_health_database(
     {
         bail!("embedded vector metadata does not match the published generation");
     }
-    let actual: i64 = connection.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))?;
-    if actual < 0 || actual as u64 != expected_points {
-        bail!(
-            "embedded vector count mismatch: expected {expected_points}, found {}",
-            actual.max(0)
-        );
+    Ok(metadata.point_count as u64)
+}
+
+fn vector_publication_envelope_matches(
+    path: &Path,
+    metadata: &DatabaseMetadata,
+    generation: &str,
+    input_hash: &str,
+) -> Result<bool> {
+    let manifest_path = path
+        .parent()
+        .context("embedded vector database has no generation directory")?
+        .join(VECTOR_GENERATION_MANIFEST_FILE);
+    match std::fs::symlink_metadata(&manifest_path) {
+        Ok(file_metadata) => {
+            if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+                bail!("vector generation manifest is not a regular file");
+            }
+            let manifest: VectorGenerationManifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
+                    format!(
+                        "read vector generation manifest {}",
+                        manifest_path.display()
+                    )
+                })?)?;
+            manifest.validate()?;
+            Ok(metadata.point_count >= 0
+                && metadata.embedding_dim >= 0
+                && manifest.vectors.generation == generation
+                && manifest.vectors.input_hash == input_hash
+                && manifest.vectors.component_schema_version == metadata.component_schema_version
+                && manifest.vectors.component_sha256 == metadata.component_sha256
+                && manifest.vectors.embedding_backend == metadata.embedding_backend
+                && manifest.vectors.embedding_dim == metadata.embedding_dim as usize
+                && manifest.vectors.point_count == metadata.point_count as u64)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(metadata.generation == generation && metadata.input_hash == input_hash)
+        }
+        Err(error) => Err(error).context("inspect vector generation manifest"),
     }
-    Ok(actual as u64)
 }
 
 fn expected_anchor_map(
@@ -1231,98 +2114,151 @@ fn read_metadata(connection: &Connection) -> Result<DatabaseMetadata> {
     if metadata_rows != 1 {
         bail!("embedded vector metadata must contain exactly one row");
     }
+    let has_component_metadata =
+        table_has_column(connection, "metadata", "component_schema_version")?
+            && table_has_column(connection, "metadata", "component_sha256")?;
+    let query = if has_component_metadata {
+        "SELECT schema_version, generation, input_hash, embedding_backend,
+                embedding_dim, point_count, producer_identity,
+                evidence_contract_identity, vector_digest,
+                component_schema_version, component_sha256
+         FROM metadata WHERE singleton = 1"
+    } else {
+        "SELECT schema_version, generation, input_hash, embedding_backend,
+                embedding_dim, point_count, producer_identity,
+                evidence_contract_identity, vector_digest, 1, ''
+         FROM metadata WHERE singleton = 1"
+    };
     connection
-        .query_row(
-            "SELECT schema_version, generation, input_hash, embedding_backend,
-                    embedding_dim, point_count, producer_identity,
-                    evidence_contract_identity, vector_digest
-             FROM metadata WHERE singleton = 1",
-            [],
-            |row| {
-                Ok(DatabaseMetadata {
-                    schema_version: row.get(0)?,
-                    generation: row.get(1)?,
-                    input_hash: row.get(2)?,
-                    embedding_backend: row.get(3)?,
-                    embedding_dim: row.get(4)?,
-                    point_count: row.get(5)?,
-                    producer_identity: row.get(6)?,
-                    evidence_contract_identity: row.get(7)?,
-                    vector_digest: row.get(8)?,
-                })
-            },
-        )
+        .query_row(query, [], |row| {
+            Ok(DatabaseMetadata {
+                schema_version: row.get(0)?,
+                generation: row.get(1)?,
+                input_hash: row.get(2)?,
+                embedding_backend: row.get(3)?,
+                embedding_dim: row.get(4)?,
+                point_count: row.get(5)?,
+                producer_identity: row.get(6)?,
+                evidence_contract_identity: row.get(7)?,
+                vector_digest: row.get(8)?,
+                component_schema_version: row.get(9)?,
+                component_sha256: row.get(10)?,
+            })
+        })
         .context("read the single embedded vector metadata row")
 }
 
-fn canonical_vector_digest(connection: &Connection, embedding_dim: usize) -> Result<String> {
-    digest_vector_rows(connection, embedding_dim, None).map(|(digest, _)| digest)
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for observed in columns {
+        if observed? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn validate_and_digest_vectors(
-    connection: &Connection,
-    embedding_dim: usize,
-    expected_anchors: &BTreeMap<String, String>,
-) -> Result<(String, usize)> {
-    digest_vector_rows(connection, embedding_dim, Some(expected_anchors))
+fn canonical_vector_component_digest(connection: &Connection) -> Result<String> {
+    digest_vector_component_facts(connection).map(|(digest, _)| digest)
 }
 
-fn digest_vector_rows(
+fn digest_vector_component_facts(
+    connection: &Connection,
+) -> Result<(String, BTreeMap<String, String>)> {
+    if !table_has_column(connection, "vectors", "vector_sha256")? {
+        bail!("embedded vector component is missing row digests");
+    }
+    let mut statement = connection.prepare(
+        "SELECT node_id, document_hash, display_name, file_path, file_role, dense_reason,
+                vector, vector_sha256
+         FROM vectors ORDER BY node_id ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut digest = Sha256::new();
+    digest.update(VECTOR_COMPONENT_DIGEST_DOMAIN);
+    let mut anchors = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let node_id = row.get::<_, String>(0)?;
+        let document_hash = row.get::<_, String>(1)?;
+        let display_name = row.get::<_, String>(2)?;
+        let file_path = row.get::<_, Option<String>>(3)?;
+        let file_role = row.get::<_, Option<String>>(4)?;
+        let dense_reason = row.get::<_, Option<String>>(5)?;
+        let vector = row.get::<_, Vec<u8>>(6)?;
+        let vector_sha256 = row.get::<_, String>(7)?;
+        if anchors
+            .insert(node_id.clone(), document_hash.clone())
+            .is_some()
+        {
+            bail!("duplicate embedded vector row {node_id}");
+        }
+        if node_id.trim().is_empty()
+            || document_hash.trim().is_empty()
+            || !is_sha256_hex(&vector_sha256)
+        {
+            bail!("embedded vector canonical digest row identities are invalid");
+        }
+        let observed_vector_sha256 = hex_digest(Sha256::digest(&vector));
+        if observed_vector_sha256 != vector_sha256 {
+            bail!("embedded vector blob digest mismatch for node {node_id}");
+        }
+        hash_len_prefixed(&mut digest, node_id.as_bytes());
+        hash_len_prefixed(&mut digest, document_hash.as_bytes());
+        hash_len_prefixed(&mut digest, display_name.as_bytes());
+        hash_len_prefixed(
+            &mut digest,
+            file_path.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_len_prefixed(
+            &mut digest,
+            file_role.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_len_prefixed(
+            &mut digest,
+            dense_reason.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_len_prefixed(&mut digest, vector_sha256.as_bytes());
+    }
+    Ok((hex_digest(digest.finalize()), anchors))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn digest_vector_facts(
     connection: &Connection,
     embedding_dim: usize,
-    expected_anchors: Option<&BTreeMap<String, String>>,
-) -> Result<(String, usize)> {
+) -> Result<(String, BTreeMap<String, String>)> {
     let mut statement = connection
         .prepare("SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id ASC")?;
     let mut rows = statement.query([])?;
     let mut digest = Sha256::new();
     digest.update(VECTOR_DIGEST_DOMAIN);
-    let mut seen = BTreeSet::new();
+    let mut anchors = BTreeMap::new();
     while let Some(row) = rows.next()? {
         let node_id: String = row.get(0)?;
         let document_hash: String = row.get(1)?;
         let vector: Vec<u8> = row.get(2)?;
-        if !seen.insert(node_id.clone()) {
+        if anchors
+            .insert(node_id.clone(), document_hash.clone())
+            .is_some()
+        {
             bail!("duplicate embedded vector row {node_id}");
         }
         if node_id.trim().is_empty() || document_hash.trim().is_empty() {
             bail!("embedded vector row identities must be non-empty");
-        }
-        if let Some(expected_anchors) = expected_anchors {
-            let expected_hash = expected_anchors
-                .get(&node_id)
-                .with_context(|| format!("unexpected embedded vector row {node_id}"))?;
-            if expected_hash != &document_hash {
-                bail!(
-                    "embedded vector document hash mismatch for node {node_id}: expected {expected_hash}, found {document_hash}"
-                );
-            }
         }
         validate_vector_bytes(&node_id, &vector, embedding_dim)?;
         hash_len_prefixed(&mut digest, node_id.as_bytes());
         hash_len_prefixed(&mut digest, document_hash.as_bytes());
         hash_len_prefixed(&mut digest, &vector);
     }
-    if let Some(expected_anchors) = expected_anchors
-        && seen.len() != expected_anchors.len()
-    {
-        let missing = expected_anchors
-            .keys()
-            .filter(|node_id| !seen.contains(*node_id))
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>();
-        bail!(
-            "embedded vector row coverage mismatch: expected {}, found {}, missing {:?}",
-            expected_anchors.len(),
-            seen.len(),
-            missing
-        );
-    }
-    Ok((hex_digest(digest.finalize()), seen.len()))
+    Ok((hex_digest(digest.finalize()), anchors))
 }
 
-fn validate_vector(node_id: &str, vector: &[f32], embedding_dim: usize) -> Result<()> {
+pub(crate) fn validate_vector(node_id: &str, vector: &[f32], embedding_dim: usize) -> Result<()> {
     if vector.len() != embedding_dim {
         bail!(
             "embedded vector dimension mismatch for node {node_id}: expected {embedding_dim}, found {}",
@@ -1519,17 +2455,13 @@ fn search_database_batch_with_abstention(
         return Ok(vec![Vec::new(); queries.len()]);
     }
     let connection = open_read_only(path)?;
-    let (stored_generation, stored_hash, stored_dim): (String, String, i64) = connection
-        .query_row(
-            "SELECT generation, input_hash, embedding_dim FROM metadata",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-    if stored_generation != generation
-        || stored_hash != input_hash
+    let metadata = read_metadata(&connection)?;
+    if !vector_publication_envelope_matches(path, &metadata, generation, input_hash)?
+        || metadata.generation.trim().is_empty()
+        || metadata.input_hash.trim().is_empty()
         || queries
             .iter()
-            .any(|(query, limit)| *limit != 0 && stored_dim != query.len() as i64)
+            .any(|(query, limit)| *limit != 0 && metadata.embedding_dim != query.len() as i64)
     {
         bail!("embedded vector index publication identity changed");
     }
@@ -1553,9 +2485,15 @@ fn search_database_batch_with_abstention(
             Ok(query_norm)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut statement = connection.prepare(
-        "SELECT node_id, display_name, file_path, file_role, dense_reason, vector FROM vectors",
-    )?;
+    let has_vector_hash = table_has_column(&connection, "vectors", "vector_sha256")?;
+    let query = if has_vector_hash {
+        "SELECT node_id, display_name, file_path, file_role, dense_reason, vector,
+                vector_sha256 FROM vectors"
+    } else {
+        "SELECT node_id, display_name, file_path, file_role, dense_reason, vector,
+                '' FROM vectors"
+    };
+    let mut statement = connection.prepare(query)?;
     let mut rows = statement.query([])?;
     let mut scored = queries
         .iter()
@@ -1566,6 +2504,12 @@ fn search_database_batch_with_abstention(
             bail!("embedded vector search cancelled");
         }
         let bytes: Vec<u8> = row.get(5)?;
+        let expected_vector_sha256 = row.get::<_, String>(6)?;
+        if !expected_vector_sha256.is_empty()
+            && hex_digest(Sha256::digest(&bytes)) != expected_vector_sha256
+        {
+            bail!("embedded vector row digest mismatch");
+        }
         let node_id = row.get::<_, String>(0)?;
         let display_name = row.get::<_, String>(1)?;
         let file_path = row.get::<_, Option<String>>(2)?;
@@ -1626,6 +2570,8 @@ fn scored_hits_to_candidates(scored: Vec<ScoredHit>) -> Vec<CandidateHit> {
                     CandidateSource::Semantic,
                 );
                 hit.node_id = Some(node_id);
+                hit.source_bytes_upper_bound =
+                    Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
                 hit.file_role = file_role
                     .as_deref()
                     .map(codestory_store::FileRole::from_db_value);
@@ -1723,8 +2669,8 @@ mod tests {
     use crate::config::SidecarLayout;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{
-        DenseAnchorInput, FileRole, IndexPublicationMode, IndexPublicationRecord,
-        RetrievalIndexManifest,
+        DenseAnchorInput, DenseAnchorPublicationManifest, FileRole, IndexPublicationMode,
+        IndexPublicationRecord, RetrievalIndexManifest,
     };
     use std::io::Write;
     use std::path::PathBuf;
@@ -1776,6 +2722,138 @@ mod tests {
                 document_hash: "document-2".into(),
             },
         ]
+    }
+
+    fn current_anchor(
+        node_id: &str,
+        document_hash: &str,
+        display_name: &str,
+    ) -> CurrentVectorAnchor {
+        CurrentVectorAnchor {
+            node_id: node_id.into(),
+            document_hash: document_hash.into(),
+            display_name: display_name.into(),
+            file_path: Some(format!("src/{node_id}.rs")),
+            file_role: Some(FileRole::Source),
+            dense_reason: Some("public_api".into()),
+        }
+    }
+
+    fn recreate_vector_database(
+        source: &Path,
+        destination: &Path,
+        page_size: u64,
+        without_rowid: bool,
+    ) {
+        assert!(matches!(page_size, 4096 | 16384));
+        let parent = destination.parent().expect("legacy vector parent");
+        std::fs::create_dir_all(parent).expect("create legacy vector parent");
+        let connection = Connection::open(destination).expect("create legacy vector database");
+        let source = source.to_string_lossy().into_owned();
+        connection
+            .execute("ATTACH DATABASE ?1 AS source", [source])
+            .expect("attach fresh vector database");
+        let rowid_suffix = if without_rowid { " WITHOUT ROWID" } else { "" };
+        connection
+            .execute_batch(&format!(
+                "PRAGMA page_size={page_size};
+                 PRAGMA journal_mode=OFF;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE metadata (
+                     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     generation TEXT NOT NULL,
+                     input_hash TEXT NOT NULL,
+                     embedding_backend TEXT NOT NULL,
+                     embedding_dim INTEGER NOT NULL,
+                     point_count INTEGER NOT NULL,
+                     producer_identity TEXT NOT NULL,
+                     evidence_contract_identity TEXT NOT NULL,
+                     vector_digest TEXT NOT NULL,
+                     component_schema_version INTEGER NOT NULL,
+                     component_sha256 TEXT NOT NULL
+                 );
+                 CREATE TABLE vectors (
+                     node_id TEXT PRIMARY KEY NOT NULL,
+                     document_hash TEXT NOT NULL,
+                     display_name TEXT NOT NULL,
+                     file_path TEXT,
+                     file_role TEXT,
+                     dense_reason TEXT,
+                     vector BLOB NOT NULL,
+                     vector_sha256 TEXT NOT NULL
+                 ){rowid_suffix};
+                 CREATE TRIGGER vectors_vector_update_guard
+                 AFTER UPDATE OF vector ON vectors
+                 BEGIN
+                     UPDATE vectors SET vector_sha256 = 'invalid' WHERE node_id = NEW.node_id;
+                 END;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO metadata SELECT * FROM source.metadata;
+                 INSERT INTO vectors SELECT * FROM source.vectors ORDER BY node_id;
+                 COMMIT;
+                 PRAGMA optimize;"
+            ))
+            .expect("recreate legacy vector database");
+        connection
+            .execute_batch("DETACH DATABASE source")
+            .expect("detach fresh vector database");
+        drop(connection);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(destination)
+            .expect("open legacy vector database for sync")
+            .sync_all()
+            .expect("sync legacy vector database");
+    }
+
+    fn recreate_without_rowid_vector_database(source: &Path, destination: &Path) {
+        recreate_vector_database(source, destination, 4096, true);
+    }
+
+    fn recreate_four_kib_rowid_vector_database(source: &Path, destination: &Path) {
+        recreate_vector_database(source, destination, 4096, false);
+    }
+
+    fn sqlite_page_bytes(path: &Path) -> u64 {
+        let connection = open_read_only(path).expect("open vector database for page count");
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page size");
+        let page_count = connection
+            .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page count");
+        let page_size = u64::try_from(page_size).expect("positive vector page size");
+        let page_count = u64::try_from(page_count).expect("nonnegative vector page count");
+        page_size
+            .checked_mul(page_count)
+            .expect("vector page bytes")
+    }
+
+    fn sqlite_page_size(path: &Path) -> u64 {
+        let connection = open_read_only(path).expect("open vector database for page size");
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+            .expect("read vector page size");
+        u64::try_from(page_size).expect("positive vector page size")
+    }
+
+    fn dense_manifest(
+        core_generation_id: &str,
+        core_run_id: &str,
+    ) -> DenseAnchorPublicationManifest {
+        DenseAnchorPublicationManifest {
+            schema_version: codestory_store::DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: core_generation_id.into(),
+            core_run_id: core_run_id.into(),
+            anchor_count: 2,
+            anchor_digest: "stable-dense-anchor-digest".into(),
+            anchor_source_identity: "stable-dense-source".into(),
+            policy_version: crate::generation::SEMANTIC_POLICY_VERSION.into(),
+            migration_state: codestory_store::DENSE_ANCHOR_MIGRATION_STATE_NATIVE.into(),
+            published_at_epoch_ms: 1,
+        }
     }
 
     fn accelerated_device() -> EmbeddingDeviceReadiness {
@@ -2298,6 +3376,25 @@ mod tests {
         assert_eq!(attestation.vector_digest.len(), 64);
         assert_eq!(attestation.database_sha256.len(), 64);
         assert_eq!(attestation.producer_identity, "producer-v1");
+        let second_envelope = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "codestory_attested_second_envelope",
+            "generation-v2",
+            "input-v2",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build same component under a second envelope");
+        assert_eq!(
+            attestation.component_sha256, second_envelope.component_sha256,
+            "physical component identity must not include the core-bound publication envelope"
+        );
+        assert_ne!(attestation.generation, second_envelope.generation);
+        assert_ne!(attestation.input_hash, second_envelope.input_hash);
         assert_eq!(
             EmbeddedVectorIndex::validate_published_attestation(
                 &layout,
@@ -2425,6 +3522,62 @@ mod tests {
     }
 
     #[test]
+    fn same_generation_vector_retry_replaces_a_readonly_partial_component() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let contract = evidence_contract();
+        let expected = expected_anchors();
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "partial",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("publish component before envelope");
+        let path = index_path(&layout, "partial");
+        assert!(
+            std::fs::metadata(&path)
+                .expect("partial permissions")
+                .permissions()
+                .readonly()
+        );
+
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "partial",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![0.0, 1.0]))?;
+                visit(attested_point("2", "document-2", vec![1.0, 0.0]))
+            },
+        )
+        .expect("repair same-generation partial component");
+
+        assert!(
+            std::fs::metadata(&path)
+                .expect("repaired permissions")
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(
+            search_database(&path, "generation-v1", "input-v1", &[1.0, 0.0], 1, || false)
+                .expect("search repaired component")[0]
+                .node_id
+                .as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
     fn attested_index_rejects_inexact_anchor_coverage_and_invalid_vectors() {
         let root = tempdir().expect("tempdir");
         let layout = layout(root.path());
@@ -2485,6 +3638,907 @@ mod tests {
     }
 
     #[test]
+    fn incremental_generation_reconciles_same_count_changes_without_rewriting_predecessor() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let evidence = build_vector_producer_evidence(
+            &device,
+            Some(&identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let previous_expected = vec![
+            ExpectedVectorAnchor {
+                node_id: "1".into(),
+                document_hash: "document-1".into(),
+            },
+            ExpectedVectorAnchor {
+                node_id: "2".into(),
+                document_hash: "document-2".into(),
+            },
+        ];
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &previous_expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        let previous_manifest =
+            VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("predecessor manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &previous_manifest)
+            .expect("publish predecessor manifest");
+        let previous_bytes = std::fs::read(index_path(&layout, "previous")).expect("predecessor");
+
+        let current_expected = vec![
+            ExpectedVectorAnchor {
+                node_id: "1".into(),
+                document_hash: "document-1".into(),
+            },
+            ExpectedVectorAnchor {
+                node_id: "3".into(),
+                document_hash: "document-3".into(),
+            },
+        ];
+        let outcome = EmbeddedVectorIndex::try_build_incremental_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "current",
+                generation: "generation-v2",
+                input_hash: "input-v2",
+                contract: &contract,
+                expected_anchors: &current_expected,
+            },
+            "previous",
+            &evidence,
+            &[
+                current_anchor("1", "document-1", "renamed display metadata"),
+                current_anchor("3", "document-3", "symbol_3"),
+            ],
+            &|| false,
+            || Ok(()),
+            |missing, visit| {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0].node_id, "3");
+                visit(attested_point("3", "document-3", vec![0.0, 1.0]))
+            },
+        )
+        .expect("incremental build");
+        let Some((attestation, work)) = outcome else {
+            return;
+        };
+
+        assert_eq!(work.retained, 1);
+        assert_eq!(work.inserted, 1);
+        assert_eq!(work.removed, 1);
+        assert_eq!(attestation.point_count, 2);
+        assert_eq!(
+            std::fs::read(index_path(&layout, "previous")).expect("predecessor after build"),
+            previous_bytes
+        );
+        let connection = open_read_only(&index_path(&layout, "current")).expect("current db");
+        let retained_metadata: String = connection
+            .query_row(
+                "SELECT display_name FROM vectors WHERE node_id = '1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retained metadata");
+        assert_eq!(retained_metadata, "renamed display metadata");
+        let removed_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vectors WHERE node_id = '2'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("removed row");
+        assert_eq!(removed_count, 0);
+        assert!(
+            std::fs::metadata(index_path(&layout, "previous"))
+                .expect("previous permissions")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            std::fs::metadata(index_path(&layout, "current"))
+                .expect("current permissions")
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn incremental_clone_permissions_failure_removes_candidate_and_preserves_predecessor() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        let previous_manifest =
+            VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("predecessor manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &previous_manifest)
+            .expect("publish predecessor manifest");
+        let previous_path = index_path(&layout, "previous");
+        let previous_bytes = std::fs::read(&previous_path).expect("predecessor vectors");
+        let previous_manifest_path = generation_manifest_path(&layout, "previous");
+        let previous_manifest_bytes =
+            std::fs::read(&previous_manifest_path).expect("predecessor manifest");
+
+        let current_path = index_path(&layout, "current");
+        let current = [
+            current_anchor("1", "document-1", "changed display name"),
+            current_anchor("2", "document-2", "symbol_2"),
+        ];
+        let build = |fail_writable| {
+            crate::copy_on_write::with_production_copy_and_writable_failure(fail_writable, || {
+                EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                    AttestedVectorPublication {
+                        layout: &layout,
+                        collection: "current",
+                        generation: "generation-v2",
+                        input_hash: "input-v2",
+                        contract: &contract,
+                        expected_anchors: &expected,
+                    },
+                    "previous",
+                    &evidence,
+                    &current,
+                    &|| false,
+                    || Ok(()),
+                    |missing, _| {
+                        assert!(missing.is_empty());
+                        Ok(())
+                    },
+                )
+            })
+        };
+        let failed = build(true);
+        let error = failed.expect_err("permissions failure after clone");
+        assert!(format!("{error:#}").contains("injected staged component permissions failure"));
+        assert!(
+            !current_path.exists(),
+            "candidate was published after failure"
+        );
+        assert_eq!(
+            std::fs::read_dir(current_path.parent().expect("collection directory"))
+                .expect("candidate directory")
+                .count(),
+            0,
+            "failed clone left a temporary vector database"
+        );
+        assert_eq!(std::fs::read(&previous_path).unwrap(), previous_bytes);
+        assert_eq!(
+            std::fs::read(&previous_manifest_path).unwrap(),
+            previous_manifest_bytes
+        );
+
+        let retry = build(false);
+        let (attestation, work) = retry.expect("retry").expect("clone path");
+        assert_eq!(attestation.point_count, 2);
+        assert!(!work.direct_reference);
+        assert_eq!(
+            work.stage.expect("production stage").strategy,
+            codestory_store::SealedStageStrategy::Copied
+        );
+        assert_eq!(std::fs::read(&previous_path).unwrap(), previous_bytes);
+        assert_eq!(
+            std::fs::read(&previous_manifest_path).unwrap(),
+            previous_manifest_bytes
+        );
+        let entries: Vec<_> = std::fs::read_dir(current_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries, vec![current_path]);
+    }
+
+    #[test]
+    fn publication_only_vector_churn_directly_references_the_component_without_clone() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let evidence = build_vector_producer_evidence(
+            &device,
+            Some(&identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "previous",
+            &VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("predecessor manifest"),
+        )
+        .expect("publish predecessor manifest");
+        let previous_path = index_path(&layout, "previous");
+
+        let outcome = crate::copy_on_write::with_clone_disabled(|| {
+            EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                AttestedVectorPublication {
+                    layout: &layout,
+                    collection: "current",
+                    generation: "generation-v2",
+                    input_hash: "input-v2",
+                    contract: &contract,
+                    expected_anchors: &expected,
+                },
+                "previous",
+                &evidence,
+                &[
+                    current_anchor("1", "document-1", "symbol_1"),
+                    current_anchor("2", "document-2", "symbol_2"),
+                ],
+                &|| false,
+                || Ok(()),
+                |_, _| panic!("publication-only reuse must not request vector production"),
+            )
+        })
+        .expect("publication-only vector build")
+        .expect("direct-reference outcome");
+        let (attestation, work) = outcome;
+        assert!(work.direct_reference);
+        assert_eq!(work.retained, 2);
+        assert_eq!(work.inserted, 0);
+        assert_eq!(work.removed, 0);
+        let current_path = index_path(&layout, "current");
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
+        );
+        assert_eq!(attestation.generation, "generation-v2");
+        assert_eq!(attestation.input_hash, "input-v2");
+        assert!(
+            std::fs::metadata(&previous_path)
+                .expect("previous permissions")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            std::fs::metadata(&current_path)
+                .expect("current permissions")
+                .permissions()
+                .readonly()
+        );
+        let aliased_receipt = vector_database_receipt_stats(&layout, "current")
+            .expect("direct reference inherits the validated component receipt");
+        assert_eq!(aliased_receipt.validations, 1);
+        EmbeddedVectorIndex::validate_published_attestation(
+            &layout,
+            "current",
+            "generation-v2",
+            "input-v2",
+            &contract,
+            &expected,
+            &attestation,
+        )
+        .expect("validate current envelope over referenced vectors");
+        let reused_receipt = vector_database_receipt_stats(&layout, "current")
+            .expect("current component receipt remains sealed");
+        assert_eq!(reused_receipt.validations, 1);
+        assert!(reused_receipt.reuses > aliased_receipt.reuses);
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "current",
+            &VectorGenerationManifest::new(evidence, attestation)
+                .expect("current generation manifest"),
+        )
+        .expect("publish current generation manifest");
+        search_database(
+            &current_path,
+            "generation-v2",
+            "input-v2",
+            &[1.0, 0.0],
+            1,
+            || false,
+        )
+        .expect("search current direct-reference envelope");
+        for (generation, input_hash) in [
+            ("wrong-generation", "input-v2"),
+            ("generation-v2", "wrong-input"),
+        ] {
+            let error = search_database(
+                &current_path,
+                generation,
+                input_hash,
+                &[1.0, 0.0],
+                1,
+                || false,
+            )
+            .expect_err("direct-reference search must reject the wrong envelope");
+            assert!(
+                format!("{error:#}").contains("publication identity changed"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_semantic_page_density_preserves_legacy_and_four_kib_reuse() {
+        const POINT_COUNT: usize = 512;
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let dimension = crate::embeddings::RETRIEVAL_EMBEDDING_DIM;
+        let mut evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            dimension as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            dimension,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = (0..POINT_COUNT)
+            .map(|index| ExpectedVectorAnchor {
+                node_id: format!("node-{index:04}"),
+                document_hash: format!("document-{index:04}"),
+            })
+            .collect::<Vec<_>>();
+        let fresh_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "fresh",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                for (index, anchor) in expected.iter().enumerate() {
+                    let mut vector = vec![0.0_f32; dimension];
+                    vector[index % dimension] = 1.0;
+                    visit(attested_point(
+                        &anchor.node_id,
+                        &anchor.document_hash,
+                        vector,
+                    ))?;
+                }
+                Ok(())
+            },
+        )
+        .expect("build fresh large-vector component");
+        let fresh_path = index_path(&layout, "fresh");
+        let legacy_path = index_path(&layout, "legacy");
+        recreate_without_rowid_vector_database(&fresh_path, &legacy_path);
+        let legacy_attestation = validate_database(
+            &legacy_path,
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected_anchor_map(&expected).expect("legacy expected anchors"),
+            None,
+        )
+        .expect("validate legacy physical layout");
+        assert_eq!(
+            fresh_attestation.component_sha256, legacy_attestation.component_sha256,
+            "legacy layout must retain the canonical vector component"
+        );
+
+        let previous_path = index_path(&layout, "previous");
+        recreate_four_kib_rowid_vector_database(&fresh_path, &previous_path);
+        let previous_attestation = validate_database(
+            &previous_path,
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected_anchor_map(&expected).expect("expected anchors"),
+            None,
+        )
+        .expect("validate previous physical layout");
+        assert_eq!(
+            fresh_attestation.component_sha256, previous_attestation.component_sha256,
+            "page geometry must not change the canonical vector component"
+        );
+        let previous_bytes = std::fs::read(&previous_path).expect("read previous layout");
+        evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "previous",
+            &VectorGenerationManifest::new(evidence.clone(), previous_attestation)
+                .expect("previous manifest"),
+        )
+        .expect("publish previous manifest");
+        let current_anchors = expected
+            .iter()
+            .map(|anchor| {
+                current_anchor(
+                    &anchor.node_id,
+                    &anchor.document_hash,
+                    &format!("symbol_{}", anchor.node_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outcome = crate::copy_on_write::with_clone_disabled(|| {
+            EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                AttestedVectorPublication {
+                    layout: &layout,
+                    collection: "current",
+                    generation: "generation-v2",
+                    input_hash: "input-v2",
+                    contract: &contract,
+                    expected_anchors: &expected,
+                },
+                "previous",
+                &evidence,
+                &current_anchors,
+                &|| false,
+                || Ok(()),
+                |_, _| panic!("unchanged old-layout vectors must not be produced again"),
+            )
+        })
+        .expect("reuse old-layout vectors")
+        .expect("direct-reference outcome");
+        assert!(outcome.1.direct_reference);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&index_path(&layout, "current"))
+                .expect("current identity")
+        );
+        assert_eq!(
+            std::fs::read(&previous_path).expect("previous after reuse"),
+            previous_bytes
+        );
+
+        let fresh_page_bytes = sqlite_page_bytes(&fresh_path);
+        let previous_page_bytes = sqlite_page_bytes(&previous_path);
+        assert!(
+            fresh_page_bytes.saturating_mul(20) <= previous_page_bytes.saturating_mul(17),
+            "fresh page geometry must reduce a four-KiB large-vector baseline by at least 15%: fresh={fresh_page_bytes}, previous={previous_page_bytes}"
+        );
+        assert_eq!(sqlite_page_size(&fresh_path), 16 * 1024);
+        assert_eq!(sqlite_page_size(&previous_path), 4 * 1024);
+    }
+
+    #[test]
+    fn graph_equivalent_dense_publication_references_vectors_without_anchor_metadata_scan() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "previous",
+            &VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("previous manifest"),
+        )
+        .expect("publish previous manifest");
+
+        let previous_dense = dense_manifest("core-v1", "run-v1");
+        let current_dense = dense_manifest("core-v2", "run-v2");
+        let (attestation, work) = EmbeddedVectorIndex::try_reference_graph_equivalent_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "current",
+                generation: "generation-v2",
+                input_hash: "input-v2",
+                contract: &contract,
+                expected_anchors: &expected,
+            },
+            "previous",
+            &evidence,
+            &previous_dense,
+            &current_dense,
+            || Ok(()),
+        )
+        .expect("reference graph-equivalent vectors")
+        .expect("graph-equivalent reference eligible");
+        assert!(work.direct_reference);
+        assert_eq!((work.retained, work.inserted, work.removed), (2, 0, 0));
+        assert_eq!(attestation.generation, "generation-v2");
+        assert_eq!(attestation.input_hash, "input-v2");
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&index_path(&layout, "previous"))
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&index_path(&layout, "current"))
+                .expect("current identity"),
+        );
+
+        let mut changed_dense = current_dense;
+        changed_dense.anchor_digest = "changed-dense-anchor-digest".into();
+        assert!(
+            EmbeddedVectorIndex::try_reference_graph_equivalent_with_cancel(
+                AttestedVectorPublication {
+                    layout: &layout,
+                    collection: "rejected",
+                    generation: "generation-v3",
+                    input_hash: "input-v3",
+                    contract: &contract,
+                    expected_anchors: &expected,
+                },
+                "previous",
+                &evidence,
+                &previous_dense,
+                &changed_dense,
+                || Ok(()),
+            )
+            .expect("changed dense evidence is a fallback")
+            .is_none()
+        );
+        assert!(!index_path(&layout, "rejected").exists());
+    }
+
+    #[test]
+    fn incremental_vector_cancellation_leaves_no_candidate_publication() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v1".into(),
+                core_run_id: "run-v1".into(),
+                retrieval_generation: "generation-v1".into(),
+                retrieval_input_hash: "input-v1".into(),
+                semantic_generation: "previous".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let manifest = VectorGenerationManifest::new(evidence.clone(), previous_attestation)
+            .expect("manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &manifest)
+            .expect("publish predecessor manifest");
+
+        let result = EmbeddedVectorIndex::try_build_incremental_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "cancelled",
+                generation: "generation-v2",
+                input_hash: "input-v2",
+                contract: &contract,
+                expected_anchors: &expected,
+            },
+            "previous",
+            &evidence,
+            &[
+                current_anchor("1", "document-1", "symbol_1"),
+                current_anchor("2", "document-2", "symbol_2"),
+            ],
+            &|| true,
+            || panic!("cancelled stage must not reach publication"),
+            |missing, _| {
+                assert!(missing.is_empty());
+                Ok(())
+            },
+        );
+        let error = result.expect_err("cancelled stage must fail");
+        assert!(crate::index::is_retrieval_index_cancelled(&error));
+        assert!(!index_path(&layout, "cancelled").exists());
+    }
+
+    #[test]
+    fn corrupt_vector_predecessor_requests_complete_fallback_without_a_candidate() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v1".into(),
+                core_run_id: "run-v1".into(),
+                retrieval_generation: "generation-v1".into(),
+                retrieval_input_hash: "input-v1".into(),
+                semantic_generation: "previous".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let manifest =
+            VectorGenerationManifest::new(evidence.clone(), attestation).expect("manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &manifest)
+            .expect("publish manifest");
+        let previous_path = index_path(&layout, "previous");
+        crate::copy_on_write::make_file_owner_writable(&previous_path)
+            .expect("authorize hostile corruption");
+        let connection = Connection::open(previous_path).expect("open vector db");
+        connection
+            .execute("DROP TRIGGER vectors_vector_update_guard", [])
+            .expect("remove mutation guard");
+        connection
+            .execute(
+                "UPDATE vectors SET vector = X'0000000000000000' WHERE node_id = '1'",
+                [],
+            )
+            .expect("corrupt vector row");
+        drop(connection);
+
+        let outcome = EmbeddedVectorIndex::try_build_incremental_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "current",
+                generation: "generation-v2",
+                input_hash: "input-v2",
+                contract: &contract,
+                expected_anchors: &expected,
+            },
+            "previous",
+            &evidence,
+            &[
+                current_anchor("1", "document-1", "symbol_1"),
+                current_anchor("2", "document-2", "symbol_2"),
+            ],
+            &|| false,
+            || Ok(()),
+            |_, _| panic!("corrupt predecessor must not enter differential production"),
+        )
+        .expect("fallback decision");
+
+        assert!(outcome.is_none());
+        assert!(!index_path(&layout, "current").exists());
+    }
+
+    #[test]
+    fn legacy_vector_manifest_requests_complete_fallback_before_clone() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v1".into(),
+                core_run_id: "run-v1".into(),
+                retrieval_generation: "generation-v1".into(),
+                retrieval_input_hash: "input-v1".into(),
+                semantic_generation: "previous".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut manifest =
+            VectorGenerationManifest::new(evidence.clone(), attestation).expect("manifest");
+        manifest.schema_version = 1;
+        manifest.vectors.component_schema_version = 1;
+        manifest.vectors.component_sha256.clear();
+        std::fs::create_dir_all(
+            generation_manifest_path(&layout, "previous")
+                .parent()
+                .expect("manifest parent"),
+        )
+        .expect("manifest parent");
+        std::fs::write(
+            generation_manifest_path(&layout, "previous"),
+            serde_json::to_vec(&manifest).expect("legacy manifest JSON"),
+        )
+        .expect("legacy manifest");
+
+        let outcome = EmbeddedVectorIndex::try_build_incremental_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "current",
+                generation: "generation-v2",
+                input_hash: "input-v2",
+                contract: &contract,
+                expected_anchors: &expected,
+            },
+            "previous",
+            &evidence,
+            &[
+                current_anchor("1", "document-1", "symbol_1"),
+                current_anchor("2", "document-2", "symbol_2"),
+            ],
+            &|| false,
+            || Ok(()),
+            |_, _| panic!("legacy predecessor must not enter differential production"),
+        )
+        .expect("fallback decision");
+
+        assert!(outcome.is_none());
+        assert!(!index_path(&layout, "current").exists());
+    }
+
+    #[test]
     fn published_attestation_rejects_contract_and_database_drift() {
         let root = tempdir().expect("tempdir");
         let layout = layout(root.path());
@@ -2519,9 +4573,12 @@ mod tests {
             .is_err()
         );
 
+        let drift_path = index_path(&layout, "codestory_drift");
+        crate::copy_on_write::make_file_owner_writable(&drift_path)
+            .expect("make database writable for hostile drift injection");
         std::fs::OpenOptions::new()
             .append(true)
-            .open(index_path(&layout, "codestory_drift"))
+            .open(drift_path)
             .expect("open database for drift")
             .write_all(b"drift")
             .expect("append database drift");
@@ -2540,6 +4597,100 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_vector_database_reuses_receipt_and_replacement_revalidates() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let collection = "codestory_receipt";
+        let contract = evidence_contract();
+        let expected = expected_anchors();
+        let attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            collection,
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build attested vectors");
+        let validate = || {
+            EmbeddedVectorIndex::validate_published_attestation(
+                &layout,
+                collection,
+                "generation-v1",
+                "input-v1",
+                &contract,
+                &expected,
+                &attestation,
+            )
+        };
+
+        validate().expect("first published validation");
+        validate().expect("receipt-backed validation");
+        let warm = vector_database_receipt_stats(&layout, collection).expect("warm receipt");
+        assert_eq!(warm.validations, 1);
+        assert_eq!(warm.reuses, 1);
+        assert_eq!(warm.invalidations, 0);
+
+        assert!(
+            EmbeddedVectorIndex::health(
+                &layout,
+                collection,
+                "generation-v1",
+                "input-v1",
+                2,
+                "backend",
+                2,
+            )
+            .ready
+        );
+        let first_health =
+            vector_database_receipt_stats(&layout, collection).expect("first health receipt");
+        assert!(
+            EmbeddedVectorIndex::health(
+                &layout,
+                collection,
+                "generation-v1",
+                "input-v1",
+                2,
+                "backend",
+                2,
+            )
+            .ready
+        );
+        let second_health =
+            vector_database_receipt_stats(&layout, collection).expect("second health receipt");
+        assert_eq!(second_health.validations, first_health.validations);
+        assert_eq!(second_health.reuses, first_health.reuses + 1);
+
+        let database_path = index_path(&layout, collection);
+        let replacement_path = database_path.with_extension("replacement");
+        std::fs::copy(&database_path, &replacement_path).expect("copy valid replacement");
+        std::fs::remove_file(&database_path).expect("remove original vector identity");
+        std::fs::rename(&replacement_path, &database_path).expect("replace vector identity");
+        validate().expect("same bytes under a new identity revalidate successfully");
+        let replaced = vector_database_receipt_stats(&layout, collection)
+            .expect("replacement validation receipt");
+        assert_eq!(replaced.validations, 2);
+        assert_eq!(replaced.reuses, second_health.reuses);
+        assert_eq!(replaced.invalidations, 1);
+
+        crate::copy_on_write::make_file_owner_writable(&database_path)
+            .expect("make replacement writable for truncation");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&database_path)
+            .expect("open vector database for truncation")
+            .set_len(64)
+            .expect("truncate vector database");
+        validate().expect_err("truncation must invalidate and fail deep validation");
+        assert!(vector_database_receipt_stats(&layout, collection).is_none());
+    }
+
+    #[test]
     fn reader_admission_revalidates_database_sha_digest_hashes_and_cardinality() {
         let root = tempdir().expect("tempdir");
         let layout = layout(root.path());
@@ -2555,6 +4706,7 @@ mod tests {
             validate_generation_evidence_for_publication(
                 &layout,
                 &storage,
+                None,
                 &manifest,
                 &publication,
                 &runtime,
@@ -2574,9 +4726,12 @@ mod tests {
         );
         validate().expect("admit complete reader generation");
 
+        let vector_path = index_path(&layout, &manifest.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile byte drift injection");
         std::fs::OpenOptions::new()
             .append(true)
-            .open(index_path(&layout, &manifest.semantic_generation))
+            .open(&vector_path)
             .expect("open database for exact-byte drift")
             .write_all(b"byte-drift")
             .expect("append exact-byte drift");
@@ -2592,6 +4747,8 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile vector drift injection");
         let mut changed_vector = vec![0.0_f32; crate::embeddings::RETRIEVAL_EMBEDDING_DIM];
         changed_vector[1] = 1.0;
         Connection::open(index_path(&layout, &manifest.semantic_generation))
@@ -2613,6 +4770,8 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile document drift injection");
         Connection::open(index_path(&layout, &manifest.semantic_generation))
             .expect("open database for document drift")
             .execute(
@@ -2621,7 +4780,10 @@ mod tests {
             )
             .expect("change document hash");
         let error = validate().expect_err("document hash drift must fail admission");
-        assert!(format!("{error:#}").contains("document hash mismatch"));
+        assert!(
+            format!("{error:#}").contains("document hash mismatch"),
+            "{error:#}"
+        );
 
         publish_reader_generation(
             &layout,
@@ -2632,12 +4794,85 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile cardinality drift injection");
         Connection::open(index_path(&layout, &manifest.semantic_generation))
             .expect("open database for cardinality drift")
             .execute("DELETE FROM vectors WHERE node_id = '1'", [])
             .expect("remove vector row");
         let error = validate().expect_err("vector cardinality drift must fail admission");
         assert!(format!("{error:#}").contains("count mismatch"));
+    }
+
+    #[test]
+    fn unchanged_publication_reuses_the_core_vector_relation_receipt() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let runtime = reader_runtime(root.path(), &layout);
+        let publication = reader_publication();
+        let core_database_path = root.path().join("core.sqlite3");
+        let storage = seed_reader_store(&core_database_path, &publication);
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let manifest = reader_manifest(&crate::embeddings::embedding_runtime_id_for_runtime(
+            &runtime,
+        ));
+        publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        let validate = || {
+            validate_sealed_generation_evidence_for_publication(
+                &layout,
+                &storage,
+                &core_database_path,
+                &manifest,
+                &publication,
+                &runtime,
+                &device,
+                Some(&identity),
+            )
+        };
+
+        validate().expect("first publication validation");
+        validate().expect("receipt-backed publication validation");
+        let warm = vector_publication_receipt_stats(&core_database_path, &manifest, &publication)
+            .expect("whole-publication receipt");
+        assert_eq!(warm.validations, 1);
+        assert_eq!(warm.reuses, 1);
+        assert_eq!(warm.invalidations, 0);
+
+        let vector_path = index_path(&layout, &manifest.semantic_generation);
+        let replacement_path = vector_path.with_extension("replacement");
+        std::fs::copy(&vector_path, &replacement_path).expect("copy valid replacement");
+        std::fs::remove_file(&vector_path).expect("remove original vector identity");
+        std::fs::rename(&replacement_path, &vector_path).expect("replace vector identity");
+        validate().expect("same vector bytes under a new identity revalidate");
+        let replaced =
+            vector_publication_receipt_stats(&core_database_path, &manifest, &publication)
+                .expect("replacement publication receipt");
+        assert_eq!(replaced.validations, 2);
+        assert_eq!(replaced.reuses, 1);
+        assert_eq!(replaced.invalidations, 1);
+
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make replacement writable for truncation");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&vector_path)
+            .expect("open vector database for truncation")
+            .set_len(64)
+            .expect("truncate vector database");
+        validate().expect_err("truncation must invalidate and fail deep validation");
+        assert!(
+            vector_publication_receipt_stats(&core_database_path, &manifest, &publication,)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2691,6 +4926,7 @@ mod tests {
         let error = validate_generation_evidence_for_publication(
             &layout,
             &storage,
+            None,
             &manifest,
             &publication,
             &runtime,

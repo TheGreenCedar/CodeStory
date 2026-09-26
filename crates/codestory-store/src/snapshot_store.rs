@@ -1,9 +1,12 @@
 use crate::{
-    CorePromotionStats, DatabaseSnapshotCopyStats, GroundingSnapshotMetadata, StorageError,
-    StorageOpenMode, Store,
+    CorePromotionStats, CorePublicationLayout, DatabaseSnapshotCopyStats,
+    DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, GroundingSnapshotMetadata,
+    IndexPublicationRecord, ProofResolutionPublication, ProofResolutionPublicationValidation,
+    StorageError, StorageOpenMode, Store, StructuralTextPublicationValidation,
+    StructuralTextUnitPublicationManifest,
 };
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 /// Timings for rebuilding both grounding snapshot layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,53 @@ pub struct StagedSnapshot {
     path: PathBuf,
     store: Store,
     snapshot_copy: Option<DatabaseSnapshotCopyStats>,
+    inherited_dense_anchor_validation: Option<DenseAnchorPublicationValidation>,
+    inherited_structural_text_validation: Option<StructuralTextPublicationValidation>,
+    inherited_proof_resolution_validation: Option<ProofResolutionPublicationValidation>,
+}
+
+/// Owns a stage throughout sealing and promotion. The stage's SQLite handle
+/// must close before removing its owned directory, including on early `?`.
+struct PublishingStage {
+    path: PathBuf,
+    store: Option<Store>,
+    cleanup_on_drop: bool,
+}
+
+impl PublishingStage {
+    fn new(path: PathBuf, store: Store) -> Self {
+        Self {
+            path,
+            store: Some(store),
+            cleanup_on_drop: true,
+        }
+    }
+
+    fn store(&self) -> &Store {
+        self.store.as_ref().expect("publishing stage is open")
+    }
+
+    fn close(&mut self) {
+        drop(self.store.take());
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for PublishingStage {
+    fn drop(&mut self) {
+        self.close();
+        if self.cleanup_on_drop {
+            if let Err(error) = Store::discard_staged_snapshot(&self.path) {
+                tracing::warn!(path = %self.path.display(), error = %error, "failed to discard rejected core stage sidecars");
+            }
+            if let Err(error) = crate::core_generation::remove_staging_database(&self.path) {
+                tracing::warn!(path = %self.path.display(), error = %error, "failed to remove rejected core stage");
+            }
+        }
+    }
 }
 
 impl<'a> SnapshotStore<'a> {
@@ -52,16 +102,8 @@ impl<'a> SnapshotStore<'a> {
     }
 
     /// Build a unique SQLite path beside the intended live database.
-    pub fn staged_path(live_path: &Path) -> PathBuf {
-        let epoch_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        codestory_contracts::owned_artifacts::staged_snapshot_path(
-            live_path,
-            std::process::id(),
-            epoch_ns,
-        )
+    pub fn staged_path(live_path: &Path) -> Result<PathBuf, StorageError> {
+        CorePublicationLayout::from_storage_path(live_path)?.create_staging_database_path()
     }
 
     /// Open a fresh staged database in build mode.
@@ -79,12 +121,18 @@ impl<'a> SnapshotStore<'a> {
 
     /// Clone the live database into a unique staged database in build mode.
     ///
-    /// The SQLite backup primitive captures a coherent source snapshot while
-    /// allowing existing live readers to remain open. Incremental writers can
-    /// then mutate and finalize the clone without exposing partial graph or
-    /// grounding-snapshot generations at the live path.
+    /// A sealed published source is cloned or copied under its reader lease;
+    /// mutable legacy sources use a coherent SQLite online backup. Incremental
+    /// writers mutate only the staged image until publication.
     pub fn clone_live_to_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
-        StagedSnapshot::clone_live(live_path)
+        StagedSnapshot::clone_live(live_path, &|| false)
+    }
+
+    pub fn clone_live_to_staged_with_cancel(
+        live_path: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedSnapshot, StorageError> {
+        StagedSnapshot::clone_live(live_path, cancelled)
     }
 
     /// Remove a staged database and SQLite sidecars.
@@ -185,40 +233,159 @@ impl<'a> SnapshotStore<'a> {
 
 impl StagedSnapshot {
     fn open(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
+        let path = SnapshotStore::staged_path(live_path)?;
         let store = Store::open_build(&path)?;
         Ok(Self {
             path,
             store,
             snapshot_copy: None,
+            inherited_dense_anchor_validation: None,
+            inherited_structural_text_validation: None,
+            inherited_proof_resolution_validation: None,
         })
     }
 
     fn open_disposable_full_refresh(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
+        let layout = CorePublicationLayout::from_storage_path(live_path)?;
+        let source_logical_bytes = layout
+            .resolve_active_database()?
+            .map(|source| crate::storage_impl::database_logical_bytes_at_path(&source))
+            .transpose()?
+            .unwrap_or(0);
+        crate::ensure_full_size_write_capacity(
+            live_path
+                .parent()
+                .ok_or_else(|| StorageError::Other("Core storage path has no parent".into()))?,
+            source_logical_bytes,
+            "complete core build",
+        )?;
+        let path = SnapshotStore::staged_path(live_path)?;
         let store = Store::open_disposable_full_build(&path)?;
         Ok(Self {
             path,
             store,
             snapshot_copy: None,
+            inherited_dense_anchor_validation: None,
+            inherited_structural_text_validation: None,
+            inherited_proof_resolution_validation: None,
         })
     }
 
-    fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
-        Store::discard_staged_snapshot(&path)?;
-        let snapshot_copy = match Store::copy_database_snapshot(live_path, &path) {
-            Ok(stats) => stats,
+    fn clone_live(live_path: &Path, cancelled: &dyn Fn() -> bool) -> Result<Self, StorageError> {
+        let layout = CorePublicationLayout::from_storage_path(live_path)?;
+        let published = layout.read_pointer()?.is_some();
+        let pinned = if published {
+            Some(crate::CoreReadSession::pin(live_path)?)
+        } else {
+            None
+        };
+        let source = if let Some(session) = pinned.as_ref() {
+            session.generation_path().to_path_buf()
+        } else {
+            layout.resolve_active_database()?.ok_or_else(|| {
+                StorageError::Other(format!(
+                    "No published core database exists for incremental clone: {}",
+                    live_path.display()
+                ))
+            })?
+        };
+        let inherited_validations = if published {
+            Store::open_immutable_generation(&source)
+                .ok()
+                .and_then(|source_store| {
+                    source_store
+                        .get_complete_index_publication()
+                        .ok()
+                        .flatten()
+                        .map(|publication| {
+                            (
+                                source_store
+                                    .validate_dense_anchor_publication_sealed(&source, &publication)
+                                    .ok(),
+                                source_store
+                                    .load_structural_text_rebind_validation(&source, &publication)
+                                    .ok(),
+                                source_store
+                                    .load_proof_resolution_rebind_validation(&source, &publication)
+                                    .ok(),
+                            )
+                        })
+                })
+        } else {
+            None
+        };
+        let (
+            inherited_dense_anchor_validation,
+            inherited_structural_text_validation,
+            inherited_proof_resolution_validation,
+        ) = inherited_validations.unwrap_or((None, None, None));
+        let source_bytes = crate::storage_impl::database_logical_bytes_at_path(&source)?;
+        crate::ensure_full_size_write_capacity(
+            live_path
+                .parent()
+                .ok_or_else(|| StorageError::Other("Core storage path has no parent".into()))?,
+            source_bytes,
+            "incremental core stage",
+        )?;
+        let path = SnapshotStore::staged_path(live_path)?;
+        let copy_started = Instant::now();
+        let stage = if published {
+            match crate::stage_sealed_file(&source, &path, cancelled) {
+                Ok(stage) => Some(stage),
+                Err(error) => {
+                    // stage_sealed_file authenticates and cleans up its own
+                    // file. A replacement must keep this directory nonempty.
+                    let _ = crate::core_generation::remove_empty_staging_directory(&path);
+                    return Err(error);
+                }
+            }
+        } else {
+            if let Err(error) =
+                crate::core_generation::copy_legacy_rollback_snapshot(&source, &path, cancelled)
+            {
+                let _ = crate::core_generation::remove_staging_database(&path);
+                return Err(error);
+            }
+            None
+        };
+        let staged_file = (|| {
+            crate::core_generation::make_file_owner_writable(&path)?;
+            let target_bytes = crate::storage_impl::database_logical_bytes_at_path(&path)?;
+            Ok::<_, StorageError>(target_bytes)
+        })();
+        let target_bytes = match staged_file {
+            Ok(result) => result,
             Err(error) => {
-                let _ = Store::discard_staged_snapshot(&path);
+                let _ = crate::core_generation::remove_staging_database(&path);
                 return Err(error);
             }
         };
-        match Store::open_with_mode(&path, StorageOpenMode::Build) {
+        let snapshot_copy = DatabaseSnapshotCopyStats {
+            copy_ms: clamp_u128_to_u32(copy_started.elapsed().as_millis()),
+            source_bytes,
+            target_bytes,
+            stage_strategy: stage
+                .as_ref()
+                .map_or("sqlite_backup", |stage| match stage.strategy {
+                    crate::SealedStageStrategy::Cloned => "cloned",
+                    crate::SealedStageStrategy::Copied => "copied",
+                }),
+            fallback_reason: stage.as_ref().and_then(|stage| stage.fallback_reason),
+            native_error_code: stage.as_ref().and_then(|stage| stage.native_error_code),
+            cloned_bytes: stage.as_ref().map_or(0, |stage| stage.cloned_bytes),
+            copied_bytes: stage
+                .as_ref()
+                .map_or(source_bytes, |stage| stage.copied_bytes),
+        };
+        let opened = Store::open_with_mode(&path, StorageOpenMode::Build);
+        match opened {
             Ok(store) => Ok(Self {
                 path,
                 store,
                 snapshot_copy: Some(snapshot_copy),
+                inherited_dense_anchor_validation,
+                inherited_structural_text_validation,
+                inherited_proof_resolution_validation,
             }),
             Err(error) => {
                 let _ = Store::discard_staged_snapshot(&path);
@@ -237,6 +404,57 @@ impl StagedSnapshot {
         &mut self.store
     }
 
+    /// Rebind the validated dense-anchor contents inherited from the immutable
+    /// predecessor. Returns `None` when the predecessor was legacy, failed its
+    /// deep validation, or no longer matches the requested publication.
+    pub fn rebind_inherited_dense_anchor_generation(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        policy_version: &str,
+    ) -> Result<Option<DenseAnchorPublicationManifest>, StorageError> {
+        let Some(inherited) = self.inherited_dense_anchor_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store
+            .rebind_dense_anchor_generation(inherited, previous, publication, policy_version)
+    }
+
+    pub fn rebind_inherited_structural_text_generation(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<StructuralTextUnitPublicationManifest>, StorageError> {
+        let Some(inherited) = self.inherited_structural_text_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store.rebind_structural_text_unit_generation(
+            inherited,
+            previous,
+            publication,
+            changed_file_ids,
+        )
+    }
+
+    pub fn rebind_inherited_proof_resolution_source_identities(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<ProofResolutionPublication>, StorageError> {
+        let Some(inherited) = self.inherited_proof_resolution_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store
+            .rebind_validated_proof_resolution_source_identities(
+                inherited,
+                previous,
+                publication,
+                changed_file_ids,
+            )
+    }
+
     /// Access snapshot operations for the staged store.
     pub fn snapshots(&self) -> SnapshotStore<'_> {
         self.store.snapshots()
@@ -246,7 +464,8 @@ impl StagedSnapshot {
     pub fn discard(self) -> Result<(), StorageError> {
         let path = self.path;
         drop(self.store);
-        SnapshotStore::discard_staged(&path)
+        SnapshotStore::discard_staged(&path)?;
+        crate::core_generation::remove_staging_database(&path)
     }
 
     /// Seal, close, and promote the staged database to `live_path`.
@@ -259,11 +478,45 @@ impl StagedSnapshot {
         self,
         live_path: &Path,
     ) -> Result<StagedSnapshotPublishStats, StorageError> {
-        let seal_stats = self.store.seal_disposable_full_build()?;
-        let path = self.path;
+        let mut stage = PublishingStage::new(self.path, self.store);
+        let seal_stats = stage.store().seal_disposable_full_build()?;
         let snapshot_copy = self.snapshot_copy;
-        drop(self.store);
-        let core_promotion = SnapshotStore::promote_staged(&path, live_path)?;
+        stage.close();
+        let core_promotion = SnapshotStore::promote_staged(&stage.path, live_path)?;
+        stage.disarm();
+        Ok(StagedSnapshotPublishStats {
+            sqlite_wal_autocheckpoint_bytes: seal_stats
+                .as_ref()
+                .map(|stats| stats.wal_autocheckpoint_bytes),
+            sqlite_checkpoint_ms: seal_stats.as_ref().map(|stats| stats.checkpoint_ms),
+            sqlite_sync_ms: seal_stats.as_ref().map(|stats| stats.sync_ms),
+            snapshot_copy,
+            core_promotion,
+        })
+    }
+
+    /// Publish a candidate whose owning pipeline already validated every
+    /// complete component receipt. The closed SQLite image is sealed to native
+    /// identity before promotion, so the publisher can reuse those validations
+    /// instead of replaying repository-scale proof and projection scans.
+    pub fn publish_receipted_with_stats(
+        self,
+        live_path: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedSnapshotPublishStats, StorageError> {
+        let mut stage = PublishingStage::new(self.path, self.store);
+        let seal_stats = stage.store().seal_disposable_full_build()?;
+        let receipt = stage.store().mint_core_candidate_receipt()?;
+        let snapshot_copy = self.snapshot_copy;
+        stage.close();
+        let receipt = crate::storage_impl::seal_core_candidate_receipt(&stage.path, receipt)?;
+        let core_promotion = Store::promote_staged_snapshot_with_receipt(
+            &stage.path,
+            live_path,
+            receipt,
+            cancelled,
+        )?;
+        stage.disarm();
         Ok(StagedSnapshotPublishStats {
             sqlite_wal_autocheckpoint_bytes: seal_stats
                 .as_ref()
@@ -320,9 +573,13 @@ mod tests {
     }
 
     fn logical_database_bytes(path: &Path) -> u64 {
-        let connection =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .expect("open database for logical byte count");
+        let resolved =
+            crate::resolve_core_database_path(path).unwrap_or_else(|_| path.to_path_buf());
+        let connection = rusqlite::Connection::open_with_flags(
+            resolved,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open database for logical byte count");
         let page_count: i64 = connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .expect("read database page count");
@@ -357,7 +614,8 @@ mod tests {
 
     fn named_promotion_ms(stats: &CorePromotionStats) -> u32 {
         stats
-            .lock_recovery_ms
+            .lock_wait_ms
+            .saturating_add(stats.lock_recovery_ms)
             .saturating_add(stats.candidate_validation_ms)
             .saturating_add(stats.previous_validation_ms)
             .saturating_add(stats.rollback_backup_copy_ms.unwrap_or_default())
@@ -368,6 +626,8 @@ mod tests {
             .saturating_add(stats.staged_to_live_restore_ms)
             .saturating_add(stats.promoted_validation_ms)
             .saturating_add(stats.committed_journal_ms)
+            .saturating_add(stats.generation_install_ms)
+            .saturating_add(stats.pointer_publication_ms)
             .saturating_add(stats.cleanup_ms)
     }
 
@@ -453,7 +713,13 @@ mod tests {
     }
 
     #[test]
-    fn full_replacement_reports_backup_and_restore_without_incremental_clone() {
+    fn full_replacement_publishes_generation_pointer_without_backup_or_restore() {
+        for previous_schema in [31, crate::CURRENT_SCHEMA_VERSION] {
+            assert_full_replacement_preserves_previous_schema(previous_schema);
+        }
+    }
+
+    fn assert_full_replacement_preserves_previous_schema(previous_schema: u32) {
         let temp = fresh_temp_root("full-replacement-telemetry");
         let live_path = temp.join("live.sqlite");
         {
@@ -480,6 +746,14 @@ mod tests {
                 .expect("identify previous live publication");
             publish_empty_source_policy(&mut live, &publication);
         }
+
+        {
+            let previous = rusqlite::Connection::open(&live_path).expect("open predecessor");
+            previous
+                .pragma_update(None, "user_version", previous_schema)
+                .expect("set supported predecessor schema");
+        }
+        let old_bytes = fs::read(&live_path).expect("read legacy database");
 
         let mut staged = SnapshotStore::open_staged(&live_path).expect("open replacement stage");
         staged
@@ -516,13 +790,14 @@ mod tests {
             publish_stats
                 .core_promotion
                 .rollback_backup_copy_ms
-                .is_some()
+                .is_none()
         );
-        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert_eq!(
             publish_stats.core_promotion.previous_live_bytes,
-            publish_stats.core_promotion.rollback_backup_bytes
+            publish_stats.core_promotion.rollback_generation_bytes
         );
+        assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
         assert!(
             publish_stats.core_promotion.previous_live_bytes.is_some(),
             "full replacement must report the previous live image"
@@ -532,19 +807,40 @@ mod tests {
             publish_stats.core_promotion.candidate_bytes,
             logical_database_bytes(&live_path)
         );
+        let pointer = crate::CorePublicationLayout::from_storage_path(&live_path)
+            .expect("core layout")
+            .read_pointer()
+            .expect("read pointer")
+            .expect("published pointer");
+        assert_eq!(pointer.active.generation_id, "new-generation");
+        let rollback = pointer.rollback.expect("rollback");
+        assert_eq!(rollback.generation_id, "old-generation");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let rollback_path = layout
+            .generation_database_path(&rollback.generation_id)
+            .expect("rollback path");
+        let rollback_db = rusqlite::Connection::open_with_flags(
+            rollback_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read retained predecessor");
+        let retained_schema: u32 = rollback_db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("retained schema");
+        assert_eq!(retained_schema, previous_schema);
+        assert_eq!(fs::read(&live_path).expect("legacy bytes"), old_bytes);
+        drop(rollback_db);
 
         let _ = fs::remove_dir_all(&temp);
     }
 
-    /// Whole-database restore is what makes the post-restore identity fence
-    /// cheap: the published file is the validated candidate's bytes, so the
-    /// candidate's receipt covers it. This pins the claim against the files
-    /// themselves, so the reported fence cannot drift from what was published.
+    /// Renaming the sealed stage into its generation preserves the exact
+    /// candidate bytes; publication moves only the small pointer.
     #[test]
     fn promotion_receipt_is_backed_by_the_published_and_candidate_bytes() {
         let temp = fresh_temp_root("receipt-bytes");
         let live_path = temp.join("live.sqlite");
-        let staged_path = SnapshotStore::staged_path(&live_path);
+        let staged_path = SnapshotStore::staged_path(&live_path).expect("staged path");
         let publication = crate::IndexPublicationRecord {
             generation: 1,
             generation_id: "receipt-generation".to_string(),
@@ -580,31 +876,24 @@ mod tests {
             stats.promoted_validation,
             crate::PromotedValidation::ReusedCandidateReceipt
         );
-        let published_bytes = fs::read(&live_path).expect("read published bytes");
+        let published_path =
+            crate::resolve_core_database_path(&live_path).expect("resolve published generation");
+        let published_bytes = fs::read(&published_path).expect("read published bytes");
         assert_eq!(
             published_bytes.len(),
             candidate_bytes.len(),
             "a claimed receipt must describe a published file of the candidate's size"
         );
-        // Only SQLite's own header bookkeeping may differ; every content byte
-        // has to match, or the receipt claimed an identity that does not hold.
-        const SQLITE_HEADER_BYTES: usize = 100;
-        assert_eq!(
-            &published_bytes[SQLITE_HEADER_BYTES..],
-            &candidate_bytes[SQLITE_HEADER_BYTES..],
-            "a claimed receipt must describe the candidate's pages"
-        );
+        assert_eq!(published_bytes, candidate_bytes);
 
         let _ = fs::remove_dir_all(&temp);
     }
 
-    /// The post-restore fence may only claim the candidate receipt when the
-    /// promotion can actually prove the published file byte-identical to the
-    /// validated candidate. A staged image with live content outside the main
-    /// file is unprovable, and the promotion must report the weaker claim
-    /// instead of asserting an identity it never established.
+    /// An immutable generation cannot carry live SQLite content outside its
+    /// database file. A pinned WAL rejects publication before the pointer can
+    /// move.
     #[test]
-    fn promotion_reports_revalidated_when_the_candidate_image_is_unprovable() {
+    fn promotion_rejects_a_candidate_with_live_wal_content() {
         let temp = fresh_temp_root("unprovable-candidate-image");
         let live_path = temp.join("live.sqlite");
         let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
@@ -651,24 +940,18 @@ mod tests {
             "fixture must leave staged content outside the main database file"
         );
 
-        let publish_stats = staged
+        let error = staged
             .publish_with_stats(&live_path)
-            .expect("promote an unprovable staged candidate");
-
-        assert_eq!(
-            publish_stats.core_promotion.promoted_validation,
-            crate::PromotedValidation::Revalidated,
-            "an unprovable candidate image must not claim the byte-identity receipt"
-        );
-        let live = Store::open(&live_path).expect("open promoted live store");
-        assert_eq!(
-            live.get_complete_index_publication()
-                .expect("read promoted publication"),
-            Some(publication),
-            "the weaker fence still has to publish the candidate"
+            .expect_err("live WAL candidate must not publish");
+        assert!(error.to_string().contains("retains SQLite content"));
+        assert!(
+            crate::CorePublicationLayout::from_storage_path(&live_path)
+                .expect("layout")
+                .read_pointer()
+                .expect("observe pointer")
+                .is_none()
         );
 
-        drop(live);
         drop(staged_reader);
         let _ = Store::discard_staged_snapshot(&staged_path);
         let _ = fs::remove_dir_all(&temp);
@@ -833,6 +1116,12 @@ mod tests {
         );
         assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
+        assert!(
+            publish_stats
+                .core_promotion
+                .rollback_generation_bytes
+                .is_none()
+        );
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,
@@ -863,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn disposable_full_refresh_busy_seal_never_starts_promotion() {
+    fn disposable_full_refresh_busy_seal_cleans_stage_and_allows_retry() {
         let temp = fresh_temp_root("disposable-busy");
         let live_path = temp.join("live.sqlite");
         let mut staged = SnapshotStore::open_disposable_full_refresh(&live_path)
@@ -912,14 +1201,41 @@ mod tests {
             !live_path.exists(),
             "seal failure must not create live state"
         );
-        assert!(staged_path.exists(), "failed stage must remain inspectable");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        assert!(layout.read_pointer().expect("read pointer").is_none());
         assert!(!live_path.with_extension("sqlite.backup").exists());
         assert!(
             !PathBuf::from(format!("{}.promotion.prepared.json", live_path.display())).exists()
         );
 
+        // Unix can unlink a rejected owned stage while another SQLite reader
+        // still has it open. Windows may retain the file until that reader exits.
+        #[cfg(unix)]
+        assert!(
+            !staged_path.exists(),
+            "rejected owned stage must be removed"
+        );
         drop(reader);
-        Store::discard_staged_snapshot(&staged_path).expect("discard failed stage");
+        Store::discard_staged_snapshot(&staged_path).expect("discard failed stage sidecars");
+        crate::core_generation::remove_staging_database(&staged_path)
+            .expect("discard rejected owned stage after reader closes");
+        assert!(!staged_path.exists());
+
+        let mut retry =
+            SnapshotStore::open_disposable_full_refresh(&live_path).expect("open retry stage");
+        retry
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify retry candidate");
+        publish_empty_source_policy(retry.store_mut(), &publication);
+        retry.publish(&live_path).expect("publish completed retry");
+        let live = Store::open(&live_path).expect("open retry publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retry publication"),
+            Some(publication)
+        );
+        drop(live);
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -937,6 +1253,151 @@ mod tests {
         staged.discard().expect("discard staged snapshot");
         assert!(!staged_path.exists(), "staged database should be removed");
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn failed_consuming_promotion_discards_stage_and_allows_retry() {
+        let temp = fresh_temp_root("failed-promote-retry");
+        let live_path = temp.join("live.sqlite");
+        let mut predecessor = Store::open(&live_path).expect("predecessor");
+        let previous_publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "previous-generation".into(),
+            run_id: "previous-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        predecessor
+            .put_index_publication(&previous_publication)
+            .expect("complete predecessor identity");
+        publish_empty_source_policy(&mut predecessor, &previous_publication);
+        drop(predecessor);
+        let legacy = rusqlite::Connection::open(&live_path).expect("open predecessor");
+        legacy
+            .pragma_update(None, "user_version", crate::CURRENT_SCHEMA_VERSION + 1)
+            .expect("make unsupported predecessor");
+        drop(legacy);
+        let original = fs::read(&live_path).expect("read old core");
+
+        let make_candidate = || {
+            let mut staged = SnapshotStore::open_staged(&live_path).expect("open candidate");
+            let publication = crate::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "recovered-generation".into(),
+                run_id: "recovered-run".into(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            };
+            staged
+                .store_mut()
+                .put_index_publication(&publication)
+                .expect("candidate identity");
+            publish_empty_source_policy(staged.store_mut(), &publication);
+            staged
+        };
+        let rejected = make_candidate();
+        let rejected_path = rejected.path().to_path_buf();
+        let error = rejected
+            .publish_with_stats(&live_path)
+            .expect_err("unsupported predecessor must reject promotion");
+        assert!(
+            error.to_string().contains("unsupported schema version"),
+            "{error}"
+        );
+        assert!(
+            !rejected_path.exists(),
+            "consumed candidate stage is cleaned"
+        );
+        assert_eq!(
+            fs::read(&live_path).expect("read preserved old core"),
+            original
+        );
+
+        let legacy = rusqlite::Connection::open(&live_path).expect("repair fixture");
+        legacy
+            .pragma_update(None, "user_version", crate::CURRENT_SCHEMA_VERSION)
+            .expect("restore supported schema");
+        drop(legacy);
+        make_candidate()
+            .publish_with_stats(&live_path)
+            .expect("retry completed candidate");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        assert_eq!(
+            layout
+                .read_pointer()
+                .expect("pointer read")
+                .unwrap()
+                .active
+                .generation_id,
+            "recovered-generation"
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn failed_receipt_mint_discards_owned_stage_before_retry() {
+        let temp = fresh_temp_root("failed-receipt-retry");
+        let live_path = temp.join("live.sqlite");
+        let mut predecessor = Store::open(&live_path).expect("predecessor");
+        let previous = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "previous-generation".into(),
+            run_id: "previous-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        predecessor
+            .put_index_publication(&previous)
+            .expect("previous identity");
+        publish_empty_source_policy(&mut predecessor, &previous);
+        drop(predecessor);
+        let original = fs::read(&live_path).expect("old core bytes");
+
+        let candidate = crate::IndexPublicationRecord {
+            generation: 2,
+            generation_id: "next-generation".into(),
+            run_id: "next-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        let mut rejected = SnapshotStore::open_staged(&live_path).expect("open rejected stage");
+        rejected
+            .store_mut()
+            .put_index_publication(&candidate)
+            .expect("candidate identity");
+        let rejected_path = rejected.path().to_path_buf();
+        let error = rejected
+            .publish_receipted_with_stats(&live_path, &|| false)
+            .expect_err("missing source-policy receipt must reject before promotion");
+        assert!(
+            error.to_string().contains("source-policy receipt"),
+            "{error}"
+        );
+        assert!(
+            !rejected_path.exists(),
+            "owned stage is cleaned on early error"
+        );
+        assert_eq!(fs::read(&live_path).expect("preserved old core"), original);
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        assert!(layout.read_pointer().expect("pointer read").is_none());
+
+        let mut retry = SnapshotStore::open_staged(&live_path).expect("retry stage");
+        retry
+            .store_mut()
+            .put_index_publication(&candidate)
+            .expect("retry identity");
+        publish_empty_source_policy(retry.store_mut(), &candidate);
+        retry.publish(&live_path).expect("valid retry publishes");
+        assert_eq!(
+            layout
+                .read_pointer()
+                .expect("retry pointer")
+                .unwrap()
+                .active
+                .generation_id,
+            "next-generation"
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -994,6 +1455,178 @@ mod tests {
         assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn clone_live_copies_incrementally_when_native_clone_is_unavailable() {
+        let temp = fresh_temp_root("clone-live-cow-disabled");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut live = Store::open(&live_path).expect("open live");
+            live.insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("old.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed live file");
+        }
+
+        let mut staged = crate::with_core_clone_disabled(|| {
+            SnapshotStore::clone_live_to_staged(&live_path)
+                .expect("unsupported native clone uses the production copy path")
+        });
+        assert_ne!(staged.path(), live_path);
+        assert_eq!(
+            staged.store_mut().get_files().expect("staged files")[0].path,
+            PathBuf::from("old.rs")
+        );
+        staged.discard().expect("discard copied stage");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_live_failure_preserves_a_replacement_in_its_stage_directory() {
+        let temp = fresh_temp_root("clone-live-replacement");
+        let live_path = temp.join("live.sqlite");
+        let mut initial = SnapshotStore::open_staged(&live_path).expect("initial stage");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "published-generation".into(),
+            run_id: "published-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        initial
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("publication");
+        publish_empty_source_policy(initial.store_mut(), &publication);
+        initial
+            .publish_with_stats(&live_path)
+            .expect("publish initial");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let original = layout
+            .read_pointer()
+            .expect("read pointer")
+            .expect("pointer");
+        let replacement = std::cell::RefCell::new(None);
+        let error =
+            crate::with_core_clone_disabled(
+                || match SnapshotStore::clone_live_to_staged_with_cancel(&live_path, &|| {
+                    let candidate = fs::read_dir(layout.staging_root())
+                        .ok()
+                        .and_then(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .map(|entry| entry.path().join("codestory.db"))
+                                .find(|path| path.is_file())
+                        });
+                    if let Some(candidate) = candidate {
+                        let moved = candidate.with_file_name("moved-owned.db");
+                        fs::rename(&candidate, &moved).expect("move owned candidate");
+                        fs::write(&candidate, b"another owner's replacement").expect("replacement");
+                        *replacement.borrow_mut() = Some(candidate);
+                        return true;
+                    }
+                    false
+                }) {
+                    Ok(stage) => {
+                        stage.discard().expect("discard unexpected stage");
+                        panic!("cancel after replacement");
+                    }
+                    Err(error) => error,
+                },
+            );
+        assert!(error.to_string().contains("identity changed"));
+        let replacement = replacement.into_inner().expect("replacement installed");
+        assert_eq!(
+            fs::read(replacement).expect("replacement retained"),
+            b"another owner's replacement"
+        );
+        assert_eq!(
+            layout.read_pointer().expect("read unchanged pointer"),
+            Some(original)
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn clone_live_cancellation_keeps_typed_error_and_previous_publication() {
+        let temp = fresh_temp_root("clone-live-cancelled");
+        let live_path = temp.join("live.sqlite");
+        let mut initial = SnapshotStore::open_staged(&live_path).expect("initial stage");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "published-generation".into(),
+            run_id: "published-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        initial
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("publication");
+        publish_empty_source_policy(initial.store_mut(), &publication);
+        initial
+            .publish_with_stats(&live_path)
+            .expect("publish initial");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let original = layout
+            .read_pointer()
+            .expect("read pointer")
+            .expect("pointer");
+        let error =
+            crate::with_core_clone_disabled(
+                || match SnapshotStore::clone_live_to_staged_with_cancel(&live_path, &|| true) {
+                    Ok(stage) => {
+                        stage.discard().expect("discard unexpected stage");
+                        panic!("cancelled stage succeeded");
+                    }
+                    Err(error) => error,
+                },
+            );
+        assert!(matches!(error, StorageError::Cancelled));
+        assert_eq!(
+            layout.read_pointer().expect("read unchanged pointer"),
+            Some(original)
+        );
+        assert!(
+            fs::read_dir(layout.staging_root())
+                .expect("staging root")
+                .next()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn complete_build_refuses_insufficient_space_before_staging() {
+        let temp = fresh_temp_root("full-capacity");
+        let live_path = temp.join("live.sqlite");
+        let result = crate::with_available_filesystem_bytes_override(0, || {
+            SnapshotStore::open_disposable_full_refresh(&live_path)
+        });
+        match result {
+            Ok(stage) => {
+                stage.discard().expect("discard unexpected stage");
+                panic!("complete build must refuse zero available bytes");
+            }
+            Err(error) => assert!(matches!(error, StorageError::InsufficientSpace { .. })),
+        }
+        assert!(
+            !crate::CorePublicationLayout::from_storage_path(&live_path)
+                .expect("layout")
+                .staging_root()
+                .exists()
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -1252,16 +1885,17 @@ mod tests {
             Some(snapshot_copy.source_bytes)
         );
         assert_eq!(
-            publish_stats.core_promotion.rollback_backup_bytes,
+            publish_stats.core_promotion.rollback_generation_bytes,
             publish_stats.core_promotion.previous_live_bytes
         );
+        assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
         assert!(
             publish_stats
                 .core_promotion
                 .rollback_backup_copy_ms
-                .is_some()
+                .is_none()
         );
-        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,

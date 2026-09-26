@@ -376,9 +376,18 @@ pub enum EmbeddingResult {
         columns: u32,
         encoding: String,
         identity: Box<EmbeddingEngineIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timings: Option<EmbeddingVectorTimings>,
     },
     Released,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingVectorTimings {
+    pub tokenization_ns: u64,
+    pub native_encode_ns: u64,
+    pub normalization_ns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

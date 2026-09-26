@@ -31,6 +31,8 @@ pub struct ApiErrorDetails {
     pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_retry: Option<EmbeddingRetryStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_space: Option<DiskSpacePressureDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
 }
@@ -60,6 +62,14 @@ pub struct EmbeddingRetryStateDto {
     pub retry_condition: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<EmbeddingCapacityPressureDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct DiskSpacePressureDto {
+    pub operation: String,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+    pub retry_condition: String,
 }
 
 pub const COMMAND_FAILURE_SCHEMA_VERSION: u32 = 1;
@@ -99,6 +109,7 @@ impl ApiErrorDetails {
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         }
     }
@@ -115,6 +126,7 @@ impl ApiErrorDetails {
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         }
     }
@@ -144,6 +156,7 @@ impl ApiErrorDetails {
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps,
         }
     }
@@ -180,6 +193,38 @@ impl ApiError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new("internal", message)
+    }
+
+    pub fn insufficient_cache_space(
+        operation: impl Into<String>,
+        required_bytes: u64,
+        available_bytes: u64,
+    ) -> Self {
+        let operation = operation.into();
+        Self::with_details(
+            "insufficient_space",
+            format!(
+                "Insufficient cache space for {operation}: required {required_bytes} bytes, available {available_bytes} bytes"
+            ),
+            ApiErrorDetails {
+                cause_code: Some("insufficient_space".into()),
+                failed_layer: Some("cache_stage".into()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: None,
+                embedding_retry: None,
+                disk_space: Some(DiskSpacePressureDto {
+                    operation,
+                    required_bytes,
+                    available_bytes,
+                    retry_condition: "after_space_available".into(),
+                }),
+                coverage_gaps: Vec::new(),
+            },
+        )
     }
 
     pub fn source_coverage_failure(
@@ -229,6 +274,7 @@ impl ApiError {
                     retry_condition: pressure.retry_condition.clone(),
                     capacity: Some(pressure),
                 }),
+                disk_space: None,
                 coverage_gaps: Vec::new(),
             },
         )
@@ -252,6 +298,7 @@ impl ApiError {
                 readiness: None,
                 embedding_capacity: retry.capacity.clone(),
                 embedding_retry: Some(retry),
+                disk_space: None,
                 coverage_gaps: Vec::new(),
             },
         )

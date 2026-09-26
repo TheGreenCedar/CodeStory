@@ -48,24 +48,240 @@ const windowsSccacheCacheSize = "2G";
 
 export { crateDurabilityFile, retrievalFile };
 
-function tomlSection(source, section) {
-  const header = `[${section}]`;
-  const start = source.indexOf(`${header}\n`);
-  if (start < 0) return null;
-  const bodyStart = start + header.length + 1;
-  const next = source.slice(bodyStart).search(/^\[[^\]]+\]\s*$/mu);
-  return next < 0
-    ? source.slice(bodyStart)
-    : source.slice(bodyStart, bodyStart + next);
+function sameFeatureSet(actual, expected) {
+  return actual !== null
+    && actual.length === expected.length
+    && new Set(actual).size === actual.length
+    && expected.every((feature) => actual.includes(feature));
+}
+
+// The semantic checks below intentionally consume one small TOML spelling.
+// Reject every other valid spelling instead of letting the scanner ignore it.
+function canonicalTomlCode(line) {
+  if (line.trim().length === 0 || line.trimStart().startsWith("#")) return "";
+  if (line !== line.trim()) return null;
+
+  let inBasicString = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (!inBasicString && character === "#") return null;
+    if (character === "\\") return null;
+    if (!inBasicString && character === "'") return null;
+    if (character === '"') {
+      if (line.slice(index, index + 3) === '"""') return null;
+      inBasicString = !inBasicString;
+    }
+  }
+  return inBasicString ? null : line;
+}
+
+function splitCanonicalTomlItems(source) {
+  const items = [];
+  let start = 0;
+  let inBasicString = false;
+  let squareDepth = 0;
+  let braceDepth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '"') {
+      inBasicString = !inBasicString;
+      continue;
+    }
+    if (inBasicString) continue;
+    if (character === "[") squareDepth += 1;
+    if (character === "]") {
+      if (squareDepth === 0) return null;
+      squareDepth -= 1;
+    }
+    if (character === "{") braceDepth += 1;
+    if (character === "}") {
+      if (braceDepth === 0) return null;
+      braceDepth -= 1;
+    }
+    if (character === "," && squareDepth === 0 && braceDepth === 0) {
+      items.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  if (inBasicString || squareDepth !== 0 || braceDepth !== 0) return null;
+  items.push(source.slice(start).trim());
+  return items;
+}
+
+function canonicalBasicString(value) {
+  return /^"[^"\\\r\n]*"$/u.test(value)
+    ? { kind: "string", value: value.slice(1, -1) }
+    : null;
+}
+
+function canonicalStringArray(value) {
+  if (!value.startsWith("[") || !value.endsWith("]")) return null;
+  const content = value.slice(1, -1).trim();
+  if (content.length === 0) return { kind: "string-array", value: [] };
+  const items = splitCanonicalTomlItems(content);
+  if (items === null || items.some((item) => item.length === 0)) return null;
+  const strings = items.map(canonicalBasicString);
+  return strings.every((item) => item !== null)
+    ? { kind: "string-array", value: strings.map((item) => item.value) }
+    : null;
+}
+
+function canonicalDependencySpecification(value) {
+  const direct = canonicalBasicString(value);
+  if (direct !== null) return direct;
+  if (!value.startsWith("{") || !value.endsWith("}")) return null;
+  const content = value.slice(1, -1).trim();
+  if (content.length === 0) return null;
+  const items = splitCanonicalTomlItems(content);
+  if (items === null || items.some((item) => item.length === 0)) return null;
+
+  const attributes = new Map();
+  for (const item of items) {
+    const assignment = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/u.exec(item);
+    if (assignment === null || attributes.has(assignment[1])) return null;
+    const source = assignment[2].trim();
+    const itemValue = source === "true" || source === "false"
+      ? { kind: "boolean", value: source === "true" }
+      : canonicalBasicString(source) ?? canonicalStringArray(source);
+    if (itemValue === null) return null;
+    attributes.set(assignment[1], itemValue);
+  }
+  return { kind: "inline-table", attributes };
+}
+
+function canonicalScalar(value) {
+  if (value === "true" || value === "false") {
+    return { kind: "boolean", value: value === "true" };
+  }
+  return canonicalBasicString(value);
+}
+
+function parseCanonicalBenchmarkManifest(source) {
+  const sections = [];
+  let section = null;
+  for (const line of source.split(/\r?\n/u)) {
+    const code = canonicalTomlCode(line);
+    if (code === null) return null;
+    if (code.length === 0) continue;
+
+    const table = /^\[([A-Za-z0-9_-]+)\]$/u.exec(code);
+    const arrayTable = /^\[\[([A-Za-z0-9_-]+)\]\]$/u.exec(code);
+    if (table !== null) {
+      if (!["package", "dependencies", "dev-dependencies"].includes(table[1])) {
+        return null;
+      }
+      section = { kind: "table", name: table[1], fields: new Map() };
+      sections.push(section);
+      continue;
+    }
+    if (arrayTable !== null) {
+      if (!["bin", "bench"].includes(arrayTable[1])) return null;
+      section = { kind: "array-table", name: arrayTable[1], fields: new Map() };
+      sections.push(section);
+      continue;
+    }
+
+    const assignment = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/u.exec(code);
+    if (
+      assignment === null
+      || section === null
+      || section.fields.has(assignment[1])
+    ) return null;
+    const source = assignment[2].trim();
+    const isDependencySection = section.name === "dependencies"
+      || section.name === "dev-dependencies";
+    const value = isDependencySection
+      ? canonicalDependencySpecification(source)
+      : canonicalScalar(source);
+    if (value === null) return null;
+    section.fields.set(assignment[1], value);
+  }
+  return { sections };
+}
+
+function manifestSections(manifest, kind, name) {
+  return manifest.sections.filter((section) =>
+    section.kind === kind && section.name === name
+  );
+}
+
+function stringField(section, field) {
+  const value = section.fields.get(field);
+  return value?.kind === "string" ? value.value : null;
+}
+
+function dependencyEntries(section) {
+  return [...section.fields.entries()]
+    .map(([name, specification]) => {
+      const packageName = specification.kind === "inline-table"
+        ? specification.attributes.get("package")
+        : null;
+      const packageIdentity = packageName?.kind === "string"
+        ? packageName.value
+        : name;
+      return { name, packageIdentity, specification };
+    });
+}
+
+function dependencySpecificationMatches(specification, expectedAttributes) {
+  if (specification?.kind !== "inline-table") return false;
+  const expected = Object.entries(expectedAttributes);
+  if (specification.attributes.size !== expected.length) return false;
+  return expected.every(([attribute, expectedValue]) => {
+    const actual = specification.attributes.get(attribute);
+    if (typeof expectedValue === "boolean") {
+      return actual?.kind === "boolean" && actual.value === expectedValue;
+    }
+    return actual?.kind === "string-array"
+      && sameFeatureSet(actual.value, expectedValue);
+  });
+}
+
+function dependencyMatches(section, name, expectedAttributes) {
+  return dependencySpecificationMatches(
+    section.fields.get(name),
+    expectedAttributes,
+  );
+}
+
+function dependencyFeatureOwnerRecords(section, feature) {
+  return dependencyEntries(section)
+    .filter(({ specification }) => {
+      if (specification.kind !== "inline-table") return false;
+      const features = specification.attributes.get("features");
+      return features?.kind === "string-array" && features.value.includes(feature);
+    });
+}
+
+function dependencyRecordsByPackageIdentity(section) {
+  const recordsByPackageIdentity = new Map();
+  for (const record of dependencyEntries(section)) {
+    const records = recordsByPackageIdentity.get(record.packageIdentity) ?? [];
+    records.push(record);
+    recordsByPackageIdentity.set(record.packageIdentity, records);
+  }
+  return recordsByPackageIdentity;
 }
 
 export function benchmarkDependencyIsolationViolations(source) {
+  const manifest = parseCanonicalBenchmarkManifest(source);
+  if (manifest === null) {
+    return [
+      "codestory-bench dependency policy requires canonical TOML syntax before semantic checks",
+    ];
+  }
   const violations = [];
-  const dependencies = tomlSection(source, "dependencies");
-  const devDependencies = tomlSection(source, "dev-dependencies");
-  if (dependencies === null || devDependencies === null) {
+  const dependencySections = manifestSections(manifest, "table", "dependencies");
+  const devDependencySections = manifestSections(
+    manifest,
+    "table",
+    "dev-dependencies",
+  );
+  if (dependencySections.length !== 1 || devDependencySections.length !== 1) {
     return ["codestory-bench must separate product-driver and benchmark dependencies"];
   }
+  const dependencies = dependencySections[0];
+  const devDependencies = devDependencySections[0];
   const benchmarkOnly = [
     "codestory-cli",
     "codestory-contracts",
@@ -75,27 +291,154 @@ export function benchmarkDependencyIsolationViolations(source) {
     "criterion",
     "uuid",
   ];
-  const dependencyNames = new Set(
-    [...dependencies.matchAll(/^([A-Za-z0-9_-]+)\s*=/gmu)]
-      .map((match) => match[1]),
+  const dependencyRecords = dependencyRecordsByPackageIdentity(dependencies);
+  const devDependencyRecords = dependencyRecordsByPackageIdentity(devDependencies);
+
+  const binSections = manifestSections(manifest, "array-table", "bin");
+  const qualificationBinName = "codestory-proof-availability";
+  const qualificationBinPath = "src/bin/codestory_proof_availability.rs";
+  const qualificationBins = binSections.filter((section) =>
+    stringField(section, "name") === qualificationBinName
+    || stringField(section, "path") === qualificationBinPath
   );
-  const devDependencyNames = new Set(
-    [...devDependencies.matchAll(/^([A-Za-z0-9_-]+)\s*=/gmu)]
-      .map((match) => match[1]),
-  );
+  if (qualificationBins.length > 0) {
+    const sealedBins = qualificationBins.filter((section) =>
+      stringField(section, "name") === qualificationBinName
+      && stringField(section, "path") === qualificationBinPath
+    );
+    add(
+      violations,
+      qualificationBins.length === 1 && sealedBins.length === 1,
+      "codestory-bench must declare exactly one sealed codestory-proof-availability bin",
+    );
+    if (qualificationBins.length !== 1 || sealedBins.length !== 1) return violations;
+
+    const proofQualificationSupport = "proof-qualification-support";
+    const benchmarkSupport = "benchmark-support";
+    const ordinaryProductDependencies = [
+      "codestory-contracts",
+      "codestory-indexer",
+      "codestory-retrieval",
+      "codestory-store",
+      "codestory-workspace",
+    ];
+    const reviewedProductDependencies = [
+      ["codestory-agent", {
+        workspace: true,
+      }],
+      ["codestory-cli", {
+        workspace: true,
+        features: [proofQualificationSupport],
+      }],
+      ...ordinaryProductDependencies.map((name) => [name, { workspace: true }]),
+      ["codestory-runtime", {
+        workspace: true,
+        features: [proofQualificationSupport],
+      }],
+    ];
+    add(
+      violations,
+      reviewedProductDependencies.every(([packageIdentity, expectedAttributes]) => {
+        const records = dependencyRecords.get(packageIdentity) ?? [];
+        return records.length === 1
+          && records[0].name === packageIdentity
+          && dependencySpecificationMatches(
+            records[0].specification,
+            expectedAttributes,
+          );
+      }),
+      "codestory-bench reviewed CodeStory package identities must have exactly one exact normal dependency record",
+    );
+    add(
+      violations,
+      ordinaryProductDependencies.every((name) =>
+        dependencyMatches(dependencies, name, { workspace: true })
+      ),
+      "codestory-bench ordinary CodeStory product dependencies must use the exact reviewed workspace-only shape",
+    );
+    const qualificationFeatureOwners = dependencyFeatureOwnerRecords(
+      dependencies,
+      proofQualificationSupport,
+    );
+    add(
+      violations,
+      dependencyMatches(dependencies, "codestory-agent", {
+        workspace: true,
+      })
+        && dependencyMatches(dependencies, "codestory-cli", {
+          workspace: true,
+          features: [proofQualificationSupport],
+        })
+        && dependencyMatches(dependencies, "codestory-runtime", {
+          workspace: true,
+          features: [proofQualificationSupport],
+        })
+        && qualificationFeatureOwners.length === 2
+        && ["codestory-cli", "codestory-runtime"]
+          .every((name) => qualificationFeatureOwners.some((record) =>
+            record.name === name
+          )),
+      "codestory-bench qualification dependencies must use the exact reviewed feature topology",
+    );
+    add(
+      violations,
+      ["criterion", "uuid"].every(
+        (name) =>
+          !dependencyRecords.has(name) && devDependencyRecords.has(name),
+      ),
+      "codestory-bench criterion and uuid must remain dev-only",
+    );
+    add(
+      violations,
+      dependencyMatches(dependencies, "codestory-retrieval", { workspace: true })
+        && dependencyMatches(devDependencies, "codestory-retrieval", {
+          workspace: true,
+          features: [benchmarkSupport],
+        })
+        && dependencyMatches(dependencies, "codestory-runtime", {
+          workspace: true,
+          features: [proofQualificationSupport],
+        })
+        && dependencyMatches(devDependencies, "codestory-runtime", {
+          workspace: true,
+          features: [benchmarkSupport],
+        }),
+      "codestory-bench benchmark-only runtime and retrieval support must remain dev-only",
+    );
+    add(
+      violations,
+      dependencyFeatureOwnerRecords(dependencies, benchmarkSupport).length === 0
+        && dependencyFeatureOwnerRecords(dependencies, "test-support").length === 0,
+      "codestory-bench product dependencies must not enable benchmark-support or test-support",
+    );
+    return violations;
+  }
+
   add(
     violations,
     benchmarkOnly.every(
-      (name) => !dependencyNames.has(name) && devDependencyNames.has(name),
+      (name) =>
+        !dependencyRecords.has(name) && devDependencyRecords.has(name),
     ),
     "codestory-bench benchmark-only dependencies must not enter packaged qualification binaries",
   );
   add(
     violations,
-    /^codestory-runtime\s*=\s*\{\s*workspace\s*=\s*true,\s*features\s*=\s*\["benchmark-support"\]\s*\}\s*$/mu
-      .test(devDependencies)
-      && !/\b(?:benchmark-support|test-support)\b/u.test(dependencies),
+    dependencyMatches(devDependencies, "codestory-runtime", {
+      workspace: true,
+      features: ["benchmark-support"],
+    })
+      && dependencyFeatureOwnerRecords(dependencies, "benchmark-support").length === 0
+      && dependencyFeatureOwnerRecords(dependencies, "test-support").length === 0,
     "codestory-bench product dependencies must not enable benchmark-support or test-support",
+  );
+  add(
+    violations,
+    dependencyFeatureOwnerRecords(
+      dependencies,
+      "proof-qualification-support",
+    ).length === 0,
+    "codestory-bench product dependencies must not enable proof-qualification-support without the sealed qualification driver",
   );
   return violations;
 }
@@ -1356,6 +1699,17 @@ const draftStepSequence = [
     keys: ["name", "if", "uses", "continue-on-error", "with"],
   },
 ];
+// Shared pin for draft CI and the retrieval cache-seed producer. Keep both
+// workflows on this exact release so draft restore-keys can hit base-branch seeds.
+const draftPinnedRustToolchain = "1.97.1";
+const draftRustInstallCommands = [
+  `rustup toolchain install ${draftPinnedRustToolchain} --profile minimal --component clippy --component rustfmt`,
+  `rustup default ${draftPinnedRustToolchain}`,
+];
+const retrievalRustInstallCommands = [
+  `rustup toolchain install ${draftPinnedRustToolchain} --profile minimal`,
+  `rustup default ${draftPinnedRustToolchain}`,
+];
 const draftRunCommands = new Map([
   ["Configure bounded compiler cache", [
     "{",
@@ -1367,10 +1721,7 @@ const draftRunCommands = new Map([
     'echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"',
     '} >> "$GITHUB_ENV"',
   ]],
-  ["Install Rust stable", [
-    "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
-    "rustup default 1.97.1",
-  ]],
+  ["Install Rust stable", draftRustInstallCommands],
   ["Install Linux Vulkan build dependencies", [
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
   ]],
@@ -2085,6 +2436,13 @@ export function draftSourcePolicyViolations(
   add(violations, compilerSave?.if === draftCompilerSaveCondition, "draft compiler cache must save only on a successful run that missed its primary key");
   add(violations, compilerSaveWith.path === draftCompilerCachePath && compilerSaveWith.key === draftCompilerSaveKey, "draft compiler cache save must publish the restored primary key path");
 
+  const retrievalInstall = namedStep(retrievalJob, "Install Rust stable");
+  add(
+    violations,
+    sameStrings(nonCommentLines(retrievalInstall?.run), retrievalRustInstallCommands),
+    `retrieval cache producer must pin the same draft Rust ${draftPinnedRustToolchain} toolchain`,
+  );
+
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
   const retrievalRestoreWith = object(retrievalRestore?.with);
   add(
@@ -2397,9 +2755,15 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/codestory-release-claims.mjs",
       "scripts/codestory-release-closeout.mjs",
       "scripts/codestory-release-evidence-gate.mjs",
+      "scripts/lib/release-coordinator-github.mjs",
+      "scripts/lib/release-coordinator-contract.mjs",
+      "scripts/lib/release-coordinator-evidence.mjs",
+      "scripts/lib/read-release-artifact.py",
       "scripts/tests/codestory-release-claims.test.mjs",
       "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
+      "scripts/tests/codestory-release-live.test.mjs",
+      "scripts/tests/fixtures/release-github.mjs",
       "scripts/tests/fixtures/release-claims/**",
       ".github/scripts/publish-marketplace-catalog.mjs",
       ".github/scripts/publish-marketplace-catalog.test.mjs",
@@ -3384,6 +3748,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, sameMembers(needs(linuxVulkan), releaseChain.dependencies["linux-vulkan-proof"]), `${releaseFile} Linux Vulkan proof dependencies must match the release claim graph`);
   add(
     violations,
+    object(linuxVulkan.with).package_run_id === "${{ github.run_id }}",
+    `${releaseFile} Linux proof must bind package_run_id to this release run`,
+  );
+  add(
+    violations,
     object(linuxVulkan.with).candidate_installed_proof === true
       && object(linuxVulkan.with).server_behavior_only === true
       && object(linuxVulkan.with).emit_release_cells === true,
@@ -4164,6 +4533,9 @@ function validatePackagedProof(workflows, violations, graph) {
     "CXX=clang++-13",
     "LIBCLANG_PATH=/usr/lib/llvm-13/lib",
     "-mavxvnni -mavx512bf16 -mamx-tile -mamx-int8",
+    "snapshot.debian.org/archive/debian/20260518T000000Z",
+    "snapshot.debian.org/archive/debian-security/20260518T000000Z",
+    'Acquire::Check-Valid-Until "false"',
   ]) {
     add(
       violations,
@@ -4310,17 +4682,37 @@ function validatePackagedProof(workflows, violations, graph) {
       ).length > 0)
     .map(step => step.name)
     .sort();
+  const hostCargoBuilds = shellInvocationsContaining(packageBuildRun, "cargo build");
+  const hostProductionBuild = hostCargoBuilds.find(command =>
+    command.includes("${cargo_args[@]}"));
+  const hostDriverBuild = hostCargoBuilds.find(command =>
+    command.includes("-p codestory-bench"));
+  const hostProductionArgs = /cargo_args=\(([^)]*)\)/u.exec(packageBuildRun)?.[1]
+    .trim().replaceAll(/\s+/gu, " ");
+  const hostBuildCalls = [...packageBuildRun.matchAll(
+    /\b(build_qualification_driver|build_package_graph)\s*\\/gu,
+  )].map((match) => match[1]);
+  const linuxCargoBuilds = shellInvocationsContaining(linuxBuildRun, "cargo build");
+  const linuxProductionBuild = linuxCargoBuilds.find(command =>
+    command.includes("-p codestory-cli"));
+  const linuxDriverBuild = linuxCargoBuilds.find(command =>
+    command.includes("-p codestory-bench"));
   add(
     violations,
-    shellInvocationsContaining(packageBuildRun, "cargo build").length === 1
+    hostCargoBuilds.length === 2
       && packageBuildRun.includes("cargo build --release --locked")
       && packageBuildRun.includes("-p codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli-runtime")
+      && hostProductionArgs === "-p codestory-cli --bin codestory-cli --bin codestory-cli-runtime"
       && packageBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
-      && packageBuildRun.includes("-p codestory-bench")
-      && packageBuildRun.includes("--bin codestory_embedding_qualification")
-      && packageBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && hostProductionBuild?.includes("cargo build --release --locked")
+      && hostProductionBuild?.includes("--target $RELEASE_RUST_TARGET")
+      && !hostProductionBuild?.includes("codestory-bench")
+      && hostDriverBuild?.includes("cargo build --release --locked")
+      && hostDriverBuild?.includes("--bin codestory_embedding_qualification")
+      && hostDriverBuild?.includes("--target $RELEASE_RUST_TARGET")
+      && !hostDriverBuild?.includes("-p codestory-cli")
       && packageBuildRun.includes("if [ $RUNNER_OS = Windows ]")
       && packageBuildRun.includes("--message-format=json-render-diagnostics")
       && packageBuildRun.includes("--timings")
@@ -4330,11 +4722,20 @@ function validatePackagedProof(workflows, violations, graph) {
       && packageBuildRun.includes("--source-sha $SOURCE_SHA")
       && packageBuildRun.includes("--source-tree $SOURCE_TREE")
       && occurrenceCount(packageBuildRun, "build_package_graph") === 3
+      && occurrenceCount(packageBuildRun, "build_qualification_driver") === 3
+      && JSON.stringify(hostBuildCalls) === JSON.stringify([
+        "build_qualification_driver", "build_package_graph",
+        "build_qualification_driver", "build_package_graph",
+      ])
+      && !packageBuildRun.includes("cargo_args+=(")
+      && packageBuildRun.includes("qualification_input=(--qualification-input $qualification_json)")
+      && packageBuildRun.includes("${qualification_input[@]}")
+      && packageBuildRun.includes("--input $cargo_json")
       && !packageBuildRun.includes("codestory_embedding_constant_calibration")
       && !packageBuildRun.includes("target/debug")
       && !/(?:^|\s)--test(?:s)?(?:\s|$)/u.test(packageBuildRun)
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
-    `${file} host package must build only the production bins and optional qualification driver in one exact Cargo invocation`,
+    `${file} host package must isolate the optional qualification driver from the production Cargo graph`,
   );
   // Windows linker timing was a substring count over the build log, which the
   // Cargo progress line `Compiling time v0.3.47` satisfied. The reported
@@ -4390,24 +4791,29 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   add(
     violations,
-    shellInvocationsContaining(linuxBuildRun, "cargo build").length === 1
+    linuxCargoBuilds.length === 2
       && linuxBuildRun.includes("CARGO_TARGET_DIR=/workspace/target/glibc-2.31")
       && linuxBuildRun.includes("CXXFLAGS=-std=c++17")
       && linuxBuildRun.includes("INCLUDE_QUALIFICATION_DRIVER=$INCLUDE_QUALIFICATION_DRIVER")
       && linuxBuildRun.includes("RELEASE_RUST_TARGET=$RELEASE_RUST_TARGET")
-      && linuxBuildRun.includes("-p codestory-cli")
-      && linuxBuildRun.includes("--bin codestory-cli")
-      && linuxBuildRun.includes("--bin codestory-cli-runtime")
+      && linuxProductionBuild?.includes("cargo build --release --locked")
+      && linuxProductionBuild?.includes("--bin codestory-cli")
+      && linuxProductionBuild?.includes("--bin codestory-cli-runtime")
+      && !linuxProductionBuild?.includes("codestory-bench")
       && linuxBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
-      && linuxBuildRun.includes("-p codestory-bench")
-      && linuxBuildRun.includes("--bin codestory_embedding_qualification")
+      && linuxDriverBuild?.includes("cargo build --release --locked")
+      && linuxDriverBuild?.includes("--bin codestory_embedding_qualification")
+      && !linuxDriverBuild?.includes("-p codestory-cli")
+      && linuxBuildRun.indexOf(linuxDriverBuild) < linuxBuildRun.indexOf(linuxProductionBuild)
+      && linuxBuildRun.includes("qualification-messages.jsonl")
+      && !linuxBuildRun.includes("set --")
       && linuxBuildRun.includes("--target $RELEASE_RUST_TARGET")
       && linuxBuildRun.includes("--message-format=json-render-diagnostics")
       && linuxBuildRun.includes("cargo-build-artifacts.mjs features")
       && linuxBuildRun.includes("--workspace-root $GITHUB_WORKSPACE")
       && !linuxBuildRun.includes("codestory_embedding_constant_calibration")
       && !/(?:^|\s)--bins(?:\s|$)/u.test(linuxBuildRun),
-    `${file} Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
+    `${file} Linux package must isolate the optional qualification driver from the production Cargo graph`,
   );
   // The identity the smoke reads is the one `source-identity` proved against the dispatched ref,
   // and it now arrives through `env:` rather than spliced into the command. Both halves are pinned:

@@ -108,7 +108,38 @@ pub(super) fn bounded_markdown_snippet_from_path(
     truncation_suffix: &str,
 ) -> io::Result<BoundedSnippet> {
     let file = std::fs::File::open(path)?;
-    let mut reader = io::BufReader::new(file);
+    bounded_markdown_snippet_from_reader(
+        io::BufReader::new(file),
+        focus_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+pub(crate) fn bounded_markdown_snippet_from_text(
+    text: &str,
+    focus_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
+    bounded_markdown_snippet_from_reader(
+        io::Cursor::new(text.as_bytes()),
+        focus_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+fn bounded_markdown_snippet_from_reader(
+    mut reader: impl BufRead,
+    focus_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
     let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP);
     let focus = focus_line.max(1) as usize;
     let start = focus.saturating_sub(context).max(1);
@@ -141,6 +172,63 @@ pub(super) fn bounded_markdown_snippet_from_path(
         max_bytes,
         truncation_suffix,
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceWindow {
+    pub(crate) text: String,
+    pub(crate) start_line: u32,
+    pub(crate) end_line: u32,
+    pub(crate) truncated: bool,
+}
+
+/// Select a window from already verified UTF-8 without reopening its source.
+pub(crate) fn bounded_source_window(
+    text: &str,
+    focus_line: u32,
+    context: usize,
+    maximum_bytes: usize,
+) -> Option<SourceWindow> {
+    let focus = usize::try_from(focus_line).ok()?.checked_sub(1)?;
+    let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP);
+    let start = focus.saturating_sub(context);
+    let lines = text
+        .lines()
+        .skip(start)
+        .take(context * 2 + 1)
+        .collect::<Vec<_>>();
+    if lines.len() <= focus - start {
+        return None;
+    }
+    let end = focus.saturating_add(context).saturating_sub(start) + 1;
+    let text = lines[..lines.len().min(end)].join("\n");
+    Some(cap_source_window(
+        &text,
+        u32::try_from(start + 1).ok()?,
+        maximum_bytes,
+    ))
+}
+
+/// Keep only source lines represented by the retained prefix, including partial last lines.
+pub(crate) fn cap_source_window(text: &str, start_line: u32, maximum_bytes: usize) -> SourceWindow {
+    let mut end = text.len().min(maximum_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = end < text.len();
+    let text = if truncated {
+        text[..end].trim_end_matches('\n')
+    } else {
+        &text[..end]
+    }
+    .to_owned();
+    let line_count = text.split('\n').count();
+    SourceWindow {
+        text,
+        start_line,
+        end_line: start_line.saturating_add(u32::try_from(line_count - 1).unwrap_or(u32::MAX)),
+        truncated,
+    }
 }
 
 pub(super) fn bounded_markdown_snippet_range_from_path(
@@ -255,5 +343,56 @@ fn read_line_capped<R: BufRead>(
         if newline.is_some() {
             return Ok((total, truncated));
         }
+    }
+}
+
+#[cfg(test)]
+mod source_window_tests {
+    use super::{bounded_source_window, cap_source_window};
+
+    #[test]
+    fn source_windows_keep_actual_lines_and_reject_missing_focus() {
+        let source = "first\r\nsecond\r\nthird\r\n";
+        for focus in [1, 2, 3] {
+            let window = bounded_source_window(source, focus, 6, 1024).expect("window");
+            assert_eq!(window.text, "first\nsecond\nthird");
+            assert_eq!((window.start_line, window.end_line), (1, 3));
+            assert!(!window.truncated);
+        }
+        for focus in [0, 4, u32::MAX] {
+            assert!(bounded_source_window(source, focus, 6, 1024).is_none());
+        }
+        assert!(bounded_source_window("", 1, 6, 1024).is_none());
+        let source = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window = bounded_source_window(&source, 10, 6, 1024).expect("interior window");
+        assert_eq!((window.start_line, window.end_line), (4, 16));
+        assert_eq!(window.text.lines().count(), 13);
+    }
+
+    #[test]
+    fn byte_caps_preserve_utf8_and_report_the_retained_last_line() {
+        let source = "prefix\n界界界\nsuffix";
+        let window = bounded_source_window(source, 2, 1, 10).expect("window");
+        assert_eq!(window.text, "prefix\n界");
+        assert_eq!((window.start_line, window.end_line), (1, 2));
+        assert!(window.truncated);
+        let shorter = cap_source_window(&window.text, window.start_line, 8);
+        assert_eq!(shorter.text, "prefix");
+        assert_eq!((shorter.start_line, shorter.end_line), (1, 1));
+        assert!(shorter.truncated);
+        let blank = bounded_source_window("\n\nend\n", 2, 1, 100).expect("blank lines");
+        assert_eq!(blank.text, "\n\nend");
+        assert_eq!((blank.start_line, blank.end_line), (1, 3));
+        let long = format!("{}\nlast", "é".repeat(20_000));
+        let first = bounded_source_window(&long, 1, 6, 16 * 1024).expect("long line");
+        let public = cap_source_window(&first.text, first.start_line, 8 * 1024);
+        assert_eq!(first.text.len(), 16 * 1024);
+        assert_eq!(public.text.len(), 8 * 1024);
+        assert_eq!((public.start_line, public.end_line), (1, 1));
+        assert!(first.truncated && public.truncated);
+        assert!(!public.text.contains('\u{fffd}'));
     }
 }

@@ -26,7 +26,8 @@ pub(in crate::app) fn build_doctor_output(
     }
     let project = display::clean_path_string(&summary.root);
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
-    let storage_exists = runtime.storage_path.exists();
+    let storage_exists =
+        codestory_runtime::core_database_exists(&runtime.storage_path).unwrap_or(false);
     let sidecar_retrieval = doctor_sidecar_status(runtime);
     let readiness_sidecar = agent_readiness_status(runtime, None);
     let readiness = build_summary_readiness(
@@ -116,6 +117,7 @@ pub(in crate::app) fn build_doctor_output(
     DoctorOutput {
         project: project.clone(),
         storage_path,
+        core_status: None,
         indexed,
         stats: summary.stats.clone(),
         retrieval_mode: readiness_sidecar.retrieval_mode.clone(),
@@ -546,7 +548,7 @@ pub(in crate::app) fn index_next_commands(
     }
     commands.push(format!("codestory-cli ground --project {project}"));
     commands.push(format!(
-        "codestory-cli search --project {project} --query \"<symbol/file/literal/API path>\" --why"
+        "codestory-cli search --project {project} --query \"<symbol/file/literal/API path>\""
     ));
     commands.push(format!(
         "codestory-cli context --project {project} --query \"<concrete target>\""

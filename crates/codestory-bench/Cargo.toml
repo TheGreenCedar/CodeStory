@@ -1,27 +1,34 @@
 [package]
 name = "codestory-bench"
-version = "0.17.5"
+version = "0.17.6"
 edition = "2024"
 publish = false
 
 [dependencies]
+codestory-agent = { workspace = true }
+codestory-cli = { workspace = true, features = ["proof-qualification-support"] }
+codestory-contracts = { workspace = true }
+codestory-indexer = { workspace = true }
 codestory-retrieval = { workspace = true }
+codestory-runtime = { workspace = true, features = ["proof-qualification-support"] }
+codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 
+[[bin]]
+name = "codestory-proof-availability"
+path = "src/bin/codestory_proof_availability.rs"
+
 [dev-dependencies]
-codestory-cli = { workspace = true }
-codestory-contracts = { workspace = true }
-codestory-indexer = { workspace = true }
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
 codestory-runtime = { workspace = true, features = ["benchmark-support"] }
-codestory-store = { workspace = true }
 criterion = { workspace = true }
 uuid = { workspace = true }
 

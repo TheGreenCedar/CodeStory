@@ -54,10 +54,17 @@ fn file_coverage_reason(
     if file.complete {
         return None;
     }
-    if let Some(reason) = errors_by_file
-        .get(&file.id)
-        .and_then(|reasons| reasons.first())
-    {
+    if let Some(reason) = errors_by_file.get(&file.id).and_then(|reasons| {
+        reasons
+            .iter()
+            .find(|reason| {
+                !matches!(
+                    reason,
+                    FileCoverageReason::Malformed | FileCoverageReason::ParserPartial
+                )
+            })
+            .or_else(|| reasons.first())
+    }) {
         return Some(*reason);
     }
     if !file.complete && file.indexed && has_verified_content {
@@ -74,6 +81,44 @@ pub(crate) fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
             | FileCoverageReason::DiscoveryIncomplete
             | FileCoverageReason::CollectorFailure
     )
+}
+
+pub(crate) fn coverage_gap_blocks_publication(gap: &FileCoverageDiagnosticDto) -> bool {
+    match gap.reason {
+        FileCoverageReason::ParserPartial => !gap.verified_source,
+        FileCoverageReason::Malformed => !gap.verified_source || gap.projection_available,
+        _ => true,
+    }
+}
+
+/// Malformed files have no projection to validate. Recheck their authenticated
+/// source identity at the final commit fence, including same-mtime replacement.
+pub(crate) fn revalidate_malformed_sources(storage: &Store) -> Result<(), ApiError> {
+    let malformed = storage
+        .get_errors(None)
+        .map_err(|error| ApiError::internal(format!("Failed to read coverage errors: {error}")))?
+        .into_iter()
+        .filter(|error| error.coverage_reason == Some(FileCoverageReason::Malformed))
+        .filter_map(|error| error.file_id.map(|id| id.0))
+        .collect::<HashSet<_>>();
+    if malformed.is_empty() {
+        return Ok(());
+    }
+    let files = storage.files().inventory().map_err(|error| {
+        ApiError::internal(format!("Failed to read source identities: {error}"))
+    })?;
+    codestory_workspace::reverify_source_freshness_from_content();
+    for file in files.iter().filter(|file| malformed.contains(&file.id)) {
+        if file.content_hash.is_none()
+            || codestory_workspace::stored_file_requires_reindex(&file.path, file)
+        {
+            return Err(ApiError::new(
+                "source_changed",
+                "Malformed source could not be reverified at publication; the candidate was discarded.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
@@ -499,7 +544,9 @@ impl IndexedFilesAggregation {
                         reason,
                         retryable: file_coverage_retryable(reason),
                         verified_source,
-                        projection_available: file.indexed && verified_source,
+                        projection_available: file.indexed
+                            && verified_source
+                            && reason != FileCoverageReason::Malformed,
                     })
             })
             .collect();
@@ -648,6 +695,7 @@ pub(crate) fn indexed_files_from_storage(
     source_index_policy: &SourceIndexPolicy,
     req: IndexedFilesRequest,
 ) -> Result<IndexedFilesDto, ApiError> {
+    let include_framework_coverage = req.include_framework_coverage;
     let inventory = IndexedFilesInventory::load(storage, root, source_index_policy)?;
     let aggregation = IndexedFilesAggregation::from_inventory(root, &inventory);
     let selection = IndexedFilesSelection::from_inventory(root, inventory, req);
@@ -672,6 +720,12 @@ pub(crate) fn indexed_files_from_storage(
             selection.policy_exclusion_count
         ));
     }
+    if !include_framework_coverage {
+        coverage_notes.push(
+            "Global framework capability catalog omitted; request include_framework_coverage for its limitations. File inventory does not establish route coverage."
+                .to_string(),
+        );
+    }
 
     Ok(IndexedFilesDto {
         project_root: root.to_string_lossy().to_string(),
@@ -687,7 +741,12 @@ pub(crate) fn indexed_files_from_storage(
             incomplete_reason_counts: aggregation.incomplete_reason_counts,
             truncated: selection.truncated,
             language_counts: aggregation.language_counts,
-            framework_route_coverage: framework_route_coverage_matrix(),
+            framework_route_coverage: if include_framework_coverage {
+                framework_route_coverage_matrix()
+            } else {
+                Vec::new()
+            },
+            framework_route_coverage_included: Some(include_framework_coverage),
             coverage_notes,
         },
         coverage_gaps: aggregation.coverage_gaps,

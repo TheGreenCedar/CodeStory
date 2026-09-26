@@ -1,5 +1,7 @@
-(function_declaration
-  name: (identifier) @name) @def
+[
+  (function_declaration name: (identifier) @name)
+  (generator_function_declaration name: (identifier) @name)
+] @def
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"
@@ -387,23 +389,10 @@
   attr (@binding_name.node -> @module.node) kind = "IMPORT"
 }
 
-;; Lambda assignment
+;; Callable variable bindings
 (variable_declarator
   name: (identifier) @name
-  value: (arrow_function) @def)
-{
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @def)
-  attr (@name.node) start_col = (start-column @def)
-  attr (@name.node) end_row = (end-row @def)
-  attr (@name.node) end_col = (end-column @def)
-}
-
-(variable_declarator
-  name: (identifier) @name
-  value: (function_expression) @def)
+  value: [(arrow_function) (function_expression) (generator_function)] @def)
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"

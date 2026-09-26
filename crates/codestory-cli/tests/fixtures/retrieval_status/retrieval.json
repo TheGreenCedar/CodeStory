@@ -31,7 +31,7 @@
         "embedding_backend": "manifest-backend",
         "embedding_dim": 768,
         "graph_artifact_hash": "golden-graph-hash",
-        "lexical_version": "sqlite-fts5-v1",
+        "lexical_version": "sqlite-fts5-v2",
         "precise_semantic_import_producer": "golden-import-producer",
         "precise_semantic_import_reason": "golden-import-reason",
         "precise_semantic_import_revision": "golden-import-revision",
@@ -43,7 +43,7 @@
         "semantic_policy_version": "graph_first_v3",
         "sidecar_generation": "golden-generation",
         "sidecar_input_hash": "golden-input",
-        "sidecar_schema_version": 6,
+        "sidecar_schema_version": 7,
         "symbol_doc_count": 8
       },
       "manifest_contract": {
@@ -136,7 +136,7 @@
         "embedding_backend": "manifest-backend",
         "embedding_dim": 768,
         "graph_artifact_hash": "golden-graph-hash",
-        "lexical_version": "sqlite-fts5-v1",
+        "lexical_version": "sqlite-fts5-v2",
         "precise_semantic_import_producer": "golden-import-producer",
         "precise_semantic_import_reason": "golden-import-reason",
         "precise_semantic_import_revision": "golden-import-revision",
@@ -148,7 +148,7 @@
         "semantic_policy_version": "graph_first_v3",
         "sidecar_generation": "golden-generation",
         "sidecar_input_hash": "golden-input",
-        "sidecar_schema_version": 6,
+        "sidecar_schema_version": 7,
         "symbol_doc_count": 8
       },
       "manifest_contract": {
