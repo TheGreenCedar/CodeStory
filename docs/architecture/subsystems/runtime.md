@@ -78,6 +78,13 @@ an `AnnotationsOwned`, which only
 `ensure_annotations_owned_before_core_replacement` can mint. A future refresh
 entry point that forgets the cutover does not compile.
 
+The controller rebinding pass runs after a committed core independently of
+resident cache refresh. If it fails, the saved annotation evidence remains at
+its last verified generation; full, incremental, and semantic-only core writers
+must catch up against the current complete core before advancing again. Legacy
+or interrupted standalone cores without a complete generation remain eligible
+for managed recovery.
+
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
 engine activation and hold publication leases, but cannot reconfigure the
