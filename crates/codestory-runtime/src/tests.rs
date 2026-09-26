@@ -5118,6 +5118,202 @@ fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source()
     assert_eq!(fact.edge_id, None);
 }
 
+fn source_absent_exact_proof_republish(language: &str) {
+    use codestory_contracts::proof_resolution::{ProofResolutionStatus, ResolutionEvidence};
+
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (sources, callsite) = match language {
+        "python" => (
+            vec![
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", "def target():\n    pass\n"),
+                (
+                    "pkg/main.py",
+                    "from .target import target\ndef caller():\n    target()\n",
+                ),
+            ],
+            "pkg/main.py",
+        ),
+        "dart" => (
+            vec![
+                (
+                    "lib/main.dart",
+                    "final class Worker {\n  void target() {}\n}\nvoid caller(Worker worker) { worker.target(); }\n",
+                ),
+                ("lib/sibling.dart", "final class Sibling {}\n"),
+            ],
+            "lib/main.dart",
+        ),
+        other => panic!("unexpected proof language: {other}"),
+    };
+    for (relative, source) in &sources {
+        let path = workspace.path().join(relative);
+        fs::create_dir_all(path.parent().expect("source parent")).expect("create source parent");
+        fs::write(path, source).expect("write source");
+    }
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core with exact language proof");
+    let (before, proof, facts, exact) = {
+        let storage = Storage::open(&storage_path).expect("open published core");
+        let before = storage
+            .get_complete_index_publication()
+            .expect("read core")
+            .expect("complete core");
+        let proof = storage
+            .validate_proof_resolution_publication(&before)
+            .expect("source-present full proof validation");
+        let facts = storage
+            .get_proof_resolution_facts()
+            .expect("read exact facts");
+        let exact = facts
+            .iter()
+            .find(|fact| {
+                fact.status == ProofResolutionStatus::Exact
+                    && fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == "target"
+                    && match language {
+                        "python" => fact.evidence_chain.iter().any(|evidence| {
+                            matches!(evidence, ResolutionEvidence::StaticImportBinding { .. })
+                        }),
+                        "dart" => fact.evidence_chain.iter().any(|evidence| {
+                            matches!(evidence, ResolutionEvidence::ExplicitReceiverType { .. })
+                        }),
+                        _ => false,
+                    }
+            })
+            .unwrap_or_else(|| panic!("missing exact {language} import/receiver fact: {facts:?}"))
+            .clone();
+        (before, proof, facts, exact)
+    };
+    assert!(
+        exact.provenance.dependency_file_hashes.len() >= if language == "python" { 3 } else { 2 },
+        "exact proof must carry the package or complete library dependency domain: {exact:?}"
+    );
+
+    // Full validation must still authenticate live bytes and dispatch shape.
+    let callsite_path = workspace.path().join(callsite);
+    let original = fs::read(&callsite_path).expect("source before drift");
+    fs::write(&callsite_path, b"changed source\n").expect("drift source");
+    let drift_error = Storage::open(&storage_path)
+        .expect("open core after source drift")
+        .validate_proof_resolution_publication(&before)
+        .expect_err("full validation must reject live source drift");
+    assert!(drift_error.to_string().contains("proof"), "{drift_error:?}");
+    fs::write(&callsite_path, original).expect("restore source");
+
+    for (relative, _) in &sources {
+        fs::remove_file(workspace.path().join(relative)).expect("remove source");
+    }
+    let outcome = controller
+        .republish_semantic_projections_blocking()
+        .expect("rebind exact proof from stored core without source");
+    assert_eq!(outcome.previous_publication, before);
+    assert_eq!(outcome.publication.generation, before.generation + 1);
+    let storage = Storage::open(&storage_path).expect("open rebound core");
+    let rebound = storage
+        .get_proof_resolution_publication()
+        .expect("read rebound proof")
+        .expect("proof remains present");
+    assert_eq!(rebound.fact_digest, proof.fact_digest);
+    assert_eq!(
+        rebound.core_generation_id,
+        outcome.publication.generation_id
+    );
+    assert_eq!(rebound.core_run_id, outcome.publication.run_id);
+    assert_eq!(storage.get_proof_resolution_facts().unwrap(), facts);
+    drop(storage);
+
+    if language == "dart" {
+        let owner = exact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::ExplicitReceiverType { receiver_type } => Some(*receiver_type),
+                _ => None,
+            })
+            .expect("exact Dart receiver owner");
+        mutate_published_core(&storage_path, |storage| {
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    rusqlite::params![NodeKind::UNKNOWN as i32, owner.0],
+                )
+                .expect("mutate stored Dart receiver owner");
+        });
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("mutated stored Dart receiver owner must reject rebind");
+        assert!(error.message.contains("proof"), "{error:?}");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path).unwrap(),
+            Some(outcome.publication.clone())
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+        mutate_published_core(&storage_path, |storage| {
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    rusqlite::params![NodeKind::CLASS as i32, owner.0],
+                )
+                .expect("restore stored Dart receiver owner");
+        });
+    }
+
+    // A changed stored dependency receipt must reject the next rebind and
+    // leave the prior publication identity unchanged.
+    mutate_published_core(&storage_path, |storage| {
+        let mut dependencies = exact.provenance.dependency_file_hashes.clone();
+        assert!(!dependencies.is_empty(), "exact proof has dependencies");
+        dependencies[0].source_sha256 = "0".repeat(64);
+        let provenance_id: i64 = storage
+            .get_connection()
+            .query_row(
+                "SELECT provenance_id FROM proof_resolution_fact WHERE fact_id = ?1",
+                [&exact.fact_id],
+                |row| row.get(0),
+            )
+            .expect("stored exact provenance");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_provenance SET dependency_json = ?1 WHERE provenance_id = ?2",
+                rusqlite::params![serde_json::to_string(&dependencies).unwrap(), provenance_id],
+            )
+            .expect("tamper stored dependency receipt");
+    });
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("mutated stored dependency must reject rebind");
+    assert!(error.message.contains("proof"), "{error:?}");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path).expect("read preserved core"),
+        Some(outcome.publication)
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn semantic_projection_republish_rebinds_exact_python_relative_import_without_source() {
+    source_absent_exact_proof_republish("python");
+}
+
+#[test]
+fn semantic_projection_republish_rebinds_exact_dart_final_receiver_without_source() {
+    source_absent_exact_proof_republish("dart");
+}
+
 #[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
