@@ -397,7 +397,7 @@ fn stage_sealed_file_impl(
                             io_error("create sealed stage destination", destination, cause)
                         })?;
                     owned.record(&output)?;
-                    let mut buffer = [0_u8; COPY_CHUNK_BYTES];
+                    let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
                     let mut copied = 0_u64;
                     loop {
                         if cancelled() {
