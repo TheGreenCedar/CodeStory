@@ -4,6 +4,8 @@
 
 - Cancelling a retrieval refresh before its pointer commit preserves the previous current and rollback generations.
 
+- Bash source-call proof refuses function bindings after unknown executable commands or unset effects that can change the function namespace.
+
 - Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.
 
 - JavaScript and TypeScript call proof refuses explicit prototype mutations,
