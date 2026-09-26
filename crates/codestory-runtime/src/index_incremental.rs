@@ -1462,6 +1462,11 @@ fn run_incremental_indexing_common(
     let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
+    crate::activation_retrieval::apply_core_gc_after_publication(
+        runtime,
+        storage_path,
+        cancel_token,
+    );
     if let Some(receipt) = retrieval_refresh_receipt {
         codestory_retrieval::install_incremental_retrieval_refresh_receipt(receipt).map_err(
             |error| {

@@ -24,17 +24,17 @@ impl CoreReadSession {
     /// immutable generation. Live WAL content fails closed.
     pub fn pin(storage_path: &Path) -> Result<Self, StorageError> {
         let layout = CorePublicationLayout::from_storage_path(storage_path)?;
-        let pointer = layout.read_pointer()?.ok_or_else(|| {
+        let pinned = crate::storage_impl::pin_active_core(&layout)?.ok_or_else(|| {
             StorageError::Other(format!(
                 "No core publication pointer at {}",
                 layout.publication_path().display()
             ))
         })?;
-        let generation_path = layout.resolve_generation_database(&pointer.active.generation_id)?;
-        let storage = Store::open_immutable_generation(&generation_path)?;
+        let generation_path = pinned.path;
+        let storage = Store::open_immutable_generation_with_lease(&generation_path, pinned.lease)?;
         Ok(Self {
             storage,
-            pointer,
+            pointer: pinned.pointer,
             generation_path,
         })
     }

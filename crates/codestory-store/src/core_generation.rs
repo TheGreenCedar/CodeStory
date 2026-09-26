@@ -295,6 +295,7 @@ impl CorePublicationLayout {
         }
         require_regular_generation_file(staged_database)?;
         make_file_immutable(staged_database)?;
+        crate::storage_impl::provision_generation_locks(self, staged_directory)?;
         let generation_directory = self.generation_directory(generation_id)?;
         fs::create_dir_all(self.generations_root()).map_err(|error| {
             core_path_error("create generations root", &self.generations_root(), error)
@@ -797,7 +798,7 @@ fn validate_generation_identity(identity: &CoreGenerationIdentityV1) -> Result<(
     Ok(())
 }
 
-fn validate_generation_id(generation_id: &str) -> Result<(), StorageError> {
+pub(crate) fn validate_generation_id(generation_id: &str) -> Result<(), StorageError> {
     if generation_id.is_empty()
         || generation_id.len() > MAX_GENERATION_ID_BYTES
         || !generation_id

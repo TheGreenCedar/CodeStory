@@ -243,6 +243,19 @@ impl GenerationRetentionLock {
         }
     }
 
+    /// A best-effort cleanup must not wait behind a query or publisher holding
+    /// the shared global fence. Its next pass can retry after they finish.
+    pub fn try_acquire(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
+        let (path, file) = Self::open_lock_file(state_file, scope_id)?;
+        match bounded_locks::try_acquire(&file, FileLockKind::Exclusive) {
+            Ok(true) => Ok(Some(Self { file })),
+            Ok(false) => Ok(None),
+            Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
+                format!("try lock exclusive generation retention {}", path.display())
+            }),
+        }
+    }
+
     /// Observe the retention lock without creating it.
     ///
     /// A read-only pass may not be the reason a retention directory or lock

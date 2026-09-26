@@ -33,12 +33,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod bookmarks;
+mod core_retention;
 mod helpers;
 mod proof_resolution;
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
 mod trail;
+
+pub use core_retention::{CORE_LEASE_FILE, CoreRetentionReport, apply_core_retention};
+pub(crate) use core_retention::{
+    CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,
+};
 
 use crate::annotations::{
     AnnotationCategory, CoreAnchorCandidate, LegacyAnnotationSnapshot, LegacyBookmarkRow,
@@ -1161,6 +1167,7 @@ fn read_proof_resolution_rollback_identity(
     let storage = Storage {
         conn,
         retrieval_publication_path: None,
+        _core_generation_lease: None,
         cache: StorageCache::default(),
         deferred_secondary_indexes: false,
         durability_profile: SqliteDurabilityProfile::Durable,
@@ -2679,6 +2686,8 @@ pub struct Storage {
     /// Staged and legacy stores retain `None` and use their embedded row only
     /// as a migration input.
     retrieval_publication_path: Option<PathBuf>,
+    /// A writer-provisioned immutable generation stays alive for this handle.
+    _core_generation_lease: Option<CoreGenerationLease>,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
     durability_profile: SqliteDurabilityProfile,
@@ -4970,12 +4979,55 @@ pub struct SymbolSummaryRecord {
 /// attach of the logical path would otherwise read an empty legacy shell.
 fn resolved_copy_source_database_path(
     logical_path: &Path,
-) -> Result<Option<PathBuf>, StorageError> {
-    if !crate::core_database_exists(logical_path)? {
+) -> Result<Option<PinnedCopySource>, StorageError> {
+    let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
+    let mut pinned = pin_active_core(&layout)?;
+    if pinned.is_none() {
+        recover_interrupted_promotion(logical_path)?;
+        pinned = pin_active_core(&layout)?;
+    }
+    if let Some(pinned) = pinned {
+        // The attach remains bound to this image for its whole caller scope.
+        drop(Storage::open_immutable_generation(&pinned.path)?);
+        return Ok(Some(PinnedCopySource {
+            path: pinned.path,
+            _lease: pinned.lease,
+            immutable: true,
+        }));
+    }
+    if !logical_path.is_file() {
         return Ok(None);
     }
     drop(Storage::open_read_only(logical_path)?);
-    crate::resolve_core_database_path(logical_path).map(Some)
+    Ok(Some(PinnedCopySource {
+        path: logical_path.to_path_buf(),
+        _lease: None,
+        immutable: false,
+    }))
+}
+
+struct PinnedCopySource {
+    path: PathBuf,
+    _lease: Option<CoreGenerationLease>,
+    immutable: bool,
+}
+
+impl PinnedCopySource {
+    fn attach_argument(&self) -> String {
+        if self.immutable {
+            sqlite_path::observational_uri(&self.path, true)
+        } else {
+            sqlite_path::attach_argument(&self.path)
+        }
+    }
+}
+
+impl std::ops::Deref for PinnedCopySource {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
 }
 
 /// Open the active core without materializing SQLite lock sidecars beside an
@@ -4985,31 +5037,51 @@ fn open_core_database_read_only(
     logical_path: &Path,
     recover_legacy: bool,
     operation: &str,
-) -> Result<Connection, StorageError> {
+) -> Result<PinnedCoreConnection, StorageError> {
     let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
-    let mut pointer = layout.read_pointer()?;
-    if pointer.is_none() && recover_legacy {
+    let mut pinned = pin_active_core(&layout)?;
+    if pinned.is_none() && recover_legacy {
         recover_interrupted_promotion(logical_path)?;
-        pointer = layout.read_pointer()?;
+        pinned = pin_active_core(&layout)?;
     }
-    let resolved = layout.resolve_active_database()?.ok_or_else(|| {
-        StorageError::Other(format!(
+    let (resolved, published, lease) = match pinned {
+        Some(pinned) => (pinned.path, true, pinned.lease),
+        None => (logical_path.to_path_buf(), false, None),
+    };
+    if !resolved.is_file() {
+        return Err(StorageError::Other(format!(
             "{operation} requires an existing database: {}",
             logical_path.display()
-        ))
-    })?;
-    if pointer.is_some() {
-        return Connection::open_with_flags(
+        )));
+    }
+    let conn = if published {
+        Connection::open_with_flags(
             sqlite_path::observational_uri(&resolved, true),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(StorageError::from);
+        )?
+    } else {
+        Connection::open_with_flags(
+            sqlite_path::open_path(&resolved),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?
+    };
+    Ok(PinnedCoreConnection {
+        conn,
+        _lease: lease,
+    })
+}
+
+struct PinnedCoreConnection {
+    conn: Connection,
+    _lease: Option<CoreGenerationLease>,
+}
+
+impl std::ops::Deref for PinnedCoreConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
     }
-    Connection::open_with_flags(
-        sqlite_path::open_path(&resolved),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(StorageError::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5046,17 +5118,22 @@ impl Storage {
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let logical_path = path.as_ref();
         let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
-        let pointer = layout.read_pointer()?;
-        if pointer.is_none() {
+        let mut pinned = pin_active_core(&layout)?;
+        if pinned.is_none() {
             recover_interrupted_promotion(logical_path)?;
+            pinned = pin_active_core(&layout)?;
         }
-        let path = layout.resolve_active_database()?.ok_or_else(|| {
-            StorageError::Other(format!(
+        let (path, published, core_generation_lease) = match pinned {
+            Some(pinned) => (pinned.path, true, pinned.lease),
+            None => (logical_path.to_path_buf(), false, None),
+        };
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
                 "Read-only storage requires an existing database: {}",
                 logical_path.display()
-            ))
-        })?;
-        let conn = if pointer.is_some() {
+            )));
+        }
+        let conn = if published {
             Connection::open_with_flags(
                 sqlite_path::observational_uri(&path, true),
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -5086,9 +5163,8 @@ impl Storage {
         }
         Ok(Self {
             conn,
-            retrieval_publication_path: pointer
-                .is_some()
-                .then(|| layout.retrieval_publication_path()),
+            retrieval_publication_path: published.then(|| layout.retrieval_publication_path()),
+            _core_generation_lease: core_generation_lease,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -5103,6 +5179,14 @@ impl Storage {
     /// is rejected because `immutable=1` intentionally ignores WAL content.
     pub fn open_immutable_generation<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        let lease = pin_exact_core(path)?;
+        Self::open_immutable_generation_with_lease(path, lease)
+    }
+
+    pub(crate) fn open_immutable_generation_with_lease(
+        path: &Path,
+        core_generation_lease: Option<CoreGenerationLease>,
+    ) -> Result<Self, StorageError> {
         if !path.is_file() {
             return Err(StorageError::Other(format!(
                 "Immutable core generation requires an existing database: {}",
@@ -5139,6 +5223,7 @@ impl Storage {
         Ok(Self {
             conn,
             retrieval_publication_path: None,
+            _core_generation_lease: core_generation_lease,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -5183,19 +5268,17 @@ impl Storage {
     fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
         let logical_path = path;
         let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
-        let pointer = layout.read_pointer()?;
         if promotion_artifacts_exist(logical_path) {
             return Err(StorageError::Other(format!(
                 "Observational storage cannot inspect {} while promotion recovery is pending",
                 logical_path.display()
             )));
         }
-        let path = layout.resolve_active_database()?.ok_or_else(|| {
-            StorageError::Other(format!(
-                "Observational storage requires an existing database: {}",
-                logical_path.display()
-            ))
-        })?;
+        let pinned = pin_active_core(&layout)?;
+        let (path, published, core_generation_lease) = match pinned {
+            Some(pinned) => (pinned.path, true, pinned.lease),
+            None => (logical_path.to_path_buf(), false, None),
+        };
         if !path.is_file() {
             return Err(StorageError::Other(format!(
                 "Observational storage requires an existing database: {}",
@@ -5224,7 +5307,7 @@ impl Storage {
             // WAL observer. Accidental `-wal`/`-shm` beside a published generation
             // must not reopen a mutable proof fence; callers fall through to the
             // Direct/Unavailable single-shot validation path instead.
-            if pointer.is_some() {
+            if published {
                 return Err(StorageError::Other(format!(
                     "Proof validation observer is unavailable for immutable core generation: {}",
                     path.display()
@@ -5301,9 +5384,8 @@ impl Storage {
         }
         Ok(Self {
             conn,
-            retrieval_publication_path: pointer
-                .is_some()
-                .then(|| layout.retrieval_publication_path()),
+            retrieval_publication_path: published.then(|| layout.retrieval_publication_path()),
+            _core_generation_lease: core_generation_lease,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -5406,6 +5488,7 @@ impl Storage {
         let storage = Self {
             conn,
             retrieval_publication_path: None,
+            _core_generation_lease: None,
             cache: StorageCache::default(),
             deferred_secondary_indexes: matches!(mode, StorageOpenMode::Build),
             durability_profile,
@@ -5524,6 +5607,7 @@ impl Storage {
         let storage = Self {
             conn,
             retrieval_publication_path: None,
+            _core_generation_lease: None,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -5670,7 +5754,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -5733,7 +5817,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn.execute(
             "ATTACH DATABASE ?1 AS structural_cache_source",
             params![source],
@@ -7881,7 +7965,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -10996,7 +11080,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
         let copy_result = self.conn.execute(
@@ -11366,7 +11450,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let source_has_comments = self
@@ -12098,7 +12182,7 @@ impl Storage {
         let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
         };
-        let source = sqlite_path::attach_argument(&source_path);
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(

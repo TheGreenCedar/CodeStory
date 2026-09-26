@@ -128,6 +128,15 @@ impl OwnedDeletionRoot {
         Ok(crate::workspace_file_identity(&self.root)? == crate::workspace_path_identity(path)?)
     }
 
+    /// Compare this pinned directory with a directory handle authenticated
+    /// before a caller's publication or retention validation.
+    pub fn matches_open_directory(&self, expected: &File) -> io::Result<bool> {
+        Ok(
+            crate::workspace_file_identity(&self.root)?
+                == crate::workspace_file_identity(expected)?,
+        )
+    }
+
     /// Remove this already-open directory only when empty. Unix retains it
     /// because `rmdir` cannot bind its last name lookup to this handle.
     pub fn remove_pinned_empty_directory(self) -> io::Result<bool> {

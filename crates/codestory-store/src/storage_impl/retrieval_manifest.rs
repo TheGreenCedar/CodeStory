@@ -3,6 +3,69 @@ use rusqlite::{Connection, OpenFlags, Row};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Every core identity rooted by the mutable retrieval publication. The
+/// caller holds retrieval's global publication fence while this scan runs.
+/// Refuse malformed or recovery-dependent SQLite state before core deletion.
+pub(super) fn retained_retrieval_core_ids(path: &Path) -> Result<Vec<String>, StorageError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(StorageError::Other(format!(
+                "Cannot inspect retrieval core roots {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(StorageError::Other(format!(
+            "Retrieval core roots are not a direct regular file: {}",
+            path.display()
+        )));
+    }
+    crate::sqlite_observation::observe_sqlite_database(path)?;
+    let connection = open_external_retrieval_publication(path, false)?;
+    let mut statement = connection.prepare(MANIFEST_SELECT)?;
+    let mut rows = statement.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let (manifest, rollback) = publication_from_row(row)?;
+        if manifest.project_id.trim().is_empty() {
+            return Err(StorageError::Other(
+                "Retrieval core root has no project identity".into(),
+            ));
+        }
+        let current_id: String = row.get(23)?;
+        let current_run: String = row.get(24)?;
+        validate_core_binding(&current_id, &current_run)?;
+        ids.push(current_id);
+        let rollback_id: Option<String> = row.get(25)?;
+        let rollback_run: Option<String> = row.get(26)?;
+        if rollback.is_some() != rollback_id.is_some()
+            || rollback_id.is_some() != rollback_run.is_some()
+        {
+            return Err(StorageError::Other(
+                "Retrieval rollback core binding is incomplete".into(),
+            ));
+        }
+        if let (Some(id), Some(run)) = (rollback_id, rollback_run) {
+            validate_core_binding(&id, &run)?;
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_core_binding(generation_id: &str, run_id: &str) -> Result<(), StorageError> {
+    crate::core_generation::validate_generation_id(generation_id)?;
+    if run_id.trim().is_empty() || run_id.len() > 128 {
+        return Err(StorageError::Other(
+            "Retrieval core binding has an invalid run identity".into(),
+        ));
+    }
+    Ok(())
+}
+
 const RETRIEVAL_PUBLICATION_SCHEMA_VERSION: u32 = 1;
 const CREATE_RETRIEVAL_PUBLICATION_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
