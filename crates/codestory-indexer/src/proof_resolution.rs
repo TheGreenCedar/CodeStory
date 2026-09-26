@@ -17632,15 +17632,14 @@ impl JavaKotlinProjectionIndex {
                 return JavaKotlinImportResolution::Ambiguous;
             }
         }
-        if let Some(owner) = owner_name {
-            if language == "java"
+        if let Some(owner) = owner_name
+            && (language == "java"
                 && self
                     .java_overrides
                     .refuses(package_name, owner, imported_name)
-                || language == "kotlin" && !domain.kotlin_runtime_closed_types.contains(owner)
-            {
-                return JavaKotlinImportResolution::Unsupported;
-            }
+                || language == "kotlin" && !domain.kotlin_runtime_closed_types.contains(owner))
+        {
+            return JavaKotlinImportResolution::Unsupported;
         }
         let resolution = Self::resolve_domain(domain, owner_name, imported_name);
         let (Some(owner_name), JavaKotlinImportResolution::Exact { owner, .. }) =
