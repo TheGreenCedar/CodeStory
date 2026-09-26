@@ -9012,6 +9012,25 @@ fn schema31_rollback_snapshot_includes_committed_wal_rows() -> Result<(), Storag
             .is_some_and(|sidecars| sidecars.iter().any(|sidecar| sidecar["suffix"] == "-wal")),
         "the retirement receipt must capture the live WAL identity"
     );
+    let main_before = fs::read(&live).expect("read in-use legacy database");
+    let wal_before = fs::read(&wal).expect("read in-use WAL");
+    let mut deletion_attempts = Vec::new();
+    let deferred =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |_, name, _| {
+            deletion_attempts.push(name.to_owned());
+            Err(StorageError::Other("in-use legacy database".into()))
+        })?;
+    assert!(deferred.pending);
+    assert_eq!(
+        deletion_attempts,
+        ["codestory.db"],
+        "in-use database refusal must precede sidecar deletion"
+    );
+    assert_eq!(
+        fs::read(&live).expect("preserved in-use database"),
+        main_before
+    );
+    assert_eq!(fs::read(&wal).expect("preserved in-use WAL"), wal_before);
     drop(writer);
     let retirement =
         super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {

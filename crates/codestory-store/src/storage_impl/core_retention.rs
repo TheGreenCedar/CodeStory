@@ -422,20 +422,9 @@ pub fn apply_legacy_retirement(
     if !report.errors.is_empty() {
         return defer_legacy_retirement(&layout, &mut receipt, report);
     }
-    for (sidecar_name, file) in &owned {
-        match remove_owned_file(parent, sidecar_name, file) {
-            Ok(true) => {}
-            Ok(false) => report.errors.push(format!(
-                "Legacy sidecar {sidecar_name} changed before deletion"
-            )),
-            Err(error) => report.errors.push(format!(
-                "Legacy sidecar {sidecar_name} deletion deferred: {error}"
-            )),
-        }
-    }
-    if !report.errors.is_empty() {
-        return defer_legacy_retirement(&layout, &mut receipt, report);
-    }
+    // Refuse an in-use database before touching its WAL or shared-memory
+    // sidecars. Windows deletion sharing can reject the main file while its
+    // SQLite client still needs those sidecars.
     if let Some(file) = source {
         report.legacy_bytes = file
             .metadata()
@@ -449,6 +438,20 @@ pub fn apply_legacy_retirement(
             Err(error) => report
                 .errors
                 .push(format!("Legacy database deletion deferred: {error}")),
+        }
+    }
+    if !report.errors.is_empty() {
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    for (sidecar_name, file) in &owned {
+        match remove_owned_file(parent, sidecar_name, file) {
+            Ok(true) => {}
+            Ok(false) => report.errors.push(format!(
+                "Legacy sidecar {sidecar_name} changed before deletion"
+            )),
+            Err(error) => report.errors.push(format!(
+                "Legacy sidecar {sidecar_name} deletion deferred: {error}"
+            )),
         }
     }
     if !report.errors.is_empty() {
