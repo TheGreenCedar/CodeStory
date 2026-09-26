@@ -247,7 +247,7 @@ fn ruby_php_resolution_work() -> usize {
 
 const ADAPTER_VERSION: &str = "reference-v15";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
-const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
+const PYTHON_ADAPTER_VERSION: &str = "reference-v18";
 const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";
@@ -8398,6 +8398,10 @@ impl<'tree> PythonResolutionIndex<'tree> {
             writes_by_function: HashMap::new(),
         };
 
+        // Constructor inference shares the module namespace with functions. Collect
+        // declarations before receiver assignments so source order cannot hide a
+        // collision; this closed adapter refuses collisions rather than executing
+        // Python's module binding timeline.
         walk_nodes(root, &mut |node| {
             count_python_resolution_work(1);
             match node.kind() {
@@ -8407,6 +8411,22 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 "class_definition" => {
                     result.collect_class(node, root, source, &class_nodes, &callable_nodes);
                 }
+                _ => {}
+            }
+        });
+        let callable_names = result
+            .declarations
+            .iter()
+            .map(|declaration| declaration.name.clone())
+            .collect::<HashSet<_>>();
+        for name in result.classes_by_name.keys() {
+            if callable_names.contains(name) {
+                *result.module_blockers.entry(name.clone()).or_default() += 1;
+            }
+        }
+        walk_nodes(root, &mut |node| {
+            count_python_resolution_work(1);
+            match node.kind() {
                 "import_from_statement" => {
                     result.collect_import(node, root, source, &import_nodes);
                     if python_enclosing_function(node).is_some() {
@@ -8445,6 +8465,11 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 _ => {}
             }
         });
+        for name in result.imports.keys() {
+            if callable_names.contains(name) || result.classes_by_name.contains_key(name) {
+                *result.module_blockers.entry(name.clone()).or_default() += 1;
+            }
+        }
         result.collect_module_class_member_mutations(root, source);
         for (function, global_names) in &result.global_names_by_function {
             if let Some(writes) = result.writes_by_function.get(function) {
@@ -8492,10 +8517,11 @@ impl<'tree> PythonResolutionIndex<'tree> {
         let mut names = self.module_blockers.keys().cloned().collect::<HashSet<_>>();
         names.extend(self.imports.keys().cloned());
         for class in &self.classes {
-            if self
-                .method_blockers_by_owner_and_name
-                .iter()
-                .any(|(owner, _)| *owner == class.declaration)
+            if self.dynamic_class_owners.contains(&class.declaration)
+                || self
+                    .method_blockers_by_owner_and_name
+                    .iter()
+                    .any(|(owner, _)| *owner == class.declaration)
             {
                 names.insert(class.name.clone());
             }
@@ -8882,23 +8908,72 @@ impl<'tree> PythonResolutionIndex<'tree> {
     fn collect_module_class_member_mutations(&mut self, root: TsNode<'tree>, source: &str) {
         walk_nodes(root, &mut |node| {
             count_python_resolution_work(1);
+            if !python_module_execution(node, root) {
+                return;
+            }
+            if node.kind() == "call" {
+                if !python_direct_call_name(node, source)
+                    .is_some_and(|name| matches!(name, "setattr" | "delattr"))
+                {
+                    return;
+                }
+                let Some(arguments) = node.child_by_field_name("arguments") else {
+                    return;
+                };
+                let mut cursor = arguments.walk();
+                let values = arguments
+                    .named_children(&mut cursor)
+                    .filter(|value| value.kind() != "comment")
+                    .collect::<Vec<_>>();
+                let class_name = values
+                    .first()
+                    .copied()
+                    .map(python_unwrap_parenthesized)
+                    .filter(|receiver| receiver.kind() == "identifier")
+                    .and_then(|receiver| node_text(receiver, source));
+                let Some(classes) = class_name.and_then(|name| self.classes_by_name.get(name))
+                else {
+                    // A splat, alias, keyword or otherwise unresolved receiver
+                    // may refer to any class/module. Do not execute Python values
+                    // to recover authority from a direct mutator call.
+                    self.module_dynamic = true;
+                    self.dynamic_class_owners
+                        .extend(self.classes.iter().map(|class| class.declaration));
+                    return;
+                };
+                // Only a plain identifier string supplies a bounded member name.
+                // Computed/escaped/keyword forms poison the known owner as a whole.
+                let member = values
+                    .get(1)
+                    .and_then(|value| node_text(*value, source))
+                    .and_then(|text| {
+                        text.strip_prefix('\'')
+                            .and_then(|text| text.strip_suffix('\''))
+                            .or_else(|| {
+                                text.strip_prefix('"')
+                                    .and_then(|text| text.strip_suffix('"'))
+                            })
+                    })
+                    .filter(|name| python_identifier(name));
+                let owners = classes
+                    .iter()
+                    .map(|class| class.declaration)
+                    .collect::<Vec<_>>();
+                for owner in owners {
+                    if let Some(member) = member {
+                        self.poison_class_members(owner, [member.to_string()]);
+                    } else {
+                        self.dynamic_class_owners.insert(owner);
+                    }
+                }
+                return;
+            }
             if !matches!(
                 node.kind(),
                 "assignment" | "augmented_assignment" | "delete_statement"
             ) {
                 return;
             }
-            let direct_module = node.parent().is_some_and(|parent| parent.id() == root.id())
-                || node.parent().is_some_and(|parent| {
-                    parent.kind() == "expression_statement"
-                        && parent
-                            .parent()
-                            .is_some_and(|grandparent| grandparent.id() == root.id())
-                });
-            if !direct_module {
-                return;
-            }
-
             let mut targets = Vec::new();
             if node.kind() == "delete_statement" {
                 let mut cursor = node.walk();
@@ -8906,12 +8981,13 @@ impl<'tree> PythonResolutionIndex<'tree> {
             } else if let Some(left) = node.child_by_field_name("left") {
                 targets.push(left);
             }
-            for target in targets {
+            for target in targets.into_iter().map(python_unwrap_parenthesized) {
                 if target.kind() != "attribute" {
                     continue;
                 }
                 let Some(class_name) = target
                     .child_by_field_name("object")
+                    .map(python_unwrap_parenthesized)
                     .filter(|object| object.kind() == "identifier")
                     .and_then(|object| node_text(object, source))
                     .filter(|name| python_identifier(name))
@@ -8920,23 +8996,21 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 };
                 let Some(member) = target
                     .child_by_field_name("attribute")
-                    .filter(|attribute| attribute.kind() == "identifier")
                     .and_then(|attribute| node_text(attribute, source))
                     .filter(|name| python_identifier(name))
                 else {
                     continue;
                 };
-                let owner = match self
+                let owners = self
                     .classes_by_name
                     .get(class_name)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                {
-                    [class] => class.declaration,
-                    _ => continue,
-                };
-                self.method_blockers_by_owner_and_name
-                    .insert((owner, member.to_string()));
+                    .into_iter()
+                    .flatten()
+                    .map(|class| class.declaration)
+                    .collect::<Vec<_>>();
+                for owner in owners {
+                    self.poison_class_members(owner, [member.to_string()]);
+                }
             }
         });
     }
@@ -9188,6 +9262,8 @@ impl<'tree> PythonResolutionIndex<'tree> {
                             },
                         ],
                     ) if *at < call.start_byte()
+                        && !self.module_blockers.contains_key(type_name)
+                        && !self.module_dynamic
                         && !self
                             .bindings
                             .get(&function.id())
@@ -9281,6 +9357,26 @@ fn python_single_simple_base(class: TsNode<'_>, source: &str) -> bool {
         .and_then(|surface| surface.strip_prefix('('))
         .and_then(|surface| surface.strip_suffix(')'))
         .is_some_and(|surface| surface.trim() == base_name)
+}
+
+// Module control-flow and class suites execute eagerly, as do definition
+// defaults/decorators. Only a function/lambda body defers execution; keep walking
+// past eager definition expressions to detect a deferred outer body.
+fn python_module_execution(mut node: TsNode<'_>, root: TsNode<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.id() == root.id() {
+            return true;
+        }
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.id() == node.id())
+        {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn python_direct_enclosing_class(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
