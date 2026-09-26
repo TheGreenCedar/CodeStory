@@ -2509,11 +2509,12 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
-        incremental_refresh.contains("SnapshotStore::clone_live_to_staged(storage_path)")
+        incremental_refresh
+            .contains("SnapshotStore::clone_live_to_staged_with_cancel(storage_path, &cancelled)")
             && incremental_refresh.contains(".snapshots()\n            .finalize_staged()")
             && incremental_refresh.contains(".snapshots()\n            .refresh_detail()")
             && commit.contains(".publish_receipted_with_stats(&self.storage_path, &cancelled)"),
-        "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
+        "incremental refresh should stage with cancellation, finalize both snapshot tiers, and publish through the store snapshot surface"
     );
     for forbidden in [
         "create_deferred_secondary_indexes()",
