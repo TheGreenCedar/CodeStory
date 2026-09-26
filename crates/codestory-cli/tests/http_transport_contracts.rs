@@ -448,16 +448,17 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     write!(slow, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("slow peer preamble");
     slow.flush().expect("flush slow peer preamble");
 
-    // Never send the blank line that ends the headers, and keep the connection
-    // demonstrably live with a byte well inside the 2s read window.
+    // Never send the blank line that ends the headers. Keep sending through
+    // the five-second request deadline and the response drain, so a drain
+    // timeout that restarts after each byte would hold the serial server.
     let dribbler = {
         let mut slow = slow.try_clone().expect("clone slow peer");
         thread::spawn(move || {
-            for _ in 0..30 {
+            for _ in 0..400 {
                 if write!(slow, "X").is_err() || slow.flush().is_err() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(20));
             }
         })
     };
@@ -494,7 +495,7 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
         "the 408 must carry its typed code: {body}"
     );
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(7),
         "the whole-request deadline should end the peer promptly, took {elapsed:?}"
     );
 
@@ -503,6 +504,10 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     let health = http_get(&addr, "/health").expect("health after the slow peer");
     assert_eq!(health.status, 200, "{}", health.body);
     assert_eq!(health.body["ok"], true, "{}", health.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "continued sending must not extend the serial server's drain"
+    );
     let _ = dribbler.join();
 }
 
