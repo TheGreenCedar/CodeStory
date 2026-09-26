@@ -346,12 +346,24 @@ impl AppController {
             .cloned()
             .unwrap_or_else(|| node_display_name(&node));
 
-        let mut file_path = Self::file_path_for_node(storage, &node).ok().flatten();
+        let mut file_path = if node.kind == codestory_contracts::graph::NodeKind::FILE {
+            // FILE nodes have no parent file_node_id. Resolve their location by
+            // the same pinned file identity used by the core publication.
+            storage
+                .get_file_by_id(id.0)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load indexed file identity: {error}"))
+                })?
+                .map(|file| file.path.to_string_lossy().into_owned())
+        } else {
+            Self::file_path_for_node(storage, &node).ok().flatten()
+        };
         let mut line = node.start_line;
         if let Ok(occs) = storage.get_occurrences_for_node(id)
             && let Some(occ) = preferred_occurrence(&occs)
         {
             if file_path.is_none()
+                && node.kind != codestory_contracts::graph::NodeKind::FILE
                 && let Ok(Some(file_node)) = storage.get_node(occ.location.file_node_id)
             {
                 file_path = Some(file_node.serialized_name);
