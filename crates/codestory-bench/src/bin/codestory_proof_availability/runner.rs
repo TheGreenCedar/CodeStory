@@ -537,8 +537,8 @@ mod tests {
         ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
         UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
     };
-    use std::fs;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn qualification_runner_has_no_retrieval_or_indexing_execution_path() {
