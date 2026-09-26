@@ -1004,9 +1004,10 @@ mod tests {
         write(&source, "generation-a");
         let pinned_modified = 1_700_000_000_000_000_000;
         set_modified(&source, pinned_modified);
-        let mut permissions = std::fs::metadata(&source)
+        let original_permissions = std::fs::metadata(&source)
             .expect("source metadata")
             .permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         std::fs::set_permissions(&source, permissions.clone()).expect("make source immutable");
         let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
@@ -1021,11 +1022,9 @@ mod tests {
             .expect("capture original receipt");
         std::fs::hard_link(&source, &destination).expect("create owned link");
 
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&source, permissions.clone()).expect("allow hostile rewrite");
+        std::fs::set_permissions(&source, original_permissions).expect("allow hostile rewrite");
         write(&source, "generation-X");
         set_modified(&source, pinned_modified);
-        permissions.set_readonly(true);
         std::fs::set_permissions(&source, permissions).expect("restore immutable bit");
 
         assert!(

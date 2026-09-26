@@ -3500,7 +3500,7 @@ mod tests {
             path: build.clone(),
             permissions: fs::metadata(&build)?.permissions(),
         };
-        fs::set_permissions(&build, fs::Permissions::from_mode(0))?;
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o0))?;
         assert_eq!(
             fs::metadata(&tracked).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
