@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.
+
 - JavaScript and TypeScript call proof refuses explicit prototype mutations,
   including mutations declared in an imported class’s defining module. Calls
   also retain their actual caller when several functions share a source line.

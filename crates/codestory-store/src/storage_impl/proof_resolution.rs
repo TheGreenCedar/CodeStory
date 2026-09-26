@@ -441,7 +441,7 @@ struct ProofResolutionValidationContext {
     file_by_id: HashMap<i64, FileInfo>,
     file_content_hash_by_id: HashMap<i64, String>,
     rust_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
-    rust_root_count_by_directory: HashMap<PathBuf, usize>,
+    rust_root_file_ids: HashSet<FileId>,
     node_by_id: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     edge_index_by_id: HashMap<EdgeId, usize>,
@@ -640,9 +640,9 @@ fn ruby_php_dependency_ids(
 
 fn prepare_rust_file_identity(
     file_by_id: &HashMap<i64, FileInfo>,
-) -> (HashMap<PathBuf, Vec<FileId>>, HashMap<PathBuf, usize>) {
+) -> (HashMap<PathBuf, Vec<FileId>>, HashSet<FileId>) {
     let mut file_ids_by_path = HashMap::<PathBuf, Vec<FileId>>::new();
-    let mut root_count_by_directory = HashMap::<PathBuf, usize>::new();
+    let mut root_file_ids = HashSet::new();
     for file in file_by_id.values().filter(|file| file.language == "rust") {
         count_store_replay_work(1);
         file_ids_by_path
@@ -652,16 +652,16 @@ fn prepare_rust_file_identity(
         if matches!(
             file.path.file_name().and_then(|name| name.to_str()),
             Some("lib.rs" | "main.rs")
-        ) && let Some(directory) = file.path.parent()
-        {
-            *root_count_by_directory
-                .entry(directory.to_path_buf())
-                .or_default() += 1;
+        ) {
+            root_file_ids.insert(FileId(file.id));
         }
     }
-    (file_ids_by_path, root_count_by_directory)
+    (file_ids_by_path, root_file_ids)
 }
 
+// Extra Rust same-file dependency hashes are conservative ancestor coverage.
+// They do not prove module ownership; the required graph evidence is validated
+// separately. Sibling library/binary roots are distinct indexed files.
 fn rust_dependency_path_is_ancestor(
     source: &FileInfo,
     dependency: &FileInfo,
@@ -685,7 +685,7 @@ fn rust_dependency_path_is_ancestor(
     };
     let (module_base, conflicting_form) = match file_name {
         "lib.rs" | "main.rs" => {
-            if context.rust_root_count_by_directory.get(directory).copied() != Some(1) {
+            if !context.rust_root_file_ids.contains(&FileId(dependency.id)) {
                 return false;
             }
             (directory.to_path_buf(), None)
@@ -1974,7 +1974,7 @@ mod go_replay_complexity_tests {
             file_by_id,
             file_content_hash_by_id,
             rust_file_ids_by_path: HashMap::new(),
-            rust_root_count_by_directory: HashMap::new(),
+            rust_root_file_ids: HashSet::new(),
             node_by_id: HashMap::new(),
             edges: Vec::new(),
             edge_index_by_id: HashMap::new(),
@@ -2153,7 +2153,7 @@ mod python_replay_complexity_tests {
             file_content_hash_by_id,
             file_by_id,
             rust_file_ids_by_path: HashMap::new(),
-            rust_root_count_by_directory: HashMap::new(),
+            rust_root_file_ids: HashSet::new(),
             node_by_id: HashMap::new(),
             edges: Vec::new(),
             edge_index_by_id: HashMap::new(),
@@ -2283,7 +2283,7 @@ mod ruby_php_replay_complexity_tests {
             file_by_id,
             file_content_hash_by_id: HashMap::new(),
             rust_file_ids_by_path: HashMap::new(),
-            rust_root_count_by_directory: HashMap::new(),
+            rust_root_file_ids: HashSet::new(),
             node_by_id,
             edges: Vec::new(),
             edge_index_by_id: HashMap::new(),
@@ -2466,8 +2466,7 @@ impl ProofResolutionValidationContext {
     fn prepare(storage: &Storage, mode: ProofValidationMode) -> Result<Self, StorageError> {
         let files = storage.get_files()?;
         let file_by_id = files.iter().cloned().map(|file| (file.id, file)).collect();
-        let (rust_file_ids_by_path, rust_root_count_by_directory) =
-            prepare_rust_file_identity(&file_by_id);
+        let (rust_file_ids_by_path, rust_root_file_ids) = prepare_rust_file_identity(&file_by_id);
         let python_file_ids_by_path = prepare_python_file_ids_by_path(&file_by_id);
         let file_content_hash_by_id = storage.get_file_content_hashes()?;
         let python_attestation_error_by_file = prepare_python_source_attestation(
@@ -2712,7 +2711,7 @@ impl ProofResolutionValidationContext {
             file_by_id,
             file_content_hash_by_id,
             rust_file_ids_by_path,
-            rust_root_count_by_directory,
+            rust_root_file_ids,
             node_by_id,
             edges,
             edge_index_by_id,
