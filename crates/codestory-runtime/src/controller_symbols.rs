@@ -109,27 +109,45 @@ impl AppController {
         project_root: &Path,
         exact_path: &Path,
     ) -> Result<Vec<IndexedSymbolIdentityCandidate>, ApiError> {
-        let candidates = self.resolve_exact_indexed_symbol_identities(query)?;
-        let core_ids = candidates
-            .iter()
-            .filter_map(|candidate| candidate.node_id.0.parse::<i64>().ok())
-            .map(codestory_contracts::graph::NodeId)
-            .collect::<Vec<_>>();
-        let details = self
-            .open_storage_read_only()?
-            .get_node_file_identities_by_ids(
-                &core_ids,
-                INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1),
-            )
-            .map_err(|error| {
+        let query = query.trim();
+        let file = std::fs::File::open(exact_path).map_err(|error| {
+            ApiError::internal(format!("Failed to pin file-symbol path identity: {error}"))
+        })?;
+        let file_identity =
+            codestory_workspace::workspace_file_identity(&file).map_err(|error| {
                 ApiError::internal(format!(
-                    "Failed to resolve bounded file-scoped symbol identities: {error}"
+                    "Failed to observe file-symbol path identity: {error}"
                 ))
             })?;
-        let matching_ids = details
-            .into_iter()
-            .filter_map(|detail| {
-                let path = detail.file_path?;
+        let storage = self.open_storage_read_only()?;
+        // Public packet operations already hold a core read snapshot. Direct
+        // controller callers also need all identity pages to share one view.
+        let snapshot = if self.active_core_publication().is_none() {
+            Some(storage.read_snapshot().map_err(|error| {
+                ApiError::internal(format!("Failed to pin file-symbol identities: {error}"))
+            })?)
+        } else {
+            None
+        };
+        let mut after_node_id = None;
+        let mut candidates = Vec::new();
+        let local_limit = INTERIM_MAX_ADMITTED_CANDIDATES.saturating_add(1);
+        loop {
+            let page = storage
+                .get_exact_symbol_file_identities_after(query, after_node_id, 256)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve file-scoped symbol identities: {error}"
+                    ))
+                })?;
+            if page.is_empty() {
+                break;
+            }
+            after_node_id = page.last().map(|identity| identity.node_id);
+            for identity in page {
+                let Some(path) = identity.file_path else {
+                    continue;
+                };
                 let path = Path::new(&path);
                 let joined;
                 let candidate_path = if path.is_absolute() {
@@ -138,14 +156,37 @@ impl AppController {
                     joined = project_root.join(path);
                     joined.as_path()
                 };
-                codestory_workspace::same_workspace_path(exact_path, candidate_path)
-                    .then_some(detail.node_id.0.to_string())
-            })
-            .collect::<HashSet<_>>();
-        Ok(candidates
-            .into_iter()
-            .filter(|candidate| matching_ids.contains(&candidate.node_id.0))
-            .collect())
+                if codestory_workspace::workspace_path_identity(candidate_path)
+                    .is_ok_and(|identity| identity == file_identity)
+                {
+                    candidates.push(IndexedSymbolIdentityCandidate {
+                        node_id: NodeId::from(identity.node_id),
+                        display_name: query.to_string(),
+                    });
+                }
+            }
+            // Preserve deterministic API-ID ordering with bounded retained
+            // memory. Neither the fuzzy 200-result window nor the global
+            // admission window can hide a match in the selected file.
+            candidates.sort_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+            candidates.truncate(local_limit);
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.finish().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to finish file-symbol identity read: {error}"
+                ))
+            })?;
+        }
+        if !codestory_workspace::workspace_path_identity(exact_path)
+            .is_ok_and(|identity| identity == file_identity)
+        {
+            return Err(ApiError::new(
+                "file_identity_changed",
+                "file-symbol path changed during identity resolution",
+            ));
+        }
+        Ok(candidates)
     }
 
     pub(crate) fn cached_labels<I>(
