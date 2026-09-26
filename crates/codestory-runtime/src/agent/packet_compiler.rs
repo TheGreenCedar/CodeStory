@@ -917,6 +917,399 @@ mod tests {
     use codestory_store::FileRole;
 
     #[test]
+    fn frozen_public_packet_keeps_only_admitted_sources_and_induced_relations() {
+        use crate::agent::packet_candidate::PacketAdmissionDecision;
+        use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+        use serde_json::json;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let project = tempfile::tempdir().expect("isolated source project");
+        let cache = tempfile::tempdir().expect("isolated Store");
+        let database = cache.path().join("core.sqlite3");
+        let mut storage = Store::open(&database).expect("real file-backed Store");
+        // Source bodies and bounds are stored independently of admission. The
+        // unrelated rows must remain present throughout the test.
+        let files = [
+            (10, "src/alpha.rs", "fn alpha() {}\n"),
+            (20, "src/beta.rs", "fn beta() {}\n"),
+            (30, "src/gamma.rs", "fn gamma() {}\n"),
+            (40, "src/reference.rs", "const REFERENCE: usize = 1;\n"),
+            (90, "noise/outside.rs", "fn NOISE_OUTSIDE() {}\n"),
+            (190, "noise/unrelated.rs", "fn NOISE_UNRELATED() {}\n"),
+        ];
+        for (id, relative, source) in files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("source directory");
+            std::fs::write(&path, source).expect("real source bytes");
+            let file = FileInfo {
+                id,
+                path,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).expect("file row");
+            storage
+                .update_file_metadata(
+                    &file,
+                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+                )
+                .expect("pinned source digest");
+            storage
+                .insert_nodes_batch(&[CoreNode {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: relative.into(),
+                    file_node_id: Some(CoreNodeId(id)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                }])
+                .expect("file node");
+        }
+        for (id, file_id, name) in [
+            (11, 10, "alpha"),
+            (21, 20, "beta"),
+            (31, 30, "gamma"),
+            (99, 90, "NOISE_OUTSIDE"),
+            (199, 190, "NOISE_UNRELATED"),
+        ] {
+            storage
+                .insert_nodes_batch(&[CoreNode {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: name.into(),
+                    file_node_id: Some(CoreNodeId(file_id)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                }])
+                .expect("stored symbol");
+        }
+        let kinds = [
+            (CoreEdgeKind::MEMBER, PacketRelationKindV1::Member),
+            (CoreEdgeKind::TYPE_USAGE, PacketRelationKindV1::TypeUsage),
+            (CoreEdgeKind::USAGE, PacketRelationKindV1::Usage),
+            (CoreEdgeKind::CALL, PacketRelationKindV1::Call),
+            (CoreEdgeKind::INHERITANCE, PacketRelationKindV1::Inheritance),
+            (CoreEdgeKind::OVERRIDE, PacketRelationKindV1::Override),
+            (
+                CoreEdgeKind::TYPE_ARGUMENT,
+                PacketRelationKindV1::TypeArgument,
+            ),
+            (
+                CoreEdgeKind::TEMPLATE_SPECIALIZATION,
+                PacketRelationKindV1::TemplateSpecialization,
+            ),
+            (CoreEdgeKind::INCLUDE, PacketRelationKindV1::Include),
+            (CoreEdgeKind::IMPORT, PacketRelationKindV1::Import),
+            (CoreEdgeKind::MACRO_USAGE, PacketRelationKindV1::MacroUsage),
+            (
+                CoreEdgeKind::ANNOTATION_USAGE,
+                PacketRelationKindV1::AnnotationUsage,
+            ),
+            (CoreEdgeKind::UNKNOWN, PacketRelationKindV1::Unknown),
+        ];
+        let mut expected_relations = Vec::new();
+        for (base, from, to) in [(100, 11, 21), (200, 21, 31)] {
+            for (offset, (kind, expected_kind)) in kinds.into_iter().enumerate() {
+                let id = base + offset as i64;
+                for representative in [id, id + 1_000] {
+                    storage
+                        .insert_edge(&CoreEdge {
+                            id: CoreEdgeId(representative),
+                            source: CoreNodeId(from),
+                            target: CoreNodeId(to),
+                            kind,
+                            certainty: Some(ResolutionCertainty::Certain),
+                            ..Default::default()
+                        })
+                        .expect("certain kind/pair and duplicate");
+                }
+                expected_relations.push((
+                    id.to_string(),
+                    format!("node:{from}"),
+                    format!("node:{to}"),
+                    expected_kind,
+                ));
+            }
+        }
+        // Both directions of a one-admitted-endpoint edge, a wholly unrelated
+        // pair, and an earlier probable duplicate cannot become induced evidence.
+        for (id, from, to, certainty) in [
+            (1, 11, 99, ResolutionCertainty::Certain),
+            (2, 199, 21, ResolutionCertainty::Certain),
+            (3, 99, 199, ResolutionCertainty::Certain),
+            (4, 11, 21, ResolutionCertainty::Probable),
+        ] {
+            storage
+                .insert_edge(&CoreEdge {
+                    id: CoreEdgeId(id),
+                    source: CoreNodeId(from),
+                    target: CoreNodeId(to),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(certainty),
+                    ..Default::default()
+                })
+                .expect("hostile stored edge");
+        }
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "h7-core-generation".into(),
+            run_id: "h7-core-run".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        storage
+            .put_index_publication(&publication)
+            .expect("complete fixture publication");
+        assert_eq!(storage.get_nodes().unwrap().len(), 11);
+        assert_eq!(storage.get_edges().unwrap().len(), 56);
+        drop(storage);
+
+        let controller = AppController::new();
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(database);
+        }
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let session = PacketProofSession::new();
+        let admitted = ["node:11", "node:21", "node:31", "path:src/reference.rs"];
+        for identity in admitted {
+            assert_eq!(
+                session.admit(identity, INTERIM_SOURCE_ROW_UPPER_BOUND),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(json!({"question":"stored evidence fixture"})).unwrap();
+        let trace = json!({"request_id":"h7-request", "resolved_profile":"investigate",
+            "policy_mode":"latency_first", "total_latency_ms":0, "sla_missed":false,
+            "semantic_fallback_count":0, "semantic_fallbacks":[], "semantic_stage_timeout_zero_hits":0,
+            "semantic_abstained_count":0, "annotations":[], "steps":[], "packet_sidecar_diagnostics":[]});
+        // Only the input packet envelope is a fixture. Evidence comes from the
+        // real runtime hydration/compiler and real v3 projection below.
+        let mut packet: AgentPacketDto = serde_json::from_value(json!({
+            "packet_id":"h7-request", "question":request.question, "plan":{"queries":[],"trace":[]},
+            "answer":{"answer_id":"h7-answer", "prompt":request.question, "summary":"fixture",
+                "sections":[], "citations":[], "subgraph_ids":[], "retrieval_version":"fixture",
+                "graphs":[], "retrieval_trace":trace}, "support":[],
+            "disposition":{"kind":"not_established"},
+            "budget":{"requested":"standard", "limits":{"max_anchors":16,"max_files":16,
+                "max_snippets":16,"max_trail_edges":16,"max_output_bytes":65536},
+                "used":{"anchors":0,"files":0,"snippets":0,"trail_edges":0,"output_bytes":0},
+                "truncated":false, "next_deeper_command":null},
+            "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,"search_steps":0,"trail_steps":0}
+        })).expect("typed internal packet envelope");
+        let projected = service
+            .run_observational_with_cancel(
+                "h7-packet-compilation",
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    assert_eq!(controller.active_core_publication().unwrap(), publication);
+                    let pinned = controller.open_storage_read_only()?;
+                    let mut gaps = Vec::new();
+                    let (authenticated, sources, _) = hydrate_admitted_sources(
+                        &controller,
+                        &pinned,
+                        &session.receipts(),
+                        &mut gaps,
+                    )?;
+                    assert!(gaps.is_empty());
+                    assert_eq!(
+                        authenticated
+                            .iter()
+                            .map(|item| item.receipt.stable_identity.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(admitted)
+                    );
+                    assert_eq!(
+                        sources
+                            .iter()
+                            .map(|source| source.stable_identity.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(admitted)
+                    );
+                    let induced = hydrate_induced_relations(&pinned, &authenticated)?;
+                    assert!(
+                        induced
+                            .iter()
+                            .all(|edge| edge.certainty == PacketRelationCertaintyV1::Certain)
+                    );
+                    let mut observed = induced
+                        .iter()
+                        .map(|edge| {
+                            (
+                                edge.relation_id.clone(),
+                                edge.from_identity.clone(),
+                                edge.to_identity.clone(),
+                                edge.relation_kind,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    observed.sort();
+                    expected_relations.sort();
+                    assert_eq!(observed, expected_relations);
+                    assert_eq!(
+                        induced.len(),
+                        26,
+                        "all kinds for both admitted directed pairs before forest selection"
+                    );
+                    let frozen =
+                        freeze_packet_compilation(&controller, "h7-project", &[], None, &session)?;
+                    assert_eq!(
+                        frozen
+                            .source_coverage
+                            .iter()
+                            .map(|row| row.path.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            "src/alpha.rs",
+                            "src/beta.rs",
+                            "src/gamma.rs",
+                            "src/reference.rs"
+                        ])
+                    );
+                    packet.answer.source_coverage = frozen.source_coverage.clone();
+                    apply_frozen_packet_compilation(&mut packet, Some(&request), frozen);
+                    assert_eq!(
+                        packet.support.len(),
+                        6,
+                        "four real source rows and two forest relations fit caps"
+                    );
+                    assert_eq!(
+                        final_support_identities_for_observation(&packet.support)
+                            .into_iter()
+                            .collect::<BTreeSet<_>>(),
+                        admitted.into_iter().map(str::to_owned).collect()
+                    );
+                    let source_units = packet
+                        .support
+                        .iter()
+                        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        source_units
+                            .iter()
+                            .map(|unit| (unit.symbol_id.as_deref(), unit.path.as_deref()))
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            (Some("11"), Some("src/alpha.rs")),
+                            (Some("21"), Some("src/beta.rs")),
+                            (Some("31"), Some("src/gamma.rs")),
+                            (None, Some("src/reference.rs"))
+                        ])
+                    );
+                    assert!(
+                        source_units
+                            .iter()
+                            .all(|unit| unit.start_line == Some(1) && unit.end_line == Some(1))
+                    );
+                    for (path, body) in [
+                        ("src/alpha.rs", "fn alpha() {}"),
+                        ("src/beta.rs", "fn beta() {}"),
+                        ("src/gamma.rs", "fn gamma() {}"),
+                        ("src/reference.rs", "const REFERENCE: usize = 1;"),
+                    ] {
+                        let source = source_units
+                            .iter()
+                            .find(|unit| unit.path.as_deref() == Some(path))
+                            .expect("expected admitted source row");
+                        assert!(
+                            source
+                                .snippet
+                                .as_ref()
+                                .is_some_and(|text| text.contains(body)),
+                            "source body must match its admitted path: {path}"
+                        );
+                    }
+                    assert_eq!(
+                        packet
+                            .support
+                            .iter()
+                            .filter(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
+                            .map(|unit| (
+                                unit.id.as_str(),
+                                unit.from_symbol.as_deref(),
+                                unit.to_symbol.as_deref(),
+                                unit.edge_kind.as_deref()
+                            ))
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            ("edge:100", Some("11"), Some("21"), Some("member")),
+                            ("edge:200", Some("21"), Some("31"), Some("member"))
+                        ])
+                    );
+                    crate::evidence_projection_v3::project_packet_v3(
+                        &service,
+                        "h7-caller",
+                        &request,
+                        &packet,
+                        |projection| {
+                            serde_json::to_vec(projection)
+                                .map(|bytes| bytes.len())
+                                .map_err(|_| ())
+                        },
+                    )
+                },
+            )
+            .expect("normal pinned freeze-to-public projection")
+            .value;
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = &projected.projection else {
+            panic!("small admitted fixture must not exceed public output budget")
+        };
+        assert_eq!(evidence.as_slice().len(), 6);
+        assert!(!gaps.as_slice().iter().any(|gap| gap.kind
+            == codestory_contracts::packet_projection_v3::GapKindV3Dto::OutputBudgetExceeded));
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
+                .map(|row| (
+                    row.symbol_id.as_ref().map(|id| id.as_str()),
+                    row.path.as_ref().map(|path| path.as_str())
+                ))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (Some("11"), Some("src/alpha.rs")),
+                (Some("21"), Some("src/beta.rs")),
+                (Some("31"), Some("src/gamma.rs")),
+                (None, Some("src/reference.rs"))
+            ])
+        );
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
+                .map(|row| row.summary.as_ref().unwrap().as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["11 -[member]-> 21", "21 -[member]-> 31"])
+        );
+        let public_json =
+            serde_json::to_string(&projected.projection).expect("actual public serialization");
+        for noise in ["NOISE_", "noise/"] {
+            assert!(
+                !public_json.contains(noise),
+                "unadmitted stored evidence leaked: {noise}"
+            );
+        }
+        let retained = controller.open_storage_read_only().unwrap();
+        assert!(retained.get_node(CoreNodeId(99)).unwrap().is_some());
+        assert_eq!(
+            retained.get_edges().unwrap().len(),
+            56,
+            "exclusion is not deletion of stored noise"
+        );
+    }
+
+    #[test]
     fn whole_file_renderer_has_no_fifty_line_focus_limit() {
         let source = "\n".repeat(80);
         let rendered = complete_file_markdown(&source, 80, 1024)
