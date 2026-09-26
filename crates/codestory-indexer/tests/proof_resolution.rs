@@ -986,6 +986,165 @@ fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> 
 }
 
 #[test]
+fn f4_verifier_relative_nested_java_ancestor() -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact(
+        &[(
+            "p/Outer.java",
+            concat!(
+                "package p;\n",
+                "class Outer {\n",
+                "  static class Worker {\n",
+                "    public void target() {}\n",
+                "  }\n",
+                "  static class Caller {\n",
+                "    void caller(Worker value) {\n",
+                "      value.target();\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+                "class Child extends Outer.Worker {\n",
+                "  public void target() {}\n",
+                "}\n",
+            ),
+        )],
+        "java",
+        "p/Outer.java",
+        8,
+    )
+}
+
+#[test]
+fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Result<()> {
+    // Nested Exact authority remains unsupported, even without an override.
+    // Each geometry still requires the actual canonical CALL and matching fact.
+    for parent in [
+        "",
+        "class Child extends Outer.Worker { public void target() {} }",
+        "class Child extends p.Outer.Worker { public void target() {} }",
+    ] {
+        let outer = format!(
+            "package p;\nclass Outer {{\n  static class Worker {{\n    public void target() {{}}\n  }}\n  static class Caller {{\n    void caller(Worker value) {{\n      value.target();\n    }}\n  }}\n}}\n{parent}\n"
+        );
+        assert_nominal_call_is_nonexact(&[("p/Outer.java", &outer)], "java", "p/Outer.java", 8)?;
+    }
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Outer.java",
+                "package p;\nclass Outer {\n  static class Worker { public void target() {} }\n  static class Caller {\n    void caller(Worker value) {\n      value.target();\n    }\n  }\n}\n",
+            ),
+            (
+                "p/Child.java",
+                "package p;\nclass Child extends Outer.Worker { public void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Outer.java",
+        6,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[(
+            "Outer.java",
+            "class Outer {\n  static class Worker { public void target() {} }\n  static class Child extends Worker { public void target() {} }\n  static class Caller {\n    void caller(Worker value) {\n      value.target();\n    }\n  }\n}\n",
+        )],
+        "java",
+        "Outer.java",
+        6,
+    )?;
+
+    // A nested Worker must not be inventoried as the unrelated p.Worker.
+    // Its lexically bare parent binds Outer.Worker, not the top-level name.
+    for ancestor in ["Worker", "Outer.Worker", "p.Outer.Worker", "Worker<String>"] {
+        let nested = if ancestor == "Worker<String>" {
+            format!(
+                "package p;\nclass Outer {{\n  static class Worker<T> {{ public void target() {{}} }}\n  static class Child extends {ancestor} {{ public void target() {{}} }}\n}}\n"
+            )
+        } else {
+            format!(
+                "package p;\nclass Outer {{\n  static class Worker {{ public void target() {{}} }}\n  static class Child extends {ancestor} {{ public void target() {{}} }}\n}}\n"
+            )
+        };
+        assert_nominal_call_is_exact(
+            &[
+                (
+                    "p/Worker.java",
+                    "package p;\nclass Worker {\n  public void target() {}\n}\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+                ),
+                ("p/Outer.java", &nested),
+            ],
+            "java",
+            "p/Worker.java",
+            3,
+            2,
+        )?;
+    }
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "p/Outer.java",
+                "package p;\npublic class Outer { public static class Worker { public void target() {} } }\n",
+            ),
+            (
+                "q/Child.java",
+                "package q;\nimport p.Outer;\nclass Child extends Outer.Worker { public void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Worker.java",
+        3,
+        2,
+    )?;
+    // A nested subclass of a genuine top-level ancestor still poisons that
+    // ancestor's instance route; imported and fully qualified forms agree.
+    for (path, source) in [
+        (
+            "p/Outer.java",
+            "package p;\nclass Outer { static class Child extends p.Worker { public void target() {} } }\n",
+        ),
+        (
+            "q/Outer.java",
+            "package q;\nimport p.Worker;\nclass Outer { static class Child extends Worker { public void target() {} } }\n",
+        ),
+        (
+            "q/Outer.java",
+            "package q;\nimport p.Worker;\nclass Outer { static class Child extends Worker<String> { public void target() {} } }\n",
+        ),
+    ] {
+        let worker = if source.contains("Worker<String>") {
+            "package p;\npublic class Worker<T> { public void target() {} }\n"
+        } else {
+            "package p;\npublic class Worker { public void target() {} }\n"
+        };
+        assert_nominal_call_is_nonexact(
+            &[
+                ("p/Worker.java", worker),
+                (path, source),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+                ),
+            ],
+            "java",
+            "p/Caller.java",
+            4,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn java_static_refusal_classification_uses_modifier_tokens() -> anyhow::Result<()> {
     for split in [false, true] {
         let files = if split {
@@ -12613,12 +12772,17 @@ fn stale_jvm_swift_owner_policy_inputs_refuse_then_reparse_and_reuse() -> anyhow
         let mut artifact = decode_index_artifact_json(&blob)?;
         // This is a simulated stale identity on a current parser payload, not a
         // claim that an old binary produced the payload.
-        artifact["resolution_file"]["adapter_version"] = "reference-v2".into();
+        let previous = if language == "java" {
+            "reference-v3"
+        } else {
+            "reference-v2"
+        };
+        artifact["resolution_file"]["adapter_version"] = previous.into();
         for call in artifact["call_resolution_inputs"]
             .as_array_mut()
             .expect("cached calls")
         {
-            call["adapter_version"] = "reference-v2".into();
+            call["adapter_version"] = previous.into();
         }
         store.get_connection().execute(
             "UPDATE index_artifact_cache SET artifact_blob = ?1",
@@ -12670,7 +12834,11 @@ fn stale_jvm_swift_owner_policy_inputs_refuse_then_reparse_and_reuse() -> anyhow
             )?;
             assert_eq!(
                 matching[0].provenance.language_adapter_version,
-                "reference-v3"
+                if language == "java" {
+                    "reference-v4"
+                } else {
+                    "reference-v3"
+                }
             );
         }
     }

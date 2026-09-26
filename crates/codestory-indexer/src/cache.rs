@@ -342,6 +342,17 @@ pub(crate) struct CachedClassDeclaration {
     /// They remain available when a declaration cannot bind uniquely to a node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_method_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_scope: Option<CachedJavaClassScope>,
+}
+
+/// Refusal-only Java type identity; it does not authorize nested Exact lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedJavaClassScope {
+    pub type_path: Vec<String>,
+    /// Ordered lexical/import/package candidates; equal-priority imports remain
+    /// one group so ambiguity cannot be resolved by iteration order.
+    pub superclass_candidates: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -971,13 +982,19 @@ mod tests {
         let legacy = br#"{"name":"Worker","declaration":41,"methods":[{"name":"target","declaration":42,"cross_module_visible":true}],"cross_module_visible":true,"runtime_closed":false,"super_name":null}"#;
         let mut class: CachedClassDeclaration = serde_json::from_slice(legacy)?;
         assert!(class.instance_method_names.is_empty());
+        assert!(class.java_scope.is_none());
         assert_eq!(
             serde_json::to_vec(&class)?,
             legacy,
             "unchanged language inventories must keep their prior serialized bytes and fingerprints"
         );
         class.instance_method_names.push("target".to_string());
+        class.java_scope = Some(CachedJavaClassScope {
+            type_path: vec!["Outer".to_string(), "Worker".to_string()],
+            superclass_candidates: vec![vec!["p.Base".to_string()]],
+        });
         let decoded: CachedClassDeclaration = serde_json::from_slice(&serde_json::to_vec(&class)?)?;
+        assert_eq!(decoded.java_scope, class.java_scope);
         assert_eq!(
             decoded, class,
             "nonempty Java refusal metadata must survive cache persistence"
