@@ -18,11 +18,6 @@ use crate::call_path_kernel::{
     ValidatedCallPathContract, ValidatedContractRendering, project_translation_unknown_result,
     validate_contract,
 };
-#[cfg(test)]
-use crate::call_path_kernel::{
-    ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathSpec,
-    UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
-};
 pub use crate::call_path_kernel::{
     UnvalidatedCallPathContract, ValidationOutcome, validate_compact_projection,
 };
@@ -352,10 +347,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::{
-        ClauseAnchor, ClauseClassification, InternalProjection, ProofContractField, ProofHashes,
-        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-        UnvalidatedExactSymbolSelector, ValidatedCallPathContract, ValidatedContractRendering,
-        ValidationOutcome, validate_contract,
+        InternalProjection, ProofHashes, UnvalidatedCallPathContract, ValidatedCallPathContract,
+        ValidatedContractRendering, ValidationOutcome, validate_contract,
+    };
+    use crate::call_path_kernel::{
+        ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
     };
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::graph::{Node, NodeKind};
