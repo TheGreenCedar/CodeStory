@@ -1487,13 +1487,7 @@ fn ensure_lexical_generation(
                 if let Some(work) = work {
                     record_finalize_component_work(
                         "lexical",
-                        if work.direct_reference {
-                            "reused"
-                        } else if work.copied {
-                            "copied"
-                        } else {
-                            "delta"
-                        },
+                        work.mode(),
                         Some(work.retained),
                         Some(work.inserted),
                         Some(work.removed),

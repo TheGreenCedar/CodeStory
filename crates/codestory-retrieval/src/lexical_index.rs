@@ -1015,6 +1015,18 @@ pub(crate) struct IncrementalLexicalWork {
     pub copied: bool,
 }
 
+impl IncrementalLexicalWork {
+    pub(crate) fn mode(&self) -> &'static str {
+        if self.copied {
+            "copied"
+        } else if self.direct_reference {
+            "reused"
+        } else {
+            "delta"
+        }
+    }
+}
+
 fn publish_lexical_state_for_generation(
     shard_dir: &Path,
     previous_state_path: Option<&Path>,
@@ -1534,17 +1546,18 @@ pub(crate) fn build_prepared_lexical_shard_with_cancel(
             let removed = u64::try_from(previous_state.documents.len())
                 .unwrap_or(u64::MAX)
                 .saturating_sub(delta.retained);
+            let copied = copied_components
+                || state_stage.is_some_and(|stage| {
+                    stage.strategy == codestory_store::SealedStageStrategy::Copied
+                });
             return Ok((
                 expected.fingerprint.clone(),
                 Some(IncrementalLexicalWork {
                     retained: delta.retained,
                     inserted,
                     removed,
-                    direct_reference: inserted == 0 && removed == 0,
-                    copied: copied_components
-                        || state_stage.is_some_and(|stage| {
-                            stage.strategy == codestory_store::SealedStageStrategy::Copied
-                        }),
+                    direct_reference: inserted == 0 && removed == 0 && !copied,
+                    copied,
                 }),
             ));
         }
@@ -5668,6 +5681,52 @@ mod tests {
                 .validations,
             1,
             "owned hard-link cleanup must not force another full lexical scan",
+        );
+    }
+
+    #[test]
+    fn publication_only_lexical_fallback_reports_copied_not_reused() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("data");
+        let prepared = prepared_documents(vec![
+            source_document("src/a.rs", "alpha"),
+            source_document("src/b.rs", "beta"),
+        ]);
+        build_prepared_lexical_shard(&data, "previous", &prepared, "input-v1", None, || Ok(()))
+            .expect("previous shard");
+        let (_, work) = crate::copy_on_write::with_hard_link_disabled(|| {
+            crate::copy_on_write::with_clone_disabled(|| {
+                build_prepared_lexical_shard(
+                    &data,
+                    "current",
+                    &prepared,
+                    "input-v2",
+                    Some("previous"),
+                    || Ok(()),
+                )
+            })
+        })
+        .expect("publication-only copied shard");
+        let work = work.expect("incremental work");
+        assert_eq!((work.retained, work.inserted, work.removed), (2, 0, 0));
+        assert!(work.copied);
+        assert!(!work.direct_reference);
+        assert_eq!(work.mode(), "copied");
+        assert_ne!(
+            codestory_workspace::workspace_path_identity(
+                &shard_dir_for(&data, "previous").join(LEXICAL_INDEX_FILE)
+            )
+            .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(
+                &shard_dir_for(&data, "current").join(LEXICAL_INDEX_FILE)
+            )
+            .expect("copied identity"),
+        );
+        assert_eq!(
+            search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "alpha", 8)
+                .expect("copied search")
+                .len(),
+            1
         );
     }
 

@@ -5,11 +5,26 @@ use std::path::Path;
 thread_local! {
     static OWNER_WRITABLE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PUBLICATION_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HARD_LINK_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn with_clone_disabled<T>(action: impl FnOnce() -> T) -> T {
     codestory_store::with_native_clone_disabled(action)
+}
+
+#[cfg(test)]
+pub(crate) fn with_hard_link_disabled<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HARD_LINK_DISABLED.set(self.0);
+        }
+    }
+    let restore = Restore(HARD_LINK_DISABLED.replace(true));
+    let result = action();
+    drop(restore);
+    result
 }
 
 #[cfg(test)]
@@ -95,6 +110,10 @@ pub(crate) fn reference_file(source: &Path, destination: &Path) -> Result<bool> 
     }
     if std::fs::symlink_metadata(destination).is_ok() {
         bail!("component reference destination already exists");
+    }
+    #[cfg(test)]
+    if HARD_LINK_DISABLED.get() {
+        return Ok(false);
     }
     match std::fs::hard_link(source, destination) {
         Ok(()) => {

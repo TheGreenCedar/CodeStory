@@ -52,34 +52,57 @@ pub struct SealedStageStats {
 thread_local! {
     static NATIVE_CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
-    static PARENT_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PARENT_SYNC_FAULT: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
-    static FILE_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FILE_SYNC_FAULT: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static NATIVE_CLONE_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-fn with_parent_sync_failure<T>(action: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+fn faulty_sync_handle(_source: &Path) -> File {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        // SAFETY: into_raw_fd transfers the socket's only owned descriptor.
+        unsafe { File::from_raw_fd(socket.into_raw_fd()) }
+    }
+    #[cfg(windows)]
+    {
+        File::open(_source).expect("read-only handle rejects FlushFileBuffers")
+    }
+}
+
+#[cfg(test)]
+fn with_parent_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<File>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            PARENT_SYNC_FAILURE.set(self.0);
+            PARENT_SYNC_FAULT.with(|fault| {
+                fault.replace(self.0.take());
+            });
         }
     }
-    let restore = Restore(PARENT_SYNC_FAILURE.replace(true));
+    let restore =
+        Restore(PARENT_SYNC_FAULT.with(|fault| fault.replace(Some(faulty_sync_handle(source)))));
     let result = action();
     drop(restore);
     result
 }
 
 #[cfg(test)]
-fn with_file_sync_failure<T>(action: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+fn with_file_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<File>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            FILE_SYNC_FAILURE.set(self.0);
+            FILE_SYNC_FAULT.with(|fault| {
+                fault.replace(self.0.take());
+            });
         }
     }
-    let restore = Restore(FILE_SYNC_FAILURE.replace(true));
+    let restore =
+        Restore(FILE_SYNC_FAULT.with(|fault| fault.replace(Some(faulty_sync_handle(source)))));
     let result = action();
     drop(restore);
     result
@@ -333,12 +356,19 @@ fn stage_sealed_file_impl(
         }
     }
     let source_bytes = metadata.len();
+    crate::ensure_full_size_write_capacity(
+        destination.parent().unwrap_or_else(|| Path::new(".")),
+        source_bytes,
+        "sealed_component_copy",
+    )?;
     let mut owned = OwnedDestination::new(destination)?;
     let result = (|| {
         #[cfg(any(test, feature = "test-support"))]
         let native = if NATIVE_CLONE_DISABLED.get() {
             CloneResult::Unsupported("native_clone_disabled", None)
         } else {
+            #[cfg(test)]
+            NATIVE_CLONE_ATTEMPTS.set(NATIVE_CLONE_ATTEMPTS.get() + 1);
             native_clone(source, destination, source_bytes, &mut owned, cancelled)?
         };
         #[cfg(not(any(test, feature = "test-support")))]
@@ -357,11 +387,6 @@ fn stage_sealed_file_impl(
                     copied_bytes,
                 ),
                 CloneResult::Unsupported(reason, native_error_code) => {
-                    crate::ensure_full_size_write_capacity(
-                        destination.parent().unwrap_or_else(|| Path::new(".")),
-                        source_bytes,
-                        "sealed_component_copy",
-                    )?;
                     let mut input = File::open(source)
                         .map_err(|cause| io_error("open sealed source", source, cause))?;
                     let mut output = OpenOptions::new()
@@ -410,14 +435,10 @@ fn stage_sealed_file_impl(
         // clonefile can carry the source's read-only mode to the destination.
         // The stage is writable until the caller seals and publishes it.
         crate::core_generation::make_file_owner_writable(destination)?;
-        #[cfg(test)]
-        if FILE_SYNC_FAILURE.get() {
-            return Err(error("injected sealed stage file sync failure"));
-        }
         OpenOptions::new()
             .write(true)
             .open(destination)
-            .and_then(|file| file.sync_all())
+            .and_then(|file| sync_stage_handle(&file, false))
             .map_err(|cause| io_error("sync sealed stage", destination, cause))?;
         sync_parent(destination)?;
         Ok(SealedStageStats {
@@ -447,15 +468,25 @@ enum CloneResult {
     Unsupported(&'static str, Option<i32>),
 }
 
+fn sync_stage_handle(file: &File, _parent: bool) -> std::io::Result<()> {
+    #[cfg(test)]
+    let injected = if _parent {
+        PARENT_SYNC_FAULT.with(|fault| fault.borrow().as_ref().map(File::try_clone).transpose())?
+    } else {
+        FILE_SYNC_FAULT.with(|fault| fault.borrow().as_ref().map(File::try_clone).transpose())?
+    };
+    #[cfg(test)]
+    let target = injected.as_ref().unwrap_or(file);
+    #[cfg(not(test))]
+    let target = file;
+    target.sync_all()
+}
+
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), StorageError> {
-    #[cfg(test)]
-    if PARENT_SYNC_FAILURE.get() {
-        return Err(error("injected sealed stage parent sync failure"));
-    }
     if let Some(parent) = path.parent() {
         File::open(parent)
-            .and_then(|directory| directory.sync_all())
+            .and_then(|directory| sync_stage_handle(&directory, true))
             .map_err(|cause| io_error("sync sealed stage parent", parent, cause))?;
     }
     Ok(())
@@ -463,10 +494,6 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
 
 #[cfg(windows)]
 fn sync_parent(path: &Path) -> Result<(), StorageError> {
-    #[cfg(test)]
-    if PARENT_SYNC_FAILURE.get() {
-        return Err(error("injected sealed stage parent sync failure"));
-    }
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     if let Some(parent) = path.parent() {
@@ -474,7 +501,7 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
             .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(parent)
-            .and_then(|directory| directory.sync_all())
+            .and_then(|directory| sync_stage_handle(&directory, true))
             .map_err(|cause| io_error("sync sealed stage parent", parent, cause))?;
     }
     Ok(())
@@ -789,6 +816,25 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_space_refuses_before_native_clone_attempt() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let source = sealed_source(root.path(), b"published sealed bytes");
+        let destination = root.path().join("candidate.db");
+        let attempts_before = NATIVE_CLONE_ATTEMPTS.get();
+        let error = crate::with_available_filesystem_bytes_override(0, || {
+            stage_sealed_file(&source, &destination, &|| false)
+                .expect_err("low space must refuse before native clone")
+        });
+        assert!(matches!(error, StorageError::InsufficientSpace { .. }));
+        assert_eq!(NATIVE_CLONE_ATTEMPTS.get(), attempts_before);
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(source).expect("published source"),
+            b"published sealed bytes"
+        );
+    }
+
+    #[test]
     fn cancelled_copy_removes_only_its_owned_destination() {
         let root = tempfile::TempDir::new().expect("tempdir");
         let source = sealed_source(root.path(), &vec![7_u8; COPY_CHUNK_BYTES * 3]);
@@ -859,12 +905,12 @@ mod tests {
         let root = tempfile::TempDir::new().expect("tempdir");
         let source = sealed_source(root.path(), b"sealed");
         let destination = root.path().join("candidate.db");
-        let error = with_parent_sync_failure(|| {
+        let error = with_parent_sync_failure(&source, || {
             with_native_clone_disabled(|| {
                 stage_sealed_file(&source, &destination, &|| false).expect_err("sync failure")
             })
         });
-        assert!(error.to_string().contains("parent sync failure"));
+        assert!(error.to_string().contains("sync sealed stage parent"));
         assert!(!destination.exists());
         assert_eq!(fs::read(source).expect("source"), b"sealed");
     }
@@ -874,12 +920,12 @@ mod tests {
         let root = tempfile::TempDir::new().expect("tempdir");
         let source = sealed_source(root.path(), b"sealed");
         let destination = root.path().join("candidate.db");
-        let error = with_file_sync_failure(|| {
+        let error = with_file_sync_failure(&source, || {
             with_native_clone_disabled(|| {
                 stage_sealed_file(&source, &destination, &|| false).expect_err("sync failure")
             })
         });
-        assert!(error.to_string().contains("file sync failure"));
+        assert!(error.to_string().contains("sync sealed stage "));
         assert!(!destination.exists());
         assert_eq!(fs::read(source).expect("source"), b"sealed");
     }
