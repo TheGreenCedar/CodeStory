@@ -9729,18 +9729,27 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
             ),
         ],
     ] {
-        assert_no_exact_calls(&files)?;
+        let (path, caller) = files.last().expect("designated importer fixture");
+        let (marker, callee) = if caller.contains("local();") {
+            ("local();", "local")
+        } else {
+            ("target();", "target")
+        };
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
     }
-    assert_no_exact_calls(&[
-        (
-            "src/target.ts",
-            "export interface Target { value: number }\nexport function target() {}\n",
-        ),
-        (
-            "src/aliased_type.ts",
-            "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
-        ),
-    ])?;
+    assert_no_exact_calls_at(
+        &[
+            (
+                "src/target.ts",
+                "export interface Target { value: number }\nexport function target() {}\n",
+            ),
+            (
+                "src/aliased_type.ts",
+                "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
+            ),
+        ],
+        &[("src/aliased_type.ts", "local();", "local")],
+    )?;
     Ok(())
 }
 
@@ -9773,7 +9782,13 @@ fn typescript_type_specifier_local_collisions_close_the_entire_import_binding() 
             ),
         ],
     ] {
-        assert_no_exact_calls(&files)?;
+        let (path, caller) = files.last().expect("designated importer fixture");
+        let (marker, callee) = if caller.contains("local();") {
+            ("local();", "local")
+        } else {
+            ("target();", "target")
+        };
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
     }
     Ok(())
 }
@@ -12110,26 +12125,106 @@ fn assert_call_named_is_exact(files: &[(&str, &str)], raw_target: &str) -> anyho
     Ok(())
 }
 
+fn assert_script_call_anchor(
+    store: &Store,
+    files: &[(&str, &str)],
+    facts: &[codestory_contracts::proof_resolution::CallResolutionFact],
+    path: &str,
+    marker: &str,
+    callee: &str,
+) -> anyhow::Result<()> {
+    let source = files
+        .iter()
+        .find(|(file, _)| *file == path)
+        .expect("fixture source")
+        .1;
+    let markers = source.match_indices(marker).collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "designated marker must be unique: {path}/{marker}"
+    );
+    let callee_offsets = marker.match_indices(callee).collect::<Vec<_>>();
+    assert_eq!(
+        callee_offsets.len(),
+        1,
+        "callee within marker must be unique"
+    );
+    let start = markers[0].0 + callee_offsets[0].0;
+    assert_script_call_at_byte(store, facts, path, source, start, callee)
+}
+
+fn assert_script_call_at_byte(
+    store: &Store,
+    facts: &[codestory_contracts::proof_resolution::CallResolutionFact],
+    path: &str,
+    source: &str,
+    start: usize,
+    raw_target: &str,
+) -> anyhow::Result<()> {
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with(path))
+        .expect("independent designated file identity");
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+    let column = (start - prefix.rfind('\n').map_or(0, |newline| newline + 1)) as u32 + 1;
+    let matching = facts
+        .iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(file.id)
+                && fact.callsite.line == line
+                && fact.callsite.column == column
+        })
+        .collect::<Vec<_>>();
+    let [fact] = matching.as_slice() else {
+        panic!("designated {path}:{line}:{column} fact must exist once: {facts:#?}");
+    };
+    assert_eq!(
+        fact.callsite.raw_target, raw_target,
+        "{path}:{line}:{column}"
+    );
+    assert!(
+        fact.status != ProofResolutionStatus::Exact
+            && fact.target.is_none()
+            && fact.edge_id.is_none()
+            && fact.evidence_chain.is_empty(),
+        "designated {path}:{line}:{column} acquired authority: {fact:#?}"
+    );
+    Ok(())
+}
+
+fn is_script_fixture(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+    )
+}
+
 fn assert_no_exact_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    assert_no_exact_calls_at(files, &[])
+}
+
+fn assert_no_exact_calls_at(
+    files: &[(&str, &str)],
+    anchors: &[(&str, &str, &str)],
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
-    if files.iter().any(|(path, _)| {
-        matches!(
-            std::path::Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
-        )
-    }) {
+    if files.iter().any(|(path, _)| is_script_fixture(path)) {
         assert!(
-            facts
-                .iter()
-                .any(|fact| matches!(fact.callsite.raw_target.as_str(), "target" | "local")),
-            "designated script call fact must not disappear: {files:?}"
+            !anchors.is_empty(),
+            "script negatives require designated call anchors"
         );
+    }
+    for (path, marker, callee) in anchors {
+        assert_script_call_anchor(&store, files, &facts, path, marker, callee)?;
     }
     assert!(
         facts
@@ -12150,17 +12245,27 @@ fn assert_no_exact_target_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
         .iter()
         .filter(|fact| fact.callsite.raw_target.trim_start_matches('#') == "target")
         .collect::<Vec<_>>();
-    if files.iter().any(|(path, _)| {
-        matches!(
-            std::path::Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
-        )
-    }) {
+    if files.iter().any(|(path, _)| is_script_fixture(path)) {
+        let mut anchors = 0;
+        // These fixtures designate contiguous target(); invocations. Derive
+        // every occurrence from the fixture bytes, never from emitted facts.
+        for (path, source) in files.iter().filter(|(path, _)| is_script_fixture(path)) {
+            for (start, _) in source.match_indices("target();") {
+                let private = source[..start].ends_with('#');
+                assert_script_call_at_byte(
+                    &store,
+                    &facts,
+                    path,
+                    source,
+                    if private { start - 1 } else { start },
+                    if private { "#target" } else { "target" },
+                )?;
+                anchors += 1;
+            }
+        }
         assert!(
-            !target_facts.is_empty(),
-            "designated script target fact must not disappear: {files:?}"
+            anchors > 0,
+            "script target negatives require fixture invocation markers"
         );
     }
     assert!(
@@ -12243,98 +12348,178 @@ fn rust_fact_after_forcing_call_target(
 
 #[test]
 fn javascript_typescript_unsupported_matrix_never_authorizes() -> anyhow::Result<()> {
-    for (path, source) in [
+    for (path, source, marker, callee) in [
         (
             "src/script.js",
             "function target() {}\nfunction caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/commonjs.cjs",
             "const target = require('./target');\nfunction caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/function_expression.js",
             "export const target = function () {};\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/alias.js",
             "const actual = () => {};\nexport const target = actual;\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/object.js",
             "const object = { target() {} };\nexport function caller() { object.target(); }\n",
+            "object.target()",
+            "target",
         ),
         (
             "src/optional.js",
             "export class C { target() {} }\nexport function caller() { const receiver = new C(); receiver?.target(); }\n",
+            "receiver?.target()",
+            "target",
         ),
         (
             "src/computed.js",
             "export class C { target() {} }\nexport function caller() { const receiver = new C(); receiver['target'](); }\n",
+            "receiver['target']()",
+            "'target'",
         ),
         (
             "src/optional_identifier.js",
             "export function target() {}\nexport function caller() { target?.(); }\n",
+            "target?.()",
+            "target",
         ),
         (
             "src/tagged.js",
             "export function target() {}\nexport function caller() { target`value`; }\n",
+            "target`value`",
+            "target",
         ),
         (
             "src/call.js",
             "export function target() {}\nexport function caller() { target.call(null); }\n",
+            "target.call(null)",
+            "call",
         ),
         (
             "src/bind.js",
             "export function target() {}\nexport function caller() { target.bind(null)(); }\n",
+            "target.bind(null)",
+            "bind",
         ),
         (
             "src/dynamic_import.js",
             "export async function caller() { const target = await import('./target.js'); target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/type_only.ts",
             "import type { target } from './target';\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/namespace.ts",
             "import * as ns from './target';\nexport function caller() { ns.target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/package.ts",
             "import { target } from 'package';\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/nested.ts",
             "export function target() {}\nexport function outer() { function caller() { target(); } caller(); }\n",
+            "function caller() { target(); }",
+            "target",
         ),
         (
             "src/parameter_initializer.ts",
             "export function target() {}\nexport function caller(value = target()) {}\n",
+            "value = target()",
+            "target",
         ),
         (
             "src/relevant_using.ts",
             "export function target() {}\nusing target = resource;\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/accessor.js",
             "export function target() {}\nexport class C { get value() { target(); return 1; } }\n",
+            "get value() { target();",
+            "target",
         ),
         (
             "src/field.js",
             "export function target() {}\nexport class C { value = target(); }\n",
+            "value = target()",
+            "target",
         ),
         (
             "src/static.js",
             "export function target() {}\nexport class C { static { target(); } }\n",
-        ),
-        (
-            "src/new.js",
-            "export class C {}\nexport function caller() { new C(); }\n",
+            "static { target();",
+            "target",
         ),
     ] {
-        assert_no_exact_calls(&[(path, source)])?;
+        assert_no_exact_calls_at(&[(path, source)], &[(path, marker, callee)])?;
     }
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/new.js",
+            "export class C {}\nexport function caller() { new C(); }\n",
+        )],
+    )?;
+    let nodes = store.get_nodes()?;
+    let owner = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::CLASS)
+        .expect("constructor declaration");
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(2)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name == "C")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "ordinary constructor CALL must exist");
+    assert_eq!(owner.serialized_name, "C");
+    let identity = parse_canonical_callsite_identity(
+        calls[0]
+            .callsite_identity
+            .as_deref()
+            .expect("ordinary constructor identity"),
+    )
+    .expect("canonical constructor CALL identity");
+    assert_eq!(identity.line, 2);
+    assert_eq!(identity.raw_target, calls[0].target);
+    // JavascriptResolutionIndex::build deliberately collects call_expression,
+    // not new_expression. Assert that narrower exclusion without a vacuous all().
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    assert!(store.get_proof_resolution_facts()?.is_empty());
+    assert!(store.get_edges()?.iter().any(|edge| edge == &calls[0]));
     Ok(())
 }
 
