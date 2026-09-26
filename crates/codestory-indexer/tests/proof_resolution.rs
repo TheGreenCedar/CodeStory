@@ -682,6 +682,82 @@ fn assert_nominal_exact_target(
     Ok(())
 }
 
+fn assert_nominal_caller(
+    store: &Store,
+    root: &std::path::Path,
+    fact: &codestory_contracts::proof_resolution::CallResolutionFact,
+    caller_path: &str,
+    declaration_line: u32,
+    call_line: u32,
+) -> anyhow::Result<()> {
+    let nodes = store.get_nodes()?;
+    let file = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == root.join(caller_path).display().to_string()
+        })
+        .expect("independently designated caller file");
+    let callers = nodes
+        .iter()
+        .filter(|node| {
+            node.file_node_id == Some(file.id)
+                && node.start_line == Some(declaration_line)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .collect::<Vec<_>>();
+    let [caller] = callers.as_slice() else {
+        panic!("intended callable census at {caller_path}:{declaration_line}: {callers:#?}");
+    };
+    assert_eq!(
+        fact.caller, caller.id,
+        "fact must name independently designated callable"
+    );
+    assert_eq!(fact.callsite.file_id, FileId(file.id.0));
+    assert_eq!(fact.callsite.line, call_line);
+    let edges = store.get_edges()?;
+    let call = edges
+        .iter()
+        .find(|edge| Some(edge.id) == fact.edge_id)
+        .expect("actual intended CALL");
+    assert_eq!(call.effective_source(), caller.id);
+    assert_eq!(call.file_node_id, Some(file.id));
+    assert_eq!(call.line, Some(call_line));
+    Ok(())
+}
+
+fn assert_f9_nominal_call_is_exact(
+    files: &[(&str, &str)],
+    language: &str,
+    target: (&str, u32, u32),
+    caller: (&str, u32, u32),
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("intended positive call census: {facts:#?}");
+    };
+    assert_nominal_exact_target(
+        &store,
+        project.path(),
+        fact,
+        target.0,
+        target.1,
+        Some(target.2),
+    )?;
+    assert_nominal_caller(&store, project.path(), fact, caller.0, caller.1, caller.2)
+}
+
 fn assert_nominal_call_is_nonexact(
     files: &[(&str, &str)],
     language: &str,
@@ -3218,7 +3294,46 @@ fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow:
                 ("php_exact_use_aliases", "memberTarget") => ("src/Lib/Worker.php", 4, Some(4)),
                 _ => unreachable!("each positive fixture must specify its intended declaration"),
             };
+            let (caller_path, anchors): (&str, &[(u32, u32)]) = match (name, target) {
+                ("ruby_same_file_and_self", "same_file_target") => {
+                    ("lib/exact.rb", &[(4, 3), (5, 3)])
+                }
+                ("ruby_same_file_and_self", "member_target") => ("lib/exact.rb", &[(11, 10)]),
+                ("ruby_constructor_receiver", _) => ("lib/exact.rb", &[(7, 5)]),
+                ("ruby_literal_require_relative", _) => ("lib/caller.rb", &[(4, 2)]),
+                (
+                    "php_same_file_namespace_this_constructor_and_typed_receiver",
+                    "same_file_target",
+                ) => ("src/Exact.php", &[(4, 4), (4, 4)]),
+                ("php_same_file_namespace_this_constructor_and_typed_receiver", "memberTarget") => {
+                    ("src/Exact.php", &[(7, 7), (9, 9), (10, 10)])
+                }
+                ("php_exact_use_aliases", "target_alias") => ("src/App/Caller.php", &[(5, 5)]),
+                ("php_exact_use_aliases", "memberTarget") => ("src/App/Caller.php", &[(6, 6)]),
+                _ => unreachable!("each positive specifies its intended caller"),
+            };
+            let mut actual_lines = exact
+                .iter()
+                .map(|fact| fact.callsite.line)
+                .collect::<Vec<_>>();
+            actual_lines.sort_unstable();
+            let mut expected_lines = anchors.iter().map(|(call, _)| *call).collect::<Vec<_>>();
+            expected_lines.sort_unstable();
+            assert_eq!(actual_lines, expected_lines, "{name} {target} call census");
             for fact in &exact {
+                let caller_line = anchors
+                    .iter()
+                    .find(|(call, _)| *call == fact.callsite.line)
+                    .expect("designated call")
+                    .1;
+                assert_nominal_caller(
+                    &store,
+                    project.path(),
+                    fact,
+                    caller_path,
+                    caller_line,
+                    fact.callsite.line,
+                )?;
                 assert_nominal_exact_target(
                     &store,
                     project.path(),
@@ -4862,7 +4977,36 @@ fn cpp_closed_exact_subset_emits_replay_valid_authenticated_facts() -> anyhow::R
             "member_target" => (5, Some(2)),
             _ => unreachable!("each C++ positive must specify its intended declaration"),
         };
+        let anchors: &[(u32, u32)] = match target {
+            "free_target" => &[(14, 14)],
+            "namespaced_target" => &[(15, 15)],
+            "static_target" => &[(16, 16)],
+            "member_target" => &[(6, 6), (7, 7), (11, 11), (17, 17), (18, 18), (19, 19)],
+            _ => unreachable!("each C++ positive specifies intended callers"),
+        };
+        let mut actual_lines = exact
+            .iter()
+            .map(|fact| fact.callsite.line)
+            .collect::<Vec<_>>();
+        actual_lines.sort_unstable();
+        assert_eq!(
+            actual_lines,
+            anchors.iter().map(|(call, _)| *call).collect::<Vec<_>>()
+        );
         for fact in &exact {
+            let caller_line = anchors
+                .iter()
+                .find(|(call, _)| *call == fact.callsite.line)
+                .expect("designated call")
+                .1;
+            assert_nominal_caller(
+                &store,
+                project.path(),
+                fact,
+                "fixture.cpp",
+                caller_line,
+                fact.callsite.line,
+            )?;
             assert_nominal_exact_target(
                 &store,
                 project.path(),
@@ -16501,6 +16645,7 @@ fn assert_relative_import_exact_name_and_cache(
         None,
     )?;
 
+    assert_nominal_caller(&store, project.path(), fact, &importer_path, 2, 2)?;
     let before = store.get_proof_resolution_facts()?;
     let paths = vec![
         project.path().join(&target_path),
@@ -16582,6 +16727,7 @@ fn assert_relative_import_exact_name_and_cache(
             target_line,
             None,
         )?;
+        assert_nominal_caller(&store, project.path(), fact, &importer_path, 2, 2)?;
         assert_eq!(fact.provenance.language_adapter_version, current_version);
         let imports = store
             .get_edges()?
@@ -16699,12 +16845,11 @@ fn ordinary_conditional_receiver_matrix_and_clean_bindings() -> anyhow::Result<(
     }
     let ruby_clean =
         format!("{ruby_prefix}def caller\n  receiver = Worker.new\n  receiver.target\nend\n");
-    assert_nominal_call_is_exact(
+    assert_f9_nominal_call_is_exact(
         &[("lib/receiver.rb", &ruby_clean)],
         "ruby",
-        "lib/receiver.rb",
-        2,
-        1,
+        ("lib/receiver.rb", 2, 1),
+        ("lib/receiver.rb", 9, 11),
     )?;
 
     let php_prefix = "<?php\nclass Worker { public function target() {} }\nclass Other { public function target() {} }\n";
@@ -16739,12 +16884,16 @@ fn ordinary_conditional_receiver_matrix_and_clean_bindings() -> anyhow::Result<(
     ] {
         let source =
             format!("{php_prefix}function caller() {{\n{body}  $receiver->target();\n}}\n");
-        assert_nominal_call_is_exact(
+        let call_line = source
+            .lines()
+            .position(|line| line == "  $receiver->target();")
+            .unwrap() as u32
+            + 1;
+        assert_f9_nominal_call_is_exact(
             &[("src/Receiver.php", &source)],
             "php",
-            "src/Receiver.php",
-            2,
-            2,
+            ("src/Receiver.php", 2, 2),
+            ("src/Receiver.php", 4, call_line),
         )?;
     }
     Ok(())
@@ -16787,19 +16936,18 @@ fn ordinary_python_namespace_owner_and_alias_controls() -> anyhow::Result<()> {
         )?;
     }
     // A shadowed Worker spelling must not contaminate an independently named owner.
-    assert_nominal_call_is_exact(
+    assert_f9_nominal_call_is_exact(
         &[(
             "src/receiver.py",
             "class Worker:\n    def target(self):\n        pass\ndef Worker():\n    return None\nclass Safe:\n    def target(self):\n        pass\ndef caller():\n    worker = Safe()\n    worker.target()\n",
         )],
         "python",
-        "src/receiver.py",
-        7,
-        6,
+        ("src/receiver.py", 7, 6),
+        ("src/receiver.py", 9, 11),
     )?;
     // Remote owner Worker is reached through the authenticated alias Bound,
     // while a same-spelled local function has no authority over that alias.
-    assert_nominal_call_is_exact(
+    assert_f9_nominal_call_is_exact(
         &[
             ("pkg/__init__.py", ""),
             (
@@ -16812,9 +16960,8 @@ fn ordinary_python_namespace_owner_and_alias_controls() -> anyhow::Result<()> {
             ),
         ],
         "python",
-        "pkg/target.py",
-        2,
-        1,
+        ("pkg/target.py", 2, 1),
+        ("pkg/main.py", 4, 6),
     )
 }
 
