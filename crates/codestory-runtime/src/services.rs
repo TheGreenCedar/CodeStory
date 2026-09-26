@@ -4290,7 +4290,14 @@ pub(crate) mod activation_tests {
                 .ready_lease_present,
             "the restored lease must match before publication removal"
         );
-        fs::remove_file(&fixture.storage_path).expect("remove legacy database for hostile state");
+        let published = codestory_store::resolve_core_database_path(&fixture.storage_path)
+            .expect("resolve active generation for hostile state");
+        fs::write(
+            &fixture.storage_path,
+            fs::read(published).expect("read active generation for legacy stand-in"),
+        )
+        .expect("create legacy stand-in for hostile state");
+        fs::remove_file(&fixture.storage_path).expect("remove legacy stand-in for hostile state");
         assert!(
             codestory_store::core_database_exists(&fixture.storage_path)
                 .expect("resolve retained generation"),
@@ -4310,7 +4317,9 @@ pub(crate) mod activation_tests {
         let layout =
             codestory_store::CorePublicationLayout::from_storage_path(&fixture.storage_path)
                 .expect("publication layout");
-        fs::remove_file(layout.publication_path()).expect("remove active publication pointer");
+        let pointer_path = layout.publication_path();
+        let pointer_bytes = fs::read(&pointer_path).expect("read active publication pointer");
+        fs::remove_file(&pointer_path).expect("remove active publication pointer");
         assert!(
             !codestory_store::core_database_exists(&fixture.storage_path)
                 .expect("observe missing publication"),
@@ -4326,6 +4335,63 @@ pub(crate) mod activation_tests {
             },
             "unavailable",
         );
+
+        fs::write(&pointer_path, pointer_bytes).expect("restore active publication pointer");
+        let active = layout
+            .resolve_active_database()
+            .expect("resolve restored active publication")
+            .expect("restored active generation");
+        let mut permissions = fs::metadata(&active)
+            .expect("active generation metadata")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&active, permissions).expect("make hostile generation removable");
+        fs::remove_file(&active).expect("remove pointer-selected active generation");
+        assert!(
+            codestory_store::core_database_exists(&fixture.storage_path).is_err(),
+            "a dangling pointer must report a corrupt publication"
+        );
+
+        let state_before = coordinator_snapshot(&service);
+        let files_before = tree_snapshot(&cache_root);
+        let observer_requests_before = service.controller.source_observer_requests_for_test();
+        let workers_before = service.worker_start_count_for_test();
+        let preparation_before = service.preparation_counts_for_test();
+        let status_error = service
+            .retrieval_status(fixture.project.path(), &fixture.storage_path)
+            .err()
+            .expect("status must reject a missing pointer-selected generation");
+        assert!(
+            status_error
+                .to_string()
+                .contains("resolve core publication"),
+            "status reports the broken core pointer: {status_error}"
+        );
+        let doctor_error = service
+            .retrieval_engine_diagnostics(fixture.project.path(), &fixture.storage_path)
+            .err()
+            .expect("doctor must reject a missing pointer-selected generation");
+        assert!(
+            doctor_error
+                .to_string()
+                .contains("resolve core publication"),
+            "doctor reports the broken core pointer: {doctor_error}"
+        );
+        assert_eq!(coordinator_snapshot(&service), state_before);
+        assert_eq!(
+            service.controller.source_observer_requests_for_test(),
+            observer_requests_before
+        );
+        assert_eq!(service.worker_start_count_for_test(), workers_before);
+        assert_eq!(service.preparation_counts_for_test(), preparation_before);
+        assert_eq!(codestory_workspace::source_freshness_counts(), None);
+        assert_eq!(tree_snapshot(&cache_root), files_before);
     }
 
     #[test]

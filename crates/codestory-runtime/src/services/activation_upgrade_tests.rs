@@ -315,8 +315,17 @@ fn activation_rebuilds_release_java_visibility_projection() {
     connection
         .execute_batch("PRAGMA user_version = 31; PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("stamp the release schema");
+    let predecessor_node_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))
+        .expect("count release nodes");
+    assert!(predecessor_node_count > 0, "release core contains nodes");
+    let predecessor_access_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM component_access", [], |row| {
+            row.get(0)
+        })
+        .expect("count absent release projection");
+    assert_eq!(predecessor_access_count, 0);
     drop(connection);
-    let predecessor = fs::read(&storage_path).unwrap();
 
     Runtime::new()
         .activation_service()
@@ -326,10 +335,39 @@ fn activation_rebuilds_release_java_visibility_projection() {
             Arc::new(AtomicBool::new(false)),
         )
         .expect("activation rebuilds the release Java projection");
+    assert!(
+        !storage_path.exists(),
+        "committed migration retires the standalone release database"
+    );
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path).unwrap();
+    let pointer = layout.read_pointer().unwrap().unwrap();
+    let rollback = layout
+        .resolve_generation_database(&pointer.rollback.unwrap().generation_id)
+        .unwrap();
+    let rollback =
+        rusqlite::Connection::open_with_flags(rollback, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open coherent release rollback");
     assert_eq!(
-        fs::read(&storage_path).unwrap(),
-        predecessor,
-        "release rollback bytes remain unchanged"
+        rollback
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        31,
+        "rollback retains the release schema"
+    );
+    assert_eq!(
+        rollback
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        predecessor_node_count,
+        "rollback retains the release nodes"
+    );
+    assert_eq!(
+        rollback
+            .query_row("SELECT COUNT(*) FROM component_access", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        predecessor_access_count,
+        "rollback retains the release projection absence"
     );
 
     let store = Store::open_read_only(&storage_path).unwrap();
