@@ -16060,7 +16060,26 @@ func indexedComposite() {
 }
 "#;
     let (nodes, edges) = index_files(&[("main.go", source)])?;
-    for caller in ["nestedSelector", "doublePointer", "indexedComposite"] {
+    let call_lines = source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains("x.Run()").then_some(index as u32 + 1))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_lines.len(),
+        3,
+        "fixture must retain all hostile x.Run() sites"
+    );
+    for (caller, line) in ["nestedSelector", "doublePointer", "indexedComposite"]
+        .into_iter()
+        .zip(call_lines)
+    {
+        let call = one_go_call(&nodes, &edges, caller, "Run");
+        assert_eq!(call.line, Some(line), "{caller}: wrong x.Run() source site");
+        assert_eq!(
+            call.resolved_target, None,
+            "{caller}: unsupported shape resolved"
+        );
         for owner in ["A", "B"] {
             assert_no_resolved_call_to_method_owner(
                 "Go non-closed type/constructor AST",
@@ -17040,6 +17059,10 @@ func (Handler) String() string { return "handler" }
 func Convert(k Key) string { return string(k) }
 "#,
     )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "string").resolved_target,
+        None
+    );
     assert_no_resolved_call_to_method_owner("G01", &nodes, &edges, "Convert", "Handler", "String");
     assert_no_resolved_call_of_kind("G01", &nodes, &edges, "Convert", NodeKind::METHOD);
 
@@ -17054,6 +17077,10 @@ func (Handler) string() int { return 1 }
 func Convert(k Key) string { return string(k) }
 "#,
     )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "string").resolved_target,
+        None
+    );
     assert_no_resolved_call_to_method_owner("G02", &nodes, &edges, "Convert", "Handler", "string");
     assert_no_resolved_call_of_kind("G02", &nodes, &edges, "Convert", NodeKind::METHOD);
 
@@ -17067,6 +17094,10 @@ func (Handler) run() int { return 1 }
 func Variable(run func() int) int { return run() }
 "#,
     )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Variable", "run").resolved_target,
+        None
+    );
     assert_no_resolved_call_to_method_owner("G03", &nodes, &edges, "Variable", "Handler", "run");
     assert_no_resolved_call_of_kind("G03", &nodes, &edges, "Variable", NodeKind::METHOD);
 
@@ -17102,6 +17133,10 @@ func (Handler) Token() {}
 func Convert() Token { return Token("x") }
 "#,
     )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Convert", "Token").resolved_target,
+        None
+    );
     assert_no_resolved_call_to_method_owner("G05", &nodes, &edges, "Convert", "Handler", "Token");
     assert_no_resolved_call_of_kind("G05", &nodes, &edges, "Convert", NodeKind::METHOD);
 
@@ -17319,6 +17354,96 @@ func Caller() { chosen.Target() }
             .unwrap_or(false),
         "G10-imported-package-function: the module declaration must bind example.com/project/selected to the local selected/selected.go, not the same-basename external suffix decoy. Calls: {:?}",
         describe_call_edges(&edges, &nodes)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_import_alias_shadow_never_receives_package_function_evidence() -> anyhow::Result<()> {
+    let caller = r#"package caller
+import chosen "example.com/project/selected"
+func Parameter(chosen Runner) { chosen.Target() }
+func UntypedVar() { var chosen = Runner{}; chosen.Target() }
+func Unshadowed() { chosen.Target() }
+"#;
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.com/project\n\ngo 1.24\n"),
+        (
+            "selected/selected.go",
+            "package selected\nfunc Target() {}\n",
+        ),
+        (
+            "runner.go",
+            "package caller\ntype Runner struct{}\nfunc (Runner) Target() {}\n",
+        ),
+        ("caller.go", caller),
+    ])?;
+    for name in ["Parameter", "UntypedVar"] {
+        let call = one_go_call(&nodes, &edges, name, "Target");
+        assert!(
+            !callsite_has_segment(call, "syntax:go-package-function"),
+            "{name}: lexical receiver shadow carried imported-package evidence: {call:?}"
+        );
+        assert!(
+            resolved_function_paths(&nodes, &edges, name, "Target").is_empty(),
+            "{name}: lexical receiver shadow resolved to imported package Target"
+        );
+    }
+    let unshadowed = one_go_call(&nodes, &edges, "Unshadowed", "Target");
+    assert!(callsite_has_segment(
+        unshadowed,
+        "syntax:go-package-function"
+    ));
+    let target = resolved_function_paths(&nodes, &edges, "Unshadowed", "Target");
+    assert_eq!(target.len(), 1, "unshadowed alias must resolve once");
+    assert!(
+        target[0]
+            .replace('\\', "/")
+            .ends_with("/selected/selected.go")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_go_imported_ordinary_package_excludes_external_test_name_collision() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        ("go.mod", "module example.org/mod\n\ngo 1.24\n"),
+        (
+            "pkg/pkg.go",
+            "package pkg\nfunc Target() {}\ntype Worker struct{}\nfunc New() *Worker { return nil }\nfunc (Worker) Finish() {}\n",
+        ),
+        (
+            "pkg/pkg_test.go",
+            "package pkg_test\nfunc Target() {}\nfunc New() int { return 0 }\n",
+        ),
+        (
+            "caller/caller.go",
+            "package caller\nimport alias \"example.org/mod/pkg\"\nfunc Direct() { alias.Target() }\nfunc Factory() { alias.New().Finish() }\n",
+        ),
+    ])?;
+    for (caller, function) in [("Direct", "Target"), ("Factory", "New")] {
+        one_go_call(&nodes, &edges, caller, function);
+        let paths = resolved_function_paths(&nodes, &edges, caller, function);
+        assert_eq!(
+            paths.len(),
+            1,
+            "{caller}: ordinary package {function} must resolve despite external _test duplicate; calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        assert!(
+            paths[0].replace('\\', "/").ends_with("/pkg/pkg.go"),
+            "{caller}: external _test declaration competed with importable package: {paths:?}"
+        );
+    }
+    one_go_call(&nodes, &edges, "Factory", "Finish");
+    assert_resolved_call_to_method_owner_in_file(
+        "external-test-imported-factory",
+        &nodes,
+        &edges,
+        "Factory",
+        "Worker",
+        "Finish",
+        "pkg/pkg.go",
     );
     Ok(())
 }
@@ -18457,6 +18582,39 @@ fn test_go_module_control_change_reindexes_callers_and_clears_old_resolution() -
     Ok(())
 }
 
+fn one_go_call<'a>(nodes: &[Node], edges: &'a [Edge], caller: &str, target: &str) -> &'a Edge {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                && node_by_id.get(&edge.target).is_some_and(|target_node| {
+                    is_matching_name(&target_node.serialized_name, target)
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{caller}.{target}: expected one extracted CALL at the selector, got: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+    let call = calls[0];
+    let file = call.file_node_id.expect("CALL file identity");
+    let line = call.line.expect("CALL source line");
+    let canonical = format!("{}:{line}:", file.0);
+    assert!(
+        call.callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with(&canonical)),
+        "{caller}.{target}: CALL must retain its source-file and line identity: {call:?}"
+    );
+    call
+}
+
 fn resolved_function_paths(
     nodes: &[Node],
     edges: &[Edge],
@@ -18645,6 +18803,10 @@ func (Handler) String() string { return "handler" }
 func Guess(x any) { x.String() }
 "#,
     )])?;
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Guess", "String").resolved_target,
+        None
+    );
     assert_no_resolved_call_to_method_owner("G11", &nodes, &edges, "Guess", "Handler", "String");
     assert_no_resolved_call_of_kind("G11", &nodes, &edges, "Guess", NodeKind::METHOD);
     Ok(())

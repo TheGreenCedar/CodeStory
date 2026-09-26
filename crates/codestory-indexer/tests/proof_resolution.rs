@@ -6376,7 +6376,10 @@ fn go_noncompeting_conditional_and_test_siblings_preserve_the_exact_package_doma
                 "//go:build linux\n\npackage proof\nfunc unrelated() {}\n",
             ),
             ("main_test.go", "package proof_test\nfunc testOnly() {}\n"),
-            ("same_package_test.go", "package proof\nfunc target() {}\n"),
+            (
+                "same_package_test.go",
+                "package proof\nfunc testHelper() {}\n",
+            ),
         ],
     )?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;

@@ -752,6 +752,7 @@ pub struct ResolutionPass {
 struct GoPackageIdentity {
     import_path: String,
     package_name: String,
+    is_test_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -765,11 +766,19 @@ struct GoReturnDeclarationKey {
 type GoReturnResults = Option<Vec<Option<String>>>;
 type GoReturnDeclarationCatalog = HashMap<GoReturnDeclarationKey, GoReturnResults>;
 
+#[derive(Default)]
+struct GoReturnDeclarationCatalogs {
+    all: GoReturnDeclarationCatalog,
+    importable: GoReturnDeclarationCatalog,
+}
+
 #[derive(Debug, Default)]
 struct GoResolutionContext {
     packages_by_file_node_id: HashMap<i64, GoPackageIdentity>,
+    importable_package_names: HashMap<String, HashSet<String>>,
     ambiguous_import_paths: HashSet<String>,
     return_declarations: GoReturnDeclarationCatalog,
+    importable_return_declarations: GoReturnDeclarationCatalog,
 }
 
 #[derive(Debug)]
@@ -859,6 +868,7 @@ impl GoResolutionContext {
         let package_names = load_go_package_names(conn)?;
 
         let mut packages_by_file_node_id = HashMap::new();
+        let mut importable_package_names = HashMap::<String, HashSet<String>>::new();
         let mut package_directories_by_import = HashMap::<String, HashSet<PathBuf>>::new();
         for file in files.iter().filter(|file| file.language == "go") {
             let Some(package_name) = package_names.get(&file.id).and_then(Clone::clone) else {
@@ -891,6 +901,20 @@ impl GoResolutionContext {
             } else {
                 format!("{}/{relative}", module_path.trim_end_matches('/'))
             };
+            // Go test files may declare a separate package in the same
+            // directory, but neither its declarations nor same-package test
+            // helpers are importable by ordinary package clients.
+            let is_test_file = [&file.path, &canonical_file].into_iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_test.go"))
+            });
+            if !is_test_file {
+                importable_package_names
+                    .entry(import_path.clone())
+                    .or_default()
+                    .insert(package_name.clone());
+            }
             package_directories_by_import
                 .entry(import_path.clone())
                 .or_default()
@@ -900,6 +924,7 @@ impl GoResolutionContext {
                 GoPackageIdentity {
                     import_path,
                     package_name,
+                    is_test_file,
                 },
             );
         }
@@ -907,7 +932,7 @@ impl GoResolutionContext {
             .into_iter()
             .filter_map(|(import_path, directories)| (directories.len() > 1).then_some(import_path))
             .collect();
-        let return_declarations = load_go_return_declarations(
+        let return_catalogs = load_go_return_declarations(
             &files,
             &packages_by_file_node_id,
             &canonical_root,
@@ -915,9 +940,20 @@ impl GoResolutionContext {
         );
         Ok(Self {
             packages_by_file_node_id,
+            importable_package_names,
             ambiguous_import_paths,
-            return_declarations,
+            return_declarations: return_catalogs.all,
+            importable_return_declarations: return_catalogs.importable,
         })
+    }
+
+    fn importable_package_name(&self, module: &str, required: Option<&str>) -> Option<&str> {
+        let mut names = self.importable_package_names.get(module)?.iter();
+        let name = names.next()?;
+        if names.next().is_some() || required.is_some_and(|required| required != name.as_str()) {
+            return None;
+        }
+        Some(name)
     }
 }
 
@@ -926,7 +962,7 @@ fn load_go_return_declarations(
     packages: &HashMap<i64, GoPackageIdentity>,
     canonical_root: &Path,
     storage: &Storage,
-) -> GoReturnDeclarationCatalog {
+) -> GoReturnDeclarationCatalogs {
     const MAX_FILES: usize = 4_096;
     const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
     const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
@@ -935,7 +971,7 @@ fn load_go_return_declarations(
         .filter(|file| file.language == "go")
         .collect::<Vec<_>>();
     if go_files.len() > MAX_FILES {
-        return HashMap::new();
+        return GoReturnDeclarationCatalogs::default();
     }
     let mut total_bytes = 0usize;
     let mut pending = Vec::new();
@@ -945,30 +981,30 @@ fn load_go_return_declarations(
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .is_err()
     {
-        return HashMap::new();
+        return GoReturnDeclarationCatalogs::default();
     }
     for file in go_files {
         let Some(package) = packages.get(&file.id) else {
             continue;
         };
         let Ok(canonical_path) = file.path.canonicalize() else {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         };
         if !canonical_path.starts_with(canonical_root) {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         }
         let Some(expected_hash) = storage.get_file_content_hash(file.id).ok().flatten() else {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         };
         let Some(source) = verified_go_source(&file.path, &expected_hash, MAX_FILE_BYTES) else {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         };
         total_bytes = total_bytes.saturating_add(source.len());
         if total_bytes > MAX_TOTAL_BYTES {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         }
         let Some(tree) = parser.parse(&source, None) else {
-            return HashMap::new();
+            return GoReturnDeclarationCatalogs::default();
         };
         concrete_types
             .entry((package.import_path.clone(), package.package_name.clone()))
@@ -983,11 +1019,11 @@ fn load_go_return_declarations(
                 owner: declaration.owner,
                 function: declaration.function,
             };
-            pending.push((key, declaration.results));
+            pending.push((key, declaration.results, package.is_test_file));
         }
     }
-    let mut declarations = HashMap::new();
-    for (key, mut results) in pending {
+    let mut catalogs = GoReturnDeclarationCatalogs::default();
+    for (key, mut results, is_test_file) in pending {
         let package_types =
             concrete_types.get(&(key.import_path.clone(), key.package_name.clone()));
         if key
@@ -1005,16 +1041,27 @@ fn load_go_return_declarations(
                 *result = None;
             }
         }
-        match declarations.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(results));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(None);
-            }
+        if !is_test_file {
+            insert_go_return_declaration(&mut catalogs.importable, key.clone(), results.clone());
+        }
+        insert_go_return_declaration(&mut catalogs.all, key, results);
+    }
+    catalogs
+}
+
+fn insert_go_return_declaration(
+    declarations: &mut GoReturnDeclarationCatalog,
+    key: GoReturnDeclarationKey,
+    results: Vec<Option<String>>,
+) {
+    match declarations.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(results));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
         }
     }
-    declarations
 }
 
 fn verified_go_source(path: &Path, expected_hash: &str, max_bytes: usize) -> Option<String> {
@@ -1122,10 +1169,9 @@ impl ResolutionPass {
             .copied()
             .filter(|module| !context.ambiguous_import_paths.contains(*module))
             .filter(|module| {
-                context.packages_by_file_node_id.values().any(|package| {
-                    package.import_path == *module
-                        && package_name.is_none_or(|name| package.package_name == name)
-                })
+                context
+                    .importable_package_name(module, package_name)
+                    .is_some()
             })
             .collect::<Vec<_>>();
         eligible_modules.sort_unstable();
@@ -1133,6 +1179,8 @@ impl ResolutionPass {
         let [eligible_module] = eligible_modules.as_slice() else {
             return None;
         };
+        let eligible_package_name =
+            context.importable_package_name(eligible_module, package_name)?;
         let mut matches = candidates
             .exact_map
             .get(function_name)
@@ -1146,7 +1194,8 @@ impl ResolutionPass {
             })
             .filter_map(|node| {
                 let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
-                (package_name.is_none_or(|name| package.package_name == name)
+                (!package.is_test_file
+                    && package.package_name == eligible_package_name
                     && *eligible_module == package.import_path)
                     .then_some(node.id)
             })
@@ -1164,7 +1213,8 @@ impl ResolutionPass {
         method_name: &str,
     ) -> Option<i64> {
         let context = self.go_context.as_ref()?;
-        let (module, required_package_name) = if path.module == "." {
+        let local_package = path.module == ".";
+        let (module, required_package_name) = if local_package {
             let package = context.packages_by_file_node_id.get(&caller_file_id?)?;
             (
                 package.import_path.clone(),
@@ -1176,13 +1226,9 @@ impl ResolutionPass {
                 .split(',')
                 .filter(|module| !context.ambiguous_import_paths.contains(*module))
                 .filter(|module| {
-                    context.packages_by_file_node_id.values().any(|package| {
-                        package.import_path == *module
-                            && path
-                                .package_name
-                                .as_deref()
-                                .is_none_or(|name| package.package_name == name)
-                    })
+                    context
+                        .importable_package_name(module, path.package_name.as_deref())
+                        .is_some()
                 })
                 .collect::<Vec<_>>();
             eligible.sort_unstable();
@@ -1195,28 +1241,19 @@ impl ResolutionPass {
         if context.ambiguous_import_paths.contains(&module) {
             return None;
         }
-        let package_name = if let Some(package_name) = required_package_name {
-            package_name
+        let package_name = if local_package {
+            required_package_name?
         } else {
-            let mut packages = context
-                .return_declarations
-                .keys()
-                .filter(|key| {
-                    key.import_path == module
-                        && key.owner.is_none()
-                        && key.function == path.function
-                })
-                .map(|key| key.package_name.as_str())
-                .collect::<Vec<_>>();
-            packages.sort_unstable();
-            packages.dedup();
-            let [package_name] = packages.as_slice() else {
-                return None;
-            };
-            (*package_name).to_string()
+            context
+                .importable_package_name(&module, required_package_name.as_deref())?
+                .to_string()
         };
-        let initial = context
-            .return_declarations
+        let declarations = if local_package {
+            &context.return_declarations
+        } else {
+            &context.importable_return_declarations
+        };
+        let initial = declarations
             .get(&GoReturnDeclarationKey {
                 import_path: module.clone(),
                 package_name: package_name.clone(),
@@ -1229,8 +1266,7 @@ impl ResolutionPass {
         }
         let mut owner = initial.get(path.result_index)?.clone()?;
         for hop in &path.methods {
-            let results = context
-                .return_declarations
+            let results = declarations
                 .get(&GoReturnDeclarationKey {
                     import_path: module.clone(),
                     package_name: package_name.clone(),
@@ -1255,7 +1291,9 @@ impl ResolutionPass {
             })
             .filter_map(|node| {
                 let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
-                (package.import_path == module && package.package_name == package_name)
+                (package.import_path == module
+                    && package.package_name == package_name
+                    && (local_package || !package.is_test_file))
                     .then_some(node.id)
             })
             .collect::<Vec<_>>();

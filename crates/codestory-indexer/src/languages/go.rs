@@ -426,13 +426,11 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         );
         collect_go_package_function_call_specs(
             callable,
-            source,
             ManualReceiverSource {
                 name: call_source.name,
                 span: call_source.span,
             },
-            &package_imports,
-            &file_scope_names,
+            &resolution_context,
             &local_binding_callsites,
             &mut edges,
         );
@@ -516,10 +514,8 @@ impl GoNameVisibilityIndex {
 
 fn collect_go_package_function_call_specs(
     callable: TsNode<'_>,
-    source: &str,
     call_source: ManualReceiverSource<'_>,
-    imports: &GoPackageImports,
-    file_scope_names: &HashSet<String>,
+    context: &GoCallableResolutionContext<'_>,
     local_binding_callsites: &HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
@@ -527,33 +523,38 @@ fn collect_go_package_function_call_specs(
         if !receiver_call_belongs_to_callable(node, callable) {
             return;
         }
-        let Some((receiver_name, method_name)) = selector_call(node, source) else {
+        let Some((receiver_name, method_name)) = selector_call(node, context.source) else {
             return;
         };
-        let method_col = member_call_method_col(node, source, &method_name);
+        let method_col = member_call_method_col(node, context.source, &method_name);
         let key = ReceiverCallSiteKey {
             receiver_name: receiver_name.clone(),
             method_name: method_name.clone(),
             line: Some(node.start_position().row as u32 + 1),
             method_col,
         };
-        if local_binding_callsites.contains(&key) || file_scope_names.contains(&receiver_name) {
+        if local_binding_callsites.contains(&key)
+            || context.file_scope_names.contains(&receiver_name)
+            || context
+                .callable_name_visibility
+                .is_visible(&receiver_name, node.start_byte())
+        {
             return;
         }
         let (owner_module, binding_marker) =
-            if let Some(module) = imports.explicit.get(&receiver_name) {
+            if let Some(module) = context.return_imports.explicit.get(&receiver_name) {
                 (
                     Some(module.clone()),
                     PACKAGE_FUNCTION_CALLSITE_MARKER.to_string(),
                 )
-            } else if imports.implicit.is_empty() {
+            } else if context.return_imports.implicit.is_empty() {
                 return;
             } else {
                 (
                     None,
                     format!(
                         "{PACKAGE_FUNCTION_IMPORT_SET_PREFIX}{}",
-                        imports.implicit.join(",")
+                        context.return_imports.implicit.join(",")
                     ),
                 )
             };
