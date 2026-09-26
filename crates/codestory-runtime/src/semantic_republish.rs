@@ -361,10 +361,10 @@ fn commit_semantic_projection(
         ensure_indexing_active(cancel_token)?;
         let publish_started = Instant::now();
         let publish_stats = staged.publish_with_stats(storage_path).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to publish staged semantic projections: {error}. Preserved staged snapshot at {}",
-                staged_path.display()
-            ))
+            crate::index_storage_error(
+                &format!("Failed to publish staged semantic projections; preserved staged snapshot at {}", staged_path.display()),
+                error,
+            )
         })?;
         Ok((
             prepared_search_state,

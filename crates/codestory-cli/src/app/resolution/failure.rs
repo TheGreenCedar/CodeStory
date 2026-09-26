@@ -40,6 +40,7 @@ pub(in crate::app) fn command_failure_envelope(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         },
     ))

@@ -99,6 +99,7 @@ pub(in crate::app) fn ambiguous_command_failure(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         },
     ))

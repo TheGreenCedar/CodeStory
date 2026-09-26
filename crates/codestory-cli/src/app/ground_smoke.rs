@@ -85,6 +85,7 @@ pub(super) fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 readiness: None,
                 embedding_capacity: None,
                 embedding_retry: None,
+                disk_space: None,
                 coverage_gaps: Vec::new(),
             },
         ))
