@@ -9643,27 +9643,40 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
             vec![
                 (
                     "src/target.ts",
-                    "export interface Target { value: number }\nexport function target() {}\n",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
                 ),
                 (
                     "src/importer.ts",
-                    "import { type Target, target } from './target';\nexport function caller() { target(); }\n",
+                    "import { type Target, execute } from './target';\nexport function caller() { execute(); }\n",
                 ),
             ],
-            "target",
+            "execute",
         ),
         (
             vec![
                 (
                     "src/target.ts",
-                    "export interface Target { value: number }\nexport function target() {}\n",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
                 ),
                 (
                     "src/importer.ts",
-                    "import { target, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { target(); }\n",
+                    "import { execute, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { execute(); }\n",
                 ),
             ],
-            "target",
+            "execute",
+        ),
+        (
+            vec![
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
+                ),
+                (
+                    "src/importer.ts",
+                    "import { execute, type Target } from './target';\nexport function caller() { execute(); }\n",
+                ),
+            ],
+            "execute",
         ),
         (
             vec![
