@@ -3935,6 +3935,12 @@ pub(crate) mod activation_tests {
     }
 
     pub(crate) fn ready_activation_fixture() -> ReadyActivationFixture {
+        ready_activation_fixture_with_observer_setup(|_, _| {})
+    }
+
+    fn ready_activation_fixture_with_observer_setup(
+        setup_observer: impl FnOnce(&Path, &AppController),
+    ) -> ReadyActivationFixture {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let storage_path = cache.path().join("codestory.db");
@@ -3972,6 +3978,7 @@ pub(crate) mod activation_tests {
         .expect("publish ready-lease retrieval fixture");
 
         let service = runtime.activation_service();
+        setup_observer(project.path(), &service.controller);
         let core_publication = service
             .retained_core_publication(&storage_path)
             .expect("read ready core")
@@ -4043,6 +4050,27 @@ pub(crate) mod activation_tests {
             lease,
             sidecar,
         }
+    }
+
+    /// Force public admission to derive freshness from content. A real OS
+    /// observer may deliver a just-written file event after admission, making
+    /// the ready lease's epoch temporarily look unchanged. Replacing its
+    /// session makes that lease snapshot explicitly unproven without changing
+    /// the indexed source or injecting an event into the scan window.
+    fn require_content_scan_on_next_admission(fixture: &ReadyActivationFixture) {
+        let root = fixture.project.path();
+        let session =
+            crate::tests::freshness_observer_tests::scripted_session(root, |_| Vec::new());
+        let controller = &fixture.runtime.activation_service().controller;
+        controller.install_source_observer_for_test(root, Arc::new(session));
+        let observed = controller
+            .observed_source_epoch_if_armed(root)
+            .expect("scripted observer remains armed");
+        assert_ne!(
+            fixture.lease.source_observer.as_ref(),
+            Some(&observed),
+            "the ready lease must be unproven before testing content admission"
+        );
     }
 
     fn complete_core_without_retrieval_pointer_fixture()
@@ -4563,6 +4591,7 @@ pub(crate) mod activation_tests {
             .expect("stat the indexed source")
             .modified()
             .expect("indexed source modification time");
+        require_content_scan_on_next_admission(&fixture);
 
         let mut builds = 0_usize;
         let refusal = fixture
@@ -5390,6 +5419,7 @@ pub(crate) mod activation_tests {
             "the fixture must first populate the ready lease fingerprint memo"
         );
 
+        require_content_scan_on_next_admission(&fixture);
         fs::write(&source, "// ADMISSION_REFUSAL_DRIFT\n").expect("make source stale");
         let mut builds = 0;
         let refusal = fixture
@@ -5418,6 +5448,112 @@ pub(crate) mod activation_tests {
                 .readiness_fingerprint_passes,
             1,
             "the next readiness pass must recompute after admission refused freshness"
+        );
+    }
+
+    #[test]
+    fn a_delayed_observer_event_cannot_serve_stale_source_from_a_ready_lease() {
+        let fixture = ready_activation_fixture_with_observer_setup(|root, controller| {
+            let session =
+                crate::tests::freshness_observer_tests::scripted_session(root, |_| Vec::new());
+            controller.install_source_observer_for_test(root, Arc::new(session));
+        });
+        let browser = fixture.runtime.browser_service();
+        let source = fixture.project.path().join("metadata.rs");
+        let original = fs::read(&source).expect("read indexed source");
+        let original_mtime = fs::metadata(&source)
+            .expect("stat indexed source")
+            .modified()
+            .expect("indexed source modification time");
+        let first = browser
+            .packet(warm_packet_request())
+            .expect("prime the ready lease fingerprint memo");
+        assert_eq!(
+            first
+                .answer
+                .retrieval_trace
+                .source_freshness_telemetry
+                .expect("priming packet telemetry")
+                .readiness_fingerprint_passes,
+            1
+        );
+
+        let controller = &fixture.runtime.activation_service().controller;
+        let recorded = fixture
+            .lease
+            .source_observer
+            .as_ref()
+            .expect("the ready lease records the scripted observer");
+        assert_eq!(
+            controller
+                .observed_source_epoch_if_armed(fixture.project.path())
+                .as_ref(),
+            Some(recorded),
+            "the ready lease must begin with a coherent observer identity"
+        );
+        let mut drifted = original.clone();
+        let last_byte = drifted.len() - 2;
+        drifted[last_byte] = b'X';
+        assert_ne!(drifted, original, "the drift must change source bytes");
+        fs::write(&source, &drifted).expect("change indexed source");
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .expect("reopen drifted source")
+            .set_modified(original_mtime)
+            .expect("restore source modification time");
+        let observed_source = fs::metadata(&source).expect("stat drifted source");
+        assert_eq!(
+            observed_source.len(),
+            original.len() as u64,
+            "the drift must preserve byte length"
+        );
+        assert_eq!(
+            observed_source
+                .modified()
+                .expect("drifted modification time"),
+            original_mtime,
+            "the drift must preserve modification time"
+        );
+        assert_eq!(
+            controller
+                .observed_source_epoch_if_armed(fixture.project.path())
+                .as_ref(),
+            Some(recorded),
+            "the scripted observer deliberately delays the source event"
+        );
+
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                builds += 1;
+                Ok(())
+            })
+            .expect_err("post-build content rehash must refuse stale source");
+        assert_eq!(
+            builds, 2,
+            "the same ready lease admits both bounded attempts while its event is delayed"
+        );
+        assert_eq!(refusal.code, "publication_changed");
+
+        fs::write(&source, original).expect("restore source after refusal");
+        let _lease_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            fixture.lease.source_freshness_memo.clone(),
+        );
+        codestory_retrieval::strict_sidecar_status_for_runtime(
+            fixture.project.path(),
+            Some(&fixture.storage_path),
+            fixture.sidecar.clone(),
+        )
+        .expect("readiness after the delayed-event refusal");
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("post-refusal readiness telemetry")
+                .readiness_fingerprint_passes,
+            1,
+            "the delayed-event refusal must clear the ready lease fingerprint memo"
         );
     }
 

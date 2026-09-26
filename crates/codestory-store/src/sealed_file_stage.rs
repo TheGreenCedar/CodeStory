@@ -397,7 +397,7 @@ fn stage_sealed_file_impl(
                             io_error("create sealed stage destination", destination, cause)
                         })?;
                     owned.record(&output)?;
-                    let mut buffer = [0_u8; COPY_CHUNK_BYTES];
+                    let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
                     let mut copied = 0_u64;
                     loop {
                         if cancelled() {
@@ -763,6 +763,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const BOUNDED_STACK_COPY_CHILD_ROOT_ENV: &str = "CODESTORY_SEALED_COPY_STACK_CHILD_ROOT";
+
     fn sealed_source(root: &Path, bytes: &[u8]) -> PathBuf {
         let path = root.join("source.db");
         fs::write(&path, bytes).expect("source");
@@ -786,6 +788,61 @@ mod tests {
         assert_eq!(
             fs::read(destination).expect("candidate"),
             fs::read(source).expect("source")
+        );
+    }
+
+    #[test]
+    fn bounded_stack_copy_child() {
+        let Some(root) = std::env::var_os(BOUNDED_STACK_COPY_CHILD_ROOT_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let source = root.join("source.db");
+        let destination = root.join("candidate.db");
+        let stats = std::thread::Builder::new()
+            .name("sealed-copy-bounded-stack".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                with_native_clone_disabled(|| {
+                    stage_sealed_file(&source, &destination, &|| false)
+                        .expect("copy sealed file on bounded worker stack")
+                })
+            })
+            .expect("start bounded-stack copy worker")
+            .join()
+            .expect("bounded-stack copy worker completed");
+        assert_eq!(stats.strategy, SealedStageStrategy::Copied);
+        assert_eq!(stats.fallback_reason, Some("native_clone_disabled"));
+        assert!(stats.copied_bytes > COPY_CHUNK_BYTES as u64);
+        assert_eq!(stats.copied_bytes, stats.source_bytes);
+    }
+
+    #[test]
+    fn production_copy_fits_a_bounded_worker_stack() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let source = sealed_source(root.path(), &vec![7_u8; COPY_CHUNK_BYTES * 2 + 17]);
+        let destination = root.path().join("candidate.db");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "sealed_file_stage::tests::bounded_stack_copy_child",
+                "--nocapture",
+            ])
+            .env(BOUNDED_STACK_COPY_CHILD_ROOT_ENV, root.path())
+            .current_dir(root.path())
+            .output()
+            .expect("run bounded-stack copy child");
+        assert!(
+            output.status.success(),
+            "bounded-stack copy child failed: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read(&destination).expect("copied candidate")
+                == fs::read(&source).expect("sealed source"),
+            "bounded-stack copy preserves every source byte"
         );
     }
 
