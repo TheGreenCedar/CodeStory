@@ -11292,8 +11292,7 @@ fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyh
                                     .as_deref()
                                     .and_then(parse_canonical_callsite_identity)
                                     .is_some_and(|identity| {
-                                        identity.line == line
-                                            && identity.column == fact.callsite.column
+                                        identity.file_id == FileId(file.id) && identity.line == line
                                     })
                         })
                         .collect::<Vec<_>>();
