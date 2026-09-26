@@ -4539,6 +4539,57 @@ struct JavaKotlinWalkContext {
     unsupported: bool,
 }
 
+#[derive(Default)]
+struct JavaOverridePolicy {
+    overridden_methods: HashSet<(String, String, String)>,
+}
+
+impl JavaOverridePolicy {
+    fn prepare<'a>(classes: impl Iterator<Item = (&'a str, &'a CachedClassDeclaration)>) -> Self {
+        let mut classes_by_name = HashMap::<String, Vec<&CachedClassDeclaration>>::new();
+        for (package, class) in classes {
+            classes_by_name
+                .entry(format!("{package}.{}", class.name))
+                .or_default()
+                .push(class);
+        }
+        let mut overridden_methods = HashSet::new();
+        for classes in classes_by_name.values() {
+            for class in classes {
+                let mut parent = class.super_name.as_deref();
+                let mut visited = HashSet::new();
+                while let Some(name) = parent {
+                    if !visited.insert(name) {
+                        break;
+                    }
+                    if let Some((package, owner)) = name.rsplit_once('.') {
+                        for method in &class.instance_method_names {
+                            overridden_methods.insert((
+                                package.to_string(),
+                                owner.to_string(),
+                                method.clone(),
+                            ));
+                        }
+                    }
+                    parent = match classes_by_name.get(name).map(Vec::as_slice) {
+                        Some([class]) => class.super_name.as_deref(),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        Self { overridden_methods }
+    }
+
+    fn refuses(&self, package: &str, owner: &str, method: &str) -> bool {
+        self.overridden_methods.contains(&(
+            package.to_string(),
+            owner.to_string(),
+            method.to_string(),
+        ))
+    }
+}
+
 struct JavaKotlinResolutionIndex<'tree> {
     language: &'tree str,
     calls: Vec<IndexedJavaKotlinCall<'tree>>,
@@ -4563,6 +4614,7 @@ struct JavaKotlinResolutionIndex<'tree> {
     package_name: Option<String>,
     wildcard_import: bool,
     overloads: HashSet<String>,
+    java_overrides: JavaOverridePolicy,
     extension_methods: HashSet<String>,
     has_annotated_declaration: bool,
     has_delegation: bool,
@@ -4642,6 +4694,7 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             package_name: csd_source_domain(language, source_path),
             wildcard_import: false,
             overloads: HashSet::new(),
+            java_overrides: JavaOverridePolicy::default(),
             extension_methods: HashSet::new(),
             has_annotated_declaration: nominal_source_poison,
             has_delegation: false,
@@ -4708,6 +4761,14 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                     .or_default()
                     .push(method_index);
             }
+        }
+        if language == "java" {
+            result.java_overrides = JavaOverridePolicy::prepare(
+                result
+                    .classes
+                    .iter()
+                    .map(|class| (result.package_name.as_deref().unwrap_or_default(), class)),
+            );
         }
         result
     }
@@ -5010,6 +5071,15 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             );
         };
         let class = &self.classes[*class_index];
+        if self.language == "java"
+            && self.java_overrides.refuses(
+                self.package_name.as_deref().unwrap_or_default(),
+                &owner_name,
+                raw_target,
+            )
+        {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
         count_java_kotlin_resolution_work(1);
         let matching_methods = self
             .class_method_indices_by_name
@@ -5281,7 +5351,11 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             return context;
         };
         if self.index.language == "java"
-            && !java_kotlin_java_method_is_static(declaration_node, self.source)
+            && !java_kotlin_java_method_is_static(
+                declaration_node,
+                self.source,
+                self.index.language,
+            )
             && let Some(owner_index) = context.owner_index
         {
             self.index.classes[owner_index]
@@ -5327,7 +5401,11 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                     .parent()
                     .is_some_and(|parent| parent.kind() == "program")
             } else {
-                java_kotlin_java_method_is_static(declaration_node, self.source)
+                java_kotlin_java_method_is_static(
+                    declaration_node,
+                    self.source,
+                    self.index.language,
+                )
             };
             if same_file {
                 count_java_kotlin_resolution_work(1);
@@ -6104,7 +6182,19 @@ fn java_kotlin_declaration_has_annotation(node: TsNode<'_>, source: &str) -> boo
         .is_some_and(|header| header.contains('@'))
 }
 
-fn java_kotlin_java_method_is_static(node: TsNode<'_>, source: &str) -> bool {
+fn java_kotlin_java_method_is_static(node: TsNode<'_>, source: &str, language: &str) -> bool {
+    if language == "java" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "modifiers")
+            .any(|modifiers| {
+                let mut cursor = modifiers.walk();
+                modifiers
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "static")
+            });
+    }
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
@@ -17012,7 +17102,7 @@ struct JavaKotlinImportDomain {
 
 struct JavaKotlinProjectionIndex {
     domains: HashMap<(String, String), JavaKotlinImportDomain>,
-    java_overridden_methods: HashSet<(String, String, String)>,
+    java_overrides: JavaOverridePolicy,
     php_domains: HashMap<CachedPhpNamespace, JavaKotlinImportDomain>,
     php_identity_by_file: HashMap<i64, CachedPhpNamespace>,
     ruby_complete: bool,
@@ -17427,51 +17517,23 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
-        // Refusal belongs to the declaring receiver domain, not a same-spelled
-        // method elsewhere in the source file. Complete cached ancestry also
-        // makes the policy independent of declaration file boundaries.
-        let mut java_classes = HashMap::<String, Vec<&CachedClassDeclaration>>::new();
-        for record in records
-            .iter()
-            .filter(|record| record.file.language == "java")
-        {
-            let package = record
-                .file
-                .java_kotlin_package
-                .as_deref()
-                .unwrap_or_default();
-            for class in &record.file.classes {
-                java_classes
-                    .entry(format!("{package}.{}", class.name))
-                    .or_default()
-                    .push(class);
-            }
-        }
-        let mut java_overridden_methods = HashSet::new();
-        for classes in java_classes.values() {
-            for class in classes {
-                let mut parent = class.super_name.as_deref();
-                let mut visited = HashSet::new();
-                while let Some(name) = parent {
-                    if !visited.insert(name) {
-                        break;
-                    }
-                    if let Some((package, owner)) = name.rsplit_once('.') {
-                        for method in &class.instance_method_names {
-                            java_overridden_methods.insert((
-                                package.to_string(),
-                                owner.to_string(),
-                                method.clone(),
-                            ));
-                        }
-                    }
-                    parent = match java_classes.get(name).map(Vec::as_slice) {
-                        Some([class]) => class.super_name.as_deref(),
-                        _ => None,
-                    };
-                }
-            }
-        }
+        let java_overrides = JavaOverridePolicy::prepare(
+            records
+                .iter()
+                .filter(|record| record.file.language == "java")
+                .flat_map(|record| {
+                    record.file.classes.iter().map(move |class| {
+                        (
+                            record
+                                .file
+                                .java_kotlin_package
+                                .as_deref()
+                                .unwrap_or_default(),
+                            class,
+                        )
+                    })
+                }),
+        );
         for ((language, package), domain) in &mut domains {
             if is_java_kotlin_language(language) {
                 if language == "java"
@@ -17530,7 +17592,7 @@ impl JavaKotlinProjectionIndex {
         }
         Self {
             domains,
-            java_overridden_methods,
+            java_overrides,
             php_domains,
             php_identity_by_file,
             ruby_complete,
@@ -17554,13 +17616,27 @@ impl JavaKotlinProjectionIndex {
         else {
             return JavaKotlinImportResolution::Missing;
         };
+        if matches!(language, "java" | "kotlin") {
+            if !domain.complete
+                || domain.poisoned
+                || owner_name.is_some_and(|owner| domain.unsupported_owner_names.contains(owner))
+            {
+                return JavaKotlinImportResolution::Incomplete;
+            }
+            if owner_name.is_some_and(|owner| {
+                domain
+                    .classes
+                    .get(owner)
+                    .is_some_and(|classes| classes.len() > 1)
+            }) {
+                return JavaKotlinImportResolution::Ambiguous;
+            }
+        }
         if let Some(owner) = owner_name {
             if language == "java"
-                && self.java_overridden_methods.contains(&(
-                    package_name.to_string(),
-                    owner.to_string(),
-                    imported_name.to_string(),
-                ))
+                && self
+                    .java_overrides
+                    .refuses(package_name, owner, imported_name)
                 || language == "kotlin" && !domain.kotlin_runtime_closed_types.contains(owner)
             {
                 return JavaKotlinImportResolution::Unsupported;
@@ -18235,6 +18311,53 @@ fn resolve_syntax_claim(
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
     let mut exact_node_file_expectations = vec![(caller, input.callsite.file_id)];
     let mut exact_dependency_files = vec![input.callsite.file_id];
+    let local_java_owner = match &input.binding {
+        CachedResolutionBinding::ImplicitReceiver { owner_name, .. }
+        | CachedResolutionBinding::ConstructorBinding {
+            class_binding: CachedClassBinding::SameFile { owner_name, .. },
+            ..
+        }
+        | CachedResolutionBinding::ExplicitReceiverType {
+            class_binding: CachedClassBinding::SameFile { owner_name, .. },
+            ..
+        } => Some(owner_name),
+        _ => None,
+    };
+    if source_record.file.language == "java"
+        && local_java_owner.is_some_and(|owner| {
+            java_kotlin_index.java_overrides.refuses(
+                source_record
+                    .file
+                    .java_kotlin_package
+                    .as_deref()
+                    .unwrap_or_default(),
+                owner,
+                &input.callsite.raw_target,
+            )
+        })
+    {
+        let complete = source_file.complete
+            && source_record.file.complete
+            && source_record.file.lookup_input_complete;
+        return Ok(ResolvedSyntaxClaim {
+            input,
+            caller,
+            target,
+            status: if complete {
+                ProofResolutionStatus::Unsupported
+            } else {
+                ProofResolutionStatus::IncompleteDomain
+            },
+            reason: if complete {
+                ProofResolutionReason::UnsupportedConstruct
+            } else {
+                ProofResolutionReason::LookupDomainIncomplete
+            },
+            evidence_chain,
+            exact_node_file_expectations,
+            exact_dependency_files,
+        });
+    }
     match &input.binding {
         CachedResolutionBinding::SameFile {
             declaration,
@@ -19527,35 +19650,6 @@ fn resolve_syntax_claim(
             evidence_chain.clear();
             exact_dependency_files.clear();
         }
-    }
-    let local_java_owner = match &input.binding {
-        CachedResolutionBinding::ImplicitReceiver { owner_name, .. }
-        | CachedResolutionBinding::ConstructorBinding {
-            class_binding: CachedClassBinding::SameFile { owner_name, .. },
-            ..
-        }
-        | CachedResolutionBinding::ExplicitReceiverType {
-            class_binding: CachedClassBinding::SameFile { owner_name, .. },
-            ..
-        } => Some(owner_name),
-        _ => None,
-    };
-    if source_record.file.language == "java"
-        && source_record.file.java_kotlin_package.is_none()
-        && local_java_owner.is_some_and(|owner| {
-            java_kotlin_index.java_overridden_methods.contains(&(
-                String::new(),
-                owner.clone(),
-                input.callsite.raw_target.clone(),
-            ))
-        })
-    {
-        status = ProofResolutionStatus::Unsupported;
-        reason = ProofResolutionReason::UnsupportedConstruct;
-        target = None;
-        evidence_chain.clear();
-        exact_node_file_expectations.clear();
-        exact_dependency_files.clear();
     }
     if status == ProofResolutionStatus::Exact && source_record.file.language == "java" {
         let same_package_receiver = input.callsite.callee_form == CalleeForm::ExplicitReceiver

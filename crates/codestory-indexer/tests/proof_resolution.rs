@@ -745,9 +745,9 @@ fn assert_nominal_call_is_nonexact(
         "{language} {caller_path}:{call_line} pre-proof CALL={:?}, fact={fact:#?}",
         calls[0]
     );
-    assert_ne!(
+    assert_eq!(
         fact.status,
-        ProofResolutionStatus::Exact,
+        ProofResolutionStatus::Unsupported,
         "source virtual/class refusal must not depend on declaration file boundaries"
     );
     assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
@@ -816,6 +816,53 @@ fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> 
         "java",
         "Caller.java",
         5,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "Worker.java",
+                "class Worker {\n  void target() {}\n}\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "Child.java",
+                "class Child extends Worker { void target() {} }\n",
+            ),
+        ],
+        "java",
+        "Worker.java",
+        6,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "Worker.java",
+                "class Worker {\n  static void target() {}\n}\nclass Caller { void caller() { Worker.target(); } }\n",
+            ),
+            (
+                "Child.java",
+                "class Child extends Worker { static void target() {} }\n",
+            ),
+        ],
+        "java",
+        "Worker.java",
+        2,
+        1,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  void target() {}\n}\nclass Caller { void caller(Worker value) { value.target(); } }\n",
+            ),
+            (
+                "q/Worker.java",
+                "package q;\nclass Worker { void target() {} }\nclass Child extends Worker { void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Worker.java",
+        3,
+        2,
     )?;
     for split in [false, true] {
         let files = if split {
@@ -926,6 +973,58 @@ fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> 
             (
                 "q/Child.java",
                 "package q;\nimport p.Worker;\nclass Child extends Worker { public void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+        "java",
+        "p/Caller.java",
+        4,
+    )
+}
+
+#[test]
+fn java_static_refusal_classification_uses_modifier_tokens() -> anyhow::Result<()> {
+    for split in [false, true] {
+        let files = if split {
+            vec![
+                (
+                    "p/Worker.java",
+                    "package p;\nclass Worker { public void target() {} }\n",
+                ),
+                (
+                    "p/Child.java",
+                    "package p;\nclass Child extends Worker { public /* static */ void target() {} }\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+                ),
+            ]
+        } else {
+            vec![(
+                "p/Caller.java",
+                "package p;\nclass Worker { public void target() {} }\nclass Child extends Worker { public /* static */ void target() {} }\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            )]
+        };
+        assert_nominal_call_is_nonexact(
+            &files,
+            "java",
+            "p/Caller.java",
+            if split { 4 } else { 6 },
+        )?;
+    }
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\npublic class Worker { public void target() {} }\n",
+            ),
+            (
+                "q/Child.java",
+                "package q;\nimport p.Worker;\n@interface Note { String value(); }\nclass Child extends Worker { @Note(\" static \") public void target() {} }\n",
             ),
             (
                 "p/Caller.java",
