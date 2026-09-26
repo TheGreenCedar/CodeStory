@@ -4045,6 +4045,27 @@ pub(crate) mod activation_tests {
         }
     }
 
+    /// Force public admission to derive freshness from content. A real OS
+    /// observer may deliver a just-written file event after admission, making
+    /// the ready lease's epoch temporarily look unchanged. Replacing its
+    /// session makes that lease snapshot explicitly unproven without changing
+    /// the indexed source or injecting an event into the scan window.
+    fn require_content_scan_on_next_admission(fixture: &ReadyActivationFixture) {
+        let root = fixture.project.path();
+        let session =
+            crate::tests::freshness_observer_tests::scripted_session(root, |_| Vec::new());
+        let controller = &fixture.runtime.activation_service().controller;
+        controller.install_source_observer_for_test(root, Arc::new(session));
+        let observed = controller
+            .observed_source_epoch_if_armed(root)
+            .expect("scripted observer remains armed");
+        assert_ne!(
+            fixture.lease.source_observer.as_ref(),
+            Some(&observed),
+            "the ready lease must be unproven before testing content admission"
+        );
+    }
+
     fn complete_core_without_retrieval_pointer_fixture()
     -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
         let project = tempfile::tempdir().expect("project");
@@ -4563,6 +4584,7 @@ pub(crate) mod activation_tests {
             .expect("stat the indexed source")
             .modified()
             .expect("indexed source modification time");
+        require_content_scan_on_next_admission(&fixture);
 
         let mut builds = 0_usize;
         let refusal = fixture
@@ -5390,6 +5412,7 @@ pub(crate) mod activation_tests {
             "the fixture must first populate the ready lease fingerprint memo"
         );
 
+        require_content_scan_on_next_admission(&fixture);
         fs::write(&source, "// ADMISSION_REFUSAL_DRIFT\n").expect("make source stale");
         let mut builds = 0;
         let refusal = fixture
