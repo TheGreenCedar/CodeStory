@@ -125,6 +125,35 @@ fn u03_localstack_openapi_fixtures_project_endpoints_without_collector_failure()
 
 #[test]
 fn u03_colliding_route_siblings_keep_file_owned_openapi_projections() -> Result<()> {
+    let expected_routes: [(&str, &[&str]); 5] = [
+        (
+            "tests/aws/files/pets.json",
+            &["GET /pets", "GET /pets/{petId}"],
+        ),
+        (
+            "tests/aws/files/petstore-swagger.json",
+            &[
+                "GET /",
+                "GET /pets",
+                "POST /pets",
+                "OPTIONS /pets",
+                "GET /pets/{petId}",
+                "OPTIONS /pets/{petId}",
+            ],
+        ),
+        (
+            "tests/aws/files/openapi.spec.tf.json",
+            &["GET /", "OPTIONS /"],
+        ),
+        (
+            "tests/aws/files/openapi.spec.global-auth.json",
+            &["GET /pets"],
+        ),
+        (
+            "tests/aws/files/openapi.spec.circular-ref.json",
+            &["POST /person"],
+        ),
+    ];
     let files = colliding_u03_cases()
         .into_iter()
         .map(|(relative, name)| (relative, fixture(name)))
@@ -153,6 +182,40 @@ fn u03_colliding_route_siblings_keep_file_owned_openapi_projections() -> Result<
         failures.is_empty(),
         "shared-route OpenAPI siblings must not collide; failures={failures:#?}"
     );
+
+    let endpoints = storage
+        .get_nodes()?
+        .into_iter()
+        .filter_map(|node| {
+            node.canonical_id
+                .as_deref()
+                .and_then(|value| value.strip_prefix("openapi:endpoint:"))
+                .map(|label| (label.to_owned(), node.file_node_id.map(|owner| owner.0)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        endpoints.len(),
+        expected_routes
+            .iter()
+            .map(|(_, routes)| routes.len())
+            .sum::<usize>(),
+        "shared-route batch must not add or drop an endpoint"
+    );
+    for (relative, routes) in expected_routes {
+        let file = indexed
+            .iter()
+            .find(|file| file.path.ends_with(relative))
+            .unwrap_or_else(|| panic!("missing indexed file {relative}"));
+        let mut actual = endpoints
+            .iter()
+            .filter(|(_, owner)| *owner == Some(file.id))
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = routes.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "{relative} endpoint membership");
+    }
     Ok(())
 }
 

@@ -14,6 +14,60 @@ use std::fs;
 use std::path::PathBuf;
 
 const GOLDEN_SHA256: &str = "93590a228d76de40245623308699e98b8f2b84ddd119cfddc583560f55903c93";
+// File-owned endpoints in the retained 3.2 schema. The line is the method
+// declaration, not the path declaration; this pins the emitted source span.
+const EXPECTED_ENDPOINTS: [(&str, u32); 50] = [
+    ("GET /query", 13),
+    ("POST /query", 146),
+    ("GET /query_range", 214),
+    ("POST /query_range", 373),
+    ("GET /query_exemplars", 429),
+    ("POST /query_exemplars", 518),
+    ("GET /format_query", 577),
+    ("POST /format_query", 619),
+    ("GET /parse_query", 667),
+    ("POST /parse_query", 710),
+    ("GET /labels", 759),
+    ("POST /labels", 875),
+    ("GET /label/{name}/values", 951),
+    ("GET /search/metric_names", 1060),
+    ("POST /search/metric_names", 1257),
+    ("GET /search/label_names", 1306),
+    ("POST /search/label_names", 1493),
+    ("GET /search/label_values", 1543),
+    ("POST /search/label_values", 1740),
+    ("GET /series", 1791),
+    ("POST /series", 1903),
+    ("GET /metadata", 1974),
+    ("GET /scrape_pools", 2051),
+    ("GET /scrape_pools/config", 2092),
+    ("GET /targets", 2141),
+    ("GET /targets/metadata", 2225),
+    ("GET /targets/relabel_steps", 2296),
+    ("GET /rules", 2362),
+    ("GET /alerts", 2510),
+    ("GET /alertmanagers", 2552),
+    ("GET /status/config", 2587),
+    ("GET /status/runtimeinfo", 2634),
+    ("GET /status/buildinfo", 2679),
+    ("GET /status/flags", 2717),
+    ("GET /status/tsdb", 2763),
+    ("GET /status/tsdb/blocks", 2833),
+    ("GET /status/walreplay", 2880),
+    ("GET /status/self_metrics", 2915),
+    ("PUT /admin/tsdb/delete_series", 2986),
+    ("POST /admin/tsdb/delete_series", 3069),
+    ("PUT /admin/tsdb/clean_tombstones", 3153),
+    ("POST /admin/tsdb/clean_tombstones", 3184),
+    ("PUT /admin/tsdb/snapshot", 3216),
+    ("POST /admin/tsdb/snapshot", 3260),
+    ("POST /read", 3305),
+    ("POST /write", 3321),
+    ("POST /otlp/v1/metrics", 3337),
+    ("GET /notifications", 3353),
+    ("GET /notifications/live", 3388),
+    ("GET /features", 3426),
+];
 
 fn golden_bytes() -> &'static [u8] {
     include_bytes!("fixtures/openapi_3.2_golden.yaml")
@@ -88,18 +142,31 @@ fn openapi_3_2_golden_yaml_produces_endpoint_projection_without_collector_failur
         "OpenAPI 3.2 golden YAML must not land CollectorFailure; errors={collector_failures:?}"
     );
 
-    let endpoints = storage
+    let mut endpoints = storage
         .get_nodes()?
         .into_iter()
-        .filter(|node| {
+        .filter_map(|node| {
             node.canonical_id
                 .as_deref()
-                .is_some_and(|value| value.starts_with("openapi:endpoint:"))
+                .and_then(|value| value.strip_prefix("openapi:endpoint:"))
+                .map(|label| {
+                    (
+                        label.to_owned(),
+                        node.file_node_id.map(|owner| owner.0),
+                        node.start_line,
+                    )
+                })
         })
-        .count();
-    assert!(
-        endpoints >= 1,
-        "expected at least one openapi:endpoint projection; got {endpoints}"
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    let mut expected = EXPECTED_ENDPOINTS
+        .into_iter()
+        .map(|(label, line)| (label.to_owned(), Some(file_id), Some(line)))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(
+        endpoints, expected,
+        "OpenAPI 3.2 golden must project every method/path with file ownership and source line"
     );
     Ok(())
 }
