@@ -11208,6 +11208,137 @@ fn script_exported_prototype_poison_is_persisted_and_class_wide() -> anyhow::Res
 }
 
 #[test]
+fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        for default in [false, true] {
+            for mutation in [
+                "const Alias = C; Reflect.set(Alias.prototype, 'target', other);",
+                "Reflect.set(...[C.prototype, 'target', other]);",
+                "Reflect.set(getPrototype(), 'target', other);",
+                "Reflect[key](C.prototype, 'target', other);",
+                "Object.defineProperty(globalThis, 'unrelated', { value: 1 });",
+            ] {
+                let project = tempfile::tempdir()?;
+                let mut store = Store::new_in_memory()?;
+                let exporter_path = format!("src/exported.{extension}");
+                let class_importer_path = format!("src/class_importer.{extension}");
+                let callable_importer_path = format!("src/callable_importer.{extension}");
+                let declaration = if default {
+                    "export default class C"
+                } else {
+                    "export class C"
+                };
+                let class_import = if default {
+                    "import C from './exported';"
+                } else {
+                    "import { C } from './exported';"
+                };
+                let exporter = format!(
+                    "{declaration} {{\n  target() {{}}\n}}\nfunction other() {{}}\n{mutation}\nexport function lexicalTarget() {{}}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\nexport function lexicalCaller() {{\n  lexicalTarget();\n}}\n"
+                );
+                let class_importer = format!(
+                    "{class_import}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+                );
+                index_files(
+                    project.path(),
+                    &mut store,
+                    &[
+                        (&exporter_path, &exporter),
+                        (&class_importer_path, &class_importer),
+                        (
+                            &callable_importer_path,
+                            "import { lexicalTarget } from './exported';\nexport function caller() {\n  lexicalTarget();\n}\n",
+                        ),
+                    ],
+                )?;
+                let files = store.get_files()?;
+                let ordinary = store.get_edges()?;
+                rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+                store.validate_proof_resolution_publication(&publication(1))?;
+                let facts = store.get_proof_resolution_facts()?;
+                for (path, line) in [(&exporter_path, 9), (&class_importer_path, 4)] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent receiver file");
+                    let matching = facts
+                        .iter()
+                        .filter(|fact| {
+                            fact.callsite.file_id == FileId(file.id)
+                                && fact.callsite.line == line
+                                && fact.callsite.raw_target == "target"
+                        })
+                        .collect::<Vec<_>>();
+                    let [fact] = matching.as_slice() else {
+                        panic!("designated receiver fact must exist once: {matching:#?}");
+                    };
+                    assert_eq!(
+                        fact.status,
+                        ProofResolutionStatus::IncompleteDomain,
+                        "{extension}/{default}/{mutation}: {fact:#?}"
+                    );
+                    assert!(
+                        fact.target.is_none()
+                            && fact.edge_id.is_none()
+                            && fact.evidence_chain.is_empty()
+                    );
+                    let calls = ordinary
+                        .iter()
+                        .filter(|edge| {
+                            edge.kind == EdgeKind::CALL
+                                && edge.file_node_id == Some(NodeId(file.id))
+                                && edge
+                                    .callsite_identity
+                                    .as_deref()
+                                    .and_then(parse_canonical_callsite_identity)
+                                    .is_some_and(|identity| {
+                                        identity.line == line
+                                            && identity.column == fact.callsite.column
+                                    })
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        calls.len(),
+                        1,
+                        "independent designated ordinary CALL census"
+                    );
+                    assert!(
+                        store.get_edges()?.iter().any(|edge| edge == calls[0]),
+                        "nonexact proof must not upgrade ordinary endpoint"
+                    );
+                }
+                for (path, line) in [(&exporter_path, 12), (&callable_importer_path, 3)] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent callable file");
+                    let matching = facts
+                        .iter()
+                        .filter(|fact| {
+                            fact.callsite.file_id == FileId(file.id)
+                                && fact.callsite.line == line
+                                && fact.callsite.raw_target == "lexicalTarget"
+                        })
+                        .collect::<Vec<_>>();
+                    let [fact] = matching.as_slice() else {
+                        panic!("designated lexical fact must exist once: {matching:#?}");
+                    };
+                    assert_nominal_exact_target(
+                        &store,
+                        project.path(),
+                        fact,
+                        &exporter_path,
+                        6,
+                        None,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::Result<()> {
     for (extension, old_version, current_version) in [
         ("js", "reference-v15", "reference-v16"),

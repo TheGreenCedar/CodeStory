@@ -9979,6 +9979,7 @@ struct JavascriptResolutionIndex<'tree> {
     mutated_members: HashMap<(String, String), Vec<(usize, usize)>>,
     dynamically_mutated_owners: HashMap<String, Vec<(usize, usize)>>,
     dynamic_breaker_scopes: HashSet<(usize, usize)>,
+    receiver_mutation_scopes: HashSet<(usize, usize)>,
     module_dynamic_breaker: bool,
     export_statements: Vec<TsNode<'tree>>,
     module_range: (usize, usize),
@@ -10037,6 +10038,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             mutated_members: HashMap::new(),
             dynamically_mutated_owners: HashMap::new(),
             dynamic_breaker_scopes: HashSet::new(),
+            receiver_mutation_scopes: HashSet::new(),
             module_dynamic_breaker: false,
             export_statements: Vec::new(),
             module_range: (root.start_byte(), root.end_byte()),
@@ -10419,8 +10421,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         let Some(member) = member else {
             // A computed Object/Reflect operation may be one of the mutators.
             // Keep authority closed without evaluating arbitrary property values.
-            self.dynamic_breaker_scopes.insert(range);
-            self.module_dynamic_breaker |= scope.id() == root.id();
+            self.receiver_mutation_scopes.insert(range);
             return;
         };
         let member_write = matches!(
@@ -10447,8 +10448,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             .first()
             .and_then(|target| javascript_mutation_owner(*target, source))
         else {
-            self.dynamic_breaker_scopes.insert(range);
-            self.module_dynamic_breaker |= scope.id() == root.id();
+            self.receiver_mutation_scopes.insert(range);
             return;
         };
         // A lexical alias is not an authenticated class/receiver owner. It may
@@ -10463,8 +10463,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             })
             || self.receiver_bindings.contains_key(base);
         if !known_owner {
-            self.dynamic_breaker_scopes.insert(range);
-            self.module_dynamic_breaker |= scope.id() == root.id();
+            self.receiver_mutation_scopes.insert(range);
             return;
         }
         match (builtin, member) {
@@ -10606,6 +10605,16 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             return (Some(caller), CachedResolutionBinding::Unsupported);
         }
         if javascript_ancestor_range_is_indexed(callee, &self.dynamic_breaker_scopes) {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        // Explicit Object/Reflect mutations can invalidate receiver domains,
+        // but cannot replace an authenticated lexical callable binding. eval/with
+        // retain the separate all-call fence above.
+        if matches!(
+            form,
+            CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver
+        ) && javascript_ancestor_range_is_indexed(callee, &self.receiver_mutation_scopes)
+        {
             return (Some(caller), CachedResolutionBinding::IncompleteDomain);
         }
         if form == CalleeForm::ImplicitReceiver {
@@ -10910,7 +10919,8 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                     (declaration, CachedDeclarationKind::Callable)
                 }
                 JavascriptBindingKind::Class { owner } => {
-                    if mutated_module_owners.contains(name.as_str())
+                    if self.receiver_mutation_scopes.contains(&self.module_range)
+                        || mutated_module_owners.contains(name.as_str())
                         || mutated_module_owners.contains(format!("{name}.prototype").as_str())
                     {
                         poisoned_names.insert(if is_default {
