@@ -2693,52 +2693,33 @@ mod tests {
             _ => panic!("unsupported dependency-order fixture {language}"),
         };
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        // Select a complete ordinary path tuple, rather than comparing candidates
-        // against one fixed temp-root-dependent hash extremum.
+        // Preserve supported logical target paths and literal imports. Select
+        // the enclosing project root and caller path together so neither native
+        // file identity is a fixed hash extremum.
         let parser_file_id = |path: &Path| {
             let path = path.to_string_lossy().replace('\\', "/");
             #[cfg(windows)]
             let path = path.to_lowercase();
             codestory_indexer::generate_id(&format!("{path}:{path}:1"))
         };
-        let target_template = Path::new(target_path);
-        let target_stem = target_template.file_stem().unwrap().to_str().unwrap();
-        let source_candidates = (0..64)
-            .map(|index| {
-                root.join(caller_directory)
-                    .join(format!("caller_{index}.{extension}"))
-            })
-            .map(|path| {
-                let id = parser_file_id(&path);
-                (path, id)
-            })
-            .collect::<Vec<_>>();
-        let (target_path, source_path) = (0..64)
-            .find_map(|index| {
-                let target_path = root
-                    .join(target_template.parent().unwrap())
-                    .join(format!("{target_stem}_{index}.{extension}"));
+        let (root, target_path, source_path) = (0..64)
+            .find_map(|root_index| {
+                let root = temp.path().join(format!("project_{root_index}"));
+                let target_path = root.join(target_path);
                 let target_id = parser_file_id(&target_path);
-                source_candidates
-                    .iter()
-                    .find(|(_, source_id)| {
-                        (*source_id > target_id) == source_after_target && *source_id != target_id
+                (0..64)
+                    .map(|index| {
+                        root.join(caller_directory)
+                            .join(format!("caller_{index}.{extension}"))
                     })
-                    .map(|(source_path, _)| (target_path, source_path.clone()))
+                    .find(|source_path| {
+                        let source_id = parser_file_id(source_path);
+                        (source_id > target_id) == source_after_target && source_id != target_id
+                    })
+                    .map(|source_path| (root, target_path, source_path))
             })
-            .expect("bounded complete path tuples realize requested parser file-ID order");
+            .expect("bounded root/path tuples realize requested parser file-ID order");
         let target_file_id = parser_file_id(&target_path);
-        let target_leaf = target_path.file_name().unwrap().to_str().unwrap();
-        let target_stem = target_path.file_stem().unwrap().to_str().unwrap();
-        let caller_source = match language {
-            "ruby" => caller_source.replace(
-                "require_relative \"worker\"",
-                &format!("require_relative \"{target_stem}\""),
-            ),
-            "dart" => caller_source.replace("'worker.dart'", &format!("'{target_leaf}'")),
-            _ => caller_source.to_owned(),
-        };
         fs::create_dir_all(target_path.parent().unwrap()).unwrap();
         fs::write(&target_path, target_source).unwrap();
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
