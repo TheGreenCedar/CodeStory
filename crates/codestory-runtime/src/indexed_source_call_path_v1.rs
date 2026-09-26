@@ -3147,28 +3147,38 @@ mod tests {
 
     #[test]
     fn sealed_encounter_order_compact_selects_each_evidence_profile() {
-        // Actual two-step Ruby source chain produces both receipts before any JSON mutation.
-        let mut case = sealed_dependency_order_case("ruby", true);
-        let worker_path = case.fixture.root.join("lib/worker.rb");
-        let worker_id = case.target.file_node_id.unwrap().0;
+        // Build the complete named-receiver chain together, without an incremental
+        // update or a constructor-expression call standing in for a proven receipt.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let parser_file_id = |path: &Path| {
+            let path = path.to_string_lossy().replace('\\', "/");
+            #[cfg(windows)]
+            let path = path.to_lowercase();
+            codestory_indexer::generate_id(&format!("{path}:{path}:1"))
+        };
+        let worker_path = root.join("lib/worker.rb");
+        let worker_id = parser_file_id(&worker_path);
+        let source_path = (0..4096)
+            .map(|index| root.join(format!("lib/caller_{index}.rb")))
+            .find(|path| parser_file_id(path) > worker_id)
+            .expect("ordinary caller spelling after worker ID");
         let other_path = (0..4096)
-            .map(|index| case.fixture.root.join(format!("lib/other_{index}.rb")))
-            .find(|path| {
-                let path = path.to_string_lossy().replace('\\', "/");
-                #[cfg(windows)]
-                let path = path.to_lowercase();
-                codestory_indexer::generate_id(&format!("{path}:{path}:1")) < worker_id
-            })
+            .map(|index| root.join(format!("lib/other_{index}.rb")))
+            .find(|path| parser_file_id(path) < worker_id)
             .expect("ordinary target spelling before worker ID");
         let other_stem = other_path.file_stem().unwrap().to_str().unwrap();
-        fs::write(&worker_path, format!("require_relative \"{other_stem}\"\nclass Worker\n  def target\n    Other.new.finish\n  end\nend\n")).unwrap();
+        fs::create_dir_all(worker_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "require_relative \"worker\"\ndef caller\n  worker = Worker.new\n  worker.target\nend\n").unwrap();
+        fs::write(&worker_path, format!("require_relative \"{other_stem}\"\nclass Worker\n  def target\n    other = Other.new\n    other.finish\n  end\nend\n")).unwrap();
         fs::write(&other_path, "class Other\n  def finish\n  end\nend\n").unwrap();
-        WorkspaceIndexer::new(case.fixture.root.clone())
+        let mut store = Store::new_in_memory().unwrap();
+        WorkspaceIndexer::new(root.clone())
             .run_incremental(
-                &mut case.fixture.store,
+                &mut store,
                 &RefreshInfo {
                     mode: BuildMode::Incremental,
-                    files_to_index: vec![case.fixture.source_path.clone(), worker_path, other_path],
+                    files_to_index: vec![source_path.clone(), worker_path, other_path],
                     files_to_remove: Vec::new(),
                     existing_file_ids: HashMap::new(),
                 },
@@ -3176,21 +3186,19 @@ mod tests {
                 None,
             )
             .unwrap();
-        case.fixture.publication.generation = 2;
-        case.fixture.publication.generation_id = "mixed-profile-generation-2".to_owned();
-        case.fixture.publication.run_id = "mixed-profile-run-2".to_owned();
-        rematerialize_proof_resolution_projection(
-            &mut case.fixture.store,
-            &case.fixture.publication,
-        )
-        .unwrap();
-        case.fixture
-            .store
-            .validate_proof_resolution_publication(&case.fixture.publication)
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "mixed-profile-generation-1".to_owned(),
+            run_id: "mixed-profile-run-1".to_owned(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        rematerialize_proof_resolution_projection(&mut store, &publication).unwrap();
+        store
+            .validate_proof_resolution_publication(&publication)
             .unwrap();
-        let target = case
-            .fixture
-            .store
+        let caller = source_callable(&store, "caller");
+        let target = store
             .get_nodes()
             .unwrap()
             .into_iter()
@@ -3198,9 +3206,7 @@ mod tests {
                 is_callable(node.kind) && node.qualified_name.as_deref() == Some("Worker.target")
             })
             .unwrap();
-        let finish = case
-            .fixture
-            .store
+        let finish = store
             .get_nodes()
             .unwrap()
             .into_iter()
@@ -3209,14 +3215,22 @@ mod tests {
             })
             .unwrap();
         let (contract, hashes, rendering) = validated_contract(
-            canonical_id(&case.caller),
+            canonical_id(&caller),
             &[canonical_id(&target), canonical_id(&finish)],
         );
+        let fixture = SourceBuiltFixture {
+            _root: temp,
+            root: root.clone(),
+            source_path,
+            store,
+            publication,
+            project_id: project_identity_v3(&root).project_id,
+        };
         let checked = evaluate_from_store(
-            &case.fixture.store,
-            &case.fixture.root,
-            &case.fixture.project_id,
-            &case.fixture.publication,
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
             CheckedIntegrationInputs {
                 contract: &contract,
                 hashes: &hashes,
@@ -3226,7 +3240,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(checked.disposition(), ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 2)
+            matches!(checked.disposition(), ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 2),
+            "two-step source fixture failed: checked={checked:#?}; facts={:#?}; edges={:#?}",
+            fixture.store.get_proof_resolution_facts().unwrap(),
+            fixture.store.get_edges().unwrap(),
         );
         let InternalProjection::Complete { root, .. } =
             project_internal_call_path_result(&checked).unwrap()
