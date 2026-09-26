@@ -252,9 +252,9 @@ const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
-const CPP_ADAPTER_VERSION: &str = "reference-v4";
-const RUBY_ADAPTER_VERSION: &str = "reference-v3";
-const PHP_ADAPTER_VERSION: &str = "reference-v2";
+const CPP_ADAPTER_VERSION: &str = "reference-v5";
+const RUBY_ADAPTER_VERSION: &str = "reference-v4";
+const PHP_ADAPTER_VERSION: &str = "reference-v3";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
@@ -3127,6 +3127,9 @@ impl<'tree> CCppResolutionIndex<'tree> {
                 constructor,
                 receiver_name,
             } => {
+                if *constructor && !self.constructor_spelling_is_unambiguous(call, owner_name) {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
                 if let (Some(callable_id), Some(receiver_name)) = (call.callable_id, receiver_name)
                     && self
                         .rebound_receivers
@@ -3243,6 +3246,55 @@ impl<'tree> CCppResolutionIndex<'tree> {
             [] => CachedResolutionBinding::Unsupported,
             _ => CachedResolutionBinding::Ambiguous,
         }
+    }
+
+    fn constructor_spelling_is_unambiguous(&self, call: &IndexedCCppCall<'_>, name: &str) -> bool {
+        if self.macro_names.contains(name) {
+            return false;
+        }
+        if let Some(owner) = call.owner_index {
+            let owner_name = &self.classes[owner].name;
+            let callable_key = (
+                self.class_namespace_paths[owner].clone(),
+                Some(owner_name.clone()),
+                name.to_string(),
+            );
+            // An actual constructor shares its class name. Other class-scope
+            // callables and fields can hide an enclosing type in an expression.
+            if (owner_name != name
+                && (self.declaration_signatures.contains_key(&callable_key)
+                    || self.unsupported_declarations.contains(&callable_key)))
+                || self.owner_bindings.contains_key(&(owner, name.to_string()))
+            {
+                return false;
+            }
+        }
+        // Unqualified expression lookup includes enclosing namespaces. The complete
+        // callable census also covers prototypes and declarations with no graph target.
+        let class_namespace =
+            self.class_indices_by_name
+                .get(name)
+                .and_then(|classes| match classes.as_slice() {
+                    [class] => Some(&self.class_namespace_paths[*class]),
+                    _ => None,
+                });
+        for depth in (0..=call.namespace_path.len()).rev() {
+            count_c_cpp_resolution_work(3);
+            let namespace = call.namespace_path[..depth].to_vec();
+            let callable_key = (namespace.clone(), None, name.to_string());
+            if self.declaration_signatures.contains_key(&callable_key)
+                || self.unsupported_declarations.contains(&callable_key)
+                || self
+                    .global_shadow_names
+                    .contains(&(namespace.clone(), name.to_string()))
+            {
+                return false;
+            }
+            if class_namespace == Some(&namespace) {
+                return true;
+            }
+        }
+        false
     }
 
     fn resolve_explicit_receiver(
@@ -3902,6 +3954,14 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
                     ));
                 }
                 if let Some(owner_name) = c_cpp_direct_constructor_type(receiver, self.source) {
+                    if self.active_bindings.contains_key(&owner_name) {
+                        return Some((
+                            field,
+                            CalleeForm::ExplicitReceiver,
+                            target,
+                            CCppCallReceiver::Blocked,
+                        ));
+                    }
                     return Some((
                         field,
                         CalleeForm::ExplicitReceiver,
