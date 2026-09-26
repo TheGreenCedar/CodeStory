@@ -433,6 +433,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             },
             &package_imports,
             &file_scope_names,
+            &resolution_context.callable_name_visibility,
             &local_binding_callsites,
             &mut edges,
         );
@@ -520,6 +521,7 @@ fn collect_go_package_function_call_specs(
     call_source: ManualReceiverSource<'_>,
     imports: &GoPackageImports,
     file_scope_names: &HashSet<String>,
+    callable_name_visibility: &GoNameVisibilityIndex,
     local_binding_callsites: &HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
@@ -537,7 +539,10 @@ fn collect_go_package_function_call_specs(
             line: Some(node.start_position().row as u32 + 1),
             method_col,
         };
-        if local_binding_callsites.contains(&key) || file_scope_names.contains(&receiver_name) {
+        if local_binding_callsites.contains(&key)
+            || file_scope_names.contains(&receiver_name)
+            || callable_name_visibility.is_visible(&receiver_name, node.start_byte())
+        {
             return;
         }
         let (owner_module, binding_marker) =
