@@ -559,6 +559,34 @@ fn a_peer_ending_incomplete_headers_receives_the_full_bad_request_response() {
     );
 }
 
+#[test]
+fn queued_unread_request_bytes_receive_complete_bad_request_before_clean_eof() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+    let mut peer = TcpStream::connect(&addr).expect("connect queued-byte peer");
+    peer.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {addr}\r\n{}",
+        "X".repeat(16 * 1024)
+    );
+    peer.write_all(request.as_bytes())
+        .expect("queue incomplete headers");
+    peer.shutdown(Shutdown::Write)
+        .expect("finish request writes");
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response)
+        .expect("response must end in clean EOF, not a reset");
+    let response = String::from_utf8(response).expect("UTF-8 response");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response:?}"
+    );
+    let (_, body) = response.split_once("\r\n\r\n").expect("headers and body");
+    let body: Value = serde_json::from_str(body).expect("complete JSON body");
+    assert_eq!(body["error"], "bad request");
+}
+
 fn get_json(addr: &str, target: &str) -> Value {
     let response = http_get(addr, target).unwrap_or_else(|error| panic!("GET {target}: {error}"));
     assert_eq!(
