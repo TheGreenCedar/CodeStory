@@ -2625,6 +2625,162 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kernel_total_work_is_bounded_before_missing_last_builder_gap() {
+        let mut observations = Vec::new();
+        for branches in [2, 4] {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let mut source = String::new();
+            for (step, name) in names.iter().enumerate() {
+                source.push_str(&format!("fn {name}() {{\n"));
+                if step < 5 {
+                    for _ in 0..branches {
+                        source.push_str(&format!("  {}();\n", names[step + 1]));
+                    }
+                }
+                source.push_str("}\n");
+            }
+            let fixture = source_built_fixture(&source);
+            let selectors = names
+                .iter()
+                .map(|name| canonical_id(&source_callable(&fixture.store, name)).to_owned())
+                .collect::<Vec<_>>();
+            let targets = selectors[1..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let (contract, hashes, rendering) = validated_contract(&selectors[0], &targets);
+            let sealed = fixture.store.get_proof_resolution_facts().unwrap();
+            assert_eq!(sealed.len(), branches * 5);
+            assert!(sealed.iter().all(|fact| {
+                fact.status == ProofResolutionStatus::Exact
+                    && seal_call_resolution_fact(fact.clone()).unwrap() == *fact
+            }));
+            let built = build_from_store(
+                &fixture.store,
+                &fixture.root,
+                &fixture.project_id,
+                &fixture.publication,
+                &contract,
+                |path| fs::read(path),
+            )
+            .unwrap();
+            assert_eq!(built.receipts.len(), branches * 5);
+            assert!(
+                built
+                    .gaps
+                    .contains(&FactBuildGap::DirectCallMissing { step_index: 5 })
+            );
+            assert!(built.unavailable.is_empty());
+            let reversed = {
+                let mut copy = built.clone();
+                copy.facts.reverse();
+                copy.receipts.reverse();
+                copy
+            };
+            let (checked, observed) = crate::call_path_kernel::with_kernel_work_observation(|| {
+                check_built_call_path_integration(&contract, &hashes, &rendering, built).unwrap()
+            });
+            let reordered =
+                check_built_call_path_integration(&contract, &hashes, &rendering, reversed)
+                    .unwrap();
+            assert_eq!(reordered.disposition(), checked.disposition());
+            let ProofDisposition::Unknown {
+                gaps,
+                connected_receipts,
+                ..
+            } = checked.disposition()
+            else {
+                panic!("missing sixth call must never prove/refute")
+            };
+            assert!(gaps.contains(&crate::call_path_kernel::ProofGap::FactBuild(
+                FactBuildGap::DirectCallMissing { step_index: 5 }
+            )));
+            if branches == 4 {
+                assert!(
+                    gaps.contains(&crate::call_path_kernel::ProofGap::KernelSearchBudgetExceeded)
+                );
+                assert!(connected_receipts.is_empty());
+                let InternalProjection::Complete { root, .. } =
+                    project_internal_call_path_result(&checked).unwrap()
+                else {
+                    panic!("bounded exhausted result should fit complete output")
+                };
+                assert_eq!(
+                    crate::call_path_kernel::validate_compact_projection(&root),
+                    Ok(())
+                );
+                let public =
+                    crate::proof_qualification_support::project_public_verification_result(
+                        root.clone(),
+                    )
+                    .unwrap();
+                assert_eq!(public.as_value()["graph_disposition"], "unknown");
+                assert_eq!(public.as_value()["runtime_execution_proven"], false);
+                let public_gaps = public.as_value()["disposition"]["gaps"].as_array().unwrap();
+                assert!(public_gaps.contains(&json!({"kind":"kernel_search_budget_exceeded"})));
+                let schema =
+                    codestory_contracts::call_path_public::public_call_path_result_schema();
+                let unknown = schema
+                    .pointer("/oneOf/0/properties/disposition/oneOf")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|variant| variant["properties"]["kind"]["enum"][0] == "unknown")
+                    .unwrap();
+                let gap_shape = unknown["properties"]["gaps"]["items"]["oneOf"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|variant| {
+                        variant["properties"]["kind"]["enum"][0] == "kernel_search_budget_exceeded"
+                    })
+                    .unwrap();
+                assert_eq!(gap_shape["required"], json!(["kind"]));
+                assert_eq!(gap_shape["additionalProperties"], false);
+                let gap_index = root["disposition"]["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|gap| gap["kind"] == "kernel_search_budget_exceeded")
+                    .unwrap();
+                for malformed in [
+                    json!({"kind":"kernel_search_budget_exceeded", "step_index":0}),
+                    json!({"kind":"unrecognized_search_budget"}),
+                ] {
+                    let mut hostile_root = root.clone();
+                    hostile_root["disposition"]["gaps"][gap_index] = malformed;
+                    assert_eq!(
+                        crate::call_path_kernel::validate_compact_projection(&hostile_root),
+                        Err("compact_disposition_gap_invalid".to_owned())
+                    );
+                }
+            } else {
+                assert!(
+                    !gaps.contains(&crate::call_path_kernel::ProofGap::KernelSearchBudgetExceeded)
+                );
+                assert_eq!(connected_receipts.len(), 5);
+            }
+            eprintln!(
+                "branches={branches}, actual sealed receipts={}, kernel={observed:?}, disposition={:?}",
+                sealed.len(),
+                checked.disposition()
+            );
+            observations.push(observed);
+        }
+        assert!(
+            observations[1].fact_examinations + observations[1].comparisons <= 32_768,
+            "small admitted branching input exceeds total kernel work bound: {:?}",
+            observations[1]
+        );
+        assert!(
+            observations[1].prefix_states_created <= 1_024,
+            "small admitted branching input exceeds prefix state bound: {:?}",
+            observations[1]
+        );
+    }
+
     struct SealedDependencyOrderCase {
         fixture: SourceBuiltFixture,
         caller: Node,

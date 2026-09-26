@@ -3616,11 +3616,11 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     );
     assert_eq!(
         report_schema["$defs"]["ActualProductResultV1"]["oneOf"][2]["properties"]["gaps"]["maxItems"],
-        76
+        77
     );
     assert_eq!(
         report_schema["$defs"]["ProductDispositionV1"]["properties"]["gaps"]["maxItems"],
-        6
+        7
     );
     assert_eq!(
         report_schema["$defs"]["ActualProductResultV1"]["oneOf"][3]["properties"]["reasons"]["maxItems"],

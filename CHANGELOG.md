@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Call-path qualification stops at a bounded search budget and reports an unknown result when branching evidence exceeds it.
+
 - Valid Ruby, PHP, C#, Swift and Dart call-path evidence is no longer rejected solely because its source file identity sorts after a dependency.
 
 - Call navigation avoids conditional or shadowed receiver bindings in Ruby, PHP and Python. Relative JavaScript and TypeScript imports prefer an exact name and leave competing declarations unresolved.
