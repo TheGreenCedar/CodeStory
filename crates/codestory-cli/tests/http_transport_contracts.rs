@@ -448,16 +448,17 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     write!(slow, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("slow peer preamble");
     slow.flush().expect("flush slow peer preamble");
 
-    // Never send the blank line that ends the headers, and keep the connection
-    // demonstrably live with a byte well inside the 2s read window.
+    // Never send the blank line that ends the headers. Keep sending through
+    // the five-second request deadline and the response drain, so a drain
+    // timeout that restarts after each byte would hold the serial server.
     let dribbler = {
         let mut slow = slow.try_clone().expect("clone slow peer");
         thread::spawn(move || {
-            for _ in 0..30 {
+            for _ in 0..400 {
                 if write!(slow, "X").is_err() || slow.flush().is_err() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(20));
             }
         })
     };
@@ -477,7 +478,6 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     }
     let elapsed = started.elapsed();
     let response = String::from_utf8_lossy(&response_bytes).to_string();
-    let _ = dribbler.join();
 
     assert!(
         response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
@@ -495,14 +495,96 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
         "the 408 must carry its typed code: {body}"
     );
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(7),
         "the whole-request deadline should end the peer promptly, took {elapsed:?}"
     );
 
-    // The serving thread is back: the route the slow peer was blocking answers.
+    // The serving thread is back while the sender is still attempting to
+    // dribble bytes, rather than only after the sender thread has finished.
     let health = http_get(&addr, "/health").expect("health after the slow peer");
     assert_eq!(health.status, 200, "{}", health.body);
     assert_eq!(health.body["ok"], true, "{}", health.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "continued sending must not extend the serial server's drain"
+    );
+    let _ = dribbler.join();
+}
+
+#[test]
+fn a_peer_ending_incomplete_headers_receives_the_full_bad_request_response() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+
+    let mut partial = TcpStream::connect(&addr).expect("connect partial peer");
+    partial
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("partial peer read timeout");
+    write!(partial, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("write incomplete headers");
+    partial
+        .shutdown(Shutdown::Write)
+        .expect("end incomplete request");
+
+    let mut response_bytes = Vec::new();
+    partial
+        .read_to_end(&mut response_bytes)
+        .expect("read full bad-request response through EOF");
+    let response = String::from_utf8(response_bytes).expect("response should be UTF-8");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "incomplete headers should receive a bad-request status: {response:?}"
+    );
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("bad-request response should include a body: {response:?}"));
+    let body: Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("bad-request body should be JSON: {error}: {body:?}"));
+    assert_eq!(body["error"], "bad request", "{body}");
+
+    // A different peer can disappear before reading its 400. That failed
+    // delivery must not hold the only serving thread for the next client.
+    let mut aborted = TcpStream::connect(&addr).expect("connect early-closing peer");
+    write!(aborted, "GET /health HTTP/1.1\r\nHost: {addr}\r\n")
+        .expect("write early-closing peer headers");
+    aborted
+        .shutdown(Shutdown::Both)
+        .expect("close early peer before its response");
+    drop(aborted);
+    let started = Instant::now();
+    let health = http_get(&addr, "/health").expect("health after early-closing peer");
+    assert_eq!(health.status, 200, "{}", health.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "an early close should release the serving thread promptly"
+    );
+}
+
+#[test]
+fn queued_unread_request_bytes_receive_complete_bad_request_before_clean_eof() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+    let mut peer = TcpStream::connect(&addr).expect("connect queued-byte peer");
+    peer.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {addr}\r\n{}",
+        "X".repeat(16 * 1024)
+    );
+    peer.write_all(request.as_bytes())
+        .expect("queue incomplete headers");
+    peer.shutdown(Shutdown::Write)
+        .expect("finish request writes");
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response)
+        .expect("response must end in clean EOF, not a reset");
+    let response = String::from_utf8(response).expect("UTF-8 response");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response:?}"
+    );
+    let (_, body) = response.split_once("\r\n\r\n").expect("headers and body");
+    let body: Value = serde_json::from_str(body).expect("complete JSON body");
+    assert_eq!(body["error"], "bad request");
 }
 
 fn get_json(addr: &str, target: &str) -> Value {

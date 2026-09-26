@@ -6,7 +6,7 @@ use codestory_contracts::api::{
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{IpAddr, TcpStream},
+    net::{IpAddr, Shutdown, TcpStream},
     time::{Duration, Instant},
 };
 
@@ -34,6 +34,15 @@ const HTTP_REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(5);
 /// Polling granularity inside [`HTTP_REQUEST_HEADER_DEADLINE`], never a bound
 /// on the request: each read window restarts, the deadline does not.
 const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound response delivery even when a peer stops reading from the serial server.
+const HTTP_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// After sending a response, consume pending request bytes before closing the
+/// socket. An immediate close with unread bytes can reset the connection and
+/// discard the JSON body that was just written.
+const HTTP_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
+const HTTP_COMPLETE_REQUEST_DRAIN_GRACE: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HttpServePolicy {
@@ -93,7 +102,7 @@ pub(crate) fn handle_http_request(
         }
     }
     if deadline_exceeded {
-        return write_http_error_json(
+        return write_http_error_json_with_drain(
             &mut stream,
             408,
             "http_request_deadline_exceeded",
@@ -101,13 +110,15 @@ pub(crate) fn handle_http_request(
                 "Request headers did not arrive within {} seconds.",
                 HTTP_REQUEST_HEADER_DEADLINE.as_secs()
             ),
+            HTTP_RESPONSE_DRAIN_GRACE,
         );
     }
     if !headers_complete {
-        return write_http_json(
+        return write_http_json_with_drain(
             &mut stream,
             400,
             &serde_json::json!({"error": "bad request"}),
+            HTTP_RESPONSE_DRAIN_GRACE,
         );
     }
     let request = String::from_utf8_lossy(&request_bytes);
@@ -559,6 +570,15 @@ fn write_http_json<T: serde::Serialize>(
     status: u16,
     value: &T,
 ) -> Result<()> {
+    write_http_json_with_drain(stream, status, value, HTTP_COMPLETE_REQUEST_DRAIN_GRACE)
+}
+
+fn write_http_json_with_drain<T: serde::Serialize>(
+    stream: &mut TcpStream,
+    status: u16,
+    value: &T,
+    drain_grace: Duration,
+) -> Result<()> {
     let body = serde_json::to_string_pretty(value)?;
     let status_text = match status {
         200 => "OK",
@@ -569,12 +589,54 @@ fn write_http_json<T: serde::Serialize>(
         408 => "Request Timeout",
         _ => "OK",
     };
-    write!(
-        stream,
+    let response = format!(
         "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )?;
+    );
+    let write_deadline = Instant::now() + HTTP_RESPONSE_WRITE_DEADLINE;
+    let mut remaining = response.as_bytes();
+    while !remaining.is_empty() {
+        let timeout = write_deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            bail!("HTTP response write deadline exceeded");
+        }
+        stream.set_write_timeout(Some(timeout))?;
+        let written = stream.write(remaining)?;
+        if written == 0 {
+            bail!("HTTP peer closed before the response was written");
+        }
+        remaining = &remaining[written..];
+    }
+
+    // TCP can reset a connection closed with unread request bytes, even after
+    // write() accepted the full response. Half-close first so the peer can
+    // receive the response and EOF, then give its pending bytes a fixed drain.
+    stream.shutdown(Shutdown::Write)?;
+    let drain_deadline = Instant::now() + drain_grace;
+    let mut pending = [0u8; 1024];
+    loop {
+        let timeout = drain_deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            break;
+        }
+        stream.set_read_timeout(Some(timeout))?;
+        match stream.read(&mut pending) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
@@ -623,7 +685,23 @@ fn write_http_error_json(
     code: &'static str,
     message: impl Into<String>,
 ) -> Result<()> {
-    write_http_json(
+    write_http_error_json_with_drain(
+        stream,
+        status,
+        code,
+        message,
+        HTTP_COMPLETE_REQUEST_DRAIN_GRACE,
+    )
+}
+
+fn write_http_error_json_with_drain(
+    stream: &mut TcpStream,
+    status: u16,
+    code: &'static str,
+    message: impl Into<String>,
+    drain_grace: Duration,
+) -> Result<()> {
+    write_http_json_with_drain(
         stream,
         status,
         &serde_json::json!({
@@ -632,12 +710,16 @@ fn write_http_error_json(
                 "message": message.into()
             }
         }),
+        drain_grace,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
     fn query_resolved_graph_routes_use_the_complete_retrieval_operation() {
@@ -651,6 +733,35 @@ mod tests {
         assert_eq!(
             http_target_public_operation(&args::TargetSelection::Id(NodeId("node-1".to_string()))),
             "graph"
+        );
+    }
+
+    #[test]
+    fn a_nonreading_peer_cannot_hold_response_writing_indefinitely() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect nonreading peer");
+        let (mut stream, _) = listener.accept().expect("accept nonreading peer");
+        let (sent, received) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let body = "x".repeat(16 * 1024 * 1024);
+            let started = Instant::now();
+            let result = write_http_json(&mut stream, 200, &body);
+            sent.send((started.elapsed(), result.is_err()))
+                .expect("report response result");
+        });
+
+        let outcome = received.recv_timeout(Duration::from_secs(4));
+        drop(peer);
+        writer.join().expect("join response writer");
+        let (elapsed, failed_write) = outcome.expect("nonreading peer must release server");
+        assert!(
+            failed_write,
+            "a response too large for the peer must time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "response writing exceeded its bound: {elapsed:?}"
         );
     }
 }
