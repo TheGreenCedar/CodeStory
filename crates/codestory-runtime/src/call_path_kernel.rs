@@ -5475,6 +5475,53 @@ mod tests {
     }
 
     #[test]
+    fn compact_dependency_order_uses_each_referenced_profile() {
+        // Supplemental schema-boundary fixture, not parser/Store authority evidence.
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let mut first = indexed_receipt(0, "A", "B", "first\n".to_owned());
+        first.resolution_provenance.language_adapter = "ruby".to_owned();
+        let second = indexed_receipt(1, "B", "C", "second\n".to_owned());
+        let checked = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
+        );
+        let root = complete_root(&checked);
+        assert_eq!(validate_compact_projection(&root), Ok(()));
+        assert_eq!(
+            root["identities"]["provenance_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            root["identities"]["provenance_profiles"][0]["language_adapter"],
+            "ruby"
+        );
+        assert_eq!(
+            root["identities"]["provenance_profiles"][1]["language_adapter"],
+            "rust"
+        );
+        assert_eq!(
+            root["identities"]["evidence"][1]["provenance"]["profile"],
+            1
+        );
+        let mut mutated = root.clone();
+        mutated["identities"]["evidence"][1]["provenance"]["dependency_files"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert_eq!(
+            validate_compact_projection(&mutated),
+            Err("compact_dependency_files_noncanonical".to_owned()),
+            "second sorted profile cannot inherit the first encounter profile's policy"
+        );
+        assert_eq!(validate_compact_projection(&root), Ok(()));
+    }
+
+    #[test]
     fn internal_projection_interns_shared_identities_in_authoritative_receipt_order() {
         let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
         let first = indexed_receipt(0, "A", "B", "first\n".to_owned());

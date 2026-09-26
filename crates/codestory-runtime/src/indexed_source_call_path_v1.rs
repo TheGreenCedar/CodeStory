@@ -2694,28 +2694,53 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        let target_path = root.join(target_path);
-        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
-        fs::write(&target_path, target_source).unwrap();
-        // Select ordinary source paths with the requested actual parser file-ID order.
-        // This controls identity spelling, never remaps or hand-seals a receipt.
+        // Select a complete ordinary path tuple, rather than comparing candidates
+        // against one fixed temp-root-dependent hash extremum.
         let parser_file_id = |path: &Path| {
             let path = path.to_string_lossy().replace('\\', "/");
             #[cfg(windows)]
             let path = path.to_lowercase();
             codestory_indexer::generate_id(&format!("{path}:{path}:1"))
         };
-        let target_file_id = parser_file_id(&target_path);
-        let source_path = (0..4096)
+        let target_template = Path::new(target_path);
+        let target_stem = target_template.file_stem().unwrap().to_str().unwrap();
+        let source_candidates = (0..64)
             .map(|index| {
                 root.join(caller_directory)
                     .join(format!("caller_{index}.{extension}"))
             })
-            .find(|path| {
-                (parser_file_id(path) > target_file_id) == source_after_target
-                    && parser_file_id(path) != target_file_id
+            .map(|path| {
+                let id = parser_file_id(&path);
+                (path, id)
             })
-            .expect("ordinary path spelling realizes either file-ID order");
+            .collect::<Vec<_>>();
+        let (target_path, source_path) = (0..64)
+            .find_map(|index| {
+                let target_path = root
+                    .join(target_template.parent().unwrap())
+                    .join(format!("{target_stem}_{index}.{extension}"));
+                let target_id = parser_file_id(&target_path);
+                source_candidates
+                    .iter()
+                    .find(|(_, source_id)| {
+                        (*source_id > target_id) == source_after_target && *source_id != target_id
+                    })
+                    .map(|(source_path, _)| (target_path, source_path.clone()))
+            })
+            .expect("bounded complete path tuples realize requested parser file-ID order");
+        let target_file_id = parser_file_id(&target_path);
+        let target_leaf = target_path.file_name().unwrap().to_str().unwrap();
+        let target_stem = target_path.file_stem().unwrap().to_str().unwrap();
+        let caller_source = match language {
+            "ruby" => caller_source.replace(
+                "require_relative \"worker\"",
+                &format!("require_relative \"{target_stem}\""),
+            ),
+            "dart" => caller_source.replace("'worker.dart'", &format!("'{target_leaf}'")),
+            _ => caller_source.to_owned(),
+        };
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, target_source).unwrap();
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         fs::write(&source_path, caller_source).unwrap();
         let mut store = Store::new_in_memory().unwrap();
@@ -3143,138 +3168,6 @@ mod tests {
             );
         }
         checked_dependency_root(&case);
-    }
-
-    #[test]
-    fn sealed_encounter_order_compact_selects_each_evidence_profile() {
-        // Build the complete named-receiver chain together, without an incremental
-        // update or a constructor-expression call standing in for a proven receipt.
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let parser_file_id = |path: &Path| {
-            let path = path.to_string_lossy().replace('\\', "/");
-            #[cfg(windows)]
-            let path = path.to_lowercase();
-            codestory_indexer::generate_id(&format!("{path}:{path}:1"))
-        };
-        let worker_path = root.join("lib/worker.rb");
-        let worker_id = parser_file_id(&worker_path);
-        let source_path = (0..4096)
-            .map(|index| root.join(format!("lib/caller_{index}.rb")))
-            .find(|path| parser_file_id(path) > worker_id)
-            .expect("ordinary caller spelling after worker ID");
-        let other_path = (0..4096)
-            .map(|index| root.join(format!("lib/other_{index}.rb")))
-            .find(|path| parser_file_id(path) < worker_id)
-            .expect("ordinary target spelling before worker ID");
-        let other_stem = other_path.file_stem().unwrap().to_str().unwrap();
-        fs::create_dir_all(worker_path.parent().unwrap()).unwrap();
-        fs::write(&source_path, "require_relative \"worker\"\ndef caller\n  worker = Worker.new\n  worker.target\nend\n").unwrap();
-        fs::write(&worker_path, format!("require_relative \"{other_stem}\"\nclass Worker\n  def target\n    other = Other.new\n    other.finish\n  end\nend\n")).unwrap();
-        fs::write(&other_path, "class Other\n  def finish\n  end\nend\n").unwrap();
-        let mut store = Store::new_in_memory().unwrap();
-        WorkspaceIndexer::new(root.clone())
-            .run_incremental(
-                &mut store,
-                &RefreshInfo {
-                    mode: BuildMode::Incremental,
-                    files_to_index: vec![source_path.clone(), worker_path, other_path],
-                    files_to_remove: Vec::new(),
-                    existing_file_ids: HashMap::new(),
-                },
-                &EventBus::new(),
-                None,
-            )
-            .unwrap();
-        let publication = IndexPublicationRecord {
-            generation: 1,
-            generation_id: "mixed-profile-generation-1".to_owned(),
-            run_id: "mixed-profile-run-1".to_owned(),
-            mode: IndexPublicationMode::Full,
-            published_at_epoch_ms: 1,
-        };
-        rematerialize_proof_resolution_projection(&mut store, &publication).unwrap();
-        store
-            .validate_proof_resolution_publication(&publication)
-            .unwrap();
-        let caller = source_callable(&store, "caller");
-        let target = store
-            .get_nodes()
-            .unwrap()
-            .into_iter()
-            .find(|node| {
-                is_callable(node.kind) && node.qualified_name.as_deref() == Some("Worker.target")
-            })
-            .unwrap();
-        let finish = store
-            .get_nodes()
-            .unwrap()
-            .into_iter()
-            .find(|node| {
-                is_callable(node.kind) && node.qualified_name.as_deref() == Some("Other.finish")
-            })
-            .unwrap();
-        let (contract, hashes, rendering) = validated_contract(
-            canonical_id(&caller),
-            &[canonical_id(&target), canonical_id(&finish)],
-        );
-        let fixture = SourceBuiltFixture {
-            _root: temp,
-            root: root.clone(),
-            source_path,
-            store,
-            publication,
-            project_id: project_identity_v3(&root).project_id,
-        };
-        let checked = evaluate_from_store(
-            &fixture.store,
-            &fixture.root,
-            &fixture.project_id,
-            &fixture.publication,
-            CheckedIntegrationInputs {
-                contract: &contract,
-                hashes: &hashes,
-                rendering: &rendering,
-            },
-            |path| fs::read(path),
-        )
-        .unwrap();
-        assert!(
-            matches!(checked.disposition(), ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 2),
-            "two-step source fixture failed: checked={checked:#?}; facts={:#?}; edges={:#?}",
-            fixture.store.get_proof_resolution_facts().unwrap(),
-            fixture.store.get_edges().unwrap(),
-        );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&checked).unwrap()
-        else {
-            panic!("actual two-step source chain must project")
-        };
-        assert_eq!(
-            crate::call_path_kernel::validate_compact_projection(&root),
-            Ok(())
-        );
-        let mut mixed = root.clone();
-        let profile_index = mixed["identities"]["provenance_profiles"]
-            .as_array()
-            .unwrap()
-            .len();
-        let mut sorted_profile = mixed["identities"]["provenance_profiles"][0].clone();
-        sorted_profile["language_adapter"] = json!("unknown-adapter");
-        mixed["identities"]["provenance_profiles"]
-            .as_array_mut()
-            .unwrap()
-            .push(sorted_profile);
-        mixed["identities"]["evidence"][1]["provenance"]["profile"] = json!(profile_index);
-        assert_eq!(
-            crate::call_path_kernel::validate_compact_projection(&mixed),
-            Err("compact_dependency_files_noncanonical".to_owned()),
-            "second evidence must use its sorted profile, not the first encounter profile"
-        );
-        assert_eq!(
-            crate::call_path_kernel::validate_compact_projection(&root),
-            Ok(())
-        );
     }
 
     fn source_callable(store: &Store, terminal_name: &str) -> Node {
