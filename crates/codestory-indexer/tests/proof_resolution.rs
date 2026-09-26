@@ -1,8 +1,8 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
 use codestory_contracts::proof_resolution::{
-    CalleeForm, DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
-    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    CalleeForm, CanonicalCallsiteIdentity, DependencyFileHash, FileId, ProofResolutionProjection,
+    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
     parse_canonical_callsite_identity,
 };
 use codestory_indexer::{
@@ -10904,7 +10904,7 @@ fn assert_script_ordinary_call_owner(
     line: u32,
     owner_name: &str,
     target_name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CanonicalCallsiteIdentity> {
     let nodes = store.get_nodes()?;
     let calls = store
         .get_edges()?
@@ -10938,6 +10938,22 @@ fn assert_script_ordinary_call_owner(
     .expect("canonical ordinary identity");
     assert_eq!(identity.file_id, file_id);
     assert_eq!(identity.line, line);
+    assert_eq!(
+        identity.raw_target, call.target,
+        "canonical raw occurrence must match its CALL target"
+    );
+    Ok(identity)
+}
+
+fn assert_script_imported_call_source_column(
+    store: &Store,
+    file_id: FileId,
+    line: u32,
+    owner_name: &str,
+    target_name: &str,
+) -> anyhow::Result<()> {
+    let identity =
+        assert_script_ordinary_call_owner(store, file_id, line, owner_name, target_name)?;
     let file = store
         .get_files()?
         .into_iter()
@@ -10959,10 +10975,6 @@ fn assert_script_ordinary_call_owner(
     assert_eq!(
         identity.column_or_ordinal, *column,
         "actual callee column survives artifact reuse"
-    );
-    assert_eq!(
-        identity.raw_target, call.target,
-        "canonical raw occurrence must match its CALL target"
     );
     Ok(())
 }
@@ -11475,14 +11487,14 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             .into_iter()
             .find(|file| file.path.ends_with(&importer_path))
             .expect("independent original two-call importer");
-        assert_script_ordinary_call_owner(
+        assert_script_imported_call_source_column(
             &store,
             FileId(initial_importer.id),
             4,
             "caller",
             "target",
         )?;
-        assert_script_ordinary_call_owner(
+        assert_script_imported_call_source_column(
             &store,
             FileId(initial_importer.id),
             8,
@@ -11610,8 +11622,14 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             );
             rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
             store.validate_proof_resolution_publication(&publication(generation))?;
-            assert_script_ordinary_call_owner(&store, FileId(importer.id), 4, "caller", "target")?;
-            assert_script_ordinary_call_owner(
+            assert_script_imported_call_source_column(
+                &store,
+                FileId(importer.id),
+                4,
+                "caller",
+                "target",
+            )?;
+            assert_script_imported_call_source_column(
                 &store,
                 FileId(importer.id),
                 8,
