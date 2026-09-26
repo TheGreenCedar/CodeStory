@@ -245,6 +245,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
                     .map_err(map_api_error)?,
             );
             finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
+                .map_err(map_retrieval_finalize_error)
                 .context("retrieval index finalize after semantic-doc contract repair")?
         }
         Err(error) => return Err(map_retrieval_finalize_error(error)),

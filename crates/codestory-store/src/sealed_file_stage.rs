@@ -53,6 +53,8 @@ thread_local! {
     static NATIVE_CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static PARENT_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static FILE_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -64,6 +66,20 @@ fn with_parent_sync_failure<T>(action: impl FnOnce() -> T) -> T {
         }
     }
     let restore = Restore(PARENT_SYNC_FAILURE.replace(true));
+    let result = action();
+    drop(restore);
+    result
+}
+
+#[cfg(test)]
+fn with_file_sync_failure<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FILE_SYNC_FAILURE.set(self.0);
+        }
+    }
+    let restore = Restore(FILE_SYNC_FAILURE.replace(true));
     let result = action();
     drop(restore);
     result
@@ -394,6 +410,10 @@ fn stage_sealed_file_impl(
         // clonefile can carry the source's read-only mode to the destination.
         // The stage is writable until the caller seals and publishes it.
         crate::core_generation::make_file_owner_writable(destination)?;
+        #[cfg(test)]
+        if FILE_SYNC_FAILURE.get() {
+            return Err(error("injected sealed stage file sync failure"));
+        }
         OpenOptions::new()
             .write(true)
             .open(destination)
@@ -845,6 +865,21 @@ mod tests {
             })
         });
         assert!(error.to_string().contains("parent sync failure"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(source).expect("source"), b"sealed");
+    }
+
+    #[test]
+    fn failed_file_sync_removes_owned_stage() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let source = sealed_source(root.path(), b"sealed");
+        let destination = root.path().join("candidate.db");
+        let error = with_file_sync_failure(|| {
+            with_native_clone_disabled(|| {
+                stage_sealed_file(&source, &destination, &|| false).expect_err("sync failure")
+            })
+        });
+        assert!(error.to_string().contains("file sync failure"));
         assert!(!destination.exists());
         assert_eq!(fs::read(source).expect("source"), b"sealed");
     }
