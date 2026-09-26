@@ -1677,9 +1677,18 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) next_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiagnosticCoreStatus {
+    Unavailable,
+    UpgradeRequired,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_status: Option<DiagnosticCoreStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2495,6 +2504,8 @@ pub(crate) struct RetrievalStatusOutput {
 pub(crate) struct DoctorOutput {
     pub(crate) project: String,
     pub(crate) storage_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_status: Option<DiagnosticCoreStatus>,
     pub(crate) indexed: bool,
     pub(crate) stats: codestory_contracts::api::StorageStatsDto,
     pub(crate) retrieval_mode: String,
