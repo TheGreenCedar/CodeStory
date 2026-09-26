@@ -2743,8 +2743,30 @@ mod tests {
         store
             .validate_proof_resolution_publication(&publication)
             .unwrap();
-        let caller = source_callable(&store, caller_name);
-        let target = source_callable(&store, target_name);
+        let callable_in_file = |terminal_name: &str, file_id: i64| {
+            let matches = store
+                .get_nodes()
+                .unwrap()
+                .into_iter()
+                .filter(|node| {
+                    is_callable(node.kind)
+                        && node.file_node_id == Some(NodeId(file_id))
+                        && node
+                            .qualified_name
+                            .as_deref()
+                            .unwrap_or(&node.serialized_name)
+                            .rsplit(['.', ':'])
+                            .next()
+                            == Some(terminal_name)
+                })
+                .collect::<Vec<_>>();
+            let [node] = matches.as_slice() else {
+                panic!("{language} needs one callable {terminal_name} in {file_id}: {matches:#?}")
+            };
+            node.clone()
+        };
+        let caller = callable_in_file(caller_name, parser_file_id(&source_path));
+        let target = callable_in_file(target_name, target_file_id);
         assert_eq!(target.file_node_id.unwrap().0, target_file_id);
         assert_eq!(
             (caller.file_node_id.unwrap().0 > target_file_id),
