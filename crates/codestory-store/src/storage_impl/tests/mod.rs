@@ -8978,6 +8978,34 @@ fn cancellation_during_legacy_retirement_receipt_cannot_commit_pointer() -> Resu
 }
 
 #[test]
+fn uncommitted_legacy_receipt_cannot_retire_source() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = fs::read(&live).expect("read source");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+    Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+        .expect_err("cancel after durable receipt");
+    assert!(layout.read_pointer()?.is_none());
+
+    let report =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove source if erroneously authorized");
+            Ok(true)
+        })?;
+    assert!(
+        report.pending && !report.retired,
+        "precommit retirement: {report:?}"
+    );
+    assert_eq!(fs::read(&live).expect("precommit source survives"), before);
+    Ok(())
+}
+
+#[test]
 fn legacy_retirement_waits_for_commit_and_retries_owned_deletion_without_touching_annotations()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir().expect("migration root");
