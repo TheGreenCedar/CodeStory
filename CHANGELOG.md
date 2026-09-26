@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search keeps candidate metadata tied to the core generation pinned for each query, so a concurrent index update cannot hide source results.
+
 - Exact file-symbol lookups find the selected file’s declaration even when many other files contain the same name, while preserving ambiguity within that file.
 - Packets report query deadlines with the already resolved hits and an explicit notice when the admitted result cannot be retried.
 
