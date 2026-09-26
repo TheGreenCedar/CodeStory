@@ -7,6 +7,7 @@
 - Cache rehydrate copies the source generation it validated. If a new target lacks space, it leaves the target directory untouched so a later retry starts cleanly.
 - Bookmarks retain their last verified binding when a core lookup or post-index cache refresh fails, so a later refresh can still follow a unique rename or move. Direct relative-root incremental indexing reports a committed refresh as successful when optional retrieval refresh evidence cannot be used.
 - Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
+- Go call navigation keeps locally shadowed import aliases distinct from package calls and follows ordinary package functions and factory methods when an external test package declares the same names.
 
 ## 0.17.6
 
