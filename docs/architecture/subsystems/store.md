@@ -127,11 +127,11 @@ logical row attempts, prepared-statement executions, and estimated raw bind
 payload bytes by family; the byte count describes input shape, not database,
 WAL, or physical-write bytes.
 
-Promotion journals record candidate and rollback structural identities.
-Prepared install, committed recovery, and rollback validate the recorded
-manifest and current row digest before accepting a database. Missing, legacy,
-or corrupt structural publication state therefore cannot become the current
-core generation.
+Legacy promotion journals record candidate and rollback structural identities.
+Their recovery validates the recorded manifest and current row digest before
+accepting a database. Current publication installs a sealed immutable generation
+and atomically replaces its pointer after validation. Missing, legacy, or
+corrupt structural publication state cannot become the current core generation.
 
 Schema v25 also stores the current retrieval manifest and its deeply verified
 rollback record in the same SQLite row. They change in one transaction. The

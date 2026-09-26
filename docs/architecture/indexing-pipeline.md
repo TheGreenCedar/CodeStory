@@ -109,7 +109,7 @@ There is no source-reading fallback.
 
 The replacement receives the `semantic_projection` core publication mode and
 uses the same incomplete marker, catalog lock, live-publication revalidation,
-snapshot seal, promotion journal, rollback validation, and cache publication
+snapshot seal, immutable-generation installation, rollback validation, and cache publication
 as full and incremental indexing. A missing contract, cancellation, concurrent
 writer, or changed live publication leaves the previous complete core usable.
 Failure and cancellation coverage includes semantic-context index creation,
@@ -187,12 +187,12 @@ wall, and logical source/target database bytes. A mutable legacy source uses
 SQLite online backup and reports that strategy instead. The stage happens
 before incremental indexing begins, so `staged_snapshot_copy` is independent
 of the later `publish_ms` wall. Every successful core publication also reports
-nested promotion telemetry for lock/recovery, candidate and prior-live
-validation, the optional rollback-backup copy and validation, prepared-journal
-write/file sync/directory sync, staged-to-live restore, promoted-live
-validation, committed-journal transition, and cleanup. The promotion object
-retains candidate, prior-live, and rollback-backup logical bytes plus a
-saturating residual that reconciles its displayed total. Logical bytes use
+nested promotion telemetry for lock/recovery, candidate and prior-generation
+validation, immutable-generation installation, pointer publication, and cleanup.
+Legacy journal, backup-copy, and staged-to-live restore fields remain in the
+schema but are absent or zero for immutable-generation publication. The
+promotion object retains candidate, previous, and rollback-generation logical
+bytes plus a saturating residual that reconciles its displayed total. Logical bytes use
 SQLite `page_count * page_size`, including committed pages still backed by WAL;
 they do not measure filesystem allocation or physical writes. Only
 `core_promotion` is a diagnostic nested inside the publication wall.
@@ -438,7 +438,7 @@ The last step belongs to runtime plus store:
 - incremental refresh mutates a durable clone, refreshes both summary and detail snapshots there, and publishes the completed replacement
 
 Full and incremental stage preparation remain intentionally different even
-though both finish through the same core-promotion journal.
+though both finish through immutable-generation installation and pointer publication.
 
 Staged finalization splits deferred indexes around summary materialization. It
 creates the four source, target, resolved-source, and resolved-target edge
@@ -698,8 +698,8 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v3`
 - `staged_snapshot_copy`: successful incremental stage strategy (`cloned`, `copied`, or `sqlite_backup` for mutable legacy), fallback reason and native error code when relevant, cloned/copied bytes, stage wall, and logical source/target database bytes (`page_count * page_size`); staging happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
-- `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
-- `core_promotion.promoted_validation`: which post-restore identity fence the promotion satisfied. `reused_candidate_receipt` means the published file was proven byte-identical to the candidate whose validation already passed; `revalidated` means it could not be proven identical and the deep identity checks were re-derived from the published file. An absent value reads as `revalidated`, because that is the weaker claim
+- `core_promotion`: successful nested promotion wall, candidate and prior validation, generation installation, pointer publication, cleanup, logical candidate/prior/rollback-generation bytes, and its saturating residual; legacy journal, backup-copy, and restore fields are absent or zero on this path
+- `core_promotion.promoted_validation`: the recorded validation fence for the installed generation. `reused_candidate_receipt` means the installed file retained the validated candidate identity; `revalidated` means deep checks were re-derived. An absent value reads as `revalidated`, the weaker claim
 
 Only the sibling fields inside `full_refresh_wall_ms` are additive. Indexer
 children, semantic diagnostics, search stream/commit/reload timings, snapshot
