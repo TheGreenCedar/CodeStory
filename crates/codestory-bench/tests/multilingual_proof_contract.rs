@@ -53,29 +53,32 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
             .iter()
             .filter(|case| case.language == dispatch.language)
             .collect::<Vec<_>>();
-        assert_eq!(
-            cases
+        for (class, ordinals) in [
+            (FixtureClass::Supported, 0..12_u8),
+            (FixtureClass::Unsupported, 12..18),
+            (FixtureClass::Hostile, 18..24),
+        ] {
+            let expected = ordinals.collect::<BTreeSet<_>>();
+            let class_cases = cases
                 .iter()
-                .filter(|case| case.class == FixtureClass::Supported)
-                .count(),
-            12
-        );
-        assert_eq!(
-            cases
-                .iter()
-                .filter(|case| matches!(
-                    case.class,
-                    FixtureClass::Unsupported | FixtureClass::Hostile
-                ))
-                .count(),
-            12
-        );
-        assert!(
-            cases
-                .iter()
-                .any(|case| case.class == FixtureClass::Unsupported)
-        );
-        assert!(cases.iter().any(|case| case.class == FixtureClass::Hostile));
+                .filter(|case| case.class == class)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                class_cases.len(),
+                expected.len(),
+                "{} {class:?} census",
+                dispatch.language
+            );
+            assert_eq!(
+                class_cases
+                    .iter()
+                    .map(|case| case.ordinal)
+                    .collect::<BTreeSet<_>>(),
+                expected,
+                "{} {class:?} ordinals",
+                dispatch.language
+            );
+        }
         assert!(
             cases.iter().all(|case| case.parser_node_count > 0),
             "{} parser extraction emitted no nodes",
@@ -93,6 +96,40 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
                     .as_deref()
                     .is_some_and(|digest| digest.len() == 64)
         }));
+
+        for negative in cases
+            .iter()
+            .filter(|case| case.class == FixtureClass::Unsupported)
+        {
+            assert!(
+                negative.facts.iter().all(|fact| {
+                    !fact.proof_admitted && fact.status != ProofResolutionStatus::Exact
+                }),
+                "{} missing-target case {} falsely admitted proof: {:?}",
+                dispatch.language,
+                negative.ordinal,
+                negative.facts
+            );
+        }
+        for hostile in cases
+            .iter()
+            .filter(|case| case.class == FixtureClass::Hostile)
+        {
+            // PHP includes a literal direct call; this bounds counts, not callback identity.
+            let maximum_admitted = usize::from(dispatch.language == "php");
+            let admitted = hostile
+                .facts
+                .iter()
+                .filter(|fact| fact.proof_admitted)
+                .count();
+            assert!(
+                admitted <= maximum_admitted,
+                "{} hostile callback case {} admission count {admitted} exceeds {maximum_admitted}: {:?}",
+                dispatch.language,
+                hostile.ordinal,
+                hostile.facts
+            );
+        }
 
         for positive in cases
             .iter()
