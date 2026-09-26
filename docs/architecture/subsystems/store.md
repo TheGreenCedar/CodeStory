@@ -24,11 +24,11 @@ recovery.
 
 ## Publication and reads
 
-Full refresh builds and validates a staged database. Promotion durably records a
-prepared journal with previous and candidate identities, installs and validates
-the candidate, records committed, then performs best-effort cleanup. Recovery
-may restore only a valid recorded prepared backup; a committed publication is
-never rolled back merely because a backup remains.
+Full refresh builds and validates a staged database. Publication seals and
+installs the candidate as an immutable generation, then atomically replaces
+the current/rollback pointer. Pinned readers keep their selected generation.
+Legacy promotion-journal recovery remains bounded by recorded candidate and
+backup identities; backup existence alone never authorizes rollback.
 
 The fresh full-refresh stage is explicitly disposable until publication. It
 keeps WAL so a bounded artifact-cache reader can be opened when verified
@@ -39,12 +39,21 @@ Active WAL growth may exceed the retention limit while a transaction or pinned
 reader needs its frames. Parser rows are not copied, and a stage with no copied
 structural rows opens no cache reader. Its consuming publish path restores
 NORMAL synchronization, completes a TRUNCATE checkpoint, syncs the standalone
-database and directory, and permits no later stage writes before entering the
-promotion journal. Live stores, generic build callers, and staged incremental
+database and directory, and permits no later stage writes before immutable
+generation publication. Live stores, generic build callers, and staged incremental
 clones remain WAL/NORMAL with their default journal retention.
 
-Incremental refresh writes a durable clone and promotes the completed
-replacement through the same journal. Readers that need publication coherence
+Incremental refresh stages a sealed, immutable core image with a native file
+clone where available, or a cancellable chunked byte copy. The source stays
+under a generation reader lease for the entire stage. The stage is create-new,
+synced before use, and removed on failure only when its native file identity
+still matches the file this operation created. A source with SQLite WAL/SHM
+sidecars cannot use this path; mutable legacy databases use a coherent SQLite
+online backup instead. Full builds, incremental stages, and one-time legacy
+backups check available cache-volume space against the source's logical SQLite
+bytes plus a 64 MiB reserve before writing a full-size image. A refusal leaves
+the previous publication in place. The completed replacement is installed as
+an immutable generation and selected by the same atomic pointer. Readers that need publication coherence
 use store read snapshots and compare the recorded generation/run identity;
 retrieval owns the session that combines that transaction with immutable
 generation leases before returning evidence.
@@ -227,6 +236,7 @@ helpers, not an operator workflow.
   cutover, and the native-root location registry
 - `src/annotations/resolution.rs`: the conservative rebind ladder
 - `src/snapshot_store.rs`: staged and live grounding snapshots
+- `src/sealed_file_stage.rs`: shared sealed-file native clone or cancellable copy
 - `src/file_store.rs`: focused file persistence
 - `src/storage_impl/trail.rs`: trail queries
 

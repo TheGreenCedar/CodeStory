@@ -114,12 +114,15 @@ run is recovered by a complete refresh; its incomplete core is never offered
 as a rollback generation. No manual cache deletion is part of the normal
 upgrade.
 
-On filesystems without copy-on-write cloning, an incremental refresh with
-changed source runs a complete rebuild and reports the effective full mode.
-During the first upgrade, preserving a complete legacy core as the rollback
-generation may require a staged ordinary copy. That copy is cancellable and
-can take time proportional to the old database size; the old core remains in
-place until a complete replacement is published.
+Incremental refresh stays incremental on filesystems without native file
+cloning. CodeStory copies the sealed core image in cancellable chunks when a
+native clone is unavailable. A low-space check refuses the stage before writing
+it and reports required and available cache-volume bytes; the previous
+publication remains usable. During the first upgrade, preserving a complete
+legacy core as the rollback generation still uses a coherent SQLite backup.
+That one-time copy is cancellable and can take time proportional to the old
+database size; the old core remains in place until a complete replacement is
+published.
 
 Before an upgrade where rollback is required, stop clients using that cache and
 preserve a complete pre-upgrade copy, including its annotation sidecar. Keep the

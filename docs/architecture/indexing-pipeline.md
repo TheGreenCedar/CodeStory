@@ -87,7 +87,8 @@ but whose semantic or dense-selection policy needs a new publication. It does
 not run workspace discovery, schedule files, invoke parsers or structural
 collectors, or reopen source files.
 
-The runtime pins the live core publication, clones it with SQLite backup, and
+The runtime pins the live core publication, stages its sealed file with a native
+clone or cancellable byte copy, and
 validates its dense-anchor, structural-unit, and source-policy manifests. It
 also binds the selected native project identity to the stored source-policy
 project/workspace identity, so an arbitrary cache override cannot adopt another
@@ -167,21 +168,23 @@ flowchart TD
 `crates/codestory-runtime/src/index_full.rs` and
 `crates/codestory-runtime/src/index_incremental.rs` own the orchestration split
 (`index_full_for_runtime` / `index_incremental_for_runtime`). Full indexing
-opens a fresh stage, runs the indexer, and publishes. Incremental clones the
-live database, diffs inventory, and publishes the replacement.
+opens a fresh stage, runs the indexer, and publishes. Incremental stages the
+sealed live database, diffs inventory, and publishes the replacement.
 
 Only the fresh full stage uses relaxed SQLite synchronization. It remains in
 WAL mode so a bounded cache reader is available when verified structural rows
 were copied forward, and keeps a nonzero 64 MiB automatic-checkpoint budget.
 An entirely fresh stage opens no second reader. The consuming publish call
 restores NORMAL synchronization, completes a blocking TRUNCATE checkpoint,
-syncs the database and containing directory, and only then enters the store's
-old-or-new promotion journal. Its phase telemetry exposes the checkpoint
+syncs the database and containing directory, and only then enters immutable
+generation publication. Its phase telemetry exposes the checkpoint
 budget, checkpoint time, and sync time. Generic build stores and incremental
 clones keep WAL/NORMAL throughout.
 
-Incremental clone telemetry records the successful live-to-staged SQLite
-backup call and the logical source/target database bytes. The clone happens
+Incremental stage telemetry records native clone or production copy strategy,
+fallback reason, native error code when present, cloned and copied bytes, stage
+wall, and logical source/target database bytes. A mutable legacy source uses
+SQLite online backup and reports that strategy instead. The stage happens
 before incremental indexing begins, so `staged_snapshot_copy` is independent
 of the later `publish_ms` wall. Every successful core publication also reports
 nested promotion telemetry for lock/recovery, candidate and prior-live
@@ -543,10 +546,11 @@ then updates unresolved edges using the stored graph state.
 ### How full and incremental core publication differ
 
 Full refresh builds a fresh disposable stage and publishes it only after staged
-finalization succeeds. Incremental refresh starts with a coherent SQLite backup
-of the live database, changes only that durable clone, and publishes the
-completed replacement. The previous live database remains usable until either
-candidate enters the shared promotion journal.
+finalization succeeds. Incremental refresh stages the sealed live database with
+a native clone or cancellable byte copy, changes only that durable stage, and
+publishes the completed replacement. The previous immutable generation remains
+usable until the new pointer is installed; its file remains available to pinned
+readers afterward.
 
 Neither core path alone publishes the immutable retrieval generation.
 Retrieval finalization binds its candidate to the resulting core generation and
@@ -561,13 +565,15 @@ refresh discards the stage; incremental refresh discards its clone; promotion
 and rollback validate the recorded structural identity before installing either
 database.
 
-### Why whole-database staging still owns core publication
+### Historical decision record: whole-database staging
 
-One incremental publication moves the whole database three times: it clones
-live into the stage, copies live into the rollback backup, and restores the
-stage over live. A staged delta or attached-database apply would remove all
-three, so the wall those three report is the ceiling on what such a design
-could save. That ceiling was measured rather than assumed, by
+Incremental publication still stages a whole logical core image. The current
+store seals the candidate, installs it as an immutable generation, and atomically
+replaces the pointer while retaining the rollback image by reference. Native cloning can avoid a physical
+full-size copy for sealed files; unsupported filesystems use cancellable byte
+copy without changing the indexing mode. The older movement measurement below
+predates that stage strategy and does not measure its current disk use or wall.
+It documents the older copy/restore design decision and was recorded by
 `incremental_publication_whole_database_movement_measurement` in
 `crates/codestory-runtime/tests/integration.rs`.
 
@@ -582,8 +588,8 @@ repository, on an optimized dev build, Apple-silicon laptop, APFS:
 | 4     |    20,252 ms |   10,007 ms |                5,562 ms |          27.5% |
 | 5     |    19,912 ms |   11,088 ms |                5,640 ms |          28.3% |
 
-Publication is 43.7-67.1% of an incremental refresh at this size, and moving
-whole databases is 23.8-38.8% of it. The two validation phases that carry the
+In that earlier run, publication was 43.7-67.1% of an incremental refresh at
+this size, and whole-database movement was 23.8-38.8% of it. The two validation phases that carry the
 whole-file digests add a further 4,887-8,247 ms — the candidate is digested on
 each side of its own validation and the published file once more — though those
 phases also do cheap indexed identity reads, so that figure bounds the digest
@@ -595,25 +601,25 @@ real and material, and it is not the reason the swap is declined.
 Read these as one machine's ratios, not a portable budget. The run shared the
 host with other compilation, which is most of why the per-round walls spread as
 widely as they do; rerun the measurement before quoting an absolute number.
-The ordering it establishes is what the decision below rests on, and it held in
-every round: publication is about half the refresh, and moving whole databases
-is the largest single part of publication.
+For that older candidate, publication was about half the refresh, and moving
+whole databases was the largest single part of publication. These ratios do
+not characterize immutable-generation publication.
 
-The swap is declined because of the four properties it has to preserve, two of
-which it cannot:
+The proposed in-place apply was declined at the time because of the four
+properties it had to preserve, two of which it could not:
 
-- **Pinned readers** and **old-or-new publication** would survive. A single
+- **Pinned readers** and **old-or-new publication** would have survived. A single
   WAL write transaction commits atomically and a reader holding a snapshot sees
-  the old generation until it ends, exactly as the restore-based promotion
-  already gives it.
-- **Post-restore identity** does not. The current fence proves the published
+  the old generation until it ends, as the then-current restore-based promotion
+  did.
+- **Post-restore identity** did not. That fence proved the published
   file is byte-identical to the candidate whose validation already passed, and
   reports `core_promotion.promoted_validation=reused_candidate_receipt`; every
   publication in the table did. An apply assembles the live image in place and
   keeps no separate validated candidate file, so the receipt has no second file
   to match. The strongest claim it can make is `revalidated`, which is a
   strictly weaker post-restore identity than the one being replaced.
-- **Crash recovery** does not survive independently of that. Rollback returns
+- **Crash recovery** did not survive independently of that. Rollback returned
   the live path to the whole-database backup image. An apply that drops the
   backup has to validate before it commits instead — and a pre-commit
   validation cannot digest a file that does not exist yet. Dropping the backup
@@ -628,9 +634,9 @@ published database inside one transaction — would hold a write transaction
 against live for the whole refresh, which the table above measures at
 19.8-35.0 seconds.
 
-So the promotion fence is unchanged and this is a recorded non-change, not a
-deferral for lack of evidence. Two things would reopen it, and both are
-measurable from telemetry already emitted:
+This remains a historical non-change. Reassessing an in-place apply would
+require new measurements and a proof of its current publication invariants.
+The original decision named two possible triggers:
 
 1. a post-restore fence that binds the published database to a validation
    without requiring two files, stated and proved before any apply is written;
@@ -691,7 +697,7 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v3`
-- `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup-call wall and logical source/target database bytes (`page_count * page_size`); this clone happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
+- `staged_snapshot_copy`: successful incremental stage strategy (`cloned`, `copied`, or `sqlite_backup` for mutable legacy), fallback reason and native error code when relevant, cloned/copied bytes, stage wall, and logical source/target database bytes (`page_count * page_size`); staging happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
 - `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
 - `core_promotion.promoted_validation`: which post-restore identity fence the promotion satisfied. `reused_candidate_receipt` means the published file was proven byte-identical to the candidate whose validation already passed; `revalidated` means it could not be proven identical and the deep identity checks were re-derived from the published file. An absent value reads as `revalidated`, because that is the weaker claim
 
