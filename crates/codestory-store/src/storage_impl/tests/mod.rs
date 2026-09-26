@@ -8619,6 +8619,122 @@ fn immutable_migration_replaces_incomplete_legacy_predecessor_without_rollback()
 }
 
 #[test]
+fn interrupted_schema31_predecessor_retires_only_after_complete_replacement()
+-> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let legacy = Connection::open(&live)?;
+    legacy.execute_batch(&format!(
+        "INSERT INTO incomplete_index_run(id, started_at_epoch_ms) VALUES(1, 1);
+         PRAGMA user_version = {};",
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    ))?;
+    drop(legacy);
+    let original = fs::read(&live).expect("read authentic interrupted source");
+    let annotations_path = root.path().join("annotations.sqlite3");
+    let annotations = crate::AnnotationStore::open_for_write(
+        &annotations_path,
+        &crate::NativeRootBinding::new(Some("test-root".into()), root.path()),
+    )
+    .expect("create annotation sidecar");
+    annotations
+        .create_category("Keep category")
+        .expect("persist annotation");
+    drop(annotations);
+    let annotation_bytes = fs::read(&annotations_path).expect("read annotation sidecar");
+
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let first = layout.create_staging_database_path()?;
+    seed_promotion_file(&first, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+    let error = Storage::promote_staged_snapshot_inner(&first, &live, None, &cancelled)
+        .expect_err("cancellation after receipt write must prevent publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(
+        fs::read(&live).expect("preserved interrupted source"),
+        original
+    );
+    assert_eq!(
+        fs::read(&annotations_path).expect("preserved annotations"),
+        annotation_bytes
+    );
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("uncommitted retirement receipt"))
+            .expect("receipt JSON");
+    assert_eq!(pending["committed"], false);
+
+    let retry = layout.create_staging_database_path()?;
+    seed_promotion_file(&retry, 3, "complete.rs")?;
+    Storage::promote_staged_snapshot(&retry, &live)?;
+    let pointer = layout
+        .read_pointer()?
+        .expect("complete replacement pointer");
+    assert_eq!(pointer.active.generation_id, "generation-3");
+    assert!(
+        pointer.rollback.is_none(),
+        "interrupted predecessor is not rollback eligible"
+    );
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched interrupted source");
+            Ok(true)
+        })?;
+    assert!(retired.retired && !retired.pending);
+    assert!(
+        !live.exists(),
+        "redundant interrupted standalone image is retired"
+    );
+    assert_eq!(
+        fs::read(&annotations_path).expect("preserved sidecar"),
+        annotation_bytes
+    );
+    let categories = crate::AnnotationStore::open_observational(&annotations_path)
+        .expect("read annotations")
+        .expect("sidecar remains")
+        .categories()
+        .expect("read categories");
+    assert!(
+        categories
+            .iter()
+            .any(|category| category.name == "Keep category")
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_unpublished_standalone_core_retires_without_becoming_rollback() -> Result<(), StorageError>
+{
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    drop(Storage::open_build(&live)?);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let pointer = layout.read_pointer()?.expect("replacement pointer");
+    assert!(
+        pointer.rollback.is_none(),
+        "empty standalone core cannot be rollback"
+    );
+    assert!(layout.root().join("legacy-retirement.json").is_file());
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched empty standalone core");
+            Ok(true)
+        })?;
+    assert!(retired.retired);
+    assert!(!live.exists());
+    assert_eq!(
+        Storage::open(&live)?.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    Ok(())
+}
+
+#[test]
 fn immutable_migration_copies_complete_schema31_rollback_without_cow() -> Result<(), StorageError> {
     let root = tempfile::tempdir().expect("migration root");
     let live = root.path().join("codestory.db");

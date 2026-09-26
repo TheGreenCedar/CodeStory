@@ -7299,7 +7299,8 @@ impl Storage {
                         if !incomplete {
                             require_empty_unpublished_core(live_path)?;
                         }
-                        (None, incomplete, None)
+                        let original_identity = core_retention::capture_legacy_identity(live_path)?;
+                        (None, incomplete, Some(original_identity))
                     }
                 }
             } else {
