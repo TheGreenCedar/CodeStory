@@ -4973,6 +4973,109 @@ fn node_file_identity_lookup_does_not_decode_symbol_details() -> Result<(), Stor
 }
 
 #[test]
+fn exact_symbol_file_identity_pages_use_canonical_names_without_hydration()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "fallback".into(),
+            qualified_name: Some("pkg::exact".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            qualified_name: Some("  ".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            qualified_name: Some("other".into()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "pkg::exact".into(),
+            ..Default::default()
+        },
+    ])?;
+    storage
+        .conn
+        .execute("UPDATE node SET kind = X'80' WHERE id = 10", [])?;
+    storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+        node_id: NodeId(30),
+        display_name: "pkg::exact".into(),
+    }])?;
+    let first = storage.get_exact_symbol_file_identities_after("pkg::exact", None, 1)?;
+    assert_eq!(
+        first,
+        [NodeFileIdentityProjection {
+            node_id: NodeId(10),
+            file_path: Some("src/lib.rs".into())
+        }]
+    );
+    let rest = storage.get_exact_symbol_file_identities_after("pkg::exact", Some(NodeId(10)), 2)?;
+    assert_eq!(
+        rest,
+        [
+            NodeFileIdentityProjection {
+                node_id: NodeId(20),
+                file_path: Some("src/lib.rs".into())
+            },
+            NodeFileIdentityProjection {
+                node_id: NodeId(40),
+                file_path: None
+            },
+        ]
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("pkg::exact", Some(NodeId(40)), 1)?
+            .is_empty()
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("fallback", None, 1)?
+            .is_empty(),
+        "nonempty qualified name owns the canonical label"
+    );
+    assert!(
+        storage
+            .get_exact_symbol_file_identities_after("pkg::ex", None, 1)?
+            .is_empty(),
+        "no fuzzy matching"
+    );
+    assert!(
+        storage
+            .get_canonical_search_symbol_detail_batch_after(None, 1)
+            .is_err(),
+        "fixture proves full-detail hydration would fail"
+    );
+    assert!(matches!(
+        storage.get_exact_symbol_file_identities_after("pkg::exact", None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_exact_symbol_file_identities_after"
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
 fn canonical_search_symbol_batches_reject_zero_limit() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
 

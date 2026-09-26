@@ -737,6 +737,291 @@ mod tests {
     };
     use std::rc::Rc;
 
+    struct FileSymbolFixture {
+        _workspace: tempfile::TempDir,
+        controller: AppController,
+        selected_ids: Vec<String>,
+    }
+
+    fn file_symbol_fixture(
+        outside_count: usize,
+        selected_count: usize,
+        reverse_ids_and_insertion: bool,
+    ) -> FileSymbolFixture {
+        use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
+        use codestory_retrieval::{
+            SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults,
+            SidecarRuntimeOverrides,
+        };
+
+        let workspace = tempfile::tempdir().expect("create isolated workspace");
+        let root = workspace.path();
+        std::fs::create_dir(root.join("src")).expect("create source directory");
+        let storage_path = root.join("codestory.db");
+        let mut nodes = Vec::new();
+        let mut files = Vec::new();
+        let mut selected_ids = Vec::new();
+        for index in 0..=outside_count {
+            let selected = index == outside_count;
+            let relative = if selected {
+                "src/selected.rs".to_string()
+            } else {
+                format!("src/outside-{index}.rs")
+            };
+            let absolute = root.join(&relative);
+            std::fs::write(&absolute, "fn shared() {}\n").expect("write source file");
+            let file_id = CoreNodeId(index as i64 + 1);
+            // Mix canonical relative and absolute file labels.
+            let label = if index % 2 == 0 {
+                relative
+            } else {
+                absolute.display().to_string()
+            };
+            nodes.push(Node {
+                id: file_id,
+                kind: CoreNodeKind::FILE,
+                serialized_name: label.clone(),
+                file_node_id: Some(file_id),
+                ..Default::default()
+            });
+            files.push(codestory_store::FileInfo {
+                id: file_id.0,
+                path: absolute,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            });
+            let count = if selected { selected_count } else { 1 };
+            for occurrence in 0..count {
+                let id = if selected {
+                    900_000 + occurrence as i64
+                } else if reverse_ids_and_insertion {
+                    10_000 + (outside_count - index) as i64
+                } else {
+                    10_000 + index as i64
+                };
+                if selected {
+                    selected_ids.push(id.to_string());
+                }
+                nodes.push(Node {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "shared".into(),
+                    qualified_name: Some("shared".into()),
+                    file_node_id: Some(file_id),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                });
+            }
+        }
+        if reverse_ids_and_insertion {
+            nodes.reverse();
+            files.reverse();
+        }
+        {
+            let mut storage = crate::Storage::open(&storage_path).expect("open fixture storage");
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert real symbol identities");
+            storage
+                .insert_files_batch(&files)
+                .expect("insert complete indexed files");
+        }
+        let defaults = SidecarProcessDefaults::new(
+            root.join("isolated-cache"),
+            SidecarRuntimeDefaults::from_process_env(),
+        );
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            SidecarProfile::Local,
+            None,
+            &defaults,
+            &SidecarRuntimeOverrides::default(),
+        );
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_with_storage_path(root.to_path_buf(), storage_path)
+            .expect("open isolated project");
+        FileSymbolFixture {
+            _workspace: workspace,
+            controller,
+            selected_ids,
+        }
+    }
+
+    fn file_symbol_resolution(fixture: &FileSymbolFixture, path: &str) -> PacketProbeResolutionDto {
+        resolve_packet_probes(
+            &fixture.controller,
+            vec![PacketProbeDto::FileSymbol {
+                path: path.into(),
+                symbol: "shared".into(),
+            }],
+        )
+        .remove(0)
+    }
+
+    #[test]
+    fn file_symbol_resolves_selected_identity_after_global_caps() {
+        let fixture = file_symbol_fixture(240, 1, false);
+        let global = fixture
+            .controller
+            .resolve_exact_indexed_symbol_identities("shared")
+            .expect("global identity lookup");
+        assert_eq!(global.len(), 17, "global admission cap remains in force");
+        assert!(
+            global
+                .iter()
+                .all(|candidate| !fixture.selected_ids.contains(&candidate.node_id.0)),
+            "selected identity sorts after both global windows"
+        );
+        let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+        assert_eq!(
+            resolution.status,
+            PacketProbeResolutionStatusDto::FileScopedSymbol,
+            "241 real same-name identities must not hide the selected-file target: {resolution:?}"
+        );
+        assert_eq!(resolution.symbol_id.as_ref(), fixture.selected_ids.first());
+        assert!(resolution.candidates.is_empty());
+    }
+
+    #[test]
+    fn file_symbol_identity_is_independent_of_global_order() {
+        // Include enough exact-name rows to cross identity page boundaries.
+        for outside_count in [18, 600] {
+            for reverse in [false, true] {
+                let fixture = file_symbol_fixture(outside_count, 1, reverse);
+                let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+                assert_eq!(
+                    resolution.status,
+                    PacketProbeResolutionStatusDto::FileScopedSymbol
+                );
+                assert_eq!(
+                    resolution.symbol_id.as_ref(),
+                    fixture.selected_ids.first(),
+                    "requested file controls identity for {outside_count} duplicates, reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_symbol_preserves_local_ambiguity_and_admission_overflow() {
+        for selected_count in [2, 18] {
+            let fixture = file_symbol_fixture(240, selected_count, true);
+            let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+            assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous);
+            assert!(resolution.symbol_id.is_none());
+            assert_eq!(
+                resolution
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.symbol_id.clone())
+                    .collect::<Vec<_>>(),
+                fixture
+                    .selected_ids
+                    .iter()
+                    .take(17)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            let global = resolve_packet_probes(
+                &fixture.controller,
+                vec![PacketProbeDto::QualifiedSymbol {
+                    symbol: "shared".into(),
+                }],
+            )
+            .remove(0);
+            assert_eq!(global.status, PacketProbeResolutionStatusDto::Ambiguous);
+            assert_eq!(
+                global.candidates.len(),
+                17,
+                "global unscoped limit stays unchanged"
+            );
+        }
+        let fixture = file_symbol_fixture(240, 18, false);
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+        assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous);
+        assert_eq!(resolution.candidates.len(), 16);
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(
+            session.admit_descriptor(&retrieval_descriptor(99)),
+            PacketAdmissionDecision::CountBudgetExceeded,
+            "true local overflow consumes the shared budget rather than becoming a unique target"
+        );
+    }
+
+    #[test]
+    fn file_symbol_missing_and_external_paths_do_not_select_other_files() {
+        let fixture = file_symbol_fixture(240, 0, false);
+        for path in ["src/selected.rs", "src/missing.rs"] {
+            let resolution = file_symbol_resolution(&fixture, path);
+            assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Rejected);
+            assert_eq!(
+                resolution.rejection.expect("missing rejection").code,
+                PacketProbeRejectionCodeDto::MissingTarget
+            );
+            assert!(resolution.symbol_id.is_none());
+            assert!(resolution.candidates.is_empty());
+        }
+        let external = tempfile::tempdir().expect("create external root");
+        let external_path = external.path().join("external.rs");
+        std::fs::write(&external_path, "fn shared() {}\n").expect("write external file");
+        let resolution = file_symbol_resolution(&fixture, &external_path.display().to_string());
+        assert_eq!(
+            resolution.rejection.expect("external rejection").code,
+            PacketProbeRejectionCodeDto::OutOfProject
+        );
+        assert!(resolution.symbol_id.is_none());
+        assert!(resolution.candidates.is_empty());
+    }
+
+    #[test]
+    fn file_symbol_uses_native_file_aliases() {
+        use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
+        let fixture = file_symbol_fixture(240, 1, false);
+        let root = fixture._workspace.path();
+        let alias = root.join("src/alias.rs");
+        std::fs::hard_link(root.join("src/selected.rs"), &alias).expect("create native file alias");
+        // The requested alias is independently covered; its declaration still
+        // belongs to the other native spelling in the canonical node table.
+        let mut storage = crate::Storage::open(root.join("codestory.db")).expect("open fixture");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(5000),
+                kind: CoreNodeKind::FILE,
+                serialized_name: "src/alias.rs".into(),
+                file_node_id: Some(CoreNodeId(5000)),
+                ..Default::default()
+            }])
+            .expect("insert alias identity");
+        storage
+            .insert_file(&codestory_store::FileInfo {
+                id: 5000,
+                path: alias,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert alias coverage");
+        drop(storage);
+        let resolution = file_symbol_resolution(&fixture, "src/alias.rs");
+        assert_eq!(
+            resolution.status,
+            PacketProbeResolutionStatusDto::FileScopedSymbol
+        );
+        assert_eq!(resolution.symbol_id.as_ref(), fixture.selected_ids.first());
+        assert_eq!(resolution.path.as_deref(), Some("src/alias.rs"));
+    }
+
     fn retrieval_descriptor(index: usize) -> PacketCandidateDescriptorV1 {
         PacketCandidateDescriptorV1 {
             stable_identity: format!("node:retrieval-{index}"),

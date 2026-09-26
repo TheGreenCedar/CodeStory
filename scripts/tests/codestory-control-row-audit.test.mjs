@@ -100,6 +100,132 @@ test("control audit binds commands and artifacts and counts composed source outp
     Buffer.byteLength(setup.events[1].item.aggregated_output));
 });
 
+test("control audit independently accounts source-bearing search output", async () => {
+  for (const command of ["rg -n beta src/alpha.rs", "grep -n beta src/alpha.rs", "rg -e --count src/alpha.rs", "grep -e -l src/alpha.rs", "rg --regexp=--files src/alpha.rs", "grep -e-l src/alpha.rs"]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.events[1].item.aggregated_output = "src/alpha.rs:1:fn alpha() { beta(); }\n";
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.intervention_valid, false);
+    assert.equal(audit.native_fallback.source_read_count, 1, command);
+    assert.equal(audit.native_fallback.source_bytes, Buffer.byteLength(setup.events[1].item.aggregated_output), command);
+  }
+});
+
+test("control audit detects a direct read omitted from consistent telemetry", async () => {
+  for (const command of ["sed -n '1,2p' src/alpha.rs src/beta.rs", "cat src/alpha.rs src/beta.rs"]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.source_exposure_reconciliation?.status, "indeterminate", command);
+    assert.equal(audit.native_fallback.source_read_count, 2, command);
+    assert.match(audit.source_exposure_reconciliation.reasons.join(" "), /telemetry.*mismatch/u);
+  }
+});
+
+test("search exposure includes extensionless paths and refuses partially recognized output", async () => {
+  for (const [output, expected] of [
+    ["src/alpha.rs:1:fn alpha() {}\nDockerfile:2:FROM alpine\n", 2],
+    ["src/alpha.rs:fn alpha() {}\nDockerfile:FROM alpine\n", null],
+    ["src/alpha.rs:1:fn alpha() {}\nopaque source output\n", null],
+    ["fn alpha() {}\nFROM alpine\n", null],
+  ]) {
+    const setup = await fixture();
+    setup.events[1].item.command = "rg -n alpha src/alpha.rs Dockerfile";
+    setup.events[1].item.aggregated_output = output;
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.native_fallback.source_read_count, expected, output);
+    assert.equal(audit.source_exposure_reconciliation.status, expected === null ? "indeterminate" : "reconciled", output);
+  }
+});
+
+test("direct exposure operands include extensionless files and never count script or option values", async () => {
+  for (const command of ["cat src/alpha.rs Dockerfile", "sed -n '1,2p' src/alpha.rs Dockerfile"]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.row.transcript_analysis.direct_source_reads = [setup.row.transcript_analysis.direct_source_reads[0]];
+    setup.row.transcript_analysis.direct_source_reads_total = 1;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const omitted = await auditControlRow(setup.params);
+    assert.equal(omitted.source_exposure_reconciliation.status, "indeterminate", command);
+    assert.equal(omitted.native_fallback.source_read_count, 2, command);
+    setup.row.transcript_analysis.direct_source_reads.push({ command_id: "read", path: "Dockerfile", event_index: 1 });
+    setup.row.transcript_analysis.direct_source_reads_total = 2;
+    const complete = await auditControlRow(setup.params);
+    assert.equal(complete.source_exposure_reconciliation.status, "reconciled", command);
+    assert.equal(complete.native_fallback.source_read_count, 2, command);
+  }
+  for (const command of ["sed -n -e '1,2p' src/alpha.rs", "head -n 2 src/alpha.rs", "sed -n 'r src/beta.rs' src/alpha.rs"]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.native_fallback.source_read_count, null, command);
+    assert.equal(audit.source_exposure_reconciliation.status, "indeterminate", command);
+  }
+});
+
+test("control audit bounds wrapped or opaque source output without inventing exact exposure", async () => {
+  for (const command of [
+    "env cat src/alpha.rs",
+    "rtk proxy rg -n beta src/alpha.rs",
+    "python -c \"print(open('src/alpha.rs').read())\"",
+    "custom-reader --project .",
+    "cat src/alpha.rs | head -2",
+  ]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.source_exposure_reconciliation.status, "indeterminate", command);
+    assert.equal(audit.native_fallback.source_read_count, null, command);
+    assert.equal(audit.native_fallback.source_bytes, null, command);
+    assert.equal(audit.native_fallback.output_bytes_upper_bound, Buffer.byteLength(setup.events[1].item.aggregated_output), command);
+    assert.equal(audit.intervention_valid, false);
+  }
+});
+
+test("control audit distinguishes filename-only and known metadata output from source", async () => {
+  for (const command of ["rg --files src", "rg -l beta src", "grep -l beta src/alpha.rs", "rg -nl beta src/alpha.rs", "echo 'fn alpha() {}'", "echo src/alpha.rs", "git status --short"]) {
+    const setup = await fixture();
+    setup.events[1].item.command = command;
+    setup.events[1].item.aggregated_output = "src/alpha.rs\n";
+    setup.row.transcript_analysis.direct_source_reads = [];
+    setup.row.transcript_analysis.direct_source_reads_total = 0;
+    await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+    const audit = await auditControlRow(setup.params);
+    assert.equal(audit.source_exposure_reconciliation.status, "reconciled", command);
+    assert.equal(audit.native_fallback.source_read_count, 0, command);
+    assert.equal(audit.native_fallback.source_bytes, 0, command);
+  }
+});
+
+test("control audit derives source exposure before failure and retains healthy telemetry", async () => {
+  const setup = await fixture();
+  setup.events.reverse();
+  setup.row.transcript_analysis.direct_source_reads.forEach((read) => { read.event_index = 0; });
+  await writeFile(path.join(setup.runDir, "row.stdout.jsonl"), setup.events.map(JSON.stringify).join("\n") + "\n");
+  const audit = await auditControlRow(setup.params);
+  assert.equal(audit.source_exposure_reconciliation.status, "reconciled");
+  assert.deepEqual(audit.source_exposed_before_failure, {
+    read_count: 2, bytes: Buffer.byteLength(setup.events[0].item.aggregated_output),
+  });
+  assert.equal(audit.native_fallback.source_bytes, 0);
+});
+
 test("audit uses the preserved artifact even when the former mutable path still exists", async () => {
   const setup = await fixture();
   const mutableDir = await mkdtemp(path.join(os.tmpdir(), "codestory-audit-mutable-"));

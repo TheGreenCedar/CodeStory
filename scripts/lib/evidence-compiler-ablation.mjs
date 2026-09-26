@@ -1097,6 +1097,7 @@ export {
   isBuilderAblationArm,
   isBuilderCodeStoryArm,
   isBuilderPacketArm,
+  literalShellWords,
   marginalValue,
   planBuilderAblationRuns,
 };
