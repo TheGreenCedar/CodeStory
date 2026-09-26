@@ -973,6 +973,9 @@ pub struct IncrementalIndexingStats {
     /// Whether this run changed any graph-owned projection row rather than
     /// only refreshing verified file identity and diagnostics.
     pub graph_projection_changed: bool,
+    /// A source-only refresh changed content bytes, so raw-source proof
+    /// adapters must run again even when the graph projection is unchanged.
+    pub proof_inputs_changed: bool,
     /// Existing files whose parser projection was byte-for-byte stable while
     /// their source identity changed.
     pub source_identity_only_files: usize,
@@ -1459,38 +1462,82 @@ impl<'a> ProjectionWriter<'a> {
                     .files
                     .first()
                     .is_some_and(|file| file.language == "openapi");
-            let update_mode = if replace_file_owned_projection {
-                ProjectionUpdateMode::FullReplace
-            } else {
-                classify_projection_update(
-                    &existing_states,
-                    &local_storage.callable_projection_states,
-                )
-            };
+            let (component_access_changed, obsolete_component_access) =
+                if replace_file_owned_projection {
+                    (false, Vec::new())
+                } else {
+                    let node_ids = local_storage
+                        .nodes
+                        .iter()
+                        .map(|node| node.id)
+                        .collect::<Vec<_>>();
+                    let previous_access = self
+                        .storage
+                        .get_component_access_map_for_nodes(&node_ids)
+                        .map_err(|error| anyhow!("Storage access lookup error: {error}"))?;
+                    let current_access = local_storage
+                        .component_access
+                        .iter()
+                        .copied()
+                        .collect::<HashMap<_, _>>();
+                    let obsolete = previous_access
+                        .keys()
+                        .filter(|node_id| !current_access.contains_key(node_id))
+                        .copied()
+                        .collect::<Vec<_>>();
+                    (previous_access != current_access, obsolete)
+                };
+            let compatible_file_metadata = previous_file.as_ref().is_some_and(|previous| {
+                local_storage.files.first().is_some_and(|current| {
+                    previous.complete == current.complete
+                        && previous.language == current.language
+                        && previous.file_role == current.file_role
+                })
+            });
+            let classified_mode = classify_projection_update(
+                &existing_states,
+                &local_storage.callable_projection_states,
+            );
+            let access_only = component_access_changed
+                && file_complete
+                && compatible_file_metadata
+                && matches!(&classified_mode, ProjectionUpdateMode::NoChanges);
+            let update_mode =
+                if replace_file_owned_projection || component_access_changed && !access_only {
+                    ProjectionUpdateMode::FullReplace
+                } else {
+                    classified_mode
+                };
             source_identity_only = matches!(&update_mode, ProjectionUpdateMode::NoChanges)
-                && previous_file.as_ref().is_some_and(|previous| {
-                    local_storage.files.first().is_some_and(|current| {
-                        previous.complete == current.complete
-                            && previous.language == current.language
-                            && previous.file_role == current.file_role
-                    })
-                });
-            if source_identity_only {
+                && compatible_file_metadata
+                && !component_access_changed;
+            if access_only {
+                // The graph rows and stable node identities are unchanged.
+                // Replace only access metadata, preserving their annotations.
+                self.storage
+                    .delete_component_access_for_nodes(&obsolete_component_access)
+                    .map_err(|error| anyhow!("Storage access cleanup error: {error}"))?;
+                retain_file_identity_rows(&mut local_storage, file_id, true);
+                self.stats.graph_projection_changed = true;
+            } else if source_identity_only {
+                // Graph equality does not prove raw-source proof equivalence.
+                // Keep the fast rebind only when the content hash is unchanged
+                // (for example, a metadata-only refresh).
+                let previous_hash = self
+                    .storage
+                    .get_file_content_hash(file_id)
+                    .map_err(|error| anyhow!("Storage content hash lookup error: {error}"))?;
+                let current_hash = local_storage
+                    .file_content_hashes
+                    .iter()
+                    .find(|hash| hash.file_id == file_id)
+                    .map(|hash| hash.content_hash.as_str());
+                self.stats.proof_inputs_changed |=
+                    current_hash.is_none() || previous_hash.as_deref() != current_hash;
                 // The callable and file-structural fences prove the graph is
                 // unchanged. Keep the inherited immutable rows and flush only
                 // the new file identity, content hash, and diagnostics.
-                local_storage
-                    .nodes
-                    .retain(|node| node.id == NodeId(file_id));
-                local_storage.structural_unit_node_ids.clear();
-                local_storage.structural_text_units.clear();
-                local_storage.structural_text_projections.clear();
-                local_storage.structural_text_cache_writes.clear();
-                local_storage.edges.clear();
-                local_storage.occurrences.clear();
-                local_storage.component_access.clear();
-                local_storage.callable_projection_states.clear();
-                local_storage.impl_anchor_node_ids.clear();
+                retain_file_identity_rows(&mut local_storage, file_id, false);
                 self.stats.source_identity_only_files =
                     self.stats.source_identity_only_files.saturating_add(1);
             } else if !file_complete && !verified_malformed {
@@ -4364,11 +4411,31 @@ fn projection_flush_breakdown_ms(breakdown: &codestory_store::ProjectionFlushBre
         .saturating_add(u64::from(breakdown.callable_projection_ms))
 }
 
+fn retain_file_identity_rows(
+    storage: &mut IntermediateStorage,
+    file_id: i64,
+    keep_component_access: bool,
+) {
+    storage.nodes.retain(|node| node.id == NodeId(file_id));
+    storage.structural_unit_node_ids.clear();
+    storage.structural_text_units.clear();
+    storage.structural_text_projections.clear();
+    storage.structural_text_cache_writes.clear();
+    storage.edges.clear();
+    storage.occurrences.clear();
+    if !keep_component_access {
+        storage.component_access.clear();
+    }
+    storage.callable_projection_states.clear();
+    storage.impl_anchor_node_ids.clear();
+}
+
 fn accumulate_projection_writer_stats(
     stats: &mut IncrementalIndexingStats,
     writer_stats: &IncrementalIndexingStats,
 ) {
     stats.graph_projection_changed |= writer_stats.graph_projection_changed;
+    stats.proof_inputs_changed |= writer_stats.proof_inputs_changed;
     stats.source_identity_only_files = stats
         .source_identity_only_files
         .saturating_add(writer_stats.source_identity_only_files);

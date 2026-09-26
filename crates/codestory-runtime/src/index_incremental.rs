@@ -1196,7 +1196,9 @@ fn prepare_incremental_refresh(
         previous_publication.as_ref(),
         source_identity_file_ids.as_deref(),
     ) {
-        (Some(previous), Some(file_ids)) => preparation
+        // Graph-equivalent edits can still change raw-source proof policy
+        // (generated markers, directives, or other adapter inputs).
+        (Some(previous), Some(file_ids)) if !stats.proof_inputs_changed => preparation
             .staged_mut()
             .rebind_inherited_proof_resolution_source_identities(previous, &publication, file_ids)
             .map_err(|error| {
