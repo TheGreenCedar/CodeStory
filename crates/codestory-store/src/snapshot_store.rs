@@ -121,12 +121,18 @@ impl<'a> SnapshotStore<'a> {
 
     /// Clone the live database into a unique staged database in build mode.
     ///
-    /// The SQLite backup primitive captures a coherent source snapshot while
-    /// allowing existing live readers to remain open. Incremental writers can
-    /// then mutate and finalize the clone without exposing partial graph or
-    /// grounding-snapshot generations at the live path.
+    /// A sealed published source is cloned or copied under its reader lease;
+    /// mutable legacy sources use a coherent SQLite online backup. Incremental
+    /// writers mutate only the staged image until publication.
     pub fn clone_live_to_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
-        StagedSnapshot::clone_live(live_path)
+        StagedSnapshot::clone_live(live_path, &|| false)
+    }
+
+    pub fn clone_live_to_staged_with_cancel(
+        live_path: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedSnapshot, StorageError> {
+        StagedSnapshot::clone_live(live_path, cancelled)
     }
 
     /// Remove a staged database and SQLite sidecars.
@@ -240,6 +246,19 @@ impl StagedSnapshot {
     }
 
     fn open_disposable_full_refresh(live_path: &Path) -> Result<Self, StorageError> {
+        let layout = CorePublicationLayout::from_storage_path(live_path)?;
+        let source_logical_bytes = layout
+            .resolve_active_database()?
+            .map(|source| crate::storage_impl::database_logical_bytes_at_path(&source))
+            .transpose()?
+            .unwrap_or(0);
+        crate::ensure_full_size_write_capacity(
+            live_path
+                .parent()
+                .ok_or_else(|| StorageError::Other("Core storage path has no parent".into()))?,
+            source_logical_bytes,
+            "complete core build",
+        )?;
         let path = SnapshotStore::staged_path(live_path)?;
         let store = Store::open_disposable_full_build(&path)?;
         Ok(Self {
@@ -252,15 +271,25 @@ impl StagedSnapshot {
         })
     }
 
-    fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
+    fn clone_live(live_path: &Path, cancelled: &dyn Fn() -> bool) -> Result<Self, StorageError> {
         let layout = CorePublicationLayout::from_storage_path(live_path)?;
-        let source = layout.resolve_active_database()?.ok_or_else(|| {
-            StorageError::Other(format!(
-                "No published core database exists for incremental clone: {}",
-                live_path.display()
-            ))
-        })?;
-        let inherited_validations = if layout.read_pointer()?.is_some() {
+        let published = layout.read_pointer()?.is_some();
+        let pinned = if published {
+            Some(crate::CoreReadSession::pin(live_path)?)
+        } else {
+            None
+        };
+        let source = if let Some(session) = pinned.as_ref() {
+            session.generation_path().to_path_buf()
+        } else {
+            layout.resolve_active_database()?.ok_or_else(|| {
+                StorageError::Other(format!(
+                    "No published core database exists for incremental clone: {}",
+                    live_path.display()
+                ))
+            })?
+        };
+        let inherited_validations = if published {
             Store::open_immutable_generation(&source)
                 .ok()
                 .and_then(|source_store| {
@@ -290,24 +319,63 @@ impl StagedSnapshot {
             inherited_structural_text_validation,
             inherited_proof_resolution_validation,
         ) = inherited_validations.unwrap_or((None, None, None));
+        let source_bytes = crate::storage_impl::database_logical_bytes_at_path(&source)?;
+        crate::ensure_full_size_write_capacity(
+            live_path
+                .parent()
+                .ok_or_else(|| StorageError::Other("Core storage path has no parent".into()))?,
+            source_bytes,
+            "incremental core stage",
+        )?;
         let path = SnapshotStore::staged_path(live_path)?;
         let copy_started = Instant::now();
-        let cloned = crate::core_generation::clone_file_copy_on_write(&source, &path)?;
-        if !cloned {
-            let _ = crate::core_generation::remove_staging_database(&path);
-            return Err(StorageError::Other(format!(
-                "{}: incremental refresh cannot clone {} without a foreground full copy",
-                crate::core_generation::CORE_COPY_ON_WRITE_UNAVAILABLE,
-                source.display()
-            )));
-        }
-        crate::core_generation::make_file_owner_writable(&path)?;
-        let source_bytes = crate::storage_impl::database_logical_bytes_at_path(&source)?;
-        let target_bytes = crate::storage_impl::database_logical_bytes_at_path(&path)?;
+        let stage = if published {
+            match crate::stage_sealed_file(&source, &path, cancelled) {
+                Ok(stage) => Some(stage),
+                Err(error) => {
+                    // stage_sealed_file authenticates and cleans up its own
+                    // file. A replacement must keep this directory nonempty.
+                    let _ = crate::core_generation::remove_empty_staging_directory(&path);
+                    return Err(error);
+                }
+            }
+        } else {
+            if let Err(error) =
+                crate::core_generation::copy_legacy_rollback_snapshot(&source, &path, cancelled)
+            {
+                let _ = crate::core_generation::remove_staging_database(&path);
+                return Err(error);
+            }
+            None
+        };
+        let staged_file = (|| {
+            crate::core_generation::make_file_owner_writable(&path)?;
+            let target_bytes = crate::storage_impl::database_logical_bytes_at_path(&path)?;
+            Ok::<_, StorageError>(target_bytes)
+        })();
+        let target_bytes = match staged_file {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = crate::core_generation::remove_staging_database(&path);
+                return Err(error);
+            }
+        };
         let snapshot_copy = DatabaseSnapshotCopyStats {
             copy_ms: clamp_u128_to_u32(copy_started.elapsed().as_millis()),
             source_bytes,
             target_bytes,
+            stage_strategy: stage
+                .as_ref()
+                .map_or("sqlite_backup", |stage| match stage.strategy {
+                    crate::SealedStageStrategy::Cloned => "cloned",
+                    crate::SealedStageStrategy::Copied => "copied",
+                }),
+            fallback_reason: stage.as_ref().and_then(|stage| stage.fallback_reason),
+            native_error_code: stage.as_ref().and_then(|stage| stage.native_error_code),
+            cloned_bytes: stage.as_ref().map_or(0, |stage| stage.cloned_bytes),
+            copied_bytes: stage
+                .as_ref()
+                .map_or(source_bytes, |stage| stage.copied_bytes),
         };
         let opened = Store::open_with_mode(&path, StorageOpenMode::Build);
         match opened {
@@ -1391,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_live_reports_cow_unavailable_when_clone_is_disabled() {
+    fn clone_live_copies_incrementally_when_native_clone_is_unavailable() {
         let temp = fresh_temp_root("clone-live-cow-disabled");
         let live_path = temp.join("live.sqlite");
         {
@@ -1409,17 +1477,156 @@ mod tests {
             .expect("seed live file");
         }
 
-        let error = crate::with_core_clone_disabled(|| {
-            match SnapshotStore::clone_live_to_staged(&live_path) {
-                Ok(_) => panic!("CoW must fail closed when clone is disabled"),
-                Err(error) => error,
-            }
+        let mut staged = crate::with_core_clone_disabled(|| {
+            SnapshotStore::clone_live_to_staged(&live_path)
+                .expect("unsupported native clone uses the production copy path")
         });
-        assert!(
-            crate::is_core_copy_on_write_unavailable(&error),
-            "expected core_copy_on_write_unavailable, got {error}"
+        assert_ne!(staged.path(), live_path);
+        assert_eq!(
+            staged.store_mut().get_files().expect("staged files")[0].path,
+            PathBuf::from("old.rs")
         );
+        staged.discard().expect("discard copied stage");
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_live_failure_preserves_a_replacement_in_its_stage_directory() {
+        let temp = fresh_temp_root("clone-live-replacement");
+        let live_path = temp.join("live.sqlite");
+        let mut initial = SnapshotStore::open_staged(&live_path).expect("initial stage");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "published-generation".into(),
+            run_id: "published-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        initial
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("publication");
+        publish_empty_source_policy(initial.store_mut(), &publication);
+        initial
+            .publish_with_stats(&live_path)
+            .expect("publish initial");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let original = layout
+            .read_pointer()
+            .expect("read pointer")
+            .expect("pointer");
+        let replacement = std::cell::RefCell::new(None);
+        let error =
+            crate::with_core_clone_disabled(
+                || match SnapshotStore::clone_live_to_staged_with_cancel(&live_path, &|| {
+                    let candidate = fs::read_dir(layout.staging_root())
+                        .ok()
+                        .and_then(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .map(|entry| entry.path().join("codestory.db"))
+                                .find(|path| path.is_file())
+                        });
+                    if let Some(candidate) = candidate {
+                        let moved = candidate.with_file_name("moved-owned.db");
+                        fs::rename(&candidate, &moved).expect("move owned candidate");
+                        fs::write(&candidate, b"another owner's replacement").expect("replacement");
+                        *replacement.borrow_mut() = Some(candidate);
+                        return true;
+                    }
+                    false
+                }) {
+                    Ok(stage) => {
+                        stage.discard().expect("discard unexpected stage");
+                        panic!("cancel after replacement");
+                    }
+                    Err(error) => error,
+                },
+            );
+        assert!(error.to_string().contains("identity changed"));
+        let replacement = replacement.into_inner().expect("replacement installed");
+        assert_eq!(
+            fs::read(replacement).expect("replacement retained"),
+            b"another owner's replacement"
+        );
+        assert_eq!(
+            layout.read_pointer().expect("read unchanged pointer"),
+            Some(original)
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn clone_live_cancellation_keeps_typed_error_and_previous_publication() {
+        let temp = fresh_temp_root("clone-live-cancelled");
+        let live_path = temp.join("live.sqlite");
+        let mut initial = SnapshotStore::open_staged(&live_path).expect("initial stage");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "published-generation".into(),
+            run_id: "published-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        initial
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("publication");
+        publish_empty_source_policy(initial.store_mut(), &publication);
+        initial
+            .publish_with_stats(&live_path)
+            .expect("publish initial");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let original = layout
+            .read_pointer()
+            .expect("read pointer")
+            .expect("pointer");
+        let error =
+            crate::with_core_clone_disabled(
+                || match SnapshotStore::clone_live_to_staged_with_cancel(&live_path, &|| true) {
+                    Ok(stage) => {
+                        stage.discard().expect("discard unexpected stage");
+                        panic!("cancelled stage succeeded");
+                    }
+                    Err(error) => error,
+                },
+            );
+        assert!(matches!(error, StorageError::Cancelled));
+        assert_eq!(
+            layout.read_pointer().expect("read unchanged pointer"),
+            Some(original)
+        );
+        assert!(
+            fs::read_dir(layout.staging_root())
+                .expect("staging root")
+                .next()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn complete_build_refuses_insufficient_space_before_staging() {
+        let temp = fresh_temp_root("full-capacity");
+        let live_path = temp.join("live.sqlite");
+        let result = crate::with_available_filesystem_bytes_override(0, || {
+            SnapshotStore::open_disposable_full_refresh(&live_path)
+        });
+        match result {
+            Ok(stage) => {
+                stage.discard().expect("discard unexpected stage");
+                panic!("complete build must refuse zero available bytes");
+            }
+            Err(error) => assert!(matches!(error, StorageError::InsufficientSpace { .. })),
+        }
+        assert!(
+            !crate::CorePublicationLayout::from_storage_path(&live_path)
+                .expect("layout")
+                .staging_root()
+                .exists()
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 

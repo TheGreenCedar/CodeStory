@@ -11,6 +11,7 @@ mod core_generation;
 mod core_session;
 mod file_store;
 mod projection_store;
+mod sealed_file_stage;
 mod snapshot_store;
 mod sqlite_observation;
 mod sqlite_path;
@@ -27,15 +28,18 @@ pub use annotations::{
 #[cfg(any(test, feature = "test-support"))]
 pub use core_generation::with_core_clone_disabled;
 pub use core_generation::{
-    CORE_COPY_ON_WRITE_UNAVAILABLE, CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY,
-    CORE_PUBLICATION_FILE, CORE_STAGING_DIRECTORY, CorePublicationCommitV1,
-    CorePublicationDurabilityReasonV1, CorePublicationDurabilityV1, CorePublicationLayout,
-    core_database_exists, is_core_copy_on_write_unavailable, make_file_owner_writable,
-    remove_staging_database, resolve_core_database_path, resolve_core_generation_database_path,
+    CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY, CORE_PUBLICATION_FILE,
+    CORE_STAGING_DIRECTORY, CorePublicationCommitV1, CorePublicationDurabilityReasonV1,
+    CorePublicationDurabilityV1, CorePublicationLayout, core_database_exists,
+    make_file_owner_writable, remove_staging_database, resolve_core_database_path,
+    resolve_core_generation_database_path,
 };
 pub use core_session::{CorePublishTransaction, CoreReadSession};
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
+#[cfg(any(test, feature = "test-support"))]
+pub use sealed_file_stage::with_native_clone_disabled;
+pub use sealed_file_stage::{SealedStageStats, SealedStageStrategy, stage_sealed_file};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
     StagedSnapshotPublishStats,
@@ -43,10 +47,10 @@ pub use snapshot_store::{
 #[cfg(any(test, feature = "test-support"))]
 pub use sqlite_observation::with_available_filesystem_bytes_override;
 pub use sqlite_observation::{
-    CompactRehydratePeakSpace, SqliteDatabaseObservation, SqliteVacuumIntoStats,
-    available_filesystem_bytes, compact_candidate_size_limit,
+    CompactRehydratePeakSpace, FULL_SIZE_WRITE_RESERVE_BYTES, SqliteDatabaseObservation,
+    SqliteVacuumIntoStats, available_filesystem_bytes, compact_candidate_size_limit,
     compact_rehydrate_remaining_space_required, compact_rehydrate_space_required,
-    database_upper_bound, ensure_compact_rehydrate_peak_space,
+    database_upper_bound, ensure_compact_rehydrate_peak_space, ensure_full_size_write_capacity,
     is_insufficient_compact_rehydrate_space, measure_compact_rehydrate_peak_space,
     observe_sqlite_database, vacuum_into_database,
 };
