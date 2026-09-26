@@ -220,7 +220,75 @@ pub struct BoundRetrievalIndexManifest {
     pub core: RetrievalCoreGenerationBinding,
 }
 
+/// One write view of the authoritative retrieval pointer database.
+///
+/// An immutable core stores its mutable retrieval pointers externally; legacy
+/// stores keep them embedded. Select that connection once so staged writes,
+/// cancellation rollback, and commit always refer to the same pointer pair.
+/// Validation can read the pinned core but cannot bypass this write view.
+pub struct RetrievalPublicationTransaction<'a> {
+    storage: &'a Storage,
+    external: Option<Connection>,
+    active: bool,
+}
+
+impl RetrievalPublicationTransaction<'_> {
+    fn connection(&self) -> &Connection {
+        self.external.as_ref().unwrap_or(&self.storage.conn)
+    }
+
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub fn publish_retrieval_index_publication(
+        &mut self,
+        manifest: &RetrievalIndexManifest,
+        rollback: Option<&RetrievalIndexRollbackRecord>,
+    ) -> Result<(), StorageError> {
+        publish_retrieval_index_publication_on(
+            self.storage,
+            self.connection(),
+            self.external.is_some(),
+            manifest,
+            rollback,
+        )
+    }
+
+    pub fn finish(mut self) -> Result<(), StorageError> {
+        self.connection().execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RetrievalPublicationTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.connection().execute_batch("ROLLBACK");
+        }
+    }
+}
+
 impl Storage {
+    /// Stage and commit retrieval current/rollback on their owning connection.
+    pub fn retrieval_publication_transaction(
+        &mut self,
+    ) -> Result<RetrievalPublicationTransaction<'_>, StorageError> {
+        let external = self
+            .retrieval_publication_path
+            .as_deref()
+            .map(|path| open_external_retrieval_publication(path, true))
+            .transpose()?;
+        let connection = external.as_ref().unwrap_or(&self.conn);
+        connection.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        Ok(RetrievalPublicationTransaction {
+            storage: self,
+            external,
+            active: true,
+        })
+    }
+
     fn with_retrieval_publication_connection<T>(
         &self,
         writable: bool,
@@ -248,56 +316,9 @@ impl Storage {
         rollback: Option<&RetrievalIndexRollbackRecord>,
     ) -> Result<(), StorageError> {
         validate_rollback_record(manifest, rollback)?;
-        let rollback_record_json =
-            rollback
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|error| {
-                    StorageError::Other(format!("Failed to serialize retrieval rollback: {error}"))
-                })?;
-        let core_binding = self.get_complete_index_publication()?.map(|publication| {
-            RetrievalCoreGenerationBinding {
-                generation_id: publication.generation_id,
-                run_id: publication.run_id,
-            }
-        });
         self.with_retrieval_publication_connection(true, |connection, external| {
-            if external {
-                let current_core = core_binding.as_ref().ok_or_else(|| {
-                    StorageError::Other(
-                        "Retrieval publication requires a complete core generation".into(),
-                    )
-                })?;
-                let rollback_core = rollback
-                    .map(|rollback| {
-                        read_bound_manifest_on(connection, &manifest.project_id)?
-                            .and_then(|bound| {
-                                (bound.manifest == rollback.manifest).then_some(bound.core)
-                            })
-                            .ok_or_else(|| {
-                                StorageError::Other(
-                                    "Retrieval rollback is not the currently bound publication"
-                                        .into(),
-                                )
-                            })
-                    })
-                    .transpose()?;
-                publish_external_retrieval_index_publication_on(
-                    connection,
-                    manifest,
-                    rollback_record_json.as_deref(),
-                    current_core,
-                    rollback_core.as_ref(),
-                )
-            } else {
-                publish_embedded_retrieval_index_publication_on(
-                    connection,
-                    manifest,
-                    rollback_record_json.as_deref(),
-                )
-            }
-        })?;
-        Ok(())
+            publish_retrieval_index_publication_on(self, connection, external, manifest, rollback)
+        })
     }
 
     /// Load the authoritative current and rollback pointers from one SQLite row.
@@ -588,6 +609,58 @@ fn publish_embedded_retrieval_index_publication_on(
             ],
         )?;
     Ok(())
+}
+
+fn publish_retrieval_index_publication_on(
+    storage: &Storage,
+    connection: &Connection,
+    external: bool,
+    manifest: &RetrievalIndexManifest,
+    rollback: Option<&RetrievalIndexRollbackRecord>,
+) -> Result<(), StorageError> {
+    validate_rollback_record(manifest, rollback)?;
+    let rollback_record_json =
+        rollback
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                StorageError::Other(format!("Failed to serialize retrieval rollback: {error}"))
+            })?;
+    let core_binding = storage
+        .get_complete_index_publication()?
+        .map(|publication| RetrievalCoreGenerationBinding {
+            generation_id: publication.generation_id,
+            run_id: publication.run_id,
+        });
+    if external {
+        let current_core = core_binding.as_ref().ok_or_else(|| {
+            StorageError::Other("Retrieval publication requires a complete core generation".into())
+        })?;
+        let rollback_core = rollback
+            .map(|rollback| {
+                read_bound_manifest_on(connection, &manifest.project_id)?
+                    .and_then(|bound| (bound.manifest == rollback.manifest).then_some(bound.core))
+                    .ok_or_else(|| {
+                        StorageError::Other(
+                            "Retrieval rollback is not the currently bound publication".into(),
+                        )
+                    })
+            })
+            .transpose()?;
+        publish_external_retrieval_index_publication_on(
+            connection,
+            manifest,
+            rollback_record_json.as_deref(),
+            current_core,
+            rollback_core.as_ref(),
+        )
+    } else {
+        publish_embedded_retrieval_index_publication_on(
+            connection,
+            manifest,
+            rollback_record_json.as_deref(),
+        )
+    }
 }
 
 fn publish_external_retrieval_index_publication_on(
@@ -1125,9 +1198,10 @@ mod tests {
             .expect("seed current");
 
         {
-            let mut publication = storage.write_transaction().expect("begin publication");
+            let mut publication = storage
+                .retrieval_publication_transaction()
+                .expect("begin publication");
             publication
-                .storage_mut()
                 .publish_retrieval_index_publication(&second, Some(&rollback))
                 .expect("stage pointer pair");
         }
@@ -1140,9 +1214,10 @@ mod tests {
         );
 
         {
-            let mut publication = storage.write_transaction().expect("begin publication");
+            let mut publication = storage
+                .retrieval_publication_transaction()
+                .expect("begin publication");
             publication
-                .storage_mut()
                 .publish_retrieval_index_publication(&second, Some(&rollback))
                 .expect("stage pointer pair");
             publication.finish().expect("commit pointer pair");

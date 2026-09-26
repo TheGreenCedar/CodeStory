@@ -15412,7 +15412,7 @@ mod grounding_snapshot_fast_path_tests {
 
 pub use retrieval_manifest::{
     BoundRetrievalIndexManifest, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
-    RetrievalIndexRollbackRecord,
+    RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
 };
 
 #[cfg(test)]

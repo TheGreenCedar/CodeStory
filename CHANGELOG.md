@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Cancelling a retrieval refresh before its pointer commit preserves the previous current and rollback generations.
+
 - Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.
 
 - JavaScript and TypeScript call proof refuses explicit prototype mutations,
