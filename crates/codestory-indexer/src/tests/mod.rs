@@ -18,6 +18,73 @@ use tempfile::tempdir;
 
 mod walk_tree_nodes;
 
+#[test]
+fn exact_owned_canonical_self_call_survives_legacy_placeholder_attribution() {
+    let file = NodeId(1);
+    let recursive = Node {
+        id: NodeId(2),
+        kind: NodeKind::FUNCTION,
+        file_node_id: Some(file),
+        start_line: Some(1),
+        end_line: Some(2),
+        ..Default::default()
+    };
+    let nearby = Node {
+        id: NodeId(3),
+        kind: NodeKind::FUNCTION,
+        file_node_id: Some(file),
+        start_line: Some(2),
+        end_line: Some(2),
+        ..Default::default()
+    };
+    for legacy_edge_identity in [false, true] {
+        let mut edges = vec![Edge {
+            source: recursive.id,
+            target: recursive.id,
+            resolved_source: Some(recursive.id),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file),
+            line: Some(2),
+            ..Default::default()
+        }];
+        apply_line_range_call_attribution(
+            &[recursive.clone(), nearby.clone()],
+            &mut edges,
+            IndexFeatureFlags {
+                legacy_edge_identity,
+                lazy_graph_execution: true,
+            },
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source, recursive.id);
+        assert_eq!(edges[0].target, recursive.id);
+        assert_eq!(edges[0].resolved_source, Some(recursive.id));
+
+        // Without exact capture provenance, the existing line-based fallback
+        // remains a separate legacy boundary.
+        let placeholder = NodeId(4);
+        let mut fallback = vec![Edge {
+            source: placeholder,
+            target: placeholder,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file),
+            line: Some(2),
+            ..Default::default()
+        }];
+        apply_line_range_call_attribution(
+            &[recursive.clone(), nearby.clone()],
+            &mut fallback,
+            IndexFeatureFlags {
+                legacy_edge_identity,
+                lazy_graph_execution: true,
+            },
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].source, nearby.id);
+        assert_eq!(fallback[0].target, placeholder);
+    }
+}
+
 fn measured_go_method_identity_qualification_work(method_count: usize) -> usize {
     let mut nodes = HashMap::new();
     let mut roles = HashMap::new();

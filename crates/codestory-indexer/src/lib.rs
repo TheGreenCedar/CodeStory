@@ -7980,6 +7980,37 @@ fn javascript_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
     None
 }
 
+// None means the graph capture is not an ordinary callee capture. Some(None)
+// is a proven module-level call; it must not acquire a nearby callable owner.
+fn javascript_call_callable_span(
+    tree: &Tree,
+    lines: &LineOffsets,
+    callee_span: GraphNodeSpan,
+) -> Option<Option<GraphNodeSpan>> {
+    let byte_at = |line: u32, col: u32| {
+        lines
+            .starts
+            .get(line.checked_sub(1)? as usize)?
+            .checked_add(col.checked_sub(1)? as usize)
+    };
+    let start = byte_at(callee_span.start_line, callee_span.start_col)?;
+    let end = byte_at(callee_span.end_line, callee_span.end_col)?;
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)?;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "call_expression" {
+            let function = parent.child_by_field_name("function")?;
+            if function.start_byte() <= start && function.end_byte() >= end {
+                return Some(javascript_enclosing_callable(parent).map(ts_node_graph_span));
+            }
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
 fn javascript_runtime_import_binding_visible_at_call(
     tree: &Tree,
     source: &str,
@@ -16445,6 +16476,31 @@ fn index_file_with_resolution_inputs(
         HashSet::new()
     };
 
+    // Keep syntax ownership separate from canonical node merging. Multiple
+    // same-line callees can share a node, but each graph capture still has its
+    // own address and the nearest callable has one exact definition span.
+    let is_script = matches!(language_config.language_name, "javascript" | "typescript");
+    let mut script_callable_ids = HashMap::<GraphNodeSpan, Option<NodeId>>::new();
+    if is_script {
+        for (graph_id, node_id) in &graph_to_node_id {
+            if unique_nodes
+                .get(node_id)
+                .is_some_and(|node| is_callable_kind(node.kind))
+                && canonical_role_by_node_id.get(node_id) == Some(&CanonicalNodeRole::Definition)
+                && let Some(span) = graph_capture_spans.get(graph_id)
+            {
+                script_callable_ids
+                    .entry(*span)
+                    .and_modify(|current| {
+                        if *current != Some(*node_id) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert(Some(*node_id));
+            }
+        }
+    }
+
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
     let mut callsite_ordinals: HashMap<(NodeId, Option<u32>), u32> = HashMap::new();
@@ -16520,6 +16576,29 @@ fn index_file_with_resolution_inputs(
                 callsite_identity,
                 ..Default::default()
             };
+            let callee_span = graph_capture_spans.get(&sink_ref).copied();
+            if edge.kind == EdgeKind::CALL && is_script {
+                if edge.source == edge.target
+                    && let Some(scope) = callee_span
+                        .and_then(|span| javascript_call_callable_span(&tree, &line_offsets, span))
+                {
+                    // Exact syntax cannot be replaced by a line-only guess.
+                    // Unrepresented/ambiguous nearest callables and module
+                    // calls retain their reference occurrence, but no CALL.
+                    let Some(owner) =
+                        scope.and_then(|span| script_callable_ids.get(&span).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    edge.source = owner;
+                    edge.resolved_source = Some(owner);
+                }
+                col = col.or_else(|| {
+                    callee_span
+                        .filter(|span| Some(span.start_line) == edge.line)
+                        .map(|span| span.start_col)
+                });
+            }
             if edge.kind == EdgeKind::CALL
                 && !flags.legacy_edge_identity
                 && edge.callsite_identity.is_none()
@@ -16961,6 +17040,12 @@ fn apply_line_range_call_attribution(
         .map(|node| node.id)
         .collect();
 
+    let callable_files = nodes
+        .iter()
+        .filter(|node| is_callable_kind(node.kind))
+        .filter_map(|node| node.file_node_id.map(|file| (node.id, file)))
+        .collect::<HashMap<_, _>>();
+
     for node in nodes {
         if !is_callable_kind(node.kind) {
             continue;
@@ -16992,7 +17077,11 @@ fn apply_line_range_call_attribution(
 
     for edge in edges.iter_mut() {
         if edge.kind == EdgeKind::CALL {
-            let placeholder_source = edge.source == edge.target;
+            let exact_owned = edge.resolved_source == Some(edge.source)
+                && edge
+                    .file_node_id
+                    .is_some_and(|file| callable_files.get(&edge.source) == Some(&file));
+            let placeholder_source = edge.source == edge.target && !exact_owned;
             if placeholder_source
                 && let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
                 && let Some(ranges) = functions_by_file.get(&file_id)

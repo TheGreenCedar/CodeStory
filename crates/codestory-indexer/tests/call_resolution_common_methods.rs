@@ -2,6 +2,7 @@ use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
     Edge, EdgeKind, Node, NodeId, NodeKind, Occurrence, ResolutionCertainty,
 };
+use codestory_contracts::proof_resolution::parse_canonical_callsite_identity;
 use codestory_indexer::WorkspaceIndexer;
 use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_store::Store as Storage;
@@ -9235,15 +9236,28 @@ fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -
                     .filter(|edge| {
                         edge.kind == EdgeKind::CALL
                             && edge.line == Some(1)
-                            && occurrences.iter().any(|occurrence| {
-                                occurrence.element_id == edge.target.0
-                                    && occurrence.location.start_line == 1
-                                    && occurrence.location.start_col == column
-                            })
+                            && edge
+                                .callsite_identity
+                                .as_deref()
+                                .and_then(parse_canonical_callsite_identity)
+                                .is_some_and(|identity| {
+                                    identity.line == 1
+                                        && identity.column_or_ordinal == column
+                                        && identity.raw_target == edge.target
+                                        && edge
+                                            .file_node_id
+                                            .is_some_and(|file| file.0 == identity.file_id.0)
+                                })
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(calls.len(), 1, "{extension} column{column}: {calls:#?}");
                 let call = calls[0];
+                assert!(
+                    occurrences
+                        .iter()
+                        .any(|occurrence| { occurrence.element_id == call.target.0 }),
+                    "canonical raw target must retain its node occurrence"
+                );
                 let owner = nodes
                     .iter()
                     .find(|node| node.id == call.effective_source())
