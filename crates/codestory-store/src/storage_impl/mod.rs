@@ -9770,6 +9770,46 @@ impl Storage {
         Ok(symbols)
     }
 
+    /// Read a page of exact canonical display-name matches and their file identities.
+    ///
+    /// This is a pre-hydration identity query. The page limit is a streaming
+    /// bound, not a global admission cap: callers apply native file identity
+    /// before bounding the admitted local matches.
+    pub fn get_exact_symbol_file_identities_after(
+        &self,
+        display_name: &str,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<NodeFileIdentityProjection>, StorageError> {
+        let limit =
+            canonical_search_symbol_batch_limit("get_exact_symbol_file_identities_after", limit)?;
+        let mut sql = String::from(
+            "SELECT node.id, file.serialized_name
+             FROM node
+             LEFT JOIN node file ON file.id = node.file_node_id
+             WHERE (CASE
+                WHEN node.qualified_name IS NOT NULL AND TRIM(node.qualified_name) != ''
+                THEN node.qualified_name ELSE node.serialized_name END) = ?",
+        );
+        let mut query_params = vec![Value::Text(display_name.to_string())];
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" AND node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut identities = Vec::new();
+        while let Some(row) = rows.next()? {
+            identities.push(NodeFileIdentityProjection {
+                node_id: NodeId(row.get(0)?),
+                file_path: row.get(1)?,
+            });
+        }
+        Ok(identities)
+    }
+
     /// Read only the file identity attached to an explicit bounded node set.
     ///
     /// `limit` bounds both the input identities consulted and the rows
