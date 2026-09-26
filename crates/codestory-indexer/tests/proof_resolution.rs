@@ -10938,6 +10938,28 @@ fn assert_script_ordinary_call_owner(
     .expect("canonical ordinary identity");
     assert_eq!(identity.file_id, file_id);
     assert_eq!(identity.line, line);
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.id == file_id.0)
+        .expect("independent source file");
+    let source = fs::read_to_string(file.path)?;
+    let source_line = source
+        .lines()
+        .nth(line as usize - 1)
+        .expect("designated call line");
+    let anchor = format!("{target_name}(");
+    let columns = source_line
+        .match_indices(&anchor)
+        .map(|(byte, _)| byte as u32 + 1)
+        .collect::<Vec<_>>();
+    let [column] = columns.as_slice() else {
+        panic!("fixture must independently designate one call column: {columns:?}");
+    };
+    assert_eq!(
+        identity.column_or_ordinal, *column,
+        "actual callee column survives artifact reuse"
+    );
     assert_eq!(
         identity.raw_target, call.target,
         "canonical raw occurrence must match its CALL target"
