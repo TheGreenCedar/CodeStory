@@ -175,7 +175,11 @@ export function cacheProvenanceBlockers(result) {
     reasons.push("CodeStory semantic docs are not ready");
   }
   if (provenance.packet_embedding_execution && !packetExecutionProven) {
-    reasons.push(...packetExecutionReasons);
+    const livePublicProjection = provenance.packet_embedding_execution.source === "packet.v3_public_projection"
+      && provenance.semantic_ready === true && Boolean(provenance.embedding_engine_instance_id);
+    reasons.push(...(livePublicProjection
+      ? packetV3PublicProjectionProofBlockers(provenance, provenance.packet_embedding_execution)
+      : packetExecutionReasons));
   }
   if (provenance.indexing_in_timed_run == null) {
     reasons.push("missing timed-run indexing provenance");
@@ -189,7 +193,10 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
     return ["missing cold packet embedding execution proof"];
   }
   if (proof.source === "packet.v3_public_projection") {
-    return packetV3PublicProjectionProofBlockers(provenance, proof);
+    return [
+      "cold packet public projection proves publication eligibility, not embedding execution",
+      ...packetV3PublicProjectionProofBlockers(provenance, proof),
+    ];
   }
   const reasons = [];
   if (proof.source !== "packet.answer.retrieval_trace") {

@@ -2,6 +2,7 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
 import { contextMutations, passingCanaryFixture } from "./helpers/builder-canary-fixture.mjs";
@@ -61,6 +62,7 @@ import {
   packetRuntimeCacheObservations,
   agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  runWarmPacketRuntimeGroup,
   packetSufficiencyTelemetry,
   packetForAgentPrompt,
   packetManifestExtraProbes,
@@ -109,6 +111,7 @@ import {
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
 import * as benchmarkHarness from "../codestory-agent-ab-benchmark.mjs";
+import { packetEmbeddingExecutionProofBlockers } from "../codestory-evidence-provenance.mjs";
 import {
   packetGateSelectionOrThrow,
   packetGateStderrPath,
@@ -4952,6 +4955,99 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
   );
 });
 
+test("v3 public packet reference cannot replace missing cold execution and live guards", () => {
+  const preparation = {
+    repo: "codestory",
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "accelerated",
+    },
+    retrieval_status: { semantic_generation: "semantic-v3" },
+  };
+  const observations = agentPacketPreludeCacheObservations(
+    { cachePreparationByRepo: new Map([[preparation.repo, preparation]]) },
+    preparation.repo,
+    packetV3Fixture(),
+    { codestory_index_commands_observed: 0 },
+  );
+  const provenance = localCacheProvenance({
+    semantic_ready: false,
+    embedding_engine_instance_id: null,
+    semantic_generation: "semantic-v3",
+    transport_mode: observations.transport_mode,
+    packet_embedding_execution: observations.packet_embedding_execution,
+  });
+  const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
+  assert.match(blockers.join("\n"), /missing CodeStory embedding engine identity/u);
+  assert.match(blockers.join("\n"), /semantic docs are not ready/u);
+  assert.match(packetEmbeddingExecutionProofBlockers(provenance).join("\n"), /public projection.*not.*execution/u);
+  const claimedCounters = {
+    semantic_stage_count: 1,
+    completed_semantic_stage_count: 1,
+    invalid_semantic_stage_count: 0,
+    encode_count: 1,
+  };
+  Object.assign(provenance.packet_embedding_execution, claimedCounters);
+  assert.match(packetEmbeddingExecutionProofBlockers(provenance).join("\n"), /public projection.*not.*execution/u);
+});
+
+test("warm packet owning request conforms to the generated closed schema", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-warm-schema-"));
+  const catalog = JSON.parse(await readFile(new URL("../../plugins/codestory/generated-mcp-catalog.json", import.meta.url), "utf8"));
+  const schema = catalog.tools.find(({ name }) => name === "packet").inputSchema;
+  const validate = createRequire(import.meta.url)("../../plugins/codestory/scripts/codestory-mcp.cjs")._test.validatePublishedSchemaValue;
+  const requests = [];
+  const violations = [];
+  let servedProject;
+  let closed = false;
+  try {
+    const task = { repo: "codestory", id: "warm-schema", prompt: "Explain run", task_class: "route_tracing" };
+    const rows = await runWarmPacketRuntimeGroup({ codestoryCli: "fixture-cli", repeats: 2 }, "codestory", [task], root, {
+      repoProvenance: async () => ({ fixture: "repository" }),
+      cacheProvenance: async () => localCacheProvenance(),
+      createStdioClient: (command, args) => {
+        assert.equal(command, "fixture-cli");
+        assert.deepEqual(args.slice(0, 2), ["serve", "--project"]);
+        servedProject = args[2];
+        assert.equal(path.isAbsolute(servedProject), true);
+        assert.deepEqual(args.slice(3), ["--stdio", "--refresh", "none"]);
+        return {
+          request: async (request) => { requests.push(structuredClone(request)); },
+          requestWithTimings: async (request) => {
+            requests.push(structuredClone(request));
+            const errors = validate(schema, request.params.arguments, "/arguments");
+            violations.push(...errors);
+            const response = errors.length
+              ? { error: { code: -32602, message: JSON.stringify(errors) } }
+              : { result: { structuredContent: packetV3Fixture() } };
+            return { line: JSON.stringify(response), requestIdKey: request.id, timings: { stdio_response_wait_ms: 1 } };
+          },
+          waitForServerPhaseTimings: async () => [],
+          close: () => { closed = true; },
+          stderr: () => "",
+        };
+      },
+    });
+    assert.deepEqual(violations, []);
+    assert.ok(validate(schema, { project: servedProject, question: task.prompt, task_class: task.task_class }, "/arguments")
+      .some(({ code, pointer }) => code === "unknown_property" && pointer === "/arguments/task_class"));
+    assert.equal(requests[0].method, "initialize");
+    for (const request of requests.slice(1)) {
+      assert.equal(request.method, "tools/call");
+      assert.equal(request.params.name, "packet");
+      assert.deepEqual(request.params.arguments, { project: servedProject, question: task.prompt, budget: "standard" });
+    }
+    assert.deepEqual(rows.map(({ status }) => status), ["pass", "pass"]);
+    assert.equal(rows[1].warm_stdio_packet_cache_hit, true);
+    assert.equal(rows[1].warm_stdio_packet_cache_reference_repeat, 1);
+    assert.ok(rows.every(({ wall_ms, response_bytes }) => Number.isFinite(wall_ms) && response_bytes > 0));
+    assert.equal(closed, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("v3 public packet projection binds full retrieval to the prepared publication", () => {
   const preparation = {
     retrieval_contract: {
@@ -4974,10 +5070,23 @@ test("v3 public packet projection binds full retrieval to the prepared publicati
   });
   assert.equal(proof.source, "packet.v3_public_projection");
   assert.equal(proof.semantic_generation, "semantic-v3");
+  assert.match(packetEmbeddingExecutionProofBlockers(provenance).join("\n"), /public projection.*not.*execution/u);
   assert.deepEqual(
     cacheProvenanceBlockers({ codestory_cache_provenance: provenance }),
     [],
   );
+  for (const overrides of [
+    { semantic_ready: false },
+    { embedding_engine_instance_id: null },
+    { semantic_ready: false, embedding_engine_instance_id: null },
+  ]) {
+    const cold = { ...provenance, ...overrides, transport_mode: "cold_cli_packet",
+      packet_embedding_execution: { ...proof, transport_mode: "cold_cli_packet" } };
+    const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: cold });
+    assert.match(blockers.join("\n"), /public projection.*not.*execution/u);
+    if (cold.semantic_ready !== true) assert.match(blockers.join("\n"), /semantic docs are not ready/u);
+    if (!cold.embedding_engine_instance_id) assert.match(blockers.join("\n"), /missing CodeStory embedding engine identity/u);
+  }
 
   for (const [field, value, expected] of [
     ["retrieval_mode", "degraded", /retrieval mode=degraded/],
