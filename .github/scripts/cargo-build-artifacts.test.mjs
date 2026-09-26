@@ -169,6 +169,14 @@ function fixture({
     reason: "build-finished",
     success: true,
   });
+  const qualificationMessages = includeQualificationDriver
+    ? [
+      messages.splice(messages.findIndex(
+        (message) => message.target?.name === "codestory_embedding_qualification",
+      ), 1)[0],
+      { reason: "build-finished", success: true },
+    ]
+    : [];
 
   return {
     artifacts,
@@ -178,6 +186,10 @@ function fixture({
     ),
     jsonLines: messages.map((message) => JSON.stringify(message)).join("\n"),
     messages,
+    qualificationJsonLines: includeQualificationDriver
+      ? qualificationMessages.map((message) => JSON.stringify(message)).join("\n")
+      : undefined,
+    qualificationMessages,
     releaseDir,
     root,
     targetDir,
@@ -188,6 +200,11 @@ function refreshCargoJson(input) {
   input.jsonLines = input.messages
     .map((message) => JSON.stringify(message))
     .join("\n");
+  if (input.qualificationMessages.length > 0) {
+    input.qualificationJsonLines = input.qualificationMessages
+      .map((message) => JSON.stringify(message))
+      .join("\n");
+  }
 }
 
 function featureMessage(input, packageName) {
@@ -204,6 +221,7 @@ function build(input = fixture()) {
     exactTree: SOURCE_TREE,
     expectations: input.expectations,
     jsonLines: input.jsonLines,
+    qualificationJsonLines: input.qualificationJsonLines,
     rustTarget: RUST_TARGET,
     targetDir: input.targetDir,
     workspaceRoot: input.root,
@@ -234,7 +252,7 @@ function verify(input, manifest, exactSha = SOURCE_SHA) {
   });
 }
 
-test("binds each requested executable to the exact Windows release graph", () => {
+test("binds each requested executable to its exact Windows Cargo graph", () => {
   const { input, manifest } = build();
 
   assert.equal(manifest.schema, "codestory.cargo-build-artifacts/v2");
@@ -306,6 +324,112 @@ test("accepts the release graph without the optional qualification driver", () =
   assert.deepEqual(
     Object.keys(manifest.artifacts).sort(),
     ["cli", "runtime"],
+  );
+});
+
+test("selects the private driver from a separate Cargo graph", () => {
+  const input = fixture();
+  const driverMessage = input.qualificationMessages[0];
+
+  const manifest = buildCargoArtifactManifest({
+    exactSha: SOURCE_SHA,
+    exactTree: SOURCE_TREE,
+    expectations: input.expectations,
+    jsonLines: input.jsonLines,
+    qualificationJsonLines: input.qualificationJsonLines,
+    rustTarget: RUST_TARGET,
+    targetDir: input.targetDir,
+    workspaceRoot: input.root,
+  });
+  assert.equal(
+    manifest.artifacts.qualification_driver.path,
+    path.resolve(driverMessage.executable),
+  );
+  assert.doesNotThrow(() => verify(input, manifest));
+});
+
+test("Windows selector binds production and private Cargo receipts independently", () => {
+  const input = fixture();
+  const productionFile = path.join(input.root, "production.jsonl");
+  const driverFile = path.join(input.root, "qualification.jsonl");
+  const manifestFile = path.join(input.root, "manifest.json");
+  fs.writeFileSync(productionFile, input.jsonLines);
+  fs.writeFileSync(driverFile, input.qualificationJsonLines);
+  const args = [
+    SCRIPT,
+    "select",
+    "--input", productionFile,
+    "--qualification-input", driverFile,
+    "--out", manifestFile,
+    "--target-dir", input.targetDir,
+    "--workspace-root", input.root,
+    "--rust-target", RUST_TARGET,
+    "--source-sha", SOURCE_SHA,
+    "--source-tree", SOURCE_TREE,
+    ...input.expectations.flatMap((expectation) => ["--expect", expectation]),
+  ];
+  const selected = spawnSync(process.execPath, args, { encoding: "utf8" });
+  assert.equal(selected.status, 0, selected.stderr);
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+  assert.deepEqual(Object.keys(manifest.artifacts).sort(), [
+    "cli", "qualification_driver", "runtime",
+  ]);
+
+  fs.rmSync(manifestFile);
+  const wrongStream = spawnSync(
+    process.execPath,
+    args.map((arg) => arg === driverFile ? productionFile : arg),
+    { encoding: "utf8" },
+  );
+  assert.equal(wrongStream.status, 1);
+  assert.match(wrongStream.stderr, /qualification Cargo graph emitted a production binary/u);
+});
+
+test("refuses qualification feature unification in the shipping stream", () => {
+  for (const packageName of ["codestory-cli", "codestory-runtime"]) {
+    const input = fixture();
+    const message = packageName === "codestory-cli"
+      ? input.messages.find((entry) => entry.target?.name === "codestory-cli")
+      : featureMessage(input, packageName);
+    message.features = ["proof-qualification-support"];
+    refreshCargoJson(input);
+    assert.throws(
+      () => build(input),
+      new RegExp(`forbidden feature ${packageName}/proof-qualification-support`, "u"),
+    );
+  }
+});
+
+test("rejects mixed or unverified qualification artifact streams", () => {
+  const mixed = fixture();
+  mixed.messages.splice(-1, 0, mixed.qualificationMessages[0]);
+  refreshCargoJson(mixed);
+  assert.throws(
+    () => build(mixed),
+    /shipping Cargo graph included codestory-bench/u,
+  );
+
+  const unfinished = fixture();
+  unfinished.qualificationMessages.at(-1).success = false;
+  refreshCargoJson(unfinished);
+  assert.throws(
+    () => build(unfinished),
+    /qualification Cargo message stream did not finish successfully/u,
+  );
+
+  const testTarget = fixture();
+  testTarget.qualificationMessages[0].profile.test = true;
+  refreshCargoJson(testTarget);
+  assert.throws(
+    () => build(testTarget),
+    /qualification Cargo graph emitted a test or benchmark target/u,
+  );
+
+  const missing = fixture();
+  missing.qualificationJsonLines = undefined;
+  assert.throws(
+    () => build(missing),
+    /qualification driver requires its separate Cargo message stream/u,
   );
 });
 
