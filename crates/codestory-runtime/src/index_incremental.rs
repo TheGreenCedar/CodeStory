@@ -1191,6 +1191,18 @@ fn prepare_incremental_refresh(
             }
         })
     });
+    // This is optional bounded-refresh evidence, not part of the core
+    // publication. Reject an ineligible receipt while the pointer is still
+    // unchanged; after commit it must never turn success into a false failure.
+    let retrieval_refresh_receipt = retrieval_refresh_receipt.and_then(|receipt| {
+        match receipt.validate() {
+            Ok(()) => Some(receipt),
+            Err(error) => {
+                tracing::debug!(%error, "Discarding ineligible incremental retrieval refresh receipt");
+                None
+            }
+        }
+    });
     let proof_started = Instant::now();
     let proof_rebound = match (
         previous_publication.as_ref(),
@@ -1464,14 +1476,12 @@ fn run_incremental_indexing_common(
     let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
-    if let Some(receipt) = retrieval_refresh_receipt {
-        codestory_retrieval::install_incremental_retrieval_refresh_receipt(receipt).map_err(
-            |error| {
-                ApiError::internal(format!(
-                    "Failed to retain bounded retrieval refresh evidence: {error}"
-                ))
-            },
-        )?;
+    if let Some(receipt) = retrieval_refresh_receipt
+        && let Err(error) =
+            codestory_retrieval::install_incremental_retrieval_refresh_receipt(receipt)
+    {
+        codestory_retrieval::clear_incremental_retrieval_refresh_receipt(storage_path);
+        tracing::warn!(%error, "Discarded optional incremental retrieval refresh evidence after core commit");
     }
     let commit_wall = commit_started.elapsed();
     let mut phase_timings = core_indexing_phase_timings(
