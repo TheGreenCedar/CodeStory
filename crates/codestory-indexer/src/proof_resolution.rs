@@ -248,7 +248,7 @@ fn ruby_php_resolution_work() -> usize {
 const ADAPTER_VERSION: &str = "reference-v16";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v18";
-const RUST_ADAPTER_VERSION: &str = "reference-v19";
+const RUST_ADAPTER_VERSION: &str = "reference-v20";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v18";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
@@ -16549,7 +16549,7 @@ struct RustModuleMatch<'a> {
 
 #[derive(Clone)]
 struct RustRecordOrigin {
-    root: PathBuf,
+    root: FileId,
     base_module: Vec<String>,
     dependency_files: Vec<FileId>,
 }
@@ -16562,8 +16562,8 @@ struct RustParentClaim {
 
 struct RustProjectionIndex<'a> {
     origins: HashMap<i64, RustRecordOrigin>,
-    modules: HashMap<(PathBuf, Vec<String>), Vec<RustModuleMatch<'a>>>,
-    module_declarations: HashMap<(PathBuf, Vec<String>), Vec<NodeId>>,
+    modules: HashMap<(FileId, Vec<String>), Vec<RustModuleMatch<'a>>>,
+    module_declarations: HashMap<(FileId, Vec<String>), Vec<NodeId>>,
     node_files: HashMap<NodeId, i64>,
     module_inputs: HashMap<(i64, Vec<String>), &'a CachedRustModule>,
     declarations: HashMap<(i64, Vec<String>, String), Vec<&'a CachedTopLevelDeclaration>>,
@@ -16586,26 +16586,18 @@ impl<'a> RustProjectionIndex<'a> {
             count_rust_resolution_work(1);
             record_by_identity.insert(workspace_path_identity(&record.path)?, *record);
         }
-        let mut roots = HashMap::<PathBuf, Vec<&ResolutionCacheRecord>>::new();
+        // Library and binary roots in one directory are distinct Rust crates.
+        // Filesystem directories only locate children; they do not identify a root.
+        let mut valid_roots = HashSet::<FileId>::new();
         for record in &rust_records {
             count_rust_resolution_work(1);
             if matches!(
                 record.path.file_name().and_then(|name| name.to_str()),
                 Some("lib.rs" | "main.rs")
-            ) && let Some(root) = record.path.parent()
-            {
-                roots.entry(root.to_path_buf()).or_default().push(record);
+            ) {
+                valid_roots.insert(FileId(record.file.file_id.0));
             }
         }
-        let valid_roots = roots
-            .into_iter()
-            .filter_map(|(root, records)| {
-                let [record] = records.as_slice() else {
-                    return None;
-                };
-                Some((record.file.file_id.0, root))
-            })
-            .collect::<HashMap<_, _>>();
         let mut parent_claims = HashMap::<i64, Vec<RustParentClaim>>::new();
         for parent in &rust_records {
             count_rust_resolution_work(1);
@@ -16661,8 +16653,8 @@ impl<'a> RustProjectionIndex<'a> {
             .into_iter()
             .filter_map(|(file_id, origin)| origin.map(|origin| (file_id, origin)))
             .collect::<HashMap<_, _>>();
-        let mut modules = HashMap::<(PathBuf, Vec<String>), Vec<RustModuleMatch<'a>>>::new();
-        let mut module_declarations = HashMap::<(PathBuf, Vec<String>), Vec<NodeId>>::new();
+        let mut modules = HashMap::<(FileId, Vec<String>), Vec<RustModuleMatch<'a>>>::new();
+        let mut module_declarations = HashMap::<(FileId, Vec<String>), Vec<NodeId>>::new();
         let mut node_files = HashMap::new();
         let mut module_inputs = HashMap::new();
         let mut declarations = HashMap::<_, Vec<_>>::new();
@@ -16679,7 +16671,7 @@ impl<'a> RustProjectionIndex<'a> {
                 let mut absolute = origin.base_module.clone();
                 absolute.extend(module.module_path.clone());
                 modules
-                    .entry((origin.root.clone(), absolute.clone()))
+                    .entry((origin.root, absolute.clone()))
                     .or_default()
                     .push(RustModuleMatch {
                         record,
@@ -16688,7 +16680,7 @@ impl<'a> RustProjectionIndex<'a> {
                 if let Some(declaration) = module.declaration {
                     node_files.insert(declaration, record.file.file_id.0);
                     module_declarations
-                        .entry((origin.root.clone(), absolute.clone()))
+                        .entry((origin.root, absolute.clone()))
                         .or_default()
                         .push(declaration);
                 }
@@ -16698,7 +16690,7 @@ impl<'a> RustProjectionIndex<'a> {
                     let mut child_path = absolute.clone();
                     child_path.push(child.name.clone());
                     module_declarations
-                        .entry((origin.root.clone(), child_path))
+                        .entry((origin.root, child_path))
                         .or_default()
                         .push(child.declaration);
                 }
@@ -16778,7 +16770,7 @@ impl<'a> RustProjectionIndex<'a> {
         let origin = self.origins.get(&record.file.file_id.0)?;
         let mut absolute_module = origin.base_module.clone();
         absolute_module.extend_from_slice(relative_module);
-        let modules = self.modules.get(&(origin.root.clone(), absolute_module))?;
+        let modules = self.modules.get(&(origin.root, absolute_module))?;
         let [module_match] = modules.as_slice() else {
             return None;
         };
@@ -16863,16 +16855,15 @@ impl<'a> RustProjectionIndex<'a> {
         }
         let modules = self
             .modules
-            .get(&(source_origin.root.clone(), absolute_module.clone()))?;
+            .get(&(source_origin.root, absolute_module.clone()))?;
         let [module_match] = modules.as_slice() else {
             return None;
         };
         let mut path_nodes = Vec::with_capacity(absolute_module.len());
         for length in 1..=absolute_module.len() {
-            let declarations = self.module_declarations.get(&(
-                source_origin.root.clone(),
-                absolute_module[..length].to_vec(),
-            ))?;
+            let declarations = self
+                .module_declarations
+                .get(&(source_origin.root, absolute_module[..length].to_vec()))?;
             let [declaration] = declarations.as_slice() else {
                 return None;
             };
@@ -16925,7 +16916,7 @@ fn standard_rust_module_candidates(
 fn resolve_rust_record_origin(
     file_id: i64,
     records: &HashMap<i64, &ResolutionCacheRecord>,
-    roots: &HashMap<i64, PathBuf>,
+    roots: &HashSet<FileId>,
     parent_claims: &HashMap<i64, Vec<RustParentClaim>>,
     memo: &mut HashMap<i64, Option<RustRecordOrigin>>,
     visiting: &mut HashSet<i64>,
@@ -16941,13 +16932,13 @@ fn resolve_rust_record_origin(
         .get(&file_id)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let result = match (roots.get(&file_id), claims) {
-        (Some(root), []) => Some(RustRecordOrigin {
-            root: root.clone(),
+    let result = match (roots.contains(&FileId(file_id)), claims) {
+        (true, []) => Some(RustRecordOrigin {
+            root: FileId(file_id),
             base_module: Vec::new(),
             dependency_files: vec![FileId(file_id)],
         }),
-        (None, [claim]) if records.contains_key(&claim.parent_file_id) => {
+        (false, [claim]) if records.contains_key(&claim.parent_file_id) => {
             resolve_rust_record_origin(
                 claim.parent_file_id,
                 records,

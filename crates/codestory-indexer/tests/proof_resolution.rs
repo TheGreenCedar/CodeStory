@@ -12319,39 +12319,34 @@ fn noncanonical_callsite_spellings_leave_the_edge_unchanged_and_fact_non_exact()
 fn syntax_claims_reject_shadowing_rebinding_trait_and_generic_inference() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
-    index_files(
-        project.path(),
-        &mut store,
-        &[
-            (
-                "src/shadow.ts",
-                "function target() {}\nexport function caller(target: () => void) { target(); }\n",
-            ),
-            (
-                "src/rebind.ts",
-                "function changed() {}\nexport function caller() { let changed = () => {}; changed(); }\n",
-            ),
-            (
-                "src/trait.rs",
-                "struct Worker; trait Run { fn step(&self); } impl Run for Worker { fn step(&self) {} } fn caller<T: Run>(value: &T) { value.step(); }\n",
-            ),
-            (
-                "src/generic.rs",
-                "struct Boxed<T>(T); impl<T> Boxed<T> { fn step(&self) {} fn run(&self) { self.step(); } }\n",
-            ),
-        ],
-    )?;
+    let files = [
+        (
+            "src/shadow.ts",
+            "function target() {}\nexport function caller(target: () => void) { target(); }\n",
+        ),
+        (
+            "src/rebind.ts",
+            "function changed() {}\nexport function caller() { let changed = () => {}; changed(); }\n",
+        ),
+        (
+            "src/trait.rs",
+            "struct Worker; trait Run { fn step(&self); } impl Run for Worker { fn step(&self) {} } fn caller<T: Run>(value: &T) { value.step(); }\n",
+        ),
+        (
+            "src/generic.rs",
+            "struct Boxed<T>(T); impl<T> Boxed<T> { fn step(&self) {} fn run(&self) { self.step(); } }\n",
+        ),
+    ];
+    index_files(project.path(), &mut store, &files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
-    for raw_target in ["target", "changed", "step"] {
-        for fact in facts
-            .iter()
-            .filter(|fact| fact.callsite.raw_target == raw_target)
-        {
-            assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
-            assert!(fact.edge_id.is_none());
-            assert!(fact.target.is_none());
-        }
+    for (path, marker, callee) in [
+        ("src/shadow.ts", "{ target(); }", "target"),
+        ("src/rebind.ts", "changed();", "changed"),
+        ("src/trait.rs", "value.step()", "step"),
+        ("src/generic.rs", "self.step()", "step"),
+    ] {
+        assert_script_call_anchor(&store, &files, &facts, path, marker, callee)?;
     }
     Ok(())
 }
@@ -14119,6 +14114,334 @@ fn rust_glob_local_precedence_keeps_attributes_macros_and_incomplete_domains_clo
     Ok(())
 }
 
+fn assert_rust_nominal_call_target(
+    store: &Store,
+    root: &std::path::Path,
+    caller_path: &str,
+    call_line: u32,
+    target_path: &str,
+    target_line: u32,
+    owner_line: Option<u32>,
+) -> anyhow::Result<()> {
+    let files = store.get_files()?;
+    let source = files
+        .iter()
+        .find(|file| file.path == root.join(caller_path))
+        .expect("independent Rust caller file");
+    let callers = store
+        .get_nodes()?
+        .into_iter()
+        .filter(|node| {
+            node.file_node_id == Some(NodeId(source.id))
+                && node.start_line == Some(call_line)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callers.len(), 1, "independent Rust caller declaration");
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(source.id)
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1, "designated Rust fact census: {facts:#?}");
+    assert_eq!(
+        facts[0].caller, callers[0].id,
+        "proof caller must be the actual declaration"
+    );
+    assert_nominal_exact_target(store, root, &facts[0], target_path, target_line, owner_line)
+}
+
+#[test]
+fn rust_independent_roots_and_same_named_owners_select_nominal_targets() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "src/lib.rs",
+                concat!(
+                    "fn target() {}\n",
+                    "struct Owner;\nimpl Owner {\n",
+                    "    fn target(&self) {}\n",
+                    "    fn caller(&self) { self.target(); }\n}\n",
+                    "struct Other;\nimpl Other {\n",
+                    "    fn target(&self) {}\n",
+                    "    fn caller(&self) { self.target(); }\n}\n",
+                    "fn caller() { target(); }\n",
+                ),
+            ),
+            ("src/main.rs", "fn target() {}\nfn main() { target(); }\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    for (caller_path, call_line, target_line, owner_line) in [
+        ("src/lib.rs", 5, 4, Some(2)),
+        ("src/lib.rs", 10, 9, Some(7)),
+        ("src/lib.rs", 12, 1, None),
+        ("src/main.rs", 2, 1, None),
+    ] {
+        assert_rust_nominal_call_target(
+            &store,
+            project.path(),
+            caller_path,
+            call_line,
+            caller_path,
+            target_line,
+            owner_line,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_old_root_adapter_rejects_replay_then_reparses_and_reuses() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let files = [
+        ("src/lib.rs", "mod child;\npub fn target() {}\n"),
+        (
+            "src/child.rs",
+            "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+        ),
+        ("src/main.rs", "fn main() {}\n"),
+    ];
+    let paths = index_files(project.path(), &mut store, &files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_rust_nominal_call_target(
+        &store,
+        project.path(),
+        "src/child.rs",
+        3,
+        "src/child.rs",
+        2,
+        None,
+    )?;
+    let before = store.get_proof_resolution_facts()?;
+    let artifacts = {
+        let mut statement = store
+            .get_connection()
+            .prepare("SELECT rowid, artifact_blob FROM index_artifact_cache")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    assert_eq!(artifacts.len(), 3);
+    for (rowid, blob) in artifacts {
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        // Simulated prior version identity on current syntax payload. Root
+        // identity itself is derived during projection, not serialized here.
+        artifact["resolution_file"]["adapter_version"] = "reference-v19".into();
+        for call in artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls")
+        {
+            call["adapter_version"] = "reference-v19".into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE rowid = ?2",
+            rusqlite::params![serde_json::to_vec(&artifact)?, rowid],
+        )?;
+    }
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("old adapter must not keep previous root evidence eligible");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    assert_eq!(store.get_proof_resolution_facts()?, before);
+    for (generation, hits) in [(2, 0), (3, 3)] {
+        let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+            &mut store,
+            &RefreshInfo {
+                mode: BuildMode::Incremental,
+                files_to_index: paths.clone(),
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(
+            result.artifact_cache_hits, hits,
+            "unchanged source cache lifecycle"
+        );
+        for ((_, source), path) in files.iter().zip(&paths) {
+            assert_eq!(fs::read(path)?, source.as_bytes());
+        }
+        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+        store.validate_proof_resolution_publication(&publication(generation))?;
+        assert_rust_nominal_call_target(
+            &store,
+            project.path(),
+            "src/child.rs",
+            3,
+            "src/child.rs",
+            2,
+            None,
+        )?;
+        assert!(
+            store
+                .get_proof_resolution_facts()?
+                .iter()
+                .all(|fact| fact.provenance.language_adapter_version == "reference-v20")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_competing_root_child_claims_refuse_both_file_orders() -> anyhow::Result<()> {
+    for reverse in [false, true] {
+        let mut files = vec![
+            (
+                "src/lib.rs",
+                "mod child;\nuse crate::child::target;\nfn caller() { target(); }\n",
+            ),
+            ("src/main.rs", "mod child;\nfn main() {}\n"),
+            (
+                "src/child.rs",
+                "use super::*;\npub fn target() {}\nfn caller() { target(); }\n",
+            ),
+        ];
+        if reverse {
+            files.reverse();
+        }
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        for path in ["src/lib.rs", "src/child.rs"] {
+            assert_script_call_anchor(&store, &files, &facts, path, "{ target(); }", "target")?;
+        }
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.status == ProofResolutionStatus::IncompleteDomain),
+            "{facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_sibling_library_and_binary_roots_preserve_direct_module_proof() -> anyhow::Result<()> {
+    for reverse in [false, true] {
+        let mut files = vec![
+            (
+                "src/lib.rs",
+                "mod target;\nuse crate::target::target;\npub fn caller() { target(); }\n",
+            ),
+            ("src/target.rs", "pub fn target() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ];
+        if reverse {
+            files.reverse();
+        }
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        let source = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path == project.path().join("src/lib.rs"))
+            .expect("independent library source identity");
+        let calls = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge.file_node_id == Some(NodeId(source.id))
+                    && edge.line == Some(3)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "actual library CALL before proof: {calls:#?}"
+        );
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| {
+                fact.callsite.file_id == FileId(source.id)
+                    && fact.callsite.line == 3
+                    && fact.callsite.raw_target == "target"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "actual library fact census: {facts:#?}");
+        assert_nominal_exact_target(&store, project.path(), &facts[0], "src/target.rs", 1, None)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_sibling_roots_preserve_unique_glob_local_parent_receipt() -> anyhow::Result<()> {
+    for reverse in [false, true] {
+        let mut files = vec![
+            ("src/lib.rs", "mod child;\npub fn target() {}\n"),
+            (
+                "src/child.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+        ];
+        if reverse {
+            files.reverse();
+        }
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        let source = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path == project.path().join("src/child.rs"))
+            .expect("independent child source identity");
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| {
+                fact.callsite.file_id == FileId(source.id)
+                    && fact.callsite.line == 3
+                    && fact.callsite.raw_target == "target"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "actual child call fact census: {facts:#?}");
+        assert_nominal_exact_target(&store, project.path(), &facts[0], "src/child.rs", 2, None)?;
+        let owning_root = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path == project.path().join("src/lib.rs"))
+            .expect("independent owning root identity");
+        assert_eq!(
+            facts[0]
+                .provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|hash| hash.file_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([FileId(source.id), FileId(owning_root.id)]),
+            "child proof must bind its owning library and omit the unrelated binary"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn rust_glob_local_file_modules_require_unique_authenticated_parent_ownership() -> anyhow::Result<()>
 {
@@ -14241,7 +14564,7 @@ fn rust_glob_local_calls_preserve_repeated_source_coordinates_and_provenance() -
     );
     assert!(facts.iter().all(|fact| {
         fact.provenance.language_adapter == "rust"
-            && fact.provenance.language_adapter_version == "reference-v19"
+            && fact.provenance.language_adapter_version == "reference-v20"
             && fact.provenance.dependency_file_hashes.len() == 1
             && matches!(
                 fact.evidence_chain.as_slice(),
@@ -14737,7 +15060,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v19")
+        Some("reference-v20")
     );
     assert_eq!(
         receipt
@@ -14866,7 +15189,7 @@ fn rust_bounded_callsite_regions_preserve_coordinates_order_and_provenance() -> 
             (start as usize - line_start + 1) as u32
         );
         assert_eq!(fact.provenance.language_adapter, "rust");
-        assert_eq!(fact.provenance.language_adapter_version, "reference-v19");
+        assert_eq!(fact.provenance.language_adapter_version, "reference-v20");
         assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
         assert!(matches!(
             fact.evidence_chain.as_slice(),
@@ -15087,6 +15410,24 @@ fn rust_prepared_incompleteness_propagates_through_traits_and_nested_callables()
     Ok(())
 }
 
+fn assert_documented_rust_nominal_target(source: &str) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[("src/lib.rs", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let call_line = source.lines().count() as u32;
+    assert_rust_nominal_call_target(
+        &store,
+        project.path(),
+        "src/lib.rs",
+        call_line,
+        "src/lib.rs",
+        call_line - 1,
+        None,
+    )
+}
+
 #[test]
 fn rust_documented_free_function_target_matrix_is_exact() -> anyhow::Result<()> {
     for documentation in [
@@ -15096,8 +15437,10 @@ fn rust_documented_free_function_target_matrix_is_exact() -> anyhow::Result<()> 
         "/**\n * multiple block lines\n */",
         "/// line\n/** block */\n/// line again",
     ] {
-        let source = format!("{documentation}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
-        assert_only_call_is_exact(&[("src/lib.rs", source.as_str())])?;
+        let source = format!(
+            "mod other {{ fn target() {{}} }}\n{documentation}\nfn target() {{}}\nfn caller() {{ target(); }}\n"
+        );
+        assert_documented_rust_nominal_target(&source)?;
     }
 
     for ordinary_prefix in [
@@ -15107,8 +15450,10 @@ fn rust_documented_free_function_target_matrix_is_exact() -> anyhow::Result<()> 
         "/* ordinary block comment */",
         "// unrelated comment\n\n/* separated ordinary comment */",
     ] {
-        let source = format!("{ordinary_prefix}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
-        assert_only_call_is_exact(&[("src/lib.rs", source.as_str())])?;
+        let source = format!(
+            "mod other {{ fn target() {{}} }}\n{ordinary_prefix}\nfn target() {{}}\nfn caller() {{ target(); }}\n"
+        );
+        assert_documented_rust_nominal_target(&source)?;
     }
     Ok(())
 }

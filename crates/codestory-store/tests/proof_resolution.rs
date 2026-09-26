@@ -1449,6 +1449,83 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
 }
 
 #[test]
+fn rust_same_file_ancestor_hashes_keep_distinct_roots_and_path_guards() {
+    for (root, hash, root_path) in [(8, "b", "src/lib.rs"), (9, "c", "src/main.rs")] {
+        let mut store = Store::new_in_memory().expect("store");
+        seed_exact_graph(&mut store);
+        let mut source = store
+            .get_files()
+            .expect("files")
+            .into_iter()
+            .find(|file| file.id == 1)
+            .expect("source");
+        source.path = "src/child.rs".into();
+        store.insert_file(&source).expect("child path");
+        for (id, path, hash) in [(8, "src/lib.rs", "b"), (9, "src/main.rs", "c")] {
+            let file = FileInfo {
+                id,
+                path: path.into(),
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 2,
+                file_role: FileRole::Source,
+            };
+            store.insert_file(&file).expect("root");
+            store
+                .update_file_metadata(&file, Some(&hash.repeat(64)))
+                .expect("root hash");
+        }
+        // These extra hashes are conservative ancestry coverage, not an ownership
+        // attestation. Either root can add coverage; producer ownership is checked
+        // separately by the indexer's module-parent matrix.
+        let mut fact = exact_fact(EdgeId(7));
+        fact.provenance
+            .dependency_file_hashes
+            .push(DependencyFileHash {
+                file_id: FileId(root),
+                source_sha256: hash.repeat(64),
+            });
+        let fact = seal_call_resolution_fact(fact).expect("seal conservative ancestor");
+        store
+            .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
+            .expect("distinct root ancestor coverage");
+        store
+            .validate_proof_resolution_publication(&publication())
+            .expect("replay");
+        let mut wrong_path = store
+            .get_files()
+            .expect("files")
+            .into_iter()
+            .find(|file| file.id == root)
+            .expect("selected ancestor root");
+        wrong_path.path = "unrelated/main.rs".into();
+        store.insert_file(&wrong_path).expect("move ancestor");
+        let error = store
+            .validate_proof_resolution_publication(&publication())
+            .expect_err("wrong-path ancestor must fail");
+        assert!(error.to_string().contains("dependency hashes"), "{error}");
+        wrong_path.path = root_path.into();
+        store.insert_file(&wrong_path).expect("restore ancestor");
+        let mut duplicate = wrong_path.clone();
+        duplicate.id = 10;
+        let error = store
+            .insert_file(&duplicate)
+            .expect_err("duplicate path must be rejected at insertion");
+        assert!(
+            error
+                .to_string()
+                .contains("UNIQUE constraint failed: file.path"),
+            "{error}"
+        );
+        store
+            .validate_proof_resolution_publication(&publication())
+            .expect("failed duplicate insertion preserves the valid receipt");
+    }
+}
+
+#[test]
 fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("codestory.db");
