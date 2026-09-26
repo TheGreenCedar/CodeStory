@@ -41,7 +41,9 @@ mod row_mapping;
 mod schema;
 mod trail;
 
-pub use core_retention::{CORE_LEASE_FILE, CoreRetentionReport, apply_core_retention};
+pub use core_retention::{
+    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, apply_core_retention,
+};
 pub(crate) use core_retention::{
     CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,
 };

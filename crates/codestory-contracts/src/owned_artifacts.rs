@@ -95,10 +95,20 @@ pub const DERIVED_RESET_QUARANTINE_DIR: &str = "derived-reset-quarantine";
 
 /// Publication pointer, generations, and staging tree beside one storage file.
 pub const CORE_PUBLICATION_DIRECTORY: &str = "core";
+pub const CORE_GENERATIONS_DIRECTORY: &str = "generations";
+pub const CORE_STAGING_DIRECTORY: &str = "staging";
+pub const CORE_PUBLICATION_FILE: &str = "publication.json";
+pub const CORE_RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
+pub const CORE_ACQUISITION_FILE: &str = "acquisition.lock";
+pub const CORE_LEASE_FILE: &str = ".codestory-core-lease.lock";
 
 /// Root holding the publication pointer and immutable generations.
 pub fn core_publication_root(storage_path: &Path) -> PathBuf {
     cache_root_for(storage_path).join(CORE_PUBLICATION_DIRECTORY)
+}
+
+pub fn core_acquisition_lock_path(storage_path: &Path) -> PathBuf {
+    core_publication_root(storage_path).join(CORE_ACQUISITION_FILE)
 }
 
 fn cache_root_for(storage_path: &Path) -> &Path {
@@ -194,6 +204,12 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
         storage_path,
     )));
     files.push(annotations_migration_backup_path(storage_path));
+    let core_root = core_publication_root(storage_path);
+    files.push(core_root.join(CORE_PUBLICATION_FILE));
+    files.push(core_acquisition_lock_path(storage_path));
+    files.extend(sqlite_file_with_sidecars(
+        &core_root.join(CORE_RETRIEVAL_PUBLICATION_FILE),
+    ));
     files
 }
 
@@ -202,13 +218,15 @@ pub fn promotion_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
     path_with_display_suffix(storage_path, suffix)
 }
 
-/// The annotations sidecar and its SQLite siblings in one cache root.
+/// The annotations sidecar, SQLite siblings, and retained migration export.
 ///
 /// These hold user-authored state. Nothing that reclaims derived output may
 /// move or remove them, which is why they are named separately from the rest
 /// of the owned set rather than filtered at each call site.
 pub fn annotation_owned_file_identities(cache_root: &Path) -> Vec<PathBuf> {
-    sqlite_file_with_sidecars(&cache_root.join(ANNOTATIONS_SIDECAR_FILE))
+    let mut files = sqlite_file_with_sidecars(&cache_root.join(ANNOTATIONS_SIDECAR_FILE));
+    files.push(cache_root.join(ANNOTATIONS_MIGRATION_BACKUP_FILE));
+    files
 }
 
 /// Root the guided derived-cache reset quarantines into for one storage file.
@@ -224,10 +242,11 @@ pub fn derived_reset_quarantine_root(storage_path: &Path) -> PathBuf {
 /// excludes only the publish critical section, which is a few milliseconds of
 /// a minutes-long index run — a reset that took only that lock would move the
 /// cache out from under a live indexer.
-pub fn derived_reset_held_lock_paths(storage_path: &Path) -> [PathBuf; 2] {
+pub fn derived_reset_held_lock_paths(storage_path: &Path) -> [PathBuf; 3] {
     [
         index_writer_lock_path(storage_path),
         promotion_sibling_path(storage_path, PROMOTION_LOCK_SUFFIX),
+        core_acquisition_lock_path(storage_path),
     ]
 }
 
@@ -249,13 +268,19 @@ pub fn derived_reset_file_identities(storage_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Derived directory identities the guided reset quarantines: the search trees
-/// owned by one storage file.
+/// Derived trees the reset quarantines. The core root stays in place so its
+/// acquisition lock cannot split into an old and a newly created inode.
 pub fn derived_reset_directory_identities(storage_path: &Path) -> Vec<PathBuf> {
-    SEARCH_DIRECTORY_SUFFIXES
+    let mut directories: Vec<_> = SEARCH_DIRECTORY_SUFFIXES
         .iter()
         .map(|suffix| search_directory_for_storage(storage_path, suffix))
-        .collect()
+        .collect();
+    let core_root = core_publication_root(storage_path);
+    directories.extend([
+        core_root.join(CORE_GENERATIONS_DIRECTORY),
+        core_root.join(CORE_STAGING_DIRECTORY),
+    ]);
+    directories
 }
 
 /// Build the staged snapshot path for one live database and unique parts.
@@ -347,6 +372,7 @@ mod tests {
             [
                 PathBuf::from("/cache/custom-core.index-writer.lock"),
                 PathBuf::from("/cache/custom-core.db.promotion.lock"),
+                PathBuf::from("/cache/core/acquisition.lock"),
             ],
             "the reset must exclude an indexing run, not only a publish, and must take the two locks in the order an indexer takes them"
         );
@@ -370,6 +396,9 @@ mod tests {
             "/cache/local-refresh-status.json",
             "/cache/local-refresh.lock",
             "/cache/local-refresh-state.guard",
+            "/cache/core/publication.json",
+            "/cache/core/retrieval-publication.sqlite3",
+            "/cache/core/retrieval-publication.sqlite3-wal",
         ] {
             assert!(
                 contains(required),
@@ -381,6 +410,8 @@ mod tests {
             vec![
                 PathBuf::from("/cache/custom-core.search"),
                 PathBuf::from("/cache/custom-core.search-generations"),
+                PathBuf::from("/cache/core/generations"),
+                PathBuf::from("/cache/core/staging"),
             ]
         );
         assert_eq!(

@@ -199,7 +199,18 @@ annotation afterwards.
 
 **Downgrade path.** There is no bookmark export/import command. Recovery after
 a newer schema is `cache reset --derived-only` from a 0.17 binary, then
-`index --refresh full`. Internal controller export/import types are test
+`index --refresh full`. Reset includes the immutable pointer, generations,
+stages and retrieval-publication database without opening them. The canonical
+artifact registry preserves annotations and their retained migration export,
+and leaves writer, promotion and acquisition coordination inodes at their live
+paths. Its exclusion order is the global retrieval fence, index writer,
+promotion, acquisition, then all named generation leases. The complete locked
+enumeration must prove every generation idle before any quarantine move; an
+unknown entry, enumeration error, absent lease or held reader fails closed.
+The plan is refreshed under those exclusions. Older unprovisioned immutable
+layouts require a compatible cache backup or manual recovery after all clients
+are stopped; reset cannot prove their readers idle.
+Internal controller export/import types are test
 helpers, not an operator workflow.
 
 ## Entry points
