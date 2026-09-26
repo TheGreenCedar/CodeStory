@@ -7747,6 +7747,283 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_packet_attachment_revokes_each_mismatched_capability() {
+        let bytes = b"nonempty packet diagnostic evidence".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        for mismatch in [None, Some("sha256"), Some("byte_length")] {
+            let registry = Arc::new(std::sync::Mutex::new(
+                crate::stdio_v3::DiagnosticsRegistryV3::new_with_secret([9; 32]),
+            ));
+            let packet_id = Uuid::new_v4().to_string();
+            let mut root = json!({
+                "kind":"complete", "schema_version":3,
+                "identity":{"packet_id":packet_id,"request_id":"attachment-request",
+                    "question_sha256":"a".repeat(64)},
+                "publication":{"core":{"project_id":"project-1",
+                    "generation_id":"core-1","run_id":"run-1"},"retrieval":null},
+                "status":"available",
+                "retrieval":{"state":"full","generation_id":"retrieval-1"},
+                "evidence":[{"identity":{"evidence_id":"source-1"},"kind":"exact_source",
+                    "path":"src/lib.rs","symbol_id":"entry","start_line":1,"end_line":1,
+                    "summary":"pub fn entry() {}"}],
+                "gaps":[], "continuation":null,
+                "diagnostics":{"availability":"available","reference":{
+                    "artifact_id":"diagnostics-1","sha256":digest,"byte_length":bytes.len()}}
+            });
+            match mismatch {
+                Some("sha256") => {
+                    root["diagnostics"]["reference"]["sha256"] = json!("0".repeat(64))
+                }
+                Some("byte_length") => {
+                    root["diagnostics"]["reference"]["byte_length"] = json!(bytes.len() + 1)
+                }
+                None => {}
+                _ => unreachable!(),
+            }
+            serde_json::from_value::<
+                codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+            >(root.clone())
+            .expect("attachment fixture is a typed packet projection");
+            let response = stdio_jsonrpc_tool_execution_v3(
+                json!("attachment"),
+                "packet",
+                crate::stdio_v3::McpRevisionV3::preferred(),
+                StdioToolExecutionV3 {
+                    response: json!({"result":root}),
+                    packet_diagnostics: Some(codestory_runtime::PacketDiagnosticProjectionV3 {
+                        bytes: bytes.clone(),
+                        packet_id,
+                        project_identity: "project-1".to_owned(),
+                        core_generation: "core-1".to_owned(),
+                        core_run: "run-1".to_owned(),
+                        retrieval_generation: Some("retrieval-1".to_owned()),
+                        request_digest: "a".repeat(64),
+                    }),
+                    publication_meta: None,
+                },
+                &registry,
+            );
+            let mut registry = registry.lock().unwrap();
+            let registered_uri = registry
+                .last_registered_uri_for_test()
+                .expect("native serving registered a real capability before attachment")
+                .to_owned();
+            if let Some(mismatch) = mismatch {
+                assert_eq!(
+                    response.pointer("/error/code"),
+                    Some(&json!(-32603)),
+                    "{mismatch}: {response}"
+                );
+                assert!(
+                    response.get("result").is_none(),
+                    "{mismatch}: no successful packet URI"
+                );
+                assert_eq!(
+                    registry.read_at(&registered_uri, Instant::now()),
+                    Err(crate::stdio_v3::DiagnosticsReadErrorV3::CapabilityUnavailable),
+                    "{mismatch}: the actually registered capability must be revoked"
+                );
+                assert_eq!(
+                    registry.entry_count(),
+                    0,
+                    "{mismatch}: revoked entry retained"
+                );
+                assert_eq!(
+                    registry.retained_bytes(),
+                    0,
+                    "{mismatch}: revoked bytes retained"
+                );
+            } else {
+                assert_eq!(
+                    response.pointer("/result/isError"),
+                    Some(&json!(false)),
+                    "{response}"
+                );
+                assert_eq!(
+                    response.pointer("/result/structuredContent/diagnostics/reference/uri"),
+                    Some(&json!(registered_uri))
+                );
+                assert_eq!(
+                    registry
+                        .read_at(&registered_uri, Instant::now())
+                        .unwrap()
+                        .as_ref(),
+                    bytes.as_slice()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_stable_tool_outputs_match_advertised_schemas() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        fs::write(
+            runtime.project_root.join("entry.rs"),
+            "pub fn entry() -> usize { helper() }\nfn helper() -> usize { 7 }\n",
+        )
+        .expect("write real local-tool source fixture");
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish real nonempty core");
+        let target =
+            stdio_context_target(&runtime, &json!({"params":{"arguments":{"query":"entry"}}}))
+                .expect("resolve indexed fixture target");
+        let mut state = StdioServerState::default();
+        for (tool, arguments) in [
+            ("affected", json!({"paths":["entry.rs"]})),
+            ("ground", json!({"budget":"strict"})),
+            ("files", json!({})),
+            ("neighbors", json!({"id":target.node_id.0,"depth":1})),
+            ("snippet", json!({"id":target.node_id.0})),
+            (
+                "snippet",
+                json!({"paths":[{"path":"entry.rs","start_line":1,"end_line":2}]}),
+            ),
+            ("status", json!({})),
+        ] {
+            let request = json!({"params":{"name":tool,"arguments":arguments}});
+            let prepared = match tool {
+                "affected" => {
+                    PreparedStdioToolCall::Affected(stdio_affected_request(&request).unwrap())
+                }
+                "snippet" => {
+                    PreparedStdioToolCall::Snippet(stdio_snippet_request(&request).unwrap())
+                }
+                _ => PreparedStdioToolCall::Raw,
+            };
+            let execution =
+                project_stdio_tool_execution_v3(&runtime, &mut state, &request, &prepared, tool)
+                    .expect("execute actual local tool and serialize its owning DTO");
+            let root = execution
+                .response
+                .get("result")
+                .unwrap_or_else(|| panic!("{tool}: {}", execution.response))
+                .clone();
+            match tool {
+                "affected" => {
+                    assert!(
+                        !root["changed_paths"]
+                            .as_array()
+                            .expect("changed paths")
+                            .is_empty(),
+                        "{root}"
+                    );
+                    assert!(
+                        !root["matched_files"]
+                            .as_array()
+                            .expect("matched files")
+                            .is_empty(),
+                        "{root}"
+                    );
+                    assert!(
+                        !root["impacted_symbols"]
+                            .as_array()
+                            .expect("impacted symbols")
+                            .is_empty(),
+                        "{root}"
+                    );
+                }
+                "ground" => assert!(
+                    root["stats"]["node_count"].as_u64().is_some_and(|n| n > 0),
+                    "{root}"
+                ),
+                "files" => assert!(
+                    !root["files"].as_array().expect("indexed files").is_empty(),
+                    "{root}"
+                ),
+                "neighbors" => {
+                    assert!(
+                        !root["graph"]["nodes"]
+                            .as_array()
+                            .expect("graph nodes")
+                            .is_empty(),
+                        "{root}"
+                    );
+                    assert!(
+                        !root["graph"]["edges"]
+                            .as_array()
+                            .expect("graph edges")
+                            .is_empty(),
+                        "{root}"
+                    );
+                }
+                "snippet" => assert!(
+                    root.get("snippet")
+                        .or_else(|| root.pointer("/ranges/0/snippet"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| s.contains("entry")),
+                    "{root}"
+                ),
+                "status" => {
+                    assert_eq!(
+                        root["project"],
+                        json!(runtime.project_root.to_string_lossy())
+                    );
+                    assert_eq!(
+                        root["capabilities"]["local_navigation"],
+                        json!("ready"),
+                        "{root}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let registry = Arc::new(std::sync::Mutex::new(
+                crate::stdio_v3::DiagnosticsRegistryV3::new(),
+            ));
+            let response = stdio_jsonrpc_tool_execution_v3(
+                json!(tool),
+                tool,
+                crate::stdio_v3::McpRevisionV3::preferred(),
+                execution,
+                &registry,
+            );
+            assert_eq!(
+                response.pointer("/result/isError"),
+                Some(&json!(false)),
+                "{tool}: {response}"
+            );
+            assert_eq!(
+                response.pointer("/result/structuredContent"),
+                Some(&root),
+                "{tool}"
+            );
+            let text: serde_json::Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                text, root,
+                "{tool}: native text mirrors the actual DTO projection"
+            );
+            let schema =
+                crate::stdio_v3::tools_for_revision_v3(crate::stdio_v3::McpRevisionV3::preferred())
+                    .into_iter()
+                    .find(|t| t["name"] == tool)
+                    .expect("advertised tool")["outputSchema"]
+                    .clone();
+            assert!(
+                crate::stdio_arguments::validate_structured_content(&schema, &root).is_ok(),
+                "{tool}: {root}"
+            );
+            let malformed = stdio_jsonrpc_tool_execution_v3(
+                json!(tool),
+                tool,
+                crate::stdio_v3::McpRevisionV3::preferred(),
+                StdioToolExecutionV3 {
+                    response: json!({"result":null}),
+                    packet_diagnostics: None,
+                    publication_meta: None,
+                },
+                &registry,
+            );
+            assert_eq!(
+                malformed.pointer("/error/code"),
+                Some(&json!(-32603)),
+                "{tool}: malformed output escaped native serving: {malformed}"
+            );
+        }
+    }
+
     fn diagnostic_resource_read(
         session: &mut StdioServerSession,
         id: &str,
@@ -9092,6 +9369,101 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).expect("stdio response is json"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn stdio_serve_loop_suppresses_completed_cancelled_reply_and_keeps_serving() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static COMPLETED: AtomicBool = AtomicBool::new(false);
+        static NEXT_ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        for flag in [&ENTERED, &COMPLETED, &NEXT_ENTERED, &RELEASE] {
+            flag.store(false, Ordering::Release);
+        }
+        fn handler(
+            session: &mut StdioServerSession,
+            line: &str,
+            cancelled: &Arc<AtomicBool>,
+        ) -> Option<serde_json::Value> {
+            if stdio_message_id(line) == Some(json!("cancelled")) {
+                ENTERED.store(true, Ordering::Release);
+                while !cancelled.load(Ordering::Acquire) && !RELEASE.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                // Deliberately return a reply even though this worker saw cancellation.
+                // The actual serve loop, rather than the injected handler, must suppress it.
+                COMPLETED.store(true, Ordering::Release);
+                Some(stdio_jsonrpc_success(
+                    json!("cancelled"),
+                    json!({"worker_completed":true}),
+                ))
+            } else {
+                NEXT_ENTERED.store(true, Ordering::Release);
+                handle_stdio_message(session, line, cancelled)
+            }
+        }
+        let (reader, mut client) = tokio::io::duplex(1024);
+        let mut output = Vec::new();
+        let client_sequence = async {
+            client
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"cancelled\",\"method\":\"tools/list\"}\n",
+                )
+                .await
+                .unwrap();
+            while !ENTERED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"cancelled\"}}\n").await.unwrap();
+            while !COMPLETED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"next\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"cancel-contract\",\"version\":\"1\"}}}\n").await.unwrap();
+            while !NEXT_ENTERED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            client.shutdown().await.unwrap();
+        };
+        let served = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                client_sequence,
+                serve_stdio_requests(
+                    StdioServerSession::new(None),
+                    BufReader::new(reader),
+                    &mut output,
+                    std::future::pending::<()>(),
+                    handler,
+                    STDIO_TERMINATION_DRAIN_BUDGET,
+                )
+            )
+            .1
+        })
+        .await;
+        RELEASE.store(true, Ordering::Release);
+        assert_eq!(
+            served
+                .expect("completed cancellation and next request cannot stall")
+                .unwrap(),
+            StdioServeOutcome::StdinClosed
+        );
+        assert!(COMPLETED.load(Ordering::Acquire));
+        assert!(NEXT_ENTERED.load(Ordering::Acquire));
+        let responses = stdio_written_responses(&output);
+        assert_eq!(
+            responses.len(),
+            1,
+            "worker completed and EOF drained; cancelled request emitted a reply: {responses:?}"
+        );
+        assert_eq!(responses[0]["id"], json!("next"));
+        assert!(responses[0].get("error").is_none(), "{responses:?}");
+        assert_eq!(
+            responses[0].pointer("/result/protocolVersion"),
+            Some(&json!("2025-11-25"))
+        );
+        assert_eq!(
+            responses[0].pointer("/result/serverInfo/name"),
+            Some(&json!("codestory"))
+        );
     }
 
     #[test]
