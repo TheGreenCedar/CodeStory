@@ -57,6 +57,8 @@ pub(crate) struct DiagnosticsRegistryV3 {
     secret: [u8; 32],
     entries: VecDeque<DiagnosticsEntryV3>,
     retained_bytes: usize,
+    #[cfg(test)]
+    last_registered_uri: Option<String>,
 }
 
 impl DiagnosticsRegistryV3 {
@@ -76,6 +78,8 @@ impl DiagnosticsRegistryV3 {
             secret,
             entries: VecDeque::new(),
             retained_bytes: 0,
+            #[cfg(test)]
+            last_registered_uri: None,
         }
     }
 
@@ -110,6 +114,10 @@ impl DiagnosticsRegistryV3 {
                 .remove(index)
                 .expect("matched immutable diagnostic entry");
             self.entries.push_back(entry);
+            #[cfg(test)]
+            {
+                self.last_registered_uri = Some(uri.clone());
+            }
             return Ok(DiagnosticsGrantV3 {
                 uri,
                 byte_length,
@@ -130,6 +138,10 @@ impl DiagnosticsRegistryV3 {
             bytes,
             expires_at: now + Duration::from_secs(10 * 60),
         });
+        #[cfg(test)]
+        {
+            self.last_registered_uri = Some(uri.clone());
+        }
         Ok(DiagnosticsGrantV3 {
             uri,
             byte_length,
@@ -183,12 +195,17 @@ impl DiagnosticsRegistryV3 {
     }
 
     #[cfg(test)]
-    fn entry_count(&self) -> usize {
+    pub(crate) fn last_registered_uri_for_test(&self) -> Option<&str> {
+        self.last_registered_uri.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
     }
 
     #[cfg(test)]
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
 

@@ -1334,6 +1334,87 @@ fn assert_search_repaired_before_terminal_activation(
     assert_tool_success(&ground, json!(ground_id));
 }
 
+fn assert_packet_success_after_search_repair(
+    response: &Value,
+    id: Value,
+    search_generations: &Path,
+) {
+    let packet = assert_tool_success(response, id);
+    let generation = packet
+        .pointer("/publication/core/generation_id")
+        .and_then(Value::as_str)
+        .expect("successful packet names its pinned core generation");
+    let marker_path = search_generations
+        .join(generation)
+        .join(".codestory-complete.json");
+    let marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap_or_else(|error| {
+        panic!(
+            "packet succeeded without completed search generation {}: {error}",
+            marker_path.display()
+        )
+    }))
+    .expect("rebuilt search completion marker is JSON");
+    assert_eq!(marker["schema_version"], json!(1));
+    assert_eq!(marker["generation_id"], json!(generation));
+    assert!(
+        marker["symbol_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "nonempty indexed fixture must rebuild its symbols: {marker}"
+    );
+    assert!(
+        marker["tantivy_doc_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "nonempty indexed fixture must rebuild its search documents: {marker}"
+    );
+}
+
+#[test]
+fn packet_repair_success_assertion_checks_initial_and_retry_generation_identity() {
+    let cache = tempfile::tempdir().expect("isolated assertion fixture");
+    let generation = "1031b690-2c97-496e-8895-093fbf2348a4";
+    let directory = cache.path().join(generation);
+    fs::create_dir(&directory).unwrap();
+    let marker_path = directory.join(".codestory-complete.json");
+    for id in ["packet-search-repair-first", "packet-search-repair-retry-1"] {
+        // This control exercises the shared assertion, not a runtime packet producer.
+        let response = json!({"jsonrpc":"2.0","id":id,"result":{
+            "isError":false,"content":[{"type":"text","text":"packet fixture"}],
+            "structuredContent":{"publication":{"core":{"generation_id":generation}}}}});
+        let complete = json!({"schema_version":1,"generation_id":generation,
+            "symbol_count":2,"tantivy_doc_count":2});
+        fs::write(&marker_path, serde_json::to_vec(&complete).unwrap()).unwrap();
+        assert_packet_success_after_search_repair(&response, json!(id), cache.path());
+        fs::remove_file(&marker_path).unwrap();
+        // The old initial success branch accepted this response; the retry branch
+        // additionally checked only this still-existing parent directory.
+        assert_tool_success(&response, json!(id));
+        assert!(cache.path().is_dir());
+        assert!(
+            std::panic::catch_unwind(|| assert_packet_success_after_search_repair(
+                &response,
+                json!(id),
+                cache.path()
+            ))
+            .is_err(),
+            "{id}: missing completion marker escaped the shared success assertion"
+        );
+        let mut wrong = complete.clone();
+        wrong["generation_id"] = json!("another-generation");
+        fs::write(&marker_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| assert_packet_success_after_search_repair(
+                &response,
+                json!(id),
+                cache.path()
+            ))
+            .is_err(),
+            "{id}: mismatched generation escaped the shared success assertion"
+        );
+    }
+}
+
 fn assert_tool_text_content<'a>(result: &'a Value, response: &Value) -> &'a str {
     result["content"]
         .as_array()
@@ -6588,7 +6669,11 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
     let first_error = if tool_result_code(&first).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(&first, json!("packet-search-repair-first"))
     } else if first.pointer("/result/isError") != Some(&json!(true)) {
-        assert_tool_success(&first, json!("packet-search-repair-first"));
+        assert_packet_success_after_search_repair(
+            &first,
+            json!("packet-search-repair-first"),
+            &search_generations,
+        );
         return;
     } else {
         let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
@@ -6628,11 +6713,7 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             continue;
         }
         if response.pointer("/result/isError") != Some(&json!(true)) {
-            assert_tool_success(&response, json!(id));
-            assert!(
-                search_generations.is_dir(),
-                "activation must rebuild search state before packet succeeds"
-            );
+            assert_packet_success_after_search_repair(&response, json!(id), &search_generations);
             return;
         }
         let error = assert_tool_error(&response, json!(id));
