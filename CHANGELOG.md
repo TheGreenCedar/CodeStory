@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- JavaScript and TypeScript call proof refuses explicit prototype mutations,
+  including mutations declared in an imported class’s defining module.
+
 - Python source-call proof now refuses shadowed constructor names and explicit
   module-executed class-member mutations while preserving read-only calls.
 

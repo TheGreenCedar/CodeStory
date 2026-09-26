@@ -1,5 +1,5 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind};
+use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind, Occurrence};
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
 use std::collections::HashMap;
@@ -7,6 +7,13 @@ use std::fs;
 use tempfile::tempdir;
 
 fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    let (nodes, edges, _) = index_project_with_occurrences(files)?;
+    Ok((nodes, edges))
+}
+
+fn index_project_with_occurrences(
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<Occurrence>)> {
     let dir = tempdir()?;
     let root = dir.path();
     let mut files_to_index = Vec::with_capacity(files.len());
@@ -32,7 +39,11 @@ fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>
 
     let errors = storage.get_errors(None)?;
     anyhow::ensure!(errors.is_empty(), "indexing errors: {errors:?}");
-    Ok((storage.get_nodes()?, storage.get_edges()?))
+    Ok((
+        storage.get_nodes()?,
+        storage.get_edges()?,
+        storage.get_occurrences()?,
+    ))
 }
 
 #[test]
@@ -145,8 +156,10 @@ fn script_private_call_scope_belongs_to_each_occurrence() -> anyhow::Result<()> 
                             )
                         };
                         let source = format!("function {private}(x) {{ return 99; }}\n{line}\n");
-                        let (nodes, edges) =
-                            index_project(&[(&format!("nested/fixture.{extension}"), &source)])?;
+                        let (nodes, edges, occurrences) = index_project_with_occurrences(&[(
+                            &format!("nested/fixture.{extension}"),
+                            &source,
+                        )])?;
                         let outer = nodes
                             .iter()
                             .find(|node| {
@@ -177,6 +190,59 @@ fn script_private_call_scope_belongs_to_each_occurrence() -> anyhow::Result<()> 
                             .count();
                         if calls.len() != 3 || unresolved != 2 || resolved != 1 {
                             failures.push(format!("{extension}/{callable}/{private}/outside_first={outside_first}/nested={nested}: {calls:?}"));
+                        }
+                        for (spelling, expected_owner, should_resolve) in [
+                            (
+                                format!("{private}(x-1)"),
+                                if nested { "child" } else { "bound" },
+                                false,
+                            ),
+                            (
+                                format!("{private}(x-2)"),
+                                if nested { "child" } else { "bound" },
+                                false,
+                            ),
+                            (format!("{private}(77)"), "driver", true),
+                        ] {
+                            let column =
+                                line.find(&spelling).expect("fixture occurrence") as u32 + 1;
+                            let matching = calls
+                                .iter()
+                                .filter(|edge| {
+                                    occurrences.iter().any(|occurrence| {
+                                        occurrence.element_id == edge.id.0
+                                            && occurrence.location.start_line == 2
+                                            && occurrence.location.start_col == column
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                matching.len(),
+                                1,
+                                "{extension}/{callable}/{private}/column{column}: {calls:#?}"
+                            );
+                            let edge = matching[0];
+                            let owner = nodes
+                                .iter()
+                                .find(|node| node.id == edge.effective_source())
+                                .expect("independent occurrence owner");
+                            assert!(
+                                matches_name(&owner.serialized_name, expected_owner),
+                                "column{column} belongs to {expected_owner}, got {owner:#?}"
+                            );
+                            if should_resolve {
+                                assert_eq!(
+                                    edge.resolved_target,
+                                    Some(outer.id),
+                                    "outside occurrence must select independently identified outer declaration"
+                                );
+                            } else {
+                                assert!(
+                                    edge.resolved_target.is_none()
+                                        && edge.candidate_targets.is_empty(),
+                                    "private occurrence must not inherit outside authority"
+                                );
+                            }
                         }
                     }
                 }

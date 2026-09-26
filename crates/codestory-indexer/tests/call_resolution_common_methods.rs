@@ -1,5 +1,7 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
+use codestory_contracts::graph::{
+    Edge, EdgeKind, Node, NodeId, NodeKind, Occurrence, ResolutionCertainty,
+};
 use codestory_indexer::WorkspaceIndexer;
 use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_store::Store as Storage;
@@ -252,6 +254,14 @@ fn index_files_at_root(
     root: &Path,
     files: &[(&str, &str)],
 ) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    let (nodes, edges, _) = index_files_at_root_with_occurrences(root, files)?;
+    Ok((nodes, edges))
+}
+
+fn index_files_at_root_with_occurrences(
+    root: &Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<Occurrence>)> {
     let mut files_to_index = Vec::with_capacity(files.len());
     for (filename, contents) in files {
         let file_path = root.join(filename);
@@ -283,7 +293,11 @@ fn index_files_at_root(
             .collect::<Vec<_>>()
     );
 
-    Ok((storage.get_nodes()?, storage.get_edges()?))
+    Ok((
+        storage.get_nodes()?,
+        storage.get_edges()?,
+        storage.get_occurrences()?,
+    ))
 }
 
 fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
@@ -9187,7 +9201,11 @@ fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -
             } else {
                 format!("const dispatch = require('opaque-module'); {shadowed} {imported}\n")
             };
-            let (nodes, edges) = index_single_file(&format!("neutral.{extension}"), &source)?;
+            let project = tempdir()?;
+            let (nodes, edges, occurrences) = index_files_at_root_with_occurrences(
+                project.path(),
+                &[(&format!("neutral.{extension}"), &source)],
+            )?;
             let marked = edges
                 .iter()
                 .filter(|edge| {
@@ -9206,6 +9224,40 @@ fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -
                 describe_call_edges(&edges, &nodes)
             );
             assert!(marked[0].resolved_target.is_none());
+            let outside_col = source.find("dispatch(2)").expect("outside call") as u32 + 1;
+            let shadow_col = source.find("dispatch(1)").expect("shadow call") as u32 + 1;
+            for (column, owner_name, should_mark) in [
+                (outside_col, "outside", true),
+                (shadow_col, "shadow", false),
+            ] {
+                let calls = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(1)
+                            && occurrences.iter().any(|occurrence| {
+                                occurrence.element_id == edge.id.0
+                                    && occurrence.location.start_line == 1
+                                    && occurrence.location.start_col == column
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(calls.len(), 1, "{extension} column{column}: {calls:#?}");
+                let call = calls[0];
+                let owner = nodes
+                    .iter()
+                    .find(|node| node.id == call.effective_source())
+                    .expect("call owner");
+                assert!(
+                    is_matching_name(&owner.serialized_name, owner_name),
+                    "expected {owner_name} at column{column}, got {owner:#?}"
+                );
+                assert_eq!(
+                    marked.iter().any(|marked| marked.id == call.id),
+                    should_mark,
+                    "marker swapped at column{column}"
+                );
+            }
         }
     }
     Ok(())

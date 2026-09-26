@@ -9641,7 +9641,10 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
     for (files, called_name) in [
         (
             vec![
-                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function target() {}\n",
+                ),
                 (
                     "src/importer.ts",
                     "import { type Target, target } from './target';\nexport function caller() { target(); }\n",
@@ -9651,7 +9654,10 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
         ),
         (
             vec![
-                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function target() {}\n",
+                ),
                 (
                     "src/importer.ts",
                     "import { target, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { target(); }\n",
@@ -9696,7 +9702,10 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
 
     for files in [
         vec![
-            ("src/target.ts", "export function target() {}\n"),
+            (
+                "src/target.ts",
+                "export interface Target { value: number }\nexport function target() {}\n",
+            ),
             (
                 "src/importer.ts",
                 "import type { target } from './target';\nexport function caller() { target(); }\n",
@@ -9723,7 +9732,10 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
         assert_no_exact_calls(&files)?;
     }
     assert_no_exact_calls(&[
-        ("src/target.ts", "export function target() {}\n"),
+        (
+            "src/target.ts",
+            "export interface Target { value: number }\nexport function target() {}\n",
+        ),
         (
             "src/aliased_type.ts",
             "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
@@ -9992,13 +10004,6 @@ fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Resul
             ),
         ],
         vec![
-            ("src/exported.cjs", "export function target() {}\n"),
-            (
-                "src/importer.cjs",
-                "import { target } from './exported.cjs';\nexport function caller() { target(); }\n",
-            ),
-        ],
-        vec![
             (
                 "src/a.ts",
                 "import { target } from './b';\nexport function helper() {}\nexport function caller() { target(); }\n",
@@ -10011,6 +10016,17 @@ fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Resul
     ] {
         assert_only_call_is_exact(&files)?;
     }
+
+    assert_no_exact_target_calls(&[
+        (
+            "src/exported.cjs",
+            "function target() {}\nmodule.exports = { target };\n",
+        ),
+        (
+            "src/importer.cjs",
+            "const { target } = require('./exported.cjs');\nfunction caller() { target(); }\n",
+        ),
+    ])?;
 
     for files in [
         vec![(
@@ -10854,6 +10870,515 @@ fn optional_typescript_parameters_are_not_receiver_authority() -> anyhow::Result
     )])
 }
 
+fn assert_script_receiver_target(
+    files: &[(&str, &str)],
+    caller_path: &str,
+    call_line: u32,
+    target_path: &str,
+    expected: ProofResolutionStatus,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    let nodes = store.get_nodes()?;
+    let files = store.get_files()?;
+    let caller_file = files
+        .iter()
+        .find(|file| file.path.ends_with(caller_path))
+        .expect("independent caller file");
+    let target_file = files
+        .iter()
+        .find(|file| file.path.ends_with(target_path))
+        .expect("independent target file");
+    let owner = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(target_file.id))
+                && node.kind == NodeKind::CLASS
+                && node.start_line == Some(1)
+        })
+        .expect("independent C owner");
+    let target = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(target_file.id))
+                && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                && node.start_line == Some(2)
+                && node.serialized_name.ends_with("target")
+        })
+        .expect("independent C.target declaration");
+    let edges = store.get_edges()?;
+    assert!(edges.iter().any(|edge| edge.kind == EdgeKind::MEMBER
+        && edge.effective_source() == owner.id
+        && edge.effective_target() == target.id));
+    let calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(caller_file.id))
+                && edge.line == Some(call_line)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name.ends_with("target"))
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("actual target CALL census: {calls:#?}");
+    };
+    assert!(nodes.iter().any(|node| node.id == call.effective_source()
+        && node.serialized_name.ends_with("caller")
+        && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)));
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary identity"),
+    )
+    .expect("canonical ordinary identity");
+    assert_eq!(identity.file_id, FileId(caller_file.id));
+    assert_eq!(identity.line, call_line);
+    assert_eq!(identity.raw_target, call.target);
+    eprintln!(
+        "{caller_path}:{call_line} pre-proof resolved={:?} certainty={:?}",
+        call.resolved_target, call.certainty
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(caller_file.id)
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("nonempty designated fact required: {facts:#?}");
+    };
+    eprintln!(
+        "{caller_path}:{call_line} post-proof {:?} {:?}",
+        fact.status, fact.target
+    );
+    assert_eq!(fact.status, expected, "{fact:#?}");
+    if expected == ProofResolutionStatus::Exact {
+        assert_nominal_exact_target(&store, project.path(), fact, target_path, 2, Some(1))?;
+    } else {
+        assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
+        assert_eq!(
+            store
+                .get_edges()?
+                .into_iter()
+                .find(|edge| edge.id == call.id)
+                .as_ref(),
+            Some(*call),
+            "nonexact proof must not upgrade existing graph authority (ordinary endpoint F9)"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reflect_set_prototype_refuses_same_file_receiver_proof() -> anyhow::Result<()> {
+    assert_script_receiver_target(
+        &[(
+            "src/main.js",
+            concat!(
+                "export class C {\n  target() {}\n}\n",
+                "export function other() {}\n",
+                "Reflect.set(C.prototype, 'target', other);\n",
+                "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+            ),
+        )],
+        "src/main.js",
+        8,
+        "src/main.js",
+        ProofResolutionStatus::Unsupported,
+    )
+}
+
+#[test]
+fn exporter_prototype_mutation_refuses_imported_receiver_proof() -> anyhow::Result<()> {
+    assert_script_receiver_target(
+        &[
+            (
+                "src/exported.js",
+                concat!(
+                    "export class C {\n  target() {}\n}\n",
+                    "C.prototype.target = function replacement() {};\n",
+                ),
+            ),
+            (
+                "src/importer.js",
+                "import { C } from './exported';\nexport function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+            ),
+        ],
+        "src/importer.js",
+        4,
+        "src/exported.js",
+        ProofResolutionStatus::IncompleteDomain,
+    )
+}
+
+#[test]
+fn script_reflection_mutation_spellings_and_scopes() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        let path = format!("src/main.{extension}");
+        for mutation in [
+            "Reflect.set(C.prototype, 'target', other);",
+            "(Reflect.set)(C.prototype, 'target', other);",
+            "( /*comment*/ Reflect.set)(C.prototype, 'target', other);",
+            "Reflect['se' + 't'](C.prototype, 'target', other);",
+            "Reflect.set(( /*comment*/ C.prototype), ( /*comment*/ 'target'), other);",
+            "Reflect.set(C.prototype, 'tar' + 'get', other);",
+            "Reflect.setPrototypeOf(C.prototype, {});",
+            "Reflect /*comment*/ . set(C.prototype, 'target', other);",
+            "Reflect['set'](C['prototype'], 'target', other);",
+            "Reflect.set(C.prototype, key, other);",
+            "Reflect[key](C.prototype, 'target', other);",
+            "Reflect.set(...[C.prototype, 'target', other]);",
+            "const Alias = C; Reflect.set(Alias.prototype, 'target', other);",
+            "Reflect.set(getPrototype(), 'target', other);",
+            "Object.defineProperty(C.prototype, 'target', { value: other });",
+            "Object['defineProperty'](C.prototype, 'target', { value: other });",
+            "Reflect.deleteProperty(C.prototype, 'target');",
+            "if (flag) { Reflect.set(C.prototype, 'target', other); }",
+            "for (const item of values) { Reflect.set(C.prototype, 'target', other); }",
+        ] {
+            eprintln!("{extension} mutation: {mutation}");
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\n{mutation}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::Unsupported,
+            )?;
+        }
+        for read_only in [
+            "",
+            "Reflect.get(C.prototype, 'target');",
+            "Object.getOwnPropertyDescriptor(C.prototype, 'target');",
+            "Reflect.set(C.prototype, 'other', other);",
+            "class D {} Reflect.set(D.prototype, 'target', other);",
+        ] {
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\n{read_only}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::Exact,
+            )?;
+        }
+        let eager_this = "export class C {\n  target() {}\n  static { Reflect.set(this.prototype, 'target', other); }\n}\nexport function other() {}\nexport function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n";
+        assert_script_receiver_target(
+            &[(&path, eager_this)],
+            &path,
+            8,
+            &path,
+            ProofResolutionStatus::Unsupported,
+        )?;
+        for mutation in [
+            "Reflect.set(receiver, 'target', other);",
+            "Reflect.set(receiver, key, other);",
+        ] {
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\nexport function caller(key) {{\n  const receiver = new C();\n  {mutation}\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::Unsupported,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn script_exported_prototype_poison_is_persisted_and_class_wide() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        for default in [false, true] {
+            let exporter_path = format!("src/exported.{extension}");
+            let importer_path = format!("src/importer.{extension}");
+            let declaration = if default {
+                "export default class C"
+            } else {
+                "export class C"
+            };
+            let import = if default {
+                "import C from './exported';"
+            } else {
+                "import { C } from './exported';"
+            };
+            for (mutation, expected) in [
+                (
+                    "C.prototype.target = function replacement() {};",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, 'target', other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, key, other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, 'other', other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Object.defineProperty(C.prototype, 'target', { value: other });",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                ("", ProofResolutionStatus::Exact),
+                (
+                    "class D {} Reflect.set(D.prototype, 'target', other);",
+                    ProofResolutionStatus::Exact,
+                ),
+                (
+                    "Reflect.get(C.prototype, 'target');",
+                    ProofResolutionStatus::Exact,
+                ),
+            ] {
+                let exporter = format!(
+                    "{declaration} {{\n  target() {{}}\n}}\nfunction other() {{}}\n{mutation}\n"
+                );
+                let importer = format!(
+                    "{import}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+                );
+                assert_script_receiver_target(
+                    &[(&exporter_path, &exporter), (&importer_path, &importer)],
+                    &importer_path,
+                    4,
+                    &exporter_path,
+                    expected,
+                )?;
+                if extension != "js" {
+                    let typed = format!(
+                        "{import}\nexport function caller(receiver: C) {{\n  receiver.target();\n}}\n"
+                    );
+                    assert_script_receiver_target(
+                        &[(&exporter_path, &exporter), (&importer_path, &typed)],
+                        &importer_path,
+                        3,
+                        &exporter_path,
+                        expected,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::Result<()> {
+    for (extension, old_version, current_version) in [
+        ("js", "reference-v15", "reference-v16"),
+        ("ts", "reference-v17", "reference-v18"),
+        ("tsx", "reference-v17", "reference-v18"),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let exporter_path = format!("src/exported.{extension}");
+        let importer_path = format!("src/importer.{extension}");
+        let paths = index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    &exporter_path,
+                    concat!(
+                        "export class C {\n  target() {}\n}\n",
+                        "function other() {}\n",
+                        "Reflect.set(C.prototype, 'target', other);\n",
+                        "export class Safe {\n  target() {}\n}\n",
+                    ),
+                ),
+                (
+                    &importer_path,
+                    concat!(
+                        "import { C, Safe } from './exported';\n",
+                        "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+                        "export function safeCaller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
+                    ),
+                ),
+            ],
+        )?;
+        let source_before = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let before = store.get_proof_resolution_facts()?;
+        let importer = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(&importer_path))
+            .expect("independent importer file");
+        let owner = store
+            .get_nodes()?
+            .into_iter()
+            .find(|node| node.kind == NodeKind::CLASS && node.start_line == Some(1))
+            .expect("independent original C declaration");
+        let hostile = before
+            .iter()
+            .find(|fact| {
+                fact.callsite.file_id == FileId(importer.id)
+                    && fact.callsite.line == 4
+                    && fact.callsite.raw_target == "target"
+            })
+            .expect("initial nonempty mutated-class fact");
+        assert_eq!(hostile.status, ProofResolutionStatus::IncompleteDomain);
+        assert!(
+            hostile.target.is_none()
+                && hostile.edge_id.is_none()
+                && hostile.evidence_chain.is_empty()
+        );
+        let safe = before
+            .iter()
+            .find(|fact| {
+                fact.callsite.file_id == FileId(importer.id)
+                    && fact.callsite.line == 8
+                    && fact.callsite.raw_target == "target"
+            })
+            .expect("independent clean exported class fact");
+        assert_nominal_exact_target(&store, project.path(), safe, &exporter_path, 7, Some(6))?;
+
+        let entries = store
+            .get_connection()
+            .prepare(
+                "SELECT file_path, artifact_blob FROM index_artifact_cache ORDER BY file_path",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 2);
+        for (file_path, blob) in entries {
+            let mut artifact = decode_index_artifact_json(&blob)?;
+            assert_eq!(
+                artifact["resolution_file"]["adapter_version"],
+                current_version
+            );
+            if file_path.ends_with(&exporter_path) {
+                assert_eq!(
+                    artifact["resolution_file"]["poisoned_export_names"],
+                    serde_json::json!(["C"])
+                );
+                // Simulate the causally demonstrated pre-F6 export payload on
+                // unchanged bytes; this is not output claimed from an old binary.
+                artifact["resolution_file"]["poisoned_export_names"] = serde_json::json!([]);
+                artifact["resolution_file"]["direct_exports"]
+                    .as_array_mut()
+                    .expect("cached exports")
+                    .push(serde_json::json!({
+                        "exported_name": "C", "declaration": owner.id.0,
+                        "is_default": false, "declaration_kind": "class",
+                    }));
+            }
+            artifact["resolution_file"]["adapter_version"] = old_version.into();
+            for call in artifact["call_resolution_inputs"]
+                .as_array_mut()
+                .expect("cached calls")
+            {
+                call["adapter_version"] = old_version.into();
+            }
+            store.get_connection().execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path = ?2",
+                rusqlite::params![serde_json::to_vec(&artifact)?, file_path],
+            )?;
+        }
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("old script mutation semantics must reject stored replay");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_proof_resolution_facts()?,
+            before,
+            "old-cache rejection preserves prior proof"
+        );
+        assert_eq!(
+            store
+                .get_proof_resolution_publication()?
+                .expect("prior receipt")
+                .core_generation_id,
+            publication(1).generation_id
+        );
+        for (generation, expected_hits) in [(2, 0), (3, 2)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "{extension} generation{generation}"
+            );
+            assert_eq!(
+                paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?,
+                source_before
+            );
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            let facts = store.get_proof_resolution_facts()?;
+            let hostile = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.file_id == FileId(importer.id)
+                        && fact.callsite.line == 4
+                        && fact.callsite.raw_target == "target"
+                })
+                .expect("reparsed/reused nonempty mutated-class fact");
+            assert_eq!(hostile.status, ProofResolutionStatus::IncompleteDomain);
+            assert!(
+                hostile.target.is_none()
+                    && hostile.edge_id.is_none()
+                    && hostile.evidence_chain.is_empty()
+            );
+            assert_eq!(hostile.provenance.language_adapter_version, current_version);
+            let safe = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.file_id == FileId(importer.id)
+                        && fact.callsite.line == 8
+                        && fact.callsite.raw_target == "target"
+                })
+                .expect("clean exported class retained after reparse/reuse");
+            assert_nominal_exact_target(&store, project.path(), safe, &exporter_path, 7, Some(6))?;
+            let blob = store.get_connection().query_row(
+                "SELECT artifact_blob FROM index_artifact_cache WHERE file_path LIKE ?1",
+                [format!("%{exporter_path}")],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let artifact = decode_index_artifact_json(&blob)?;
+            assert_eq!(
+                artifact["resolution_file"]["adapter_version"],
+                current_version
+            );
+            assert_eq!(
+                artifact["resolution_file"]["poisoned_export_names"],
+                serde_json::json!(["C"])
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn receiver_class_and_mutation_domains_fail_closed() -> anyhow::Result<()> {
     for (path, source) in [
@@ -11582,6 +12107,21 @@ fn assert_no_exact_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    if files.iter().any(|(path, _)| {
+        matches!(
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+        )
+    }) {
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact.callsite.raw_target.as_str(), "target" | "local")),
+            "designated script call fact must not disappear: {files:?}"
+        );
+    }
     assert!(
         facts
             .iter()
@@ -11597,11 +12137,31 @@ fn assert_no_exact_target_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    let target_facts = facts
+        .iter()
+        .filter(|fact| fact.callsite.raw_target.trim_start_matches('#') == "target")
+        .collect::<Vec<_>>();
+    if files.iter().any(|(path, _)| {
+        matches!(
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+        )
+    }) {
+        assert!(
+            !target_facts.is_empty(),
+            "designated script target fact must not disappear: {files:?}"
+        );
+    }
     assert!(
-        facts.iter().all(|fact| {
-            fact.callsite.raw_target != "target" || fact.status != ProofResolutionStatus::Exact
-        }),
-        "{files:?}: {facts:#?}"
+        target_facts
+            .iter()
+            .all(|fact| fact.status != ProofResolutionStatus::Exact
+                && fact.target.is_none()
+                && fact.edge_id.is_none()
+                && fact.evidence_chain.is_empty()),
+        "{files:?}: {target_facts:#?}"
     );
     Ok(())
 }

@@ -245,11 +245,11 @@ fn ruby_php_resolution_work() -> usize {
     RUBY_PHP_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v15";
+const ADAPTER_VERSION: &str = "reference-v16";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v18";
 const RUST_ADAPTER_VERSION: &str = "reference-v19";
-const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
+const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v18";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
 const C_ADAPTER_VERSION: &str = "reference-v2";
@@ -9981,6 +9981,7 @@ struct JavascriptResolutionIndex<'tree> {
     dynamic_breaker_scopes: HashSet<(usize, usize)>,
     module_dynamic_breaker: bool,
     export_statements: Vec<TsNode<'tree>>,
+    module_range: (usize, usize),
     ecmascript_module: bool,
     typescript_directory_imports_enabled: bool,
 }
@@ -10038,6 +10039,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             dynamic_breaker_scopes: HashSet::new(),
             module_dynamic_breaker: false,
             export_statements: Vec::new(),
+            module_range: (root.start_byte(), root.end_byte()),
             ecmascript_module: typescript_file_is_module(root),
             typescript_directory_imports_enabled: typescript_directory_imports_enabled(
                 language,
@@ -10363,7 +10365,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                     .push(range);
             }
         } else if let Some(member) =
-            property.and_then(|property| simple_typescript_string(property, source))
+            property.and_then(|property| javascript_literal_property_name(property, source))
         {
             self.mutated_members
                 .entry((owner, member.to_string()))
@@ -10386,30 +10388,90 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         if node.kind() != "call_expression" {
             return;
         }
-        let Some(function) = node.child_by_field_name("function") else {
+        let Some(function) = node
+            .child_by_field_name("function")
+            .map(javascript_unwrap_parenthesized)
+        else {
             return;
         };
-        let Some(function) = node_text(function, source) else {
+        if !matches!(
+            function.kind(),
+            "member_expression" | "subscript_expression"
+        ) {
+            return;
+        }
+        let Some(object) = function
+            .child_by_field_name("object")
+            .map(javascript_unwrap_parenthesized)
+        else {
             return;
         };
+        let Some(builtin) = (object.kind() == "identifier")
+            .then(|| node_text(object, source))
+            .flatten()
+            .filter(|name| matches!(*name, "Object" | "Reflect"))
+        else {
+            return;
+        };
+        let member = javascript_static_member_name(function, source);
+        let scope = javascript_governing_scope(node, root);
+        let range = (scope.start_byte(), scope.end_byte());
+        let Some(member) = member else {
+            // A computed Object/Reflect operation may be one of the mutators.
+            // Keep authority closed without evaluating arbitrary property values.
+            self.dynamic_breaker_scopes.insert(range);
+            self.module_dynamic_breaker |= scope.id() == root.id();
+            return;
+        };
+        let member_write = matches!(
+            (builtin, member),
+            ("Object" | "Reflect", "defineProperty") | ("Reflect", "set" | "deleteProperty")
+        );
+        let owner_write = matches!(
+            (builtin, member),
+            ("Object", "assign" | "setPrototypeOf" | "defineProperties")
+                | ("Reflect", "setPrototypeOf")
+        );
+        if !member_write && !owner_write {
+            return;
+        }
         let Some(arguments) = node.child_by_field_name("arguments") else {
             return;
         };
         let mut cursor = arguments.walk();
-        let arguments = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+        let arguments = arguments
+            .named_children(&mut cursor)
+            .filter(|argument| argument.kind() != "comment")
+            .collect::<Vec<_>>();
         let Some(owner) = arguments
             .first()
             .and_then(|target| javascript_mutation_owner(*target, source))
         else {
+            self.dynamic_breaker_scopes.insert(range);
+            self.module_dynamic_breaker |= scope.id() == root.id();
             return;
         };
-        let scope = javascript_governing_scope(node, root);
-        let range = (scope.start_byte(), scope.end_byte());
-        match function {
-            "Object.defineProperty" | "Reflect.defineProperty" => {
+        // A lexical alias is not an authenticated class/receiver owner. It may
+        // name a known prototype, so use the existing scoped breaker rather than
+        // store poison under an unrelated spelling and regain authority.
+        let base = owner.split('.').next().unwrap_or_default();
+        let known_owner = (base == "this" && scope.id() != root.id())
+            || self.bindings.get(base).is_some_and(|bindings| {
+                bindings
+                    .iter()
+                    .any(|binding| matches!(binding.kind, JavascriptBindingKind::Class { .. }))
+            })
+            || self.receiver_bindings.contains_key(base);
+        if !known_owner {
+            self.dynamic_breaker_scopes.insert(range);
+            self.module_dynamic_breaker |= scope.id() == root.id();
+            return;
+        }
+        match (builtin, member) {
+            ("Object" | "Reflect", "defineProperty") | ("Reflect", "set" | "deleteProperty") => {
                 if let Some(member) = arguments
                     .get(1)
-                    .and_then(|property| simple_typescript_string(*property, source))
+                    .and_then(|property| javascript_literal_property_name(*property, source))
                 {
                     if member == "prototype" {
                         self.dynamically_mutated_owners
@@ -10434,7 +10496,8 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                         .push(range);
                 }
             }
-            "Object.assign" | "Object.setPrototypeOf" => {
+            ("Object", "assign" | "setPrototypeOf" | "defineProperties")
+            | ("Reflect", "setPrototypeOf") => {
                 self.dynamically_mutated_owners
                     .entry(owner)
                     .or_default()
@@ -10788,6 +10851,21 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         let mut exports = Vec::new();
         let mut poison_all = self.module_dynamic_breaker;
         let mut poisoned_names = HashSet::new();
+        // Export poison is deliberately class-wide: imported member resolution
+        // cannot recover a clean member domain from an eagerly mutated prototype.
+        // Deferred callable-local mutations keep their existing lexical scope.
+        let mutated_module_owners = self
+            .mutated_members
+            .iter()
+            .filter(|(_, ranges)| ranges.contains(&self.module_range))
+            .map(|((owner, _), _)| owner.as_str())
+            .chain(
+                self.dynamically_mutated_owners
+                    .iter()
+                    .filter(|(_, ranges)| ranges.contains(&self.module_range))
+                    .map(|(owner, _)| owner.as_str()),
+            )
+            .collect::<HashSet<_>>();
         let assignment_names = self
             .export_statements
             .iter()
@@ -10831,7 +10909,19 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                 JavascriptBindingKind::SameFile { declaration } => {
                     (declaration, CachedDeclarationKind::Callable)
                 }
-                JavascriptBindingKind::Class { owner } => (owner, CachedDeclarationKind::Class),
+                JavascriptBindingKind::Class { owner } => {
+                    if mutated_module_owners.contains(name.as_str())
+                        || mutated_module_owners.contains(format!("{name}.prototype").as_str())
+                    {
+                        poisoned_names.insert(if is_default {
+                            "default".to_string()
+                        } else {
+                            name
+                        });
+                        continue;
+                    }
+                    (owner, CachedDeclarationKind::Class)
+                }
                 _ => continue,
             };
             exports.push(CachedDirectExport {
@@ -10963,19 +11053,54 @@ fn javascript_method_has_unsupported_modifier(method: TsNode<'_>) -> bool {
         .any(|token| has_direct_unnamed_token(method, token))
 }
 
+fn javascript_unwrap_parenthesized(mut node: TsNode<'_>) -> TsNode<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let mut cursor = node.walk();
+        let mut children = node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "comment");
+        let Some(inner) = children.next() else {
+            break;
+        };
+        if children.next().is_some() {
+            break;
+        }
+        node = inner;
+    }
+    node
+}
+
+fn javascript_literal_property_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    let node = javascript_unwrap_parenthesized(node);
+    (node.kind() == "string")
+        .then(|| simple_typescript_string(node, source))
+        .flatten()
+}
+
+fn javascript_static_member_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "member_expression" => node
+            .child_by_field_name("property")
+            .filter(|property| matches!(property.kind(), "property_identifier" | "identifier"))
+            .and_then(|property| node_text(property, source)),
+        "subscript_expression" => node
+            .child_by_field_name("index")
+            .and_then(|property| javascript_literal_property_name(property, source)),
+        _ => None,
+    }
+}
+
 fn javascript_mutation_owner(node: TsNode<'_>, source: &str) -> Option<String> {
+    let node = javascript_unwrap_parenthesized(node);
     match node.kind() {
         "identifier" | "this" => node_text(node, source).map(str::to_string),
-        "member_expression" => {
+        "member_expression" | "subscript_expression" => {
             let object = node.child_by_field_name("object")?;
-            let property = node.child_by_field_name("property")?;
-            if !matches!(property.kind(), "property_identifier" | "identifier") {
-                return None;
-            }
+            let member = javascript_static_member_name(node, source)?;
             Some(format!(
                 "{}.{}",
                 javascript_mutation_owner(object, source)?,
-                node_text(property, source)?
+                member
             ))
         }
         _ => None,
