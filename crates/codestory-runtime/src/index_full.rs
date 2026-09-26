@@ -1025,6 +1025,11 @@ pub(super) fn index_full_for_runtime(
         },
         cancel_token,
     )?;
+    crate::activation_retrieval::apply_core_gc_after_publication(
+        runtime,
+        storage_path,
+        cancel_token,
+    );
     wall_durations.catalog_publication = wall_stage_started.elapsed();
     let full_refresh_wall = wall_durations.finish(core_refresh_started.elapsed());
     let mut phase_timings = core_indexing_phase_timings(

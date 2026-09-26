@@ -49,6 +49,24 @@ use store read snapshots and compare the recorded generation/run identity;
 retrieval owns the session that combines that transaction with immutable
 generation leases before returning evidence.
 
+Each newly installed immutable core image has a writer-provisioned lease.
+Readers pin the selected image across their Store lifetime; a short
+acquisition lock closes the pointer-to-lease race without holding every old
+reader behind cleanup. Successful publication schedules best-effort core
+retention, and explicit retrieval GC can retry it. The runtime coordinates
+retrieval publication, while the store protects active and rollback core
+identities plus every current or rollback retrieval binding. A pass completes
+its root and generation-directory scan before deleting anything, then removes
+at most 16 authenticated, unpinned images. Discovery is O(directory entries),
+not constant time. Unknown neighbors, old images without a provisioned lease,
+and SQLite images whose WAL, journal, or sidecar state cannot be observed
+safely are retained. Unix may retain an empty generation directory after its
+image is removed because the final directory pathname cannot be removed with
+the same handle-bound identity guarantee. Its final file unlink is also
+name-based after a native identity recheck; the acquisition and publication
+fences exclude CodeStory writers in that interval, while an external actor
+replacing the name at the last syscall remains outside that guarantee.
+
 The dense-anchor manifest is part of the core publication boundary. It binds
 the complete row count and digest, policy version, migration state, and every
 row's source identity to the current core generation/run. A migrated cache has

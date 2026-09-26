@@ -604,6 +604,13 @@ fn publish_rehydrated_database(
             .context("begin rehydrate publish transaction")?
             .commit_rehydrate(logical_target)
             .context("publish rehydrated generation and swap the publication pointer")?;
+        let retrieval_runtime =
+            codestory_retrieval::SidecarRuntimeConfig::for_project_auto(target_project);
+        crate::activation_retrieval::apply_core_gc_after_publication(
+            &retrieval_runtime,
+            logical_target,
+            None,
+        );
         Ok(PublishedRehydrate {
             invalidated_retrieval_manifests,
             rebase_stats,

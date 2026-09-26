@@ -52,8 +52,9 @@ pub use sqlite_observation::{
 };
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
-    BoundedRawCallEdges, BoundedRawIncidentEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION,
-    CallerProjectionRemovalSummary, CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    BoundedRawCallEdges, BoundedRawIncidentEdges, BuildNodeLookup, CORE_LEASE_FILE,
+    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, CorePromotionStats,
+    CoreRetentionReport, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorContentIdentity,
     DenseAnchorInput, DenseAnchorInputReuseMetadata, DenseAnchorInputStats,
     DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, DenseReasonCounts,
@@ -74,8 +75,8 @@ pub use storage_impl::{
     StructuralTextArtifactCacheWrite, StructuralTextProjection,
     StructuralTextPublicationCompatibility, StructuralTextUnit,
     StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    UnownedProjectionRemovalSummary, seal_call_resolution_fact, stored_vector_encoding,
-    structural_text_unit_digest,
+    UnownedProjectionRemovalSummary, apply_core_retention, seal_call_resolution_fact,
+    stored_vector_encoding, structural_text_unit_digest,
 };
 #[cfg(debug_assertions)]
 pub use storage_impl::{

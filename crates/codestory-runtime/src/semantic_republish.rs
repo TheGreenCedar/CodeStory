@@ -518,6 +518,11 @@ pub(super) fn semantic_projection_republish_for_runtime(
             prepared_search_state,
             cancel_token,
         )?;
+        crate::activation_retrieval::apply_core_gc_after_publication(
+            runtime,
+            storage_path,
+            cancel_token,
+        );
         let phase_timings =
             semantic_projection_phase_timings(&prepared, publish_stats, publish_duration);
         Ok((

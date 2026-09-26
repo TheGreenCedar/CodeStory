@@ -128,6 +128,66 @@ impl OwnedDeletionRoot {
         Ok(crate::workspace_file_identity(&self.root)? == crate::workspace_path_identity(path)?)
     }
 
+    /// Compare this pinned directory with a directory handle authenticated
+    /// before a caller's publication or retention validation.
+    pub fn matches_open_directory(&self, expected: &File) -> io::Result<bool> {
+        Ok(
+            crate::workspace_file_identity(&self.root)?
+                == crate::workspace_file_identity(expected)?,
+        )
+    }
+
+    /// Remove one direct regular file only when its native identity still
+    /// matches an authenticated open handle. Windows deletes through the same
+    /// handle used for this comparison. Unix unlinks by name after the last
+    /// comparison, so callers must exclude cooperating writers through their
+    /// own publication or ownership lock for that final interval.
+    pub fn remove_regular_file_matching(&self, name: &Path, expected: &File) -> io::Result<bool> {
+        let parts = relative_owned_parts(name)?;
+        if parts.len() != 1 {
+            return Err(invalid_relative_path(name));
+        }
+        #[cfg(unix)]
+        {
+            let Some(opened) = self.open_regular_file(name)? else {
+                return Ok(false);
+            };
+            if crate::workspace_file_identity(&opened)? != crate::workspace_file_identity(expected)?
+            {
+                return Ok(false);
+            }
+            remove_file_entry(&self.root, &parts[0])
+        }
+        #[cfg(windows)]
+        {
+            use fs_at::os::windows::{FileExt as _, OpenOptionsExt as _};
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+            let mut options = AtOpenOptions::default();
+            options
+                .desired_access(DELETE | FILE_READ_ATTRIBUTES)
+                .follow(false);
+            let opened = match options.open_at(&self.root, name) {
+                Ok(opened) => opened,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let metadata = opened.metadata()?;
+            reject_windows_reparse(&metadata)?;
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            if crate::workspace_file_identity(&opened)? != crate::workspace_file_identity(expected)?
+            {
+                return Ok(false);
+            }
+            opened
+                .delete_by_handle()
+                .map(|()| true)
+                .map_err(|(_, error)| error)
+        }
+    }
+
     /// Remove this already-open directory only when empty. Unix retains it
     /// because `rmdir` cannot bind its last name lookup to this handle.
     pub fn remove_pinned_empty_directory(self) -> io::Result<bool> {
@@ -379,6 +439,65 @@ mod tests {
             fs::read(owned.join("scope/unknown")).expect("unknown child survives"),
             b"keep"
         );
+    }
+
+    #[test]
+    fn matching_file_removal_refuses_replaced_db_and_lease_leaves() {
+        let temp = tempdir().expect("create temp root");
+        for (case, name) in ["candidate.db", ".codestory-core-lease.lock"]
+            .into_iter()
+            .enumerate()
+        {
+            let owned = temp.path().join(format!("owned-{case}"));
+            fs::create_dir_all(&owned).expect("create owned root");
+            let leaf = owned.join(name);
+            fs::write(&leaf, b"original").expect("write owned leaf");
+            let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+            let validated = deletion
+                .open_regular_file(name.as_ref())
+                .expect("open validated file")
+                .expect("validated file exists");
+            fs::rename(&leaf, owned.join("moved-original")).expect("move validated file");
+            fs::write(&leaf, b"replacement").expect("install replacement");
+
+            assert!(
+                !deletion
+                    .remove_regular_file_matching(name.as_ref(), &validated)
+                    .expect("refuse changed leaf")
+            );
+            assert_eq!(fs::read(&leaf).unwrap(), b"replacement");
+            assert_eq!(fs::read(owned.join("moved-original")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn pinned_empty_directory_removal_never_targets_a_replacement_name() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        let original = owned.join("scope");
+        let moved = owned.join("moved-original");
+        fs::create_dir_all(&original).expect("create owned scope");
+        let root = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+        let validated = root
+            .open_child_directory("scope".as_ref())
+            .expect("pin original directory");
+        fs::rename(&original, &moved).expect("move pinned directory");
+        fs::create_dir(&original).expect("replace directory name");
+
+        let removed = validated
+            .remove_pinned_empty_directory()
+            .expect("remove only pinned directory if supported");
+        assert!(original.is_dir(), "replacement directory must survive");
+        #[cfg(unix)]
+        {
+            assert!(!removed, "Unix retains the pinned empty directory");
+            assert!(moved.is_dir());
+        }
+        #[cfg(windows)]
+        {
+            assert!(removed, "Windows deletes the pinned directory handle");
+            assert!(!moved.exists());
+        }
     }
 
     #[cfg(unix)]
