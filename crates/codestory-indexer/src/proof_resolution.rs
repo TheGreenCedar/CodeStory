@@ -249,14 +249,14 @@ const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
-const JAVA_ADAPTER_VERSION: &str = "reference-v2";
-const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
+const JAVA_ADAPTER_VERSION: &str = "reference-v3";
+const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
 const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v5";
 const RUBY_ADAPTER_VERSION: &str = "reference-v4";
 const PHP_ADAPTER_VERSION: &str = "reference-v3";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
-const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
+const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
 const BASH_ADAPTER_VERSION: &str = "reference-v1";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
@@ -1440,6 +1440,7 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
                 });
                 self.index.direct_exports.push(CachedDirectExport {
                     exported_name: name.clone(),
@@ -2176,6 +2177,7 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
                 });
                 self.class_indices
                     .entry(name.clone())
@@ -3630,6 +3632,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
             cross_module_visible: false,
             runtime_closed: false,
             super_name: None,
+            instance_method_names: Vec::new(),
         });
         self.index
             .class_namespace_paths
@@ -4533,7 +4536,6 @@ struct JavaKotlinWalkContext {
     callable_id: Option<usize>,
     caller: Option<NodeId>,
     owner_index: Option<usize>,
-    owner_virtual: bool,
     unsupported: bool,
 }
 
@@ -4561,7 +4563,6 @@ struct JavaKotlinResolutionIndex<'tree> {
     package_name: Option<String>,
     wildcard_import: bool,
     overloads: HashSet<String>,
-    virtual_methods: HashSet<String>,
     extension_methods: HashSet<String>,
     has_annotated_declaration: bool,
     has_delegation: bool,
@@ -4641,7 +4642,6 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             package_name: csd_source_domain(language, source_path),
             wildcard_import: false,
             overloads: HashSet::new(),
-            virtual_methods: HashSet::new(),
             extension_methods: HashSet::new(),
             has_annotated_declaration: nominal_source_poison,
             has_delegation: false,
@@ -4654,7 +4654,6 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 callable_id: None,
                 caller: None,
                 owner_index: None,
-                owner_virtual: false,
                 unsupported: false,
             },
         );
@@ -4755,7 +4754,6 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
         count_java_kotlin_resolution_work(4);
         if call.unsupported
             || self.wildcard_import
-            || self.virtual_methods.contains(raw_target)
             || self.extension_methods.contains(raw_target)
             || self.has_delegation
             || self.has_annotated_declaration
@@ -5028,7 +5026,12 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 },
             );
         };
-        if is_csharp_swift_dart_language(self.language) {
+        if self.language == "kotlin" && !class.runtime_closed {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self.language == "java" && self.package_name.is_some()
+            || is_csharp_swift_dart_language(self.language)
+        {
             return (
                 Some(caller),
                 CachedResolutionBinding::JavaKotlinPackageReceiver {
@@ -5200,7 +5203,6 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             || virtual_owner
             || node.child_by_field_name("type_parameters").is_some()
             || java_kotlin_has_direct_child_kind(node, "type_parameters");
-        context.owner_virtual = virtual_owner;
         context.owner_index = None;
 
         let Some(name) = declaration_name(node, self.source).map(str::to_string) else {
@@ -5213,7 +5215,35 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         self.index.class_names.insert(name.clone());
         let cross_module_visible = csd_cross_module_visible(node, self.source, self.index.language);
         let runtime_closed = csd_runtime_closed(node, self.source, self.index.language);
-        let super_name = csd_super_name(node, self.source, self.index.language);
+        let super_name = if self.index.language == "java" {
+            node.child_by_field_name("superclass")
+                .and_then(|superclass| superclass.named_child(0))
+                .and_then(|superclass| {
+                    if superclass.kind() == "generic_type" {
+                        superclass.named_child(0)
+                    } else {
+                        Some(superclass)
+                    }
+                })
+                .and_then(|superclass| node_text(superclass, self.source))
+                .map(|name| {
+                    if name.contains('.') {
+                        name.to_string()
+                    } else if let Some([import]) =
+                        self.index.type_imports_by_name.get(name).map(Vec::as_slice)
+                    {
+                        format!("{}.{}", import.package_name, import.imported_name)
+                    } else {
+                        format!(
+                            "{}.{}",
+                            self.index.package_name.as_deref().unwrap_or_default(),
+                            name
+                        )
+                    }
+                })
+        } else {
+            csd_super_name(node, self.source, self.index.language)
+        };
         self.index.classes.push(CachedClassDeclaration {
             name,
             declaration,
@@ -5221,6 +5251,7 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             cross_module_visible,
             runtime_closed,
             super_name,
+            instance_method_names: Vec::new(),
         });
         context.owner_index = Some(self.index.classes.len() - 1);
         context
@@ -5249,14 +5280,18 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             context.callable_id = Some(node.id());
             return context;
         };
+        if self.index.language == "java"
+            && !java_kotlin_java_method_is_static(declaration_node, self.source)
+            && let Some(owner_index) = context.owner_index
+        {
+            self.index.classes[owner_index]
+                .instance_method_names
+                .push(name.clone());
+        }
         count_java_kotlin_resolution_work(1);
         if !self.index.overloads.insert(name.clone()) {
             count_java_kotlin_resolution_work(1);
             self.index.overloads.insert(format!("overload:{name}"));
-        }
-        if context.owner_virtual {
-            count_java_kotlin_resolution_work(1);
-            self.index.virtual_methods.insert(name.clone());
         }
         if self.index.language == "kotlin"
             && java_kotlin_kotlin_extension_declaration(node, self.source)
@@ -5897,7 +5932,10 @@ fn csd_owner_is_unsupported(node: TsNode<'_>, source: &str, language: &str) -> b
         "csharp" => header.split_whitespace().any(|word| word == "partial"),
         "swift" => {
             let header = header.trim_start();
-            header.starts_with("class ") || header.contains("@objc") || header.contains(" dynamic ")
+            node.child_by_field_name("declaration_kind")
+                .is_some_and(|kind| kind.kind() == "class")
+                || header.contains("@objc")
+                || header.contains(" dynamic ")
         }
         "dart" => {
             let header = header.trim_start();
@@ -5978,6 +6016,20 @@ pub(crate) fn swift_declaration_cross_module_visible_at(
 fn csd_runtime_closed(node: TsNode<'_>, source: &str, language: &str) -> bool {
     let header = csd_declaration_header(node, source).trim_start();
     match language {
+        "kotlin" => {
+            let mut cursor = node.walk();
+            !node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "modifiers")
+                .any(|modifiers| {
+                    let mut cursor = modifiers.walk();
+                    modifiers.named_children(&mut cursor).any(|modifier| {
+                        matches!(modifier.kind(), "inheritance_modifier" | "class_modifier")
+                            && node_text(modifier, source)
+                                .is_some_and(|text| matches!(text, "open" | "abstract" | "sealed"))
+                    })
+                })
+        }
         "csharp" => header.split_whitespace().any(|token| token == "sealed"),
         "swift" => header.starts_with("struct ") || header.starts_with("enum "),
         "dart" => header.starts_with("final class ") || header.starts_with("sealed class "),
@@ -8386,6 +8438,7 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 cross_module_visible: false,
                 runtime_closed: false,
                 super_name: None,
+                instance_method_names: Vec::new(),
             };
             self.classes_by_name
                 .entry(name.clone())
@@ -9839,6 +9892,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                         cross_module_visible: false,
                         runtime_closed: false,
                         super_name: None,
+                        instance_method_names: Vec::new(),
                     });
                 }
                 JavascriptBindingKind::Class { owner }
@@ -16948,6 +17002,7 @@ struct JavaKotlinImportDomain {
     declarations: HashMap<(Option<String>, String), Vec<JavaKotlinImportCandidate>>,
     classes: HashMap<String, Vec<JavaKotlinImportCandidate>>,
     cross_module_visible_nodes: HashSet<NodeId>,
+    kotlin_runtime_closed_types: HashSet<String>,
     dart_runtime_closed_types: HashSet<String>,
     dart_overridden_methods: HashSet<(String, String)>,
     dart_parent_candidates: HashMap<String, Vec<Option<String>>>,
@@ -16957,6 +17012,7 @@ struct JavaKotlinImportDomain {
 
 struct JavaKotlinProjectionIndex {
     domains: HashMap<(String, String), JavaKotlinImportDomain>,
+    java_overridden_methods: HashSet<(String, String, String)>,
     php_domains: HashMap<CachedPhpNamespace, JavaKotlinImportDomain>,
     php_identity_by_file: HashMap<i64, CachedPhpNamespace>,
     ruby_complete: bool,
@@ -16976,6 +17032,7 @@ enum JavaKotlinImportResolution {
     Missing,
     Ambiguous,
     Incomplete,
+    Unsupported,
 }
 
 fn dart_library_root(path: &Path) -> Option<&Path> {
@@ -17332,6 +17389,11 @@ impl JavaKotlinProjectionIndex {
                 if class.cross_module_visible {
                     domain.cross_module_visible_nodes.insert(class.declaration);
                 }
+                if record.file.language == "kotlin" && class.runtime_closed {
+                    domain
+                        .kotlin_runtime_closed_types
+                        .insert(class.name.clone());
+                }
                 if record.file.language == "dart" && class.runtime_closed {
                     domain.dart_runtime_closed_types.insert(class.name.clone());
                 }
@@ -17362,6 +17424,51 @@ impl JavaKotlinProjectionIndex {
                             .or_default()
                             .push(method.name.clone());
                     }
+                }
+            }
+        }
+        // Refusal belongs to the declaring receiver domain, not a same-spelled
+        // method elsewhere in the source file. Complete cached ancestry also
+        // makes the policy independent of declaration file boundaries.
+        let mut java_classes = HashMap::<String, Vec<&CachedClassDeclaration>>::new();
+        for record in records
+            .iter()
+            .filter(|record| record.file.language == "java")
+        {
+            let package = record
+                .file
+                .java_kotlin_package
+                .as_deref()
+                .unwrap_or_default();
+            for class in &record.file.classes {
+                java_classes
+                    .entry(format!("{package}.{}", class.name))
+                    .or_default()
+                    .push(class);
+            }
+        }
+        let mut java_overridden_methods = HashSet::new();
+        for classes in java_classes.values() {
+            for class in classes {
+                let mut parent = class.super_name.as_deref();
+                let mut visited = HashSet::new();
+                while let Some(name) = parent {
+                    if !visited.insert(name) {
+                        break;
+                    }
+                    if let Some((package, owner)) = name.rsplit_once('.') {
+                        for method in &class.instance_method_names {
+                            java_overridden_methods.insert((
+                                package.to_string(),
+                                owner.to_string(),
+                                method.clone(),
+                            ));
+                        }
+                    }
+                    parent = match java_classes.get(name).map(Vec::as_slice) {
+                        Some([class]) => class.super_name.as_deref(),
+                        _ => None,
+                    };
                 }
             }
         }
@@ -17423,6 +17530,7 @@ impl JavaKotlinProjectionIndex {
         }
         Self {
             domains,
+            java_overridden_methods,
             php_domains,
             php_identity_by_file,
             ruby_complete,
@@ -17446,6 +17554,18 @@ impl JavaKotlinProjectionIndex {
         else {
             return JavaKotlinImportResolution::Missing;
         };
+        if let Some(owner) = owner_name {
+            if language == "java"
+                && self.java_overridden_methods.contains(&(
+                    package_name.to_string(),
+                    owner.to_string(),
+                    imported_name.to_string(),
+                ))
+                || language == "kotlin" && !domain.kotlin_runtime_closed_types.contains(owner)
+            {
+                return JavaKotlinImportResolution::Unsupported;
+            }
+        }
         let resolution = Self::resolve_domain(domain, owner_name, imported_name);
         let (Some(owner_name), JavaKotlinImportResolution::Exact { owner, .. }) =
             (owner_name, &resolution)
@@ -18844,6 +18964,10 @@ fn resolve_syntax_claim(
                     status = ProofResolutionStatus::IncompleteDomain;
                     reason = ProofResolutionReason::LookupDomainIncomplete;
                 }
+                JavaKotlinImportResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
             }
         }
         CachedResolutionBinding::JavaKotlinImportedFunction {
@@ -18901,6 +19025,10 @@ fn resolve_syntax_claim(
             JavaKotlinImportResolution::Incomplete => {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
             }
         },
         CachedResolutionBinding::JavaKotlinPackageReceiver {
@@ -18977,6 +19105,10 @@ fn resolve_syntax_claim(
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
             }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
+            }
         },
         CachedResolutionBinding::JavaKotlinImportedReceiver {
             package_name,
@@ -19043,6 +19175,10 @@ fn resolve_syntax_claim(
             JavaKotlinImportResolution::Incomplete => {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
             }
         },
         CachedResolutionBinding::CCppQualified { components } => {
@@ -19391,6 +19527,35 @@ fn resolve_syntax_claim(
             evidence_chain.clear();
             exact_dependency_files.clear();
         }
+    }
+    let local_java_owner = match &input.binding {
+        CachedResolutionBinding::ImplicitReceiver { owner_name, .. }
+        | CachedResolutionBinding::ConstructorBinding {
+            class_binding: CachedClassBinding::SameFile { owner_name, .. },
+            ..
+        }
+        | CachedResolutionBinding::ExplicitReceiverType {
+            class_binding: CachedClassBinding::SameFile { owner_name, .. },
+            ..
+        } => Some(owner_name),
+        _ => None,
+    };
+    if source_record.file.language == "java"
+        && source_record.file.java_kotlin_package.is_none()
+        && local_java_owner.is_some_and(|owner| {
+            java_kotlin_index.java_overridden_methods.contains(&(
+                String::new(),
+                owner.clone(),
+                input.callsite.raw_target.clone(),
+            ))
+        })
+    {
+        status = ProofResolutionStatus::Unsupported;
+        reason = ProofResolutionReason::UnsupportedConstruct;
+        target = None;
+        evidence_chain.clear();
+        exact_node_file_expectations.clear();
+        exact_dependency_files.clear();
     }
     if status == ProofResolutionStatus::Exact && source_record.file.language == "java" {
         let same_package_receiver = input.callsite.callee_form == CalleeForm::ExplicitReceiver
@@ -21331,6 +21496,7 @@ mod python_complexity_tests {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
                 }],
                 direct_exports: Vec::new(),
                 export_poison_all: false,

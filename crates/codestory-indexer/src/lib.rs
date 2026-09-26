@@ -17279,6 +17279,7 @@ mod proof_resolution_cache_tests {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
                 }],
                 direct_exports: vec![CachedDirectExport {
                     exported_name: "C".to_owned(),

@@ -338,6 +338,10 @@ pub(crate) struct CachedClassDeclaration {
     pub runtime_closed: bool,
     #[serde(default)]
     pub super_name: Option<String>,
+    /// Syntactic non-static declarations used only for conservative JVM refusal.
+    /// They remain available when a declaration cannot bind uniquely to a node.
+    #[serde(default)]
+    pub instance_method_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
