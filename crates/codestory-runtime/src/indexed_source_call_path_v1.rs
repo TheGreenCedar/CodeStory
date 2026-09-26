@@ -2643,7 +2643,7 @@ mod tests {
             let fixture = source_built_fixture(&source);
             let selectors = names
                 .iter()
-                .map(|name| canonical_id(&source_callable(&fixture.store, name)))
+                .map(|name| canonical_id(&source_callable(&fixture.store, name)).to_owned())
                 .collect::<Vec<_>>();
             let targets = selectors[1..]
                 .iter()
