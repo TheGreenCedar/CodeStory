@@ -15,14 +15,11 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
         );
     }
     let document = read_bounded_call_path(&cmd.spec)?;
-    let contract =
-        codestory_runtime::proof_qualification_support::parse_public_call_path_document(&document)
-            .map_err(anyhow::Error::msg)?;
-    let validation =
-        codestory_runtime::proof_qualification_support::validate_public_call_path_contract(
-            contract,
-        )
+    let contract = codestory_runtime::public_call_path::parse_public_call_path_document(&document)
         .map_err(anyhow::Error::msg)?;
+    let validation =
+        codestory_runtime::public_call_path::validate_public_call_path_contract(contract)
+            .map_err(anyhow::Error::msg)?;
     let project = ProjectArgs {
         project: cmd.project,
         cache_dir: None,
@@ -37,13 +34,13 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
         )
         .map_err(map_api_error)?;
     let public = match validation {
-        codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
+        codestory_runtime::public_call_path::ValidationOutcome::Validated {
             contract,
             hashes,
             rendering,
         } => {
-            let operation = codestory_runtime::proof_qualification_support::
-                run_observed_call_path_public_operation(
+            let operation =
+                codestory_runtime::public_call_path::run_observed_call_path_public_operation(
                     &runtime.runtime,
                     &contract,
                     &hashes,
@@ -51,19 +48,17 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            codestory_runtime::proof_qualification_support::project_observed_public_operation(
-                &operation,
-            )
-            .map_err(anyhow::Error::msg)?
+            codestory_runtime::public_call_path::project_observed_public_operation(&operation)
+                .map_err(anyhow::Error::msg)?
         }
-        codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
+        codestory_runtime::public_call_path::ValidationOutcome::Unknown {
             spec,
             hashes,
             rendering,
             gaps,
         } => {
-            let operation = codestory_runtime::proof_qualification_support::
-                run_translation_unknown_public_operation(
+            let operation =
+                codestory_runtime::public_call_path::run_translation_unknown_public_operation(
                     &runtime.runtime,
                     &spec,
                     &hashes,
@@ -72,10 +67,8 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            codestory_runtime::proof_qualification_support::project_internal_projection(
-                &operation.value,
-            )
-            .map_err(anyhow::Error::msg)?
+            codestory_runtime::public_call_path::project_internal_projection(&operation.value)
+                .map_err(anyhow::Error::msg)?
         }
     };
     emit(OutputFormat::Json, &public, String::new(), None)

@@ -87,12 +87,6 @@ pub fn with_core_clone_disabled_for_test<T>(action: impl FnOnce() -> T) -> T {
 mod affected;
 mod agent;
 mod call_path_grammar;
-#[allow(unused_imports)]
-#[cfg(any(
-    test,
-    feature = "test-support",
-    feature = "proof-qualification-support"
-))]
 mod call_path_kernel;
 mod evidence_projection_v3;
 mod index_commit;
@@ -101,16 +95,11 @@ mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
-#[allow(unused_imports)]
-#[cfg(any(
-    test,
-    feature = "test-support",
-    feature = "proof-qualification-support"
-))]
 mod indexed_source_call_path_v1;
 #[cfg(feature = "proof-qualification-support")]
 #[doc(hidden)]
 pub mod proof_qualification_support;
+pub mod public_call_path;
 mod publication;
 mod repo_text;
 mod root_rank;
@@ -669,11 +658,6 @@ pub struct AppController {
     pub(crate) canonical_symbol_names:
         Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
     source_observer: Arc<Mutex<SourceObserverState>>,
-    #[cfg(any(
-        test,
-        feature = "test-support",
-        feature = "proof-qualification-support"
-    ))]
     proof_validation_cache: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,

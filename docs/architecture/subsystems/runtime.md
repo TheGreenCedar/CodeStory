@@ -129,7 +129,7 @@ retrieval index command publishes a matching generation.
 - core indexing success is reported as full retrieval readiness;
 - a project operation mutates per-user server or process defaults.
 
-## Internal call-path qualification
+## Indexed call-path verification
 
 The hidden call-path kernel shares one request budget across strict search,
 exclusion-tolerant search, reachable prefixes and final fact/state scans. Its
@@ -140,4 +140,7 @@ returns `Unknown` with `kernel_search_budget_exceeded` and no connected receipts
 an incomplete search establishes neither a longest prefix nor a refutation.
 Known input unavailability precedes exploration. An input exceeding the budget
 just to scan fails closed without inferring an unscanned unavailable suffix.
-This bounds internal qualification work, not product latency or runtime execution.
+The public `verify_indexed_direct_calls` operation uses this kernel; the
+qualification driver inspects its detailed traces through an optional feature.
+The bound applies to call-path verification, not packet/search latency or
+runtime execution.

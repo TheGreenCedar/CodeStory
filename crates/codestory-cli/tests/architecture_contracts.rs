@@ -871,7 +871,7 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 }
 
 #[test]
-fn public_exact_verifier_compiles_through_the_sealed_proof_facades() {
+fn public_exact_verifier_compiles_without_qualification_support() {
     const SUPPORT_FEATURE: &str = "proof-qualification-support";
     let agent_manifest = manifest("crates/codestory-agent/Cargo.toml");
     let agent_features = agent_manifest
@@ -889,15 +889,22 @@ fn public_exact_verifier_compiles_through_the_sealed_proof_facades() {
         .get("features")
         .and_then(Value::as_table)
         .expect("runtime features");
-    assert!(
+    assert_eq!(
         runtime_features
             .get("default")
-            .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
-        "crates/codestory-runtime/Cargo.toml must compile the sealed proof facade for the public verifier"
+            .expect("runtime defaults")
+            .to_string(),
+        "[]",
+        "runtime defaults must not enable qualification support"
     );
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    assert!(runtime_lib.contains("pub mod public_call_path;"));
     assert!(runtime_lib.contains("pub mod proof_qualification_support;"));
     assert!(runtime_lib.contains("mod call_path_kernel;"));
+    assert!(runtime_lib.contains("#[cfg(feature = \"proof-qualification-support\")]\n#[doc(hidden)]\npub mod proof_qualification_support;"));
+    let product_facade = read("crates/codestory-runtime/src/public_call_path.rs");
+    assert!(product_facade.contains("pub fn run_observed_call_path_public_operation"));
+    assert!(!product_facade.contains("pub fn canonical_json_bytes"));
     let cli = read_source_tree("crates/codestory-cli/src");
     assert!(cli.contains("run_observed_call_path_public_operation"));
     assert!(cli.contains("run_translation_unknown_public_operation"));
@@ -1022,25 +1029,21 @@ fn runtime_test_support_never_reaches_the_private_agent_kernel() {
 }
 
 #[test]
-fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
+fn product_call_path_kernel_stays_private_to_the_runtime() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        runtime_lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod call_path_kernel;"
-        ),
-        "the dark call-path kernel must remain private behind test or sealed qualification support"
+        runtime_lib.contains("mod call_path_kernel;"),
+        "the product verifier must compile the private call-path kernel"
     );
     assert!(
         !runtime_lib.contains("pub mod call_path_kernel;"),
-        "the dark call-path kernel must never become a qualification-visible module"
+        "the call-path kernel must remain private"
     );
 
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        runtime_lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;"
-        ),
-        "the dark Store/source adapter must remain behind test or sealed qualification support"
+        runtime_lib.contains("mod indexed_source_call_path_v1;"),
+        "the product verifier must compile the private Store/source adapter"
     );
     let adapter = production_source(&read(
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",

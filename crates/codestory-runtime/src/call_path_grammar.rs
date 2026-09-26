@@ -12,7 +12,7 @@
 //! exclude-from-projection symbol "tracing::span"
 //! ```
 
-use crate::proof_qualification_support as proof;
+use crate::call_path_kernel as proof;
 
 pub(crate) const CALL_PATH_GRAMMAR_HEADER: &str = "call-path/v1";
 const MAX_QUOTED_ATOM_BYTES: usize = 512;

@@ -57,10 +57,8 @@ pub(crate) fn measure_revision_native_proof_result_v3(
     root: &serde_json::Value,
 ) -> Result<Vec<RevisionNativeToolResultMeasurementV3>, StdioV3InternalError> {
     let public =
-        codestory_runtime::proof_qualification_support::project_public_verification_result(
-            root.clone(),
-        )
-        .map_err(StdioV3InternalError::InvalidProjection)?;
+        codestory_runtime::public_call_path::project_public_verification_result(root.clone())
+            .map_err(StdioV3InternalError::InvalidProjection)?;
     McpRevisionV3::all()
         .iter()
         .map(|revision| {
