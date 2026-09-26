@@ -16,12 +16,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const CORE_DIRECTORY: &str = "core";
-pub const CORE_GENERATIONS_DIRECTORY: &str = "generations";
-pub const CORE_STAGING_DIRECTORY: &str = "staging";
+pub use codestory_contracts::owned_artifacts::{
+    CORE_GENERATIONS_DIRECTORY, CORE_PUBLICATION_DIRECTORY as CORE_DIRECTORY,
+    CORE_PUBLICATION_FILE, CORE_RETRIEVAL_PUBLICATION_FILE as RETRIEVAL_PUBLICATION_FILE,
+    CORE_STAGING_DIRECTORY,
+};
 pub const CORE_DATABASE_FILE: &str = "codestory.db";
-pub const CORE_PUBLICATION_FILE: &str = "publication.json";
-pub const RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
 
 /// Prefix for StorageError messages when block cloning cannot stage a core image.
 ///

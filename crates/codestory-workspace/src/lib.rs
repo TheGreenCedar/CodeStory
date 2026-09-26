@@ -5337,6 +5337,7 @@ mod tests {
 
         let owned_files = storage_owned_discovery_files(&storage_path);
         for path in &owned_files {
+            fs::create_dir_all(path.parent().expect("owned file parent"))?;
             fs::write(path, b"codestory-owned\n")?;
         }
         let staged_files = [

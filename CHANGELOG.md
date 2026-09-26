@@ -4,6 +4,10 @@
 
 - Call navigation avoids conditional or shadowed receiver bindings in Ruby, PHP and Python. Relative JavaScript and TypeScript imports prefer an exact name and leave competing declarations unresolved.
 
+- Derived cache reset quarantines immutable core generations as well as legacy caches, so a newer cache schema can be rebuilt. Saved annotations and their retained migration export stay in place; reset refuses live readers and caches whose reader leases cannot be verified.
+
+- Cancelling a retrieval refresh before its pointer commit preserves the previous current and rollback generations.
+
 - Bash source-call proof refuses function bindings after unknown executable commands or unset effects that can change the function namespace.
 
 - Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.
