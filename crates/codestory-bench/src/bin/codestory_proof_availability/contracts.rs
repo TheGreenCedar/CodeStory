@@ -1807,7 +1807,7 @@ pub enum ActualProofGapV1 {
     ReceiptOrEdgeAlreadyUsed { step_index: u8 },
     ProjectionExclusionConflictsWithRequiredReceipt { step_index: u8 },
     OutputBudgetExceeded,
-    KernelSearchBudgetExceeded,
+    KernelSearchBudgetExceeded {},
 }
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -2131,7 +2131,7 @@ fn coarse_gap(gap: &ActualProofGapV1) -> TypedGapV1 {
         | ActualProofGapV1::EdgeContainmentUnproven { .. } => TypedGapV1::SourceBinding,
         ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { .. }
         | ActualProofGapV1::OutputBudgetExceeded => TypedGapV1::ProjectionBudget,
-        ActualProofGapV1::KernelSearchBudgetExceeded => TypedGapV1::SearchBudget,
+        ActualProofGapV1::KernelSearchBudgetExceeded {} => TypedGapV1::SearchBudget,
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -4564,7 +4564,7 @@ fn gap_cause_matches_trace(gap: ActualProofGapV1, trace: &ProofQualificationTrac
         }
         // The current trace has no authenticated kernel-work exhaustion marker.
         // Accept the typed unknown without inventing a step/finalization cause.
-        ActualProofGapV1::KernelSearchBudgetExceeded => false,
+        ActualProofGapV1::KernelSearchBudgetExceeded {} => false,
         ActualProofGapV1::OutputBudgetExceeded => matches!(
             trace.finalization,
             FinalizationTraceV1::Failed {
@@ -4838,9 +4838,8 @@ fn valid_actual_gap(gap: &ActualProofGapV1) -> bool {
         | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
             *step_index < 6
         }
-        ActualProofGapV1::OutputBudgetExceeded | ActualProofGapV1::KernelSearchBudgetExceeded => {
-            true
-        }
+        ActualProofGapV1::OutputBudgetExceeded
+        | ActualProofGapV1::KernelSearchBudgetExceeded {} => true,
     }
 }
 
@@ -6289,7 +6288,7 @@ mod contract_digest_binding_tests {
         }
         gaps.extend([
             ActualProofGapV1::OutputBudgetExceeded,
-            ActualProofGapV1::KernelSearchBudgetExceeded,
+            ActualProofGapV1::KernelSearchBudgetExceeded {},
         ]);
         gaps
     }

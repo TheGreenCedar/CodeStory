@@ -672,7 +672,9 @@ mod tests {
             panic!("search exhaustion remains typed unknown")
         };
         assert!(
-            gaps.contains(&super::super::contracts::ActualProofGapV1::KernelSearchBudgetExceeded)
+            gaps.contains(
+                &super::super::contracts::ActualProofGapV1::KernelSearchBudgetExceeded {}
+            )
         );
         assert!(connected_receipts.is_empty());
         assert!(report.authoritative_receipts.is_empty());
