@@ -149,7 +149,7 @@
               "items": {
                 "$ref": "#/$defs/ActualProofGapV1"
               },
-              "maxItems": 76,
+              "maxItems": 77,
               "minItems": 1,
               "type": "array"
             },
@@ -458,6 +458,19 @@
           "properties": {
             "kind": {
               "const": "output_budget_exceeded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "kernel_search_budget_exceeded",
               "type": "string"
             }
           },
@@ -1534,7 +1547,7 @@
           "items": {
             "$ref": "#/$defs/TypedGapV1"
           },
-          "maxItems": 6,
+          "maxItems": 7,
           "minItems": 0,
           "type": "array"
         },
@@ -2824,7 +2837,8 @@
         "relation_missing",
         "recursion",
         "source_binding",
-        "projection_budget"
+        "projection_budget",
+        "search_budget"
       ],
       "type": "string"
     },

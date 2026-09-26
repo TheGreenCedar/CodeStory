@@ -31,7 +31,7 @@ const ACTUAL_SELECTOR_GAP_VARIANTS: usize = 3;
 const ACTUAL_SELECTOR_GAP_INDEX_COUNT: usize = 7;
 const ACTUAL_STEP_GAP_VARIANTS: usize = 9;
 const ACTUAL_STEP_GAP_INDEX_COUNT: usize = 6;
-const ACTUAL_UNINDEXED_GAP_VARIANTS: usize = 1;
+const ACTUAL_UNINDEXED_GAP_VARIANTS: usize = 2;
 pub const MAX_ACTUAL_PROOF_GAPS: usize = ACTUAL_SELECTOR_GAP_VARIANTS
     * ACTUAL_SELECTOR_GAP_INDEX_COUNT
     + ACTUAL_STEP_GAP_VARIANTS * ACTUAL_STEP_GAP_INDEX_COUNT
@@ -1807,6 +1807,7 @@ pub enum ActualProofGapV1 {
     ReceiptOrEdgeAlreadyUsed { step_index: u8 },
     ProjectionExclusionConflictsWithRequiredReceipt { step_index: u8 },
     OutputBudgetExceeded,
+    KernelSearchBudgetExceeded,
 }
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -2130,6 +2131,7 @@ fn coarse_gap(gap: &ActualProofGapV1) -> TypedGapV1 {
         | ActualProofGapV1::EdgeContainmentUnproven { .. } => TypedGapV1::SourceBinding,
         ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { .. }
         | ActualProofGapV1::OutputBudgetExceeded => TypedGapV1::ProjectionBudget,
+        ActualProofGapV1::KernelSearchBudgetExceeded => TypedGapV1::SearchBudget,
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -2151,6 +2153,7 @@ pub enum TypedGapV1 {
     Recursion,
     SourceBinding,
     ProjectionBudget,
+    SearchBudget,
 }
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -4559,6 +4562,9 @@ fn gap_cause_matches_trace(gap: ActualProofGapV1, trace: &ProofQualificationTrac
         | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
             step_admitted(trace, step_index)
         }
+        // The current trace has no authenticated kernel-work exhaustion marker.
+        // Accept the typed unknown without inventing a step/finalization cause.
+        ActualProofGapV1::KernelSearchBudgetExceeded => false,
         ActualProofGapV1::OutputBudgetExceeded => matches!(
             trace.finalization,
             FinalizationTraceV1::Failed {
@@ -4832,7 +4838,9 @@ fn valid_actual_gap(gap: &ActualProofGapV1) -> bool {
         | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
             *step_index < 6
         }
-        ActualProofGapV1::OutputBudgetExceeded => true,
+        ActualProofGapV1::OutputBudgetExceeded | ActualProofGapV1::KernelSearchBudgetExceeded => {
+            true
+        }
     }
 }
 
@@ -5576,7 +5584,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some("ProductDispositionV1"),
                 "gaps",
                 Some(0),
-                Some(6),
+                Some(7),
             );
             set_bounds(
                 schema,
@@ -6279,8 +6287,57 @@ mod contract_digest_binding_tests {
                 ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index },
             ]);
         }
-        gaps.push(ActualProofGapV1::OutputBudgetExceeded);
+        gaps.extend([
+            ActualProofGapV1::OutputBudgetExceeded,
+            ActualProofGapV1::KernelSearchBudgetExceeded,
+        ]);
         gaps
+    }
+
+    #[test]
+    fn kernel_search_budget_gap_is_closed_and_never_invents_actionable_trace_authority() {
+        let gap_json = serde_json::json!({"kind":"kernel_search_budget_exceeded"});
+        let gap: ActualProofGapV1 = serde_json::from_value(gap_json.clone()).unwrap();
+        assert_eq!(coarse_gap(&gap), TypedGapV1::SearchBudget);
+        assert_ne!(coarse_gap(&gap), TypedGapV1::ProjectionBudget);
+        assert!(valid_actual_gap(&gap));
+        for hostile in [
+            serde_json::json!({"kind":"kernel_search_budget_exceeded", "step_index":0}),
+            serde_json::json!({"kind":"kernel_search_budget_exceeded", "selector_index":0}),
+            serde_json::json!({"kind":"kernel_search_budget_exceeded", "after_step_count":6}),
+            serde_json::json!({"kind":"unrecognized_search_budget"}),
+        ] {
+            assert!(serde_json::from_value::<ActualProofGapV1>(hostile).is_err());
+        }
+        let trace = ProofQualificationTraceV1 {
+            selector_early_return: false,
+            selectors: Vec::new(),
+            steps: Vec::new(),
+            finalization: FinalizationTraceV1::Failed {
+                failure: FinalizationFailureV1::ProjectionBudget,
+            },
+        };
+        assert!(gap_cause_matches_trace(
+            ActualProofGapV1::OutputBudgetExceeded,
+            &trace
+        ));
+        assert!(!gap_cause_matches_trace(gap, &trace));
+        assert_eq!(actionable_boundary(gap, 0, 6, &trace), None);
+        let schema = schema_json(SchemaDocument::Report);
+        let shape = schema["$defs"]["ActualProofGapV1"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|shape| shape["properties"]["kind"]["const"] == gap_json["kind"])
+            .unwrap();
+        assert_eq!(shape["required"], serde_json::json!(["kind"]));
+        assert_eq!(shape["additionalProperties"], false);
+        assert!(
+            schema["$defs"]["TypedGapV1"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("search_budget"))
+        );
     }
 
     #[test]
@@ -6312,7 +6369,7 @@ mod contract_digest_binding_tests {
     }
 
     #[test]
-    fn actual_unknown_accepts_the_closed_gap_domain_and_rejects_a_seventy_seventh_gap() {
+    fn actual_unknown_accepts_the_closed_gap_domain_and_rejects_an_extra_gap() {
         let gaps = every_actual_gap();
         assert_eq!(gaps.len(), MAX_ACTUAL_PROOF_GAPS);
         let actual = ActualProductResultV1::Unknown {

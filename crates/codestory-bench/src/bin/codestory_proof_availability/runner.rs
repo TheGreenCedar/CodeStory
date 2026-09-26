@@ -561,6 +561,146 @@ mod tests {
     }
 
     #[test]
+    fn kernel_search_budget_public_unknown_roundtrips_into_qualification_report() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src")).unwrap();
+        let names = ["a", "b", "c", "d", "e", "f", "g"];
+        let mut source = String::new();
+        for (step, name) in names.iter().enumerate() {
+            source.push_str(&format!("pub fn {name}() {{\n"));
+            if step < 5 {
+                for _ in 0..4 {
+                    source.push_str(&format!("  {}();\n", names[step + 1]));
+                }
+            }
+            source.push_str("}\n");
+        }
+        fs::write(project.path().join("src/lib.rs"), source).unwrap();
+        let database = project.path().join("core.sqlite3");
+        let runtime = core_only_runtime(project.path(), cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(project.path().to_path_buf(), database.clone())
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let store = Store::open_observational(&database).unwrap();
+        assert_eq!(store.get_proof_resolution_facts().unwrap().len(), 20);
+        let nodes = store.get_nodes().unwrap();
+        let canonical = names
+            .iter()
+            .map(|name| {
+                nodes
+                    .iter()
+                    .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == *name)
+                    .unwrap()
+                    .canonical_id
+                    .clone()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+        let text = "exact direct ordered call path";
+        let fields = std::iter::once(ProofContractField::Start)
+            .chain((0..6).flat_map(|step| {
+                [
+                    ProofContractField::StepTarget { step },
+                    ProofContractField::Directness { step },
+                    ProofContractField::Ordering { step },
+                    ProofContractField::Relation { step },
+                ]
+            }))
+            .collect();
+        let ValidationOutcome::Validated {
+            contract,
+            hashes,
+            rendering,
+        } = validate_contract(UnvalidatedCallPathContract::new(
+            text,
+            vec![ClauseAnchor {
+                clause_id: "contract".into(),
+                start: 0,
+                end: text.len(),
+                quote: text.into(),
+                classification: ClauseClassification::ResolvedMaterial { fields },
+            }],
+            UnvalidatedCallPathSpec {
+                start: UnvalidatedExactSymbolSelector::CanonicalId(canonical[0].clone()),
+                steps: canonical[1..]
+                    .iter()
+                    .map(|target| UnvalidatedDirectCallStep {
+                        target: UnvalidatedExactSymbolSelector::CanonicalId(target.clone()),
+                    })
+                    .collect(),
+                prohibit_traversal_through: vec![],
+                exclude_from_projection: vec![],
+            },
+        ))
+        .unwrap()
+        else {
+            panic!("valid six-step fixture")
+        };
+        let operation = run_observed_call_path_public_operation(
+            &runtime,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(operation.retrieval_publication.is_none());
+        let public =
+            codestory_runtime::proof_qualification_support::project_observed_public_operation(
+                &operation,
+            )
+            .unwrap();
+        assert_eq!(public.as_value()["graph_disposition"], "unknown");
+        assert_eq!(public.as_value()["runtime_execution_proven"], false);
+        let report =
+            super::super::contracts::product_disposition_from_projection(public.as_value())
+                .unwrap();
+        let ActualProductResultV1::Unknown {
+            gaps,
+            connected_receipts,
+            ..
+        } = &report.actual
+        else {
+            panic!("search exhaustion remains typed unknown")
+        };
+        assert!(
+            gaps.contains(&super::super::contracts::ActualProofGapV1::KernelSearchBudgetExceeded)
+        );
+        assert!(connected_receipts.is_empty());
+        assert!(report.authoritative_receipts.is_empty());
+        assert!(
+            report
+                .gaps
+                .contains(&super::super::contracts::TypedGapV1::SearchBudget)
+        );
+        assert!(
+            !report
+                .gaps
+                .contains(&super::super::contracts::TypedGapV1::ProjectionBudget)
+        );
+        let roundtrip: super::super::contracts::ProductDispositionV1 =
+            serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(roundtrip.actual, report.actual);
+        assert_eq!(roundtrip.gaps, report.gaps);
+        let mut hostile = public.as_value().clone();
+        let gap = hostile["disposition"]["gaps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|gap| gap["kind"] == "kernel_search_budget_exceeded")
+            .unwrap();
+        gap["step_index"] = json!(0);
+        assert!(super::super::contracts::product_disposition_from_projection(&hostile).is_err());
+    }
+
+    #[test]
     fn source_built_case_runs_through_the_runtime_owned_kernel() {
         let project = tempfile::tempdir().unwrap();
         fs::create_dir_all(project.path().join("src")).unwrap();

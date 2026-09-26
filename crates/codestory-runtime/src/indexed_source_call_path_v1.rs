@@ -2739,16 +2739,23 @@ mod tests {
                     .unwrap();
                 assert_eq!(gap_shape["required"], json!(["kind"]));
                 assert_eq!(gap_shape["additionalProperties"], false);
-                let mut malformed = public_gaps.last().unwrap().clone();
-                malformed["step_index"] = json!(0);
-                let mut hostile_root = root.clone();
-                hostile_root["disposition"]["gaps"]
-                    .as_array_mut()
+                let gap_index = root["disposition"]["gaps"]
+                    .as_array()
                     .unwrap()
-                    .push(malformed);
-                assert!(
-                    crate::call_path_kernel::validate_compact_projection(&hostile_root).is_err()
-                );
+                    .iter()
+                    .position(|gap| gap["kind"] == "kernel_search_budget_exceeded")
+                    .unwrap();
+                for malformed in [
+                    json!({"kind":"kernel_search_budget_exceeded", "step_index":0}),
+                    json!({"kind":"unrecognized_search_budget"}),
+                ] {
+                    let mut hostile_root = root.clone();
+                    hostile_root["disposition"]["gaps"][gap_index] = malformed;
+                    assert_eq!(
+                        crate::call_path_kernel::validate_compact_projection(&hostile_root),
+                        Err("compact_disposition_gap_invalid".to_owned())
+                    );
+                }
             } else {
                 assert!(
                     !gaps.contains(&crate::call_path_kernel::ProofGap::KernelSearchBudgetExceeded)
