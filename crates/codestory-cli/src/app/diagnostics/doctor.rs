@@ -117,6 +117,7 @@ pub(in crate::app) fn build_doctor_output(
     DoctorOutput {
         project: project.clone(),
         storage_path,
+        core_status: None,
         indexed,
         stats: summary.stats.clone(),
         retrieval_mode: readiness_sidecar.retrieval_mode.clone(),

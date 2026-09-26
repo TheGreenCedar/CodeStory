@@ -428,6 +428,20 @@ impl AppController {
         })? {
             return Ok(None);
         }
+        let schema_version = Storage::database_schema_version_observational(&storage_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect core schema observationally: {error}"
+                ))
+            })?;
+        if schema_version < CURRENT_SCHEMA_VERSION {
+            return Err(ApiError::new(
+                "core_schema_upgrade_required",
+                format!(
+                    "Core cache schema {schema_version} requires a full index to upgrade to schema {CURRENT_SCHEMA_VERSION}"
+                ),
+            ));
+        }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
             ApiError::internal(format!("Failed to open storage observationally: {error}"))
         })?;
