@@ -16381,55 +16381,65 @@ fn relative_type_value_import_prefers_exact_callable_name() -> anyhow::Result<()
 }
 
 #[test]
-fn ordinary_constructor_and_mutation_refusals_have_no_certain_endpoint() -> anyhow::Result<()> {
-    for (path, source, language, caller_line, call_line) in [
-        (
-            "src/collision.cpp",
-            concat!(
-                "struct Worker { void target() {} };\nstruct Other { void target() {} };\n",
-                "Other Worker() { return {}; }\nvoid caller() {\n  Worker().target();\n}\n",
-            ),
-            "cpp",
-            4,
-            5,
+fn ordinary_cpp_factory_collision_does_not_select_hidden_type() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/collision.cpp",
+        concat!(
+            "struct Worker { void target() {} };\nstruct Other { void target() {} };\n",
+            "Other Worker() { return {}; }\nvoid caller() {\n  Worker().target();\n}\n",
         ),
-        (
-            "src/collision.py",
-            concat!(
-                "class Worker:\n    def target(self):\n        pass\n",
-                "class Other:\n    def target(self):\n        pass\n",
-                "def Worker():\n    return Other()\n",
-                "def caller():\n    worker = Worker()\n    worker.target()\n",
-            ),
-            "python",
-            9,
-            11,
+        "cpp",
+        "target",
+        4,
+        5,
+    )
+}
+
+#[test]
+fn ordinary_python_factory_collision_does_not_select_hidden_type() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/collision.py",
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "class Other:\n    def target(self):\n        pass\n",
+            "def Worker():\n    return Other()\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
         ),
-        (
-            "src/mutation.py",
-            concat!(
-                "class Worker:\n    def target(self):\n        pass\n",
-                "def replacement():\n    pass\nsetattr(Worker, 'target', replacement)\n",
-                "def caller():\n    worker = Worker()\n    worker.target()\n",
-            ),
-            "python",
-            7,
-            9,
+        "python",
+        "target",
+        9,
+        11,
+    )
+}
+
+#[test]
+fn ordinary_python_replaced_member_has_no_certain_endpoint() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/mutation.py",
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def replacement():\n    pass\nsetattr(Worker, 'target', replacement)\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
         ),
-        (
-            "src/mutation.js",
-            concat!(
-                "export class C {\n  target() {}\n}\nexport function other() {}\n",
-                "Reflect.set(C.prototype, 'target', other);\n",
-                "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
-            ),
-            "javascript",
-            6,
-            8,
+        "python",
+        "target",
+        7,
+        9,
+    )
+}
+
+#[test]
+fn ordinary_script_replaced_member_has_no_certain_endpoint() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/mutation.js",
+        concat!(
+            "export class C {\n  target() {}\n}\nexport function other() {}\n",
+            "Reflect.set(C.prototype, 'target', other);\n",
+            "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
         ),
-    ] {
-        assert_ordinary_receiver_refusal(path, source, language, "target", caller_line, call_line)
-            .map_err(|error| anyhow::anyhow!("{path}: {error:#}"))?;
-    }
-    Ok(())
+        "javascript",
+        "target",
+        6,
+        8,
+    )
 }
