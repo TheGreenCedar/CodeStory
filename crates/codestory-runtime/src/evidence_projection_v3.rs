@@ -1251,7 +1251,7 @@ mod tests {
             .expect("indexed FILE");
         let node_id = file_hit.node_id.to_core().expect("numeric file identity");
         let published =
-            codestory_store::Store::open(&state.path().join("codestory.db")).expect("pinned store");
+            codestory_store::Store::open(state.path().join("codestory.db")).expect("pinned store");
         let scratch_path = state.path().join("isolated-path-test.db");
         published
             .get_connection()
