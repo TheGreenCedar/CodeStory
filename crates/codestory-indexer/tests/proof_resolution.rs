@@ -688,6 +688,22 @@ fn assert_nominal_call_is_nonexact(
     caller_path: &str,
     call_line: u32,
 ) -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact_with_status(
+        files,
+        language,
+        caller_path,
+        call_line,
+        ProofResolutionStatus::Unsupported,
+    )
+}
+
+fn assert_nominal_call_is_nonexact_with_status(
+    files: &[(&str, &str)],
+    language: &str,
+    caller_path: &str,
+    call_line: u32,
+    expected_status: ProofResolutionStatus,
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
@@ -746,8 +762,7 @@ fn assert_nominal_call_is_nonexact(
         calls[0]
     );
     assert_eq!(
-        fact.status,
-        ProofResolutionStatus::Unsupported,
+        fact.status, expected_status,
         "source virtual/class refusal must not depend on declaration file boundaries"
     );
     assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
@@ -1064,23 +1079,30 @@ fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Re
                 "package p;\nclass Outer {{\n  static class Worker {{ public void target() {{}} }}\n  static class Child extends {ancestor} {{ public void target() {{}} }}\n}}\n"
             )
         };
-        assert_nominal_call_is_exact(
-            &[
-                (
-                    "p/Worker.java",
-                    "package p;\nclass Worker {\n  public void target() {}\n}\n",
-                ),
-                (
-                    "p/Caller.java",
-                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
-                ),
-                ("p/Outer.java", &nested),
-            ],
-            "java",
-            "p/Worker.java",
-            3,
-            2,
-        )?;
+        let files = [
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            ("p/Outer.java", &nested),
+        ];
+        if ancestor == "Outer.Worker" {
+            // The relative CLASS use anchor creates two replay package spellings.
+            // Publish an explicit nonexact result instead of an invalid receipt.
+            assert_nominal_call_is_nonexact_with_status(
+                &files,
+                "java",
+                "p/Caller.java",
+                4,
+                ProofResolutionStatus::IncompleteDomain,
+            )?;
+        } else {
+            assert_nominal_call_is_exact(&files, "java", "p/Worker.java", 3, 2)?;
+        }
     }
     assert_nominal_call_is_exact(
         &[
@@ -1103,6 +1125,26 @@ fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Re
         ],
         "java",
         "p/Worker.java",
+        3,
+        2,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "q/Worker.java",
+                "package q;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "q/Caller.java",
+                "package q;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "p/Outer.java",
+                "package p;\nclass Outer {\n  static class Worker { public void target() {} }\n  static class Child extends Outer.Worker { public void target() {} }\n}\n",
+            ),
+        ],
+        "java",
+        "q/Worker.java",
         3,
         2,
     )?;

@@ -4558,7 +4558,8 @@ impl JavaOverridePolicy {
                 unsupported_owners.insert(class.declaration);
                 continue;
             };
-            // Nested type lookup is outside the source Exact domain. Keep its
+            // Nested receiver/type owner lookup is outside the source Exact domain.
+            // Direct authenticated Identifier/SameFile calls retain their route. Keep its
             // syntax identity for ancestor refusal without granting authority.
             if scope.type_path.len() > 1 {
                 unsupported_owners.insert(class.declaration);
@@ -17391,6 +17392,49 @@ impl JavaKotlinProjectionIndex {
                     .map(|package| (record.file.file_id, package.as_str()))
             })
             .collect::<HashMap<_, _>>();
+        // Mirror Store's named Java replay-authority census. Its enclosing
+        // type set includes default-package files too. CLASS use anchors with
+        // a second package spelling cannot authorize a complete package route.
+        let java_files = records
+            .iter()
+            .filter(|record| record.file.language == "java")
+            .map(|record| record.file.file_id)
+            .collect::<HashSet<_>>();
+        let java_class_names = nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) && node
+                    .file_node_id
+                    .is_some_and(|file| java_files.contains(&file))
+            })
+            .filter_map(|node| node.qualified_name.as_deref())
+            .collect::<HashSet<_>>();
+        let mut java_replay_packages = HashMap::<NodeId, BTreeSet<&str>>::new();
+        for node in nodes.iter().filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+            ) && node
+                .file_node_id
+                .is_some_and(|file| java_files.contains(&file))
+        }) {
+            let Some(file) = node.file_node_id else {
+                continue;
+            };
+            let Some((parent, _)) = node
+                .qualified_name
+                .as_deref()
+                .and_then(|name| name.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if !parent.is_empty() && !java_class_names.contains(parent) {
+                java_replay_packages.entry(file).or_default().insert(parent);
+            }
+        }
         let mut java_package_dependency_files = HashSet::new();
         let mut java_unsupported_owner_names = HashMap::<&str, HashSet<String>>::new();
         for node in nodes.iter().filter(|node| {
@@ -17546,7 +17590,17 @@ impl JavaKotlinProjectionIndex {
             let domain = domains
                 .entry((record.file.language.clone(), package_name.clone()))
                 .or_default();
-            let file_complete = record.file.complete && record.file.lookup_input_complete;
+            let java_replay_complete = record.file.language != "java"
+                || !java_package_dependency_files.contains(&FileId(record.file.file_id.0))
+                || java_replay_packages
+                    .get(&record.file.file_id)
+                    .is_some_and(|packages| {
+                        packages.len() == 1 && packages.contains(package_name.as_str())
+                    });
+            let file_complete =
+                record.file.complete && record.file.lookup_input_complete && java_replay_complete;
+            // Keep dependencies and refusal inventory even when replay identity
+            // is incomplete; omit positive authority, never required source input.
             if domain.dependencies.is_empty() {
                 domain.complete = file_complete;
             } else {
