@@ -1,8 +1,8 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
 use codestory_contracts::proof_resolution::{
-    CalleeForm, DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
-    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    CalleeForm, CanonicalCallsiteIdentity, DependencyFileHash, FileId, ProofResolutionProjection,
+    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
     parse_canonical_callsite_identity,
 };
 use codestory_indexer::{
@@ -9641,23 +9641,42 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
     for (files, called_name) in [
         (
             vec![
-                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
+                ),
                 (
                     "src/importer.ts",
-                    "import { type Target, target } from './target';\nexport function caller() { target(); }\n",
+                    "import { type Target, execute } from './target';\nexport function caller() { execute(); }\n",
                 ),
             ],
-            "target",
+            "execute",
         ),
         (
             vec![
-                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
+                ),
                 (
                     "src/importer.ts",
-                    "import { target, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { target(); }\n",
+                    "import { execute, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { execute(); }\n",
                 ),
             ],
-            "target",
+            "execute",
+        ),
+        (
+            vec![
+                (
+                    "src/target.ts",
+                    "export interface Target { value: number }\nexport function execute() {}\n",
+                ),
+                (
+                    "src/importer.ts",
+                    "import { execute, type Target } from './target';\nexport function caller() { execute(); }\n",
+                ),
+            ],
+            "execute",
         ),
         (
             vec![
@@ -9696,7 +9715,10 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
 
     for files in [
         vec![
-            ("src/target.ts", "export function target() {}\n"),
+            (
+                "src/target.ts",
+                "export interface Target { value: number }\nexport function target() {}\n",
+            ),
             (
                 "src/importer.ts",
                 "import type { target } from './target';\nexport function caller() { target(); }\n",
@@ -9720,15 +9742,27 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
             ),
         ],
     ] {
-        assert_no_exact_calls(&files)?;
+        let (path, caller) = files.last().expect("designated importer fixture");
+        let (marker, callee) = if caller.contains("local();") {
+            ("local();", "local")
+        } else {
+            ("target();", "target")
+        };
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
     }
-    assert_no_exact_calls(&[
-        ("src/target.ts", "export function target() {}\n"),
-        (
-            "src/aliased_type.ts",
-            "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
-        ),
-    ])?;
+    assert_no_exact_calls_at(
+        &[
+            (
+                "src/target.ts",
+                "export interface Target { value: number }\nexport function target() {}\n",
+            ),
+            (
+                "src/aliased_type.ts",
+                "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
+            ),
+        ],
+        &[("src/aliased_type.ts", "local();", "local")],
+    )?;
     Ok(())
 }
 
@@ -9761,7 +9795,13 @@ fn typescript_type_specifier_local_collisions_close_the_entire_import_binding() 
             ),
         ],
     ] {
-        assert_no_exact_calls(&files)?;
+        let (path, caller) = files.last().expect("designated importer fixture");
+        let (marker, callee) = if caller.contains("local();") {
+            ("local();", "local")
+        } else {
+            ("target();", "target")
+        };
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
     }
     Ok(())
 }
@@ -9992,13 +10032,6 @@ fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Resul
             ),
         ],
         vec![
-            ("src/exported.cjs", "export function target() {}\n"),
-            (
-                "src/importer.cjs",
-                "import { target } from './exported.cjs';\nexport function caller() { target(); }\n",
-            ),
-        ],
-        vec![
             (
                 "src/a.ts",
                 "import { target } from './b';\nexport function helper() {}\nexport function caller() { target(); }\n",
@@ -10011,6 +10044,17 @@ fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Resul
     ] {
         assert_only_call_is_exact(&files)?;
     }
+
+    assert_no_exact_target_calls(&[
+        (
+            "src/exported.cjs",
+            "function target() {}\nmodule.exports = { target };\n",
+        ),
+        (
+            "src/importer.cjs",
+            "const { target } = require('./exported.cjs');\nfunction caller() { target(); }\n",
+        ),
+    ])?;
 
     for files in [
         vec![(
@@ -10854,6 +10898,788 @@ fn optional_typescript_parameters_are_not_receiver_authority() -> anyhow::Result
     )])
 }
 
+fn assert_script_ordinary_call_owner(
+    store: &Store,
+    file_id: FileId,
+    line: u32,
+    owner_name: &str,
+    target_name: &str,
+) -> anyhow::Result<CanonicalCallsiteIdentity> {
+    let nodes = store.get_nodes()?;
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(file_id.0))
+                && edge.line == Some(line)
+                && nodes.iter().any(|node| {
+                    node.id == edge.target && node.serialized_name.ends_with(target_name)
+                })
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("designated ordinary CALL must exist once: {calls:#?}");
+    };
+    let owner = nodes
+        .iter()
+        .find(|node| node.id == call.source)
+        .expect("raw source owner node");
+    assert!(
+        matches!(owner.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            && owner.serialized_name.ends_with(owner_name),
+        "wrong ordinary caller: {owner:#?}"
+    );
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary identity"),
+    )
+    .expect("canonical ordinary identity");
+    assert_eq!(identity.file_id, file_id);
+    assert_eq!(identity.line, line);
+    assert_eq!(
+        identity.raw_target, call.target,
+        "canonical raw occurrence must match its CALL target"
+    );
+    Ok(identity)
+}
+
+fn assert_script_imported_call_source_column(
+    store: &Store,
+    file_id: FileId,
+    line: u32,
+    owner_name: &str,
+    target_name: &str,
+) -> anyhow::Result<()> {
+    let identity =
+        assert_script_ordinary_call_owner(store, file_id, line, owner_name, target_name)?;
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.id == file_id.0)
+        .expect("independent source file");
+    let source = fs::read_to_string(file.path)?;
+    let source_line = source
+        .lines()
+        .nth(line as usize - 1)
+        .expect("designated call line");
+    let anchor = format!("{target_name}(");
+    let columns = source_line
+        .match_indices(&anchor)
+        .map(|(byte, _)| byte as u32 + 1)
+        .collect::<Vec<_>>();
+    let [column] = columns.as_slice() else {
+        panic!("fixture must independently designate one call column: {columns:?}");
+    };
+    assert_eq!(
+        identity.column_or_ordinal, *column,
+        "actual callee column survives artifact reuse"
+    );
+    Ok(())
+}
+
+fn assert_script_receiver_target(
+    files: &[(&str, &str)],
+    caller_path: &str,
+    call_line: u32,
+    target_path: &str,
+    expected: ProofResolutionStatus,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    let nodes = store.get_nodes()?;
+    let files = store.get_files()?;
+    let caller_file = files
+        .iter()
+        .find(|file| file.path.ends_with(caller_path))
+        .expect("independent caller file");
+    let target_file = files
+        .iter()
+        .find(|file| file.path.ends_with(target_path))
+        .expect("independent target file");
+    let owner = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(target_file.id))
+                && node.kind == NodeKind::CLASS
+                && node.start_line == Some(1)
+        })
+        .expect("independent C owner");
+    let target = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(target_file.id))
+                && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                && node.start_line == Some(2)
+                && node.serialized_name.ends_with("target")
+        })
+        .expect("independent C.target declaration");
+    let edges = store.get_edges()?;
+    assert!(edges.iter().any(|edge| edge.kind == EdgeKind::MEMBER
+        && edge.effective_source() == owner.id
+        && edge.effective_target() == target.id));
+    let calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(caller_file.id))
+                && edge.line == Some(call_line)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name.ends_with("target"))
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("actual target CALL census: {calls:#?}");
+    };
+    assert!(nodes.iter().any(|node| node.id == call.effective_source()
+        && node.serialized_name.ends_with("caller")
+        && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)));
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary identity"),
+    )
+    .expect("canonical ordinary identity");
+    assert_eq!(identity.file_id, FileId(caller_file.id));
+    assert_eq!(identity.line, call_line);
+    assert_eq!(identity.raw_target, call.target);
+    eprintln!(
+        "{caller_path}:{call_line} pre-proof resolved={:?} certainty={:?}",
+        call.resolved_target, call.certainty
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(caller_file.id)
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("nonempty designated fact required: {facts:#?}");
+    };
+    eprintln!(
+        "{caller_path}:{call_line} post-proof {:?} {:?}",
+        fact.status, fact.target
+    );
+    assert_eq!(fact.status, expected, "{fact:#?}");
+    if expected == ProofResolutionStatus::Exact {
+        assert_nominal_exact_target(&store, project.path(), fact, target_path, 2, Some(1))?;
+    } else {
+        assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
+        assert_eq!(
+            store
+                .get_edges()?
+                .into_iter()
+                .find(|edge| edge.id == call.id)
+                .as_ref(),
+            Some(*call),
+            "nonexact proof must not upgrade existing graph authority (ordinary endpoint F9)"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reflect_set_prototype_refuses_same_file_receiver_proof() -> anyhow::Result<()> {
+    assert_script_receiver_target(
+        &[(
+            "src/main.js",
+            concat!(
+                "export class C {\n  target() {}\n}\n",
+                "export function other() {}\n",
+                "Reflect.set(C.prototype, 'target', other);\n",
+                "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+            ),
+        )],
+        "src/main.js",
+        8,
+        "src/main.js",
+        ProofResolutionStatus::IncompleteDomain,
+    )
+}
+
+#[test]
+fn exporter_prototype_mutation_refuses_imported_receiver_proof() -> anyhow::Result<()> {
+    assert_script_receiver_target(
+        &[
+            (
+                "src/exported.js",
+                concat!(
+                    "export class C {\n  target() {}\n}\n",
+                    "C.prototype.target = function replacement() {};\n",
+                ),
+            ),
+            (
+                "src/importer.js",
+                "import { C } from './exported';\nexport function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+            ),
+        ],
+        "src/importer.js",
+        4,
+        "src/exported.js",
+        ProofResolutionStatus::IncompleteDomain,
+    )
+}
+
+#[test]
+fn script_reflection_mutation_spellings_and_scopes() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        let path = format!("src/main.{extension}");
+        for mutation in [
+            "Reflect.set(C.prototype, 'target', other);",
+            "(Reflect.set)(C.prototype, 'target', other);",
+            "( /*comment*/ Reflect.set)(C.prototype, 'target', other);",
+            "Reflect['se' + 't'](C.prototype, 'target', other);",
+            "Reflect.set(( /*comment*/ C.prototype), ( /*comment*/ 'target'), other);",
+            "Reflect.set(C.prototype, 'tar' + 'get', other);",
+            "Reflect.setPrototypeOf(C.prototype, {});",
+            "Reflect /*comment*/ . set(C.prototype, 'target', other);",
+            "Reflect['set'](C['prototype'], 'target', other);",
+            "Reflect.set(C.prototype, key, other);",
+            "Reflect[key](C.prototype, 'target', other);",
+            "Reflect.set(...[C.prototype, 'target', other]);",
+            "const Alias = C; Reflect.set(Alias.prototype, 'target', other);",
+            "Reflect.set(getPrototype(), 'target', other);",
+            "Object.defineProperty(C.prototype, 'target', { value: other });",
+            "Object['defineProperty'](C.prototype, 'target', { value: other });",
+            "Reflect.deleteProperty(C.prototype, 'target');",
+            "if (flag) { Reflect.set(C.prototype, 'target', other); }",
+            "for (const item of values) { Reflect.set(C.prototype, 'target', other); }",
+        ] {
+            eprintln!("{extension} mutation: {mutation}");
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\n{mutation}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::IncompleteDomain,
+            )?;
+        }
+        for read_only in [
+            "",
+            "Reflect.get(C.prototype, 'target');",
+            "Object.getOwnPropertyDescriptor(C.prototype, 'target');",
+            "Reflect.set(C.prototype, 'other', other);",
+            "class D {} Reflect.set(D.prototype, 'target', other);",
+        ] {
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\n{read_only}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::Exact,
+            )?;
+        }
+        let eager_this = "export class C {\n  target() {}\n  static { Reflect.set(this.prototype, 'target', other); }\n}\nexport function other() {}\nexport function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n";
+        assert_script_receiver_target(
+            &[(&path, eager_this)],
+            &path,
+            8,
+            &path,
+            ProofResolutionStatus::IncompleteDomain,
+        )?;
+        for mutation in [
+            "Reflect.set(receiver, 'target', other);",
+            "Reflect.set(receiver, key, other);",
+        ] {
+            let source = format!(
+                "export class C {{\n  target() {{}}\n}}\nexport function other() {{}}\nexport function caller(key) {{\n  const receiver = new C();\n  {mutation}\n  receiver.target();\n}}\n"
+            );
+            assert_script_receiver_target(
+                &[(&path, &source)],
+                &path,
+                8,
+                &path,
+                ProofResolutionStatus::IncompleteDomain,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn script_exported_prototype_poison_is_persisted_and_class_wide() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        for default in [false, true] {
+            let exporter_path = format!("src/exported.{extension}");
+            let importer_path = format!("src/importer.{extension}");
+            let declaration = if default {
+                "export default class C"
+            } else {
+                "export class C"
+            };
+            let import = if default {
+                "import C from './exported';"
+            } else {
+                "import { C } from './exported';"
+            };
+            for (mutation, expected) in [
+                (
+                    "C.prototype.target = function replacement() {};",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, 'target', other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, key, other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Reflect.set(C.prototype, 'other', other);",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                (
+                    "Object.defineProperty(C.prototype, 'target', { value: other });",
+                    ProofResolutionStatus::IncompleteDomain,
+                ),
+                ("", ProofResolutionStatus::Exact),
+                (
+                    "class D {} Reflect.set(D.prototype, 'target', other);",
+                    ProofResolutionStatus::Exact,
+                ),
+                (
+                    "Reflect.get(C.prototype, 'target');",
+                    ProofResolutionStatus::Exact,
+                ),
+            ] {
+                let exporter = format!(
+                    "{declaration} {{\n  target() {{}}\n}}\nfunction other() {{}}\n{mutation}\n"
+                );
+                let importer = format!(
+                    "{import}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+                );
+                assert_script_receiver_target(
+                    &[(&exporter_path, &exporter), (&importer_path, &importer)],
+                    &importer_path,
+                    4,
+                    &exporter_path,
+                    expected,
+                )?;
+                if extension != "js" {
+                    let typed = format!(
+                        "{import}\nexport function caller(receiver: C) {{\n  receiver.target();\n}}\n"
+                    );
+                    assert_script_receiver_target(
+                        &[(&exporter_path, &exporter), (&importer_path, &typed)],
+                        &importer_path,
+                        3,
+                        &exporter_path,
+                        expected,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        for default in [false, true] {
+            for mutation in [
+                "const Alias = C; Reflect.set(Alias.prototype, 'target', other);",
+                "Reflect.set(...[C.prototype, 'target', other]);",
+                "Reflect.set(getPrototype(), 'target', other);",
+                "Reflect[key](C.prototype, 'target', other);",
+                "Object.defineProperty(globalThis, 'unrelated', { value: 1 });",
+            ] {
+                let project = tempfile::tempdir()?;
+                let mut store = Store::new_in_memory()?;
+                let exporter_path = format!("src/exported.{extension}");
+                let class_importer_path = format!("src/class_importer.{extension}");
+                let callable_importer_path = format!("src/callable_importer.{extension}");
+                let declaration = if default {
+                    "export default class C"
+                } else {
+                    "export class C"
+                };
+                let class_import = if default {
+                    "import C from './exported';"
+                } else {
+                    "import { C } from './exported';"
+                };
+                let exporter = format!(
+                    "{declaration} {{\n  target() {{}}\n}}\nfunction other() {{}}\n{mutation}\nexport function lexicalTarget() {{}}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\nexport function lexicalCaller() {{\n  lexicalTarget();\n}}\n"
+                );
+                let class_importer = format!(
+                    "{class_import}\nexport function caller() {{\n  const receiver = new C();\n  receiver.target();\n}}\n"
+                );
+                index_files(
+                    project.path(),
+                    &mut store,
+                    &[
+                        (&exporter_path, &exporter),
+                        (&class_importer_path, &class_importer),
+                        (
+                            &callable_importer_path,
+                            "import { lexicalTarget } from './exported';\nexport function caller() {\n  lexicalTarget();\n}\n",
+                        ),
+                    ],
+                )?;
+                let files = store.get_files()?;
+                for (path, line, caller, target) in [
+                    (&exporter_path, 9, "caller", "target"),
+                    (&exporter_path, 12, "lexicalCaller", "lexicalTarget"),
+                    (&class_importer_path, 4, "caller", "target"),
+                    (&callable_importer_path, 3, "caller", "lexicalTarget"),
+                ] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent designated file");
+                    assert_script_ordinary_call_owner(
+                        &store,
+                        FileId(file.id),
+                        line,
+                        caller,
+                        target,
+                    )?;
+                }
+                let ordinary = store.get_edges()?;
+                rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+                store.validate_proof_resolution_publication(&publication(1))?;
+                let facts = store.get_proof_resolution_facts()?;
+                for (path, line) in [(&exporter_path, 9), (&class_importer_path, 4)] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent receiver file");
+                    let matching = facts
+                        .iter()
+                        .filter(|fact| {
+                            fact.callsite.file_id == FileId(file.id)
+                                && fact.callsite.line == line
+                                && fact.callsite.raw_target == "target"
+                        })
+                        .collect::<Vec<_>>();
+                    let [fact] = matching.as_slice() else {
+                        panic!("designated receiver fact must exist once: {matching:#?}");
+                    };
+                    assert_eq!(
+                        fact.status,
+                        ProofResolutionStatus::IncompleteDomain,
+                        "{extension}/{default}/{mutation}: {fact:#?}"
+                    );
+                    assert!(
+                        fact.target.is_none()
+                            && fact.edge_id.is_none()
+                            && fact.evidence_chain.is_empty()
+                    );
+                    let calls = ordinary
+                        .iter()
+                        .filter(|edge| {
+                            edge.kind == EdgeKind::CALL
+                                && edge.file_node_id == Some(NodeId(file.id))
+                                && edge
+                                    .callsite_identity
+                                    .as_deref()
+                                    .and_then(parse_canonical_callsite_identity)
+                                    .is_some_and(|identity| {
+                                        identity.file_id == FileId(file.id) && identity.line == line
+                                    })
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        calls.len(),
+                        1,
+                        "independent designated ordinary CALL census"
+                    );
+                    assert!(
+                        store.get_edges()?.iter().any(|edge| edge == calls[0]),
+                        "nonexact proof must not upgrade ordinary endpoint"
+                    );
+                }
+                for (path, line) in [(&exporter_path, 12), (&callable_importer_path, 3)] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent callable file");
+                    let matching = facts
+                        .iter()
+                        .filter(|fact| {
+                            fact.callsite.file_id == FileId(file.id)
+                                && fact.callsite.line == line
+                                && fact.callsite.raw_target == "lexicalTarget"
+                        })
+                        .collect::<Vec<_>>();
+                    let [fact] = matching.as_slice() else {
+                        panic!("designated lexical fact must exist once: {matching:#?}");
+                    };
+                    assert_script_ordinary_call_owner(
+                        &store,
+                        FileId(file.id),
+                        line,
+                        if path == &exporter_path {
+                            "lexicalCaller"
+                        } else {
+                            "caller"
+                        },
+                        "lexicalTarget",
+                    )?;
+                    assert_nominal_exact_target(
+                        &store,
+                        project.path(),
+                        fact,
+                        &exporter_path,
+                        6,
+                        None,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::Result<()> {
+    for (extension, old_version, current_version) in [
+        ("js", "reference-v15", "reference-v16"),
+        ("ts", "reference-v17", "reference-v18"),
+        ("tsx", "reference-v17", "reference-v18"),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let exporter_path = format!("src/exported.{extension}");
+        let importer_path = format!("src/importer.{extension}");
+        let paths = index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    &exporter_path,
+                    concat!(
+                        "export class C {\n  target() {}\n}\n",
+                        "function other() {}\n",
+                        "Reflect.set(C.prototype, 'target', other);\n",
+                        "export class Safe {\n  target() {}\n}\n",
+                    ),
+                ),
+                (
+                    &importer_path,
+                    concat!(
+                        "import { C, Safe } from './exported';\n",
+                        "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+                        "export function safeCaller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
+                    ),
+                ),
+            ],
+        )?;
+        let source_before = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+        let initial_importer = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(&importer_path))
+            .expect("independent original two-call importer");
+        assert_script_imported_call_source_column(
+            &store,
+            FileId(initial_importer.id),
+            4,
+            "caller",
+            "target",
+        )?;
+        assert_script_imported_call_source_column(
+            &store,
+            FileId(initial_importer.id),
+            8,
+            "safeCaller",
+            "target",
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let before = store.get_proof_resolution_facts()?;
+        let importer = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(&importer_path))
+            .expect("independent importer file");
+        let owner = store
+            .get_nodes()?
+            .into_iter()
+            .find(|node| node.kind == NodeKind::CLASS && node.start_line == Some(1))
+            .expect("independent original C declaration");
+        let hostile = before
+            .iter()
+            .find(|fact| {
+                fact.callsite.file_id == FileId(importer.id)
+                    && fact.callsite.line == 4
+                    && fact.callsite.raw_target == "target"
+            })
+            .expect("initial nonempty mutated-class fact");
+        assert_eq!(hostile.status, ProofResolutionStatus::IncompleteDomain);
+        assert!(
+            hostile.target.is_none()
+                && hostile.edge_id.is_none()
+                && hostile.evidence_chain.is_empty()
+        );
+        let safe = before
+            .iter()
+            .find(|fact| {
+                fact.callsite.file_id == FileId(importer.id)
+                    && fact.callsite.line == 8
+                    && fact.callsite.raw_target == "target"
+            })
+            .expect("independent clean exported class fact");
+        assert_nominal_exact_target(&store, project.path(), safe, &exporter_path, 7, Some(6))?;
+
+        let entries = store
+            .get_connection()
+            .prepare(
+                "SELECT file_path, artifact_blob FROM index_artifact_cache ORDER BY file_path",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 2);
+        for (file_path, blob) in entries {
+            let mut artifact = decode_index_artifact_json(&blob)?;
+            assert_eq!(
+                artifact["resolution_file"]["adapter_version"],
+                current_version
+            );
+            if file_path.ends_with(&exporter_path) {
+                assert_eq!(
+                    artifact["resolution_file"]["poisoned_export_names"],
+                    serde_json::json!(["C"])
+                );
+                // Simulate the causally demonstrated pre-F6 export payload on
+                // unchanged bytes; this is not output claimed from an old binary.
+                artifact["resolution_file"]["poisoned_export_names"] = serde_json::json!([]);
+                artifact["resolution_file"]["direct_exports"]
+                    .as_array_mut()
+                    .expect("cached exports")
+                    .push(serde_json::json!({
+                        "exported_name": "C", "declaration": owner.id.0,
+                        "is_default": false, "declaration_kind": "class",
+                    }));
+            }
+            artifact["resolution_file"]["adapter_version"] = old_version.into();
+            for call in artifact["call_resolution_inputs"]
+                .as_array_mut()
+                .expect("cached calls")
+            {
+                call["adapter_version"] = old_version.into();
+            }
+            store.get_connection().execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path = ?2",
+                rusqlite::params![serde_json::to_vec(&artifact)?, file_path],
+            )?;
+        }
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("old script mutation semantics must reject stored replay");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_proof_resolution_facts()?,
+            before,
+            "old-cache rejection preserves prior proof"
+        );
+        assert_eq!(
+            store
+                .get_proof_resolution_publication()?
+                .expect("prior receipt")
+                .core_generation_id,
+            publication(1).generation_id
+        );
+        for (generation, expected_hits) in [(2, 0), (3, 2)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "{extension} generation{generation}"
+            );
+            assert_eq!(
+                paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?,
+                source_before
+            );
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            assert_script_imported_call_source_column(
+                &store,
+                FileId(importer.id),
+                4,
+                "caller",
+                "target",
+            )?;
+            assert_script_imported_call_source_column(
+                &store,
+                FileId(importer.id),
+                8,
+                "safeCaller",
+                "target",
+            )?;
+            let facts = store.get_proof_resolution_facts()?;
+            let hostile = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.file_id == FileId(importer.id)
+                        && fact.callsite.line == 4
+                        && fact.callsite.raw_target == "target"
+                })
+                .expect("reparsed/reused nonempty mutated-class fact");
+            assert_eq!(hostile.status, ProofResolutionStatus::IncompleteDomain);
+            assert!(
+                hostile.target.is_none()
+                    && hostile.edge_id.is_none()
+                    && hostile.evidence_chain.is_empty()
+            );
+            assert_eq!(hostile.provenance.language_adapter_version, current_version);
+            let safe = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.file_id == FileId(importer.id)
+                        && fact.callsite.line == 8
+                        && fact.callsite.raw_target == "target"
+                })
+                .expect("clean exported class retained after reparse/reuse");
+            assert_nominal_exact_target(&store, project.path(), safe, &exporter_path, 7, Some(6))?;
+            let blob = store.get_connection().query_row(
+                "SELECT artifact_blob FROM index_artifact_cache WHERE file_path LIKE ?1",
+                [format!("%{exporter_path}")],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let artifact = decode_index_artifact_json(&blob)?;
+            assert_eq!(
+                artifact["resolution_file"]["adapter_version"],
+                current_version
+            );
+            assert_eq!(
+                artifact["resolution_file"]["poisoned_export_names"],
+                serde_json::json!(["C"])
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn receiver_class_and_mutation_domains_fail_closed() -> anyhow::Result<()> {
     for (path, source) in [
@@ -11576,12 +12402,107 @@ fn assert_call_named_is_exact(files: &[(&str, &str)], raw_target: &str) -> anyho
     Ok(())
 }
 
+fn assert_script_call_anchor(
+    store: &Store,
+    files: &[(&str, &str)],
+    facts: &[codestory_contracts::proof_resolution::CallResolutionFact],
+    path: &str,
+    marker: &str,
+    callee: &str,
+) -> anyhow::Result<()> {
+    let source = files
+        .iter()
+        .find(|(file, _)| *file == path)
+        .expect("fixture source")
+        .1;
+    let markers = source.match_indices(marker).collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "designated marker must be unique: {path}/{marker}"
+    );
+    let callee_offsets = marker.match_indices(callee).collect::<Vec<_>>();
+    assert_eq!(
+        callee_offsets.len(),
+        1,
+        "callee within marker must be unique"
+    );
+    let start = markers[0].0 + callee_offsets[0].0;
+    assert_script_call_at_byte(store, facts, path, source, start, callee)
+}
+
+fn assert_script_call_at_byte(
+    store: &Store,
+    facts: &[codestory_contracts::proof_resolution::CallResolutionFact],
+    path: &str,
+    source: &str,
+    start: usize,
+    raw_target: &str,
+) -> anyhow::Result<()> {
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with(path))
+        .expect("independent designated file identity");
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+    let column = (start - prefix.rfind('\n').map_or(0, |newline| newline + 1)) as u32 + 1;
+    let matching = facts
+        .iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(file.id)
+                && fact.callsite.line == line
+                && fact.callsite.column == column
+        })
+        .collect::<Vec<_>>();
+    let [fact] = matching.as_slice() else {
+        panic!("designated {path}:{line}:{column} fact must exist once: {facts:#?}");
+    };
+    assert_eq!(
+        fact.callsite.raw_target, raw_target,
+        "{path}:{line}:{column}"
+    );
+    assert!(
+        fact.status != ProofResolutionStatus::Exact
+            && fact.target.is_none()
+            && fact.edge_id.is_none()
+            && fact.evidence_chain.is_empty(),
+        "designated {path}:{line}:{column} acquired authority: {fact:#?}"
+    );
+    Ok(())
+}
+
+fn is_script_fixture(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+    )
+}
+
 fn assert_no_exact_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    assert_no_exact_calls_at(files, &[])
+}
+
+fn assert_no_exact_calls_at(
+    files: &[(&str, &str)],
+    anchors: &[(&str, &str, &str)],
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    if files.iter().any(|(path, _)| is_script_fixture(path)) {
+        assert!(
+            !anchors.is_empty(),
+            "script negatives require designated call anchors"
+        );
+    }
+    for (path, marker, callee) in anchors {
+        assert_script_call_anchor(&store, files, &facts, path, marker, callee)?;
+    }
     assert!(
         facts
             .iter()
@@ -11597,11 +12518,41 @@ fn assert_no_exact_target_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    let target_facts = facts
+        .iter()
+        .filter(|fact| fact.callsite.raw_target.trim_start_matches('#') == "target")
+        .collect::<Vec<_>>();
+    if files.iter().any(|(path, _)| is_script_fixture(path)) {
+        let mut anchors = 0;
+        // These fixtures designate contiguous target(); invocations. Derive
+        // every occurrence from the fixture bytes, never from emitted facts.
+        for (path, source) in files.iter().filter(|(path, _)| is_script_fixture(path)) {
+            for (start, _) in source.match_indices("target();") {
+                let private = source[..start].ends_with('#');
+                assert_script_call_at_byte(
+                    &store,
+                    &facts,
+                    path,
+                    source,
+                    if private { start - 1 } else { start },
+                    if private { "#target" } else { "target" },
+                )?;
+                anchors += 1;
+            }
+        }
+        assert!(
+            anchors > 0,
+            "script target negatives require fixture invocation markers"
+        );
+    }
     assert!(
-        facts.iter().all(|fact| {
-            fact.callsite.raw_target != "target" || fact.status != ProofResolutionStatus::Exact
-        }),
-        "{files:?}: {facts:#?}"
+        target_facts
+            .iter()
+            .all(|fact| fact.status != ProofResolutionStatus::Exact
+                && fact.target.is_none()
+                && fact.edge_id.is_none()
+                && fact.evidence_chain.is_empty()),
+        "{files:?}: {target_facts:#?}"
     );
     Ok(())
 }
@@ -11674,98 +12625,178 @@ fn rust_fact_after_forcing_call_target(
 
 #[test]
 fn javascript_typescript_unsupported_matrix_never_authorizes() -> anyhow::Result<()> {
-    for (path, source) in [
+    for (path, source, marker, callee) in [
         (
             "src/script.js",
             "function target() {}\nfunction caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/commonjs.cjs",
             "const target = require('./target');\nfunction caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/function_expression.js",
             "export const target = function () {};\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/alias.js",
             "const actual = () => {};\nexport const target = actual;\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/object.js",
             "const object = { target() {} };\nexport function caller() { object.target(); }\n",
+            "object.target()",
+            "target",
         ),
         (
             "src/optional.js",
             "export class C { target() {} }\nexport function caller() { const receiver = new C(); receiver?.target(); }\n",
+            "receiver?.target()",
+            "target",
         ),
         (
             "src/computed.js",
             "export class C { target() {} }\nexport function caller() { const receiver = new C(); receiver['target'](); }\n",
+            "receiver['target']()",
+            "'target'",
         ),
         (
             "src/optional_identifier.js",
             "export function target() {}\nexport function caller() { target?.(); }\n",
+            "target?.()",
+            "target",
         ),
         (
             "src/tagged.js",
             "export function target() {}\nexport function caller() { target`value`; }\n",
+            "target`value`",
+            "target",
         ),
         (
             "src/call.js",
             "export function target() {}\nexport function caller() { target.call(null); }\n",
+            "target.call(null)",
+            "call",
         ),
         (
             "src/bind.js",
             "export function target() {}\nexport function caller() { target.bind(null)(); }\n",
+            "target.bind(null)",
+            "bind",
         ),
         (
             "src/dynamic_import.js",
             "export async function caller() { const target = await import('./target.js'); target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/type_only.ts",
             "import type { target } from './target';\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/namespace.ts",
             "import * as ns from './target';\nexport function caller() { ns.target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/package.ts",
             "import { target } from 'package';\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/nested.ts",
             "export function target() {}\nexport function outer() { function caller() { target(); } caller(); }\n",
+            "function caller() { target(); }",
+            "target",
         ),
         (
             "src/parameter_initializer.ts",
             "export function target() {}\nexport function caller(value = target()) {}\n",
+            "value = target()",
+            "target",
         ),
         (
             "src/relevant_using.ts",
             "export function target() {}\nusing target = resource;\nexport function caller() { target(); }\n",
+            "target();",
+            "target",
         ),
         (
             "src/accessor.js",
             "export function target() {}\nexport class C { get value() { target(); return 1; } }\n",
+            "get value() { target();",
+            "target",
         ),
         (
             "src/field.js",
             "export function target() {}\nexport class C { value = target(); }\n",
+            "value = target()",
+            "target",
         ),
         (
             "src/static.js",
             "export function target() {}\nexport class C { static { target(); } }\n",
-        ),
-        (
-            "src/new.js",
-            "export class C {}\nexport function caller() { new C(); }\n",
+            "static { target();",
+            "target",
         ),
     ] {
-        assert_no_exact_calls(&[(path, source)])?;
+        assert_no_exact_calls_at(&[(path, source)], &[(path, marker, callee)])?;
     }
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/new.js",
+            "export class C {}\nexport function caller() { new C(); }\n",
+        )],
+    )?;
+    let nodes = store.get_nodes()?;
+    let owner = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::CLASS)
+        .expect("constructor declaration");
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(2)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name == "C")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "ordinary constructor CALL must exist");
+    assert_eq!(owner.serialized_name, "C");
+    let identity = parse_canonical_callsite_identity(
+        calls[0]
+            .callsite_identity
+            .as_deref()
+            .expect("ordinary constructor identity"),
+    )
+    .expect("canonical constructor CALL identity");
+    assert_eq!(identity.line, 2);
+    assert_eq!(identity.raw_target, calls[0].target);
+    // JavascriptResolutionIndex::build deliberately collects call_expression,
+    // not new_expression. Assert that narrower exclusion without a vacuous all().
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    assert!(store.get_proof_resolution_facts()?.is_empty());
+    assert!(store.get_edges()?.iter().any(|edge| edge == &calls[0]));
     Ok(())
 }
 
