@@ -1,7 +1,7 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeId, EdgeKind};
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
-    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
+    CallResolutionFact, FileId, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
 };
 use codestory_indexer::{
     WorkspaceIndexer, bash_resolution_work, rematerialize_proof_resolution_projection,
@@ -70,6 +70,282 @@ fn index_files(
         None,
     )?;
     Ok(paths)
+}
+
+const DYNAMIC_EXECUTABLE_SOURCE: &str =
+    "target() { :; }\ncaller() {\n  op=unset\n  \"$op\" -f target\n  target\n}\n";
+
+fn assert_later_target_fact(
+    store: &Store,
+    root: &Path,
+    source: &str,
+    expected: ProofResolutionStatus,
+) -> anyhow::Result<CallResolutionFact> {
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == root.join("proof.sh"))
+        .expect("independently identify fixture file");
+    let start = source
+        .find("  target\n")
+        .expect("unique designated later call")
+        + 2;
+    assert_eq!(source.matches("  target\n").count(), 1);
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+    let column = (start - prefix.rfind('\n').map_or(0, |offset| offset + 1)) as u32 + 1;
+    let nodes = store.get_nodes()?;
+    let declaration = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION
+                && node.file_node_id == Some(NodeId(file.id))
+                && node.start_line == Some(1)
+        })
+        .expect("independent target declaration");
+    let caller = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION
+                && node.file_node_id == Some(NodeId(file.id))
+                && node.start_line == Some(2)
+        })
+        .expect("independent caller declaration");
+    let edges = store.get_edges()?;
+    let calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(file.id))
+                && edge.line == Some(line)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "real designated later ordinary CALL: {calls:#?}"
+    );
+    assert_eq!(calls[0].effective_source(), caller.id);
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(file.id)
+                && fact.callsite.start_byte == start as u64
+                && fact.callsite.end_byte_exclusive == start as u64 + 6
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.len(),
+        1,
+        "designated later fact must exist: {facts:#?}"
+    );
+    let fact = &facts[0];
+    assert_eq!((fact.callsite.line, fact.callsite.column), (line, column));
+    assert_eq!(fact.callsite.raw_target, "target");
+    assert_eq!(fact.caller, caller.id);
+    if fact.status == ProofResolutionStatus::Exact {
+        assert_eq!(fact.target, Some(declaration.id));
+        assert_eq!(fact.edge_id, Some(calls[0].id));
+        assert_eq!(calls[0].effective_target(), declaration.id);
+        assert_eq!(
+            store.get_exact_proof_resolution_fact_by_edge(calls[0].id)?,
+            Some(fact.clone())
+        );
+    }
+    assert_eq!(
+        fact.status, expected,
+        "later call after command effect: {fact:#?}"
+    );
+    if expected != ProofResolutionStatus::Exact {
+        assert!(
+            fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty(),
+            "later call retained authority: {fact:#?}"
+        );
+        assert!(fact.raw_edge_target.is_none() && fact.raw_callsite_identity.is_none());
+        assert!(!fact.lookup_domain_complete);
+    }
+    Ok(fact.clone())
+}
+
+#[test]
+fn bash_nonliteral_executable_effect_revokes_later_literal_call() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[("proof.sh", DYNAMIC_EXECUTABLE_SOURCE)],
+    )?;
+    let before = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(5))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before.len(),
+        1,
+        "baseline requires actual later ordinary CALL"
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_later_target_fact(
+        &store,
+        project.path(),
+        DYNAMIC_EXECUTABLE_SOURCE,
+        ProofResolutionStatus::Unsupported,
+    )?;
+    Ok(())
+}
+
+fn assert_bash_source_later_status(
+    source: &str,
+    expected: ProofResolutionStatus,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[("proof.sh", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_later_target_fact(&store, project.path(), source, expected)?;
+    Ok(())
+}
+
+#[test]
+fn bash_unset_default_function_fallback_revokes_later_literal_call() -> anyhow::Result<()> {
+    assert_bash_source_later_status(
+        "target() { :; }\ncaller() {\n  unset target\n  target\n}\n",
+        ProofResolutionStatus::IncompleteDomain,
+    )
+}
+
+#[test]
+fn bash_unset_dynamic_option_revokes_later_literal_call() -> anyhow::Result<()> {
+    assert_bash_source_later_status(
+        "target() { :; }\ncaller() {\n  opt=-f\n  unset \"$opt\" target\n  target\n}\n",
+        ProofResolutionStatus::Unsupported,
+    )
+}
+
+#[test]
+fn bash_executable_effect_matrix_preserves_argument_and_literal_controls() -> anyhow::Result<()> {
+    let unknown_executables = [
+        r#"op=unset; $op -f target"#,
+        r#"op=unset; ${op} -f target"#,
+        r#"op=unset; "${op}" -f target"#,
+        r#"${op:-unset} -f target"#,
+        r#"$(printf unset) -f target"#,
+        r#""$(printf unset)" -f target"#,
+        r#"`printf unset` -f target"#,
+        r#""unset" -f target"#,
+        r#"'unset' -f target"#,
+        r#"un"set" -f target"#,
+        r#"un\set -f target"#,
+        r#"bu\iltin unset -f target"#,
+        r#"builtin un\set -f target"#,
+        r#"un* -f target"#,
+        r#"{unset,eval} -f target"#,
+        r#"op=unset; if test -n "$FLAG"; then "$op" -f target; fi"#,
+        r#"op=unset; for value in one; do "$op" -f target; done"#,
+    ];
+    for command in unknown_executables {
+        let source = format!("target() {{ :; }}\ncaller() {{\n  {command}\n  target\n}}\n");
+        assert_bash_source_later_status(&source, ProofResolutionStatus::Unsupported)?;
+    }
+    for command in [
+        ":",
+        r#"op=unset; printf '%s' "$op""#,
+        r#"printf '%s' "$(printf unset)""#,
+        r#"printf '%s' un\set"#,
+        "unset -v target",
+        "unset unrelated",
+        "unset -f unrelated",
+        "unset",
+        "unset --",
+        r#"if [ -n "$FLAG" ]; then :; fi"#,
+    ] {
+        let source = format!("target() {{ :; }}\ncaller() {{\n  {command}\n  target\n}}\n");
+        assert_bash_source_later_status(&source, ProofResolutionStatus::Exact)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn bash_previous_effect_adapter_refuses_then_reparses_and_reuses() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let paths = index_files(
+        project.path(),
+        &mut store,
+        &[("proof.sh", DYNAMIC_EXECUTABLE_SOURCE)],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_later_target_fact(
+        &store,
+        project.path(),
+        DYNAMIC_EXECUTABLE_SOURCE,
+        ProofResolutionStatus::Unsupported,
+    )?;
+    let before = store.get_proof_resolution_facts()?;
+    let blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact = decode_index_artifact_json(&blob)?;
+    // Simulated prior identity on current syntax payload, not an old binary
+    // payload claim. The baseline separately established the prior false Exact.
+    artifact["resolution_file"]["adapter_version"] = "reference-v1".into();
+    for call in artifact["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("cached calls")
+    {
+        call["adapter_version"] = "reference-v1".into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("prior effect policy must not remain eligible");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    assert_eq!(
+        store.get_proof_resolution_facts()?,
+        before,
+        "rejected cache leaves the prior complete projection intact"
+    );
+    for (generation, expected_hits) in [(2, 0), (3, 1)] {
+        let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+            &mut store,
+            &RefreshInfo {
+                mode: BuildMode::Incremental,
+                files_to_index: paths.clone(),
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(
+            result.artifact_cache_hits, expected_hits,
+            "actual unchanged-source reparse/reuse"
+        );
+        assert_eq!(fs::read(&paths[0])?, DYNAMIC_EXECUTABLE_SOURCE.as_bytes());
+        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+        store.validate_proof_resolution_publication(&publication(generation))?;
+        let fact = assert_later_target_fact(
+            &store,
+            project.path(),
+            DYNAMIC_EXECUTABLE_SOURCE,
+            ProofResolutionStatus::Unsupported,
+        )?;
+        assert_eq!(fact.provenance.language_adapter_version, "reference-v2");
+    }
+    Ok(())
 }
 
 #[test]
