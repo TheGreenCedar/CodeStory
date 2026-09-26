@@ -6,7 +6,7 @@ use std::{fs, io};
 use codestory_retrieval::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock, global_generation_gc_state_file,
 };
-use codestory_store::{CORE_DATABASE_FILE, CORE_LEASE_FILE, StorageError};
+use codestory_store::{CORE_DATABASE_FILE, CORE_LEASE_FILE, CoreResetExclusion, StorageError};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 
 use crate::{
@@ -14,6 +14,32 @@ use crate::{
     RollbackActivationError, RollbackActivationOutcome, RuntimeRetrievalConfig, SidecarGcReport,
     SidecarInventoryReport,
 };
+
+/// Held through reset planning and quarantine, with core exclusions released
+/// before the outer retrieval fence. Acquiring this never opens core SQLite.
+pub struct DerivedCacheResetExclusion {
+    _core: CoreResetExclusion,
+    _global: GenerationRetentionLock,
+}
+
+pub fn acquire_derived_cache_reset_exclusion(
+    storage_path: &Path,
+    runtime: &RuntimeRetrievalConfig,
+) -> anyhow::Result<DerivedCacheResetExclusion> {
+    let runtime = runtime.as_inner();
+    let global = GenerationRetentionLock::try_acquire(
+        &global_generation_gc_state_file(runtime),
+        GLOBAL_GENERATION_GC_LOCK_SCOPE,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("Retrieval reader or publisher is active; retry derived reset when idle")
+    })?;
+    let core = CoreResetExclusion::acquire(storage_path)?;
+    Ok(DerivedCacheResetExclusion {
+        _core: core,
+        _global: global,
+    })
+}
 
 impl ActivationService {
     /// Observe the retained rollback pointer without validating or mutating it.

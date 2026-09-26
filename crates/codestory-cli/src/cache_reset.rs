@@ -23,22 +23,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline};
 use codestory_contracts::owned_artifacts;
+use codestory_runtime::{RuntimeRetrievalConfig, acquire_derived_cache_reset_exclusion};
 
 use crate::args::{CacheResetCommand, CacheResetOutput};
 use crate::output::emit;
 use crate::runtime::RuntimeContext;
-
-/// Wait budget for each writer exclusion the reset holds.
-///
-/// A legitimate holder is a whole indexing, publication, or promotion pass, so
-/// this matches the publication budget every other waiter behind such a pass
-/// uses.
-const RESET_LOCK_WAIT: Duration = bounded_locks::PUBLICATION_LOCK_WAIT;
 
 pub(crate) fn run_cache_reset(cmd: CacheResetCommand) -> Result<()> {
     crate::ensure_dot_only_for_trail(cmd.format, "cache reset")?;
@@ -52,7 +44,12 @@ pub(crate) fn run_cache_reset(cmd: CacheResetCommand) -> Result<()> {
         bail!("`cache reset` only supports --derived-only.");
     }
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let output = plan_and_maybe_apply(&runtime.project_root, &runtime.storage_path, cmd.confirm)?;
+    let output = plan_and_maybe_apply(
+        &runtime.project_root,
+        &runtime.storage_path,
+        &runtime.sidecar,
+        cmd.confirm,
+    )?;
     let markdown = render_cache_reset_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -60,10 +57,11 @@ pub(crate) fn run_cache_reset(cmd: CacheResetCommand) -> Result<()> {
 fn plan_and_maybe_apply(
     project_root: &Path,
     storage_path: &Path,
+    runtime: &RuntimeRetrievalConfig,
     apply: bool,
 ) -> Result<CacheResetOutput> {
     let project = crate::display::clean_path_string(&project_root.to_string_lossy());
-    let plan = derived_reset_plan(storage_path);
+    let plan = derived_reset_plan(storage_path)?;
     let quarantine_dir =
         owned_artifacts::derived_reset_quarantine_root(storage_path).join(quarantine_slot_name());
     let preserved = present_annotation_identities(storage_path);
@@ -86,7 +84,7 @@ fn plan_and_maybe_apply(
     if !apply {
         return Ok(output);
     }
-    let moved = apply_derived_reset(storage_path, &plan, &quarantine_dir)?;
+    let moved = apply_derived_reset(storage_path, runtime, &quarantine_dir)?;
     output.applied = true;
     output.quarantined = moved
         .iter()
@@ -102,19 +100,43 @@ fn plan_and_maybe_apply(
 }
 
 /// Derived identities that currently exist, in a stable order.
-fn derived_reset_plan(storage_path: &Path) -> Vec<PathBuf> {
-    let mut plan: Vec<PathBuf> = owned_artifacts::derived_reset_file_identities(storage_path)
-        .into_iter()
-        .filter(|path| path.is_file() || path.is_symlink())
-        .collect();
-    plan.extend(
-        owned_artifacts::derived_reset_directory_identities(storage_path)
-            .into_iter()
-            .filter(|path| path.is_dir()),
-    );
+fn derived_reset_plan(storage_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut plan = Vec::new();
+    for (paths, directory) in [
+        (
+            owned_artifacts::derived_reset_file_identities(storage_path),
+            false,
+        ),
+        (
+            owned_artifacts::derived_reset_directory_identities(storage_path),
+            true,
+        ),
+    ] {
+        for path in paths {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect derived reset artifact {}", path.display())
+                    });
+                }
+            };
+            let kind = metadata.file_type();
+            if (directory && !kind.is_dir())
+                || (!directory && !kind.is_file() && !kind.is_symlink())
+            {
+                bail!(
+                    "Derived reset artifact has an unexpected type: {}",
+                    path.display()
+                );
+            }
+            plan.push(path);
+        }
+    }
     plan.sort();
     plan.dedup();
-    plan
+    Ok(plan)
 }
 
 fn present_annotation_identities(storage_path: &Path) -> Vec<PathBuf> {
@@ -129,64 +151,15 @@ fn present_annotation_identities(storage_path: &Path) -> Vec<PathBuf> {
 
 fn apply_derived_reset(
     storage_path: &Path,
-    plan: &[PathBuf],
+    runtime: &RuntimeRetrievalConfig,
     quarantine_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     let cache_root = storage_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache root {}", cache_root.display()))?;
-    let _exclusion = ResetExclusion::acquire(storage_path)?;
-    move_plan_into_quarantine(storage_path, plan, quarantine_dir)
-}
-
-/// Every writer exclusion the reset holds for the whole move.
-///
-/// The promotion lock alone is not enough: a publisher holds it only for the
-/// publish critical section, so an indexing run that is between publishes owns
-/// none of it while it keeps writing the cache this reset is moving. The
-/// index-writer lock is the one a run holds end to end, so the reset takes
-/// both, outermost first, in the order an indexing run takes them.
-struct ResetExclusion {
-    held: Vec<fs::File>,
-}
-
-impl ResetExclusion {
-    fn acquire(storage_path: &Path) -> Result<Self> {
-        let mut exclusion = Self { held: Vec::new() };
-        for lock_path in owned_artifacts::derived_reset_held_lock_paths(storage_path) {
-            let lock_file = fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .with_context(|| format!("open cache lock {}", lock_path.display()))?;
-            bounded_locks::acquire_with_deadline(
-                &lock_file,
-                FileLockKind::Exclusive,
-                LockDeadline::after(RESET_LOCK_WAIT),
-                None,
-            )
-            .with_context(|| {
-                format!(
-                    "acquire {} exclusively for the derived cache reset",
-                    lock_path.display()
-                )
-            })?;
-            // Push after the acquisition so a refusal releases only what this
-            // reset actually took.
-            exclusion.held.push(lock_file);
-        }
-        Ok(exclusion)
-    }
-}
-
-impl Drop for ResetExclusion {
-    fn drop(&mut self) {
-        for lock_file in self.held.iter().rev() {
-            let _ = bounded_locks::release(lock_file);
-        }
-    }
+    let _exclusion = acquire_derived_cache_reset_exclusion(storage_path, runtime)?;
+    let plan = derived_reset_plan(storage_path)?;
+    move_plan_into_quarantine(storage_path, &plan, quarantine_dir)
 }
 
 fn move_plan_into_quarantine(
@@ -202,6 +175,10 @@ fn move_plan_into_quarantine(
             continue;
         }
         let destination = quarantine_dir.join(display_name(storage_path, source));
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create quarantine parent {}", parent.display()))?;
+        }
         fs::rename(source, &destination).with_context(|| {
             format!(
                 "quarantine {} into {}",
@@ -283,7 +260,13 @@ fn render_cache_reset_markdown(output: &CacheResetOutput) -> String {
 mod tests {
     use super::*;
     use crate::args::{OutputFormat, ProjectArgs};
+    use codestory_contracts::bounded_locks::{self, FileLockKind};
+    use codestory_runtime::{
+        RetrievalProcessDefaults, RetrievalRuntimeDefaults, RetrievalRuntimeOverrides,
+        RuntimeRetrievalProfile,
+    };
     use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct CacheFixture {
@@ -299,6 +282,21 @@ mod tests {
         /// edit cannot move the expectation along with the behaviour.
         index_writer_lock: PathBuf,
         promotion_lock: PathBuf,
+    }
+
+    impl CacheFixture {
+        fn runtime_config(&self) -> RuntimeRetrievalConfig {
+            RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
+                Some(&self.project_root),
+                RuntimeRetrievalProfile::Local,
+                None,
+                &RetrievalProcessDefaults::new(
+                    self._root.path().join("runtime"),
+                    RetrievalRuntimeDefaults::default(),
+                ),
+                &RetrievalRuntimeOverrides::default(),
+            )
+        }
     }
 
     /// A cache root holding derived core state plus a user annotation sidecar.
@@ -519,8 +517,13 @@ mod tests {
     fn confirmed_reset_quarantines_derived_state_and_preserves_annotations() {
         let fixture = seed_cache();
 
-        let output = plan_and_maybe_apply(&fixture.project_root, &fixture.storage_path, true)
-            .expect("reset");
+        let output = plan_and_maybe_apply(
+            &fixture.project_root,
+            &fixture.storage_path,
+            &fixture.runtime_config(),
+            true,
+        )
+        .expect("reset");
 
         assert!(output.applied);
         assert!(
@@ -585,8 +588,13 @@ mod tests {
     fn dry_run_reports_the_plan_without_moving_anything() {
         let fixture = seed_cache();
 
-        let output = plan_and_maybe_apply(&fixture.project_root, &fixture.storage_path, false)
-            .expect("plan");
+        let output = plan_and_maybe_apply(
+            &fixture.project_root,
+            &fixture.storage_path,
+            &fixture.runtime_config(),
+            false,
+        )
+        .expect("plan");
 
         assert!(!output.applied);
         assert!(
@@ -613,6 +621,40 @@ mod tests {
     }
 
     #[test]
+    fn application_replans_immutable_state_under_the_exclusion() {
+        let fixture = seed_cache();
+        let planned = derived_reset_plan(&fixture.storage_path).expect("initial plan");
+        let core = fixture.cache_root.join("core");
+        fs::create_dir_all(core.join("generations/late-generation")).unwrap();
+        fs::write(core.join("acquisition.lock"), b"").unwrap();
+        fs::write(core.join("publication.json"), b"late pointer state").unwrap();
+        fs::write(
+            core.join("generations/late-generation/.codestory-core-lease.lock"),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            core.join("generations/late-generation/codestory.db"),
+            b"late core bytes",
+        )
+        .unwrap();
+        assert!(!planned.contains(&core.join("publication.json")));
+        let quarantine = fixture.cache_root.join("derived-reset-quarantine/late");
+        let moved = apply_derived_reset(
+            &fixture.storage_path,
+            &fixture.runtime_config(),
+            &quarantine,
+        )
+        .expect("locked application must refresh the plan");
+        assert!(moved.contains(&core.join("publication.json")));
+        assert_eq!(
+            fs::read(quarantine.join("core/generations/late-generation/codestory.db")).unwrap(),
+            b"late core bytes"
+        );
+        assert!(core.join("acquisition.lock").is_file());
+    }
+
+    #[test]
     fn reset_does_not_open_or_migrate_the_core_database() {
         // A schema-too-new database is the exact case this command exists for,
         // so it must be reachable without a store open. Bytes that no SQLite
@@ -621,8 +663,13 @@ mod tests {
         fs::write(&fixture.storage_path, b"not a sqlite database at all")
             .expect("write unopenable core database");
 
-        let output = plan_and_maybe_apply(&fixture.project_root, &fixture.storage_path, true)
-            .expect("reset");
+        let output = plan_and_maybe_apply(
+            &fixture.project_root,
+            &fixture.storage_path,
+            &fixture.runtime_config(),
+            true,
+        )
+        .expect("reset");
 
         assert!(output.applied);
         assert_eq!(

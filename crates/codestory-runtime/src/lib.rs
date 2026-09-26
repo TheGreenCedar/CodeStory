@@ -349,6 +349,7 @@ pub use path_resolution::resolve_project_file_path_from_root;
 mod process_config;
 pub use process_config::RuntimeProcessConfig;
 mod activation_retrieval;
+pub use activation_retrieval::{DerivedCacheResetExclusion, acquire_derived_cache_reset_exclusion};
 mod query_language;
 mod repository_identity;
 mod retrieval_boundary;

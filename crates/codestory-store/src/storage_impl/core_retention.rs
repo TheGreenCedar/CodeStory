@@ -65,8 +65,8 @@ fn inject_enumeration_failure() -> Result<(), StorageError> {
     })
 }
 
-pub const CORE_LEASE_FILE: &str = ".codestory-core-lease.lock";
-const CORE_ACQUISITION_FILE: &str = "acquisition.lock";
+pub use codestory_contracts::owned_artifacts::CORE_LEASE_FILE;
+use codestory_contracts::owned_artifacts::{self, CORE_ACQUISITION_FILE};
 const MAX_RECLAIMS_PER_PASS: usize = 16;
 
 pub(crate) struct CoreGenerationLease(File);
@@ -82,6 +82,85 @@ struct CoreAcquisitionLock(File);
 impl Drop for CoreAcquisitionLock {
     fn drop(&mut self) {
         let _ = bounded_locks::release(&self.0);
+    }
+}
+
+/// Excludes writers and existing/new core readers without opening any database.
+/// The caller holds retrieval's global exclusive fence before acquiring this.
+/// Coordination paths remain in place throughout quarantine.
+pub struct CoreResetExclusion {
+    held: Vec<File>,
+}
+
+impl CoreResetExclusion {
+    pub fn acquire(logical_path: &Path) -> Result<Self, StorageError> {
+        let mut exclusion = Self { held: Vec::new() };
+        let layout = CorePublicationLayout::from_storage_path(logical_path)?;
+        let paths = owned_artifacts::derived_reset_held_lock_paths(logical_path);
+        // Same order as indexing/promotion, then retention's acquisition fence.
+        for path in &paths[..2] {
+            let file = open_regular_lock(path, true)?.expect("create returns a file");
+            acquire_with_deadline(
+                &file,
+                FileLockKind::Exclusive,
+                LockDeadline::after(PUBLICATION_LOCK_WAIT),
+                None,
+            )
+            .map_err(|error| retention_error("acquire derived reset writer exclusion", error))?;
+            exclusion.held.push(file);
+        }
+        match fs::symlink_metadata(layout.root()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(exclusion),
+            Err(error) => return Err(retention_error("inspect reset core root", error)),
+            Ok(_) => require_direct_directory(layout.root())?,
+        }
+        let acquisition = open_regular_lock(&paths[2], false)?.ok_or_else(|| {
+            StorageError::Other("Derived reset requires a provisioned core acquisition lock; restore a compatible cache or stop older clients before manual recovery".into())
+        })?;
+        if !bounded_locks::try_acquire(&acquisition, FileLockKind::Exclusive)
+            .map_err(|error| retention_error("exclude core acquisition for reset", error))?
+        {
+            return Err(StorageError::Other(
+                "Core reader acquisition is active; retry derived reset when readers are idle"
+                    .into(),
+            ));
+        }
+        exclusion.held.push(acquisition);
+        let generations = layout.generations_root();
+        match fs::symlink_metadata(&generations) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(exclusion),
+            Err(error) => return Err(retention_error("inspect reset generations", error)),
+            Ok(_) => require_direct_directory(&generations)?,
+        }
+        // Finish enumeration and take every named lease before any caller moves
+        // state. An unknown entry or absent old-format lease cannot prove idle.
+        for entry in fs::read_dir(&generations)
+            .map_err(|error| retention_error("enumerate reset generations", error))?
+        {
+            #[cfg(test)]
+            inject_enumeration_failure()?;
+            let entry = entry.map_err(|error| retention_error("read reset generation", error))?;
+            let name = entry.file_name();
+            let id = name.to_str().ok_or_else(|| {
+                StorageError::Other("Reset generation has no safe UTF-8 identity".into())
+            })?;
+            let database = layout.generation_database_path(id)?;
+            require_direct_directory(&entry.path())?;
+            match try_acquire_generation_exclusive(&database)? {
+                NamedLeaseTry::Held(file) => exclusion.held.push(file),
+                NamedLeaseTry::Contended => return Err(StorageError::Other("Core reader is active; retry derived reset when readers are idle".into())),
+                NamedLeaseTry::Unprovisioned => return Err(StorageError::Other("Derived reset refuses an unprovisioned core generation; restore a compatible cache or stop older clients before manual recovery".into())),
+            }
+        }
+        Ok(exclusion)
+    }
+}
+
+impl Drop for CoreResetExclusion {
+    fn drop(&mut self) {
+        for file in self.held.iter().rev() {
+            let _ = bounded_locks::release(file);
+        }
     }
 }
 
@@ -706,6 +785,65 @@ mod tests {
             .expect("pointer");
         assert!(pinned.lease.is_some());
         assert_eq!(pinned.pointer.active.generation_id, "owned-one");
+    }
+
+    #[test]
+    fn reset_exclusion_refuses_reader_acquisition_and_named_pins() {
+        let (_cache, logical, layout) = published_lock_fixture();
+        let during_acquisition = logical.clone();
+        set_after_pointer_before_lease(move || {
+            let error = CoreResetExclusion::acquire(&during_acquisition)
+                .err()
+                .expect("reset must refuse pointer-to-lease window");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Core reader acquisition is active")
+            );
+        });
+        let pinned = pin_active_core(&layout)
+            .expect("pin")
+            .expect("complete pointer");
+        let error = CoreResetExclusion::acquire(&logical)
+            .err()
+            .expect("live named reader");
+        assert!(error.to_string().contains("Core reader is active"));
+        assert_eq!(fs::read(&pinned.path).unwrap(), b"candidate");
+        drop(pinned);
+        let guard = CoreResetExclusion::acquire(&logical).expect("retry after reader release");
+        assert!(
+            acquire_acquisition(&layout, FileLockKind::Shared, true)
+                .unwrap()
+                .is_none()
+        );
+        drop(guard);
+        assert!(pin_active_core(&layout).unwrap().unwrap().lease.is_some());
+    }
+
+    #[test]
+    fn reset_exclusion_refuses_incomplete_or_unknown_enumeration() {
+        let (_cache, logical, layout) = published_lock_fixture();
+        let other = layout.generation_directory("owned-two").unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join(CORE_LEASE_FILE), b"").unwrap();
+        fs::write(other.join(CORE_DATABASE_FILE), b"other").unwrap();
+        let before = fs::read(layout.publication_path()).unwrap();
+        fail_enumeration_after(1);
+        assert!(
+            CoreResetExclusion::acquire(&logical)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("injected late")
+        );
+        assert_eq!(fs::read(layout.publication_path()).unwrap(), before);
+        let unknown = layout.generations_root().join("unknown-file");
+        fs::write(&unknown, b"not a generation directory").unwrap();
+        assert!(CoreResetExclusion::acquire(&logical).is_err());
+        assert_eq!(fs::read(layout.publication_path()).unwrap(), before);
+        fs::remove_file(unknown).unwrap();
+        drop(CoreResetExclusion::acquire(&logical).expect("complete enumeration retry"));
+        assert!(pin_active_core(&layout).unwrap().unwrap().lease.is_some());
     }
 
     #[test]
