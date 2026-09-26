@@ -1310,6 +1310,24 @@ pub(crate) fn run_packet_planned_subqueries(
             return Err(error);
         }
     };
+    if !packet_fused_retry_is_live() {
+        return Err(ApiError::new(
+            "cancelled",
+            "packet fused batch was cancelled before merging results",
+        ));
+    }
+    if !outcome.retained_deadline_queries.is_empty() {
+        let retained_hits = outcome
+            .results
+            .iter()
+            .filter(|(query, _)| outcome.retained_deadline_queries.contains(query))
+            .map(|(_, hits)| hits.len())
+            .sum::<usize>();
+        answer.retrieval_trace.annotations.push(RetrievalAnnotationDto::observation(format!(
+            "packet_fused_deadline_retry_omitted reason=sealed_descriptor count={} retained_hits={retained_hits}",
+            outcome.retained_deadline_queries.len(),
+        )));
+    }
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace

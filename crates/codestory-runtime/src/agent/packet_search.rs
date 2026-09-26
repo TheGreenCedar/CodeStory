@@ -16,6 +16,7 @@ const PACKET_TRANSIENT_RETRY_MIN_BUDGET_MS: u32 = 1_000;
 pub(crate) struct PacketFusedBatchOutcome {
     pub results: Vec<(String, Vec<PacketSearchHit>)>,
     pub retryable_queries: Vec<String>,
+    pub retained_deadline_queries: Vec<String>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
@@ -105,6 +106,7 @@ impl AppController {
             return Ok(PacketFusedBatchOutcome {
                 results: Vec::new(),
                 retryable_queries: Vec::new(),
+                retained_deadline_queries: Vec::new(),
                 sidecar_diagnostics: Vec::new(),
             });
         }
@@ -118,6 +120,7 @@ impl AppController {
                     return Ok(PacketFusedBatchOutcome {
                         results: outcome.results,
                         retryable_queries: outcome.retryable_queries,
+                        retained_deadline_queries: outcome.retained_deadline_queries,
                         sidecar_diagnostics: outcome.diagnostics,
                     });
                 }

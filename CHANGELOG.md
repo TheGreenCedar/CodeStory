@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Exact file-symbol lookups find the selected file’s declaration even when many other files contain the same name, while preserving ambiguity within that file.
+- Packets report query deadlines with the already resolved hits and an explicit notice when the admitted result cannot be retried.
 
 - `doctor` and plain `ready` now inspect missing or older caches without creating or upgrading them. They report when a full index is needed to make an older cache usable.
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
