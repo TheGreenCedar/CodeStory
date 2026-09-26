@@ -3555,6 +3555,339 @@ fn c_cpp_closed_direct_identifier_matrix() -> anyhow::Result<()> {
 }
 
 #[test]
+fn cpp_same_named_free_function_does_not_certify_constructor_receiver() -> anyhow::Result<()> {
+    for (name, source, call_line, member_line, exact) in [
+        (
+            "enclosing_class_static_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            6,
+            1,
+            false,
+        ),
+        (
+            "deeper_enclosing_class_late_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  struct Middle {\n",
+                "    struct Inner {\n",
+                "      void caller() { Worker().target(); }\n",
+                "    };\n",
+                "  };\n",
+                "  static Other Worker() { return {}; }\n",
+                "};\n",
+            ),
+            6,
+            1,
+            false,
+        ),
+        (
+            "sibling_type_does_not_hide_enclosing_factory",
+            concat!(
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Sibling {\n",
+                "    struct Worker { void target() {} };\n",
+                "  };\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            8,
+            5,
+            false,
+        ),
+        (
+            "nested_caller_constructor_control",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Holder {\n",
+                "  struct Inner {\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            4,
+            1,
+            true,
+        ),
+        (
+            "nested_type_declaration_remains_unsupported",
+            concat!(
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  struct Inner {\n",
+                "    struct Worker { void target() {} };\n",
+                "    void caller() { Worker().target(); }\n",
+                "  };\n",
+                "};\n",
+            ),
+            6,
+            5,
+            false,
+        ),
+        (
+            "injected_class_name_hides_namespace_factory_control",
+            concat!(
+                "struct Worker {\n",
+                "  void target() {}\n",
+                "  void caller() { Worker().target(); }\n",
+                "};\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+            ),
+            3,
+            2,
+            true,
+        ),
+        (
+            "global_function_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+                "void caller() { Worker().target(); }\n",
+            ),
+            4,
+            1,
+            false,
+        ),
+        (
+            "prototype_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker();\n",
+                "void caller() { Worker().target(); }\n",
+            ),
+            4,
+            1,
+            false,
+        ),
+        (
+            "namespace_function_collision",
+            concat!(
+                "namespace scope {\n",
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+                "void caller() { Worker().target(); }\n",
+                "}\n",
+            ),
+            5,
+            2,
+            false,
+        ),
+        (
+            "enclosing_namespace_function_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+                "namespace child { void caller() { Worker().target(); } }\n",
+            ),
+            4,
+            1,
+            false,
+        ),
+        (
+            "local_callable_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "Other factory() { return {}; }\n",
+                "void caller() { auto Worker = factory; Worker().target(); }\n",
+            ),
+            4,
+            1,
+            false,
+        ),
+        (
+            "member_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  Other Worker() { return {}; }\n",
+                "  void caller() { Worker().target(); }\n",
+                "};\n",
+            ),
+            5,
+            1,
+            false,
+        ),
+        (
+            "static_member_factory_collision",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "struct Holder {\n",
+                "  static Other Worker() { return {}; }\n",
+                "  void caller() { Worker().target(); }\n",
+                "};\n",
+            ),
+            5,
+            1,
+            false,
+        ),
+        (
+            "class_caller_constructor_control",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Holder {\n",
+                "  void caller() { Worker().target(); }\n",
+                "};\n",
+            ),
+            3,
+            1,
+            true,
+        ),
+        (
+            "direct_constructor_control",
+            concat!(
+                "struct Worker { Worker() {} void target() {} };\n",
+                "void caller() { Worker().target(); }\n",
+            ),
+            2,
+            1,
+            true,
+        ),
+        (
+            "unrelated_namespace_function_control",
+            concat!(
+                "struct Worker { void target() {} };\n",
+                "struct Other { void target() {} };\n",
+                "namespace unrelated { Other Worker() { return {}; } }\n",
+                "void caller() { Worker().target(); }\n",
+            ),
+            4,
+            1,
+            true,
+        ),
+        (
+            "nearer_type_hides_enclosing_function_control",
+            concat!(
+                "struct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\n",
+                "namespace child { struct Worker { void target() {} };\n",
+                "void caller() { Worker().target(); } }\n",
+            ),
+            4,
+            3,
+            true,
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("fixture.cpp", source)])?;
+        let nodes = store.get_nodes()?;
+        let worker_member = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                    && node.start_line == Some(member_line)
+                    && node.serialized_name.ends_with("target")
+            })
+            .expect("Worker target member");
+        let calls = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge.line == Some(call_line)
+                    && nodes.iter().any(|node| {
+                        node.id == edge.target && node.serialized_name.ends_with("target")
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            panic!("{name} requires one ordinary target CALL: {calls:#?}");
+        };
+        let identity = parse_canonical_callsite_identity(
+            call.callsite_identity
+                .as_deref()
+                .expect("ordinary CALL identity"),
+        )
+        .expect("canonical ordinary CALL identity");
+        assert_eq!(identity.file_id, FileId(call.file_node_id.unwrap().0));
+        assert_eq!(identity.line, call_line);
+        assert_eq!(identity.raw_target, call.target);
+        assert!(nodes.iter().any(|node| {
+            node.id == call.effective_source()
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && node.start_line == Some(call_line)
+                && node.serialized_name.ends_with("caller")
+        }));
+        eprintln!(
+            "{name}: pre-proof ordinary CALL target={:?}, certainty={:?}",
+            call.resolved_target, call.certainty
+        );
+
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let target_facts = facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        let [fact] = target_facts.as_slice() else {
+            panic!("{name} requires one target fact: {target_facts:#?}");
+        };
+        let after = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("ordinary CALL survives proof materialization");
+        if exact {
+            assert_eq!(
+                fact.status,
+                ProofResolutionStatus::Exact,
+                "{name}: {fact:#?}"
+            );
+            assert_eq!(fact.target, Some(worker_member.id), "{name}: {fact:#?}");
+            assert_eq!(after.resolved_target, Some(worker_member.id));
+            assert_eq!(after.certainty, Some(ResolutionCertainty::Certain));
+        } else {
+            assert_ne!(
+                fact.status,
+                ProofResolutionStatus::Exact,
+                "{name}: {fact:#?}"
+            );
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty()
+            );
+            if name == "nested_type_declaration_remains_unsupported" {
+                // A class-only field declaration has no declarator, so the existing
+                // bounded adapter poisons this immediate owner's declaration domain.
+                assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+            }
+            assert_eq!(
+                after.resolved_target, call.resolved_target,
+                "{name}: proof upgraded target"
+            );
+            assert_eq!(
+                after.certainty, call.certainty,
+                "{name}: proof upgraded certainty"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn cpp_closed_exact_subset_emits_replay_valid_authenticated_facts() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -3785,6 +4118,95 @@ fn c_cpp_complete_declaration_domain_replays_or_fails_closed() -> anyhow::Result
             assert!(
                 fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty(),
                 "{name}: {fact:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cpp_out_of_class_receiver_requires_unique_declaration_member_relations() -> anyhow::Result<()> {
+    for member_name in ["caller", "target"] {
+        for mutation in [
+            RelationMutation::Missing,
+            RelationMutation::Duplicate,
+            RelationMutation::Wrong,
+            RelationMutation::CandidateRetained,
+            RelationMutation::WrongFile,
+        ] {
+            let project = tempfile::tempdir()?;
+            let mut store = Store::new_in_memory()?;
+            index_files(
+                project.path(),
+                &mut store,
+                &[(
+                    "fixture.cpp",
+                    concat!(
+                        "class Worker { public: void target(); void caller(); };\n",
+                        "void Worker::target() {}\n",
+                        "void Worker::caller() { target(); }\n",
+                    ),
+                )],
+            )?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            store.validate_proof_resolution_publication(&publication(1))?;
+            let clean = store
+                .get_proof_resolution_facts()?
+                .into_iter()
+                .find(|fact| fact.callsite.raw_target == "target")
+                .expect("clean out-of-class target fact");
+            assert_eq!(clean.status, ProofResolutionStatus::Exact, "{clean:#?}");
+            let owner = clean
+                .evidence_chain
+                .iter()
+                .find_map(|evidence| match evidence {
+                    ResolutionEvidence::ImplicitReceiver { owner } => Some(*owner),
+                    _ => None,
+                })
+                .expect("Worker receiver owner");
+            let nodes = store.get_nodes()?;
+            let edges = store.get_edges()?;
+            assert!(
+                !edges.iter().any(|edge| {
+                    edge.kind == EdgeKind::MEMBER
+                        && edge.effective_source() == owner
+                        && edge.effective_target() == clean.caller
+                }),
+                "qualified caller must use the declaration MEMBER fallback"
+            );
+            let relations = edges
+                .into_iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::MEMBER
+                        && edge.effective_source() == owner
+                        && nodes.iter().any(|node| {
+                            node.id == edge.effective_target()
+                                && node.start_line == Some(1)
+                                && node.serialized_name.ends_with(member_name)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let [relation] = relations.as_slice() else {
+                panic!("unique Worker::{member_name} declaration relation: {relations:#?}");
+            };
+            mutate_relation(&mut store, relation, mutation)?;
+            store
+                .validate_proof_resolution_publication(&publication(1))
+                .expect_err("corrupted declaration relation must reject stored Exact replay");
+            rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+            store.validate_proof_resolution_publication(&publication(2))?;
+            let fact = store
+                .get_proof_resolution_facts()?
+                .into_iter()
+                .find(|fact| fact.callsite.raw_target == "target")
+                .expect("corrupted out-of-class target fact remains in census");
+            assert_eq!(
+                fact.status,
+                ProofResolutionStatus::IncompleteDomain,
+                "{member_name}/{mutation:?}: {fact:#?}"
+            );
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty()
             );
         }
     }
@@ -4221,6 +4643,20 @@ fn inferred_cpp_headers_rematerialize_with_the_indexed_parser_provenance() -> an
     assert_eq!(indexed.language, "cpp");
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let target_facts = facts
+        .iter()
+        .filter(|fact| {
+            fact.callsite.file_id == FileId(indexed.id)
+                && fact.provenance.language_adapter == "cpp"
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = target_facts.as_slice() else {
+        panic!("compiled.h must emit one C++ target fact: {target_facts:#?}");
+    };
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported, "{fact:#?}");
+    assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
     Ok(())
 }
 
@@ -11469,6 +11905,290 @@ fn stale_rust_glob_local_adapter_inputs_reject_rematerialization() -> anyhow::Re
 }
 
 #[test]
+fn stale_ruby_php_receiver_bindings_refuse_replay_and_reparse() -> anyhow::Result<()> {
+    for (language, path, source, target, earlier_line, hostile_line, old_version, new_version) in [
+        (
+            "ruby",
+            "conditional.rb",
+            concat!(
+                "class Worker\n  def target\n  end\nend\n",
+                "class Other\n  def target\n  end\nend\n",
+                "def caller(receiver, flag)\n",
+                "  safe = Worker.new\n  safe.target\n",
+                "  if flag\n    receiver = Worker.new\n  end\n",
+                "  receiver.target\nend\n",
+            ),
+            "target",
+            11,
+            15,
+            "reference-v3",
+            "reference-v4",
+        ),
+        (
+            "php",
+            "conditional.php",
+            concat!(
+                "<?php\n",
+                "class Worker { public function target() {} }\n",
+                "class Other { public function target() {} }\n",
+                "function caller($receiver, $flag) {\n",
+                "  $safe = new Worker();\n  $safe->target();\n",
+                "  if ($flag) { $receiver = new Worker(); }\n",
+                "  $receiver->target();\n}\n",
+            ),
+            "target",
+            6,
+            8,
+            "reference-v2",
+            "reference-v3",
+        ),
+        (
+            "php",
+            "extract.php",
+            concat!(
+                "<?php\n",
+                "class Worker { public function memberTarget() {} }\n",
+                "class Other { public function memberTarget() {} }\n",
+                "function caller(Worker $worker) {\n",
+                "  $worker->memberTarget();\n",
+                "  extract([\"worker\" => new Other()]);\n",
+                "  $worker->memberTarget();\n}\n",
+            ),
+            "memberTarget",
+            5,
+            7,
+            "reference-v2",
+            "reference-v3",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let paths = index_files(project.path(), &mut store, &[(path, source)])?;
+        let source_before = fs::read(&paths[0])?;
+        let artifact_blob = store.get_connection().query_row(
+            "SELECT artifact_blob FROM index_artifact_cache",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut artifact = decode_index_artifact_json(&artifact_blob)?;
+        artifact["resolution_file"]["adapter_version"] = old_version.into();
+        let calls = artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls");
+        let exact_binding = calls
+            .iter()
+            .find(|call| {
+                call["callsite"]["line"] == earlier_line && call["callsite"]["raw_target"] == target
+            })
+            .expect("earlier exact receiver input")["binding"]
+            .clone();
+        assert!(matches!(
+            exact_binding["kind"].as_str(),
+            Some("constructor_binding" | "explicit_receiver_type")
+        ));
+        for call in calls.iter_mut() {
+            call["adapter_version"] = old_version.into();
+        }
+        let hostile = calls
+            .iter_mut()
+            .find(|call| {
+                call["callsite"]["line"] == hostile_line && call["callsite"]["raw_target"] == target
+            })
+            .expect("hostile receiver input");
+        assert!(!matches!(
+            hostile["binding"]["kind"].as_str(),
+            Some("constructor_binding" | "explicit_receiver_type")
+        ));
+        // Simulate the pre-F2 classifier by retaining the earlier exact type through
+        // the conditional/extract boundary. This is not output from an old binary.
+        hostile["binding"] = exact_binding;
+        eprintln!(
+            "{path}: simulated prior-version receiver input {}",
+            serde_json::to_string(hostile)?
+        );
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1",
+            [serde_json::to_vec(&artifact)?],
+        )?;
+        let attempt = rematerialize_proof_resolution_projection(&mut store, &publication(1));
+        if attempt.is_ok() {
+            eprintln!(
+                "{path}: unsafe cached fact {:?}",
+                store
+                    .get_proof_resolution_facts()?
+                    .into_iter()
+                    .find(|fact| fact.callsite.line == hostile_line
+                        && fact.callsite.raw_target == target)
+            );
+        }
+        let error =
+            attempt.expect_err("old conditional/extract receiver bindings must reject replay");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+
+        let reparsed = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+            &mut store,
+            &RefreshInfo {
+                mode: BuildMode::Incremental,
+                files_to_index: paths.clone(),
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(
+            reparsed.artifact_cache_hits, 0,
+            "{path}: old semantics reused"
+        );
+        assert_eq!(fs::read(&paths[0])?, source_before);
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let hostile = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.line == hostile_line
+                    && fact.callsite.raw_target == target
+            })
+            .expect("reparsed hostile receiver fact");
+        assert_ne!(
+            hostile.status,
+            ProofResolutionStatus::Exact,
+            "{path}: {hostile:#?}"
+        );
+        assert!(
+            hostile.edge_id.is_none()
+                && hostile.target.is_none()
+                && hostile.evidence_chain.is_empty()
+        );
+        assert_eq!(hostile.provenance.language_adapter_version, new_version);
+        let earlier = facts
+            .iter()
+            .find(|fact| fact.callsite.line == earlier_line && fact.callsite.raw_target == target)
+            .expect("earlier exact control survives reparse");
+        assert_eq!(
+            earlier.status,
+            ProofResolutionStatus::Exact,
+            "{path}: {earlier:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_cpp_constructor_adapter_inputs_reject_rematerialization() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let paths = index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "fixture.cpp",
+            concat!(
+                "struct Worker { Worker() {} void target() {} };\n",
+                "void caller() { Worker().target(); }\n",
+            ),
+        )],
+    )?;
+    let nodes = store.get_nodes()?;
+    let target = nodes
+        .iter()
+        .find(|node| {
+            matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                && node.start_line == Some(1)
+                && node.serialized_name.ends_with("target")
+        })
+        .expect("constructor control target member");
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(2)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name.ends_with("target"))
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("constructor control requires one ordinary target CALL: {calls:#?}");
+    };
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary CALL identity"),
+    )
+    .expect("canonical ordinary CALL identity");
+    assert_eq!(identity.line, 2);
+    assert!(nodes.iter().any(|node| {
+        node.id == call.effective_source()
+            && node.start_line == Some(2)
+            && node.serialized_name.ends_with("caller")
+    }));
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let initial = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    let [initial] = initial.as_slice() else {
+        panic!("constructor control requires one target fact: {initial:#?}");
+    };
+    assert_eq!(initial.status, ProofResolutionStatus::Exact);
+    assert_eq!(initial.target, Some(target.id));
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact = decode_index_artifact_json(&artifact_blob)?;
+    artifact["resolution_file"]["adapter_version"] = "reference-v4".into();
+    for call in artifact["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("cached calls")
+    {
+        call["adapter_version"] = "reference-v4".into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("old constructor lookup inputs must not authenticate current C++ proofs");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    let reparsed = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: paths,
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+    assert_eq!(reparsed.artifact_cache_hits, 0);
+    rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+    store.validate_proof_resolution_publication(&publication(2))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("current constructor proof after stale cache reparse");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.provenance.language_adapter_version, "reference-v5");
+    Ok(())
+}
+
+#[test]
 fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -11519,7 +12239,12 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             "{language} must invalidate parser inputs through its explicit adapter identity"
         );
     }
-    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v4")] {
+    for (language, version) in [
+        ("c", "reference-v2"),
+        ("cpp", "reference-v5"),
+        ("ruby", "reference-v4"),
+        ("php", "reference-v3"),
+    ] {
         assert_eq!(
             receipt
                 .adapter_roster
@@ -11527,7 +12252,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
                 .find(|adapter| adapter.language == language)
                 .map(|adapter| adapter.adapter_version.as_str()),
             Some(version),
-            "C and C++ must invalidate their complete declaration inputs"
+            "{language} must invalidate inputs after lookup semantics change"
         );
     }
     for fact in store.get_proof_resolution_facts()? {

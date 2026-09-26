@@ -252,9 +252,9 @@ const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
-const CPP_ADAPTER_VERSION: &str = "reference-v4";
-const RUBY_ADAPTER_VERSION: &str = "reference-v3";
-const PHP_ADAPTER_VERSION: &str = "reference-v2";
+const CPP_ADAPTER_VERSION: &str = "reference-v5";
+const RUBY_ADAPTER_VERSION: &str = "reference-v4";
+const PHP_ADAPTER_VERSION: &str = "reference-v3";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
@@ -2847,6 +2847,7 @@ struct CCppResolutionIndex<'tree> {
     declaration_indices_by_key: HashMap<(Vec<String>, String), Vec<usize>>,
     classes: Vec<CachedClassDeclaration>,
     class_namespace_paths: Vec<Vec<String>>,
+    class_parent_indices: Vec<Option<usize>>,
     class_indices_by_name: HashMap<String, Vec<usize>>,
     class_method_indices_by_name: HashMap<(usize, String), Vec<usize>>,
     namespaces: Vec<CachedCCppNamespace>,
@@ -2922,6 +2923,7 @@ impl<'tree> CCppResolutionIndex<'tree> {
             declaration_indices_by_key: HashMap::new(),
             classes: Vec::new(),
             class_namespace_paths: Vec::new(),
+            class_parent_indices: Vec::new(),
             class_indices_by_name: HashMap::new(),
             class_method_indices_by_name: HashMap::new(),
             namespaces: Vec::new(),
@@ -3127,6 +3129,9 @@ impl<'tree> CCppResolutionIndex<'tree> {
                 constructor,
                 receiver_name,
             } => {
+                if *constructor && !self.constructor_spelling_is_unambiguous(call, owner_name) {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
                 if let (Some(callable_id), Some(receiver_name)) = (call.callable_id, receiver_name)
                     && self
                         .rebound_receivers
@@ -3243,6 +3248,69 @@ impl<'tree> CCppResolutionIndex<'tree> {
             [] => CachedResolutionBinding::Unsupported,
             _ => CachedResolutionBinding::Ambiguous,
         }
+    }
+
+    fn constructor_spelling_is_unambiguous(&self, call: &IndexedCCppCall<'_>, name: &str) -> bool {
+        if self.macro_names.contains(name) {
+            return false;
+        }
+        let visible_class = self
+            .class_indices_by_name
+            .get(name)
+            .and_then(|classes| match classes.as_slice() {
+                [class] => Some(*class),
+                _ => None,
+            });
+        // Nested classes inherit unqualified lookup through every enclosing class
+        // scope. Keep those scopes ahead of namespace lookup, including declarations
+        // encountered after the call in the complete class body.
+        let mut scope = call.owner_index;
+        while let Some(owner) = scope {
+            count_c_cpp_resolution_work(4);
+            let owner_name = &self.classes[owner].name;
+            let callable_key = (
+                self.class_namespace_paths[owner].clone(),
+                Some(owner_name.clone()),
+                name.to_string(),
+            );
+            // An actual constructor shares its class name. Other class-scope
+            // callables and fields can hide an enclosing type in an expression.
+            if (owner_name != name
+                && (self.declaration_signatures.contains_key(&callable_key)
+                    || self.unsupported_declarations.contains(&callable_key)))
+                || self.owner_bindings.contains_key(&(owner, name.to_string()))
+            {
+                return false;
+            }
+            if visible_class.is_some_and(|class| {
+                class == owner || self.class_parent_indices[class] == Some(owner)
+            }) {
+                return true;
+            }
+            scope = self.class_parent_indices[owner];
+        }
+        // Unqualified expression lookup includes enclosing namespaces. The complete
+        // callable census also covers prototypes and declarations with no graph target.
+        let class_namespace = visible_class
+            .filter(|class| self.class_parent_indices[*class].is_none())
+            .map(|class| &self.class_namespace_paths[class]);
+        for depth in (0..=call.namespace_path.len()).rev() {
+            count_c_cpp_resolution_work(3);
+            let namespace = call.namespace_path[..depth].to_vec();
+            let callable_key = (namespace.clone(), None, name.to_string());
+            if self.declaration_signatures.contains_key(&callable_key)
+                || self.unsupported_declarations.contains(&callable_key)
+                || self
+                    .global_shadow_names
+                    .contains(&(namespace.clone(), name.to_string()))
+            {
+                return false;
+            }
+            if class_namespace == Some(&namespace) {
+                return true;
+            }
+        }
+        false
     }
 
     fn resolve_explicit_receiver(
@@ -3531,6 +3599,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
         node: TsNode<'tree>,
         mut context: CCppWalkContext,
     ) -> CCppWalkContext {
+        let parent_owner = context.owner_index;
         context.owner_index = None;
         context.unsupported |= node.child_by_field_name("name").is_none()
             || c_cpp_has_direct_kind(node, "base_class_clause")
@@ -3550,6 +3619,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
             .map(Vec::as_slice)
             .unwrap_or_default();
         let [declaration] = candidates else {
+            context.unsupported = true;
             return context;
         };
         count_c_cpp_resolution_work(2);
@@ -3564,6 +3634,7 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
         self.index
             .class_namespace_paths
             .push(self.namespace_path.clone());
+        self.index.class_parent_indices.push(parent_owner);
         let owner_index = self.index.classes.len() - 1;
         count_c_cpp_resolution_work(1);
         self.index
@@ -3902,6 +3973,14 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
                     ));
                 }
                 if let Some(owner_name) = c_cpp_direct_constructor_type(receiver, self.source) {
+                    if self.active_bindings.contains_key(&owner_name) {
+                        return Some((
+                            field,
+                            CalleeForm::ExplicitReceiver,
+                            target,
+                            CCppCallReceiver::Blocked,
+                        ));
+                    }
                     return Some((
                         field,
                         CalleeForm::ExplicitReceiver,
