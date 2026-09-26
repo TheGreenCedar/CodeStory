@@ -4682,17 +4682,37 @@ function validatePackagedProof(workflows, violations, graph) {
       ).length > 0)
     .map(step => step.name)
     .sort();
+  const hostCargoBuilds = shellInvocationsContaining(packageBuildRun, "cargo build");
+  const hostProductionBuild = hostCargoBuilds.find(command =>
+    command.includes("${cargo_args[@]}"));
+  const hostDriverBuild = hostCargoBuilds.find(command =>
+    command.includes("-p codestory-bench"));
+  const hostProductionArgs = /cargo_args=\(([^)]*)\)/u.exec(packageBuildRun)?.[1]
+    .trim().replaceAll(/\s+/gu, " ");
+  const hostBuildCalls = [...packageBuildRun.matchAll(
+    /\b(build_qualification_driver|build_package_graph)\s*\\/gu,
+  )].map((match) => match[1]);
+  const linuxCargoBuilds = shellInvocationsContaining(linuxBuildRun, "cargo build");
+  const linuxProductionBuild = linuxCargoBuilds.find(command =>
+    command.includes("-p codestory-cli"));
+  const linuxDriverBuild = linuxCargoBuilds.find(command =>
+    command.includes("-p codestory-bench"));
   add(
     violations,
-    shellInvocationsContaining(packageBuildRun, "cargo build").length === 1
+    hostCargoBuilds.length === 2
       && packageBuildRun.includes("cargo build --release --locked")
       && packageBuildRun.includes("-p codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli-runtime")
+      && hostProductionArgs === "-p codestory-cli --bin codestory-cli --bin codestory-cli-runtime"
       && packageBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
-      && packageBuildRun.includes("-p codestory-bench")
-      && packageBuildRun.includes("--bin codestory_embedding_qualification")
-      && packageBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && hostProductionBuild?.includes("cargo build --release --locked")
+      && hostProductionBuild?.includes("--target $RELEASE_RUST_TARGET")
+      && !hostProductionBuild?.includes("codestory-bench")
+      && hostDriverBuild?.includes("cargo build --release --locked")
+      && hostDriverBuild?.includes("--bin codestory_embedding_qualification")
+      && hostDriverBuild?.includes("--target $RELEASE_RUST_TARGET")
+      && !hostDriverBuild?.includes("-p codestory-cli")
       && packageBuildRun.includes("if [ $RUNNER_OS = Windows ]")
       && packageBuildRun.includes("--message-format=json-render-diagnostics")
       && packageBuildRun.includes("--timings")
@@ -4702,11 +4722,20 @@ function validatePackagedProof(workflows, violations, graph) {
       && packageBuildRun.includes("--source-sha $SOURCE_SHA")
       && packageBuildRun.includes("--source-tree $SOURCE_TREE")
       && occurrenceCount(packageBuildRun, "build_package_graph") === 3
+      && occurrenceCount(packageBuildRun, "build_qualification_driver") === 3
+      && JSON.stringify(hostBuildCalls) === JSON.stringify([
+        "build_qualification_driver", "build_package_graph",
+        "build_qualification_driver", "build_package_graph",
+      ])
+      && !packageBuildRun.includes("cargo_args+=(")
+      && packageBuildRun.includes("qualification_input=(--qualification-input $qualification_json)")
+      && packageBuildRun.includes("${qualification_input[@]}")
+      && packageBuildRun.includes("--input $cargo_json")
       && !packageBuildRun.includes("codestory_embedding_constant_calibration")
       && !packageBuildRun.includes("target/debug")
       && !/(?:^|\s)--test(?:s)?(?:\s|$)/u.test(packageBuildRun)
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
-    `${file} host package must build only the production bins and optional qualification driver in one exact Cargo invocation`,
+    `${file} host package must isolate the optional qualification driver from the production Cargo graph`,
   );
   // Windows linker timing was a substring count over the build log, which the
   // Cargo progress line `Compiling time v0.3.47` satisfied. The reported
@@ -4762,24 +4791,29 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   add(
     violations,
-    shellInvocationsContaining(linuxBuildRun, "cargo build").length === 1
+    linuxCargoBuilds.length === 2
       && linuxBuildRun.includes("CARGO_TARGET_DIR=/workspace/target/glibc-2.31")
       && linuxBuildRun.includes("CXXFLAGS=-std=c++17")
       && linuxBuildRun.includes("INCLUDE_QUALIFICATION_DRIVER=$INCLUDE_QUALIFICATION_DRIVER")
       && linuxBuildRun.includes("RELEASE_RUST_TARGET=$RELEASE_RUST_TARGET")
-      && linuxBuildRun.includes("-p codestory-cli")
-      && linuxBuildRun.includes("--bin codestory-cli")
-      && linuxBuildRun.includes("--bin codestory-cli-runtime")
+      && linuxProductionBuild?.includes("cargo build --release --locked")
+      && linuxProductionBuild?.includes("--bin codestory-cli")
+      && linuxProductionBuild?.includes("--bin codestory-cli-runtime")
+      && !linuxProductionBuild?.includes("codestory-bench")
       && linuxBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
-      && linuxBuildRun.includes("-p codestory-bench")
-      && linuxBuildRun.includes("--bin codestory_embedding_qualification")
+      && linuxDriverBuild?.includes("cargo build --release --locked")
+      && linuxDriverBuild?.includes("--bin codestory_embedding_qualification")
+      && !linuxDriverBuild?.includes("-p codestory-cli")
+      && linuxBuildRun.indexOf(linuxDriverBuild) < linuxBuildRun.indexOf(linuxProductionBuild)
+      && linuxBuildRun.includes("qualification-messages.jsonl")
+      && !linuxBuildRun.includes("set --")
       && linuxBuildRun.includes("--target $RELEASE_RUST_TARGET")
       && linuxBuildRun.includes("--message-format=json-render-diagnostics")
       && linuxBuildRun.includes("cargo-build-artifacts.mjs features")
       && linuxBuildRun.includes("--workspace-root $GITHUB_WORKSPACE")
       && !linuxBuildRun.includes("codestory_embedding_constant_calibration")
       && !/(?:^|\s)--bins(?:\s|$)/u.test(linuxBuildRun),
-    `${file} Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
+    `${file} Linux package must isolate the optional qualification driver from the production Cargo graph`,
   );
   // The identity the smoke reads is the one `source-identity` proved against the dispatched ref,
   // and it now arrives through `env:` rather than spliced into the command. Both halves are pinned:

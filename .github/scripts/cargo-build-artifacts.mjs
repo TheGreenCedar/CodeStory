@@ -29,8 +29,11 @@ const SHIPPING_BINARIES = [
 // graph at all, so an omission here is an unproved crate rather than a passing one.
 const FORBIDDEN_SHIPPING_FEATURES = new Map([
   ["codestory-agent", new Set(["test-support"])],
+  ["codestory-cli", new Set(["proof-qualification-support"])],
   ["codestory-retrieval", new Set(["benchmark-support", "test-support"])],
-  ["codestory-runtime", new Set(["benchmark-support", "test-support"])],
+  ["codestory-runtime", new Set([
+    "benchmark-support", "proof-qualification-support", "test-support",
+  ])],
 ]);
 const ARTIFACT_CONTRACT = {
   cli: {
@@ -150,7 +153,7 @@ function requireArtifactContract(expectations) {
     JSON.stringify(aliases) !== JSON.stringify(required)
     && JSON.stringify(aliases) !== JSON.stringify(withDriver)
   ) {
-    fail("Windows release graph artifact set changed");
+    fail("Windows package artifact set changed");
   }
   for (const expectation of expectations) {
     const contract = ARTIFACT_CONTRACT[expectation.alias];
@@ -160,7 +163,7 @@ function requireArtifactContract(expectations) {
       || expectation.kind !== contract.kind
       || expectation.targetName !== contract.targetName
     ) {
-      fail(`Windows release graph artifact contract changed for ${expectation.alias}`);
+      fail(`Windows package artifact contract changed for ${expectation.alias}`);
     }
   }
 }
@@ -233,6 +236,9 @@ export function assertShippingFeatureContract({
       targetName,
     };
   });
+  if (artifacts.some(({ packageName }) => packageName === "codestory-bench")) {
+    fail("shipping Cargo graph included codestory-bench");
+  }
 
   for (const expected of SHIPPING_BINARIES) {
     const matches = artifacts.filter(({ message, packageName, targetKinds, targetName }) =>
@@ -557,6 +563,7 @@ export function buildCargoArtifactManifest({
   exactTree,
   expectations,
   jsonLines,
+  qualificationJsonLines,
   rustTarget,
   targetDir,
   workspaceRoot,
@@ -572,6 +579,15 @@ export function buildCargoArtifactManifest({
     typeof value === "string" ? parseExpectation(value) : value
   );
   requireArtifactContract(parsedExpectations);
+  const includesDriver = parsedExpectations.some(
+    ({ alias }) => alias === "qualification_driver",
+  );
+  if (includesDriver !== (typeof qualificationJsonLines === "string")) {
+    fail("qualification driver requires its separate Cargo message stream");
+  }
+  // The public binaries are selected only from the production graph. The
+  // private driver retains its own build receipt without feature-unifying the
+  // production graph with codestory-bench.
   const aliases = new Set();
   const identities = new Set();
   for (const expectation of parsedExpectations) {
@@ -591,9 +607,42 @@ export function buildCargoArtifactManifest({
     fail("exact target release directory is missing");
   }
   const messages = parseCargoMessages(jsonLines);
+  const qualificationMessages = includesDriver
+    ? parseCargoMessageStream(qualificationJsonLines)
+    : null;
+  if (qualificationMessages) {
+    if (
+      qualificationMessages.buildFinished.length !== 1
+      || qualificationMessages.buildFinished[0]?.success !== true
+    ) {
+      fail("qualification Cargo message stream did not finish successfully");
+    }
+    if (qualificationMessages.compilerArtifacts.some((message) =>
+      message?.profile?.test === true
+      || message?.target?.kind?.includes("test")
+      || message?.target?.kind?.includes("bench")
+    )) {
+      fail("qualification Cargo graph emitted a test or benchmark target");
+    }
+    if (qualificationMessages.compilerArtifacts.some((message) =>
+      SHIPPING_BINARIES.some(({ packageName, targetName }) =>
+        packageNameFromArtifact(message) === packageName
+        && message?.target?.name === targetName
+        && message?.target?.kind?.includes("bin")
+      )
+    )) {
+      fail("qualification Cargo graph emitted a production binary");
+    }
+  }
   const artifacts = {};
   for (const expectation of parsedExpectations) {
-    const matches = matchingArtifacts(messages, expectation, resolvedWorkspaceRoot);
+    const matches = matchingArtifacts(
+      expectation.alias === "qualification_driver"
+        ? qualificationMessages.compilerArtifacts
+        : messages,
+      expectation,
+      resolvedWorkspaceRoot,
+    );
     if (matches.length !== 1) {
       fail(
         `expected exactly one Cargo artifact for ${expectation.alias}, found ${matches.length}`,
@@ -913,6 +962,9 @@ function runSelect(values) {
     exactTree: one(values, "--source-tree"),
     expectations,
     jsonLines: fs.readFileSync(input, "utf8"),
+    qualificationJsonLines: values.has("--qualification-input")
+      ? fs.readFileSync(one(values, "--qualification-input"), "utf8")
+      : undefined,
     rustTarget: one(values, "--rust-target"),
     targetDir: one(values, "--target-dir"),
     workspaceRoot: one(values, "--workspace-root"),

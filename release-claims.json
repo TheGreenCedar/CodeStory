@@ -1773,7 +1773,7 @@
       "packaged_platform_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-proof.yml",
-        "sha256": "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa",
+        "sha256": "3aff2cbb04ae5388ac295029fa582da7070a96f6c69143b80237bdc13c97c3b1",
         "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
       },
       "packaged_platform_pr_workflow": {
@@ -1826,7 +1826,7 @@
         "file": "packaged-platform-proof.yml",
         "job": "build",
         "step": "Build Linux x64 at the glibc 2.31 baseline",
-        "sha256": "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f",
+        "sha256": "d6dd1da4c317c9ec7da15a3f66bfbe712284e400fd49c4b25079154d4358425b",
         "reason": "Linux owns its compiler server inside Docker while macOS and Windows own one in the host shell; both executable programs are pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
       },
       "packaged_compile_clock_stop": {
