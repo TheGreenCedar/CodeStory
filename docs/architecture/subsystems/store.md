@@ -62,7 +62,10 @@ not constant time. Unknown neighbors, old images without a provisioned lease,
 and SQLite images whose WAL, journal, or sidecar state cannot be observed
 safely are retained. Unix may retain an empty generation directory after its
 image is removed because the final directory pathname cannot be removed with
-the same handle-bound identity guarantee.
+the same handle-bound identity guarantee. Its final file unlink is also
+name-based after a native identity recheck; the acquisition and publication
+fences exclude CodeStory writers in that interval, while an external actor
+replacing the name at the last syscall remains outside that guarantee.
 
 The dense-anchor manifest is part of the core publication boundary. It binds
 the complete row count and digest, policy version, migration state, and every

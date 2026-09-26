@@ -149,6 +149,7 @@ fn remove_owned_core_image(
     generation_id: &str,
     validated_directory: &File,
     validated_database: &File,
+    validated_lease: &File,
 ) -> Result<bool, StorageError> {
     let root = OwnedDeletionRoot::open(generations_root)
         .map_err(|error| core_deletion_error("open core generation root", error))?;
@@ -183,7 +184,7 @@ fn remove_owned_core_image(
         return Ok(false);
     }
     let removed = generation
-        .remove(Path::new(CORE_DATABASE_FILE))
+        .remove_regular_file_matching(Path::new(CORE_DATABASE_FILE), validated_database)
         .map_err(|error| core_deletion_error("remove obsolete core image", error))?;
     if !removed {
         return Ok(false);
@@ -197,13 +198,18 @@ fn remove_owned_core_image(
         }
         Err(error) => return Err(core_deletion_error("verify obsolete core removal", error)),
     }
+    if !generation
+        .remove_regular_file_matching(Path::new(CORE_LEASE_FILE), validated_lease)
+        .map_err(|error| core_deletion_error("remove retired core lease", error))?
+    {
+        return Err(StorageError::Other(
+            "Retired core lease changed after image removal".into(),
+        ));
+    }
+    // Windows deletes the authenticated directory by this handle. Unix
+    // deliberately retains it: final rmdir cannot bind to the pinned handle.
     generation
-        .remove(Path::new(CORE_LEASE_FILE))
-        .map_err(|error| core_deletion_error("remove retired core lease", error))?;
-    drop(generation);
-    // On Unix an empty directory is deliberately retained because its final
-    // pathname removal cannot be tied to the already-pinned directory handle.
-    root.remove_empty_directory(relative)
+        .remove_pinned_empty_directory()
         .map_err(|error| core_deletion_error("remove empty core directory", error))?;
     Ok(true)
 }
@@ -642,18 +648,43 @@ mod tests {
         let report = codestory_store::apply_core_retention(
             &storage_path,
             &|| false,
-            |root, generation, expected_dir, expected_db| {
+            |root, generation, expected_dir, expected_db, expected_lease| {
                 fs::rename(&old_dir, &moved).expect("replace old directory at callback seam");
                 fs::create_dir(&old_dir).expect("replacement directory");
                 fs::copy(moved.join(CORE_DATABASE_FILE), &old).expect("replacement image");
                 fs::write(old_dir.join(CORE_LEASE_FILE), b"").expect("replacement marker");
-                remove_owned_core_image(root, generation, expected_dir, expected_db)
+                remove_owned_core_image(root, generation, expected_dir, expected_db, expected_lease)
             },
         )
         .expect("retention pass");
         assert_eq!(report.reclaimed_images, 0);
         assert!(old.is_file(), "same-name replacement must survive");
         assert!(moved.join(CORE_DATABASE_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_gc_rejects_database_leaf_replacement_before_final_removal() {
+        let cache = tempdir().expect("isolated cache");
+        let project = tempdir().expect("project");
+        let storage_path = cache.path().join("codestory.db");
+        publish_owned_core_generations(project.path(), &storage_path, 3);
+        let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+        let old = layout.generation_database_path("owned-core-1").unwrap();
+        let moved = project.path().join("moved-original.db");
+        let report = codestory_store::apply_core_retention(
+            &storage_path,
+            &|| false,
+            |root, generation, expected_dir, expected_db, expected_lease| {
+                fs::rename(&old, &moved).expect("replace validated DB at deletion seam");
+                fs::write(&old, b"unowned replacement").expect("replacement DB leaf");
+                remove_owned_core_image(root, generation, expected_dir, expected_db, expected_lease)
+            },
+        )
+        .expect("retention pass");
+        assert_eq!(report.reclaimed_images, 0);
+        assert_eq!(fs::read(&old).unwrap(), b"unowned replacement");
+        assert!(moved.is_file(), "validated old image is retained");
     }
 
     #[test]
@@ -666,7 +697,7 @@ mod tests {
         let old = layout.generation_database_path("owned-core-1").unwrap();
         let original = fs::read(&old).expect("old core bytes");
         let cancelled =
-            codestory_store::apply_core_retention(&storage_path, &|| true, |_, _, _, _| {
+            codestory_store::apply_core_retention(&storage_path, &|| true, |_, _, _, _, _| {
                 panic!("cancelled retention cannot remove an image")
             })
             .expect("cancelled pass");
@@ -687,7 +718,7 @@ mod tests {
         fs::remove_file(old.parent().unwrap().join(CORE_LEASE_FILE))
             .expect("simulate pre-provisioned legacy generation");
         let unprovisioned =
-            codestory_store::apply_core_retention(&storage_path, &|| false, |_, _, _, _| {
+            codestory_store::apply_core_retention(&storage_path, &|| false, |_, _, _, _, _| {
                 panic!("unprovisioned generation cannot be removed")
             })
             .expect("legacy pass");
@@ -716,7 +747,7 @@ mod tests {
         fs::remove_file(&old).expect("replace old core file");
         symlink(&outside, &old).expect("symlink replacement");
         let report =
-            codestory_store::apply_core_retention(&storage_path, &|| false, |_, _, _, _| {
+            codestory_store::apply_core_retention(&storage_path, &|| false, |_, _, _, _, _| {
                 panic!("symlink candidate cannot reach deletion callback")
             })
             .expect("safe refusal");

@@ -3,6 +3,7 @@
 ## Unreleased
 
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
+- Cache cleanup can reclaim older, unreferenced core index images after readers release them, while retaining the current, rollback, and retrieval-bound images.
 - Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
 
 ## 0.17.6

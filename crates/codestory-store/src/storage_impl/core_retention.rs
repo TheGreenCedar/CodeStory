@@ -198,7 +198,13 @@ pub struct CoreRetentionReport {
 pub fn apply_core_retention(
     logical_path: &Path,
     cancelled: &dyn Fn() -> bool,
-    mut remove_owned_generation: impl FnMut(&Path, &str, &File, &File) -> Result<bool, StorageError>,
+    mut remove_owned_generation: impl FnMut(
+        &Path,
+        &str,
+        &File,
+        &File,
+        &File,
+    ) -> Result<bool, StorageError>,
 ) -> Result<CoreRetentionReport, StorageError> {
     let mut report = CoreRetentionReport::default();
     let layout = CorePublicationLayout::from_storage_path(logical_path)?;
@@ -328,16 +334,22 @@ pub fn apply_core_retention(
             }
         };
         // The SQLite observer opens by name. Bind that validation to the
-        // handles supplied to the remover; a replacement between proof and
-        // unlink must not inherit this candidate's authority.
+        // handles supplied to the remover, which rechecks native identity at
+        // the final leaf operation. Unix still has a name-based last syscall;
+        // the held publication/acquisition locks exclude cooperating writers.
         require_opened_matches_path(&opened_directory, &directory, false)?;
         require_opened_matches_path(&opened_database, &database, true)?;
-        drop(lock);
+        // Keep the original marker handle as deletion evidence. Its advisory
+        // lock is released before the callback removes the marker, while the
+        // exclusive acquisition fence still excludes cooperating readers.
+        bounded_locks::release(&lock)
+            .map_err(|error| retention_error("release retired core lease lock", error))?;
         if remove_owned_generation(
             &generations_root,
             &generation_id,
             &opened_directory,
             &opened_database,
+            &lock,
         )? {
             report.reclaimed_images += 1;
             report.reclaimed_logical_bytes =
@@ -700,7 +712,7 @@ mod tests {
     fn promotion_lock_defers_prune_before_pointer_publication() {
         let (_cache, logical, _layout) = published_lock_fixture();
         let _promotion = PromotionLock::acquire(&logical).expect("promotion in progress");
-        let report = apply_core_retention(&logical, &|| false, |_, _, _, _| {
+        let report = apply_core_retention(&logical, &|| false, |_, _, _, _, _| {
             panic!("candidate removal cannot run during promotion")
         })
         .expect("deferred cleanup report");
@@ -720,7 +732,7 @@ mod tests {
         // The directory has multiple entries. Fail after one has been read,
         // before candidate validation/removal can use a partial scan.
         fail_enumeration_after(1);
-        let error = apply_core_retention(&logical, &|| false, |_, _, _, _| {
+        let error = apply_core_retention(&logical, &|| false, |_, _, _, _, _| {
             panic!("an incomplete root scan cannot authorize any removal")
         })
         .expect_err("late enumeration failure must fail the pass");
