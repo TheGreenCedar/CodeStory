@@ -2625,6 +2625,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kernel_total_work_is_bounded_before_missing_last_builder_gap() {
+        let mut observations = Vec::new();
+        for branches in [2, 4] {
+            let names = ["a", "b", "c", "d", "e", "f", "g"];
+            let mut source = String::new();
+            for (step, name) in names.iter().enumerate() {
+                source.push_str(&format!("fn {name}() {{\n"));
+                if step < 5 {
+                    for _ in 0..branches {
+                        source.push_str(&format!("  {}();\n", names[step + 1]));
+                    }
+                }
+                source.push_str("}\n");
+            }
+            let fixture = source_built_fixture(&source);
+            let selectors = names
+                .iter()
+                .map(|name| canonical_id(&source_callable(&fixture.store, name)))
+                .collect::<Vec<_>>();
+            let targets = selectors[1..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let (contract, hashes, rendering) = validated_contract(&selectors[0], &targets);
+            let sealed = fixture.store.get_proof_resolution_facts().unwrap();
+            assert_eq!(sealed.len(), branches * 5);
+            assert!(sealed.iter().all(|fact| {
+                fact.status == ProofResolutionStatus::Exact
+                    && seal_call_resolution_fact(fact.clone()).unwrap() == *fact
+            }));
+            let built = build_from_store(
+                &fixture.store,
+                &fixture.root,
+                &fixture.project_id,
+                &fixture.publication,
+                &contract,
+                |path| fs::read(path),
+            )
+            .unwrap();
+            assert_eq!(built.receipts.len(), branches * 5);
+            assert!(
+                built
+                    .gaps
+                    .contains(&FactBuildGap::DirectCallMissing { step_index: 5 })
+            );
+            assert!(built.unavailable.is_empty());
+            let (checked, observed) = crate::call_path_kernel::with_kernel_work_observation(|| {
+                check_built_call_path_integration(&contract, &hashes, &rendering, built).unwrap()
+            });
+            assert!(matches!(
+                checked.disposition(),
+                ProofDisposition::Unknown { .. }
+            ));
+            eprintln!(
+                "branches={branches}, actual sealed receipts={}, kernel={observed:?}, disposition={:?}",
+                sealed.len(),
+                checked.disposition()
+            );
+            observations.push(observed);
+        }
+        assert!(
+            observations[1].fact_examinations <= 32_768,
+            "small admitted branching input exceeds total kernel work bound: {:?}",
+            observations[1]
+        );
+        assert!(
+            observations[1].prefix_states_created <= 1_024,
+            "small admitted branching input exceeds prefix state bound: {:?}",
+            observations[1]
+        );
+    }
+
     struct SealedDependencyOrderCase {
         fixture: SourceBuiltFixture,
         caller: Node,

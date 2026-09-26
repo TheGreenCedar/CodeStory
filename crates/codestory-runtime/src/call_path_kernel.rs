@@ -1481,6 +1481,47 @@ fn check_call_path_with_receipt_order(
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct KernelWorkObservation {
+    pub fact_examinations: usize,
+    pub prefix_states_created: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static KERNEL_WORK_OBSERVATION: std::cell::Cell<KernelWorkObservation> = const {
+        std::cell::Cell::new(KernelWorkObservation { fact_examinations: 0, prefix_states_created: 0 })
+    };
+}
+
+#[cfg(test)]
+fn observe_kernel_fact() {
+    KERNEL_WORK_OBSERVATION.with(|counter| {
+        let mut observed = counter.get();
+        observed.fact_examinations += 1;
+        counter.set(observed);
+    });
+}
+
+#[cfg(test)]
+fn observe_kernel_prefix_states(count: usize) {
+    KERNEL_WORK_OBSERVATION.with(|counter| {
+        let mut observed = counter.get();
+        observed.prefix_states_created += count;
+        counter.set(observed);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_kernel_work_observation<T>(
+    run: impl FnOnce() -> T,
+) -> (T, KernelWorkObservation) {
+    KERNEL_WORK_OBSERVATION.with(|counter| counter.set(KernelWorkObservation::default()));
+    let result = run();
+    (result, KERNEL_WORK_OBSERVATION.with(std::cell::Cell::get))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathPolicy {
     Strict,
@@ -1524,6 +1565,8 @@ fn search_path<'a>(
     }
     let step = &contract.spec.steps[step_index];
     for fact in facts {
+        #[cfg(test)]
+        observe_kernel_fact();
         let source_matches = current.map_or_else(
             || symbol_selector_matches(&contract.spec.start, &fact.source),
             |current| current == &fact.source,
@@ -1608,7 +1651,11 @@ fn reachable_prefixes(
     facts.sort_by(|left, right| compare_receipt_refs(&left.receipt, &right.receipt, receipt_order));
     let initial_nodes = facts
         .iter()
-        .filter(|fact| symbol_selector_matches(&contract.spec.start, &fact.source))
+        .filter(|fact| {
+            #[cfg(test)]
+            observe_kernel_fact();
+            symbol_selector_matches(&contract.spec.start, &fact.source)
+        })
         .map(|fact| fact.source.clone())
         .collect::<BTreeSet<_>>();
     let mut states = initial_nodes
@@ -1622,11 +1669,15 @@ fn reachable_prefixes(
             projection_conflict_step: None,
         })
         .collect::<Vec<_>>();
+    #[cfg(test)]
+    observe_kernel_prefix_states(states.len() * 2);
     let mut all = states.clone();
     for step_index in 0..contract.spec.steps.len() {
         let mut next = Vec::new();
         for state in states {
             for fact in &facts {
+                #[cfg(test)]
+                observe_kernel_fact();
                 if fact.source != state.current
                     || !symbol_selector_matches(
                         &contract.spec.steps[step_index].target,
@@ -1643,6 +1694,8 @@ fn reachable_prefixes(
                 used_receipts.insert(fact.receipt.receipt_id.clone());
                 used_edges.insert(fact.receipt.edge_id.clone());
                 connected_receipts.push(fact.receipt.clone());
+                #[cfg(test)]
+                observe_kernel_prefix_states(1);
                 next.push(PrefixState {
                     step_index: step_index + 1,
                     current: fact.target.clone(),
@@ -1658,6 +1711,8 @@ fn reachable_prefixes(
         if next.is_empty() {
             break;
         }
+        #[cfg(test)]
+        observe_kernel_prefix_states(next.len());
         all.extend(next.clone());
         states = next;
     }
