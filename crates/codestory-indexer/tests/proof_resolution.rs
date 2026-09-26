@@ -10992,7 +10992,7 @@ fn reflect_set_prototype_refuses_same_file_receiver_proof() -> anyhow::Result<()
         "src/main.js",
         8,
         "src/main.js",
-        ProofResolutionStatus::Unsupported,
+        ProofResolutionStatus::IncompleteDomain,
     )
 }
 
@@ -11053,7 +11053,7 @@ fn script_reflection_mutation_spellings_and_scopes() -> anyhow::Result<()> {
                 &path,
                 8,
                 &path,
-                ProofResolutionStatus::Unsupported,
+                ProofResolutionStatus::IncompleteDomain,
             )?;
         }
         for read_only in [
@@ -11080,7 +11080,7 @@ fn script_reflection_mutation_spellings_and_scopes() -> anyhow::Result<()> {
             &path,
             8,
             &path,
-            ProofResolutionStatus::Unsupported,
+            ProofResolutionStatus::IncompleteDomain,
         )?;
         for mutation in [
             "Reflect.set(receiver, 'target', other);",
@@ -11094,7 +11094,7 @@ fn script_reflection_mutation_spellings_and_scopes() -> anyhow::Result<()> {
                 &path,
                 8,
                 &path,
-                ProofResolutionStatus::Unsupported,
+                ProofResolutionStatus::IncompleteDomain,
             )?;
         }
     }
