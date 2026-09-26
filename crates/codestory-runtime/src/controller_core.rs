@@ -69,11 +69,6 @@ impl AppController {
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
             source_observer: Arc::new(Mutex::new(SourceObserverState::default())),
-            #[cfg(any(
-                test,
-                feature = "test-support",
-                feature = "proof-qualification-support"
-            ))]
             proof_validation_cache: Arc::new(Mutex::new(None)),
             events_tx,
             events_rx,
@@ -221,11 +216,6 @@ impl AppController {
         }
         let storage_path = self.require_storage_path()?;
         let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
-        #[cfg(any(
-            test,
-            feature = "test-support",
-            feature = "proof-qualification-support"
-        ))]
         self.prepare_armed_proof_publication_validation()?;
         let installed_storage = Rc::clone(&storage);
         let snapshot = storage.read_snapshot().map_err(|error| {

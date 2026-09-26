@@ -4,7 +4,7 @@ version = "0.17.6"
 edition = "2024"
 
 [features]
-default = ["proof-qualification-support"]
+default = []
 benchmark-support = ["codestory-retrieval/benchmark-support"]
 proof-qualification-support = []
 v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-support"]

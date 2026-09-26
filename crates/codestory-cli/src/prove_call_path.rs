@@ -6,7 +6,7 @@ use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 
-use codestory_runtime::proof_qualification_support as proof;
+use codestory_runtime::public_call_path as proof;
 
 pub(crate) const PUBLIC_VERIFY_TOOL_NAME: &str = "verify_indexed_direct_calls";
 pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 8 * 1024;
@@ -48,7 +48,7 @@ pub(crate) fn parse_request(
             "{PUBLIC_VERIFY_TOOL_NAME} `{CALL_PATH_ARGUMENT}` exceeds the {PROVE_CALL_PATH_INPUT_MAX_BYTES} byte input limit"
         ));
     }
-    codestory_runtime::proof_qualification_support::parse_public_call_path_document(document)
+    codestory_runtime::public_call_path::parse_public_call_path_document(document)
 }
 
 /// Reads a `call-path/v1` document from a file or stdin under the same 8 KiB

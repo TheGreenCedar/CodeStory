@@ -1,4 +1,4 @@
-//! Pure dark kernel for the `indexed_source_call_path_v1` proof domain.
+//! Pure kernel for the `indexed_source_call_path_v1` proof domain.
 //!
 //! The domain is an ordered sequence of direct, outgoing, indexed source-level
 //! `CALL` edges. A step's target is the next step's source. The kernel proves
@@ -8,8 +8,8 @@
 //! Callers must resolve selectors and verify receipts before constructing the
 //! facts accepted here.
 //!
-//! This module is compiled only for crate tests or sealed support features. No
-//! production dispatcher enables either support feature.
+//! The product's public verifier uses this kernel through a runtime-owned
+//! facade. Qualification-only inspection remains feature gated.
 
 #![allow(dead_code)]
 

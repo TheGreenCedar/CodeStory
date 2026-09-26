@@ -17,6 +17,47 @@ const SOURCE_SHA = "a".repeat(40);
 const SOURCE_TREE = "b".repeat(40);
 const RUST_TARGET = "x86_64-pc-windows-msvc";
 const SCRIPT = fileURLToPath(new URL("./cargo-build-artifacts.mjs", import.meta.url));
+const WORKSPACE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+
+test("real shipping dependency graph excludes qualification features", async (t) => {
+  // Cargo's resolved package features expose default dependency edges that a
+  // hand-built compiler-artifact fixture can never prove absent. Both shipped
+  // bins belong to codestory-cli and share this package-level feature graph;
+  // the artifact gate separately checks that Cargo emitted each bin.
+  for (const defaultMode of ["defaults", "no-default-features"]) {
+    await t.test(defaultMode, () => {
+      const args = [
+        "tree", "--locked", "-p", "codestory-cli", "--edges", "normal,build",
+        "--prefix", "none", "--format", "{p} {f}",
+      ];
+      if (defaultMode === "no-default-features") args.push("--no-default-features");
+      const result = spawnSync("cargo", args, {
+        cwd: WORKSPACE_ROOT,
+        encoding: "utf8",
+        env: { ...process.env, RUSTC_WRAPPER: "" },
+      });
+      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+      for (const [packageName, forbidden] of [
+        ["codestory-cli", ["proof-qualification-support"]],
+        ["codestory-runtime", ["benchmark-support", "proof-qualification-support", "test-support"]],
+        ["codestory-retrieval", ["benchmark-support", "test-support"]],
+        ["codestory-agent", ["test-support"]],
+      ]) {
+        const rows = result.stdout.split("\n").filter((line) =>
+          line.startsWith(`${packageName} v`)
+          && line.replaceAll("\\", "/").includes(`/crates/${packageName})`)
+        );
+        assert.ok(rows.length > 0, `missing ${packageName} in resolved graph`);
+        for (const row of rows) {
+          const enabled = row.slice(row.lastIndexOf(")") + 1).trim().split(",");
+          for (const feature of forbidden) {
+            assert.ok(!enabled.includes(feature), `${defaultMode}: ${packageName}/${feature} in ${row}`);
+          }
+        }
+      }
+    });
+  }
+});
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");

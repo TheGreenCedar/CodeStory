@@ -1927,9 +1927,9 @@ fn handle_stdio_request(
                     return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                 };
                 let validation =
-                    match codestory_runtime::proof_qualification_support::
-                        validate_public_call_path_contract(proof_request.clone())
-                    {
+                    match codestory_runtime::public_call_path::validate_public_call_path_contract(
+                        proof_request.clone(),
+                    ) {
                         Ok(validation) => validation,
                         Err(message) => {
                             return Some(stdio_jsonrpc_success(
@@ -1939,12 +1939,12 @@ fn handle_stdio_request(
                         }
                     };
                 let public = match validation {
-                    codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
+                    codestory_runtime::public_call_path::ValidationOutcome::Validated {
                         contract,
                         hashes,
                         rendering,
                     } => {
-                        let operation = match codestory_runtime::proof_qualification_support::
+                        let operation = match codestory_runtime::public_call_path::
                             run_observed_call_path_public_operation(
                                 &runtime.runtime,
                                 &contract,
@@ -1960,22 +1960,22 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        match codestory_runtime::proof_qualification_support::
-                            project_observed_public_operation(&operation)
-                        {
+                        match codestory_runtime::public_call_path::project_observed_public_operation(
+                            &operation,
+                        ) {
                             Ok(public) => public,
                             Err(_) => {
                                 return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                             }
                         }
                     }
-                    codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
+                    codestory_runtime::public_call_path::ValidationOutcome::Unknown {
                         spec,
                         hashes,
                         rendering,
                         gaps,
                     } => {
-                        let operation = match codestory_runtime::proof_qualification_support::
+                        let operation = match codestory_runtime::public_call_path::
                             run_translation_unknown_public_operation(
                                 &runtime.runtime,
                                 &spec,
@@ -1992,9 +1992,9 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        match codestory_runtime::proof_qualification_support::
-                            project_internal_projection(&operation.value)
-                        {
+                        match codestory_runtime::public_call_path::project_internal_projection(
+                            &operation.value,
+                        ) {
                             Ok(public) => public,
                             Err(_) => {
                                 return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
@@ -3645,7 +3645,7 @@ enum PreparedStdioToolCall {
     Raw,
     Affected(AffectedAnalysisRequest),
     Snippet(StdioSnippetRequest),
-    ProveCallPath(codestory_runtime::proof_qualification_support::UnvalidatedCallPathContract),
+    ProveCallPath(codestory_runtime::public_call_path::UnvalidatedCallPathContract),
 }
 
 #[derive(Debug, Clone)]

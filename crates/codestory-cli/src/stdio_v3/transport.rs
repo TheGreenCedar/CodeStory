@@ -102,7 +102,7 @@ pub(crate) fn build_proof_tool_result_v3(
     }
 
     let fallback_public =
-        codestory_runtime::proof_qualification_support::project_public_transport_budget_result(
+        codestory_runtime::public_call_path::project_public_transport_budget_result(
             public_result,
             bytes.len(),
         )
@@ -221,7 +221,7 @@ mod tests {
     use codestory_contracts::proof_resolution::{
         DependencyFileHash, ResolutionEvidence, ResolutionProvenance,
     };
-    use codestory_runtime::proof_qualification_support::{
+    use codestory_runtime::public_call_path::test_support::{
         BuiltCallPathFacts, ClauseAnchor, ClauseClassification, FactBuildGap,
         InternalCorePublicationIdentity, InternalProjection, ProofContractField, ProofHashes,
         UnavailableReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
@@ -229,7 +229,7 @@ mod tests {
         ValidatedContractRendering, ValidationOutcome, check_built_call_path_integration,
         project_internal_call_path_result, validate_contract,
     };
-    use codestory_runtime::proof_qualification_support::{
+    use codestory_runtime::public_call_path::test_support::{
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity, VerifiedDirectCallFact, VerifiedProofFact,
     };
@@ -238,7 +238,7 @@ mod tests {
     fn public_result(
         root: Value,
     ) -> codestory_contracts::call_path_public::PublicCallPathResultDto {
-        codestory_runtime::proof_qualification_support::project_public_verification_result(root)
+        codestory_runtime::public_call_path::project_public_verification_result(root)
             .expect("project public verification result")
     }
 
@@ -497,11 +497,10 @@ mod tests {
 
         let mut fallback_too_large = actual_projected_root("A calls B();\n".to_owned());
         fallback_too_large["core_publication"]["project_id"] = json!("p".repeat(70_000));
-        let error =
-            codestory_runtime::proof_qualification_support::project_public_verification_result(
-                fallback_too_large,
-            )
-            .expect_err("oversized runtime fallback must fail internally");
+        let error = codestory_runtime::public_call_path::project_public_verification_result(
+            fallback_too_large,
+        )
+        .expect_err("oversized runtime fallback must fail internally");
         assert!(error.contains("even after budget projection"), "{error}");
     }
 
@@ -539,7 +538,7 @@ mod tests {
                 else {
                     panic!("uncertainty fixture remains a complete projection")
                 };
-                codestory_runtime::proof_qualification_support::validate_compact_projection(&root)
+                codestory_runtime::public_call_path::validate_compact_projection(&root)
                     .unwrap_or_else(|error| {
                         panic!("canonical {disposition_kind} projection must validate: {error}")
                     });
@@ -679,10 +678,8 @@ mod tests {
         let mut invalid = proof_root("unknown");
         invalid["undeclared"] = json!(true);
         let error =
-            codestory_runtime::proof_qualification_support::project_public_verification_result(
-                invalid,
-            )
-            .expect_err("undeclared output must fail closed");
+            codestory_runtime::public_call_path::project_public_verification_result(invalid)
+                .expect_err("undeclared output must fail closed");
         assert!(
             error.contains("invalid internal call-path projection"),
             "undeclared proof fields must fail closed: {error:?}"

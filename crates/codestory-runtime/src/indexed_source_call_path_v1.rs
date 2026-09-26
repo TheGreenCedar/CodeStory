@@ -1,12 +1,11 @@
-//! Dark core-snapshot adapter for indexed source call-path proof facts.
+//! Core-snapshot adapter for indexed source call-path proof facts.
 //!
 //! This module is deliberately not a product facade. Its caller must already
 //! be inside `PublicOperationService::run_with_cancel`, which installs the
 //! complete core snapshot used for every Store read below.
 
-// The complete adapter stays dark until the atomic v3 surface cut. Building
-// `codestory-runtime` with either sealed support feature must not turn that
-// deliberate lack of production callers into warning noise.
+// The public call-path verifier owns the only product caller. The adapter's
+// detailed qualification traces are exposed only through the support facade.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -16,20 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::call_path_kernel::{
-    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
-    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
-    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
-    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, RawCallEdgeAdmission,
-    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract,
-    ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-    check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
-};
-#[cfg(all(
-    not(any(test, feature = "test-support")),
-    feature = "proof-qualification-support"
-))]
 use crate::call_path_kernel::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
     CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
@@ -39,6 +24,8 @@ use crate::call_path_kernel::{
     VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
     diagnose_raw_call_edge, project_internal_call_path_result,
 };
+#[cfg(test)]
+use crate::call_path_kernel::{RawCallEdgeAdmission, admit_raw_call_edge};
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
@@ -2711,10 +2698,8 @@ mod tests {
                     Ok(())
                 );
                 let public =
-                    crate::proof_qualification_support::project_public_verification_result(
-                        root.clone(),
-                    )
-                    .unwrap();
+                    crate::public_call_path::project_public_verification_result(root.clone())
+                        .unwrap();
                 assert_eq!(public.as_value()["graph_disposition"], "unknown");
                 assert_eq!(public.as_value()["runtime_execution_proven"], false);
                 let public_gaps = public.as_value()["disposition"]["gaps"].as_array().unwrap();
