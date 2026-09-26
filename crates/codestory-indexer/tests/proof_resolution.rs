@@ -16187,6 +16187,10 @@ fn assert_ordinary_receiver_refusal(
     assert_eq!(identity.line, call_line);
     assert_eq!(identity.raw_target, call.target);
     eprintln!("{language} {path}:{call_line} pre-proof CALL: {call:#?}");
+    let resolved = call
+        .resolved_target
+        .and_then(|id| nodes.iter().find(|node| node.id == id));
+    eprintln!("independent caller={caller:#?}; resolved declaration={resolved:#?}");
 
     // Do not clear graph resolution metadata: projection refusal must be
     // checked alongside the actual ordinary endpoint emitted by indexing.
