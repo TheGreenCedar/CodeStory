@@ -222,6 +222,28 @@ function searchOutputMode(words) {
   return metadata ? "metadata" : "source";
 }
 
+function directReadOperands(tool, words) {
+  const args = words.slice(1);
+  if (tool === "sed") {
+    if (args[0] === "-n") args.shift();
+    const script = args.shift();
+    if (!/^\d+(?:,\d+)?p$/u.test(script ?? "")) return null;
+  }
+  const paths = [];
+  let options = true;
+  for (const word of args) {
+    if (options && word === "--") {
+      options = false;
+    } else if (options && word.startsWith("-")) {
+      if (tool !== "cat" || !/^-[nbsvET]+$/u.test(word)) return null;
+    } else {
+      if (!word || word === "-") return null;
+      paths.push(normalizedSourcePath(word));
+    }
+  }
+  return paths.length ? [...new Set(paths)] : null;
+}
+
 function transcriptSourceReads(command) {
   if (directBenchmarkCliInvocation(command.command)) return { paths: [], direct: false, indeterminate: false };
   let words = literalShellWords(command.command);
@@ -235,8 +257,10 @@ function transcriptSourceReads(command) {
   if (!words) {
     return { paths: [], indeterminate: Boolean(command.output.trim()), direct: false };
   }
-  const paths = [...new Set(words.slice(1).filter(sourcePath).map(normalizedSourcePath))];
-  if (direct.includes(tool)) return { paths, direct: true, indeterminate: paths.length === 0 };
+  if (direct.includes(tool)) {
+    const paths = directReadOperands(tool, words);
+    return { paths: paths ?? [], direct: true, indeterminate: paths === null };
+  }
   if (!search.includes(tool)) {
     const knownMetadata = ["echo", "printf", "pwd", "true", "false"].includes(tool)
       || (tool === "git" && ["status", "rev-parse", "ls-files"].includes(words[1]));
@@ -245,13 +269,16 @@ function transcriptSourceReads(command) {
   const mode = searchOutputMode(words);
   if (!command.output.trim() || mode === "metadata") return { paths: [], direct: false, indeterminate: false };
   if (mode === "indeterminate") return { paths: [], direct: false, indeterminate: true };
-  const outputPaths = command.output.split(/\r?\n/u).flatMap((line) => {
-    const match = line.match(/^(.+?):(?:\d+:)?(.*)$/u);
-    return match && sourcePath(match[1]) && match[2]
-      ? [normalizedSourcePath(match[1])] : [];
+  const lines = command.output.split(/\r?\n/u).filter(Boolean);
+  const outputPaths = lines.map((line) => {
+    const numbered = line.match(/^(.+?):\d+:(.*)$/u);
+    const prefixed = line.match(/^(.+?):(.*)$/u);
+    const match = numbered ?? (prefixed && sourcePath(prefixed[1]) ? prefixed : null);
+    return match ? normalizedSourcePath(match[1]) : null;
   });
-  if (outputPaths.length) return { paths: [...new Set(outputPaths)], direct: false, indeterminate: false };
-  if (paths.length && command.exit_code === 0) return { paths, direct: false, indeterminate: false };
+  if (outputPaths.every((source) => source !== null)) {
+    return { paths: [...new Set(outputPaths)], direct: false, indeterminate: false };
+  }
   return { paths: [], direct: false, indeterminate: true };
 }
 
