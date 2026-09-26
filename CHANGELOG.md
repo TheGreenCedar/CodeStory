@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Call navigation avoids conditional or shadowed receiver bindings in Ruby, PHP and Python. Relative JavaScript and TypeScript imports prefer an exact name and leave competing declarations unresolved.
+
 - Bash source-call proof refuses function bindings after unknown executable commands or unset effects that can change the function namespace.
 
 - Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.

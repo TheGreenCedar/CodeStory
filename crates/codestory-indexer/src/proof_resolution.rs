@@ -245,17 +245,17 @@ fn ruby_php_resolution_work() -> usize {
     RUBY_PHP_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v16";
+const ADAPTER_VERSION: &str = "reference-v17";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
-const PYTHON_ADAPTER_VERSION: &str = "reference-v18";
+const PYTHON_ADAPTER_VERSION: &str = "reference-v19";
 const RUST_ADAPTER_VERSION: &str = "reference-v20";
-const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v18";
+const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v19";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
 const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v5";
-const RUBY_ADAPTER_VERSION: &str = "reference-v4";
-const PHP_ADAPTER_VERSION: &str = "reference-v3";
+const RUBY_ADAPTER_VERSION: &str = "reference-v5";
+const PHP_ADAPTER_VERSION: &str = "reference-v4";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
@@ -1575,39 +1575,6 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             .map(|method| method.id());
         let child_declarations_static =
             declarations_static && matches!(node.kind(), "program" | "body_statement" | "class");
-        let child_conditional_context = conditional_context
-            || matches!(
-                node.kind(),
-                "if" | "unless"
-                    | "elsif"
-                    | "else"
-                    | "case"
-                    | "when"
-                    | "while"
-                    | "until"
-                    | "for"
-                    | "block"
-                    | "do_block"
-                    | "rescue"
-                    | "ensure"
-                    | "if_modifier"
-                    | "unless_modifier"
-                    | "while_modifier"
-                    | "until_modifier"
-                    | "rescue_modifier"
-                    | "conditional"
-                    | "case_match"
-                    | "in_clause"
-            );
-        // The left operand always runs; only the right operand depends on it.
-        let short_circuit_rhs = (node.kind() == "binary"
-            && node
-                .child_by_field_name("operator")
-                .and_then(|operator| node_text(operator, self.source))
-                .is_some_and(|operator| matches!(operator, "&&" | "||" | "and" | "or")))
-        .then(|| node.child_by_field_name("right"))
-        .flatten()
-        .map(|right| right.id());
         for child in node.named_children(&mut cursor) {
             if call_method == Some(child.id()) {
                 self.observe_call(node, caller, owner_index);
@@ -1625,8 +1592,12 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                     declarations_static: child_declarations_static,
                     declaration_body_entry: child_declaration_body_entry,
                     file_scope_entry: child_file_scope_entry,
-                    conditional_context: child_conditional_context
-                        || short_circuit_rhs == Some(child.id()),
+                    conditional_context: conditional_context
+                        || crate::languages::ruby::execution_child_is_conditional(
+                            node,
+                            child,
+                            self.source,
+                        ),
                 },
             );
         }
@@ -2303,40 +2274,18 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                     | "class_declaration"
                     | "declaration_list"
             );
-        let child_conditional_context = conditional_context
-            || matches!(
-                node.kind(),
-                "if_statement"
-                    | "else_if_clause"
-                    | "else_clause"
-                    | "switch_statement"
-                    | "case_statement"
-                    | "while_statement"
-                    | "do_statement"
-                    | "for_statement"
-                    | "foreach_statement"
-                    | "conditional_expression"
-                    | "match_expression"
-                    | "try_statement"
-                    | "catch_clause"
-                    | "finally_clause"
-            );
-        // A constructor in the short-circuit RHS does not bind every path.
-        let short_circuit_rhs = (node.kind() == "binary_expression"
-            && node
-                .child_by_field_name("operator")
-                .and_then(|operator| node_text(operator, self.source))
-                .is_some_and(|operator| matches!(operator, "&&" | "||" | "and" | "or" | "??")))
-        .then(|| node.child_by_field_name("right"))
-        .flatten()
-        .map(|right| right.id());
         for child in node.named_children(&mut cursor) {
             self.visit(
                 child,
                 caller,
                 owner_index,
                 child_declarations_static,
-                child_conditional_context || short_circuit_rhs == Some(child.id()),
+                conditional_context
+                    || crate::languages::php::execution_child_is_conditional(
+                        node,
+                        child,
+                        self.source,
+                    ),
             );
         }
     }
@@ -2486,8 +2435,7 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                 self.index.poisoned = true;
             }
             if let (true, Some(caller)) = (
-                name.trim_start_matches('\\')
-                    .eq_ignore_ascii_case("extract"),
+                crate::languages::php::is_variable_table_mutation(node, self.source),
                 caller,
             ) {
                 self.latest_variable_table_mutation

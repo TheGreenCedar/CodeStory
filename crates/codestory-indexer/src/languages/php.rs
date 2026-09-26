@@ -446,6 +446,14 @@ fn collect_php_foreach_element_receiver_call_specs(
                 line,
                 method_col,
             });
+            // extract can replace the loop element too. A new foreach binding
+            // after the mutation establishes its own scope, but an older one
+            // cannot recover authority by running this later collector pass.
+            if latest_variable_table_mutation(callable, node, source)
+                .is_some_and(|position| position > foreach_node.start_byte())
+            {
+                return;
+            }
             edges.push(ManualReceiverCallSpec {
                 source_name: call_source.name.to_string(),
                 source_span: call_source.span,
@@ -925,6 +933,7 @@ fn php_visible_local_receiver_owner(
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
 ) -> Option<OptionalReceiverOwnerBinding> {
+    let latest_mutation = latest_variable_table_mutation(callable, call_node, source);
     let mut visible_bindings = Vec::new();
     walk_tree_nodes(callable, &mut |node| {
         if node.kind() != "assignment_expression" {
@@ -932,6 +941,7 @@ fn php_visible_local_receiver_owner(
         }
         if !receiver_call_belongs_to_callable(node, callable)
             || node.end_byte() > call_node.start_byte()
+            || latest_mutation.is_some_and(|position| node.start_byte() < position)
         {
             return;
         }
@@ -941,18 +951,99 @@ fn php_visible_local_receiver_owner(
         if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
             return;
         }
-        let owner = node.child_by_field_name("right").and_then(|right_node| {
-            php_direct_new_owner(
-                right_node,
-                source,
-                visible_type_names,
-                imported_type_bindings,
-            )
-        });
+        let owner = (!php_assignment_is_conditional(node, callable, source))
+            .then(|| {
+                node.child_by_field_name("right").and_then(|right_node| {
+                    php_direct_new_owner(
+                        right_node,
+                        source,
+                        visible_type_names,
+                        imported_type_bindings,
+                    )
+                })
+            })
+            .flatten();
         visible_bindings.push((node.end_byte(), owner));
     });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
+    match visible_bindings.as_slice() {
+        [] => latest_mutation.map(|_| None),
+        [(_, owner)] => Some(owner.clone()),
+        _ => Some(None),
+    }
+}
+
+fn latest_variable_table_mutation(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    source: &str,
+) -> Option<usize> {
+    let mut latest = None;
+    walk_tree_nodes(callable, &mut |node| {
+        if is_variable_table_mutation(node, source)
+            && receiver_call_belongs_to_callable(node, callable)
+            && node.end_byte() <= call_node.start_byte()
+        {
+            latest = Some(latest.map_or(node.start_byte(), |position: usize| {
+                position.max(node.start_byte())
+            }));
+        }
+    });
+    latest
+}
+
+pub(crate) fn is_variable_table_mutation(node: TsNode<'_>, source: &str) -> bool {
+    node.kind() == "function_call_expression"
+        && node
+            .child_by_field_name("function")
+            .and_then(|function| trimmed_node_text(function, source))
+            .is_some_and(|name| {
+                name.trim_start_matches('\\')
+                    .eq_ignore_ascii_case("extract")
+            })
+}
+
+pub(crate) fn execution_child_is_conditional(
+    parent: TsNode<'_>,
+    child: TsNode<'_>,
+    source: &str,
+) -> bool {
+    matches!(
+        parent.kind(),
+        "if_statement"
+            | "else_if_clause"
+            | "else_clause"
+            | "switch_statement"
+            | "case_statement"
+            | "while_statement"
+            | "do_statement"
+            | "for_statement"
+            | "foreach_statement"
+            | "conditional_expression"
+            | "match_expression"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+    ) || (parent.kind() == "binary_expression"
+        && parent
+            .child_by_field_name("operator")
+            .and_then(|operator| trimmed_node_text(operator, source))
+            .is_some_and(|operator| matches!(operator.as_str(), "&&" | "||" | "and" | "or" | "??"))
+        && parent
+            .child_by_field_name("right")
+            .is_some_and(|right| right.id() == child.id()))
+}
+
+fn php_assignment_is_conditional(mut node: TsNode<'_>, callable: TsNode<'_>, source: &str) -> bool {
+    while let Some(parent) = node.parent() {
+        if same_ts_span(parent, callable) {
+            break;
+        }
+        if execution_child_is_conditional(parent, node, source) {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn php_direct_new_owner(
