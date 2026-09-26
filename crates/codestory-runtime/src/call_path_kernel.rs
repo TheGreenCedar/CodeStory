@@ -4221,6 +4221,27 @@ pub fn project_internal_call_path_result(
     project_compact_or_budget(complete)
 }
 
+// Exercise the compact boundary independently when an earlier checked guard fails.
+// Callers supply parser/Store-built facts; this helper never exists in product builds.
+#[cfg(test)]
+pub(crate) fn project_built_receipts_for_test(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    built: BuiltCallPathFacts,
+) -> Result<InternalProjection, InternalProjectionError> {
+    let disposition = integrate_built_disposition(contract, hashes, &built);
+    let authoritative_receipts = built.receipts.clone();
+    project_internal_call_path_result(&CheckedBuiltCallPathIntegration {
+        contract: contract.clone(),
+        hashes: hashes.clone(),
+        rendering: rendering.clone(),
+        built,
+        disposition,
+        authoritative_receipts,
+    })
+}
+
 pub fn project_translation_unknown_result(
     spec: &CallPathSpec,
     hashes: &ProofHashes,

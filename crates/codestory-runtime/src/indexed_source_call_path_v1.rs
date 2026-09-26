@@ -2625,6 +2625,258 @@ mod tests {
         }
     }
 
+    struct SealedDependencyOrderCase {
+        fixture: SourceBuiltFixture,
+        caller: Node,
+        target: Node,
+        fact: CallResolutionFact,
+    }
+
+    fn sealed_dependency_order_case(
+        language: &str,
+        source_after_target: bool,
+    ) -> SealedDependencyOrderCase {
+        let (
+            target_path,
+            caller_directory,
+            extension,
+            target_source,
+            caller_source,
+            caller_name,
+            target_name,
+        ) = match language {
+            "ruby" => (
+                "lib/worker.rb",
+                "lib",
+                "rb",
+                "class Worker\n  def target\n  end\nend\n",
+                "require_relative \"worker\"\ndef caller\n  worker = Worker.new\n  worker.target\nend\n",
+                "caller",
+                "target",
+            ),
+            "php" => (
+                "src/Lib/Worker.php",
+                "src/App",
+                "php",
+                "<?php\nnamespace Lib;\nclass Worker { public function target() {} }\n",
+                "<?php\nnamespace App;\nuse Lib\\Worker as W;\nfunction caller(W $worker) { $worker->target(); }\n",
+                "caller",
+                "target",
+            ),
+            "csharp" => (
+                "src/Lib/Worker.cs",
+                "src/App",
+                "cs",
+                "namespace Lib; public sealed class Worker { public void Target() {} }\n",
+                "using WorkerAlias = Lib.Worker;\nnamespace App;\nstatic class Calls { public static void Caller(WorkerAlias worker) { worker.Target(); } }\n",
+                "Caller",
+                "Target",
+            ),
+            "swift" => (
+                "Sources/WorkerModule/Worker.swift",
+                "Sources/App",
+                "swift",
+                "public struct Worker { public func target() {} }\n",
+                "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                "caller",
+                "target",
+            ),
+            "dart" => (
+                "lib/worker.dart",
+                "lib",
+                "dart",
+                "void target() {}\n",
+                "import 'worker.dart' show target;\nvoid caller() { target(); }\n",
+                "caller",
+                "target",
+            ),
+            _ => panic!("unsupported dependency-order fixture {language}"),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let target_path = root.join(target_path);
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, target_source).unwrap();
+        // Select ordinary source paths with the requested actual parser file-ID order.
+        // This controls identity spelling, never remaps or hand-seals a receipt.
+        let parser_file_id = |path: &Path| {
+            let path = path.to_string_lossy().replace('\\', "/");
+            #[cfg(windows)]
+            let path = path.to_lowercase();
+            codestory_indexer::generate_id(&format!("{path}:{path}:1"))
+        };
+        let target_file_id = parser_file_id(&target_path);
+        let source_path = (0..4096)
+            .map(|index| {
+                root.join(caller_directory)
+                    .join(format!("caller_{index}.{extension}"))
+            })
+            .find(|path| {
+                (parser_file_id(path) > target_file_id) == source_after_target
+                    && parser_file_id(path) != target_file_id
+            })
+            .expect("ordinary path spelling realizes either file-ID order");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, caller_source).unwrap();
+        let mut store = Store::new_in_memory().unwrap();
+        WorkspaceIndexer::new(root.clone())
+            .run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: vec![target_path.clone(), source_path.clone()],
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .unwrap();
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "dependency-order-generation-1".to_owned(),
+            run_id: "dependency-order-run-1".to_owned(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        rematerialize_proof_resolution_projection(&mut store, &publication).unwrap();
+        store
+            .validate_proof_resolution_publication(&publication)
+            .unwrap();
+        let caller = source_callable(&store, caller_name);
+        let target = source_callable(&store, target_name);
+        assert_eq!(target.file_node_id.unwrap().0, target_file_id);
+        assert_eq!(
+            (caller.file_node_id.unwrap().0 > target_file_id),
+            source_after_target
+        );
+        let facts = store.get_proof_resolution_facts().unwrap();
+        let matching = facts
+            .into_iter()
+            .filter(|fact| {
+                fact.caller == caller.id
+                    && fact.target == Some(target.id)
+                    && fact.status == ProofResolutionStatus::Exact
+            })
+            .collect::<Vec<_>>();
+        let [fact] = matching.as_slice() else {
+            panic!("{language} fixture must produce one actual exact fact: {matching:#?}")
+        };
+        // Expected order comes from source/target identity, not the policy under test.
+        assert_eq!(
+            fact.provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id)
+                .collect::<Vec<_>>(),
+            vec![
+                FileId(caller.file_node_id.unwrap().0),
+                FileId(target_file_id)
+            ]
+        );
+        assert_eq!(seal_call_resolution_fact(fact.clone()).unwrap(), *fact);
+        let fact = fact.clone();
+        let fixture = SourceBuiltFixture {
+            _root: temp,
+            root: root.clone(),
+            source_path,
+            store,
+            publication,
+            project_id: project_identity_v3(&root).project_id,
+        };
+        SealedDependencyOrderCase {
+            fixture,
+            caller,
+            target,
+            fact,
+        }
+    }
+
+    fn dependency_order_built(
+        case: &SealedDependencyOrderCase,
+    ) -> (
+        BuiltCallPathFacts,
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
+    ) {
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&case.caller), &[canonical_id(&case.target)]);
+        let built = build_from_store(
+            &case.fixture.store,
+            &case.fixture.root,
+            &case.fixture.project_id,
+            &case.fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(built.receipts.len(), 1, "{built:#?}");
+        assert!(
+            built.gaps.is_empty() && built.unavailable.is_empty(),
+            "{built:#?}"
+        );
+        assert_eq!(built.receipts[0].resolution_fact_id, case.fact.fact_id);
+        assert_eq!(
+            built.receipts[0].resolution_provenance,
+            case.fact.provenance
+        );
+        (built, contract, hashes, rendering)
+    }
+
+    #[test]
+    fn sealed_encounter_order_kernel_accepts_actual_ruby_php_facts() {
+        let mut failures = Vec::new();
+        for language in ["ruby", "php"] {
+            for source_after_target in [false, true] {
+                let case = sealed_dependency_order_case(language, source_after_target);
+                let (built, contract, hashes, rendering) = dependency_order_built(&case);
+                let result =
+                    check_built_call_path_integration(&contract, &hashes, &rendering, built);
+                eprintln!(
+                    "{language} source_after_target={source_after_target}: {:?}",
+                    result.as_ref().map(|_| "accepted")
+                );
+                match result {
+                    Ok(checked) => assert!(matches!(
+                        checked.disposition(),
+                        ProofDisposition::ContractProven { .. }
+                    )),
+                    Err(error) => failures.push((language, source_after_target, error)),
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "actual sealed kernel failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn sealed_encounter_order_compact_accepts_actual_ruby_php_facts() {
+        let mut failures = Vec::new();
+        for language in ["ruby", "php"] {
+            for source_after_target in [false, true] {
+                let case = sealed_dependency_order_case(language, source_after_target);
+                let (built, contract, hashes, rendering) = dependency_order_built(&case);
+                let result = crate::call_path_kernel::project_built_receipts_for_test(
+                    &contract, &hashes, &rendering, built,
+                );
+                eprintln!(
+                    "{language} source_after_target={source_after_target}: {:?}",
+                    result.as_ref().map(|_| "accepted")
+                );
+                if let Err(error) = result {
+                    failures.push((language, source_after_target, error));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "actual sealed compact failures: {failures:?}"
+        );
+    }
+
     fn source_callable(store: &Store, terminal_name: &str) -> Node {
         let nodes = store.get_nodes().unwrap();
         let mut matches = nodes
