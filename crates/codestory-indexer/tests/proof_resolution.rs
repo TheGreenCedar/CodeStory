@@ -5551,6 +5551,473 @@ fn inferred_cpp_headers_rematerialize_with_the_indexed_parser_provenance() -> an
     Ok(())
 }
 
+fn assert_python_member_identity(
+    source: &str,
+    call_line: u32,
+    declaration_line: u32,
+    owner_line: u32,
+    exact: bool,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[("main.py", source)])?;
+    let nodes = store.get_nodes()?;
+    let file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("main.py"))
+        .expect("Python file");
+    let owner = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(file.id))
+                && node.kind == NodeKind::CLASS
+                && node.start_line == Some(owner_line)
+        })
+        .expect("independent class owner");
+    let member = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(file.id))
+                && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                && node.start_line == Some(declaration_line)
+                && node.serialized_name.ends_with("target")
+        })
+        .expect("independent target declaration");
+    let edges = store.get_edges()?;
+    assert!(
+        edges.iter().any(|edge| edge.kind == EdgeKind::MEMBER
+            && edge.effective_source() == owner.id
+            && edge.effective_target() == member.id),
+        "independent owner/member relation"
+    );
+    let calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(file.id))
+                && edge.line == Some(call_line)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name.ends_with("target"))
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("one ordinary CALL required: {calls:#?}");
+    };
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary CALL identity"),
+    )
+    .expect("canonical ordinary CALL identity");
+    assert_eq!(identity.file_id, FileId(file.id));
+    assert_eq!(identity.line, call_line);
+    assert_eq!(identity.raw_target, call.target);
+    assert!(nodes.iter().any(|node| node.id == call.effective_source()
+        && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && node.serialized_name.ends_with("caller")));
+    eprintln!(
+        "Python pre-proof line{call_line}: resolved={:?} certainty={:?}",
+        call.resolved_target, call.certainty
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == "python"
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("one nonempty Python target fact required: {facts:#?}");
+    };
+    eprintln!(
+        "Python post-proof line{call_line}: status={:?} target={:?}",
+        fact.status, fact.target
+    );
+    if exact {
+        assert_nominal_exact_target(
+            &store,
+            project.path(),
+            fact,
+            "main.py",
+            declaration_line,
+            Some(owner_line),
+        )?;
+    } else {
+        assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
+        assert_eq!(
+            store
+                .get_edges()?
+                .into_iter()
+                .find(|edge| edge.id == call.id)
+                .as_ref(),
+            Some(*call),
+            "nonexact proof must not upgrade ordinary CALL; existing endpoints belong to F9"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn python_class_function_namespace_collision_refuses_constructor_proof() -> anyhow::Result<()> {
+    let source = concat!(
+        "class Worker:\n    def target(self):\n        pass\n",
+        "class Other:\n    def target(self):\n        pass\n",
+        "def Worker():\n    return Other()\n",
+        "def caller():\n    worker = Worker()\n    worker.target()\n",
+    );
+    assert_python_member_identity(source, 11, 2, 1, false)
+}
+
+#[test]
+fn python_module_setattr_delattr_refuse_member_proof() -> anyhow::Result<()> {
+    for mutation in [
+        "setattr(Worker, 'target', replacement)",
+        "delattr(Worker, 'target')",
+    ] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\ndef replacement(self):\n    pass\n{mutation}\n"
+        );
+        assert_python_member_identity(&source, 5, 2, 1, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn python_namespace_collision_order_and_unshadowed_controls() -> anyhow::Result<()> {
+    assert_python_member_identity(
+        concat!(
+            "def Worker():\n    return Other()\n",
+            "class Other:\n    def target(self):\n        pass\n",
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
+        ),
+        11,
+        7,
+        6,
+        false,
+    )?;
+    // A call declared before the later factory still cannot certify a unique
+    // module constructor under the deliberately order-independent policy.
+    assert_python_member_identity(
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
+            "def Worker():\n    return None\n",
+        ),
+        6,
+        2,
+        1,
+        false,
+    )?;
+    for suffix in [
+        "",
+        "def unrelated():\n    def Worker():\n        pass\n",
+        "class Other:\n    def target(self):\n        pass\n",
+    ] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    worker.target()\n{suffix}"
+        );
+        assert_python_member_identity(&source, 6, 2, 1, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn python_module_execution_mutation_matrix() -> anyhow::Result<()> {
+    for mutation in [
+        "setattr(Worker, 'target', replacement)",
+        "delattr(Worker, 'target')",
+        "setattr(Worker, name, replacement)",
+        "delattr(Worker, name)",
+        "setattr(Worker, 'tar' + 'get', replacement)",
+        "setattr((Worker), 'target', replacement)",
+        "setattr(Worker, '\\x74arget', replacement)",
+        "Worker.target = replacement",
+        "Worker.target += replacement",
+        "del Worker.target",
+        "if flag:\n    setattr(Worker, 'target', replacement)",
+        "if flag:\n    delattr(Worker, name)",
+        "for value in values:\n    setattr(Worker, 'target', replacement)",
+        "while flag:\n    delattr(Worker, 'target')",
+        "try:\n    Worker.target = replacement\nexcept Exception:\n    pass",
+        "with resource():\n    del Worker.target",
+        "def setattr(*args):\n    pass\nsetattr(Worker, 'target', replacement)",
+        "from foreign import delattr\ndelattr(Worker, 'target')",
+        "class Other:\n    setattr(Worker, 'target', replacement)",
+        "class Other:\n    del Worker.target",
+        "def later(value=setattr(Worker, 'target', replacement)):\n    pass",
+        "@setattr(Worker, 'target', replacement)\ndef later():\n    pass",
+        "class Other:\n    def later(self, value=delattr(Worker, 'target')):\n        pass",
+        "callback = lambda value=setattr(Worker, 'target', replacement): None",
+        "setattr(*(Worker, 'target', replacement))",
+        "delattr(*(Worker, 'target'))",
+        "setattr(**options)",
+        "alias = Worker\nsetattr(alias, 'target', replacement)",
+    ] {
+        eprintln!("module mutation: {mutation}");
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\ndef replacement(self):\n    pass\n{mutation}\n"
+        );
+        assert_python_member_identity(&source, 5, 2, 1, false)?;
+    }
+    for read_only in [
+        "getattr(Worker, 'target')",
+        "setattr(Worker, 'other', replacement)",
+        "delattr(Worker, 'other')",
+        "class Other:\n    def target(self):\n        pass\nsetattr(Other, 'target', replacement)",
+        "def unrelated():\n    setattr(Worker, 'target', replacement)",
+        "def unrelated():\n    delattr(Worker, 'target')",
+        "callback = lambda: setattr(Worker, 'target', replacement)",
+        "if flag:\n    getattr(Worker, 'target')",
+        "class Other:\n    def unrelated(self):\n        setattr(Worker, 'target', replacement)",
+        "def unrelated():\n    class Other:\n        setattr(Worker, 'target', replacement)",
+        "def unrelated():\n    def later(value=setattr(Worker, 'target', replacement)):\n        pass",
+    ] {
+        eprintln!("module positive: {read_only}");
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\ndef replacement(self):\n    pass\n{read_only}\n"
+        );
+        assert_python_member_identity(&source, 5, 2, 1, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn python_import_namespace_and_mutated_export_controls() -> anyhow::Result<()> {
+    for mutation in [
+        "setattr(Worker, 'target', replacement)",
+        "delattr(Worker, name)",
+        "def Worker():\n    pass",
+    ] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\ndef replacement(self):\n    pass\n{mutation}\n"
+        );
+        assert_python_target_has_closed_status(
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", &source),
+                (
+                    "pkg/main.py",
+                    "from .target import Worker\ndef caller():\n    worker = Worker()\n    worker.target()\n",
+                ),
+            ],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    for source in [
+        "from .target import Worker\nclass Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    worker.target()\n",
+        "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    worker.target()\nfrom .target import Worker\n",
+    ] {
+        assert_python_target_has_closed_status(
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/target.py",
+                    "class Worker:\n    def target(self):\n        pass\n",
+                ),
+                ("pkg/main.py", source),
+            ],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_python_namespace_and_mutation_cache_refuses_replay_and_reparses() -> anyhow::Result<()> {
+    for (name, hostile_source, call_line, member_line, owner_line, constructor) in [
+        (
+            "namespace",
+            concat!(
+                "class Worker:\n    def target(self):\n        pass\n",
+                "def Worker():\n    return None\n",
+                "def caller():\n    worker = Worker()\n    worker.target()\n",
+            ),
+            8,
+            2,
+            1,
+            true,
+        ),
+        (
+            "mutation",
+            concat!(
+                "class Worker:\n    def target(self):\n        pass\n",
+                "    def caller(self):\n        self.target()\n",
+                "def replacement(self):\n    pass\n",
+                "setattr(Worker, 'target', replacement)\n",
+            ),
+            5,
+            2,
+            1,
+            false,
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let source = format!(
+            "{hostile_source}class Safe:\n    def target(self):\n        pass\n    def safe_caller(self):\n        self.target()\n"
+        );
+        let safe_owner_line = hostile_source.lines().count() as u32 + 1;
+        let safe_member_line = safe_owner_line + 1;
+        let safe_call_line = safe_owner_line + 4;
+        let paths = index_files(project.path(), &mut store, &[("main.py", &source)])?;
+        let source_before = fs::read(&paths[0])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let before = store.get_proof_resolution_facts()?;
+        let hostile = before
+            .iter()
+            .find(|fact| fact.callsite.line == call_line && fact.callsite.raw_target == "target")
+            .expect("initial hostile fact");
+        assert_eq!(
+            hostile.status,
+            ProofResolutionStatus::Unsupported,
+            "{name}: {hostile:#?}"
+        );
+        let safe = before
+            .iter()
+            .find(|fact| {
+                fact.callsite.line == safe_call_line && fact.callsite.raw_target == "target"
+            })
+            .expect("independent Safe target fact");
+        assert_nominal_exact_target(
+            &store,
+            project.path(),
+            safe,
+            "main.py",
+            safe_member_line,
+            Some(safe_owner_line),
+        )?;
+        let nodes = store.get_nodes()?;
+        let owner = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::CLASS && node.start_line == Some(owner_line))
+            .expect("original Worker owner");
+        let member = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && node.start_line == Some(member_line)
+            })
+            .expect("original Worker member");
+        let blob = store.get_connection().query_row(
+            "SELECT artifact_blob FROM index_artifact_cache",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        artifact["resolution_file"]["adapter_version"] = "reference-v17".into();
+        artifact["resolution_file"]["poisoned_export_names"] = serde_json::json!([]);
+        let calls = artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls");
+        for call in calls.iter_mut() {
+            call["adapter_version"] = "reference-v17".into();
+        }
+        let stale = calls
+            .iter_mut()
+            .find(|call| {
+                call["callsite"]["line"] == call_line && call["callsite"]["raw_target"] == "target"
+            })
+            .expect("cached hostile input");
+        // Simulate the causally demonstrated pre-F5 semantic payload on these
+        // unchanged bytes; this is not claimed output from an old binary.
+        stale["binding"] = if constructor {
+            serde_json::json!({"kind":"constructor_binding", "class_binding":{"kind":"same_file", "owner":owner.id.0, "owner_name":"Worker"}, "method_name":"target"})
+        } else {
+            serde_json::json!({"kind":"implicit_receiver", "owner":owner.id.0, "declaration":member.id.0, "owner_name":"Worker"})
+        };
+        eprintln!(
+            "{name}: simulated v17 cached input {}",
+            serde_json::to_string(stale)?
+        );
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1",
+            [serde_json::to_vec(&artifact)?],
+        )?;
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("old Python namespace semantics must reject replay");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_proof_resolution_facts()?,
+            before,
+            "rejected old cache preserves prior proof"
+        );
+        assert_eq!(
+            store
+                .get_proof_resolution_publication()?
+                .expect("prior receipt")
+                .core_generation_id,
+            publication(1).generation_id
+        );
+        for (generation, expected_hits) in [(2, 0), (3, 1)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "{name} generation{generation}"
+            );
+            assert_eq!(fs::read(&paths[0])?, source_before);
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            let facts = store.get_proof_resolution_facts()?;
+            let hostile = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.line == call_line && fact.callsite.raw_target == "target"
+                })
+                .expect("nonempty reparsed/reused hostile fact");
+            assert_eq!(
+                hostile.status,
+                ProofResolutionStatus::Unsupported,
+                "{name}: {hostile:#?}"
+            );
+            assert!(
+                hostile.target.is_none()
+                    && hostile.edge_id.is_none()
+                    && hostile.evidence_chain.is_empty()
+            );
+            assert_eq!(hostile.provenance.language_adapter_version, "reference-v18");
+            let safe = facts
+                .iter()
+                .find(|fact| {
+                    fact.callsite.line == safe_call_line && fact.callsite.raw_target == "target"
+                })
+                .expect("unaffected positive fact");
+            assert_nominal_exact_target(
+                &store,
+                project.path(),
+                safe,
+                "main.py",
+                safe_member_line,
+                Some(safe_owner_line),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
@@ -6031,7 +6498,7 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
             static_facts.iter().all(|fact| {
                 fact.status == ProofResolutionStatus::Exact
                     && fact.edge_id.is_some()
-                    && fact.provenance.language_adapter_version == "reference-v17"
+                    && fact.provenance.language_adapter_version == "reference-v18"
             }),
             "read-only getter poisoned {target}: {static_facts:#?}"
         );
@@ -13247,16 +13714,22 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "python")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v17")
+        Some("reference-v18")
     );
-    for language in ["java", "kotlin", "csharp", "swift", "dart"] {
+    for (language, expected) in [
+        ("java", "reference-v4"),
+        ("kotlin", "reference-v3"),
+        ("csharp", "reference-v2"),
+        ("swift", "reference-v3"),
+        ("dart", "reference-v2"),
+    ] {
         assert_eq!(
             receipt
                 .adapter_roster
                 .iter()
                 .find(|adapter| adapter.language == language)
                 .map(|adapter| adapter.adapter_version.as_str()),
-            Some("reference-v2"),
+            Some(expected),
             "{language} must invalidate parser inputs through its explicit adapter identity"
         );
     }
