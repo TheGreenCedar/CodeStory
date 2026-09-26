@@ -340,7 +340,7 @@ pub(crate) struct CachedClassDeclaration {
     pub super_name: Option<String>,
     /// Syntactic non-static declarations used only for conservative JVM refusal.
     /// They remain available when a declaration cannot bind uniquely to a node.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_method_names: Vec<String>,
 }
 
@@ -965,6 +965,25 @@ fn mix_bytes(state: &mut u64, bytes: &[u8]) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn legacy_class_inventory_keeps_empty_refusal_metadata_serialization() -> anyhow::Result<()> {
+        let legacy = br#"{"name":"Worker","declaration":41,"methods":[{"name":"target","declaration":42,"cross_module_visible":true}],"cross_module_visible":true,"runtime_closed":false,"super_name":null}"#;
+        let mut class: CachedClassDeclaration = serde_json::from_slice(legacy)?;
+        assert!(class.instance_method_names.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&class)?,
+            legacy,
+            "unchanged language inventories must keep their prior serialized bytes and fingerprints"
+        );
+        class.instance_method_names.push("target".to_string());
+        let decoded: CachedClassDeclaration = serde_json::from_slice(&serde_json::to_vec(&class)?)?;
+        assert_eq!(
+            decoded, class,
+            "nonempty Java refusal metadata must survive cache persistence"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_artifact_cache_key_is_portable_across_roots() -> anyhow::Result<()> {
