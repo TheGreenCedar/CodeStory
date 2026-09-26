@@ -594,6 +594,12 @@ enum LexicalHitPayload {
     DescriptorOnly,
 }
 
+#[derive(Clone, Copy)]
+struct LexicalCandidateScope<'a> {
+    payload: LexicalHitPayload,
+    shadowed_document_keys_json: Option<&'a str>,
+}
+
 /// A source route may be an admitted in-project alias. Keep that route for
 /// document identity, but seal its resolved regular file. Published artifacts
 /// continue to use ArtifactSeal directly and cannot be terminal symlinks.
@@ -1980,6 +1986,16 @@ fn search_lexical_component_set(
         LexicalHitPayload::DescriptorOnly => lexical_candidate_limit(limit, payload),
         LexicalHitPayload::Full => MAX_CANDIDATES,
     };
+    // The per-component SQL window must see only live rows. Discarding stale
+    // hits after LIMIT can exhaust the whole window before a live row is read.
+    // Bind exact keys (including their embedded NUL) as JSON text so the
+    // read-only component connection needs no writable temporary table.
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    let mut base_shadowed_keys = latest.keys().collect::<Vec<_>>();
+    base_shadowed_keys.sort_unstable();
+    let base_shadowed_json = serde_json::to_string(&base_shadowed_keys)?;
     let base_hits = search_lexical_component(
         shard_dir,
         &component_set.base,
@@ -1987,7 +2003,11 @@ fn search_lexical_component_set(
         component_limit,
         logical_count,
         Arc::clone(&cancelled),
-        payload,
+        LexicalCandidateScope {
+            payload,
+            shadowed_document_keys_json: (base_shadowed_json != "[]")
+                .then_some(base_shadowed_json.as_str()),
+        },
     )?;
     let mut hits = Vec::new();
     for hit in base_hits {
@@ -1997,6 +2017,16 @@ fn search_lexical_component_set(
         }
     }
     for (index, delta) in component_set.deltas.iter().enumerate() {
+        if cancelled() {
+            bail!("lexical search cancelled");
+        }
+        let mut delta_shadowed_keys = delta
+            .upsert_keys
+            .iter()
+            .filter(|key| latest.get(*key) != Some(&Some(index)))
+            .collect::<Vec<_>>();
+        delta_shadowed_keys.sort_unstable();
+        let delta_shadowed_json = serde_json::to_string(&delta_shadowed_keys)?;
         let delta_hits = search_lexical_component(
             shard_dir,
             &delta.component,
@@ -2004,7 +2034,11 @@ fn search_lexical_component_set(
             component_limit,
             logical_count,
             Arc::clone(&cancelled),
-            payload,
+            LexicalCandidateScope {
+                payload,
+                shadowed_document_keys_json: (delta_shadowed_json != "[]")
+                    .then_some(delta_shadowed_json.as_str()),
+            },
         )?;
         for hit in delta_hits {
             let key = lexical_hit_document_key(&hit)?;
@@ -2038,7 +2072,7 @@ fn search_lexical_component(
     limit: usize,
     logical_document_count: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-    payload: LexicalHitPayload,
+    scope: LexicalCandidateScope<'_>,
 ) -> Result<Vec<LexicalHit>> {
     validate_component_descriptor_at(shard_dir, descriptor)?;
     let path = shard_dir.join(&descriptor.file_name);
@@ -2049,14 +2083,14 @@ fn search_lexical_component(
     if metadata != descriptor.metadata {
         bail!("lexical component metadata changed after validation");
     }
-    search_lexical_index_on_connection(
+    search_lexical_index_on_connection_excluding(
         &connection,
         query,
         limit,
         logical_document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
-        payload,
+        scope,
     )
 }
 
@@ -2109,6 +2143,29 @@ fn search_lexical_index_on_connection(
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
+    search_lexical_index_on_connection_excluding(
+        connection,
+        query,
+        limit,
+        document_count,
+        frequency_cache,
+        cancelled,
+        LexicalCandidateScope {
+            payload,
+            shadowed_document_keys_json: None,
+        },
+    )
+}
+
+fn search_lexical_index_on_connection_excluding(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+    document_count: usize,
+    frequency_cache: &mut HashMap<String, usize>,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+    scope: LexicalCandidateScope<'_>,
+) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
     }
@@ -2124,7 +2181,7 @@ fn search_lexical_index_on_connection(
         .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let candidate_limit = lexical_candidate_limit(limit, payload);
+    let candidate_limit = lexical_candidate_limit(limit, scope.payload);
 
     let mandatory_tokens = quoted_query_tokens(query);
     let mut token_frequencies = Vec::with_capacity(tokens.len());
@@ -2158,41 +2215,40 @@ fn search_lexical_index_on_connection(
     // the documented two-of-three or forty-percent admission contracts.
     let required_match_count = required_lexical_match_count(tokens.len());
     let representation = lexical_database_representation(connection)?;
-
     let exact_candidates = query_exact_candidates(
         connection,
         query,
         candidate_limit,
-        payload,
         representation,
         cancelled,
+        scope,
     )?;
     let path_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
-        payload,
         representation,
         cancelled,
+        scope,
     )?;
     let content_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Content,
-        payload,
         representation,
         cancelled,
+        scope,
     )?;
     let mut symbol_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::SymbolDocument,
-        payload,
         representation,
         cancelled,
+        scope,
     )?;
     rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
 
@@ -2218,7 +2274,7 @@ fn search_lexical_index_on_connection(
         content_candidates,
         symbol_candidates,
     ]));
-    if payload == LexicalHitPayload::Full {
+    if scope.payload == LexicalHitPayload::Full {
         // The FTS lanes may return the same source row several times. Only the
         // first MAX_CANDIDATES distinct rows can enter the coverage gate, so
         // read their FTS bodies once and defer stored-source decoding until a
@@ -2285,7 +2341,7 @@ fn search_lexical_index_on_connection(
         {
             let (target, matched_line, source_excerpt) = if candidate.document.source
                 == LexicalDocumentSource::LexicalSource
-                && payload == LexicalHitPayload::Full
+                && scope.payload == LexicalHitPayload::Full
             {
                 let content = read_admitted_source_content(
                     connection,
@@ -2463,14 +2519,33 @@ fn populate_full_candidate_content(
     Ok(())
 }
 
+fn lexical_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LexicalCandidate> {
+    let document = LexicalDocument {
+        path: row.get(1)?,
+        content: String::new(),
+        source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+        })?,
+        node_id: row.get(6)?,
+        symbol_name: row.get(7)?,
+        start_line: row.get(8)?,
+    };
+    Ok(LexicalCandidate {
+        row_id: row.get(0)?,
+        document,
+        normalized_path: row.get(3)?,
+        normalized_content: row.get(4)?,
+    })
+}
+
 fn query_fts_candidates(
     connection: &Connection,
     fts_query: &str,
     candidate_limit: usize,
     order: LexicalCandidateOrder,
-    payload: LexicalHitPayload,
     representation: LexicalDatabaseRepresentation,
     cancelled: &dyn Fn() -> bool,
+    scope: LexicalCandidateScope<'_>,
 ) -> Result<Vec<LexicalCandidate>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -2481,121 +2556,141 @@ fn query_fts_candidates(
             format!("content : ({fts_query})")
         }
     };
-    let sql = match (order, payload) {
+    let shadow_clause = scope.shadowed_document_keys_json.map_or(
+        "",
+        |_| "AND d.document_key NOT IN (SELECT value FROM json_each(?3))",
+    );
+    let sql = match (order, scope.payload) {
         (LexicalCandidateOrder::Path, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::Path, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::Content, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::Content, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full)
             if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 =>
         {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line,
                     d.content_codec, d.content_decoded_bytes
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::Path, LexicalHitPayload::DescriptorOnly) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::Content, LexicalHitPayload::DescriptorOnly) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
         (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::DescriptorOnly) => {
-            "SELECT d.id, d.path, '', lexical_fts.path, '',
+            format!(
+                "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
              WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+               {shadow_clause}
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
+            )
         }
     };
-    let mut statement = connection.prepare_cached(sql)?;
-    let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
-        let document = LexicalDocument {
-            path: row.get(1)?,
-            content: String::new(),
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Text,
-                    error.into(),
-                )
-            })?,
-            node_id: row.get(6)?,
-            symbol_name: row.get(7)?,
-            start_line: row.get(8)?,
-        };
-        Ok(LexicalCandidate {
-            row_id: row.get(0)?,
-            document,
-            normalized_path: row.get(3)?,
-            normalized_content: row.get(4)?,
-        })
-    })?;
+    let mut statement = connection.prepare_cached(&sql)?;
+    let rows = if let Some(shadowed_keys) = scope.shadowed_document_keys_json {
+        statement.query_map(
+            params![scoped_query, candidate_limit as i64, shadowed_keys],
+            lexical_candidate_from_row,
+        )?
+    } else {
+        statement.query_map(
+            params![scoped_query, candidate_limit as i64],
+            lexical_candidate_from_row,
+        )?
+    };
     let mut candidates = Vec::new();
     for row in rows {
         if cancelled() {
@@ -2610,9 +2705,9 @@ fn query_exact_candidates(
     connection: &Connection,
     query: &str,
     candidate_limit: usize,
-    payload: LexicalHitPayload,
     representation: LexicalDatabaseRepresentation,
     cancelled: &dyn Fn() -> bool,
+    scope: LexicalCandidateScope<'_>,
 ) -> Result<Vec<LexicalCandidate>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -2630,74 +2725,74 @@ fn query_exact_candidates(
     needles.dedup();
 
     let mut candidates = Vec::new();
-    let sql = match payload {
+    let shadow_clause = scope.shadowed_document_keys_json.map_or(
+        "",
+        |_| "AND d.document_key NOT IN (SELECT value FROM json_each(?3))",
+    );
+    let sql = match scope.payload {
         LexicalHitPayload::Full if representation.schema_version == LEXICAL_DATABASE_SCHEMA_V3 => {
-            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
+            format!(
+                "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
                 d.source, d.node_id, d.symbol_name, d.start_line,
                 d.content_codec, d.content_decoded_bytes
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
-         WHERE lower(d.path) = ?1
+         WHERE (lower(d.path) = ?1
             OR lower(d.symbol_name) = ?1
             OR lower(d.symbol_name) LIKE '%::' || ?1
-            OR lower(d.symbol_name) LIKE '%.' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1)
+           {shadow_clause}
          ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
          LIMIT ?2"
+            )
         }
         LexicalHitPayload::Full => {
-            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
+            format!(
+                "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
-         WHERE lower(d.path) = ?1
+         WHERE (lower(d.path) = ?1
             OR lower(d.symbol_name) = ?1
             OR lower(d.symbol_name) LIKE '%::' || ?1
-            OR lower(d.symbol_name) LIKE '%.' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1)
+           {shadow_clause}
          ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
          LIMIT ?2"
+            )
         }
         LexicalHitPayload::DescriptorOnly => {
-            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
+            format!(
+                "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
-         WHERE lower(d.path) = ?1
+         WHERE (lower(d.path) = ?1
             OR lower(d.symbol_name) = ?1
             OR lower(d.symbol_name) LIKE '%::' || ?1
-            OR lower(d.symbol_name) LIKE '%.' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1)
+           {shadow_clause}
          ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
          LIMIT ?2"
+            )
         }
     };
-    let mut statement = connection.prepare_cached(sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     for needle in needles {
         if cancelled() {
             bail!("lexical search cancelled");
         }
-        let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
-            let document = LexicalDocument {
-                path: row.get(1)?,
-                content: String::new(),
-                source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(
-                    |error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            error.into(),
-                        )
-                    },
-                )?,
-                node_id: row.get(6)?,
-                symbol_name: row.get(7)?,
-                start_line: row.get(8)?,
-            };
-            Ok(LexicalCandidate {
-                row_id: row.get(0)?,
-                document,
-                normalized_path: row.get(3)?,
-                normalized_content: row.get(4)?,
-            })
-        })?;
+        let rows = if let Some(shadowed_keys) = scope.shadowed_document_keys_json {
+            statement.query_map(
+                params![needle, candidate_limit as i64, shadowed_keys],
+                lexical_candidate_from_row,
+            )?
+        } else {
+            statement.query_map(
+                params![needle, candidate_limit as i64],
+                lexical_candidate_from_row,
+            )?
+        };
         for row in rows {
             if cancelled() {
                 bail!("lexical search cancelled");
@@ -5076,6 +5171,244 @@ mod tests {
                     .iter()
                     .map(|hit| (&hit.path, hit.source, hit.node_id.as_deref()))
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_search_ignores_shadowed_rows_before_component_limit() {
+        const DOCUMENTS: usize = 10_000;
+        const SHADOWED: usize = DESCRIPTOR_MAX_CANDIDATES;
+        const RESULT_LIMIT: usize = 64;
+        assert_eq!(
+            lexical_candidate_limit(RESULT_LIMIT, LexicalHitPayload::DescriptorOnly),
+            SHADOWED,
+            "fixture must saturate the production descriptor component window"
+        );
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("incremental");
+        let mut documents = (0..DOCUMENTS)
+            .map(|index| source_document(&format!("src/doc_{index:05}.rs"), "shadowtoken"))
+            .collect::<Vec<_>>();
+        let initial = prepared_documents(documents.clone());
+        build_prepared_lexical_shard(&data, "base", &initial, "input-base", None, || Ok(()))
+            .expect("base shard");
+
+        for document in documents.iter_mut().take(SHADOWED) {
+            document.content = "quiettoken".into();
+        }
+        let current = prepared_documents(documents);
+        let (_, work) = build_prepared_lexical_shard(
+            &data,
+            "delta",
+            &current,
+            "input-delta",
+            Some("base"),
+            || Ok(()),
+        )
+        .expect("one incremental delta");
+        let work = work.expect("incremental publication");
+        assert_eq!(work.inserted, SHADOWED as u64);
+        let incremental_shard = shard_dir_for(&data, "delta");
+        let component_set =
+            read_lexical_component_set(&incremental_shard, Some("delta"), Some("input-delta"))
+                .expect("read component set")
+                .expect("incremental component set");
+        assert_eq!(component_set.deltas.len(), 1);
+        assert_eq!(component_set.deltas[0].upsert_keys.len(), SHADOWED);
+        assert!(
+            !lexical_component_set_needs_compaction(&component_set),
+            "one small delta must not rely on background compaction"
+        );
+
+        let clean_data = root.path().join("clean");
+        build_prepared_lexical_shard(&clean_data, "clean", &current, "input-clean", None, || {
+            Ok(())
+        })
+        .expect("clean shard");
+        let clean = search_lexical_index_descriptors_with_cancel(
+            &shard_dir_for(&clean_data, "clean"),
+            "input-clean",
+            "shadowtoken",
+            RESULT_LIMIT,
+            || false,
+        )
+        .expect("clean descriptor search");
+        assert_eq!(clean.len(), RESULT_LIMIT);
+        assert_eq!(clean[0].path, "src/doc_00256.rs");
+        let incremental = search_lexical_index_descriptors_with_cancel(
+            &incremental_shard,
+            "input-delta",
+            "shadowtoken",
+            RESULT_LIMIT,
+            || false,
+        )
+        .expect("incremental descriptor search");
+        assert_eq!(
+            incremental.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+            clean.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+            "a saturated stale base window must not hide unchanged logical documents"
+        );
+    }
+
+    #[test]
+    fn full_search_ignores_shadowed_rows_before_background_compaction() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("incremental");
+        let mut documents = (0..MAX_CANDIDATES + 64)
+            .map(|index| source_document(&format!("src/doc_{index:05}.rs"), "shadowtoken"))
+            .collect::<Vec<_>>();
+        let initial = prepared_documents(documents.clone());
+        build_prepared_lexical_shard(&data, "base", &initial, "input-base", None, || Ok(()))
+            .expect("base shard");
+        for document in documents.iter_mut().take(MAX_CANDIDATES) {
+            document.content = "quiettoken".into();
+        }
+        let current = prepared_documents(documents);
+        build_prepared_lexical_shard(
+            &data,
+            "delta",
+            &current,
+            "input-delta",
+            Some("base"),
+            || Ok(()),
+        )
+        .expect("incremental shard");
+        let incremental_shard = shard_dir_for(&data, "delta");
+        let component_set =
+            read_lexical_component_set(&incremental_shard, Some("delta"), Some("input-delta"))
+                .expect("read component set")
+                .expect("incremental component set");
+        assert_eq!(component_set.deltas.len(), 1);
+        assert_eq!(component_set.deltas[0].upsert_keys.len(), MAX_CANDIDATES);
+        assert!(
+            lexical_component_set_needs_compaction(&component_set),
+            "this tests the published state before asynchronous compaction finishes"
+        );
+
+        let clean_data = root.path().join("clean");
+        build_prepared_lexical_shard(&clean_data, "clean", &current, "input-clean", None, || {
+            Ok(())
+        })
+        .expect("clean shard");
+        let clean = search_lexical_index(
+            &shard_dir_for(&clean_data, "clean"),
+            "input-clean",
+            "shadowtoken",
+            64,
+        )
+        .expect("clean full search");
+        assert_eq!(clean.len(), 64);
+        assert_eq!(clean[0].path, "src/doc_04096.rs");
+        let incremental =
+            search_lexical_index(&incremental_shard, "input-delta", "shadowtoken", 64)
+                .expect("incremental full search");
+        assert_eq!(
+            incremental.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+            clean.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+            "full search must find live rows beyond its stale component window"
+        );
+    }
+
+    #[test]
+    fn component_search_respects_latest_delta_and_tombstone_ownership() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("incremental");
+        let initial = prepared_documents(vec![
+            source_document("src/a.rs", "shadowtoken"),
+            source_document("src/b.rs", "shadowtoken"),
+            source_document("src/c.rs", "shadowtoken"),
+            source_document("src/d.rs", "shadowtoken"),
+        ]);
+        build_prepared_lexical_shard(&data, "base", &initial, "input-base", None, || Ok(()))
+            .expect("base shard");
+        let first = prepared_documents(vec![
+            source_document("src/a.rs", "quiettoken"),
+            source_document("src/c.rs", "shadowtoken"),
+            source_document("src/d.rs", "shadowtoken"),
+            source_document("src/e.rs", "shadowtoken"),
+        ]);
+        build_prepared_lexical_shard(&data, "first", &first, "input-first", Some("base"), || {
+            Ok(())
+        })
+        .expect("first delta");
+        let current = prepared_documents(vec![
+            source_document("src/a.rs", "shadowtoken"),
+            source_document("src/d.rs", "shadowtoken"),
+            source_document("src/e.rs", "quiettoken"),
+            source_document("src/f.rs", "shadowtoken"),
+        ]);
+        build_prepared_lexical_shard(
+            &data,
+            "second",
+            &current,
+            "input-second",
+            Some("first"),
+            || Ok(()),
+        )
+        .expect("second delta");
+        let incremental_shard = shard_dir_for(&data, "second");
+        let component_set =
+            read_lexical_component_set(&incremental_shard, Some("second"), Some("input-second"))
+                .expect("read component set")
+                .expect("second component set");
+        assert_eq!(component_set.deltas.len(), 2);
+        assert!(
+            component_set.deltas[0]
+                .tombstone_keys
+                .iter()
+                .any(|key| key.ends_with("src/b.rs"))
+        );
+        assert!(
+            component_set.deltas[1]
+                .tombstone_keys
+                .iter()
+                .any(|key| key.ends_with("src/c.rs"))
+        );
+
+        let clean_data = root.path().join("clean");
+        build_prepared_lexical_shard(&clean_data, "clean", &current, "input-clean", None, || {
+            Ok(())
+        })
+        .expect("clean shard");
+        let clean_shard = shard_dir_for(&clean_data, "clean");
+        for (payload, search, clean) in [
+            (
+                "descriptor",
+                search_lexical_index_descriptors_with_cancel(
+                    &incremental_shard,
+                    "input-second",
+                    "shadowtoken",
+                    64,
+                    || false,
+                )
+                .expect("incremental descriptor search"),
+                search_lexical_index_descriptors_with_cancel(
+                    &clean_shard,
+                    "input-clean",
+                    "shadowtoken",
+                    64,
+                    || false,
+                )
+                .expect("clean descriptor search"),
+            ),
+            (
+                "full",
+                search_lexical_index(&incremental_shard, "input-second", "shadowtoken", 64)
+                    .expect("incremental full search"),
+                search_lexical_index(&clean_shard, "input-clean", "shadowtoken", 64)
+                    .expect("clean full search"),
+            ),
+        ] {
+            let mut paths = search.into_iter().map(|hit| hit.path).collect::<Vec<_>>();
+            let mut clean_paths = clean.into_iter().map(|hit| hit.path).collect::<Vec<_>>();
+            paths.sort();
+            clean_paths.sort();
+            assert_eq!(paths, clean_paths, "{payload}: incremental/clean drift");
+            assert_eq!(
+                paths,
+                ["src/a.rs", "src/d.rs", "src/f.rs"],
+                "{payload}: stale, tombstoned or missing latest document"
             );
         }
     }
