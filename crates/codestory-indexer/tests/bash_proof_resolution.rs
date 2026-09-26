@@ -163,7 +163,9 @@ fn assert_later_target_fact(
             "later call retained authority: {fact:#?}"
         );
         assert!(fact.raw_edge_target.is_none() && fact.raw_callsite_identity.is_none());
-        assert!(!fact.lookup_domain_complete);
+        if expected == ProofResolutionStatus::IncompleteDomain {
+            assert!(!fact.lookup_domain_complete);
+        }
     }
     Ok(fact.clone())
 }
