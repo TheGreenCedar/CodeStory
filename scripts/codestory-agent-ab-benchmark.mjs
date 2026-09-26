@@ -10048,16 +10048,16 @@ function createStdioClient(command, args, opts) {
   };
 }
 
-async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
+async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir, dependencies = {}) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const provenance = await repoProvenance(repoConfig, opts.signal);
-  const cacheProvenance = await codestoryCacheProvenance(
+  const provenance = await (dependencies.repoProvenance ?? repoProvenance)(repoConfig, opts.signal);
+  const cacheProvenance = await (dependencies.cacheProvenance ?? codestoryCacheProvenance)(
     opts,
     repoConfig,
     packetRuntimeCacheObservations(opts, repoName, "warm_stdio_packet"),
   );
-  const client = createStdioClient(
+  const client = (dependencies.createStdioClient ?? createStdioClient)(
     codestoryCli,
     ["serve", "--project", repoConfig.path, "--stdio", "--refresh", "none"],
     opts,
@@ -10081,9 +10081,9 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           params: {
             name: "packet",
             arguments: {
+              project: repoConfig.path,
               question: task.prompt,
               budget: "standard",
-              task_class: task.task_class,
             },
           },
         });
@@ -15512,6 +15512,7 @@ export {
   packetRuntimeCacheObservations,
   agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  runWarmPacketRuntimeGroup,
   packetSufficiencyTelemetry,
   groupPacketRuntimeColdJobs,
   gitCheckedOutput,
