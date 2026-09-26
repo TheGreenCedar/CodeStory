@@ -259,7 +259,7 @@ const PHP_ADAPTER_VERSION: &str = "reference-v3";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
-const BASH_ADAPTER_VERSION: &str = "reference-v1";
+const BASH_ADAPTER_VERSION: &str = "reference-v2";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
@@ -1140,8 +1140,14 @@ fn bash_command_callee(command: TsNode<'_>) -> Option<TsNode<'_>> {
 }
 
 fn bash_literal_command_name<'a>(callee: TsNode<'_>, raw_target: &'a str) -> Option<&'a str> {
-    (callee.kind() == "word" && callee.named_child_count() == 0 && !raw_target.is_empty())
-        .then_some(raw_target)
+    // Raw words containing shell expansion/escape syntax do not establish an
+    // executable identity. Ordinary argument slots use their separate policy.
+    (callee.kind() == "word"
+        && callee.named_child_count() == 0
+        && !raw_target.is_empty()
+        && !raw_target.contains(['\\', '$', '`', '*', '?', '{', '}', '~'])
+        && (raw_target == "[" || !raw_target.contains(['[', ']'])))
+    .then_some(raw_target)
 }
 
 fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
@@ -1156,8 +1162,10 @@ fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
     let Some(callee) = bash_command_callee(command) else {
         return BashCommandEffect::None;
     };
-    let Some(mut effective) = bash_literal_node_text(callee, source) else {
-        return BashCommandEffect::None;
+    let Some(mut effective) = bash_literal_executable_text(callee, source) else {
+        // The executable may be unset/source/eval even when its own dynamic
+        // call cannot bind. Revoke authority for the shared function domain.
+        return BashCommandEffect::Unsupported;
     };
     let mut cursor = command.walk();
     let arguments = command
@@ -1168,7 +1176,7 @@ fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
         let Some(argument) = arguments.get(argument_index).copied() else {
             return BashCommandEffect::Unsupported;
         };
-        let Some(next) = bash_literal_node_text(argument, source) else {
+        let Some(next) = bash_literal_executable_text(argument, source) else {
             return BashCommandEffect::Unsupported;
         };
         argument_index += 1;
@@ -1176,7 +1184,7 @@ fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
             let Some(argument) = arguments.get(argument_index).copied() else {
                 return BashCommandEffect::Unsupported;
             };
-            let Some(next_after_options) = bash_literal_node_text(argument, source) else {
+            let Some(next_after_options) = bash_literal_executable_text(argument, source) else {
                 return BashCommandEffect::Unsupported;
             };
             argument_index += 1;
@@ -1198,6 +1206,7 @@ fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
 
 fn bash_unset_effect(arguments: &[TsNode<'_>], source: &str) -> BashCommandEffect {
     let mut function_mode = false;
+    let mut variable_mode = false;
     let mut names_started = false;
     let mut names = Vec::new();
     for argument in arguments {
@@ -1219,14 +1228,16 @@ fn bash_unset_effect(arguments: &[TsNode<'_>], source: &str) -> BashCommandEffec
                         .all(|flag| matches!(flag, 'f' | 'v' | 'n'))
                     {
                         function_mode |= option[1..].contains('f');
+                        variable_mode |= option[1..].contains('v');
                         continue;
                     }
                     return BashCommandEffect::Unsupported;
                 }
+                None => return BashCommandEffect::Unsupported,
                 _ => names_started = true,
             }
         }
-        if !function_mode {
+        if variable_mode && !function_mode {
             continue;
         }
         let Some(name) = literal.filter(|name| bash_function_identifier(name)) else {
@@ -1234,13 +1245,21 @@ fn bash_unset_effect(arguments: &[TsNode<'_>], source: &str) -> BashCommandEffec
         };
         names.push(name.to_owned());
     }
-    if !function_mode {
-        BashCommandEffect::None
-    } else if names.is_empty() {
-        BashCommandEffect::Unsupported
+    // Without -v, Bash can fall back from an absent variable to a function.
+    // No-option/no-name unset is harmless; malformed function mode stays closed.
+    if names.is_empty() {
+        if function_mode {
+            BashCommandEffect::Unsupported
+        } else {
+            BashCommandEffect::None
+        }
     } else {
         BashCommandEffect::InvalidatesFunctions(names)
     }
+}
+
+fn bash_literal_executable_text<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    bash_literal_command_name(node, node_text(node, source)?)
 }
 
 fn bash_literal_node_text<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
