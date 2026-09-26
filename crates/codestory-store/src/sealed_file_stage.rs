@@ -75,7 +75,7 @@ fn faulty_sync_handle(_source: &Path) -> File {
 }
 
 #[cfg(test)]
-fn with_parent_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
+pub(crate) fn with_parent_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<File>);
     impl Drop for Restore {
         fn drop(&mut self) {

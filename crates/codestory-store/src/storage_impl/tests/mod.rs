@@ -8969,6 +8969,54 @@ fn legacy_retirement_refuses_recreated_native_identity_then_retries_original()
 }
 
 #[test]
+fn legacy_parent_sync_failure_leaves_retirement_receipt_pending() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+
+    let error = crate::sealed_file_stage::with_parent_sync_failure(&live, || {
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })
+        .expect_err("parent sync failure must not confirm retirement")
+    });
+    assert!(
+        error.to_string().contains("sync sealed stage parent"),
+        "{error}"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json"))
+            .expect("read still-pending receipt"),
+    )
+    .expect("pending receipt JSON");
+    assert_eq!(receipt["committed"], true);
+    assert_eq!(
+        receipt["retired"], false,
+        "an unsynced old-directory unlink cannot be final"
+    );
+    assert!(
+        receipt["last_error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("parent directory sync deferred"))
+    );
+    assert!(
+        layout
+            .resolve_generation_database("generation-1")?
+            .is_file()
+    );
+    let retry = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        panic!("the already absent legacy file cannot reach deletion again")
+    })?;
+    assert!(retry.retired && !retry.pending);
+    Ok(())
+}
+
+#[test]
 fn schema31_rollback_snapshot_includes_committed_wal_rows() -> Result<(), StorageError> {
     let root = tempfile::tempdir().expect("migration root");
     let live = root.path().join("codestory.db");

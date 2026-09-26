@@ -457,6 +457,12 @@ pub fn apply_legacy_retirement(
     if !report.errors.is_empty() {
         return defer_legacy_retirement(&layout, &mut receipt, report);
     }
+    if let Err(error) = crate::sealed_file_stage::sync_parent(logical_path) {
+        report
+            .errors
+            .push(format!("Legacy parent directory sync deferred: {error}"));
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
     receipt.retired = true;
     receipt.last_error = None;
     write_legacy_receipt(&layout, &receipt)?;
