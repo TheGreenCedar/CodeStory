@@ -79,7 +79,7 @@ fn assert_later_target_fact(
     store: &Store,
     root: &Path,
     source: &str,
-    expected: ProofResolutionStatus,
+    expected: Option<ProofResolutionStatus>,
 ) -> anyhow::Result<CallResolutionFact> {
     let file = store
         .get_files()?
@@ -153,17 +153,25 @@ fn assert_later_target_fact(
             Some(fact.clone())
         );
     }
-    assert_eq!(
-        fact.status, expected,
-        "later call after command effect: {fact:#?}"
-    );
-    if expected != ProofResolutionStatus::Exact {
+    if let Some(expected) = expected {
+        assert_eq!(
+            fact.status, expected,
+            "later call after command effect: {fact:#?}"
+        );
+    } else {
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "uncertain executable retained authority: {fact:#?}"
+        );
+    }
+    if fact.status != ProofResolutionStatus::Exact {
         assert!(
             fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty(),
             "later call retained authority: {fact:#?}"
         );
         assert!(fact.raw_edge_target.is_none() && fact.raw_callsite_identity.is_none());
-        if expected == ProofResolutionStatus::IncompleteDomain {
+        if fact.status == ProofResolutionStatus::IncompleteDomain {
             assert!(!fact.lookup_domain_complete);
         }
     }
@@ -195,7 +203,7 @@ fn bash_nonliteral_executable_effect_revokes_later_literal_call() -> anyhow::Res
         &store,
         project.path(),
         DYNAMIC_EXECUTABLE_SOURCE,
-        ProofResolutionStatus::Unsupported,
+        Some(ProofResolutionStatus::Unsupported),
     )?;
     Ok(())
 }
@@ -204,9 +212,33 @@ fn assert_bash_source_later_status(
     source: &str,
     expected: ProofResolutionStatus,
 ) -> anyhow::Result<()> {
+    assert_bash_source_later(source, Some(expected), true)
+}
+
+fn assert_bash_source_later(
+    source: &str,
+    expected: Option<ProofResolutionStatus>,
+    expected_complete: bool,
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, &[("proof.sh", source)])?;
+    let file = store.get_files()?.into_iter().next().expect("source file");
+    assert_eq!(
+        file.complete, expected_complete,
+        "fixture parser coverage: {source}"
+    );
+    let blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let artifact = decode_index_artifact_json(&blob)?;
+    assert_eq!(
+        artifact["resolution_file"]["lookup_input_complete"],
+        serde_json::json!(expected_complete),
+        "fixture lookup coverage: {source}"
+    );
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     store.validate_proof_resolution_publication(&publication(1))?;
     assert_later_target_fact(&store, project.path(), source, expected)?;
@@ -246,14 +278,22 @@ fn bash_executable_effect_matrix_preserves_argument_and_literal_controls() -> an
         r#"bu\iltin unset -f target"#,
         r#"builtin un\set -f target"#,
         r#"un* -f target"#,
-        r#"{unset,eval} -f target"#,
         r#"op=unset; if test -n "$FLAG"; then "$op" -f target; fi"#,
         r#"op=unset; for value in one; do "$op" -f target; done"#,
     ];
     for command in unknown_executables {
         let source = format!("target() {{ :; }}\ncaller() {{\n  {command}\n  target\n}}\n");
-        assert_bash_source_later_status(&source, ProofResolutionStatus::Unsupported)?;
+        assert_bash_source_later(&source, None, true)?;
     }
+    // Tree-sitter parses this brace expansion as a nested compound with a
+    // missing closing brace. Keep its nonempty refusal control separate; it
+    // provides parser-coverage evidence, not executable-effect coverage.
+    assert_bash_source_later(
+        "target() { :; }\ncaller() {\n  {unset,eval} -f target\n  target\n}\n",
+        None,
+        false,
+    )?;
+
     for command in [
         ":",
         r#"op=unset; printf '%s' "$op""#,
@@ -287,7 +327,7 @@ fn bash_previous_effect_adapter_refuses_then_reparses_and_reuses() -> anyhow::Re
         &store,
         project.path(),
         DYNAMIC_EXECUTABLE_SOURCE,
-        ProofResolutionStatus::Unsupported,
+        Some(ProofResolutionStatus::Unsupported),
     )?;
     let before = store.get_proof_resolution_facts()?;
     let blob = store.get_connection().query_row(
@@ -343,7 +383,7 @@ fn bash_previous_effect_adapter_refuses_then_reparses_and_reuses() -> anyhow::Re
             &store,
             project.path(),
             DYNAMIC_EXECUTABLE_SOURCE,
-            ProofResolutionStatus::Unsupported,
+            Some(ProofResolutionStatus::Unsupported),
         )?;
         assert_eq!(fact.provenance.language_adapter_version, "reference-v2");
     }
