@@ -16379,3 +16379,57 @@ fn relative_type_value_import_prefers_exact_callable_name() -> anyhow::Result<()
     }
     Ok(())
 }
+
+#[test]
+fn ordinary_constructor_and_mutation_refusals_have_no_certain_endpoint() -> anyhow::Result<()> {
+    for (path, source, language, caller_line, call_line) in [
+        (
+            "src/collision.cpp",
+            concat!(
+                "struct Worker { void target() {} };\nstruct Other { void target() {} };\n",
+                "Other Worker() { return {}; }\nvoid caller() {\n  Worker().target();\n}\n",
+            ),
+            "cpp",
+            4,
+            5,
+        ),
+        (
+            "src/collision.py",
+            concat!(
+                "class Worker:\n    def target(self):\n        pass\n",
+                "class Other:\n    def target(self):\n        pass\n",
+                "def Worker():\n    return Other()\n",
+                "def caller():\n    worker = Worker()\n    worker.target()\n",
+            ),
+            "python",
+            9,
+            11,
+        ),
+        (
+            "src/mutation.py",
+            concat!(
+                "class Worker:\n    def target(self):\n        pass\n",
+                "def replacement():\n    pass\nsetattr(Worker, 'target', replacement)\n",
+                "def caller():\n    worker = Worker()\n    worker.target()\n",
+            ),
+            "python",
+            7,
+            9,
+        ),
+        (
+            "src/mutation.js",
+            concat!(
+                "export class C {\n  target() {}\n}\nexport function other() {}\n",
+                "Reflect.set(C.prototype, 'target', other);\n",
+                "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+            ),
+            "javascript",
+            6,
+            8,
+        ),
+    ] {
+        assert_ordinary_receiver_refusal(path, source, language, "target", caller_line, call_line)
+            .map_err(|error| anyhow::anyhow!("{path}: {error:#}"))?;
+    }
+    Ok(())
+}
