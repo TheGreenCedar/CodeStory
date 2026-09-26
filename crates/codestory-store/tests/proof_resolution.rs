@@ -1510,14 +1510,18 @@ fn rust_same_file_ancestor_hashes_keep_distinct_roots_and_path_guards() {
         store.insert_file(&wrong_path).expect("restore ancestor");
         let mut duplicate = wrong_path.clone();
         duplicate.id = 10;
-        store.insert_file(&duplicate).expect("duplicate path");
-        store
-            .update_file_metadata(&duplicate, Some(&hash.repeat(64)))
-            .expect("duplicate hash");
         let error = store
+            .insert_file(&duplicate)
+            .expect_err("duplicate path must be rejected at insertion");
+        assert!(
+            error
+                .to_string()
+                .contains("UNIQUE constraint failed: file.path"),
+            "{error}"
+        );
+        store
             .validate_proof_resolution_publication(&publication())
-            .expect_err("ambiguous ancestor file identity must fail");
-        assert!(error.to_string().contains("dependency hashes"), "{error}");
+            .expect("failed duplicate insertion preserves the valid receipt");
     }
 }
 
