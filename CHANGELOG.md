@@ -28,7 +28,7 @@ Graph navigation can include test and benchmark callers through `caller_scope`; 
 
 Incremental updates reuse unchanged work across supported filesystems, including those without database cloning. When cache space is short, CodeStory reports the required and available bytes before starting a full-size index stage. Indexes, parser caches and stored source provenance use compression and deduplication. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
 
-Complete immutable index generations keep readers on a coherent snapshot during updates. Cancellation before publication preserves the previous generation, and cleanup reclaims older images only after their readers release them. Cache upgrades retain bookmarks and annotations, including on filesystems without database cloning. Recovery can rebuild derived caches while leaving user-authored annotations in place.
+Complete immutable index generations keep readers on a coherent snapshot during updates. Cancellation before publication preserves the previous generation, and cleanup reclaims older images only after their readers release them. After a successful cache upgrade, CodeStory retires the redundant old database while retaining its rollback generation. Bookmarks and annotations remain available, including on filesystems without database cloning; recovery can rebuild derived caches without removing user-authored annotations.
 
 ### Handle the repositories you actually work in
 

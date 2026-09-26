@@ -96,6 +96,9 @@ pub struct CacheInventoryReport {
     /// evidence, so no allocation claim is made at all.
     pub allocated_bytes: Option<u64>,
     pub hardlink_deduplicated_bytes: u64,
+    /// Apparent bytes in fixed-path pre-generation core databases and their
+    /// SQLite sidecars. These bytes are inventory, not a cleanup authorization.
+    pub standalone_legacy_bytes: u64,
     /// Reserved schema-v1 field. No direct clone extent evidence is available,
     /// so this remains `None` even when apparent size exceeds allocation.
     pub clone_shared_bytes: Option<u64>,
@@ -332,6 +335,12 @@ impl InventoryState {
                     .saturating_mul(group.link_count.saturating_sub(1))
             })
             .sum();
+        let standalone_legacy_bytes = self
+            .entries
+            .iter()
+            .filter(|entry| is_standalone_legacy_file(&entry.relative_path))
+            .map(|entry| entry.apparent_bytes)
+            .sum();
         let mut top_consumers = self
             .entries
             .iter()
@@ -401,6 +410,7 @@ impl InventoryState {
             unique_bytes,
             allocated_bytes,
             hardlink_deduplicated_bytes,
+            standalone_legacy_bytes,
             clone_shared_bytes: None,
             partial_scan: self.partial_scan,
             required_bytes,
@@ -478,6 +488,23 @@ fn allocated_file_bytes(metadata: &std::fs::Metadata) -> Option<u64> {
 fn path_is_under_retained(entry_relative: &str, retained_relative: &str) -> bool {
     entry_relative == retained_relative
         || entry_relative.starts_with(&format!("{retained_relative}/"))
+}
+
+fn is_standalone_legacy_file(relative: &str) -> bool {
+    let mut components = relative.split('/');
+    let (Some(workspace), Some(name), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    workspace.len() == WORKSPACE_ID_HEX_LEN
+        && [
+            "codestory.db",
+            "codestory.db-wal",
+            "codestory.db-shm",
+            "codestory.db-journal",
+        ]
+        .contains(&name)
 }
 
 fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
@@ -572,6 +599,7 @@ mod tests {
             "inventory must not write CoW probes into the system temp directory"
         );
         assert!(report.dry_run);
+        assert!(report.standalone_legacy_bytes >= std::fs::metadata(&storage).unwrap().len());
         assert_eq!(report.ownership_scope, "process_cache_root");
         assert!(
             !report.partial_scan,

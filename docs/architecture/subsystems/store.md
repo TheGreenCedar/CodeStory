@@ -76,6 +76,18 @@ name-based after a native identity recheck; the acquisition and publication
 fences exclude CodeStory writers in that interval, while an external actor
 replacing the name at the last syscall remains outside that guarantee.
 
+The first immutable publication records the native identity of the original
+standalone database before making its coherent rollback image. A durable
+receipt becomes eligible for retirement only after the new pointer commits.
+Under the same publication and acquisition fences, runtime cleanup removes
+only files whose recorded identities still match, using its owned-deletion
+boundary. In-use files remain pending for a later pass; a failed cleanup does
+not undo the committed pointer. Annotation sidecars are outside this receipt.
+Historical core retention accepts complete supported images from schema 29
+through the current schema, while preserving the same reader leases, pointer
+and retrieval references, and native identity checks. Older or incomplete
+images remain in place with an error report.
+
 The dense-anchor manifest is part of the core publication boundary. It binds
 the complete row count and digest, policy version, migration state, and every
 row's source identity to the current core generation/run. A migrated cache has

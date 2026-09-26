@@ -577,6 +577,14 @@ It documents the older copy/restore design decision and was recorded by
 `incremental_publication_whole_database_movement_measurement` in
 `crates/codestory-runtime/tests/integration.rs`.
 
+On the first migration to immutable core generations, the original standalone
+database supplies a coherent rollback image. After the replacement pointer
+commits, an identity-bound retirement receipt lets a later retention pass
+remove that redundant standalone file and its verified SQLite sidecars. The
+rollback image remains protected by its pointer, retrieval references, and
+reader leases. Diagnostic reads report pending retirement without deleting
+files.
+
 Five consecutive one-file edits against a 0.52-0.56 GB core index of this
 repository, on an optimized dev build, Apple-silicon laptop, APFS:
 

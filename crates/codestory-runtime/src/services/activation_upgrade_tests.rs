@@ -139,6 +139,20 @@ fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf
 fn activation_rebuilds_legacy_cache_before_opening_it() {
     let (project, _cache, storage_path) = legacy_activation_fixture();
     let before = fs::read(&storage_path).unwrap();
+    let annotations_path =
+        codestory_contracts::owned_artifacts::annotations_sidecar_path(&storage_path);
+    let binding = codestory_store::NativeRootBinding::new(
+        codestory_workspace::workspace_path_identity_token(project.path()).unwrap(),
+        project.path(),
+    );
+    let annotations = codestory_store::AnnotationStore::open_for_write(&annotations_path, &binding)
+        .expect("create annotation sidecar");
+    annotations
+        .create_category("Retained category")
+        .expect("persist annotation");
+    drop(annotations);
+    let annotation_identity = codestory_workspace::workspace_path_identity_token(&annotations_path)
+        .expect("observe annotation native identity");
     let runtime = Runtime::new();
     runtime
         .activation_service()
@@ -148,11 +162,43 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
             Arc::new(AtomicBool::new(false)),
         )
         .expect("managed activation rebuilds legacy parser inputs");
-    assert_eq!(
-        fs::read(&storage_path).unwrap(),
-        before,
-        "legacy rollback bytes remain unchanged"
+    assert!(
+        !storage_path.exists(),
+        "committed migration retires the standalone database"
     );
+    assert_eq!(
+        codestory_workspace::workspace_path_identity_token(&annotations_path).unwrap(),
+        annotation_identity,
+        "retirement must preserve the annotation sidecar's native identity"
+    );
+    let categories = codestory_store::AnnotationStore::open_observational(&annotations_path)
+        .expect("read annotation sidecar")
+        .expect("annotation sidecar remains")
+        .categories()
+        .expect("read retained annotations");
+    assert!(
+        categories
+            .iter()
+            .any(|category| category.name == "Retained category")
+    );
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path).unwrap();
+    let pointer = layout.read_pointer().unwrap().unwrap();
+    let rollback = layout
+        .resolve_generation_database(&pointer.rollback.unwrap().generation_id)
+        .unwrap();
+    let old = rusqlite::Connection::open_with_flags(
+        &rollback,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let old_files: i64 = old
+        .query_row("SELECT COUNT(*) FROM file", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        old_files > 0,
+        "immutable rollback retains the nonempty legacy image"
+    );
+    assert!(!before.is_empty());
     let store = Store::open_read_only(&storage_path).unwrap();
     let publication = store.get_complete_index_publication().unwrap().unwrap();
     assert_eq!(
@@ -178,6 +224,50 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
         Store::database_index_publication(&storage_path).unwrap(),
         Some(publication)
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn legacy_retirement_retries_after_a_real_windows_sharing_violation() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    // Win32 FILE_SHARE_READ | FILE_SHARE_WRITE deliberately excludes delete sharing.
+    const SHARE_WITHOUT_DELETE: u32 = 0x0000_0001 | 0x0000_0002;
+
+    let (project, _cache, storage_path) = legacy_activation_fixture();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_WITHOUT_DELETE)
+        .open(&storage_path)
+        .expect("hold legacy database without delete sharing");
+    let runtime = Runtime::new();
+    let activation = runtime.activation_service();
+    activation
+        .activate_core_only(
+            project.path(),
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("publication succeeds despite deferred legacy deletion");
+    let pending = activation
+        .observe_legacy_retirement(&storage_path)
+        .expect("observe deferral");
+    assert!(pending.pending && storage_path.is_file());
+    assert!(
+        pending
+            .errors
+            .iter()
+            .any(|reason| reason.contains("deferred"))
+    );
+
+    drop(held);
+    activation
+        .apply_retrieval_gc(project.path(), &storage_path)
+        .expect("later authorized retention retries deletion");
+    let retired = activation
+        .observe_legacy_retirement(&storage_path)
+        .expect("observe retirement");
+    assert!(retired.retired && !retired.pending);
+    assert!(!storage_path.exists());
 }
 
 #[test]
@@ -225,8 +315,17 @@ fn activation_rebuilds_release_java_visibility_projection() {
     connection
         .execute_batch("PRAGMA user_version = 31; PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("stamp the release schema");
+    let predecessor_node_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))
+        .expect("count release nodes");
+    assert!(predecessor_node_count > 0, "release core contains nodes");
+    let predecessor_access_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM component_access", [], |row| {
+            row.get(0)
+        })
+        .expect("count absent release projection");
+    assert_eq!(predecessor_access_count, 0);
     drop(connection);
-    let predecessor = fs::read(&storage_path).unwrap();
 
     Runtime::new()
         .activation_service()
@@ -236,10 +335,39 @@ fn activation_rebuilds_release_java_visibility_projection() {
             Arc::new(AtomicBool::new(false)),
         )
         .expect("activation rebuilds the release Java projection");
+    assert!(
+        !storage_path.exists(),
+        "committed migration retires the standalone release database"
+    );
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path).unwrap();
+    let pointer = layout.read_pointer().unwrap().unwrap();
+    let rollback = layout
+        .resolve_generation_database(&pointer.rollback.unwrap().generation_id)
+        .unwrap();
+    let rollback =
+        rusqlite::Connection::open_with_flags(rollback, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open coherent release rollback");
     assert_eq!(
-        fs::read(&storage_path).unwrap(),
-        predecessor,
-        "release rollback bytes remain unchanged"
+        rollback
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        31,
+        "rollback retains the release schema"
+    );
+    assert_eq!(
+        rollback
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        predecessor_node_count,
+        "rollback retains the release nodes"
+    );
+    assert_eq!(
+        rollback
+            .query_row("SELECT COUNT(*) FROM component_access", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        predecessor_access_count,
+        "rollback retains the release projection absence"
     );
 
     let store = Store::open_read_only(&storage_path).unwrap();

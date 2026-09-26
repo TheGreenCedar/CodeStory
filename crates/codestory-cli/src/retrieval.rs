@@ -25,6 +25,8 @@ struct ObservedRetrievalStatus<'a> {
     report: &'a RetrievalStatusReport,
     #[serde(flatten)]
     ready_lease: &'a codestory_runtime::ReadyLeaseEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_retirement: Option<&'a codestory_runtime::LegacyRetirementReport>,
 }
 
 pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
@@ -161,10 +163,23 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
             .retrieval_status(&runtime.project_root, &runtime.storage_path)
     };
     let (report, ready_lease) = retrieval_status_result(observation)?;
+    let legacy_retirement = match runtime
+        .activation
+        .observe_legacy_retirement(&runtime.storage_path)
+    {
+        Ok(report) if report.pending => Some(report),
+        Ok(_) => None,
+        Err(error) => Some(codestory_runtime::LegacyRetirementReport {
+            pending: true,
+            errors: vec![format!("legacy retirement observation failed: {error}")],
+            ..codestory_runtime::LegacyRetirementReport::default()
+        }),
+    };
     emit_retrieval_status(
         cmd.format,
         &report,
         &ready_lease,
+        legacy_retirement.as_ref(),
         cmd.output_file.as_deref(),
     )
 }
@@ -798,6 +813,7 @@ fn emit_retrieval_status(
     format: OutputFormat,
     report: &RetrievalStatusReport,
     ready_lease: &codestory_runtime::ReadyLeaseEvidence,
+    legacy_retirement: Option<&codestory_runtime::LegacyRetirementReport>,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let manifest_vector_embedding_backend = report
@@ -824,7 +840,7 @@ fn emit_retrieval_status(
             )
         })
         .unwrap_or_default();
-    let markdown = format!(
+    let mut markdown = format!(
         "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n- ready_lease: present={} admission_basis=`{}` observer_epoch_coherence=`{}` memo_holds_observations={}\n",
         report.retrieval_mode,
         report.degraded_reason,
@@ -858,11 +874,18 @@ fn emit_retrieval_status(
         ready_lease.ready_lease_observer_epoch_coherence,
         ready_lease.ready_lease_memo_holds_observations,
     );
+    if let Some(legacy) = legacy_retirement {
+        markdown.push_str(&format!(
+            "- legacy_retirement_pending: {} standalone_bytes={} errors={:?}\n",
+            legacy.pending, legacy.legacy_bytes, legacy.errors
+        ));
+    }
     emit(
         format,
         &ObservedRetrievalStatus {
             report,
             ready_lease,
+            legacy_retirement,
         },
         markdown,
         output_file,
@@ -1949,12 +1972,19 @@ mod tests {
         let output = tempfile::tempdir().expect("status output");
         let json_path = output.path().join("status.json");
         let markdown_path = output.path().join("status.md");
-        emit_retrieval_status(OutputFormat::Json, report, ready_lease, Some(&json_path))
-            .expect("emit status json");
+        emit_retrieval_status(
+            OutputFormat::Json,
+            report,
+            ready_lease,
+            None,
+            Some(&json_path),
+        )
+        .expect("emit status json");
         emit_retrieval_status(
             OutputFormat::Markdown,
             report,
             ready_lease,
+            None,
             Some(&markdown_path),
         )
         .expect("emit status markdown");

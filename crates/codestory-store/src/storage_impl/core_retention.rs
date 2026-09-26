@@ -4,7 +4,9 @@
 //! retrieval's global publication fence and supplies its handle-relative
 //! deletion primitive, so this layer never depends on retrieval or workspace.
 
-use super::{PromotionLock, StorageError, read_complete_promotion_database_identity};
+use super::{
+    PromotionLock, RecoveryDatabaseContract, StorageError, read_recovery_database_identity,
+};
 use crate::core_generation::{
     CORE_DATABASE_FILE, CORE_GENERATIONS_DIRECTORY, CorePublicationLayout,
 };
@@ -12,10 +14,493 @@ use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_contracts::core_publication::CorePublicationPointerV1;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+
+pub const LEGACY_RETIREMENT_RECEIPT_FILE: &str = "legacy-retirement.json";
+const LEGACY_RETIREMENT_RECEIPT_VERSION: u32 = 1;
+const MAX_LEGACY_RETIREMENT_RECEIPT_BYTES: u64 = 4096;
+const LEGACY_SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum LegacyNativeIdentity {
+    Unix { device: u64, inode: u64 },
+    Windows { volume: u64, file_id: [u8; 16] },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacySidecarIdentity {
+    suffix: String,
+    identity: LegacyNativeIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyRetirementReceipt {
+    version: u32,
+    source_identity: LegacyNativeIdentity,
+    candidate_generation_id: String,
+    sidecars: Vec<LegacySidecarIdentity>,
+    committed: bool,
+    retired: bool,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LegacyRetirementReport {
+    pub retired: bool,
+    pub pending: bool,
+    pub legacy_bytes: u64,
+    pub errors: Vec<String>,
+}
+
+pub(super) fn capture_legacy_identity(path: &Path) -> Result<LegacyNativeIdentity, StorageError> {
+    let file = open_direct_regular_file(path)?;
+    native_identity(&file)
+}
+
+fn native_identity(file: &File) -> Result<LegacyNativeIdentity, StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file
+            .metadata()
+            .map_err(|error| retention_error("identify legacy file", error))?;
+        Ok(LegacyNativeIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::mem::MaybeUninit;
+        use std::os::windows::io::AsRawHandle as _;
+        #[repr(C)]
+        struct FileIdInfo {
+            volume: u64,
+            file_id: [u8; 16],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandleEx(
+                handle: *mut c_void,
+                class: i32,
+                info: *mut c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let mut info = MaybeUninit::<FileIdInfo>::uninit();
+        // SAFETY: file owns a live handle and the correctly sized output buffer is writable.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast(),
+                18,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<FileIdInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(retention_error(
+                "identify legacy file",
+                io::Error::last_os_error(),
+            ));
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(LegacyNativeIdentity::Windows {
+            volume: info.volume,
+            file_id: info.file_id,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(StorageError::Other(
+            "Legacy retirement requires native file identity".into(),
+        ))
+    }
+}
+
+fn receipt_path(layout: &CorePublicationLayout) -> PathBuf {
+    layout.root().join(LEGACY_RETIREMENT_RECEIPT_FILE)
+}
+
+fn read_legacy_receipt(
+    layout: &CorePublicationLayout,
+) -> Result<Option<LegacyRetirementReceipt>, StorageError> {
+    use std::io::Read as _;
+    let path = receipt_path(layout);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(retention_error("inspect legacy receipt", error)),
+        Ok(_) => {}
+    }
+    let mut file = open_direct_regular_file(&path)?;
+    let length = file
+        .metadata()
+        .map_err(|error| retention_error("inspect legacy receipt", error))?
+        .len();
+    if length > MAX_LEGACY_RETIREMENT_RECEIPT_BYTES {
+        return Err(StorageError::Other(
+            "Legacy retirement receipt exceeds its bound".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_LEGACY_RETIREMENT_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| retention_error("read legacy receipt", error))?;
+    if bytes.len() as u64 > MAX_LEGACY_RETIREMENT_RECEIPT_BYTES {
+        return Err(StorageError::Other(
+            "Legacy retirement receipt exceeds its bound".into(),
+        ));
+    }
+    let receipt: LegacyRetirementReceipt = serde_json::from_slice(&bytes)
+        .map_err(|error| retention_error("parse legacy receipt", error))?;
+    let recorded_suffixes: BTreeSet<_> = receipt
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.suffix.as_str())
+        .collect();
+    if receipt.version != LEGACY_RETIREMENT_RECEIPT_VERSION
+        || crate::core_generation::validate_generation_id(&receipt.candidate_generation_id).is_err()
+        || (receipt.retired && !receipt.committed)
+        || receipt.sidecars.len() > LEGACY_SQLITE_SIDECARS.len()
+        || recorded_suffixes.len() != receipt.sidecars.len()
+        || receipt
+            .sidecars
+            .iter()
+            .any(|sidecar| !LEGACY_SQLITE_SIDECARS.contains(&sidecar.suffix.as_str()))
+    {
+        return Err(StorageError::Other(
+            "Legacy retirement receipt has unsupported ownership evidence".into(),
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+fn write_legacy_receipt(
+    layout: &CorePublicationLayout,
+    receipt: &LegacyRetirementReceipt,
+) -> Result<(), StorageError> {
+    use std::io::Write as _;
+    let path = receipt_path(layout);
+    fs::create_dir_all(layout.root())
+        .map_err(|error| retention_error("create legacy receipt directory", error))?;
+    let temporary = layout.root().join(format!(
+        ".{LEGACY_RETIREMENT_RECEIPT_FILE}.{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(receipt)
+        .map_err(|error| retention_error("serialize legacy receipt", error))?;
+    if bytes.len() as u64 > MAX_LEGACY_RETIREMENT_RECEIPT_BYTES {
+        return Err(StorageError::Other(
+            "Legacy retirement receipt exceeds its bound".into(),
+        ));
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| retention_error("create legacy receipt candidate", error))?;
+        file.write_all(&bytes)
+            .map_err(|error| retention_error("write legacy receipt candidate", error))?;
+        file.sync_all()
+            .map_err(|error| retention_error("sync legacy receipt candidate", error))?;
+        drop(file);
+        crate::core_generation::replace_file_atomic(&temporary, &path)?;
+        crate::sealed_file_stage::sync_parent(&path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub(super) fn prepare_legacy_retirement(
+    layout: &CorePublicationLayout,
+    source_identity: LegacyNativeIdentity,
+    candidate_generation_id: &str,
+) -> Result<(), StorageError> {
+    if let Some(existing) = read_legacy_receipt(layout)?
+        && existing.source_identity != source_identity
+    {
+        return Err(StorageError::Other(
+            "Prior legacy retirement receipt names another native source; refusing replacement"
+                .into(),
+        ));
+    }
+    if capture_legacy_identity(layout.legacy_storage_path())? != source_identity {
+        return Err(StorageError::Other(
+            "Legacy database identity changed during rollback backup".into(),
+        ));
+    }
+    let mut sidecars = Vec::new();
+    for suffix in LEGACY_SQLITE_SIDECARS {
+        let path = super::sqlite_sidecar_path(layout.legacy_storage_path(), suffix);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => sidecars.push(LegacySidecarIdentity {
+                suffix: suffix.into(),
+                identity: capture_legacy_identity(&path)?,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(retention_error("inspect legacy sidecar", error)),
+        }
+    }
+    write_legacy_receipt(
+        layout,
+        &LegacyRetirementReceipt {
+            version: LEGACY_RETIREMENT_RECEIPT_VERSION,
+            source_identity,
+            candidate_generation_id: candidate_generation_id.into(),
+            sidecars,
+            committed: false,
+            retired: false,
+            last_error: None,
+        },
+    )
+}
+
+pub(super) fn mark_legacy_retirement_committed(
+    layout: &CorePublicationLayout,
+) -> Result<(), StorageError> {
+    let Some(mut receipt) = read_legacy_receipt(layout)? else {
+        return Ok(());
+    };
+    if receipt.committed {
+        return Ok(());
+    }
+    let Some(pointer) = layout.read_pointer()? else {
+        return Ok(());
+    };
+    if pointer.active.generation_id != receipt.candidate_generation_id
+        && pointer
+            .rollback
+            .as_ref()
+            .is_none_or(|rollback| rollback.generation_id != receipt.candidate_generation_id)
+    {
+        return Ok(());
+    }
+    receipt.committed = true;
+    write_legacy_receipt(layout, &receipt)
+}
+
+pub fn observe_legacy_retirement(
+    logical_path: &Path,
+) -> Result<LegacyRetirementReport, StorageError> {
+    let layout = CorePublicationLayout::from_storage_path(logical_path)?;
+    let Some(receipt) = read_legacy_receipt(&layout)? else {
+        return Ok(LegacyRetirementReport::default());
+    };
+    let mut report = LegacyRetirementReport {
+        retired: receipt.retired,
+        pending: !receipt.retired,
+        ..LegacyRetirementReport::default()
+    };
+    if let Some(reason) = receipt.last_error {
+        report.errors.push(reason);
+    }
+    if report.pending {
+        match fs::symlink_metadata(logical_path) {
+            Ok(_) => match open_direct_regular_file(logical_path) {
+                Ok(file) => match native_identity(&file) {
+                    Ok(identity) if identity == receipt.source_identity => {
+                        report.legacy_bytes = file
+                            .metadata()
+                            .map_err(|error| {
+                                retention_error("measure observed legacy file", error)
+                            })?
+                            .len();
+                    }
+                    Ok(_) => report
+                        .errors
+                        .push("legacy retirement refused replaced native identity".into()),
+                    Err(error) => report
+                        .errors
+                        .push(format!("legacy database is not observable: {error}")),
+                },
+                Err(error) => report
+                    .errors
+                    .push(format!("legacy database is not observable: {error}")),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => report
+                .errors
+                .push(format!("legacy database is not observable: {error}")),
+        }
+    }
+    if !receipt.committed && !receipt.retired {
+        report
+            .errors
+            .push("legacy retirement awaits a committed core pointer".into());
+    }
+    Ok(report)
+}
+
+pub fn apply_legacy_retirement(
+    logical_path: &Path,
+    cancelled: &dyn Fn() -> bool,
+    mut remove_owned_file: impl FnMut(&Path, &str, &File) -> Result<bool, StorageError>,
+) -> Result<LegacyRetirementReport, StorageError> {
+    let layout = CorePublicationLayout::from_storage_path(logical_path)?;
+    if read_legacy_receipt(&layout)?.is_none() {
+        return Ok(LegacyRetirementReport::default());
+    }
+    let Some(_promotion) = PromotionLock::try_acquire(logical_path)? else {
+        return Ok(LegacyRetirementReport {
+            pending: true,
+            errors: vec!["core promotion is active".into()],
+            ..LegacyRetirementReport::default()
+        });
+    };
+    let Some(_acquisition) = acquire_acquisition(&layout, FileLockKind::Exclusive, true)? else {
+        return Ok(LegacyRetirementReport {
+            pending: true,
+            errors: vec!["core acquisition is active".into()],
+            ..LegacyRetirementReport::default()
+        });
+    };
+    mark_legacy_retirement_committed(&layout)?;
+    let Some(mut receipt) = read_legacy_receipt(&layout)? else {
+        return Ok(LegacyRetirementReport::default());
+    };
+    if receipt.retired {
+        return Ok(LegacyRetirementReport {
+            retired: true,
+            ..LegacyRetirementReport::default()
+        });
+    }
+    let mut report = LegacyRetirementReport {
+        pending: true,
+        ..LegacyRetirementReport::default()
+    };
+    if !receipt.committed || cancelled() {
+        report
+            .errors
+            .push("legacy retirement is not committed or was cancelled".into());
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    let parent = logical_path
+        .parent()
+        .ok_or_else(|| StorageError::Other("Legacy path has no parent".into()))?;
+    let name = logical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StorageError::Other("Legacy database has no safe file name".into()))?;
+    let mut owned = Vec::new();
+    for sidecar in &receipt.sidecars {
+        let sidecar_name = format!("{name}{}", sidecar.suffix);
+        let path = parent.join(&sidecar_name);
+        if let Some(file) = open_matching_legacy_file(&path, &sidecar.identity, &mut report)? {
+            owned.push((sidecar_name, file));
+        }
+    }
+    for suffix in LEGACY_SQLITE_SIDECARS {
+        if receipt
+            .sidecars
+            .iter()
+            .any(|sidecar| sidecar.suffix == suffix)
+        {
+            continue;
+        }
+        match fs::symlink_metadata(parent.join(format!("{name}{suffix}"))) {
+            Ok(_) => report.errors.push(format!(
+                "Unrecorded legacy sidecar {suffix} appeared; retirement deferred"
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => report
+                .errors
+                .push(format!("Cannot inspect legacy sidecar {suffix}: {error}")),
+        }
+    }
+    let source = open_matching_legacy_file(logical_path, &receipt.source_identity, &mut report)?;
+    if !report.errors.is_empty() {
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    // Refuse an in-use database before touching its WAL or shared-memory
+    // sidecars. Windows deletion sharing can reject the main file while its
+    // SQLite client still needs those sidecars.
+    if let Some(file) = source {
+        report.legacy_bytes = file
+            .metadata()
+            .map_err(|error| retention_error("measure legacy file", error))?
+            .len();
+        match remove_owned_file(parent, name, &file) {
+            Ok(true) => {}
+            Ok(false) => report
+                .errors
+                .push("Legacy database changed before deletion".into()),
+            Err(error) => report
+                .errors
+                .push(format!("Legacy database deletion deferred: {error}")),
+        }
+    }
+    if !report.errors.is_empty() {
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    for (sidecar_name, file) in &owned {
+        match remove_owned_file(parent, sidecar_name, file) {
+            Ok(true) => {}
+            Ok(false) => report.errors.push(format!(
+                "Legacy sidecar {sidecar_name} changed before deletion"
+            )),
+            Err(error) => report.errors.push(format!(
+                "Legacy sidecar {sidecar_name} deletion deferred: {error}"
+            )),
+        }
+    }
+    if !report.errors.is_empty() {
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    if let Err(error) = crate::sealed_file_stage::sync_parent(logical_path) {
+        report
+            .errors
+            .push(format!("Legacy parent directory sync deferred: {error}"));
+        return defer_legacy_retirement(&layout, &mut receipt, report);
+    }
+    receipt.retired = true;
+    receipt.last_error = None;
+    write_legacy_receipt(&layout, &receipt)?;
+    report.pending = false;
+    report.retired = true;
+    Ok(report)
+}
+
+fn defer_legacy_retirement(
+    layout: &CorePublicationLayout,
+    receipt: &mut LegacyRetirementReceipt,
+    report: LegacyRetirementReport,
+) -> Result<LegacyRetirementReport, StorageError> {
+    receipt.last_error = Some(report.errors.join("; "));
+    write_legacy_receipt(layout, receipt)?;
+    Ok(report)
+}
+
+fn open_matching_legacy_file(
+    path: &Path,
+    expected: &LegacyNativeIdentity,
+    report: &mut LegacyRetirementReport,
+) -> Result<Option<File>, StorageError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(retention_error("inspect legacy retirement file", error)),
+        Ok(_) => {}
+    }
+    let file = open_direct_regular_file(path)?;
+    if &native_identity(&file)? != expected {
+        report.errors.push(format!(
+            "Legacy retirement refused replaced native identity at {}",
+            path.display()
+        ));
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
 
 #[cfg(test)]
 thread_local! {
@@ -395,8 +880,11 @@ pub fn apply_core_retention(
         };
         let candidate = match crate::sqlite_observation::observe_sqlite_database(&database)
             .and_then(|observation| {
-                read_complete_promotion_database_identity(&database)
-                    .map(|identity| identity.map(|identity| (identity, observation.logical_bytes)))
+                read_recovery_database_identity(
+                    &database,
+                    RecoveryDatabaseContract::CurrentPromotion,
+                )
+                .map(|identity| identity.map(|identity| (identity, observation.logical_bytes)))
             }) {
             Ok(Some(candidate)) if candidate.0.generation_id == generation_id => candidate,
             Ok(_) => {

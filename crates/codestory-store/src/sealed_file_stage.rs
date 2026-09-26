@@ -75,7 +75,7 @@ fn faulty_sync_handle(_source: &Path) -> File {
 }
 
 #[cfg(test)]
-fn with_parent_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
+pub(crate) fn with_parent_sync_failure<T>(source: &Path, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<File>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -483,7 +483,7 @@ fn sync_stage_handle(file: &File, _parent: bool) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         File::open(parent)
             .and_then(|directory| sync_stage_handle(&directory, true))
@@ -493,7 +493,7 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(windows)]
-fn sync_parent(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     if let Some(parent) = path.parent() {
@@ -508,7 +508,7 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_parent(_path: &Path) -> Result<(), StorageError> {
+pub(crate) fn sync_parent(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 

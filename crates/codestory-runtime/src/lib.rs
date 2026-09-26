@@ -428,6 +428,7 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use browser::{SourceRangeRequest, SourceRangeSnippet};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
+pub use codestory_store::LegacyRetirementReport;
 pub(crate) use graph_dto::{
     app_graph_flags, edge_certainty_label, graph_edge_dto, is_structural_kind, member_access_dto,
 };

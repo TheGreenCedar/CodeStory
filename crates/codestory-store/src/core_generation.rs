@@ -681,13 +681,13 @@ pub(crate) fn abort_after_publication_point(point: &str) -> Result<(), StorageEr
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), StorageError> {
+pub(crate) fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), StorageError> {
     fs::rename(source, destination)
         .map_err(|error| core_path_error("replace pointer", destination, error))
 }
 
 #[cfg(windows)]
-fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), StorageError> {
+pub(crate) fn replace_file_atomic(source: &Path, destination: &Path) -> Result<(), StorageError> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
