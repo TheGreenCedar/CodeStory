@@ -3412,6 +3412,96 @@ mod tests {
     }
 
     #[test]
+    fn scip_copy_space_refusal_leaves_previous_component_and_no_candidate() {
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "old")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "changed")],
+        );
+        let error = crate::copy_on_write::with_clone_disabled(|| {
+            codestory_store::with_available_filesystem_bytes_override(0, || {
+                publish_scip_component_with_cancel(
+                    &current_dir,
+                    Some(&previous_dir),
+                    &current,
+                    &|| false,
+                    &mut || Ok(()),
+                )
+                .expect_err("component copy must refuse insufficient space")
+            })
+        });
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<codestory_store::StorageError>(),
+            Some(codestory_store::StorageError::InsufficientSpace {
+                operation: "sealed_component_copy",
+                available_bytes: 0,
+                ..
+            })
+        )));
+        assert!(!current_dir.join(SCIP_SYMBOLS_DATABASE_FILE).exists());
+        assert_eq!(
+            load_scip_symbols_database(&previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("previous publication"),
+            previous
+        );
+        assert_eq!(
+            std::fs::read_dir(&current_dir)
+                .expect("candidate directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn scip_copy_cancellation_preserves_previous_component_and_class() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = TempDir::new().expect("tempdir");
+        let previous_dir = root.path().join("previous");
+        let current_dir = root.path().join("current");
+        std::fs::create_dir_all(&previous_dir).expect("previous dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+        let previous = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "old")],
+        );
+        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
+            .expect("previous component");
+        let current = component_index(
+            "generation-v2",
+            vec![component_symbol("1", "src/a.rs", "changed")],
+        );
+        let polls = AtomicUsize::new(0);
+        let error = crate::copy_on_write::with_clone_disabled(|| {
+            publish_scip_component_with_cancel(
+                &current_dir,
+                Some(&previous_dir),
+                &current,
+                &|| polls.fetch_add(1, Ordering::SeqCst) >= 1,
+                &mut || Ok(()),
+            )
+            .expect_err("copy is cancelled after destination creation")
+        });
+        assert!(crate::index::is_retrieval_index_cancelled(&error));
+        assert!(polls.load(Ordering::SeqCst) >= 2);
+        assert!(!current_dir.join(SCIP_SYMBOLS_DATABASE_FILE).exists());
+        assert_eq!(
+            load_scip_symbols_database(&previous_dir.join(SCIP_SYMBOLS_DATABASE_FILE))
+                .expect("previous publication"),
+            previous
+        );
+    }
+
+    #[test]
     fn identical_scip_records_do_not_rewrite_ordering_rows() {
         let root = TempDir::new().expect("tempdir");
         let previous_dir = root.path().join("previous");
