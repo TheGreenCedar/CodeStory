@@ -713,6 +713,12 @@ fn emit_retrieval_index(
         payload.generation_retention.remaining_reclaimable_bytes,
         payload.generation_retention.pruning_suppressed,
     );
+    if !payload.generation_retention.errors.is_empty() {
+        markdown.push_str(&format!(
+            "- retention_errors: `{}`\n",
+            payload.generation_retention.errors.join("; ")
+        ));
+    }
     if let Some(timings) = core_phase_timings {
         markdown.push_str("\n## Core indexing\n\n");
         crate::output::append_index_phase_timings(&mut markdown, timings);
@@ -922,6 +928,84 @@ mod tests {
     use anyhow::anyhow;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn finalized_retrieval_output_keeps_postcommit_cleanup_warning() {
+        let dir = tempdir().expect("isolated output");
+        let manifest = codestory_retrieval::test_support::retrieval_manifest_fixture(
+            "project",
+            &"a".repeat(64),
+        );
+        let plan = codestory_runtime::GenerationRetentionPlan {
+            dry_run: true,
+            project_id: manifest.project_id.clone(),
+            pruning_suppressed: false,
+            active_bytes: 11,
+            rollback_bytes: 13,
+            building_bytes: 0,
+            retained_bytes: 24,
+            reclaimable_bytes: 7,
+            bundles: Vec::new(),
+            blocked: Vec::new(),
+            errors: Vec::new(),
+        };
+        let report = codestory_runtime::GenerationRetentionApplyReport {
+            dry_run: false,
+            project_id: manifest.project_id.clone(),
+            pruning_suppressed: true,
+            active_bytes: 11,
+            rollback_bytes: 13,
+            building_bytes: 0,
+            retained_bytes: 24,
+            reclaimable_bytes: 7,
+            removed_bytes: 0,
+            remaining_reclaimable_bytes: 7,
+            removals: Vec::new(),
+            errors: vec![
+                "cleanup deferred after committed retrieval publication: owned root unsafe".into(),
+            ],
+        };
+        let outcome = FinalizeIndexOutcome {
+            project_id: manifest.project_id.clone(),
+            manifest,
+            degraded_modes: Vec::new(),
+            scip_stubbed: false,
+            generation_retention_plan: plan,
+            generation_retention: report,
+            phase_timings: Vec::new(),
+            component_work: Vec::new(),
+        };
+        let json_path = dir.path().join("retrieval.json");
+        emit_retrieval_index(OutputFormat::Json, &outcome, None, None, Some(&json_path))
+            .expect("emit committed JSON outcome");
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&json_path).expect("read committed JSON outcome"))
+                .expect("parse committed JSON outcome");
+        assert_eq!(json["manifest"]["project_id"], "project");
+        assert_eq!(json["generation_retention"]["removed_bytes"], 0);
+        assert_eq!(
+            json["generation_retention"]["remaining_reclaimable_bytes"],
+            7
+        );
+        assert!(
+            json["generation_retention"]["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains("cleanup deferred"))
+        );
+
+        let markdown_path = dir.path().join("retrieval.md");
+        emit_retrieval_index(
+            OutputFormat::Markdown,
+            &outcome,
+            None,
+            None,
+            Some(&markdown_path),
+        )
+        .expect("emit committed Markdown outcome");
+        let markdown = fs::read_to_string(markdown_path).expect("read committed Markdown outcome");
+        assert!(markdown.contains("- retention_pruning_suppressed: true"));
+        assert!(markdown.contains("retention_errors: `cleanup deferred after committed retrieval publication: owned root unsafe`"));
+    }
 
     #[test]
     fn retrieval_observability_exposes_only_aggregate_allowlisted_values() {

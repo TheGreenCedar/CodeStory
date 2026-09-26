@@ -2892,9 +2892,47 @@ fn persist_finalized_manifest(
     cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
     project_id: String,
+    manifest: RetrievalIndexManifest,
+    degraded_modes: Vec<String>,
+    stub_flags: SidecarStubFlags,
+) -> Result<FinalizeIndexOutcome> {
+    persist_finalized_manifest_with_hooks(
+        project_root,
+        storage_path,
+        prepared_lexical,
+        retention_context,
+        cancelled,
+        sidecar_input,
+        project_id,
+        manifest,
+        degraded_modes,
+        stub_flags,
+        validate_candidate_generation,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_finalized_manifest_with_hooks(
+    project_root: &Path,
+    storage_path: &Path,
+    prepared_lexical: &PreparedLexicalInput,
+    retention_context: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
+    sidecar_input: &SidecarInputFingerprint,
+    project_id: String,
     mut manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
+    validate_candidate: impl FnOnce(
+        &str,
+        &SidecarInputFingerprint,
+        &RetrievalIndexManifest,
+        &GenerationRetentionContext<'_>,
+        &Store,
+        &Path,
+    ) -> Result<()>,
+    after_marker: impl FnOnce(),
 ) -> Result<FinalizeIndexOutcome> {
     let manifest_started = Instant::now();
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
@@ -2907,7 +2945,7 @@ fn persist_finalized_manifest(
         &retention_context.embedding_residency,
         || {
             ensure_retrieval_index_not_cancelled(cancelled, "retrieval candidate validation")?;
-            validate_candidate_generation(
+            validate_candidate(
                 &project_id,
                 sidecar_input,
                 &manifest,
@@ -3062,8 +3100,9 @@ fn persist_finalized_manifest(
             Some(error)
         }
     };
+    after_marker();
     let (generation_retention_plan, generation_retention) =
-        retain_published_generations(storage_path, retention_context, &project_id, marker_error)?;
+        retain_published_generations(storage_path, retention_context, &project_id, marker_error);
     let _ = lexical_receipt_refresh.refresh_after_owned_link_cleanup();
     if let Some(receipt) = scip_receipt_refresh {
         let _ = receipt.refresh_after_owned_link_cleanup();
@@ -3527,7 +3566,7 @@ fn retain_published_generations(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     marker_error: Option<String>,
-) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
+) -> (GenerationRetentionPlan, GenerationRetentionApplyReport) {
     let mut protection = scan_retention_protection(
         &crate::config::user_cache_root(),
         Some(storage_path),
@@ -3537,9 +3576,17 @@ fn retain_published_generations(
         protection.errors.push(error);
     }
     let plan = plan_generation_retention(context.layout, project_id, &protection);
-    let mut remover = FsGenerationRemover::new(context.layout)?;
-    let apply = apply_generation_retention(&plan, &mut remover);
-    Ok((plan, apply))
+    let apply = match FsGenerationRemover::new(context.layout) {
+        Ok(mut remover) => apply_generation_retention(&plan, &mut remover),
+        Err(error) => {
+            let error = format!(
+                "cleanup deferred after committed retrieval publication: open owned generation remover: {error:#}"
+            );
+            warn!(project_id = %project_id, error = %error, "generation retention setup failed after SQLite publication");
+            GenerationRetentionApplyReport::cleanup_deferred(&plan, error)
+        }
+    };
+    (plan, apply)
 }
 
 pub(crate) fn compute_sidecar_input_fingerprint(
@@ -3936,6 +3983,36 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    struct RestoreOwnedRoot {
+        root: PathBuf,
+        parked: PathBuf,
+        restored: bool,
+    }
+
+    #[cfg(unix)]
+    impl RestoreOwnedRoot {
+        fn restore(&mut self) -> std::io::Result<()> {
+            if !self.restored {
+                match fs::symlink_metadata(&self.root) {
+                    Ok(_) => fs::remove_file(&self.root)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                fs::rename(&self.parked, &self.root)?;
+                self.restored = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreOwnedRoot {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
 
     fn secure_test_directory(path: &Path) {
         #[cfg(unix)]
@@ -5646,6 +5723,326 @@ mod tests {
             "retention preparation must remain observational before atomic publication"
         );
         fixture.assert_core_unchanged();
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn postcommit_remover_setup_failure_preserves_publication_and_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let previous = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("publish first complete retrieval generation");
+        fs::write(
+            fixture.project.path().join("next.rs"),
+            "pub fn next_generation() {}\n",
+        )
+        .expect("write changed source for the next generation");
+        let previous_current = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("publish second complete retrieval generation");
+        assert_ne!(
+            previous.sidecar_generation, previous_current.sidecar_generation,
+            "fixture needs distinct artifact generations"
+        );
+        let current = previous;
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: previous_current,
+            verified_at_epoch_ms: 5_252,
+        };
+        let mut storage = Store::open(&fixture.storage_path).expect("open committed core");
+        storage
+            .publish_retrieval_index_publication(&current, Some(&rollback))
+            .expect("commit replacement current and rollback pointers");
+        publish_derived_retention_marker(
+            &storage,
+            &fixture.runtime.layout,
+            "postcommit-fixture-workspace",
+            fixture.project.path(),
+            &current.project_id,
+        )
+        .expect("publish marker before cleanup");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication(&current.project_id)
+                .expect("read committed pointer"),
+            Some((current.clone(), Some(rollback.clone())))
+        );
+        drop(storage);
+
+        let generations = [&current, &rollback.manifest];
+        let artifacts = generations
+            .into_iter()
+            .flat_map(|manifest| {
+                let generation = manifest.sidecar_generation.as_deref().expect("generation");
+                [
+                    crate::lexical_index::shard_dir_for(
+                        &fixture.runtime.layout.lexical_data_dir,
+                        generation,
+                    )
+                    .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                    crate::scip_index::scip_symbols_component_path(
+                        &fixture.runtime.layout.scip_project_dir(generation),
+                    ),
+                    crate::embedded_vector::index_path(
+                        &fixture.runtime.layout,
+                        &manifest.semantic_generation,
+                    ),
+                ]
+            })
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap_or_else(|error| {
+                    panic!("read committed artifact {}: {error}", path.display())
+                });
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        let pointer_bytes = fs::read(&fixture.retrieval_pointer_path)
+            .expect("read committed retrieval pointer bytes");
+
+        let root = fixture
+            .runtime
+            .layout
+            .lexical_data_dir
+            .parent()
+            .expect("sidecar root");
+        let parked = root.with_extension("parked");
+        fs::rename(root, &parked).expect("park owned sidecar root after commit");
+        let mut restore = RestoreOwnedRoot {
+            root: root.to_path_buf(),
+            parked: parked.clone(),
+            restored: false,
+        };
+        symlink(&parked, root).expect("replace owned root with unsafe symlink");
+        let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+            retain_published_generations(
+                &fixture.storage_path,
+                &GenerationRetentionContext {
+                    runtime: &fixture.runtime,
+                    layout: &fixture.runtime.layout,
+                    workspace_id: "postcommit-fixture-workspace",
+                    previous_manifest: Some(&rollback.manifest),
+                    embedding_device: &crate::embeddings::embedding_device_readiness_for_runtime(
+                        &fixture.runtime,
+                    ),
+                    embedding_residency:
+                        crate::embeddings::acquire_product_embedding_residency_for_runtime(
+                            &fixture.runtime,
+                        )
+                        .expect("acquire test residency"),
+                    pinned_core_publication: fixture.publication.clone(),
+                    graph_equivalent_predecessor: None,
+                },
+                &current.project_id,
+                None,
+            )
+        });
+        restore.restore().expect("restore owned sidecar root");
+
+        assert_eq!(
+            Store::open(&fixture.storage_path)
+                .expect("reopen committed store")
+                .get_retrieval_index_publication(&current.project_id)
+                .expect("read publication after cleanup failure"),
+            Some((current, Some(rollback)))
+        );
+        assert_eq!(
+            fs::read(&fixture.retrieval_pointer_path).expect("read retained pointer bytes"),
+            pointer_bytes
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(
+                fs::read(&path).expect("read retained artifact"),
+                bytes,
+                "{}",
+                path.display()
+            );
+        }
+        let (_plan, report) = result;
+        assert!(report.pruning_suppressed);
+        assert_eq!(report.removed_bytes, 0);
+        assert!(report.removals.is_empty());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("cleanup deferred")
+                    && error.contains("owned sidecar root")),
+            "missing explicit postcommit cleanup diagnostic: {:?}",
+            report.errors
+        );
+    }
+
+    #[cfg(all(feature = "test-support", unix))]
+    #[test]
+    fn finalized_manifest_returns_committed_outcome_when_cleanup_setup_fails() {
+        use std::os::unix::fs::symlink;
+
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let candidate = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+        )
+        .expect("prepare complete candidate artifacts");
+        let generation = candidate.sidecar_generation.as_deref().expect("generation");
+        let artifacts = [
+            crate::lexical_index::shard_dir_for(
+                &fixture.runtime.layout.lexical_data_dir,
+                generation,
+            )
+            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+            crate::scip_index::scip_symbols_component_path(
+                &fixture.runtime.layout.scip_project_dir(generation),
+            ),
+            crate::embedded_vector::index_path(
+                &fixture.runtime.layout,
+                &candidate.semantic_generation,
+            ),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read candidate artifact before commit");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        fs::remove_file(&fixture.retrieval_pointer_path)
+            .expect("reset prepared candidate to an absent first-publication pointer");
+
+        let storage = Store::open(&fixture.storage_path).expect("open candidate core");
+        let embedding_device =
+            crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        let embedding_dim = candidate.embedding_dim.expect("embedding dimension");
+        let producer = crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).expect("positive dimension"),
+        )
+        .expect("producer compatibility identity");
+        let sidecar_input = compute_sidecar_input_fingerprint(
+            &storage,
+            fixture.project.path(),
+            &fixture.storage_path,
+            &candidate.project_id,
+            candidate.embedding_backend.as_deref().expect("backend"),
+            embedding_dim,
+            &producer,
+        )
+        .expect("compute exact candidate input");
+        assert_eq!(
+            candidate.sidecar_input_hash.as_deref(),
+            Some(sidecar_input.hash.as_str()),
+            "test validator must not admit a stale candidate"
+        );
+        let prepared_lexical = prepare_lexical_input_for_store(
+            lexical_source_input(fixture.project.path(), &fixture.storage_path)
+                .expect("scan lexical source"),
+            fixture.project.path(),
+            &storage,
+        )
+        .expect("prepare lexical source seals");
+        drop(storage);
+        let residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test residency");
+        let context = GenerationRetentionContext {
+            runtime: &fixture.runtime,
+            layout: &fixture.runtime.layout,
+            workspace_id: "postcommit-finalizer-workspace",
+            previous_manifest: None,
+            embedding_device: &embedding_device,
+            embedding_residency: residency,
+            pinned_core_publication: fixture.publication.clone(),
+            graph_equivalent_predecessor: None,
+        };
+        let root = fixture
+            .runtime
+            .layout
+            .lexical_data_dir
+            .parent()
+            .expect("sidecar root");
+        let parked = root.with_extension("parked");
+        let mut restore = None;
+        let result = crate::config::with_test_cache_root(fixture._cache.path(), || {
+            persist_finalized_manifest_with_hooks(
+                fixture.project.path(),
+                &fixture.storage_path,
+                &prepared_lexical,
+                &context,
+                &AtomicBool::new(false),
+                &sidecar_input,
+                candidate.project_id.clone(),
+                candidate.clone(),
+                Vec::new(),
+                SidecarStubFlags {
+                    scip_stubbed: false,
+                },
+                |project_id, input, manifest, context, storage, _storage_path| {
+                    assert_eq!(project_id, manifest.project_id);
+                    assert_eq!(
+                        manifest.sidecar_input_hash.as_deref(),
+                        Some(input.hash.as_str())
+                    );
+                    assert_eq!(
+                        storage.get_complete_index_publication()?,
+                        Some(context.pinned_core_publication.clone())
+                    );
+                    assert!(crate::lexical_index::shard_matches_lexical_input(
+                        &context.layout.lexical_data_dir,
+                        manifest.sidecar_generation.as_deref().expect("generation"),
+                        input.lexical_file_count,
+                        &input.lexical_hash,
+                        &input.hash,
+                    ));
+                    Ok(())
+                },
+                || {
+                    fs::rename(root, &parked).expect("park sidecar root after marker");
+                    restore = Some(RestoreOwnedRoot {
+                        root: root.to_path_buf(),
+                        parked: parked.clone(),
+                        restored: false,
+                    });
+                    symlink(&parked, root).expect("replace sidecar root before remover open");
+                },
+            )
+        });
+        restore
+            .as_mut()
+            .expect("post-marker hook ran")
+            .restore()
+            .expect("restore candidate sidecar root");
+        let outcome = result.expect("committed publication must survive cleanup setup failure");
+        assert_eq!(outcome.manifest.project_id, candidate.project_id);
+        assert_eq!(
+            outcome.manifest.sidecar_generation,
+            candidate.sidecar_generation
+        );
+        assert!(outcome.generation_retention.pruning_suppressed);
+        assert_eq!(outcome.generation_retention.removed_bytes, 0);
+        assert!(outcome.generation_retention.errors.iter().any(|error| {
+            error.contains("cleanup deferred") && error.contains("owned sidecar root")
+        }));
+        assert_eq!(
+            Store::open(&fixture.storage_path)
+                .expect("reopen publication")
+                .get_retrieval_index_publication(&candidate.project_id)
+                .expect("read committed publication")
+                .map(|(manifest, rollback)| (manifest.sidecar_generation, rollback)),
+            Some((candidate.sidecar_generation, None))
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(fs::read(&path).expect("read candidate artifact"), bytes);
+        }
     }
 
     #[test]
