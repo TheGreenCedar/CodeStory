@@ -558,15 +558,20 @@ pub fn project_search_v3(
             generation_id: None,
         };
     }
-    let evidence = results
-        .hits
-        .iter()
-        .enumerate()
-        .filter_map(|(index, hit)| search_evidence_row(index, hit))
-        .take(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
-        .collect();
+    let SearchEvidenceSelectionV3 {
+        rows: evidence,
+        missing_source,
+        was_bounded,
+    } = search_evidence_selection(results);
     let mut gaps = Vec::new();
-    if results.hits.len() > codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3 {
+    if missing_source {
+        gaps.push(gap_row(
+            "search-source-unavailable",
+            GapKindV3Dto::SourceUnavailable,
+            Some("A search result had no pinned source path and could not be projected."),
+        )?);
+    }
+    if was_bounded {
         gaps.push(gap_row(
             "search-projection-bounded",
             GapKindV3Dto::OutputBudgetExceeded,
@@ -591,6 +596,40 @@ pub fn project_search_v3(
         Vec::new(),
     ))
     .map_err(|error| projection_error("search projection", error))
+}
+
+struct SearchEvidenceSelectionV3 {
+    rows: Vec<SearchEvidenceRowV3Dto>,
+    missing_source: bool,
+    was_bounded: bool,
+}
+
+fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelectionV3 {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    let mut missing_source = false;
+    let mut was_bounded = false;
+    for hit in results.hits.iter().chain(&results.repo_text_hits) {
+        let Some(path) = hit.file_path.as_deref().filter(|path| !path.is_empty()) else {
+            missing_source = true;
+            continue;
+        };
+        // The same location may be present in the merged and source-specific
+        // result lists. Different lines in one file are separate evidence.
+        if !seen.insert((hit.node_id.0.as_str(), path, hit.line)) {
+            continue;
+        }
+        if rows.len() == codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3 {
+            was_bounded = true;
+            continue;
+        }
+        rows.push(search_evidence_row(rows.len(), hit).expect("search hit has a path"));
+    }
+    SearchEvidenceSelectionV3 {
+        rows,
+        missing_source,
+        was_bounded,
+    }
 }
 
 fn projection_envelope(
@@ -853,7 +892,7 @@ fn answer_gap_rows(
 }
 
 fn search_evidence_row(index: usize, hit: &SearchHit) -> Option<SearchEvidenceRowV3Dto> {
-    let path = hit.file_path.as_deref()?;
+    let path = hit.file_path.as_deref().filter(|path| !path.is_empty())?;
     Some(SearchEvidenceRowV3Dto {
         identity: evidence_identity(&format!("search-{index}-{}", hit.node_id.0)),
         path: path_text(path),
@@ -997,7 +1036,7 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, atomic::AtomicBool};
 
-    use codestory_contracts::api::IndexMode;
+    use codestory_contracts::api::{IndexMode, SearchRepoTextMode, SearchRequest};
     use serde_json::json;
 
     use super::*;
@@ -1017,6 +1056,236 @@ mod tests {
             to_symbol: None,
             query: None,
         }
+    }
+
+    fn indexed_search_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::AppController,
+        crate::services::PublicOperationService,
+    ) {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("isolated cache");
+        let source = project.path().join("src/layout.css");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
+        fs::write(&source, "/* REPO_TEXT_TOKEN */\nbody { color: red; }\n").expect("source");
+        let controller = crate::AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                state.path().join("codestory.db"),
+            )
+            .expect("open isolated project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("complete core index");
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        (project, state, controller, service)
+    }
+
+    fn core_search_request(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.to_owned(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        }
+    }
+
+    #[test]
+    fn search_projection_keeps_real_repo_text_only_match() {
+        let (project, _state, controller, service) = indexed_search_fixture();
+        let projected = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                let mut results =
+                    controller.search_results(core_search_request("REPO_TEXT_TOKEN"))?;
+                assert!(
+                    results.hits.is_empty(),
+                    "the core symbol lane has no literal hit"
+                );
+                let storage = controller.open_storage_read_only()?;
+                let scan = crate::AppController::collect_repo_text_hits(
+                    &storage,
+                    Some(project.path()),
+                    &codestory_workspace::SourceIndexPolicy::default(),
+                    "REPO_TEXT_TOKEN",
+                    10,
+                    &HashSet::new(),
+                )?;
+                assert_eq!(scan.hits.len(), 1, "source-backed repository-text result");
+                results.repo_text_hits = scan.hits;
+                results.repo_text_mode = SearchRepoTextMode::On;
+                results.repo_text_enabled = true;
+                project_search_v3(&service, "test", &results)
+            })
+            .expect("schema-3 projection")
+            .value;
+        assert!(
+            projected.evidence.as_slice().iter().any(|row| {
+                row.path.as_str().ends_with("src/layout.css") && row.start_line == Some(1)
+            }),
+            "real repo-text match must reach public schema-3 evidence: {projected:#?}"
+        );
+    }
+
+    #[test]
+    fn search_projection_keeps_parentless_core_file_match() {
+        let (_project, _state, controller, service) = indexed_search_fixture();
+        let projected = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                let results = controller.search_results(core_search_request("layout.css"))?;
+                let file_hit = results
+                    .hits
+                    .iter()
+                    .find(|hit| hit.kind == codestory_contracts::api::NodeKind::FILE)
+                    .expect("core search found indexed FILE");
+                let storage = controller.open_storage_read_only()?;
+                let file_node = storage
+                    .get_node(file_hit.node_id.to_core()?)
+                    .expect("indexed FILE lookup")
+                    .expect("indexed FILE node");
+                assert_eq!(file_node.file_node_id, None, "FILE has no parent file");
+                assert!(
+                    file_hit.file_path.is_some(),
+                    "pinned FILE path: {file_hit:#?}"
+                );
+                project_search_v3(&service, "test", &results)
+            })
+            .expect("schema-3 projection")
+            .value;
+        assert!(
+            projected
+                .evidence
+                .as_slice()
+                .iter()
+                .any(|row| { row.path.as_str() == "src/layout.css" }),
+            "core FILE match must reach public schema-3 evidence: {projected:#?}"
+        );
+    }
+
+    #[test]
+    fn search_projection_deduplicates_mixed_hits_and_accounts_for_missing_or_bounded_rows() {
+        let (_project, _state, controller, service) = indexed_search_fixture();
+        let results = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                controller.search_results(core_search_request("layout.css"))
+            })
+            .expect("core search")
+            .value;
+        let file_hit = results
+            .hits
+            .iter()
+            .find(|hit| hit.kind == codestory_contracts::api::NodeKind::FILE)
+            .expect("indexed FILE")
+            .clone();
+
+        let mut duplicate = results.clone();
+        duplicate.hits = vec![file_hit.clone()];
+        duplicate.repo_text_hits = vec![file_hit.clone()];
+        let selection = search_evidence_selection(&duplicate);
+        assert_eq!(
+            selection.rows.len(),
+            1,
+            "one source location across both lists"
+        );
+        assert!(!selection.missing_source && !selection.was_bounded);
+
+        let mut missing = duplicate.clone();
+        missing.hits[0].file_path = None;
+        missing.repo_text_hits.clear();
+        let missing_projection = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                project_search_v3(&service, "test", &missing)
+            })
+            .expect("source-unavailable projection")
+            .value;
+        assert!(missing_projection.evidence.as_slice().is_empty());
+        assert!(
+            missing_projection
+                .gaps
+                .as_slice()
+                .iter()
+                .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+        );
+
+        let mut bounded = duplicate;
+        bounded.hits = (0..=codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
+            .map(|index| {
+                let mut hit = file_hit.clone();
+                hit.node_id.0 = format!("file-{index}");
+                hit.file_path = Some(format!("src/file-{index}.css"));
+                hit
+            })
+            .collect();
+        bounded.repo_text_hits = vec![bounded.hits[0].clone()];
+        let bounded_projection = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                project_search_v3(&service, "test", &bounded)
+            })
+            .expect("bounded projection")
+            .value;
+        assert_eq!(
+            bounded_projection.evidence.as_slice().len(),
+            codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3
+        );
+        assert!(
+            bounded_projection
+                .gaps
+                .as_slice()
+                .iter()
+                .any(|gap| gap.kind == GapKindV3Dto::OutputBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn file_search_path_comes_from_pinned_file_identity() {
+        let (_project, state, controller, _service) = indexed_search_fixture();
+        let file_hit = controller
+            .search_results(core_search_request("layout.css"))
+            .expect("core search")
+            .hits
+            .into_iter()
+            .find(|hit| hit.kind == codestory_contracts::api::NodeKind::FILE)
+            .expect("indexed FILE");
+        let node_id = file_hit.node_id.to_core().expect("numeric file identity");
+        let published =
+            codestory_store::Store::open(&state.path().join("codestory.db")).expect("pinned store");
+        let scratch_path = state.path().join("isolated-path-test.db");
+        published
+            .get_connection()
+            .execute(
+                "VACUUM INTO ?1",
+                [scratch_path.to_str().expect("UTF-8 scratch path")],
+            )
+            .expect("snapshot into isolated writable test store");
+        let storage = codestory_store::Store::open_with_mode(
+            &scratch_path,
+            codestory_store::StorageOpenMode::Build,
+        )
+        .expect("isolated writable test store");
+        let pinned_path = storage
+            .get_file_by_id(node_id.0)
+            .expect("file record query")
+            .expect("file record")
+            .path;
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET serialized_name = 'forged/outside.css' WHERE id = ?1",
+                [node_id.0],
+            )
+            .expect("hostile display-name mutation");
+        let path_bound =
+            crate::AppController::build_search_hit(&storage, &HashMap::new(), node_id, 1.0)
+                .expect("search hit")
+                .expect("FILE hit");
+        assert_eq!(
+            path_bound.file_path.as_deref(),
+            Some(pinned_path.to_str().expect("UTF-8 path")),
+            "untrusted display name cannot replace pinned FILE path"
+        );
     }
 
     #[test]

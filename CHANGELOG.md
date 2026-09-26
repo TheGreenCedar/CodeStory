@@ -9,6 +9,7 @@
 - Cache rehydrate copies the source generation it validated. If a new target lacks space, it leaves the target directory untouched so a later retry starts cleanly.
 - Bookmarks retain their last verified binding when a core lookup or post-index cache refresh fails, so a later refresh can still follow a unique rename or move. Direct relative-root incremental indexing reports a committed refresh as successful when optional retrieval refresh evidence cannot be used.
 - Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
+- Schema-3 search evidence includes repository-text matches and indexed file results, with explicit gaps when a result lacks a source path or the response reaches its row limit.
 - Lexical search over an incremental index can reach unchanged matches even when newer updates replace the first window of results from an older index component.
 - Go call navigation keeps locally shadowed import aliases distinct from package calls and follows ordinary package functions and factory methods when an external test package declares the same names.
 - Ruby and PHP call proof no longer treats a receiver assigned only on a conditional path as certain. PHP calls also stop using an earlier receiver type after `extract` can replace it, until an explicit assignment establishes it again.

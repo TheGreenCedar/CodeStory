@@ -1192,6 +1192,23 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             storage
                 .insert_nodes_batch(&nodes)
                 .expect("insert core nodes");
+            let files: Vec<_> = nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::FILE)
+                .map(|node| codestory_store::FileInfo {
+                    id: node.id.0,
+                    path: PathBuf::from(&node.serialized_name),
+                    language: "typescript".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .collect();
+            storage
+                .insert_files_batch(&files)
+                .expect("insert canonical file identities");
         }
 
         let controller = AppController::new();
