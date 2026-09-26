@@ -69,7 +69,7 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
         query: cmd.query.clone(),
         repo_text: to_api_repo_text_mode(cmd.repo_text),
         limit_per_source: cmd.limit.clamp(1, 50),
-        expand_search_plan: cmd.why && cmd.plan_details,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     }

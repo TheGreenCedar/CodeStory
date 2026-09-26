@@ -303,7 +303,6 @@ fn search_json_fails_closed_without_full_sidecars() {
             "1",
             "--refresh",
             "none",
-            "--why",
             "--format",
             "json",
         ],
@@ -438,6 +437,47 @@ fn search_json_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 }
 
 #[test]
+fn search_rejects_retired_explanation_flags_in_both_formats() {
+    let workspace = tempdir().expect("workspace dir");
+    for format in ["json", "markdown"] {
+        for flags in [
+            &["--why"][..],
+            &["--why", "--plan-details"][..],
+            &["--plan-details"][..],
+        ] {
+            let mut args = vec!["search", "--query", "indexing"];
+            args.extend_from_slice(flags);
+            args.extend_from_slice(&["--format", format]);
+            let search = run_cli(workspace.path(), &args);
+            assert!(
+                !search.status.success(),
+                "retired search flags must fail in {format}: {}",
+                String::from_utf8_lossy(&search.stdout)
+            );
+            let message = if format == "json" {
+                assert!(
+                    search.stderr.is_empty(),
+                    "JSON parse failure must not emit stderr"
+                );
+                let failure: Value =
+                    serde_json::from_slice(&search.stdout).expect("parse failure envelope");
+                assert_eq!(failure["error"]["code"], "invalid_arguments");
+                failure["error"]["message"]
+                    .as_str()
+                    .expect("argument failure message")
+                    .to_string()
+            } else {
+                String::from_utf8(search.stderr).expect("markdown parse failure is utf8")
+            };
+            assert!(
+                message.contains(&format!("unexpected argument '{}'", flags[0])),
+                "retired search flags should be unknown, not silently accepted: {message}"
+            );
+        }
+    }
+}
+
+#[test]
 fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
     let workspace = tempdir().expect("workspace dir");
 
@@ -550,7 +590,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
             "1",
             "--refresh",
             "none",
-            "--why",
             "--format",
             "json",
         ],
@@ -582,7 +621,7 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         shadow["stage_timings"]
             .as_array()
             .is_some_and(|items| !items.is_empty()),
-        "search --why json should expose sidecar stage timings: {json:#}"
+        "search json should expose sidecar stage timings: {json:#}"
     );
     assert!(
         shadow["candidates"].as_array().is_some_and(|items| {
@@ -593,19 +632,19 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
                         && item["resolution"].is_string()
                 })
         }),
-        "search --why json should expose sidecar candidate provenance and resolution labels: {json:#}"
+        "search json should expose sidecar candidate provenance and resolution labels: {json:#}"
     );
     assert!(
         shadow["candidate_count"]
             .as_u64()
             .is_some_and(|count| count > 0),
-        "search --why json should count sidecar candidates: {json:#}"
+        "search json should count sidecar candidates: {json:#}"
     );
     assert!(
         shadow["resolved_hit_count"]
             .as_u64()
             .is_some_and(|count| count > 0),
-        "search --why json should count resolved sidecar hits: {json:#}"
+        "search json should count resolved sidecar hits: {json:#}"
     );
     assert!(
         json["indexed_symbol_hits"].is_array(),
@@ -616,7 +655,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         Some(1),
         "search json should preserve the indexed symbol bucket"
     );
-    assert_eq!(json["explain"], Value::Bool(true));
     assert!(
         json["indexed_symbol_hits"][0]["score_breakdown"].is_object(),
         "search json should expose hybrid score breakdowns for indexed hits"
@@ -635,10 +673,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         "search json should include a deterministic next-action assessment"
     );
     assert!(
-        json["indexed_symbol_hits"][0]["why"].is_array(),
-        "search --why json should carry compact explanation strings"
-    );
-    assert!(
         json["repo_text_hits"].is_array(),
         "search json should preserve the repo-text hits field"
     );
@@ -652,374 +686,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         "mandatory sidecar search should not emit repo-text scan telemetry"
     );
     assert_eq!(json["limit_per_source"], Value::from(1));
-}
-
-#[test]
-#[ignore = "live full-sidecar contract; requires finalized sidecar search-plan evidence"]
-fn broad_search_json_and_markdown_expose_search_plan() {
-    let workspace = tempdir().expect("workspace dir");
-    write_search_quality_fixture(workspace.path());
-
-    let index = run_cli(
-        workspace.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
-
-    let query = "how full indexing supports search trail and snippet commands";
-    let search = run_cli(
-        workspace.path(),
-        &[
-            "search",
-            "--query",
-            query,
-            "--repo-text",
-            "on",
-            "--why",
-            "--plan-details",
-            "--format",
-            "json",
-            "--refresh",
-            "none",
-        ],
-    );
-    assert!(
-        search.status.success(),
-        "search command failed: {}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
-    let plan = &json["search_plan"];
-    assert!(
-        plan.is_object(),
-        "search json should expose search_plan: {json:#}"
-    );
-    assert_eq!(plan["original_query"], query);
-    assert_eq!(plan["eligible"], true);
-    let extracted = plan["terms"]["extracted"]
-        .as_array()
-        .expect("extracted terms")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    for expected in ["full", "indexing", "search", "trail", "snippet"] {
-        assert!(
-            extracted.contains(&expected),
-            "search plan should extract `{expected}` from broad query: {plan:#}"
-        );
-    }
-    assert!(
-        plan["terms"]["dropped"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "search plan should expose dropped natural-language terms: {plan:#}"
-    );
-    let subqueries = plan["subqueries"].as_array().expect("subqueries");
-    assert!(
-        (3..=8).contains(&subqueries.len()),
-        "broad query should produce bounded subqueries: {plan:#}"
-    );
-    let channels = subqueries
-        .iter()
-        .flat_map(|subquery| subquery["channels"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    assert!(channels.contains(&"typed_symbol"), "{plan:#}");
-    assert!(
-        channels.contains(&"lexical") || channels.contains(&"semantic"),
-        "{plan:#}"
-    );
-    assert!(
-        !channels.contains(&"repo_text"),
-        "mandatory sidecar search plans must not use repo-text fallback channels: {plan:#}"
-    );
-    assert_eq!(
-        json["repo_text_enabled"],
-        Value::Bool(false),
-        "mandatory sidecar search must ignore repo-text serving even when requested: {json:#}"
-    );
-    assert_eq!(
-        json["repo_text_hits"].as_array().map(Vec::len),
-        Some(0),
-        "mandatory sidecar search plans must not serve repo-text hits: {json:#}"
-    );
-    assert!(
-        json["repo_text_stats"].is_null(),
-        "mandatory sidecar search plans must not run repo-text scan telemetry: {json:#}"
-    );
-    assert!(
-        plan["candidate_windows"].as_array().is_some_and(|items| {
-            items.iter().all(|item| {
-                item["channel"].is_string()
-                    && item["subquery"].is_string()
-                    && item["limit"].is_number()
-                    && item["returned_count"].is_number()
-                    && item["truncated"].is_boolean()
-            })
-        }),
-        "candidate windows should expose bounded retrieval state: {plan:#}"
-    );
-    assert!(
-        plan["candidate_windows"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| {
-                item["channel"] == "typed_symbol"
-                    && item["subquery"]
-                        .as_str()
-                        .is_some_and(|subquery| subquery != query)
-                    && item["returned_count"]
-                        .as_u64()
-                        .is_some_and(|count| count > 0)
-            })),
-        "candidate windows should come from executed planned subqueries, not only the original query: {plan:#}"
-    );
-    assert!(
-        plan["candidate_windows"]
-            .as_array()
-            .is_some_and(|items| items.iter().all(|item| item["channel"] != "repo_text")),
-        "mandatory sidecar search plans must not expose repo-text candidate windows: {plan:#}"
-    );
-    assert!(
-        plan["anchor_groups"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()
-                && items.iter().all(|item| {
-                    item["anchor"].is_string()
-                        && item["promotion_status"].is_string()
-                        && item["confidence"].is_string()
-                })),
-        "search plan should expose anchor groups: {plan:#}"
-    );
-    assert!(
-        plan.get("next_commands").is_none(),
-        "search plan JSON should expose structured next actions, not rendered CLI commands: {plan:#}"
-    );
-    assert!(
-        plan["next_actions"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["action"] == "snippet"
-                    && item["node_id"].is_string()
-                    && item["options"].as_array().is_some_and(|options| {
-                        options.iter().any(|option| option == "function_body")
-                    })
-            })
-        }),
-        "search plan should provide structured next actions for CLI renderers: {plan:#}"
-    );
-    assert!(
-        plan["source_truth_checks"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "search plan should provide source-truth checks: {plan:#}"
-    );
-    assert!(
-        plan["anchor_groups"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["promotion_status"] == "typed_anchor"
-                    && item["confidence"] == "medium"
-                    && item["reasons"].as_array().is_some_and(|reasons| {
-                        reasons.iter().any(|reason| {
-                            reason
-                                .as_str()
-                                .is_some_and(|text| text.contains("typed indexed symbol"))
-                        })
-                    })
-            })
-        }),
-        "search plan should expose typed-anchor ranking hints for active investigation paths: {plan:#}"
-    );
-    assert!(
-        plan["bridges"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .all(|item| item["confidence"].as_str() != Some("low"))
-        }),
-        "search plan should suppress low-confidence bridge/noise rows by default: {plan:#}"
-    );
-    assert!(
-        plan["source_truth_checks"]
-            .as_array()
-            .is_some_and(|checks| {
-                checks.iter().any(|check| {
-                    check.as_str().is_some_and(|text| {
-                        text.contains("Suppressed") && text.contains("low-confidence bridge")
-                    })
-                })
-            }),
-        "search plan should preserve a source-truth prompt for suppressed low-confidence bridges: {plan:#}"
-    );
-    assert!(
-        plan["rejected_hits"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                matches!(
-                    item["display_name"].as_str(),
-                    Some("getElsewhereFeed" | "getCommentAuth" | "exact_symbol_anchor")
-                ) && item["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("not selected after anchor grouping"))
-            })
-        }),
-        "search plan should preserve rejected-hit reasons for unused exact anchors: {plan:#}"
-    );
-
-    let markdown = run_cli(
-        workspace.path(),
-        &[
-            "search",
-            "--query",
-            query,
-            "--repo-text",
-            "on",
-            "--why",
-            "--plan-details",
-            "--format",
-            "markdown",
-            "--refresh",
-            "none",
-        ],
-    );
-    assert!(
-        markdown.status.success(),
-        "markdown search command failed: {}",
-        String::from_utf8_lossy(&markdown.stderr)
-    );
-    let markdown = String::from_utf8(markdown.stdout).expect("markdown utf8");
-    for expected in [
-        "## Search Plan",
-        "Sidecar diagnostics:",
-        "Sidecar stages:",
-        "Sidecar candidate window:",
-        "Subqueries:",
-        "Extracted terms:",
-        "Repo-text promotions:",
-        "Source-truth checks:",
-    ] {
-        assert!(
-            markdown.contains(expected),
-            "search markdown should contain `{expected}`:\n{markdown}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "live full-sidecar contract; requires finalized sidecar search-plan evidence"]
-fn broad_search_json_without_plan_details_does_not_emit_search_plan() {
-    let workspace = tempdir().expect("workspace dir");
-    write_search_quality_fixture(workspace.path());
-
-    let index = run_cli(
-        workspace.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
-
-    let search = run_cli(
-        workspace.path(),
-        &[
-            "search",
-            "--query",
-            "how full indexing supports search trail and snippet commands",
-            "--repo-text",
-            "on",
-            "--why",
-            "--format",
-            "json",
-            "--refresh",
-            "none",
-        ],
-    );
-    assert!(
-        search.status.success(),
-        "search command failed: {}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
-    assert!(
-        json["search_plan"].is_null(),
-        "search should not emit Search Plan unless --why --plan-details is requested: {json:#}"
-    );
-}
-
-#[test]
-#[ignore = "live full-sidecar contract; requires finalized sidecar search-plan evidence"]
-fn search_plan_honors_repo_text_off() {
-    let workspace = tempdir().expect("workspace dir");
-    write_search_quality_fixture(workspace.path());
-
-    let index = run_cli(
-        workspace.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
-
-    let query = "how full indexing supports search trail and snippet commands";
-    let search = run_cli(
-        workspace.path(),
-        &[
-            "search",
-            "--query",
-            query,
-            "--repo-text",
-            "off",
-            "--why",
-            "--plan-details",
-            "--format",
-            "json",
-            "--refresh",
-            "none",
-        ],
-    );
-    assert!(
-        search.status.success(),
-        "search command failed: {}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
-    assert_eq!(json["repo_text_mode"], "off");
-    assert_eq!(json["repo_text_enabled"], false);
-    assert!(
-        json["repo_text_hits"]
-            .as_array()
-            .is_some_and(|hits| hits.is_empty()),
-        "repo_text off should not return repo-text hits: {json:#}"
-    );
-
-    let plan = &json["search_plan"];
-    assert!(
-        plan.is_object(),
-        "broad search should still expose an index-backed plan: {json:#}"
-    );
-    let subquery_channels = plan["subqueries"]
-        .as_array()
-        .expect("subqueries")
-        .iter()
-        .flat_map(|subquery| subquery["channels"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    assert!(
-        !subquery_channels.contains(&"repo_text"),
-        "repo_text off should strip repo-text plan channels: {plan:#}"
-    );
-    assert!(
-        plan["candidate_windows"]
-            .as_array()
-            .expect("candidate windows")
-            .iter()
-            .all(|window| window["channel"] != "repo_text"),
-        "repo_text off should not execute repo-text plan windows: {plan:#}"
-    );
 }
 
 #[test]
@@ -1053,7 +719,6 @@ fn exact_symbol_queries_preserve_fast_path_and_top_rank() {
                 anchor,
                 "--repo-text",
                 "on",
-                "--why",
                 "--format",
                 "json",
                 "--refresh",
@@ -1382,11 +1047,10 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let mut reciprocal_rank_sum = 0.0_f64;
     let mut latency_ms = Vec::new();
     let mut anchor_buckets = BTreeMap::<String, u32>::new();
-    let mut planned_broad_queries = 0_u32;
 
     for (query, expected, repo_text) in expectations {
         let started = Instant::now();
-        let mut args = vec![
+        let args = vec![
             "search",
             "--query",
             query,
@@ -1399,10 +1063,6 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
             "--format",
             "json",
         ];
-        if query.starts_with("how ") {
-            args.push("--why");
-            args.push("--plan-details");
-        }
         let search = run_cli(workspace.path(), &args);
         latency_ms.push(started.elapsed().as_millis() as u64);
         assert!(
@@ -1456,43 +1116,6 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
             (None, None) => "missing",
         };
         *anchor_buckets.entry(anchor_bucket.to_string()).or_default() += 1;
-        if query.starts_with("how ") {
-            let plan = &json["search_plan"];
-            assert!(
-                plan.is_object(),
-                "broad architecture query should expose a search plan: {json:#}"
-            );
-            let planned_anchor = plan["anchor_groups"]
-                .as_array()
-                .expect("anchor groups")
-                .iter()
-                .any(|group| {
-                    group["anchor"]
-                        .as_str()
-                        .is_some_and(|anchor| anchor.contains(expected))
-                        || group["chosen_symbol"]["display_name"]
-                            .as_str()
-                            .is_some_and(|name| name.contains(expected))
-                });
-            assert!(
-                planned_anchor || indexed_position.is_some() || repo_text_position.is_some(),
-                "broad architecture query should find expected anchor through hits or plan: {json:#}"
-            );
-            assert!(
-                plan["anchor_groups"]
-                    .as_array()
-                    .expect("anchor groups")
-                    .iter()
-                    .all(|group| {
-                        !matches!(
-                            group["promotion_status"].as_str(),
-                            Some("needs_source_read" | "ambiguous")
-                        ) || group["confidence"] != "high"
-                    }),
-                "unpromoted repo-text leads must not become high confidence: {json:#}"
-            );
-            planned_broad_queries += 1;
-        }
         if let Some(position) = indexed_position.or(repo_text_position) {
             found += 1;
             reciprocal_rank_sum += 1.0 / (position as f64 + 1.0);
@@ -1550,10 +1173,6 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     assert!(
         mrr >= 0.50,
         "expected useful search ordering, got mrr={mrr:.3}"
-    );
-    assert_eq!(
-        planned_broad_queries, 3,
-        "expected all broad architecture eval queries to expose search plans"
     );
     assert!(
         max_latency_ms < 3_000,

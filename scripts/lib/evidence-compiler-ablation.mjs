@@ -264,7 +264,7 @@ const EXACT_OPERATION_ARGUMENTS = Object.freeze({
       "--project", "--query", "--limit", "--repo-text", "--profile", "--run-id",
       "--format", "--refresh",
     ]),
-    booleans: new Set(["--why", "--plan-details"]),
+    booleans: new Set(),
   },
   files: {
     values: new Set(["--project", "--path", "--language", "--role", "--limit", "--format"]),
