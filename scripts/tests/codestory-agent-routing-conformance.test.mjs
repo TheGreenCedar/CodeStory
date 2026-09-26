@@ -24,10 +24,10 @@ import {
   ROUTING_REQUEST_CORPUS,
   ROUTING_SCENARIOS,
   STATIC_PARITY_HOSTS,
-  canonicalRequestContractDigest,
   materializeRoutingRequests,
   parseInstalledTranscript,
-  validateProofCallInputAgainstCatalog,
+  RETIRED_ROUTING_SCENARIOS,
+  requireSupportedRoutingScenario,
   validateRoutingRequestCorpus,
   validateInstalledSession,
   validateStaticHostParity,
@@ -148,85 +148,10 @@ const SCENARIO_IDS = [
   "packet_single_continuation",
   "packet_gap_to_focused_source",
   "packet_named_fallback_to_source",
-  "typed_proof_contract_proven",
-  "typed_proof_contract_refuted",
-  "typed_proof_unknown",
-  "typed_proof_unavailable",
-  "malformed_proof_contract",
-  "refuse_free_english_proof",
-  "proof_observational",
-  "hidden_proof_tool_discovery",
 ];
 
 function clone(value) {
   return structuredClone(value);
-}
-
-function proofContract({ prohibited = false } = {}) {
-  const sourceText = "`crate::start` directly calls `crate::finish`.";
-  const fields = [
-    { kind: "start" },
-    { kind: "step_target", step: 0 },
-    { kind: "directness", step: 0 },
-    { kind: "ordering", step: 0 },
-    { kind: "relation", step: 0 },
-    ...(prohibited ? [{ kind: "traversal_prohibition", index: 0 }] : []),
-  ];
-  return {
-    source_text: sourceText,
-    clauses: [
-      {
-        clause_id: "contract",
-        start_byte: 0,
-        end_byte_exclusive: Buffer.byteLength(sourceText),
-        quote: sourceText,
-        classification: { kind: "resolved_material", fields },
-      },
-    ],
-    spec: {
-      start: { kind: "canonical_id", canonical_id: "rust:crate::start" },
-      steps: [{ target: { kind: "canonical_id", canonical_id: "rust:crate::finish" } }],
-      prohibit_traversal_through: prohibited
-        ? [{ kind: "canonical_id", canonical_id: "rust:crate::blocked" }]
-        : [],
-      exclude_from_projection: [],
-    },
-  };
-}
-
-function publicProofArgs(document) {
-  return { call_path: document };
-}
-
-const DEFAULT_CALL_PATH = [
-  "call-path/v1",
-  'from symbol "start" in "src/lib.rs"',
-  'direct-call symbol "finish" in "src/lib.rs"',
-  "",
-].join("\n");
-
-const REFUTED_CALL_PATH = [
-  "call-path/v1",
-  'from symbol "refuted_start" in "src/lib.rs"',
-  'direct-call symbol "detour" in "src/lib.rs"',
-  'direct-call symbol "finish" in "src/lib.rs"',
-  'prohibit-through symbol "detour" in "src/lib.rs"',
-  "",
-].join("\n");
-
-const MALFORMED_CALL_PATH = "A calls B";
-
-function projectedProofClauses(contract) {
-  return contract.clauses.map((clause) => ({
-    start: clause.start_byte,
-    end: clause.end_byte_exclusive,
-    clause_id: clause.clause_id,
-    quote: clause.quote,
-    classification: clause.classification.kind,
-    fields: clause.classification.kind === "resolved_material" ? clone(clause.classification.fields) : [],
-    reason: clause.classification.kind === "unresolved_material" ? clause.classification.reason : null,
-    non_material_kind: clause.classification.kind === "non_material" ? clause.classification.reason : null,
-  }));
 }
 
 function runtimeMeta(overrides = {}) {
@@ -365,113 +290,6 @@ function v3Packet({
   };
 }
 
-function proofBody(disposition, contract, detail = {}) {
-  const publicContract = detail.public_contract ?? { call_path: DEFAULT_CALL_PATH };
-  const contractDigest = canonicalRequestContractDigest(publicContract);
-  const common = { kind: disposition, contract_digest: contractDigest };
-  let projectedDisposition;
-  let stepStatus;
-  const hasReceipt = ["contract_proven", "contract_refuted"].includes(disposition);
-  const receipts = hasReceipt ? [{
-    receipt_id: "receipt-1",
-    edge_id: "edge-1",
-    source: 0,
-    target: 1,
-    evidence: 0,
-    exact_callsite_start_byte: 0,
-    callsite_identity: "1:1:1:2|rust",
-    column_or_ordinal: 1,
-    containment: { file: 0, owner: 0, start_line: 1, end_line: 1 },
-    line_window: {
-      kind: "indexed_line_v1",
-      file: 0,
-      anchor_line: 1,
-      byte_start: 0,
-      byte_end: 10,
-      text: "finish();\n",
-    },
-  }] : [];
-  if (disposition === "contract_proven") {
-    projectedDisposition = { ...common, receipts: [0] };
-    stepStatus = "proven";
-  } else if (disposition === "contract_refuted") {
-    projectedDisposition = {
-      ...common,
-      refutation: {
-        kind: detail.basis?.kind ?? "prohibited_scope_traversal",
-        step_index: 0,
-        prohibition_index: 0,
-        connected_receipts: [0],
-      },
-    };
-    stepStatus = "positive_contradiction";
-  } else if (disposition === "unknown") {
-    projectedDisposition = {
-      ...common,
-      gaps: (detail.gaps ?? []).map(({ code }) => code.startsWith("selector_")
-        ? { kind: code, selector_index: 0 }
-        : { kind: code, step_index: 0 }),
-      connected_receipts: [],
-    };
-    stepStatus = "unknown";
-  } else {
-    projectedDisposition = { ...common, reasons: detail.reasons ?? [detail.reason] };
-    stepStatus = "unavailable";
-  }
-  return {
-    kind: "complete",
-    schema_version: 1,
-    domain: "indexed_source_call_path_v1",
-    contract_interpretation: "host_supplied",
-    guard_version: "clause_guard_v1",
-    source_text_sha256: sha256(Buffer.from(publicContract.call_path)),
-    contract_digest: contractDigest,
-    core_publication: { project_id: "project-1", generation_id: "core-1", run_id: "run-1" },
-    identities: hasReceipt ? {
-      files: [{
-        file_node_id: "1",
-        project_file_components: ["src", "lib.rs"],
-        indexed_sha256: "a".repeat(64),
-        observed_sha256: "a".repeat(64),
-      }],
-      symbols: [
-        { node_id: "1", canonical_id: "rust:crate::start", qualified_name: "crate::start", file: 0 },
-        { node_id: "2", canonical_id: "rust:crate::finish", qualified_name: "crate::finish", file: 0 },
-      ],
-      provenance_profiles: [{
-        producer: "codestory-internal",
-        fact_schema_version: 1,
-        algorithm: "exact-call-resolution-v1",
-        language_adapter: "rust",
-        language_adapter_version: "fixture-v1",
-        parser_fingerprint: "b".repeat(64),
-      }],
-      evidence: [{
-        fact_id: "c475943eeae97a7565be3dba007562b65e662b5111d1165b72ce2401e0d88eac",
-        caller: 0,
-        target: 1,
-        edge_id: "edge-1",
-        callsite_identity: "1:1:1:2|rust",
-        chain: [{ kind: "same_file_declaration", symbols: [1] }],
-        provenance: { profile: 0, dependency_files: [0], evidence_sha256: "d".repeat(64) },
-      }],
-    } : { files: [], symbols: [], provenance_profiles: [], evidence: [] },
-    spec: {
-      start: hasReceipt ? { kind: "canonical_id_ref", symbol: 0 } : clone(contract.spec.start),
-      steps: [{
-        relation: "direct_outgoing_call",
-        target: hasReceipt ? { kind: "canonical_id_ref", symbol: 1 } : clone(contract.spec.steps[0].target),
-      }],
-      prohibit_traversal_through: clone(contract.spec.prohibit_traversal_through),
-      exclude_from_projection: clone(contract.spec.exclude_from_projection),
-    },
-    clauses: projectedProofClauses(contract),
-    disposition: projectedDisposition,
-    steps: [{ step_index: 0, status: stepStatus, receipt: hasReceipt ? 0 : null }],
-    receipts,
-  };
-}
-
 function finalClaim(overrides = {}) {
   return {
     authority: "none",
@@ -490,8 +308,6 @@ function finalClaim(overrides = {}) {
 }
 
 function baseRun(scenarioId) {
-  const typed = proofContract();
-  const publicArgs = publicProofArgs(DEFAULT_CALL_PATH);
   const run = {
     scenario_id: scenarioId,
     request: {
@@ -635,81 +451,6 @@ function baseRun(scenarioId) {
         evidence_ids: ["evidence-1", "source:src/fallback.rs"],
         gap_ids: ["gap-1"],
       });
-      break;
-    case "typed_proof_contract_proven":
-      run.request.proof_contract = publicArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("contract_proven", typed))];
-      run.final = finalClaim({ authority: "typed_proof", evidence_ids: ["receipt-1"], proof_disposition: "contract_proven" });
-      break;
-    case "typed_proof_contract_refuted":
-      const refutedContract = proofContract({ prohibited: true });
-      const refutedArgs = publicProofArgs(REFUTED_CALL_PATH);
-      run.request.proof_contract = refutedArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...refutedArgs }, proofBody("contract_refuted", refutedContract, {
-        public_contract: refutedArgs,
-        basis: { kind: "prohibited_scope_traversal" },
-      }))];
-      run.final = finalClaim({
-        authority: "typed_proof",
-        outcome: "refuted",
-        evidence_ids: ["receipt-1"],
-        proof_disposition: "contract_refuted",
-        refutation_basis: "prohibited_scope_traversal",
-      });
-      break;
-    case "typed_proof_unknown":
-      run.request.proof_contract = publicArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unknown", typed, {
-        gaps: [{ code: "selector_missing" }],
-      }))];
-      run.final = finalClaim({ authority: "typed_proof", outcome: "unknown", reason_codes: ["selector_missing"], proof_disposition: "unknown" });
-      break;
-    case "typed_proof_unavailable":
-      run.request.proof_contract = publicArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unavailable", typed, {
-        reasons: ["proof_semantic_projection_unavailable"],
-      }))];
-      run.final = finalClaim({
-        authority: "typed_proof",
-        outcome: "unavailable",
-        reason_codes: ["proof_semantic_projection_unavailable"],
-        proof_disposition: "unavailable",
-      });
-      break;
-    case "malformed_proof_contract": {
-      const malformed = { ...typed, source_text: "A calls B", clauses: [] };
-      const malformedArgs = publicProofArgs(MALFORMED_CALL_PATH);
-      run.request.proof_contract = malformedArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...malformedArgs }, {
-        code: "invalid_proof_interpretation",
-        message: "source text is unclassified",
-      }, { isError: true })];
-      run.final = finalClaim({ authority: "none", outcome: "invalid_contract", reason_codes: ["invalid_proof_interpretation"] });
-      break;
-    }
-    case "refuse_free_english_proof":
-      run.request.text = "Prove from this sentence that start calls finish.";
-      run.final = finalClaim({ authority: "none", outcome: "refused", reason_codes: ["typed_contract_required"] });
-      break;
-    case "proof_observational":
-      run.request.proof_contract = publicArgs;
-      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unknown", typed, {
-        gaps: [{ code: "direct_call_missing" }],
-      }))];
-      run.final = finalClaim({
-        authority: "typed_proof",
-        outcome: "unknown",
-        reason_codes: ["direct_call_missing"],
-        proof_disposition: "unknown",
-      });
-      break;
-    case "hidden_proof_tool_discovery":
-      run.request.proof_contract = publicArgs;
-      run.steps = [
-        { kind: "tool_search", query: "codestory mcp verify_indexed_direct_calls", tools: ["mcp__codestory__verify_indexed_direct_calls"] },
-        mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("contract_proven", typed)),
-      ];
-      run.final = finalClaim({ authority: "typed_proof", evidence_ids: ["receipt-1"], proof_disposition: "contract_proven" });
       break;
     default:
       throw new Error(`unknown scenario ${scenarioId}`);
@@ -1358,9 +1099,9 @@ test("Codex reports a failed expected MCP call before rejecting retry and shell 
   assert.throws(() => validate("codex", completed), /required action sequence/u);
 });
 
-test("freezes exactly the sixteen accepted routing scenarios", () => {
+test("freezes exactly the eight supported routing scenarios", () => {
   assert.deepEqual(ROUTING_SCENARIOS.map(({ id }) => id), SCENARIO_IDS);
-  assert.equal(new Set(ROUTING_SCENARIOS.map(({ id }) => id)).size, 16);
+  assert.equal(new Set(ROUTING_SCENARIOS.map(({ id }) => id)).size, 8);
   for (const scenario of ROUTING_SCENARIOS) {
     assert.equal(typeof scenario.expected_first_tool, "string", scenario.id);
     assert.ok(Array.isArray(scenario.required_action_sequence), scenario.id);
@@ -1398,24 +1139,16 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   const prompts = materialized.map(({ request }) => request.text);
   assert.equal(prompts.length, SCENARIO_IDS.length);
   for (const prompt of prompts) {
-    assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
+    assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, none/u);
     assert.match(prompt, /only one raw JSON object and no markdown fence, explanation, prefix, or suffix/u);
-    assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
+    assert.match(prompt, /outcome must be exactly one of supported, discovery_only, unknown, unavailable/u);
     assert.match(prompt, /For a successful direct source read, record evidence identity source:<project-relative-path>/u);
     assert.match(prompt, /failed direct read contributes no source evidence identity.*material_omissions instead/u);
     assert.match(prompt, /authorized fallback read after an unavailable CodeStory result may change evidence authority but preserves the earlier unavailable outcome/u);
-    assert.match(prompt, /rejected typed interpretation.*authority none.*outcome invalid_contract.*no proof disposition/u);
-    assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);
-    assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
-    assert.match(prompt, /in that case call no product tool and do not substitute retrieval or source evidence/u);
     assert.match(prompt, /target_symbol_id must equal the final context result's target\.symbol_id.*otherwise it must be null/u);
-    assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
-    assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
+    assert.match(prompt, /proof_disposition and refutation_basis must be null/u);
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
-    assert.match(prompt, /typed proof.*receipt_id.*never copy fact_id or edge_id/u);
-    assert.match(prompt, /refutation_basis.*refutation\.kind string.*never the whole refutation object/u);
-    assert.match(prompt, /typed proof gap has no gap_id.*disposition\.gaps\[\]\.kind.*reason_codes/u);
     assert.match(prompt, /diagnostics\.availability.*optional diagnostics artifact.*never copy it into outcome or reason_codes/u);
     assert.match(prompt, /supplemental read after packet.*keeps authority packet_evidence.*uses outcome unknown.*preserves the packet gap identities/u);
     assert.match(prompt, /never grep, rg, search, or probe the installed plugin package/u);
@@ -1432,8 +1165,6 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   const selectedPrompt = materialized.find(({ scenario_id }) => scenario_id === "selected_target_context").request.text;
   assert.match(selectedPrompt, /already selected exact symbol dynamic_start/iu);
   assert.match(selectedPrompt, /use that exact selector without discovering or broadening/iu);
-  const refusalPrompt = materialized.find(({ scenario_id }) => scenario_id === "refuse_free_english_proof").request.text;
-  assert.match(refusalPrompt, /do not call any repository tool as a substitute.*refuse the proof request/iu);
   for (const scenarioId of [
     "packet_single_continuation",
     "packet_gap_to_focused_source",
@@ -1463,7 +1194,7 @@ test("terminal routing scenarios reject every unauthorized source upgrade", () =
 });
 
 for (const host of ["codex", "cursor"]) {
-  test(`${host} real-session parser accepts all sixteen frozen scenarios`, () => {
+  test(`${host} real-session parser accepts all eight supported scenarios`, () => {
     for (const scenarioId of SCENARIO_IDS) {
       const report = validate(host, baseRun(scenarioId));
       assert.equal(report.status, "pass", scenarioId);
@@ -1473,65 +1204,26 @@ for (const host of ["codex", "cursor"]) {
   });
 }
 
-const PROOF_CALL_SCENARIOS = [
-  "typed_proof_contract_proven",
-  "typed_proof_contract_refuted",
-  "typed_proof_unknown",
-  "typed_proof_unavailable",
-  "malformed_proof_contract",
-  "proof_observational",
-  "hidden_proof_tool_discovery",
-];
-
-test("all proof scenarios preserve the public input DTO through both installed-host parsers", () => {
-  for (const scenarioId of PROOF_CALL_SCENARIOS) {
-    const run = baseRun(scenarioId);
-    const expected = run.request.proof_contract;
-    const proofStep = run.steps.find((step) => step.tool === "verify_indexed_direct_calls");
-    assert.deepEqual(
-      { call_path: proofStep.args.call_path },
-      expected,
-      scenarioId,
-    );
-    assert.equal(validateProofCallInputAgainstCatalog(proofStep.args), true, scenarioId);
-    for (const host of ["codex", "cursor"]) {
-      assert.equal(validate(host, run).status, "pass", `${host}:${scenarioId}`);
-    }
+test("retired proof scenarios and proof-bearing active requests are rejected explicitly", () => {
+  assert.equal(RETIRED_ROUTING_SCENARIOS.length, 8);
+  const catalog = JSON.parse(readFileSync(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
+  assert.equal(catalog.tools.some(({ name }) => name === "verify_indexed_direct_calls"), false);
+  for (const scenarioId of RETIRED_ROUTING_SCENARIOS) {
+    assert.throws(() => requireSupportedRoutingScenario(scenarioId), /unsupported routing scenario.*retired/u);
+    assert.throws(() => validateInstalledSession({ scenarioId }), /unsupported routing scenario.*retired/u);
+    const corpus = clone(ROUTING_REQUEST_CORPUS);
+    corpus.scenarios.push({ id: scenarioId, prompt: "retired", request: {} });
+    assert.throws(() => validateRoutingRequestCorpus(corpus), /unsupported routing scenario.*retired/u);
   }
-});
-
-test("hidden proof discovery is optional only when the verifier is directly visible", () => {
+  const active = baseRun("exact_symbol_search");
+  active.request.proof_contract = { call_path: "call-path/v1\nfrom symbol \"start\"\n" };
+  assert.throws(() => validate("codex", active), /unsupported proof contract/u);
   for (const host of ["codex", "cursor"]) {
-    const visible = baseRun("hidden_proof_tool_discovery");
-    visible.steps.shift();
-    assert.deepEqual(validate(host, visible).actions, ["verify_indexed_direct_calls"]);
-
-    const lateDiscovery = baseRun("hidden_proof_tool_discovery");
-    lateDiscovery.steps.reverse();
-    assert.throws(
-      () => validate(host, lateDiscovery),
-      /required action sequence|follow-up tool_search is not permitted/u,
-    );
+    const injected = baseRun("exact_symbol_search");
+    injected.steps[0].tool = "verify_indexed_direct_calls";
+    injected.steps[0].args = { project: "/workspace/repo", call_path: "call-path/v1\nfrom symbol \"other\"\n" };
+    assert.throws(() => validate(host, injected), /required action sequence|forbidden tool/u, host);
   }
-});
-
-test("the old normalized proof-response projection is rejected as public tool input", () => {
-  const input = { project: "/workspace/repo", ...proofContract() };
-  input.clauses = input.clauses.map((clause) => ({
-    start: clause.start_byte,
-    end: clause.end_byte_exclusive,
-    clause_id: clause.clause_id,
-    quote: clause.quote,
-    classification: clause.classification.kind,
-    fields: clause.classification.fields,
-    reason: null,
-    non_material_kind: null,
-  }));
-  input.spec.steps = input.spec.steps.map((step) => ({ relation: "direct_outgoing_call", ...step }));
-  assert.throws(
-    () => validateProofCallInputAgainstCatalog(input),
-    /verify_indexed_direct_calls input schema/u,
-  );
 });
 
 test("actual parsers reject malformed, incomplete, and cross-host transcripts", () => {
@@ -2010,15 +1702,7 @@ const MUTATIONS = [
       run.final.authority = "typed_proof";
       run.final.proof_disposition = "contract_proven";
     },
-    error: /final claim authority/u,
-  },
-  {
-    name: "prose cannot replace structured final claims",
-    scenario: "typed_proof_unknown",
-    mutate(run) {
-      run.final = "Unknown, so I did not establish absence.";
-    },
-    error: /final claim.*required schema/u,
+    error: /final claim (?:authority|has invalid typed fields)/u,
   },
   {
     name: "final evidence must come from the selected result",
@@ -2053,34 +1737,6 @@ const MUTATIONS = [
     error: /packet result/u,
   },
   {
-    name: "complete proof result without steps",
-    scenario: "typed_proof_contract_proven",
-    mutate(run) {
-      mutateBody(run, 0, (body) => delete body.steps);
-    },
-    error: /proof result/u,
-  },
-  {
-    name: "proof result contract projection drift",
-    scenario: "typed_proof_contract_proven",
-    mutate(run) {
-      mutateBody(run, 0, (body) => {
-        body.source_text_sha256 = "a".repeat(64);
-      });
-    },
-    error: /semantic invariant.*source_text_sha256/u,
-  },
-  {
-    name: "proof receipt must match exact-resolution evidence",
-    scenario: "typed_proof_contract_proven",
-    mutate(run) {
-      mutateBody(run, 0, (body) => {
-        body.receipts[0].callsite_identity = "different-callsite";
-      });
-    },
-    error: /does not match exact-resolution evidence/u,
-  },
-  {
     name: "unexpected CodeStory tool error",
     scenario: "broad_packet",
     mutate(run) {
@@ -2088,32 +1744,6 @@ const MUTATIONS = [
       delete run.steps[0].result.structuredContent;
     },
     error: /unexpected failed packet action/u,
-  },
-  {
-    name: "disposition drift",
-    scenario: "typed_proof_unknown",
-    mutate(run) {
-      run.steps[0].result.structuredContent.disposition.kind = "contract_proven";
-      run.steps[0].result.content[0].text = JSON.stringify(run.steps[0].result.structuredContent);
-    },
-    error: /proof result.*disposition/u,
-  },
-  {
-    name: "proof retrieval activation",
-    scenario: "proof_observational",
-    mutate(run) {
-      run.steps[0].result._meta.codestory_execution.semantic_retrieval_activated = true;
-    },
-    error: /proof activated semantic retrieval/u,
-  },
-  {
-    name: "hidden discovery broadens lookup",
-    scenario: "hidden_proof_tool_discovery",
-    mutate(run) {
-      run.steps[0].query = "codestory mcp";
-      run.steps[0].tools.push("mcp__codestory__packet");
-    },
-    error: /hidden-tool discovery/u,
   },
   {
     name: "second packet continuation",
@@ -2124,60 +1754,12 @@ const MUTATIONS = [
     error: /required action sequence|at most one packet continuation/u,
   },
   {
-    name: "selector relaxation retry",
-    scenario: "typed_proof_contract_proven",
-    mutate(run) {
-      const retry = clone(run.steps[0]);
-      retry.args.call_path = [
-        "call-path/v1",
-        'from symbol "start" in "src/lib.rs"',
-        'direct-call symbol "other" in "src/lib.rs"',
-        "",
-      ].join("\n");
-      run.steps.push(retry);
-    },
-    error: /required action sequence|follow-up verify_indexed_direct_calls is not permitted|proof request must preserve the host-supplied typed contract|proof may be called only once/u,
-  },
-  {
-    name: "unknown becomes absence",
-    scenario: "typed_proof_unknown",
-    mutate(run) {
-      run.final.absence_claim = true;
-    },
-    error: /final claim absence_claim|Unknown must not become absence/u,
-  },
-  {
     name: "silent material gap",
     scenario: "packet_gap_to_focused_source",
     mutate(run) {
       run.final.gap_ids = [];
     },
     error: /final claim gap_ids/u,
-  },
-  {
-    name: "free English proof construction",
-    scenario: "refuse_free_english_proof",
-    mutate(run) {
-      run.steps.push(baseRun("typed_proof_contract_proven").steps[0]);
-      run.final = finalClaim({ authority: "typed_proof", proof_disposition: "contract_proven" });
-    },
-    error: /required action sequence|proof requires a host-supplied typed contract|expected no tool/u,
-  },
-  {
-    name: "unavailable reason omitted",
-    scenario: "typed_proof_unavailable",
-    mutate(run) {
-      run.final.reason_codes = [];
-    },
-    error: /reason_codes/u,
-  },
-  {
-    name: "refutation basis omitted",
-    scenario: "typed_proof_contract_refuted",
-    mutate(run) {
-      run.final.refutation_basis = null;
-    },
-    error: /refutation_basis/u,
   },
   {
     name: "packet claim contradicts packet authority",
@@ -2206,114 +1788,6 @@ for (const host of ["codex", "cursor"]) {
       mutation.mutate(run);
       assert.throws(() => validate(host, run), mutation.error, mutation.name);
     }
-  });
-}
-
-const SEMANTIC_BINDING_MUTATIONS = [
-  {
-    name: "ContractProven with Unknown step and no receipt",
-    scenario: "typed_proof_contract_proven",
-    mutate(body) {
-      body.steps[0].status = "unknown";
-      body.steps[0].receipt = null;
-    },
-  },
-  {
-    name: "ContractRefuted with Unknown step",
-    scenario: "typed_proof_contract_refuted",
-    mutate(body) {
-      body.steps[0].status = "unknown";
-      body.steps[0].receipt = null;
-    },
-  },
-  {
-    name: "Unknown with Proven step",
-    scenario: "typed_proof_unknown",
-    mutate(body) {
-      body.steps[0].status = "proven";
-    },
-  },
-  {
-    name: "Unavailable with Proven step",
-    scenario: "typed_proof_unavailable",
-    mutate(body) {
-      body.steps[0].status = "proven";
-    },
-  },
-  {
-    name: "changed digest not derived from the request",
-    scenario: "typed_proof_contract_proven",
-    mutate(body) {
-      body.contract_digest = "a".repeat(64);
-      body.disposition.contract_digest = body.contract_digest;
-    },
-  },
-  {
-    name: "exact callsite start outside its hash-bound window",
-    scenario: "typed_proof_contract_proven",
-    mutate(body) {
-      body.receipts[0].exact_callsite_start_byte = body.receipts[0].line_window.byte_end;
-    },
-  },
-];
-
-for (const host of ["codex", "cursor"]) {
-  test(`${host} canonical proof semantic-binding matrix fails closed`, () => {
-    const accepted = [];
-    for (const mutation of SEMANTIC_BINDING_MUTATIONS) {
-      const run = baseRun(mutation.scenario);
-      mutateBody(run, 0, mutation.mutate);
-      try {
-        validate(host, run);
-        accepted.push(mutation.name);
-      } catch (error) {
-        assert.match(error.message, /proof result semantic invariant/u, mutation.name);
-      }
-    }
-    assert.deepEqual(accepted, [], `semantic mutations accepted through ${host}`);
-  });
-}
-
-const SELECTOR_GAP_KINDS = ["selector_missing", "selector_ambiguous", "non_callable_selector"];
-const STEP_GAP_KINDS = [
-  "direct_call_missing",
-  "recursive_call_not_representable",
-  "source_window_too_large",
-  "invalid_utf8",
-  "source_line_out_of_range",
-  "edge_containment_unproven",
-  "missing_direct_call_receipt",
-  "receipt_or_edge_already_used",
-  "projection_exclusion_conflicts_with_required_receipt",
-];
-
-for (const host of ["codex", "cursor"]) {
-  test(`${host} canonical proof gap indices use the projected step count`, () => {
-    const acceptedOutOfRange = [];
-    for (const [kind, indexField, validIndex, invalidIndex] of [
-      ...SELECTOR_GAP_KINDS.map((kind) => [kind, "selector_index", 1, 2]),
-      ...STEP_GAP_KINDS.map((kind) => [kind, "step_index", 0, 1]),
-    ]) {
-      const boundary = baseRun("typed_proof_unknown");
-      mutateBody(boundary, 0, (body) => {
-        body.disposition.gaps = [{ kind, [indexField]: validIndex }];
-      });
-      boundary.final.reason_codes = [kind];
-      assert.equal(validate(host, boundary).status, "pass", `${kind} accepted boundary`);
-
-      const outOfRange = baseRun("typed_proof_unknown");
-      mutateBody(outOfRange, 0, (body) => {
-        body.disposition.gaps = [{ kind, [indexField]: invalidIndex }];
-      });
-      outOfRange.final.reason_codes = [kind];
-      try {
-        validate(host, outOfRange);
-        acceptedOutOfRange.push(kind);
-      } catch (error) {
-        assert.match(error.message, /proof result semantic invariant.*gap index/u, kind);
-      }
-    }
-    assert.deepEqual(acceptedOutOfRange, [], `out-of-range gaps accepted through ${host}`);
   });
 }
 
@@ -2347,23 +1821,6 @@ test("tool results bind the host-negotiated revision to the authenticated discov
   juneMeta["com.thegreencedar.codestory/protocolRevision"] = "2025-06-18";
   assert.equal(validate("codex", june).status, "pass");
 
-  const nativeProof = baseRun("typed_proof_contract_proven");
-  nativeProof.steps[0].result._meta = {
-    "com.thegreencedar.codestory/protocolRevision": "2025-06-18",
-    codestory_publication: {
-      schema_version: 3,
-      minimum_compatible_schema_version: 3,
-    },
-  };
-  assert.equal(validate("codex", nativeProof).status, "pass");
-
-  const opaqueProofCallsite = baseRun("typed_proof_contract_proven");
-  mutateBody(opaqueProofCallsite, 0, (body) => {
-    body.receipts[0].callsite_identity = "opaque-after-admission";
-    body.identities.evidence[0].callsite_identity = "opaque-after-admission";
-  });
-  assert.equal(validate("codex", opaqueProofCallsite).status, "pass");
-
   const nativeSearchWithoutRuntime = baseRun("exact_symbol_search");
   nativeSearchWithoutRuntime.steps[0].result._meta = {
     "com.thegreencedar.codestory/protocolRevision": "2025-06-18",
@@ -2374,7 +1831,7 @@ test("tool results bind the host-negotiated revision to the authenticated discov
   };
   assert.throws(
     () => validate("codex", nativeSearchWithoutRuntime),
-    /requires runtime identity outside the native proof result contract/u,
+    /requires runtime identity/u,
   );
 
   const projectedMissingDigest = baseRun("exact_symbol_search");
@@ -2407,46 +1864,7 @@ test("tool results bind the host-negotiated revision to the authenticated discov
   delete projectedMissingRuntime.steps[0].result._meta.codestory_publication.contract_runtime;
   assert.throws(
     () => validate("codex", projectedMissingRuntime),
-    /requires runtime identity outside the native proof result contract/u,
-  );
-});
-
-test("semantic proof tool errors use the explicit error contract without result identity metadata", () => {
-  const malformed = baseRun("malformed_proof_contract");
-  malformed.steps[0].result._meta = {
-    codestory_execution: { semantic_retrieval_activated: false },
-  };
-  assert.equal(validate("codex", malformed).status, "pass");
-
-  const hostFailed = baseRun("malformed_proof_contract");
-  hostFailed.steps[0].hostFailed = true;
-  assert.equal(validate("codex", hostFailed).status, "pass");
-
-  const plainText = baseRun("malformed_proof_contract");
-  plainText.steps[0].hostFailed = true;
-  plainText.steps[0].result = {
-    content: [{ type: "text", text: "MissingResolvedMaterialAnchor { field: Start }" }],
-    isError: true,
-  };
-  plainText.final.reason_codes = [];
-  assert.equal(validate("codex", plainText).status, "pass");
-
-  const cursorProjected = baseRun("malformed_proof_contract");
-  cursorProjected.steps[0].result = {
-    content: [{ text: { text: "MissingResolvedMaterialAnchor { field: Start }" } }],
-    isError: false,
-  };
-  cursorProjected.final.reason_codes = [];
-  assert.equal(validate("cursor", cursorProjected).status, "pass");
-
-  const unauthorizedProjection = baseRun("exact_symbol_search");
-  unauthorizedProjection.steps[0].result = {
-    content: [{ text: { text: "search failed" } }],
-    isError: false,
-  };
-  assert.throws(
-    () => validate("cursor", unauthorizedProjection),
-    /search Cursor text-only semantic error projection is not authorized/u,
+    /requires runtime identity/u,
   );
 });
 
@@ -2587,10 +2005,6 @@ test("packet continuation and selected-context correlation are exact", () => {
     () => validate("codex", diagnosticsOnlyUnavailable),
     /reason_codes do not match result-bound codes/u,
   );
-
-  const refusedWithOmission = baseRun("refuse_free_english_proof");
-  refusedWithOmission.final.material_omissions = ["whether start calls finish"];
-  assert.equal(validate("codex", refusedWithOmission).status, "pass");
 
   const continuedSourceFallback = baseRun("packet_single_continuation");
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
@@ -2746,61 +2160,10 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
     assert.equal(host.model_routing_evaluated, false);
   }
 
-  const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
-  const cursorRule = await readFile(join(pluginRoot, "rules", "codestory.mdc"), "utf8");
-  const openAiMetadata = await readFile(
-    join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
-    "utf8",
-  );
-  const searchReference = await readFile(
-    join(pluginRoot, "skills", "codestory-grounding", "references", "search.md"),
-    "utf8",
-  );
-  const contextReference = await readFile(
-    join(pluginRoot, "skills", "codestory-grounding", "references", "context.md"),
-    "utf8",
-  );
-  const packetReference = await readFile(
-    join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"),
-    "utf8",
-  );
-  assert.match(skill, /discovery leads?.*`search`/isu);
-  assert.match(skill, /discovery leads?.*select.*unambiguous.*identity.*(?:`context`|`snippet`).*relation/isu);
-  assert.match(skill, /preserve ambiguity.*instead of guessing/isu);
-  assert.match(skill, /symbol_id.*context.*(?:`id`|\.id)/isu);
-  assert.match(skill, /selected target.*`context`/isu);
-  assert.match(skill, /supplied symbol name.*search\.query.*unchanged/isu);
-  assert.match(skill, /broad.*`packet`.*continuation.*once.*exact navigation/isu);
-  assert.match(skill, /host-supplied.*`verify_indexed_direct_calls`/isu);
-  assert.match(skill, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu);
-  assert.match(skill, /exact proof from English.*no complete\s+`call-path\/v1` document.*stop.*do not\s+call a\s+repository tool/isu);
-  assert.match(skill, /`unknown`.*not absence/isu);
-  assert.match(skill, /runtime execution/iu);
-  assert.match(skill, /`unavailable`.*not negative proof/isu);
-  assert.match(skill, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu);
-  assert.match(skill, /transport.*tool absence.*source/isu);
-  assert.match(skill, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu);
-  assert.match(skill, /claims? no broader than.*source or typed relation/isu);
-  assert.match(skill, /gap.*does\s+not erase supported evidence.*missing edge.*does\s+not prove absence/isu);
-  assert.match(skill, /follow-up.*returned stable identity or exact path.*stop.*cannot change/isu);
-  assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
-  assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|verify_indexed_direct_calls|Inspect source after a packet/u);
-  assert.match(openAiMetadata, /read and follow the loaded codestory-grounding skill/isu);
-  assert.match(openAiMetadata, /sole source of truth/isu);
-  assert.match(openAiMetadata, /adds no parallel instructions/isu);
-  assert.doesNotMatch(
-    openAiMetadata,
-    /search.*context.*packet.*verify_indexed_direct_calls|unknown.*not absence|typed contract/isu,
-  );
-  assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
-  assert.match(searchReference, /limit.*1.*50/isu);
-  assert.match(contextReference, /bare\s+symbol.*exact\s+path.*evidence\[\]\.symbol_id.*context\.id/isu);
-  assert.match(contextReference, /do not combine.*name.*path.*free-text\s+`query`/isu);
-  assert.match(packetReference, /continuation\.gap_ids.*map.*gap_id/isu);
-  assert.match(packetReference, /exact probe only.*user.*repository evidence/isu);
+
 });
 
-test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {
+test("static parity rejects substituted bytes invalid or no-op hooks and metadata drift", async () => {
   const root = mkdtempSync(join(tmpdir(), "codestory-routing-static-"));
   cpSync(pluginRoot, root, { recursive: true });
   try {
@@ -2829,21 +2192,9 @@ test("static parity rejects substituted bytes invalid or no-op hooks metadata dr
     await assert.rejects(validateStaticHostParity(root, driftedMetadata), /metadata does not bind/u);
 
     cpSync(join(pluginRoot, ".github", "plugin", "plugin.json"), copilotMetadataPath);
+    const authenticatedSkill = staticIdentityFor(root);
     writeFileSync(join(root, "skills", "codestory-grounding", "SKILL.md"), "---\nname: codestory-grounding\n---\n# CodeStory Grounding\n");
-    const headingOnly = staticIdentityFor(root);
-    await assert.rejects(validateStaticHostParity(root, headingOnly), /search discovery authority/u);
-
-    cpSync(pluginRoot, root, { recursive: true, force: true });
-    const skillPath = join(root, "skills", "codestory-grounding", "SKILL.md");
-    writeFileSync(
-      skillPath,
-      readFileSync(skillPath, "utf8").replace(
-        /Discovery leads come from `search`; they identify candidates and never prove a claim\./u,
-        "Use ordinary symbol lookup for candidates.",
-      ),
-    );
-    const incompleteSkill = staticIdentityFor(root);
-    await assert.rejects(validateStaticHostParity(root, incompleteSkill), /search discovery authority/u);
+    await assert.rejects(validateStaticHostParity(root, authenticatedSkill), /static digest roster.*SKILL\.md/u);
 
     cpSync(pluginRoot, root, { recursive: true, force: true });
     writeFileSync(join(root, "rules", "codestory.mdc"), `---
@@ -2864,29 +2215,24 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
 
     cpSync(pluginRoot, root, { recursive: true, force: true });
     const openAiMetadataPath = join(root, "skills", "codestory-grounding", "agents", "openai.yaml");
-    writeFileSync(
-      openAiMetadataPath,
-      readFileSync(openAiMetadataPath, "utf8").replace(
-        /sole source of truth/u,
-        "preferred source",
-      ),
-    );
-    const incompleteOpenAiMetadata = staticIdentityFor(root);
+    const authenticatedOpenAiMetadata = staticIdentityFor(root);
+    writeFileSync(openAiMetadataPath, "substituted skill pointer\n");
     await assert.rejects(
-      validateStaticHostParity(root, incompleteOpenAiMetadata),
-      /OpenAI skill metadata is not the canonical skill pointer/u,
+      validateStaticHostParity(root, authenticatedOpenAiMetadata),
+      /static digest roster.*openai\.yaml/u,
     );
 
-    cpSync(pluginRoot, root, { recursive: true, force: true });
-    writeFileSync(
-      openAiMetadataPath,
-      `${readFileSync(openAiMetadataPath, "utf8")}\nRouting contract: search, context, packet, then verify_indexed_direct_calls. Unknown is not absence; supply a typed contract.\n`,
-    );
-    const duplicatedOpenAiGuidance = staticIdentityFor(root);
-    await assert.rejects(
-      validateStaticHostParity(root, duplicatedOpenAiGuidance),
-      /OpenAI skill metadata duplicates canonical routing or proof guidance/u,
-    );
+    for (const [kind, mutateCatalog, expected] of [
+      ["missing", (catalog) => { catalog.tools = catalog.tools.filter(({ name }) => name !== "search"); }, /lacks supported search contracts/u],
+      ["retired", (catalog) => { catalog.tools.push({ name: "verify_indexed_direct_calls" }); }, /retired proof verifier/u],
+    ]) {
+      cpSync(pluginRoot, root, { recursive: true, force: true });
+      const catalogPath = join(root, "generated-mcp-catalog.json");
+      const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+      mutateCatalog(catalog);
+      writeFileSync(catalogPath, JSON.stringify(catalog));
+      await assert.rejects(validateStaticHostParity(root, staticIdentityFor(root)), expected, kind);
+    }
 
     for (const relativePath of [
       ".cursor-plugin/plugin.json",
