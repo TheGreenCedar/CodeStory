@@ -538,6 +538,7 @@ mod tests {
         UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
     };
     use std::fs;
+    use serde_json::json;
 
     #[test]
     fn qualification_runner_has_no_retrieval_or_indexing_execution_path() {
