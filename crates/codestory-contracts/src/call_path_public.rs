@@ -329,7 +329,8 @@ fn gap_schema() -> Value {
             step_gap("edge_containment_unproven"),
             step_gap("missing_direct_call_receipt"),
             step_gap("receipt_or_edge_already_used"),
-            step_gap("projection_exclusion_conflicts_with_required_receipt")
+            step_gap("projection_exclusion_conflicts_with_required_receipt"),
+            closed_object_schema(vec![("kind", enum_schema(&["kernel_search_budget_exceeded"]))])
         ]
     })
 }

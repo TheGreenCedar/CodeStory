@@ -128,3 +128,16 @@ retrieval index command publishes a matching generation.
 - candidate IDs resolve against whatever core database is current;
 - core indexing success is reported as full retrieval readiness;
 - a project operation mutates per-user server or process defaults.
+
+## Internal call-path qualification
+
+The hidden call-path kernel shares one request budget across strict search,
+exclusion-tolerant search, reachable prefixes and final fact/state scans. Its
+32,768 work units include deterministic ordering allowances; sorting and
+retained prefix storage are limited to 1,024 entries. Prefixes retain complete
+receipt and edge histories, with quota reserved before copying them. Exhaustion
+returns `Unknown` with `kernel_search_budget_exceeded` and no connected receipts;
+an incomplete search establishes neither a longest prefix nor a refutation.
+Known input unavailability precedes exploration. An input exceeding the budget
+just to scan fails closed without inferring an unscanned unavailable suffix.
+This bounds internal qualification work, not product latency or runtime execution.

@@ -1243,6 +1243,7 @@ pub enum ProofGap {
     MissingDirectCallReceipt { step_index: usize },
     ReceiptOrEdgeAlreadyUsed { step_index: usize },
     ProjectionExclusionConflictsWithRequiredReceipt { step_index: usize },
+    KernelSearchBudgetExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1262,20 +1263,120 @@ pub fn check_call_path(
     check_call_path_with_receipt_order(contract, hashes, facts, None)
 }
 
+const KERNEL_SEARCH_MAX_WORK: usize = 32_768;
+const KERNEL_SEARCH_MAX_PREFIX_STATES: usize = 1_024;
+
+#[derive(Debug)]
+struct KernelSearchExhausted;
+
+struct KernelSearchBudget {
+    remaining_work: usize,
+    remaining_prefix_states: usize,
+}
+
+impl Default for KernelSearchBudget {
+    fn default() -> Self {
+        Self {
+            remaining_work: KERNEL_SEARCH_MAX_WORK,
+            remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+        }
+    }
+}
+
+impl KernelSearchBudget {
+    fn work(&mut self, units: usize) -> Result<(), KernelSearchExhausted> {
+        self.remaining_work = self
+            .remaining_work
+            .checked_sub(units)
+            .ok_or(KernelSearchExhausted)?;
+        Ok(())
+    }
+
+    fn prefix_state(&mut self) -> Result<(), KernelSearchExhausted> {
+        self.work(1)?;
+        self.remaining_prefix_states = self
+            .remaining_prefix_states
+            .checked_sub(1)
+            .ok_or(KernelSearchExhausted)?;
+        Ok(())
+    }
+}
+
 fn check_call_path_with_receipt_order(
     contract: &ValidatedCallPathContract,
     hashes: &ProofHashes,
     facts: &[VerifiedProofFact],
     receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
 ) -> ProofDisposition {
+    check_call_path_with_budget(
+        contract,
+        hashes,
+        facts,
+        receipt_order,
+        &mut KernelSearchBudget::default(),
+    )
+}
+
+fn check_call_path_with_budget(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    facts: &[VerifiedProofFact],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+    budget: &mut KernelSearchBudget,
+) -> ProofDisposition {
+    check_call_path_budgeted(contract, hashes, facts, receipt_order, budget).unwrap_or_else(|_| {
+        ProofDisposition::Unknown {
+            contract_digest: hashes.contract_digest.clone(),
+            gaps: vec![ProofGap::KernelSearchBudgetExceeded],
+            // Incomplete exploration establishes neither a longest prefix nor a refutation.
+            connected_receipts: Vec::new(),
+        }
+    })
+}
+
+// Ordering reserves a deterministic accounting allowance, n*ceil(log2(n))
+// times key cost; it is not a claim about the exact stdsort comparator count.
+// The stable O(n log n) sort is capped at 1024 items/buffer entries. Input order
+// cannot change the capacity left for searching the same admitted fact set.
+fn bounded_kernel_sort<T>(
+    values: &mut [T],
+    budget: &mut KernelSearchBudget,
+    key_cost: usize,
+    mut compare: impl FnMut(&T, &T) -> Ordering,
+) -> Result<(), KernelSearchExhausted> {
+    if values.len() > KERNEL_SEARCH_MAX_PREFIX_STATES {
+        return Err(KernelSearchExhausted);
+    }
+    let passes = values.len().max(1).next_power_of_two().trailing_zeros() as usize;
+    budget.work(values.len() * passes * key_cost)?;
+    values.sort_by(|left, right| {
+        #[cfg(test)]
+        observe_kernel_comparison();
+        compare(left, right)
+    });
+    Ok(())
+}
+
+fn check_call_path_budgeted(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    facts: &[VerifiedProofFact],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+    budget: &mut KernelSearchBudget,
+) -> Result<ProofDisposition, KernelSearchExhausted> {
     if hashes != &contract.bound_hashes {
-        return ProofDisposition::Unavailable {
+        return Ok(ProofDisposition::Unavailable {
             contract_digest: hashes.contract_digest.clone(),
             reasons: vec![UnavailableReason::ValidatedContractHashMismatch],
-        };
+        });
     }
+    budget.work(facts.len())?;
     let unavailable_reasons = facts
         .iter()
+        .inspect(|_| {
+            #[cfg(test)]
+            observe_kernel_fact();
+        })
         .filter_map(|fact| match fact {
             VerifiedProofFact::Unavailable(fact) => Some(fact.reason.clone()),
             _ => None,
@@ -1284,13 +1385,18 @@ fn check_call_path_with_receipt_order(
         .into_iter()
         .collect::<Vec<_>>();
     if !unavailable_reasons.is_empty() {
-        return ProofDisposition::Unavailable {
+        return Ok(ProofDisposition::Unavailable {
             contract_digest: hashes.contract_digest.clone(),
             reasons: unavailable_reasons,
-        };
+        });
     }
-    let direct_facts = facts
+    budget.work(facts.len())?;
+    let mut direct_facts = facts
         .iter()
+        .inspect(|_| {
+            #[cfg(test)]
+            observe_kernel_fact();
+        })
         .filter_map(|fact| match fact {
             VerifiedProofFact::DirectCall(fact)
                 if !fact.receipt.receipt_id.is_empty() && !fact.receipt.edge_id.is_empty() =>
@@ -1300,39 +1406,54 @@ fn check_call_path_with_receipt_order(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if let Some(path) = find_path(contract, &direct_facts, PathPolicy::Strict, receipt_order) {
-        return ProofDisposition::ContractProven {
+    bounded_kernel_sort(&mut direct_facts, budget, 1, |left, right| {
+        compare_receipt_refs(&left.receipt, &right.receipt, receipt_order)
+    })?;
+    if let Some(path) = find_path(contract, &direct_facts, PathPolicy::Strict, budget)? {
+        return Ok(ProofDisposition::ContractProven {
             contract_digest: hashes.contract_digest.clone(),
             receipts: path.into_iter().map(|fact| fact.receipt.clone()).collect(),
-        };
+        });
     }
     if let Some(path) = find_path(
         contract,
         &direct_facts,
         PathPolicy::AllowProjectionExclusions,
-        receipt_order,
-    ) {
+        budget,
+    )? {
         let step_index = first_projection_conflict(contract, &path).unwrap_or(0);
-        return ProofDisposition::Unknown {
+        return Ok(ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
             connected_receipts: path[..step_index]
                 .iter()
                 .map(|fact| fact.receipt.clone())
                 .collect(),
-        };
+        });
     }
-    let mut reachable = reachable_prefixes(contract, &direct_facts, receipt_order);
-    for source in facts.iter().filter_map(|fact| match fact {
-        #[cfg(any(test, feature = "test-support"))]
-        VerifiedProofFact::CertifiedAbsence(fact) => Some(&fact.source),
-        _ => None,
-    }) {
+    let mut reachable = reachable_prefixes(contract, &direct_facts, budget)?;
+    budget.work(facts.len())?;
+    for source in facts
+        .iter()
+        .inspect(|_| {
+            #[cfg(test)]
+            observe_kernel_fact();
+        })
+        .filter_map(|fact| match fact {
+            #[cfg(any(test, feature = "test-support"))]
+            VerifiedProofFact::CertifiedAbsence(fact) => Some(&fact.source),
+            _ => None,
+        })
+    {
+        budget.work(reachable.len() + 1)?;
         if symbol_selector_matches(&contract.spec.start, source)
             && !reachable
                 .iter()
                 .any(|state| state.step_index == 0 && &state.current == source)
         {
+            budget.prefix_state()?;
+            #[cfg(test)]
+            observe_kernel_prefix_states(1);
             reachable.push(PrefixState {
                 step_index: 0,
                 current: source.clone(),
@@ -1343,6 +1464,7 @@ fn check_call_path_with_receipt_order(
             });
         }
     }
+    budget.work(reachable.len() * (1 + contract.spec.prohibit_traversal_through.len()))?;
     if let Some((state, prohibition_index)) = reachable.iter().find_map(|state| {
         (state.step_index > 0
             && state.step_index < contract.spec.steps.len()
@@ -1357,15 +1479,16 @@ fn check_call_path_with_receipt_order(
         })
         .flatten()
     }) {
-        return ProofDisposition::ContractRefuted {
+        return Ok(ProofDisposition::ContractRefuted {
             contract_digest: hashes.contract_digest.clone(),
             refutation: Refutation::ProhibitedScopeTraversal {
                 step_index: state.step_index - 1,
                 prohibition_index,
                 connected_receipts: state.connected_receipts.clone(),
             },
-        };
+        });
     }
+    budget.work(reachable.len() * (1 + contract.spec.prohibit_traversal_through.len()))?;
     if let Some(step_index) = reachable.iter().find_map(|state| {
         (state.step_index > 0
             && state.step_index < contract.spec.steps.len()
@@ -1377,17 +1500,18 @@ fn check_call_path_with_receipt_order(
         .then_some(state.projection_conflict_step)
         .flatten()
     }) {
-        return ProofDisposition::Unknown {
+        return Ok(ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
-            connected_receipts: longest_clean_prefix(&reachable, receipt_order),
-        };
+            connected_receipts: longest_clean_prefix(&reachable, receipt_order, budget)?,
+        });
     }
+    budget.work(reachable.len())?;
     let mut clean_states = reachable
         .iter()
         .filter(|state| state.projection_conflict_step.is_none())
         .collect::<Vec<_>>();
-    clean_states.sort_by(|left, right| {
+    bounded_kernel_sort(&mut clean_states, budget, MAX_STEPS + 1, |left, right| {
         right.step_index.cmp(&left.step_index).then_with(|| {
             compare_receipt_sequences(
                 &left.connected_receipts,
@@ -1395,8 +1519,9 @@ fn check_call_path_with_receipt_order(
                 receipt_order,
             )
         })
-    });
+    })?;
     for state in clean_states {
+        budget.work(1)?;
         if state.step_index >= contract.spec.steps.len() || state.projection_conflict_step.is_some()
         {
             continue;
@@ -1404,8 +1529,14 @@ fn check_call_path_with_receipt_order(
         #[cfg(any(test, feature = "test-support"))]
         let target = &contract.spec.steps[state.step_index].target;
         #[cfg(any(test, feature = "test-support"))]
+        budget.work(facts.len())?;
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(absence) = facts
             .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                observe_kernel_fact();
+            })
             .filter_map(|fact| match fact {
                 VerifiedProofFact::CertifiedAbsence(fact) => Some(fact),
                 _ => None,
@@ -1417,7 +1548,7 @@ fn check_call_path_with_receipt_order(
                     && !fact.untruncated_enumeration_receipt_id.is_empty()
             })
         {
-            return ProofDisposition::ContractRefuted {
+            return Ok(ProofDisposition::ContractRefuted {
                 contract_digest: hashes.contract_digest.clone(),
                 refutation: Refutation::CertifiedAbsence {
                     step_index: state.step_index,
@@ -1429,27 +1560,30 @@ fn check_call_path_with_receipt_order(
                         .clone(),
                     connected_receipts: state.connected_receipts.clone(),
                 },
-            };
+            });
         }
     }
+    budget.work(reachable.len())?;
     let furthest_clean_step = reachable
         .iter()
         .filter(|state| state.projection_conflict_step.is_none())
         .map(|state| state.step_index)
         .max()
         .unwrap_or(0);
+    budget.work(reachable.len())?;
     if let Some(step_index) = reachable
         .iter()
         .filter(|state| state.step_index > furthest_clean_step)
         .filter_map(|state| state.projection_conflict_step)
         .min()
     {
-        return ProofDisposition::Unknown {
+        return Ok(ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
-            connected_receipts: longest_clean_prefix(&reachable, receipt_order),
-        };
+            connected_receipts: longest_clean_prefix(&reachable, receipt_order, budget)?,
+        });
     }
+    budget.work(reachable.len())?;
     let step_index = reachable
         .iter()
         .filter(|state| state.projection_conflict_step.is_none())
@@ -1457,41 +1591,52 @@ fn check_call_path_with_receipt_order(
         .max()
         .unwrap_or(0)
         .min(contract.spec.steps.len() - 1);
-    let reuse_blocked = reachable.iter().any(|state| {
-        state.step_index == step_index
-            && state.projection_conflict_step.is_none()
-            && direct_facts.iter().any(|fact| {
-                fact.source == state.current
-                    && symbol_selector_matches(
-                        &contract.spec.steps[step_index].target,
-                        &fact.target,
-                    )
-                    && (state.used_receipts.contains(&fact.receipt.receipt_id)
-                        || state.used_edges.contains(&fact.receipt.edge_id))
-            })
-    });
-    ProofDisposition::Unknown {
+    let mut reuse_blocked = false;
+    for state in &reachable {
+        budget.work(1)?;
+        if state.step_index != step_index || state.projection_conflict_step.is_some() {
+            continue;
+        }
+        for fact in &direct_facts {
+            budget.work(1)?;
+            #[cfg(test)]
+            observe_kernel_fact();
+            if fact.source == state.current
+                && symbol_selector_matches(&contract.spec.steps[step_index].target, &fact.target)
+                && (state.used_receipts.contains(&fact.receipt.receipt_id)
+                    || state.used_edges.contains(&fact.receipt.edge_id))
+            {
+                reuse_blocked = true;
+                break;
+            }
+        }
+        if reuse_blocked {
+            break;
+        }
+    }
+    Ok(ProofDisposition::Unknown {
         contract_digest: hashes.contract_digest.clone(),
         gaps: vec![if reuse_blocked {
             ProofGap::ReceiptOrEdgeAlreadyUsed { step_index }
         } else {
             ProofGap::MissingDirectCallReceipt { step_index }
         }],
-        connected_receipts: longest_clean_prefix(&reachable, receipt_order),
-    }
+        connected_receipts: longest_clean_prefix(&reachable, receipt_order, budget)?,
+    })
 }
 
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct KernelWorkObservation {
     pub fact_examinations: usize,
+    pub comparisons: usize,
     pub prefix_states_created: usize,
 }
 
 #[cfg(test)]
 thread_local! {
     static KERNEL_WORK_OBSERVATION: std::cell::Cell<KernelWorkObservation> = const {
-        std::cell::Cell::new(KernelWorkObservation { fact_examinations: 0, prefix_states_created: 0 })
+        std::cell::Cell::new(KernelWorkObservation { fact_examinations: 0, comparisons: 0, prefix_states_created: 0 })
     };
 }
 
@@ -1500,6 +1645,15 @@ fn observe_kernel_fact() {
     KERNEL_WORK_OBSERVATION.with(|counter| {
         let mut observed = counter.get();
         observed.fact_examinations += 1;
+        counter.set(observed);
+    });
+}
+
+#[cfg(test)]
+fn observe_kernel_comparison() {
+    KERNEL_WORK_OBSERVATION.with(|counter| {
+        let mut observed = counter.get();
+        observed.comparisons += 1;
         counter.set(observed);
     });
 }
@@ -1532,20 +1686,18 @@ fn find_path<'a>(
     contract: &ValidatedCallPathContract,
     facts: &[&'a VerifiedDirectCallFact],
     policy: PathPolicy,
-    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
-) -> Option<Vec<&'a VerifiedDirectCallFact>> {
-    let mut ordered = facts.to_vec();
-    ordered
-        .sort_by(|left, right| compare_receipt_refs(&left.receipt, &right.receipt, receipt_order));
+    budget: &mut KernelSearchBudget,
+) -> Result<Option<Vec<&'a VerifiedDirectCallFact>>, KernelSearchExhausted> {
     search_path(
         contract,
-        &ordered,
+        facts,
         0,
         None,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
         &mut Vec::new(),
         policy,
+        budget,
     )
 }
 
@@ -1559,12 +1711,15 @@ fn search_path<'a>(
     used_edges: &mut BTreeSet<String>,
     path: &mut Vec<&'a VerifiedDirectCallFact>,
     policy: PathPolicy,
-) -> Option<Vec<&'a VerifiedDirectCallFact>> {
+    budget: &mut KernelSearchBudget,
+) -> Result<Option<Vec<&'a VerifiedDirectCallFact>>, KernelSearchExhausted> {
+    budget.work(1)?;
     if step_index == contract.spec.steps.len() {
-        return Some(path.clone());
+        return Ok(Some(path.clone()));
     }
     let step = &contract.spec.steps[step_index];
     for fact in facts {
+        budget.work(1)?;
         #[cfg(test)]
         observe_kernel_fact();
         let source_matches = current.map_or_else(
@@ -1579,6 +1734,11 @@ fn search_path<'a>(
         {
             continue;
         }
+        budget.work(
+            contract.spec.exclude_from_projection.len()
+                + contract.spec.prohibit_traversal_through.len()
+                + 1,
+        )?;
         if policy != PathPolicy::AllowProjectionExclusions
             && receipt_hits_projection_exclusion(contract, fact)
         {
@@ -1605,14 +1765,15 @@ fn search_path<'a>(
             used_edges,
             path,
             policy,
-        ) {
-            return Some(found);
+            budget,
+        )? {
+            return Ok(Some(found));
         }
         path.pop();
         used_edges.remove(&fact.receipt.edge_id);
         used_receipts.remove(&fact.receipt.receipt_id);
     }
-    None
+    Ok(None)
 }
 
 fn receipt_hits_projection_exclusion(
@@ -1645,20 +1806,26 @@ struct PrefixState {
 fn reachable_prefixes(
     contract: &ValidatedCallPathContract,
     facts: &[&VerifiedDirectCallFact],
-    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
-) -> Vec<PrefixState> {
-    let mut facts = facts.to_vec();
-    facts.sort_by(|left, right| compare_receipt_refs(&left.receipt, &right.receipt, receipt_order));
-    let initial_nodes = facts
-        .iter()
-        .filter(|fact| {
-            #[cfg(test)]
-            observe_kernel_fact();
-            symbol_selector_matches(&contract.spec.start, &fact.source)
-        })
-        .map(|fact| fact.source.clone())
-        .collect::<BTreeSet<_>>();
-    let mut states = initial_nodes
+    budget: &mut KernelSearchBudget,
+) -> Result<Vec<PrefixState>, KernelSearchExhausted> {
+    let mut initial_nodes = Vec::new();
+    for fact in facts {
+        budget.work(1)?;
+        #[cfg(test)]
+        observe_kernel_fact();
+        if !symbol_selector_matches(&contract.spec.start, &fact.source) {
+            continue;
+        }
+        budget.work(initial_nodes.len())?;
+        if !initial_nodes.contains(&fact.source) {
+            budget.prefix_state()?;
+            initial_nodes.push(fact.source.clone());
+        }
+    }
+    bounded_kernel_sort(&mut initial_nodes, budget, 1, Ord::cmp)?;
+    #[cfg(test)]
+    observe_kernel_prefix_states(initial_nodes.len());
+    let mut all = initial_nodes
         .into_iter()
         .map(|current| PrefixState {
             step_index: 0,
@@ -1669,15 +1836,15 @@ fn reachable_prefixes(
             projection_conflict_step: None,
         })
         .collect::<Vec<_>>();
-    #[cfg(test)]
-    observe_kernel_prefix_states(states.len() * 2);
-    let mut all = states.clone();
+    let mut layer_start = 0;
+    let mut layer_end = all.len();
     for step_index in 0..contract.spec.steps.len() {
-        let mut next = Vec::new();
-        for state in states {
-            for fact in &facts {
+        for state_index in layer_start..layer_end {
+            for fact in facts {
+                budget.work(1)?;
                 #[cfg(test)]
                 observe_kernel_fact();
+                let state = &all[state_index];
                 if fact.source != state.current
                     || !symbol_selector_matches(
                         &contract.spec.steps[step_index].target,
@@ -1688,52 +1855,61 @@ fn reachable_prefixes(
                 {
                     continue;
                 }
-                let mut used_receipts = state.used_receipts.clone();
-                let mut used_edges = state.used_edges.clone();
-                let mut connected_receipts = state.connected_receipts.clone();
-                used_receipts.insert(fact.receipt.receipt_id.clone());
-                used_edges.insert(fact.receipt.edge_id.clone());
-                connected_receipts.push(fact.receipt.clone());
-                #[cfg(test)]
-                observe_kernel_prefix_states(1);
-                next.push(PrefixState {
+                budget.work(contract.spec.exclude_from_projection.len())?;
+                budget.prefix_state()?;
+                let mut next = PrefixState {
                     step_index: step_index + 1,
                     current: fact.target.clone(),
-                    used_receipts,
-                    used_edges,
-                    connected_receipts,
+                    used_receipts: state.used_receipts.clone(),
+                    used_edges: state.used_edges.clone(),
+                    connected_receipts: state.connected_receipts.clone(),
                     projection_conflict_step: state.projection_conflict_step.or_else(|| {
                         receipt_hits_projection_exclusion(contract, fact).then_some(step_index)
                     }),
-                });
+                };
+                next.used_receipts.insert(fact.receipt.receipt_id.clone());
+                next.used_edges.insert(fact.receipt.edge_id.clone());
+                next.connected_receipts.push(fact.receipt.clone());
+                #[cfg(test)]
+                observe_kernel_prefix_states(1);
+                all.push(next);
             }
         }
-        if next.is_empty() {
+        if all.len() == layer_end {
             break;
         }
-        #[cfg(test)]
-        observe_kernel_prefix_states(next.len());
-        all.extend(next.clone());
-        states = next;
+        layer_start = layer_end;
+        layer_end = all.len();
     }
-    all
+    Ok(all)
 }
 
 fn longest_clean_prefix(
     states: &[PrefixState],
     receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
-) -> Vec<ReceiptRef> {
-    states
-        .iter()
-        .filter(|state| state.projection_conflict_step.is_none())
+    budget: &mut KernelSearchBudget,
+) -> Result<Vec<ReceiptRef>, KernelSearchExhausted> {
+    let mut best: Option<&PrefixState> = None;
+    for state in states {
+        budget.work(MAX_STEPS + 1)?;
+        if state.projection_conflict_step.is_some() {
+            continue;
+        }
+        if best.is_none_or(|prior| {
+            state.connected_receipts.len() > prior.connected_receipts.len()
+                || (state.connected_receipts.len() == prior.connected_receipts.len()
+                    && compare_receipt_sequences(
+                        &state.connected_receipts,
+                        &prior.connected_receipts,
+                        receipt_order,
+                    ) == Ordering::Less)
+        }) {
+            best = Some(state);
+        }
+    }
+    Ok(best
         .map(|state| state.connected_receipts.clone())
-        .min_by(|left, right| {
-            right
-                .len()
-                .cmp(&left.len())
-                .then_with(|| compare_receipt_sequences(left, right, receipt_order))
-        })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn compare_receipt_refs(
@@ -4169,6 +4345,7 @@ fn validate_compact_gaps(gaps: &[Value], step_count: usize) -> Result<(), String
                 format!("{:020}", step_gap_index(gap, step_count)?),
                 &["kind", "step_index"],
             ),
+            "kernel_search_budget_exceeded" => (15, String::new(), &["kind"]),
             _ => return Err("compact_disposition_gap_invalid".to_owned()),
         };
         compact_closed_object(gap, fields, "compact_disposition_gap_invalid")?;
@@ -4638,6 +4815,7 @@ fn refutation_json(
 
 fn proof_gap_json(gap: &ProofGap) -> Value {
     match gap {
+        ProofGap::KernelSearchBudgetExceeded => json!({ "kind": "kernel_search_budget_exceeded" }),
         ProofGap::FactBuild(gap) => fact_build_gap_json(gap),
         ProofGap::MissingDirectCallReceipt { step_index } => {
             json!({ "kind": "missing_direct_call_receipt", "step_index": step_index })
@@ -7289,6 +7467,187 @@ mod tests {
             canonical,
             "{\"a\":\"ascii\",\"𐀀\":\"supplementary\",\"\":\"bmp\"}"
         );
+    }
+
+    fn kernel_budget_exhausted(disposition: &ProofDisposition) -> bool {
+        matches!(disposition, ProofDisposition::Unknown { gaps, connected_receipts, .. }
+            if gaps == &[ProofGap::KernelSearchBudgetExceeded] && connected_receipts.is_empty())
+    }
+
+    #[test]
+    fn kernel_budget_boundary_and_reordering_preserve_complete_paths() {
+        let (contract, hashes) = validate(&["B", "C", "D", "E", "F", "G"]);
+        let names = ["A", "B", "C", "D", "E", "F", "G"];
+        let mut facts = names
+            .windows(2)
+            .enumerate()
+            .map(|(step, pair)| call(&format!("r{step}"), &format!("e{step}"), pair[0], pair[1]))
+            .collect::<Vec<_>>();
+        let mut budget = KernelSearchBudget {
+            remaining_work: 1_000_000,
+            remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+        };
+        let expected = check_call_path_with_budget(&contract, &hashes, &facts, None, &mut budget);
+        assert!(matches!(expected, ProofDisposition::ContractProven { .. }));
+        let required = 1_000_000 - budget.remaining_work;
+        for reverse in [false, true] {
+            if reverse {
+                facts.reverse();
+            }
+            let mut exact = KernelSearchBudget {
+                remaining_work: required,
+                remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+            };
+            assert_eq!(
+                check_call_path_with_budget(&contract, &hashes, &facts, None, &mut exact),
+                expected
+            );
+            assert_eq!(exact.remaining_work, 0);
+            let mut short = KernelSearchBudget {
+                remaining_work: required - 1,
+                remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+            };
+            assert!(kernel_budget_exhausted(&check_call_path_with_budget(
+                &contract, &hashes, &facts, None, &mut short
+            )));
+        }
+        let (short_contract, short_hashes) = validate(&["B"]);
+        assert!(
+            matches!(check_call_path(&short_contract, &short_hashes, &facts),
+            ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 1)
+        );
+    }
+
+    #[test]
+    fn kernel_budget_admission_sized_complete_input_does_not_exhaust_on_ordering() {
+        let (contract, hashes) = validate(&["B", "C", "D", "E", "F", "G"]);
+        let names = ["A", "B", "C", "D", "E", "F", "G"];
+        let mut facts = names
+            .windows(2)
+            .enumerate()
+            .flat_map(|(step, pair)| {
+                (0..128).map(move |branch| {
+                    call(
+                        &format!("r{step}-{branch:03}"),
+                        &format!("e{step}-{branch:03}"),
+                        pair[0],
+                        pair[1],
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 768);
+        let expected = check_call_path(&contract, &hashes, &facts);
+        assert!(
+            matches!(expected, ProofDisposition::ContractProven { ref receipts, .. }
+            if receipts.len() == 6)
+        );
+        facts.reverse();
+        assert_eq!(check_call_path(&contract, &hashes, &facts), expected);
+    }
+
+    #[test]
+    fn kernel_budget_prefix_quota_and_fact_scans_bound_all_phases() {
+        let (contract, hashes) = validate(&["B", "C", "D", "E", "F", "G"]);
+        let names = ["A", "B", "C", "D", "E", "F"];
+        let facts = names
+            .windows(2)
+            .enumerate()
+            .flat_map(|(step, pair)| {
+                (0..4).map(move |branch| {
+                    call(
+                        &format!("r{step}-{branch}"),
+                        &format!("e{step}-{branch}"),
+                        pair[0],
+                        pair[1],
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut state_limited = KernelSearchBudget {
+            remaining_work: 1_000_000,
+            remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+        };
+        let (result, observed) = with_kernel_work_observation(|| {
+            check_call_path_with_budget(&contract, &hashes, &facts, None, &mut state_limited)
+        });
+        assert!(kernel_budget_exhausted(&result));
+        assert_eq!(
+            observed.prefix_states_created,
+            KERNEL_SEARCH_MAX_PREFIX_STATES
+        );
+        assert_eq!(state_limited.remaining_prefix_states, 0);
+        assert!(
+            observed.fact_examinations > KERNEL_SEARCH_MAX_WORK,
+            "state-only fixture must reach prefix allocation after both DFS phases"
+        );
+
+        let direct = facts
+            .iter()
+            .filter_map(|fact| match fact {
+                VerifiedProofFact::DirectCall(fact) => Some(fact),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for policy in [PathPolicy::Strict, PathPolicy::AllowProjectionExclusions] {
+            let mut budget = KernelSearchBudget {
+                remaining_work: 37,
+                remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+            };
+            let (result, observed) =
+                with_kernel_work_observation(|| find_path(&contract, &direct, policy, &mut budget));
+            assert!(result.is_err());
+            assert!(observed.fact_examinations > 0 && observed.fact_examinations <= 37);
+        }
+        let mut budget = KernelSearchBudget {
+            remaining_work: 37,
+            remaining_prefix_states: KERNEL_SEARCH_MAX_PREFIX_STATES,
+        };
+        let (result, observed) =
+            with_kernel_work_observation(|| reachable_prefixes(&contract, &direct, &mut budget));
+        assert!(result.is_err());
+        assert!(observed.fact_examinations > 0 && observed.fact_examinations <= 37);
+        assert!(observed.prefix_states_created <= KERNEL_SEARCH_MAX_PREFIX_STATES);
+    }
+
+    #[test]
+    fn kernel_budget_unavailability_precedes_search_and_oversized_inputs_fail_closed() {
+        let (contract, hashes) = validate(&["B"]);
+        let facts = vec![
+            call("r", "e", "A", "B"),
+            VerifiedProofFact::Unavailable(UnavailableProofFact {
+                reason: UnavailableReason::SourceNotBoundToPublication,
+            }),
+        ];
+        let mut budget = KernelSearchBudget {
+            remaining_work: facts.len(),
+            remaining_prefix_states: 0,
+        };
+        assert!(
+            matches!(check_call_path_with_budget(&contract, &hashes, &facts, None, &mut budget),
+            ProofDisposition::Unavailable { reasons, .. }
+                if reasons == [UnavailableReason::SourceNotBoundToPublication])
+        );
+        let mut wrong_hashes = hashes.clone();
+        wrong_hashes.contract_digest = "0".repeat(64);
+        let mut zero = KernelSearchBudget {
+            remaining_work: 0,
+            remaining_prefix_states: 0,
+        };
+        assert!(
+            matches!(check_call_path_with_budget(&contract, &wrong_hashes, &facts, None, &mut zero),
+            ProofDisposition::Unavailable { reasons, .. }
+                if reasons == [UnavailableReason::ValidatedContractHashMismatch])
+        );
+        // An input too large even to scan never attempts a partial proof. An
+        // unscanned unavailable suffix is deliberately not inferred here.
+        let mut one = KernelSearchBudget {
+            remaining_work: 1,
+            remaining_prefix_states: 0,
+        };
+        assert!(kernel_budget_exhausted(&check_call_path_with_budget(
+            &contract, &hashes, &facts, None, &mut one
+        )));
     }
 
     #[test]
