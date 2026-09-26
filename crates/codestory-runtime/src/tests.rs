@@ -19,7 +19,8 @@ use super::{
     SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
     SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
     WorkspaceManifest, apply_hybrid_limits, arm_full_refresh_staged_store_hook,
-    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_incremental_staged_store_hook, arm_postcommit_before_annotation_rebind_hook,
+    arm_postcommit_cache_refresh_error, arm_publication_test_fault,
     arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
     arm_source_policy_before_revalidate_hook, build_component_report_docs,
     build_llm_symbol_doc_text, build_persisted_search_state_from_canonical_symbols,
@@ -5075,6 +5076,82 @@ fn exact_proof_rematerializes_for_full_and_incremental_edits_and_faults_preserve
 }
 
 #[test]
+fn incremental_nongraph_generated_marker_retires_exact_csharp_proof() {
+    use codestory_contracts::proof_resolution::ProofResolutionStatus;
+
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source = workspace.path().join("Exact.cs");
+    let before = "static class Calls { static void Target() {} static void Caller() { Target(); } }\n// sourceonly\n";
+    let after = "static class Calls { static void Target() {} static void Caller() { Target(); } }\n// @generated\n";
+    assert_eq!(before.len(), after.len());
+    fs::write(&source, before).expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+    let baseline = Storage::open(&storage_path).expect("open baseline");
+    let baseline_facts = baseline
+        .get_proof_resolution_facts()
+        .expect("baseline facts");
+    let baseline_fact = baseline_facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("same-file call fact");
+    assert_eq!(baseline_fact.status, ProofResolutionStatus::Exact);
+    let old_hash = baseline_fact.callsite.source_sha256.clone();
+    drop(baseline);
+
+    fs::write(&source, after).expect("poison comment");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("publish edited core");
+    let storage = Storage::open(&storage_path).expect("open edited core");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    storage
+        .validate_proof_resolution_publication(&publication)
+        .expect("valid proof publication");
+    let facts = storage.get_proof_resolution_facts().expect("edited facts");
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("same-file call fact");
+    assert_ne!(fact.callsite.source_sha256, old_hash);
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert!(fact.evidence_chain.is_empty());
+
+    let fresh = tempfile::tempdir().expect("fresh workspace");
+    fs::write(fresh.path().join("Exact.cs"), after).expect("fresh source");
+    let fresh_storage_path = fresh.path().join(".cache").join("codestory.db");
+    let fresh_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    fresh_controller
+        .open_project_summary_with_storage_path(
+            fresh.path().to_path_buf(),
+            fresh_storage_path.clone(),
+        )
+        .expect("open fresh project");
+    fresh_controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("fresh full publication");
+    let fresh_storage = Storage::open(&fresh_storage_path).expect("open fresh core");
+    let fresh_facts = fresh_storage
+        .get_proof_resolution_facts()
+        .expect("fresh facts");
+    let fresh_fact = fresh_facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Target")
+        .expect("fresh same-file call fact");
+    assert_eq!(fact.status, fresh_fact.status);
+}
+
+#[test]
 fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source() {
     let _env = hybrid_test_env();
     let workspace = tempfile::tempdir().expect("workspace");
@@ -5116,6 +5193,202 @@ fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source()
     assert!(fact.evidence_chain.is_empty());
     assert_eq!(fact.target, None);
     assert_eq!(fact.edge_id, None);
+}
+
+fn source_absent_exact_proof_republish(language: &str) {
+    use codestory_contracts::proof_resolution::{ProofResolutionStatus, ResolutionEvidence};
+
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (sources, callsite) = match language {
+        "python" => (
+            vec![
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", "def target():\n    pass\n"),
+                (
+                    "pkg/main.py",
+                    "from .target import target\ndef caller():\n    target()\n",
+                ),
+            ],
+            "pkg/main.py",
+        ),
+        "dart" => (
+            vec![
+                (
+                    "lib/main.dart",
+                    "final class Worker {\n  void target() {}\n}\nvoid caller(Worker worker) { worker.target(); }\n",
+                ),
+                ("lib/sibling.dart", "final class Sibling {}\n"),
+            ],
+            "lib/main.dart",
+        ),
+        other => panic!("unexpected proof language: {other}"),
+    };
+    for (relative, source) in &sources {
+        let path = workspace.path().join(relative);
+        fs::create_dir_all(path.parent().expect("source parent")).expect("create source parent");
+        fs::write(path, source).expect("write source");
+    }
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core with exact language proof");
+    let (before, proof, facts, exact) = {
+        let storage = Storage::open(&storage_path).expect("open published core");
+        let before = storage
+            .get_complete_index_publication()
+            .expect("read core")
+            .expect("complete core");
+        let proof = storage
+            .validate_proof_resolution_publication(&before)
+            .expect("source-present full proof validation");
+        let facts = storage
+            .get_proof_resolution_facts()
+            .expect("read exact facts");
+        let exact = facts
+            .iter()
+            .find(|fact| {
+                fact.status == ProofResolutionStatus::Exact
+                    && fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == "target"
+                    && match language {
+                        "python" => fact.evidence_chain.iter().any(|evidence| {
+                            matches!(evidence, ResolutionEvidence::StaticImportBinding { .. })
+                        }),
+                        "dart" => fact.evidence_chain.iter().any(|evidence| {
+                            matches!(evidence, ResolutionEvidence::ExplicitReceiverType { .. })
+                        }),
+                        _ => false,
+                    }
+            })
+            .unwrap_or_else(|| panic!("missing exact {language} import/receiver fact: {facts:?}"))
+            .clone();
+        (before, proof, facts, exact)
+    };
+    assert!(
+        exact.provenance.dependency_file_hashes.len() >= if language == "python" { 3 } else { 2 },
+        "exact proof must carry the package or complete library dependency domain: {exact:?}"
+    );
+
+    // Full validation must still authenticate live bytes and dispatch shape.
+    let callsite_path = workspace.path().join(callsite);
+    let original = fs::read(&callsite_path).expect("source before drift");
+    fs::write(&callsite_path, b"changed source\n").expect("drift source");
+    let drift_error = Storage::open(&storage_path)
+        .expect("open core after source drift")
+        .validate_proof_resolution_publication(&before)
+        .expect_err("full validation must reject live source drift");
+    assert!(drift_error.to_string().contains("proof"), "{drift_error:?}");
+    fs::write(&callsite_path, original).expect("restore source");
+
+    for (relative, _) in &sources {
+        fs::remove_file(workspace.path().join(relative)).expect("remove source");
+    }
+    let outcome = controller
+        .republish_semantic_projections_blocking()
+        .expect("rebind exact proof from stored core without source");
+    assert_eq!(outcome.previous_publication, before);
+    assert_eq!(outcome.publication.generation, before.generation + 1);
+    let storage = Storage::open(&storage_path).expect("open rebound core");
+    let rebound = storage
+        .get_proof_resolution_publication()
+        .expect("read rebound proof")
+        .expect("proof remains present");
+    assert_eq!(rebound.fact_digest, proof.fact_digest);
+    assert_eq!(
+        rebound.core_generation_id,
+        outcome.publication.generation_id
+    );
+    assert_eq!(rebound.core_run_id, outcome.publication.run_id);
+    assert_eq!(storage.get_proof_resolution_facts().unwrap(), facts);
+    drop(storage);
+
+    if language == "dart" {
+        let owner = exact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::ExplicitReceiverType { receiver_type } => Some(*receiver_type),
+                _ => None,
+            })
+            .expect("exact Dart receiver owner");
+        mutate_published_core(&storage_path, |storage| {
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    rusqlite::params![NodeKind::UNKNOWN as i32, owner.0],
+                )
+                .expect("mutate stored Dart receiver owner");
+        });
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("mutated stored Dart receiver owner must reject rebind");
+        assert!(error.message.contains("proof"), "{error:?}");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path).unwrap(),
+            Some(outcome.publication.clone())
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+        mutate_published_core(&storage_path, |storage| {
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    rusqlite::params![NodeKind::CLASS as i32, owner.0],
+                )
+                .expect("restore stored Dart receiver owner");
+        });
+    }
+
+    // A changed stored dependency receipt must reject the next rebind and
+    // leave the prior publication identity unchanged.
+    mutate_published_core(&storage_path, |storage| {
+        let mut dependencies = exact.provenance.dependency_file_hashes.clone();
+        assert!(!dependencies.is_empty(), "exact proof has dependencies");
+        dependencies[0].source_sha256 = "0".repeat(64);
+        let provenance_id: i64 = storage
+            .get_connection()
+            .query_row(
+                "SELECT provenance_id FROM proof_resolution_fact WHERE fact_id = ?1",
+                [&exact.fact_id],
+                |row| row.get(0),
+            )
+            .expect("stored exact provenance");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_provenance SET dependency_json = ?1 WHERE provenance_id = ?2",
+                rusqlite::params![serde_json::to_string(&dependencies).unwrap(), provenance_id],
+            )
+            .expect("tamper stored dependency receipt");
+    });
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("mutated stored dependency must reject rebind");
+    assert!(error.message.contains("proof"), "{error:?}");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path).expect("read preserved core"),
+        Some(outcome.publication)
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn semantic_projection_republish_rebinds_exact_python_relative_import_without_source() {
+    source_absent_exact_proof_republish("python");
+}
+
+#[test]
+fn semantic_projection_republish_rebinds_exact_dart_final_receiver_without_source() {
+    source_absent_exact_proof_republish("dart");
 }
 
 #[test]
@@ -12319,6 +12592,199 @@ impl AnnotationProject {
 }
 
 #[test]
+fn relative_root_incremental_failure_never_hides_a_committed_core() {
+    let cwd = std::env::current_dir().expect("test working directory");
+    let workspace = tempfile::Builder::new()
+        .prefix(".relative-incremental-")
+        .tempdir_in(&cwd)
+        .expect("workspace under working directory");
+    let absolute_root = workspace.path().to_path_buf();
+    let root = PathBuf::from(workspace.path().file_name().expect("relative root name"));
+    assert!(!root.is_absolute());
+    fs::write(
+        absolute_root.join("alpha.rs"),
+        "pub fn alpha() -> i32 { 1 }\n",
+    )
+    .expect("alpha source");
+    fs::write(
+        absolute_root.join("beta.rs"),
+        "pub fn beta() -> i32 { 2 }\n",
+    )
+    .expect("beta source");
+    fs::write(
+        absolute_root.join("codestory_project.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "relative incremental",
+            "version": 1,
+            "source_groups": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "language": "Rust",
+                "standard": "Default",
+                "source_paths": ["alpha.rs", "beta.rs"],
+                "exclude_patterns": [],
+                "include_paths": [],
+                "defines": {},
+                "language_specific": "Other"
+            }]
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("explicit source manifest");
+    let storage_path = absolute_root.join(".cache").join("codestory.db");
+    let absolute_controller = AppController::new();
+    absolute_controller
+        .open_project_summary_with_storage_path(absolute_root.clone(), storage_path.clone())
+        .expect("open absolute baseline project");
+    absolute_controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish two-file baseline");
+    let prior = Storage::open(&storage_path)
+        .expect("baseline storage")
+        .get_complete_index_publication()
+        .expect("baseline publication")
+        .expect("complete baseline");
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+        .expect("core layout");
+    let prior_pointer = layout.read_pointer().expect("prior pointer");
+    drop(absolute_controller);
+    fs::write(
+        absolute_root.join("alpha.rs"),
+        "// source-only edit\npub fn alpha() -> i32 { 1 }\n",
+    )
+    .expect("edit one existing source");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(root, storage_path.clone())
+        .expect("reopen complete core through relative project root");
+
+    let result = controller.run_indexing_blocking(IndexMode::Incremental);
+    let current = Storage::open(&storage_path)
+        .expect("reopen storage after relative request")
+        .get_complete_index_publication()
+        .expect("current publication")
+        .expect("complete current publication");
+    match result {
+        Ok(_) => {
+            assert_eq!(current.generation, prior.generation + 1);
+            return;
+        }
+        Err(error) => {
+            assert_eq!(error.code, "source_unreadable");
+            assert_eq!(current, prior, "the reported failure precedes core commit");
+            assert_eq!(
+                layout.read_pointer().expect("current pointer"),
+                prior_pointer
+            );
+        }
+    }
+
+    let absolute_retry = AppController::new();
+    absolute_retry
+        .open_project_summary_with_storage_path(absolute_root, storage_path.clone())
+        .expect("reopen absolute project for retry");
+    absolute_retry
+        .run_indexing_blocking(IndexMode::Incremental)
+        .expect("absolute-root retry commits edited source");
+    let retried = Storage::open(&storage_path)
+        .expect("reopen retried core")
+        .get_complete_index_publication()
+        .expect("retried publication")
+        .expect("complete retried publication");
+    assert_eq!(retried.generation, prior.generation + 1);
+}
+
+#[test]
+fn dot_root_source_only_incremental_reports_committed_core_and_runtime_state() {
+    const CHILD_MARKER: &str = "CODESTORY_B1_DOT_ROOT_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let workspace = tempdir().expect("isolated child working directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::dot_root_source_only_incremental_reports_committed_core_and_runtime_state",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .current_dir(workspace.path())
+            .output()
+            .expect("run child in the project's working directory");
+        assert!(
+            output.status.success(),
+            "child stdout:\n{}\nchild stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = PathBuf::from(".");
+    let storage_path = root.join(".cache").join("codestory.db");
+    fs::write("alpha.rs", "pub fn alpha() -> i32 { 1 }\n").expect("alpha source");
+    fs::write("beta.rs", "pub fn beta() -> i32 { 2 }\n").expect("beta source");
+    fs::write(
+        "codestory_project.json",
+        serde_json::to_vec(&serde_json::json!({
+            "name": "dot root incremental",
+            "version": 1,
+            "source_groups": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "language": "Rust",
+                "standard": "Default",
+                "source_paths": ["alpha.rs", "beta.rs"],
+                "exclude_patterns": [],
+                "include_paths": [],
+                "defines": {},
+                "language_specific": "Other"
+            }]
+        }))
+        .expect("serialize explicit manifest"),
+    )
+    .expect("explicit source manifest");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(root, storage_path.clone())
+        .expect("open dot-root project");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish two-file baseline");
+    let prior = Storage::open(&storage_path)
+        .expect("baseline core")
+        .get_complete_index_publication()
+        .expect("baseline publication")
+        .expect("complete baseline");
+    fs::write(
+        "alpha.rs",
+        "pub fn alpha() -> i32 { 1 }\n// source-only edit\n",
+    )
+    .expect("edit one existing source");
+
+    let result = controller.run_indexing_blocking(IndexMode::Incremental);
+    let current = Storage::open(&storage_path)
+        .expect("reopen committed core")
+        .get_complete_index_publication()
+        .expect("current publication")
+        .expect("complete current publication");
+    assert_eq!(current.generation, prior.generation + 1);
+    if let Err(error) = &result {
+        eprintln!(
+            "core advanced from {} to {} but incremental returned {}: {}",
+            prior.generation, current.generation, error.code, error.message
+        );
+    }
+    result.expect("committed source-only incremental must report success");
+    assert_eq!(
+        controller
+            .state
+            .lock()
+            .search_publication
+            .as_ref()
+            .expect("resident search state")
+            .generation,
+        current.generation
+    );
+}
+
+#[test]
 fn observational_annotation_paths_never_materialize_the_sidecar() {
     let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
 
@@ -12470,6 +12936,289 @@ fn annotations_survive_position_shifting_edits_and_full_refresh() {
             .len(),
         1,
         "categories are user-owned and survive a full refresh"
+    );
+}
+
+#[test]
+fn committed_core_rebinds_annotations_even_when_runtime_cache_refresh_fails() {
+    let project = AnnotationProject::open(RENAMEABLE_SOURCE);
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    let prior = Storage::open(&project.storage_path)
+        .expect("prior core")
+        .get_complete_index_publication()
+        .expect("prior publication")
+        .expect("complete prior publication");
+
+    project.write("lib.rs", &format!("// shifted source\n{RENAMEABLE_SOURCE}"));
+    arm_postcommit_cache_refresh_error();
+    let error = project
+        .controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect_err("runtime cache failure remains visible");
+    assert!(error.message.contains("runtime cache refresh"));
+    let committed = Storage::open(&project.storage_path)
+        .expect("committed core")
+        .get_complete_index_publication()
+        .expect("committed publication")
+        .expect("complete committed publication");
+    assert_eq!(committed.generation, prior.generation + 1);
+    let rebound = project
+        .controller
+        .open_annotations_for_write()
+        .expect("annotations after committed core")
+        .bookmark(&bookmark.id)
+        .expect("read annotation")
+        .expect("surviving annotation");
+    assert_eq!(
+        rebound
+            .last_known_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.generation),
+        Some(committed.generation as i64),
+        "postcommit cache failure must not skip the annotation checkpoint"
+    );
+
+    project.write(
+        "lib.rs",
+        &RENAMEABLE_SOURCE.replace("pub fn alpha(", "pub fn renamed_alpha("),
+    );
+    project.index();
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after next-generation rename");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+    assert_eq!(after[0].node_label, "renamed_alpha");
+}
+
+#[test]
+fn failed_postcommit_rebind_catches_up_before_the_next_core_generation() {
+    let project = AnnotationProject::open(RENAMEABLE_SOURCE);
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    let old_line = project
+        .controller
+        .open_annotations_for_write()
+        .expect("open annotations")
+        .bookmark(&bookmark.id)
+        .expect("read annotation")
+        .expect("bound annotation")
+        .start_line
+        .expect("anchor line");
+    let prior = Storage::open(&project.storage_path)
+        .expect("prior core")
+        .get_complete_index_publication()
+        .expect("prior publication")
+        .expect("complete prior publication");
+
+    project.write("lib.rs", &format!("// shifted source\n{RENAMEABLE_SOURCE}"));
+    arm_postcommit_before_annotation_rebind_hook(|storage_path| {
+        mutate_published_core(storage_path, |storage| {
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET start_line = 'unreadable' WHERE serialized_name = 'alpha'",
+                    [],
+                )
+                .expect("make one committed anchor query fail");
+        });
+    });
+    project
+        .controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("core commit remains successful despite a rebind fault");
+    let committed = Storage::open(&project.storage_path)
+        .expect("committed core")
+        .get_complete_index_publication()
+        .expect("committed publication")
+        .expect("complete committed publication");
+    assert_eq!(committed.generation, prior.generation + 1);
+    let pending = project
+        .controller
+        .open_annotations_for_write()
+        .expect("annotations after failed rebind")
+        .bookmark(&bookmark.id)
+        .expect("read pending annotation")
+        .expect("surviving annotation");
+    assert_eq!(
+        pending
+            .last_known_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.generation),
+        Some(prior.generation as i64),
+        "the failed rebind leaves the durable prior evidence for retry"
+    );
+
+    mutate_published_core(&project.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET start_line = ?1 WHERE serialized_name = 'alpha'",
+                [old_line + 1],
+            )
+            .expect("repair the shifted anchor line");
+    });
+    let sidecar_path = project.sidecar_path();
+    let bookmark_id = bookmark.id.clone();
+    let predecessor_generation = committed.generation as i64;
+    arm_semantic_projection_before_revalidate_hook(move |_| {
+        let sidecar = codestory_store::AnnotationStore::open_observational(&sidecar_path)
+            .expect("read annotations during semantic publication")
+            .expect("annotation sidecar");
+        let caught_up = sidecar
+            .bookmark(&bookmark_id)
+            .expect("read caught-up annotation")
+            .expect("surviving annotation");
+        assert_eq!(
+            caught_up
+                .last_known_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.generation),
+            Some(predecessor_generation),
+            "semantic-only writer must catch up before committing another generation"
+        );
+    });
+    let semantic = project
+        .controller
+        .republish_semantic_projections_blocking()
+        .expect("semantic-only generation after caught-up annotation evidence");
+    assert_eq!(semantic.publication.generation, committed.generation + 1);
+    project.write(
+        "lib.rs",
+        &RENAMEABLE_SOURCE.replace("pub fn alpha(", "pub fn renamed_alpha("),
+    );
+    project.index();
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after next-generation rename");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+    assert_eq!(after[0].node_label, "renamed_alpha");
+}
+
+#[test]
+fn selective_anchor_query_error_leaves_all_persisted_bindings_for_retry() {
+    let project = AnnotationProject::open(
+        "pub fn alpha() -> i32 { 1 }\n\npub fn beta(value: i32) -> i32 {\n    value * 3 + 1\n}\n",
+    );
+    project.index();
+    let alpha = project.bookmark("alpha");
+    std::thread::sleep(Duration::from_millis(3));
+    let beta = project
+        .controller
+        .create_bookmark(CreateBookmarkRequest {
+            category_id: alpha.category_id.clone(),
+            node_id: project.node_id_for("beta"),
+            comment: Some("keep beta".to_string()),
+        })
+        .expect("create beta bookmark");
+    let annotations = project
+        .controller
+        .open_annotations_for_write()
+        .expect("open annotations");
+    annotations
+        .apply_resolution(
+            &alpha.id,
+            &codestory_store::AnnotationResolution::Orphaned {
+                reason: codestory_store::OrphanReason::TargetDeleted,
+            },
+        )
+        .expect("make first row observably stale before the pass");
+    let before = annotations
+        .bookmarks(None)
+        .expect("snapshot bound annotations");
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].uuid, alpha.id);
+    assert_eq!(before[1].uuid, beta.id);
+    let beta_line = before[1].start_line.expect("beta anchor line");
+    drop(annotations);
+
+    // A malformed value in the second row fails only its selective SQL row
+    // conversion; the first candidate can still resolve. An I/O or statement
+    // failure at the same lookup boundary has the same resolver consequence.
+    mutate_published_core(&project.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET start_line = 'unreadable' WHERE serialized_name = 'beta'",
+                [],
+            )
+            .expect("corrupt only beta's anchor row");
+    });
+    let error = project
+        .controller
+        .rebind_annotations_after_core_publication()
+        .expect_err("a failed selective lookup must abort the rebind");
+    assert!(error.message.contains("anchor"), "{}", error.message);
+    let after = project
+        .controller
+        .open_annotations_for_write()
+        .expect("reopen annotations")
+        .bookmarks(None)
+        .expect("read bindings after failed pass");
+    assert_eq!(after, before, "no earlier row may persist a partial pass");
+    let read_error = project
+        .controller
+        .list_bookmarks(None)
+        .expect_err("a live read must report the same anchor query error");
+    assert!(read_error.message.contains("anchor"));
+
+    mutate_published_core(&project.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE node SET start_line = ?1 WHERE serialized_name = 'beta'",
+                [beta_line],
+            )
+            .expect("repair beta's anchor row");
+    });
+    project
+        .controller
+        .rebind_annotations_after_core_publication()
+        .expect("retry against healthy anchors");
+    let retried = project
+        .controller
+        .open_annotations_for_write()
+        .expect("reopen annotations")
+        .bookmarks(None)
+        .expect("read retried bindings");
+    assert!(retried.iter().all(|bookmark| {
+        bookmark.resolution_status == codestory_store::ResolutionStatus::Bound
+    }));
+
+    project.write("lib.rs", "pub fn alpha() -> i32 { 1 }\n");
+    project.write(
+        "moved.rs",
+        "pub fn beta(value: i32) -> i32 {\n    value * 3 + 1\n}\n",
+    );
+    project.index();
+    let moved = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after unique move");
+    let beta_after = moved
+        .iter()
+        .find(|entry| entry.id == beta.id)
+        .expect("beta bookmark");
+    assert_eq!(
+        beta_after.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+    assert_eq!(beta_after.node_label, "beta");
+    assert!(
+        beta_after
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("moved.rs"))
     );
 }
 

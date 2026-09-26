@@ -51,6 +51,13 @@ requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
 
+Cache rehydrate selects its source's physical core generation after taking the
+source writer guard. Schema, file count, freshness, space accounting, and the
+snapshot copy use that one database; workspace-owned exclusions still use the
+logical cache path. An absent target is checked for capacity through an
+existing filesystem ancestor before its persistent writer lock is created,
+then checked again under that lock before staging.
+
 Work that one publication fixes is cached against that publication's identity
 rather than repeated per pin. The canonical symbol-name map is the example: it
 is keyed by storage path plus the full core publication identity, and its
@@ -70,6 +77,13 @@ convention: `index_full_for_runtime` and `index_incremental_for_runtime` demand
 an `AnnotationsOwned`, which only
 `ensure_annotations_owned_before_core_replacement` can mint. A future refresh
 entry point that forgets the cutover does not compile.
+
+The controller rebinding pass runs after a committed core independently of
+resident cache refresh. If it fails, the saved annotation evidence remains at
+its last verified generation; full, incremental, and semantic-only core writers
+must catch up against the current complete core before advancing again. Legacy
+or interrupted standalone cores without a complete generation remain eligible
+for managed recovery.
 
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and

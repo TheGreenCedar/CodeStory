@@ -9522,6 +9522,26 @@ impl Storage {
         Ok(None)
     }
 
+    /// Remove access rows whose stable nodes no longer project explicit access.
+    /// The incremental writer upserts the remaining current rows in its batch.
+    pub fn delete_component_access_for_nodes(
+        &mut self,
+        node_ids: &[NodeId],
+    ) -> Result<(), StorageError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare("DELETE FROM component_access WHERE node_id = ?1")?;
+            for node_id in node_ids {
+                statement.execute(params![node_id.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_component_access_map_for_nodes(
         &self,
         node_ids: &[NodeId],

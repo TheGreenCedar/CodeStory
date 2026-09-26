@@ -283,9 +283,23 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     markdown
 }
 
+fn diagnostic_core_status_label(status: crate::args::DiagnosticCoreStatus) -> &'static str {
+    match status {
+        crate::args::DiagnosticCoreStatus::Unavailable => "unavailable",
+        crate::args::DiagnosticCoreStatus::UpgradeRequired => "upgrade_required",
+    }
+}
+
 pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Readiness");
+    if let Some(status) = output.core_status {
+        let _ = writeln!(
+            markdown,
+            "core_status: `{}`",
+            diagnostic_core_status_label(status)
+        );
+    }
     if let Some(refresh) = output.local_refresh.as_ref() {
         let _ = writeln!(
             markdown,
@@ -2662,6 +2676,13 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     );
     let _ = writeln!(markdown, "project: `{}`", output.project);
     let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
+    if let Some(status) = output.core_status {
+        let _ = writeln!(
+            markdown,
+            "core_status: `{}`",
+            diagnostic_core_status_label(status)
+        );
+    }
     let _ = writeln!(
         markdown,
         "stats: nodes={} edges={} files={} errors={}",
@@ -4410,6 +4431,7 @@ mod tests {
         DoctorOutput {
             project: "C:/repo".to_string(),
             storage_path: "C:/cache/codestory.db".to_string(),
+            core_status: None,
             indexed: true,
             stats: sample_storage_stats(),
             retrieval_mode: "full".to_string(),

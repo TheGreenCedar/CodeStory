@@ -757,9 +757,35 @@ impl AnnotationStore {
         uuid: &str,
         resolution: &AnnotationResolution,
     ) -> Result<(), AnnotationError> {
+        Self::apply_resolution_on(&self.conn, uuid, resolution)
+    }
+
+    /// Persist a complete rebind pass atomically. Every core lookup has already
+    /// succeeded before this transaction starts, and a sidecar write error
+    /// rolls back earlier rows in the same pass.
+    pub fn apply_resolutions(
+        &self,
+        resolutions: &[(String, AnnotationResolution)],
+    ) -> Result<(), AnnotationError> {
+        if resolutions.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        for (uuid, resolution) in resolutions {
+            Self::apply_resolution_on(&transaction, uuid, resolution)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_resolution_on(
+        connection: &Connection,
+        uuid: &str,
+        resolution: &AnnotationResolution,
+    ) -> Result<(), AnnotationError> {
         match resolution {
             AnnotationResolution::Bound { evidence, .. } => {
-                self.conn.execute(
+                connection.execute(
                     "UPDATE bookmark SET
                         canonical_id = ?1,
                         file_identity = ?2,
@@ -790,7 +816,7 @@ impl AnnotationStore {
             // orphan keeps both so an explicit relink has something to relink
             // from.
             AnnotationResolution::Orphaned { reason } => {
-                self.conn.execute(
+                connection.execute(
                     "UPDATE bookmark SET resolution_status = ?1, orphan_reason = ?2, updated_at = ?3
                      WHERE uuid = ?4",
                     params![

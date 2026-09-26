@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+- `doctor` and plain `ready` now inspect missing or older caches without creating or upgrading them. They report when a full index is needed to make an older cache usable.
 - First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
 - Cache cleanup can reclaim older, unreferenced core index images after readers release them, while retaining the current, rollback, and retrieval-bound images.
+- Cache rehydrate copies the source generation it validated. If a new target lacks space, it leaves the target directory untouched so a later retry starts cleanly.
+- Bookmarks retain their last verified binding when a core lookup or post-index cache refresh fails, so a later refresh can still follow a unique rename or move. Direct relative-root incremental indexing reports a committed refresh as successful when optional retrieval refresh evidence cannot be used.
 - Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
 
 ## 0.17.6
