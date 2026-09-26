@@ -10898,6 +10898,53 @@ fn optional_typescript_parameters_are_not_receiver_authority() -> anyhow::Result
     )])
 }
 
+fn assert_script_ordinary_call_owner(
+    store: &Store,
+    file_id: FileId,
+    line: u32,
+    owner_name: &str,
+    target_name: &str,
+) -> anyhow::Result<()> {
+    let nodes = store.get_nodes()?;
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(NodeId(file_id.0))
+                && edge.line == Some(line)
+                && nodes.iter().any(|node| {
+                    node.id == edge.target && node.serialized_name.ends_with(target_name)
+                })
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("designated ordinary CALL must exist once: {calls:#?}");
+    };
+    let owner = nodes
+        .iter()
+        .find(|node| node.id == call.source)
+        .expect("raw source owner node");
+    assert!(
+        matches!(owner.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            && owner.serialized_name.ends_with(owner_name),
+        "wrong ordinary caller: {owner:#?}"
+    );
+    let identity = parse_canonical_callsite_identity(
+        call.callsite_identity
+            .as_deref()
+            .expect("ordinary identity"),
+    )
+    .expect("canonical ordinary identity");
+    assert_eq!(identity.file_id, file_id);
+    assert_eq!(identity.line, line);
+    assert_eq!(
+        identity.raw_target, call.target,
+        "canonical raw occurrence must match its CALL target"
+    );
+    Ok(())
+}
+
 fn assert_script_receiver_target(
     files: &[(&str, &str)],
     caller_path: &str,
@@ -11252,6 +11299,24 @@ fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyh
                     ],
                 )?;
                 let files = store.get_files()?;
+                for (path, line, caller, target) in [
+                    (&exporter_path, 9, "caller", "target"),
+                    (&exporter_path, 12, "lexicalCaller", "lexicalTarget"),
+                    (&class_importer_path, 4, "caller", "target"),
+                    (&callable_importer_path, 3, "caller", "lexicalTarget"),
+                ] {
+                    let file = files
+                        .iter()
+                        .find(|file| file.path.ends_with(path))
+                        .expect("independent designated file");
+                    assert_script_ordinary_call_owner(
+                        &store,
+                        FileId(file.id),
+                        line,
+                        caller,
+                        target,
+                    )?;
+                }
                 let ordinary = store.get_edges()?;
                 rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
                 store.validate_proof_resolution_publication(&publication(1))?;
@@ -11322,6 +11387,17 @@ fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyh
                     let [fact] = matching.as_slice() else {
                         panic!("designated lexical fact must exist once: {matching:#?}");
                     };
+                    assert_script_ordinary_call_owner(
+                        &store,
+                        FileId(file.id),
+                        line,
+                        if path == &exporter_path {
+                            "lexicalCaller"
+                        } else {
+                            "caller"
+                        },
+                        "lexicalTarget",
+                    )?;
                     assert_nominal_exact_target(
                         &store,
                         project.path(),
@@ -11348,7 +11424,6 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
         let mut store = Store::new_in_memory()?;
         let exporter_path = format!("src/exported.{extension}");
         let importer_path = format!("src/importer.{extension}");
-        let safe_importer_path = format!("src/safe_importer.{extension}");
         let paths = index_files(
             project.path(),
             &mut store,
@@ -11365,17 +11440,33 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 (
                     &importer_path,
                     concat!(
-                        "import { C } from './exported';\n",
+                        "import { C, Safe } from './exported';\n",
                         "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+                        "export function safeCaller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
                     ),
-                ),
-                (
-                    &safe_importer_path,
-                    "import { Safe } from './exported';\nexport function caller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
                 ),
             ],
         )?;
         let source_before = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+        let initial_importer = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(&importer_path))
+            .expect("independent original two-call importer");
+        assert_script_ordinary_call_owner(
+            &store,
+            FileId(initial_importer.id),
+            4,
+            "caller",
+            "target",
+        )?;
+        assert_script_ordinary_call_owner(
+            &store,
+            FileId(initial_importer.id),
+            8,
+            "safeCaller",
+            "target",
+        )?;
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         store.validate_proof_resolution_publication(&publication(1))?;
         let before = store.get_proof_resolution_facts()?;
@@ -11384,11 +11475,6 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             .into_iter()
             .find(|file| file.path.ends_with(&importer_path))
             .expect("independent importer file");
-        let safe_importer = store
-            .get_files()?
-            .into_iter()
-            .find(|file| file.path.ends_with(&safe_importer_path))
-            .expect("independent clean-class importer file");
         let owner = store
             .get_nodes()?
             .into_iter()
@@ -11411,8 +11497,8 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
         let safe = before
             .iter()
             .find(|fact| {
-                fact.callsite.file_id == FileId(safe_importer.id)
-                    && fact.callsite.line == 4
+                fact.callsite.file_id == FileId(importer.id)
+                    && fact.callsite.line == 8
                     && fact.callsite.raw_target == "target"
             })
             .expect("independent clean exported class fact");
@@ -11427,7 +11513,7 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         for (file_path, blob) in entries {
             let mut artifact = decode_index_artifact_json(&blob)?;
             assert_eq!(
@@ -11480,7 +11566,7 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 .core_generation_id,
             publication(1).generation_id
         );
-        for (generation, expected_hits) in [(2, 0), (3, 3)] {
+        for (generation, expected_hits) in [(2, 0), (3, 2)] {
             let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
                 &mut store,
                 &RefreshInfo {
@@ -11502,6 +11588,14 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             );
             rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
             store.validate_proof_resolution_publication(&publication(generation))?;
+            assert_script_ordinary_call_owner(&store, FileId(importer.id), 4, "caller", "target")?;
+            assert_script_ordinary_call_owner(
+                &store,
+                FileId(importer.id),
+                8,
+                "safeCaller",
+                "target",
+            )?;
             let facts = store.get_proof_resolution_facts()?;
             let hostile = facts
                 .iter()
@@ -11521,8 +11615,8 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             let safe = facts
                 .iter()
                 .find(|fact| {
-                    fact.callsite.file_id == FileId(safe_importer.id)
-                        && fact.callsite.line == 4
+                    fact.callsite.file_id == FileId(importer.id)
+                        && fact.callsite.line == 8
                         && fact.callsite.raw_target == "target"
                 })
                 .expect("clean exported class retained after reparse/reuse");

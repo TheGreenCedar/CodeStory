@@ -9236,7 +9236,7 @@ fn test_script_same_line_runtime_import_marks_only_the_unshadowed_occurrence() -
                         edge.kind == EdgeKind::CALL
                             && edge.line == Some(1)
                             && occurrences.iter().any(|occurrence| {
-                                occurrence.element_id == edge.id.0
+                                occurrence.element_id == edge.target.0
                                     && occurrence.location.start_line == 1
                                     && occurrence.location.start_col == column
                             })

@@ -11723,27 +11723,12 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let mut earliest_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     let mut declaration_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     for node in nodes {
         let key = (
             node.kind,
             short_member_name(&node.serialized_name).to_string(),
         );
-        let replace_earliest = earliest_by_key
-            .get(&key)
-            .and_then(|current_id| node_by_id.get(current_id))
-            .map(|current| {
-                node.start_line
-                    .unwrap_or(u32::MAX)
-                    .cmp(&current.start_line.unwrap_or(u32::MAX))
-                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
-                    .is_lt()
-            })
-            .unwrap_or(true);
-        if replace_earliest {
-            earliest_by_key.insert(key.clone(), node.id);
-        }
         let replace_declaration = declaration_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
@@ -11754,10 +11739,7 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
         }
     }
 
-    for edge in edges
-        .iter_mut()
-        .filter(|edge| matches!(edge.kind, EdgeKind::USAGE | EdgeKind::CALL))
-    {
+    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::USAGE) {
         let Some(target_node) = node_by_id.get(&edge.target).copied() else {
             continue;
         };
@@ -11765,12 +11747,9 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
             target_node.kind,
             short_member_name(&target_node.serialized_name).to_string(),
         );
-        let candidates = if edge.kind == EdgeKind::USAGE {
-            &declaration_by_key
-        } else {
-            &earliest_by_key
-        };
-        let Some(candidate_id) = candidates.get(&key).copied() else {
+        // CALL targets retain each raw occurrence until callable attribution
+        // and resolution. Rewriting a self-edge here loses its owning caller.
+        let Some(candidate_id) = declaration_by_key.get(&key).copied() else {
             continue;
         };
         edge.target = candidate_id;

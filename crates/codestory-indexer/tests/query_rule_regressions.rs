@@ -210,7 +210,7 @@ fn script_private_call_scope_belongs_to_each_occurrence() -> anyhow::Result<()> 
                                 .iter()
                                 .filter(|edge| {
                                     occurrences.iter().any(|occurrence| {
-                                        occurrence.element_id == edge.id.0
+                                        occurrence.element_id == edge.target.0
                                             && occurrence.location.start_line == 2
                                             && occurrence.location.start_col == column
                                     })
