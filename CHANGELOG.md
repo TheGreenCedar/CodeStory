@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search keeps candidate metadata tied to the core generation pinned for each query, so a concurrent index update cannot hide source results.
+
 - Exact file-symbol lookups find the selected file’s declaration even when many other files contain the same name, while preserving ambiguity within that file.
 
 - `doctor` and plain `ready` now inspect missing or older caches without creating or upgrading them. They report when a full index is needed to make an older cache usable.

@@ -678,6 +678,7 @@ dependencies = [
  "directories",
  "flate2",
  "libc",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",

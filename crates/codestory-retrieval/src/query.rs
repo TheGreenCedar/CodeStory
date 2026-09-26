@@ -29,6 +29,7 @@ use codestory_store::{
     BoundRetrievalIndexManifest, CorePublicationLayout, FileRole, RetrievalIndexManifest, Store,
     core_database_exists, resolve_core_generation_database_path,
 };
+use parking_lot::{Mutex, MutexGuard};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -155,7 +156,7 @@ pub struct QueryBatchRequest<'a> {
 /// resolution. The caller may retry this whole session once when `revalidate` returns
 /// [`RetrievalPublicationChanged`]; the session itself never retries.
 pub struct PinnedQuerySession {
-    storage: Store,
+    storage: Arc<Mutex<Store>>,
     storage_path: PathBuf,
     core_database_path: PathBuf,
     project_root: PathBuf,
@@ -274,6 +275,9 @@ impl PinnedQuerySession {
                     .context("embedding dimension exceeds evidence contract")?,
             )?;
         let publication_identity = retrieval_publication_identity_from_bound(&bound_manifest)?;
+        // Share this exact read transaction with full-payload stage enrichment.
+        // In particular, reopening a legacy path would observe newer WAL rows.
+        let storage = Arc::new(Mutex::new(storage));
         let sidecars = Arc::new(
             LiveSidecarSearch::new_for_runtime_with_embedding_device(
                 runtime,
@@ -282,7 +286,7 @@ impl PinnedQuerySession {
                 Some(&manifest),
                 Some(embedding_device.clone()),
             )?
-            .with_core_candidate_context(project_root, storage_path),
+            .with_core_candidate_context(project_root, Arc::clone(&storage)),
         );
 
         let session = Self {
@@ -375,10 +379,11 @@ impl PinnedQuerySession {
         if self.full_readiness_validated.get() {
             return Ok(());
         }
+        let storage = self.storage.lock();
         if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
             &self.project_root,
             &self.storage_path,
-            &self.storage,
+            &storage,
             &self.runtime,
             producer_compatibility_identity,
         ) {
@@ -393,8 +398,7 @@ impl PinnedQuerySession {
                 .with_stage_boundary("deferred_full_readiness_after_strict_validation")
                 .check_cancelled()?;
         }
-        let core_publication = self
-            .storage
+        let core_publication = storage
             .get_complete_index_publication()
             .context("load pinned core publication for vector validation")?
             .context("pinned retrieval query requires a complete core publication")?;
@@ -406,7 +410,7 @@ impl PinnedQuerySession {
         }
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &self.runtime.layout,
-            &self.storage,
+            &storage,
             Some(&self.core_database_path),
             &self.manifest,
             &core_publication,
@@ -425,8 +429,10 @@ impl PinnedQuerySession {
         Ok(())
     }
 
-    pub fn storage(&self) -> &Store {
-        &self.storage
+    /// Borrow the pinned core for one read operation. Drop the guard before
+    /// executing sidecar queries, whose enrichment borrows the same snapshot.
+    pub fn storage(&self) -> MutexGuard<'_, Store> {
+        self.storage.lock()
     }
 
     pub fn project_root(&self) -> &Path {
@@ -698,7 +704,7 @@ impl PinnedQuerySession {
     }
 
     fn enrich_and_rerank_candidates(&self, result: &mut QueryResult) -> Result<()> {
-        enrich_candidates_from_core(&self.storage, &self.project_root, &mut result.hits)?;
+        enrich_candidates_from_core(&self.storage.lock(), &self.project_root, &mut result.hits)?;
         result.hits = rank_candidates(&result.features, std::mem::take(&mut result.hits));
         Ok(())
     }
@@ -712,6 +718,7 @@ impl PinnedQuerySession {
         }
         let file_roles = Arc::new(
             self.storage
+                .lock()
                 .get_files()
                 .context("load file roles for enriched retrieval query")?
                 .into_iter()
@@ -863,7 +870,11 @@ fn refresh_cached_query_result(
 impl Drop for PinnedQuerySession {
     fn drop(&mut self) {
         if self.transaction_active {
-            let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+            let _ = self
+                .storage
+                .lock()
+                .get_connection()
+                .execute_batch("ROLLBACK");
             self.transaction_active = false;
         }
     }
@@ -1508,6 +1519,344 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(feature = "test-support")]
+    struct PinnedEnrichmentFixtureSidecars {
+        live: Arc<dyn SidecarSearch>,
+        enrichments: AtomicUsize,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl SidecarSearch for PinnedEnrichmentFixtureSidecars {
+        fn layout(&self) -> Option<&crate::SidecarLayout> {
+            self.live.layout()
+        }
+
+        fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
+            self.live.embedding_device_readiness()
+        }
+
+        fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+            self.live.runtime_config()
+        }
+
+        fn enrich_candidates(&self, candidates: &mut [CandidateHit]) -> Result<()> {
+            self.enrichments.fetch_add(1, Ordering::SeqCst);
+            self.live.enrich_candidates(candidates)
+        }
+
+        fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok((1..=4)
+                .map(|id| {
+                    let mut hit = CandidateHit::lexical_stub("lib.rs", 1.0);
+                    hit.node_id = Some(id.to_string());
+                    hit.symbol_name = Some(format!("symbol_{id}"));
+                    if id == 4 {
+                        hit.file_role = Some(FileRole::Test);
+                    }
+                    hit
+                })
+                .collect())
+        }
+
+        fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_expand(
+            &self,
+            _anchors: &[CandidateHit],
+            _limit: usize,
+        ) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn full_payload_pin_survives_core_change(immutable: bool) {
+        use crate::test_support::{
+            env_lock, publish_complete_core_fixture, publish_zero_dense_pinned_query_fixture,
+        };
+        use codestory_contracts::core_publication::CoreGenerationIdentityV1;
+        use codestory_store::{
+            CorePublishTransaction, IndexPublicationMode, IndexPublicationRecord, SnapshotStore,
+        };
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("retrieval cache");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn symbol_1() {}\npub fn symbol_2() {}\n")
+            .expect("write source");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = |generation, generation_id: &str| IndexPublicationRecord {
+            generation,
+            generation_id: generation_id.into(),
+            run_id: format!("run-{generation}"),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: generation as i64,
+        };
+        let first = publication(1, "11111111-1111-4111-8111-111111111111");
+        let second = publication(2, "22222222-2222-4222-8222-222222222222");
+        let seed = |path: &Path, publication: &IndexPublicationRecord, replacement: bool| {
+            let mut storage = Store::open(path).expect("open fixture core");
+            storage
+                .insert_file(&FileInfo {
+                    id: 10,
+                    path: source_path.clone(),
+                    language: "rust".into(),
+                    modification_time: live_mtime_millis(&source_path),
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert source file");
+            let nodes = (1..=4)
+                .map(|id| Node {
+                    id: NodeId(id),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("symbol_{id}"),
+                    qualified_name: Some(if id == 3 || (replacement && id == 1) {
+                        format!("tests::symbol_{id}")
+                    } else {
+                        format!("source::symbol_{id}")
+                    }),
+                    canonical_id: Some(format!("rust:symbol_{id}")),
+                    file_node_id: Some(NodeId(10)),
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(1),
+                    end_col: Some(1),
+                })
+                .chain(std::iter::once(Node {
+                    id: NodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().into_owned(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: None,
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(2),
+                    end_col: Some(1),
+                }))
+                .collect::<Vec<_>>();
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert core nodes");
+            publish_complete_core_fixture(&mut storage, project.path(), publication)
+                .expect("publish complete fixture core");
+        };
+        let identity =
+            |path: &Path, publication: &IndexPublicationRecord| CoreGenerationIdentityV1 {
+                generation_id: publication.generation_id.clone(),
+                run_id: publication.run_id.clone(),
+                logical_bytes: std::fs::metadata(path).expect("core bytes").len(),
+                published_at_epoch_ms: publication.published_at_epoch_ms,
+            };
+        if immutable {
+            let stage = SnapshotStore::staged_path(&storage_path).expect("stage A");
+            seed(&stage, &first, false);
+            let first_identity = identity(&stage, &first);
+            CorePublishTransaction::begin_from_stage(&storage_path, stage)
+                .expect("begin A publication")
+                .commit_pointer(first_identity, None)
+                .expect("activate A");
+        } else {
+            seed(&storage_path, &first, false);
+        }
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish retrieval binding A");
+        let mut session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("pin complete A");
+        let pinned_name = |session: &PinnedQuerySession| {
+            session
+                .storage()
+                .get_connection()
+                .query_row("SELECT qualified_name FROM node WHERE id=1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("pinned raw SQLite node")
+        };
+        assert_eq!(pinned_name(&session), "source::symbol_1");
+        let fixture = Arc::new(PinnedEnrichmentFixtureSidecars {
+            live: Arc::clone(&session.sidecars),
+            enrichments: AtomicUsize::new(0),
+        });
+        session.sidecars = fixture.clone();
+        if immutable {
+            let stage = SnapshotStore::staged_path(&storage_path).expect("stage B");
+            seed(&stage, &second, true);
+            let second_identity = identity(&stage, &second);
+            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+            let old = layout
+                .read_pointer()
+                .expect("old pointer")
+                .expect("A pointer")
+                .active;
+            CorePublishTransaction::begin_from_stage(&storage_path, stage)
+                .expect("begin B publication")
+                .commit_pointer(second_identity, Some(old))
+                .expect("activate B");
+            assert_eq!(
+                layout
+                    .read_pointer()
+                    .expect("new pointer")
+                    .expect("B pointer")
+                    .active
+                    .generation_id,
+                second.generation_id
+            );
+        } else {
+            let writer = Store::open(&storage_path).expect("legacy WAL writer");
+            writer.get_connection().execute_batch(
+                "PRAGMA wal_autocheckpoint=0; UPDATE node SET qualified_name='tests::symbol_1' WHERE id=1;"
+            ).expect("commit new metadata into WAL");
+            assert!(
+                std::fs::metadata(storage_path.with_extension("db-wal"))
+                    .expect("live WAL")
+                    .len()
+                    > 0
+            );
+        }
+        let current = Store::open_read_only(&storage_path).expect("current B metadata");
+        assert_eq!(
+            current
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("current node")[&NodeId(1)]
+                .qualified_name
+                .as_deref(),
+            Some("tests::symbol_1")
+        );
+        session
+            .revalidate()
+            .expect("retrieval binding remains A despite newer core metadata");
+        // Read SQLite directly so the legacy snapshot control is not satisfied
+        // by a warmed Store node cache. Live enrichment must use this read view.
+        assert_eq!(pinned_name(&session), "source::symbol_1");
+        let expected_identity = session.publication_identity().clone();
+        let assert_hits = |result: &QueryResult| {
+            let ids = result
+                .hits
+                .iter()
+                .filter_map(|hit| hit.node_id.as_deref())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                ids,
+                HashSet::from(["1", "2"]),
+                "A source hit must survive pre-fusion metadata filtering"
+            );
+            assert!(
+                result.hits.iter().all(|hit| matches!(
+                    hit.file_role,
+                    Some(FileRole::Source | FileRole::Entrypoint)
+                )),
+                "retained A hits must remain primary source candidates: {:?}",
+                result.hits
+            );
+            assert_eq!(
+                result
+                    .hits
+                    .iter()
+                    .find(|hit| hit.node_id.as_deref() == Some("1"))
+                    .expect("source hit")
+                    .qualified_name
+                    .as_deref(),
+                Some("source::symbol_1")
+            );
+            assert_eq!(
+                result.publication_identity.as_ref(),
+                Some(&expected_identity)
+            );
+        };
+        let mut cache = RetrievalCache::new();
+        assert_hits(
+            &session
+                .execute_with_cache("find service implementation", Some(500), None, &mut cache)
+                .expect("execute full query against A"),
+        );
+        let queries = [
+            QueryBatchItem {
+                query: "locate service implementation",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "explain service implementation",
+                budget_ms: Some(500),
+            },
+        ];
+        for result in session
+            .execute_batch_with_cache(&queries, None, &mut cache)
+            .expect("parallel full queries")
+        {
+            assert_hits(&result);
+        }
+        assert!(
+            fixture.enrichments.load(Ordering::SeqCst) >= 3,
+            "full stages must invoke live enrichment"
+        );
+        let before_descriptors = fixture.enrichments.load(Ordering::SeqCst);
+        session
+            .execute_packet_descriptors_with_cache(
+                "describe service implementation",
+                Some(500),
+                None,
+                &mut cache,
+            )
+            .expect("descriptor query");
+        assert_eq!(
+            fixture.enrichments.load(Ordering::SeqCst),
+            before_descriptors,
+            "descriptor execution must not hydrate core candidates"
+        );
+        session
+            .revalidate()
+            .expect("old retrieval binding remains usable");
+        assert!(
+            crate::retention::GenerationRetentionLock::try_acquire(
+                &runtime.layout.state_file,
+                session.project_id(),
+            )
+            .expect("observe cleanup fence")
+            .is_none(),
+            "query session retains its cleanup lease"
+        );
+        let project_id = session.project_id().to_owned();
+        drop(session);
+        assert!(
+            crate::retention::GenerationRetentionLock::try_acquire(
+                &runtime.layout.state_file,
+                &project_id,
+            )
+            .expect("cleanup fence after query")
+            .is_some(),
+            "cleanup can resume after the session ends"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn full_payload_enrichment_uses_pinned_core_after_pointer_swap() {
+        full_payload_pin_survives_core_change(true);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn full_payload_enrichment_uses_pinned_legacy_wal_snapshot() {
+        full_payload_pin_survives_core_change(false);
+    }
 
     #[test]
     fn strict_batch_fanout_stays_bounded_when_the_host_has_many_cores() {

@@ -260,7 +260,7 @@ fn canonical_symbol_names_for_session(
         }
     }
     let node_names = Arc::new(
-        crate::load_canonical_search_symbols(session.storage(), 10_000, None, |_| Ok(()))?.0,
+        crate::load_canonical_search_symbols(&session.storage(), 10_000, None, |_| Ok(()))?.0,
     );
     let mut state = controller.canonical_symbol_names.lock();
     state.stream_count = state.stream_count.saturating_add(1);
@@ -2656,7 +2656,7 @@ fn resolve_sidecar_candidates_in_read(
         // streaming is repository-wide core hydration and therefore cannot
         // happen before or on behalf of a rejected packet candidate.
         return resolve_sidecar_candidates_in_storage(
-            pinned.session.storage(),
+            &pinned.session.storage(),
             &HashMap::new(),
             &pinned.project_root,
             candidates,
@@ -2665,7 +2665,7 @@ fn resolve_sidecar_candidates_in_read(
     }
     let node_names = pinned.canonical_node_names(controller)?;
     resolve_sidecar_candidates_in_storage(
-        pinned.session.storage(),
+        &pinned.session.storage(),
         &node_names,
         &pinned.project_root,
         candidates,

@@ -5,8 +5,9 @@ use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::lexical_client::LexicalClient;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
-use codestory_store::RetrievalIndexManifest;
-use std::path::{Path, PathBuf};
+use codestory_store::{RetrievalIndexManifest, Store};
+use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -276,10 +277,19 @@ pub struct LiveSidecarSearch {
     core_context: Option<CoreCandidateContext>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CoreCandidateContext {
-    project_root: PathBuf,
-    storage_path: PathBuf,
+    project_root: std::path::PathBuf,
+    storage: Arc<Mutex<Store>>,
+}
+
+impl std::fmt::Debug for CoreCandidateContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoreCandidateContext")
+            .field("project_root", &self.project_root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiveSidecarSearch {
@@ -351,11 +361,11 @@ impl LiveSidecarSearch {
     pub(crate) fn with_core_candidate_context(
         mut self,
         project_root: &Path,
-        storage_path: &Path,
+        storage: Arc<Mutex<Store>>,
     ) -> Self {
         self.core_context = Some(CoreCandidateContext {
             project_root: project_root.to_path_buf(),
-            storage_path: storage_path.to_path_buf(),
+            storage,
         });
         self
     }
@@ -390,7 +400,10 @@ impl SidecarSearch for LiveSidecarSearch {
         let Some(context) = self.core_context.as_ref() else {
             return Ok(());
         };
-        let storage = codestory_store::Store::open_read_only(&context.storage_path)?;
+        // Candidate classification must use the query's already pinned read
+        // transaction, including for mutable legacy WAL cores. Sidecar I/O and
+        // ranking run outside this short metadata-read guard.
+        let storage = context.storage.lock();
         crate::query::enrich_candidates_from_core(&storage, &context.project_root, candidates)
     }
 
