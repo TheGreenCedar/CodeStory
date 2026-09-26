@@ -9,6 +9,7 @@ import { parseArgs as parseNodeArgs } from "node:util";
 import {
   codeStoryInvocationsFromCommand,
   directBenchmarkCliInvocation,
+  literalShellWords,
 } from "./lib/evidence-compiler-ablation.mjs";
 
 const CONTROL_ROW_AUDIT_CONTRACT = "codestory.control-row-audit/v1";
@@ -159,6 +160,10 @@ function commandReceipt(command) {
 }
 
 function sourceReadIndex(row, commands, events) {
+  if (commands.some(({ id }) => typeof id !== "string" || !id)
+      || new Set(commands.map(({ id }) => id)).size !== commands.length) {
+    throw new Error(`${row.benchmark_run_id}: source-read telemetry has ambiguous command identities`);
+  }
   const reads = row.transcript_analysis?.direct_source_reads;
   if (!Array.isArray(reads) || row.transcript_analysis?.direct_source_reads_total !== reads.length) {
     throw new Error(`${row.benchmark_run_id}: source-read telemetry is missing or inconsistent`);
@@ -181,6 +186,99 @@ function sourceReadIndex(row, commands, events) {
     byCommand.set(id, current);
   }
   return byCommand;
+}
+
+function sourcePath(value) {
+  return /\.(rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)$/iu.test(value);
+}
+
+function normalizedSourcePath(value) {
+  return value.replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+function searchOutputMode(words) {
+  const withValue = new Set(["-e", "--regexp", "-f", "--file", "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-m", "--max-count", "-A", "--after-context", "-B", "--before-context", "-C", "--context"]);
+  const namesOnly = new Set(["--files", "--files-with-matches", "--files-without-match", "--count", "--count-matches", "--quiet"]);
+  const noValue = new Set(["--line-number", "--no-line-number", "--with-filename", "--no-filename", "--no-heading", "--heading", "--ignore-case", "--case-sensitive", "--word-regexp", "--line-regexp", "--fixed-strings", "--only-matching", "--hidden", "--no-ignore"]);
+  let metadata = false;
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (word === "--") break;
+    const option = word.split("=", 1)[0];
+    if (withValue.has(option)) {
+      if (!word.includes("=") && ++index >= words.length) return "indeterminate";
+    } else if (/^-[efgmABC].+/u.test(word)) {
+      // Attached values are data, including values spelling metadata flags.
+    } else if (namesOnly.has(word)) {
+      metadata = true;
+    } else if (noValue.has(word)) {
+      // Supported flags that retain source-bearing output.
+    } else if (/^-[nHhivwxoUsFlLcq]+$/u.test(word)) {
+      metadata ||= /[lLcq]/u.test(word);
+    } else if (word.startsWith("-")) {
+      return "indeterminate";
+    }
+  }
+  return metadata ? "metadata" : "source";
+}
+
+function transcriptSourceReads(command) {
+  if (directBenchmarkCliInvocation(command.command)) return { paths: [], direct: false, indeterminate: false };
+  let words = literalShellWords(command.command);
+  if (words?.length === 3 && ["sh", "bash", "zsh"].includes(path.basename(words[0]))
+      && ["-c", "-lc"].includes(words[1])) {
+    words = literalShellWords(words[2]);
+  }
+  const tool = words ? path.basename(words[0] ?? "").toLowerCase() : null;
+  const direct = ["cat", "sed", "nl", "head", "tail", "bat", "get-content", "type"];
+  const search = ["rg", "grep"];
+  if (!words) {
+    return { paths: [], indeterminate: Boolean(command.output.trim()), direct: false };
+  }
+  const paths = [...new Set(words.slice(1).filter(sourcePath).map(normalizedSourcePath))];
+  if (direct.includes(tool)) return { paths, direct: true, indeterminate: paths.length === 0 };
+  if (!search.includes(tool)) {
+    const knownMetadata = ["echo", "printf", "pwd", "true", "false"].includes(tool)
+      || (tool === "git" && ["status", "rev-parse", "ls-files"].includes(words[1]));
+    return { paths: [], direct: false, indeterminate: Boolean(command.output.trim()) && !knownMetadata };
+  }
+  const mode = searchOutputMode(words);
+  if (!command.output.trim() || mode === "metadata") return { paths: [], direct: false, indeterminate: false };
+  if (mode === "indeterminate") return { paths: [], direct: false, indeterminate: true };
+  const outputPaths = command.output.split(/\r?\n/u).flatMap((line) => {
+    const match = line.match(/^(.+?):(?:\d+:)?(.*)$/u);
+    return match && sourcePath(match[1]) && match[2]
+      ? [normalizedSourcePath(match[1])] : [];
+  });
+  if (outputPaths.length) return { paths: [...new Set(outputPaths)], direct: false, indeterminate: false };
+  if (paths.length && command.exit_code === 0) return { paths, direct: false, indeterminate: false };
+  return { paths: [], direct: false, indeterminate: true };
+}
+
+function reconcileTranscriptSourceReads(commands, listedReads) {
+  const byCommand = new Map();
+  const reasons = [];
+  const unresolvedCommands = new Set();
+  for (const command of commands) {
+    const derived = transcriptSourceReads(command);
+    const listed = listedReads.get(command.id) ?? [];
+    const listedPaths = listed.map(({ path: source }) => normalizedSourcePath(source)).sort();
+    if ((derived.direct || listed.length) && JSON.stringify([...derived.paths].sort()) !== JSON.stringify(listedPaths)) {
+      reasons.push(`source-read telemetry mismatch for command ${command.id}`);
+    }
+    if (derived.indeterminate) {
+      reasons.push(`source exposure is indeterminate for command ${command.id}`);
+      unresolvedCommands.add(command.id);
+    }
+    const paths = derived.indeterminate ? [...new Set(listedPaths)] : derived.paths;
+    byCommand.set(command.id, paths.map((source) => ({ path: source })));
+  }
+  return {
+    byCommand,
+    status: reasons.length ? "indeterminate" : "reconciled",
+    reasons,
+    unresolvedCommands,
+  };
 }
 
 function sourceExposure(command, sourceReads, codeStoryReceipt) {
@@ -254,7 +352,9 @@ async function auditControlRow({
   const transcript = parseJsonlWithRawLines(stdout.bytes, stdout.preserved_name)
     .map((entry) => entry.value);
   const commands = commandEvents(transcript);
-  const sourceReads = sourceReadIndex(row, commands, transcript);
+  const listedSourceReads = sourceReadIndex(row, commands, transcript);
+  const reconciliation = reconcileTranscriptSourceReads(commands, listedSourceReads);
+  const sourceReads = reconciliation.byCommand;
   const codeStoryByEvent = new Map();
   for (const command of commands) {
     const receipt = commandReceipt(command);
@@ -271,6 +371,13 @@ async function auditControlRow({
       bytes: total.bytes + exposure.bytes,
     };
   }, { read_count: 0, bytes: 0 });
+  if (beforeFailure.some(({ id }) => reconciliation.unresolvedCommands.has(id))) {
+    sourceBeforeFailure.read_count = null;
+    sourceBeforeFailure.bytes = null;
+    sourceBeforeFailure.output_bytes_upper_bound = beforeFailure.reduce(
+      (total, command) => total + Buffer.byteLength(command.output, "utf8"), 0,
+    );
+  }
   const fallbackCommands = commands.filter((entry) => entry.event_index > failureIndex);
   const fallbackActions = fallbackCommands.map((command) => {
     const codeStory = codeStoryByEvent.get(command.event_index) ?? null;
@@ -282,15 +389,22 @@ async function auditControlRow({
       command: command.command,
       exit_status: command.exit_code,
       output_bytes: Buffer.byteLength(command.output, "utf8"),
-      source_read_count: reads.length,
+      source_read_count: reconciliation.unresolvedCommands.has(command.id) ? null : reads.length,
       source_paths: reads.map((read) => read.path),
     };
   });
   const nativeFallbackWithSource = fallbackActions.filter(
     (action) => action.kind === "native" && action.source_read_count > 0,
   );
+  const unresolvedNativeFallback = fallbackActions.some(
+    (action) => action.kind === "native" && action.source_read_count === null,
+  );
   const requiredOperation = requiredOperationValidity(row.arm, codeStoryCommands);
   const telemetry = telemetryValidity(row);
+  if (reconciliation.status !== "reconciled") {
+    telemetry.valid = false;
+    telemetry.reasons.push(...reconciliation.reasons);
+  }
   return {
     contract: CONTROL_ROW_AUDIT_CONTRACT,
     task: row.task_id,
@@ -315,17 +429,26 @@ async function auditControlRow({
     attempted_codestory_commands: codeStoryCommands,
     first_failed_codestory_command: firstFailure,
     source_exposed_before_failure: sourceBeforeFailure,
+    source_exposure_reconciliation: {
+      status: reconciliation.status,
+      reasons: reconciliation.reasons,
+    },
     source_byte_measurement: "whole command output containing source; includes formatting; combined reads counted once",
+    source_read_measurement: "distinct source paths per command; opaque reads are indeterminate",
     subsequent_actions: fallbackActions,
     native_fallback: {
-      source_read_count: nativeFallbackWithSource.reduce(
+      source_read_count: unresolvedNativeFallback ? null : nativeFallbackWithSource.reduce(
         (sum, action) => sum + action.source_read_count,
         0,
       ),
-      source_bytes: nativeFallbackWithSource.reduce(
+      source_bytes: unresolvedNativeFallback ? null : nativeFallbackWithSource.reduce(
         (sum, action) => sum + action.output_bytes,
         0,
       ),
+      ...(unresolvedNativeFallback ? {
+        output_bytes_upper_bound: fallbackActions.filter(({ kind }) => kind === "native")
+          .reduce((total, action) => total + action.output_bytes, 0),
+      } : {}),
     },
     required_operation: requiredOperation,
     telemetry,
