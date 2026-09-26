@@ -6230,6 +6230,110 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn pointer_backed_cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let mut storage =
+            Store::open(&fixture.storage_path).expect("open real pointer-backed immutable core");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("complete core"),
+            Some(fixture.publication.clone())
+        );
+        assert!(fixture.core_pointer_path.is_file());
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input("11111111111111111111111111111111");
+        let current_input = input("22222222222222222222222222222222");
+        let candidate_input = input("33333333333333333333333333333333");
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        storage
+            .publish_retrieval_index_publication(&rollback_manifest, None)
+            .expect("bind first external retrieval publication to pinned core");
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest,
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+        assert!(fixture.retrieval_pointer_path.is_file());
+        let checks = std::cell::Cell::new(0_u8);
+
+        let error = promote_retrieval_manifest_with_cancel(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == 3 {
+                    return Err(RetrievalIndexCancelled {
+                        boundary: "fixture authoritative pointer commit",
+                    }
+                    .into());
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation before commit must reject publication");
+
+        assert!(is_retrieval_index_cancelled(&error), "{error:#}");
+        fixture.assert_core_unchanged();
+        assert_eq!(
+            checks.get(),
+            3,
+            "cancellation did not reach the commit fence"
+        );
+        assert_eq!(
+            Store::open(&fixture.storage_path)
+                .expect("independently reopen pointer-backed core")
+                .get_retrieval_index_publication("proj")
+                .expect("read authoritative publication after cancellation"),
+            prior,
+            "cancelled transaction changed current or rollback pointers"
+        );
+    }
+
     #[test]
     fn partial_zero_dense_vector_candidate_repairs_then_promotes_without_weakening_prior() {
         let _env = crate::test_support::env_lock();
