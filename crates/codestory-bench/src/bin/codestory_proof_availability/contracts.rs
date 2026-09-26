@@ -6206,10 +6206,51 @@ fn ratio_milli(numerator: u64, denominator: u64) -> Result<u16> {
         return Ok(0);
     }
     let scaled = numerator
-        .checked_mul(1000)
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(denominator / 2))
         .ok_or_else(|| anyhow::anyhow!("proof_availability_metric_overflow"))?
         / denominator;
     u16::try_from(scaled).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod ratio_rounding_tests {
+    use super::*;
+
+    #[test]
+    fn funnel_conversions_use_half_up_thousandths() {
+        let one_of_six = ResolutionFunnelCountsV1 {
+            syntax_calls: 6,
+            adapter_supported: 1,
+            exact: 1,
+            ..Default::default()
+        };
+        let conversions = resolution_funnel_conversions(&one_of_six).unwrap();
+        assert_eq!(conversions.adapter_supported_per_syntax_milli, 167);
+        assert_eq!(conversions.exact_per_adapter_supported_milli, 1_000);
+
+        let five_of_six = ResolutionFunnelCountsV1 {
+            syntax_calls: 6,
+            adapter_supported: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolution_funnel_conversions(&five_of_six)
+                .unwrap()
+                .adapter_supported_per_syntax_milli,
+            833
+        );
+    }
+
+    #[test]
+    fn ratio_boundaries_keep_zero_and_checked_overflow_contracts() {
+        assert_eq!(ratio_milli(1, 16).unwrap(), 63);
+        assert_eq!(ratio_milli(1, 4).unwrap(), 250);
+        assert_eq!(ratio_milli(1, 0).unwrap(), 0);
+        assert!(ratio_milli(u64::MAX, 1).is_err());
+        assert!(ratio_milli(u64::MAX / 1_000, u64::MAX).is_err());
+        assert!(ratio_milli(66, 1).is_err());
+    }
 }
 
 #[cfg(test)]
