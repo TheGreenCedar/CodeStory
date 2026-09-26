@@ -450,7 +450,7 @@ impl RuntimeContext {
             None => self.open_project_summary()?,
         };
 
-        let completed = completed_refresh_decision(decision, phase_timings.as_ref());
+        let completed = decision;
         Ok(OpenedProject {
             summary,
             refresh_mode: completed.effective_mode,
@@ -565,19 +565,6 @@ impl RuntimeContext {
             .active_project_summary()
             .map_err(|error| map_api_error_for_project(error, &self.project_root))
     }
-}
-
-fn completed_refresh_decision(
-    mut decision: RefreshDecision,
-    timings: Option<&IndexingPhaseTimings>,
-) -> RefreshDecision {
-    if decision.effective_mode == Some(IndexMode::Incremental)
-        && timings.is_some_and(|timings| timings.full_refresh_wall.is_some())
-    {
-        decision.effective_mode = Some(IndexMode::Full);
-        decision.reason = Some("core_copy_on_write_unavailable".to_string());
-    }
-    decision
 }
 
 /// Public response-envelope contract version. `codestory_contracts::wire` owns
@@ -1201,6 +1188,7 @@ mod tests {
                 readiness: None,
                 embedding_capacity: None,
                 embedding_retry: None,
+                disk_space: None,
                 coverage_gaps: Vec::new(),
             },
         )
@@ -1244,33 +1232,6 @@ mod tests {
                 .code,
             "internal"
         );
-    }
-
-    #[test]
-    fn completed_full_fallback_reports_effective_mode_and_reason() {
-        let decision = RefreshDecision {
-            effective_mode: Some(IndexMode::Incremental),
-            reason: None,
-        };
-        let full = IndexingPhaseTimings {
-            full_refresh_wall: Some(codestory_contracts::api::FullRefreshWallTimings::default()),
-            ..IndexingPhaseTimings::default()
-        };
-        let completed = completed_refresh_decision(decision.clone(), Some(&full));
-        assert_eq!(completed.effective_mode, Some(IndexMode::Full));
-        assert_eq!(
-            completed.reason.as_deref(),
-            Some("core_copy_on_write_unavailable")
-        );
-        assert_eq!(
-            refresh_label(RefreshMode::Auto, completed.effective_mode),
-            "auto(full)"
-        );
-
-        let incremental =
-            completed_refresh_decision(decision, Some(&IndexingPhaseTimings::default()));
-        assert_eq!(incremental.effective_mode, Some(IndexMode::Incremental));
-        assert!(incremental.reason.is_none());
     }
 
     #[test]

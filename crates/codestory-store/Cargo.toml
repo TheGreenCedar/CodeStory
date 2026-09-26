@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 codestory-contracts = { workspace = true }
+fs_at = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true }

@@ -77,7 +77,7 @@ pub use dto::{
 };
 pub use errors::{
     ApiError, ApiErrorDetails, COMMAND_FAILURE_SCHEMA_VERSION, CommandFailureEnvelope,
-    EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
+    DiskSpacePressureDto, EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
 };
 pub use events::{
     AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,

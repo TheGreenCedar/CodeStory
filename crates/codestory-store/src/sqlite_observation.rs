@@ -297,6 +297,31 @@ pub fn available_filesystem_bytes(path: &Path) -> Result<u64, StorageError> {
     available_filesystem_bytes_platform(path)
 }
 
+/// Reserve space for SQLite pages, WAL growth, and metadata while writing one
+/// full-size core image. The source estimate is its logical SQLite size.
+pub const FULL_SIZE_WRITE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub fn ensure_full_size_write_capacity(
+    destination_parent: &Path,
+    source_logical_bytes: u64,
+    operation: &'static str,
+) -> Result<(), StorageError> {
+    let required_bytes = source_logical_bytes.saturating_add(FULL_SIZE_WRITE_RESERVE_BYTES);
+    let existing_parent = destination_parent
+        .ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .unwrap_or_else(|| Path::new("."));
+    let available_bytes = available_filesystem_bytes(existing_parent)?;
+    if available_bytes < required_bytes {
+        return Err(StorageError::InsufficientSpace {
+            operation,
+            required_bytes,
+            available_bytes,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn available_filesystem_bytes_platform(path: &Path) -> Result<u64, StorageError> {
     use std::ffi::CString;

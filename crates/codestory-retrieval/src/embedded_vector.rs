@@ -132,6 +132,7 @@ pub(crate) struct IncrementalVectorWork {
     pub inserted: u64,
     pub removed: u64,
     pub direct_reference: bool,
+    pub stage: Option<codestory_store::SealedStageStats>,
 }
 
 pub(crate) struct AttestedVectorPublication<'a> {
@@ -791,6 +792,7 @@ impl EmbeddedVectorIndex {
         previous_collection: &str,
         expected_evidence: &EmbeddingVectorProducerEvidenceDto,
         current_anchors: &[CurrentVectorAnchor],
+        cancelled: &dyn Fn() -> bool,
         before_publish: impl FnOnce() -> Result<()>,
         produce_missing: impl FnOnce(
             &[ExpectedVectorAnchor],
@@ -850,6 +852,12 @@ impl EmbeddedVectorIndex {
         let previous_artifacts = sqlite_file_with_sidecars(&previous_path);
         let transferable =
             VECTOR_DATABASE_RECEIPTS.transferable_receipt(&previous_path, &previous_artifacts);
+        if cancelled() {
+            return Err(crate::index::RetrievalIndexCancelled {
+                boundary: "vector staging",
+            }
+            .into());
+        }
         if previous_anchors == expected_anchors
             && previous_current_anchors == current_anchors
             && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
@@ -858,6 +866,12 @@ impl EmbeddedVectorIndex {
                 let mut attestation = previous_manifest.vectors.clone();
                 attestation.generation = publication.generation.to_string();
                 attestation.input_hash = publication.input_hash.to_string();
+                if cancelled() {
+                    return Err(crate::index::RetrievalIndexCancelled {
+                        boundary: "vector reference publication",
+                    }
+                    .into());
+                }
                 before_publish()?;
                 crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
                 if let Some(transferable) = transferable {
@@ -877,6 +891,7 @@ impl EmbeddedVectorIndex {
                         inserted: 0,
                         removed: 0,
                         direct_reference: true,
+                        stage: None,
                     },
                 ))
             })();
@@ -885,13 +900,11 @@ impl EmbeddedVectorIndex {
             }
             return result.map(Some);
         }
-        if !crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
-            return Ok(None);
-        }
+        let stage = crate::copy_on_write::stage_file(&previous_path, &temp_path, cancelled)?;
 
         let result = (|| {
             crate::copy_on_write::make_file_owner_writable(&temp_path)?;
-            let work = reconcile_cloned_database(
+            let mut work = reconcile_cloned_database(
                 &temp_path,
                 publication.generation,
                 publication.input_hash,
@@ -900,6 +913,7 @@ impl EmbeddedVectorIndex {
                 &current_anchors,
                 produce_missing,
             )?;
+            work.stage = Some(stage);
             let validation_started = Instant::now();
             let attestation = validate_database(
                 &temp_path,
@@ -913,6 +927,12 @@ impl EmbeddedVectorIndex {
                 "vector final validation",
                 validation_started.elapsed(),
             );
+            if cancelled() {
+                return Err(crate::index::RetrievalIndexCancelled {
+                    boundary: "vector publication",
+                }
+                .into());
+            }
             before_publish()?;
             crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
             Ok((attestation, work))
@@ -1026,6 +1046,7 @@ impl EmbeddedVectorIndex {
                     inserted: 0,
                     removed: 0,
                     direct_reference: true,
+                    stage: None,
                 },
             ))
         })();
@@ -1848,6 +1869,7 @@ fn reconcile_cloned_database(
         inserted: u64::try_from(missing.len()).unwrap_or(u64::MAX),
         removed: u64::try_from(removed).unwrap_or(u64::MAX),
         direct_reference: false,
+        stage: None,
     })
 }
 
@@ -3702,6 +3724,7 @@ mod tests {
                 current_anchor("1", "document-1", "renamed display metadata"),
                 current_anchor("3", "document-3", "symbol_3"),
             ],
+            &|| false,
             || Ok(()),
             |missing, visit| {
                 assert_eq!(missing.len(), 1);
@@ -3815,32 +3838,29 @@ mod tests {
             current_anchor("2", "document-2", "symbol_2"),
         ];
         let build = |fail_writable| {
-            crate::copy_on_write::with_clone_copy_fallback_and_writable_failure(
-                fail_writable,
-                || {
-                    EmbeddedVectorIndex::try_build_incremental_with_cancel(
-                        AttestedVectorPublication {
-                            layout: &layout,
-                            collection: "current",
-                            generation: "generation-v2",
-                            input_hash: "input-v2",
-                            contract: &contract,
-                            expected_anchors: &expected,
-                        },
-                        "previous",
-                        &evidence,
-                        &current,
-                        || Ok(()),
-                        |missing, _| {
-                            assert!(missing.is_empty());
-                            Ok(())
-                        },
-                    )
-                },
-            )
+            crate::copy_on_write::with_production_copy_and_writable_failure(fail_writable, || {
+                EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                    AttestedVectorPublication {
+                        layout: &layout,
+                        collection: "current",
+                        generation: "generation-v2",
+                        input_hash: "input-v2",
+                        contract: &contract,
+                        expected_anchors: &expected,
+                    },
+                    "previous",
+                    &evidence,
+                    &current,
+                    &|| false,
+                    || Ok(()),
+                    |missing, _| {
+                        assert!(missing.is_empty());
+                        Ok(())
+                    },
+                )
+            })
         };
-        let (failed, used_copy_fallback) = build(true);
-        eprintln!("clone fixture used copy fallback: {used_copy_fallback}");
+        let failed = build(true);
         let error = failed.expect_err("permissions failure after clone");
         assert!(format!("{error:#}").contains("injected staged component permissions failure"));
         assert!(
@@ -3860,11 +3880,14 @@ mod tests {
             previous_manifest_bytes
         );
 
-        let (retry, retry_used_copy_fallback) = build(false);
-        assert_eq!(retry_used_copy_fallback, used_copy_fallback);
+        let retry = build(false);
         let (attestation, work) = retry.expect("retry").expect("clone path");
         assert_eq!(attestation.point_count, 2);
         assert!(!work.direct_reference);
+        assert_eq!(
+            work.stage.expect("production stage").strategy,
+            codestory_store::SealedStageStrategy::Copied
+        );
         assert_eq!(std::fs::read(&previous_path).unwrap(), previous_bytes);
         assert_eq!(
             std::fs::read(&previous_manifest_path).unwrap(),
@@ -3948,6 +3971,7 @@ mod tests {
                     current_anchor("1", "document-1", "symbol_1"),
                     current_anchor("2", "document-2", "symbol_2"),
                 ],
+                &|| false,
                 || Ok(()),
                 |_, _| panic!("publication-only reuse must not request vector production"),
             )
@@ -4153,6 +4177,7 @@ mod tests {
                 "previous",
                 &evidence,
                 &current_anchors,
+                &|| false,
                 || Ok(()),
                 |_, _| panic!("unchanged old-layout vectors must not be produced again"),
             )
@@ -4343,19 +4368,15 @@ mod tests {
                 current_anchor("1", "document-1", "symbol_1"),
                 current_anchor("2", "document-2", "symbol_2"),
             ],
-            || bail!("simulated incremental cancellation"),
+            &|| true,
+            || panic!("cancelled stage must not reach publication"),
             |missing, _| {
                 assert!(missing.is_empty());
                 Ok(())
             },
         );
-        match result {
-            Ok(None) => {}
-            Err(error) => {
-                assert!(format!("{error:#}").contains("simulated incremental cancellation"))
-            }
-            Ok(Some(_)) => panic!("cancelled vector candidate was published"),
-        }
+        let error = result.expect_err("cancelled stage must fail");
+        assert!(crate::index::is_retrieval_index_cancelled(&error));
         assert!(!index_path(&layout, "cancelled").exists());
     }
 
@@ -4429,6 +4450,7 @@ mod tests {
                 current_anchor("1", "document-1", "symbol_1"),
                 current_anchor("2", "document-2", "symbol_2"),
             ],
+            &|| false,
             || Ok(()),
             |_, _| panic!("corrupt predecessor must not enter differential production"),
         )
@@ -4506,6 +4528,7 @@ mod tests {
                 current_anchor("1", "document-1", "symbol_1"),
                 current_anchor("2", "document-2", "symbol_2"),
             ],
+            &|| false,
             || Ok(()),
             |_, _| panic!("legacy predecessor must not enter differential production"),
         )

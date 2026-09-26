@@ -245,9 +245,10 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
                     .map_err(map_api_error)?,
             );
             finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
+                .map_err(map_retrieval_finalize_error)
                 .context("retrieval index finalize after semantic-doc contract repair")?
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(map_retrieval_finalize_error(error)),
     };
     let retrieval_finalize_ms = retrieval_started
         .elapsed()
@@ -396,6 +397,13 @@ fn retrieval_index_should_retry_full_refresh(
 ) -> bool {
     requested_refresh == RefreshMode::Auto
         && error_chain_contains(error, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED)
+}
+
+fn map_retrieval_finalize_error(error: anyhow::Error) -> anyhow::Error {
+    match codestory_runtime::insufficient_space_api_error(&error) {
+        Some(refusal) => map_api_error(refusal),
+        None => error,
+    }
 }
 
 fn error_chain_contains(error: &anyhow::Error, needle: &str) -> bool {
@@ -643,7 +651,8 @@ const RETRIEVAL_PHASE_ALLOWLIST: &[&str] = &[
 ];
 
 const RETRIEVAL_COMPONENT_ALLOWLIST: &[&str] = &["lexical", "vectors", "graph"];
-const RETRIEVAL_COMPONENT_MODE_ALLOWLIST: &[&str] = &["reused", "copy_on_write", "complete"];
+const RETRIEVAL_COMPONENT_MODE_ALLOWLIST: &[&str] =
+    &["reused", "copy_on_write", "copied", "complete"];
 
 fn safe_retrieval_phase_timings(
     timings: &[FinalizePhaseTiming],
@@ -2068,5 +2077,28 @@ mod tests {
             RefreshMode::Auto,
             &error
         ));
+    }
+
+    #[test]
+    fn sealed_copy_capacity_refusal_survives_direct_retrieval_cli_projection() {
+        let source = codestory_runtime::sealed_copy_insufficient_error_for_test(68_000_000, 0)
+            .context("retrieval index finalize");
+        assert!(!retrieval_index_should_retry_full_refresh(
+            RefreshMode::Auto,
+            &source
+        ));
+        let mapped = map_retrieval_finalize_error(source);
+        let api = crate::runtime::api_error_in_chain(&mapped).expect("typed direct CLI error");
+        assert_eq!(api.code, "insufficient_space");
+        let space = api
+            .details
+            .as_deref()
+            .and_then(|details| details.disk_space.as_ref())
+            .expect("disk details");
+        assert_eq!(space.operation, "sealed_component_copy");
+        assert_eq!(
+            (space.required_bytes, space.available_bytes),
+            (68_000_000, 0)
+        );
     }
 }

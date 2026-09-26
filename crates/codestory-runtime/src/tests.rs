@@ -2804,7 +2804,7 @@ fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation()
 }
 
 #[test]
-fn incremental_escalates_to_complete_build_when_core_cow_is_unavailable() {
+fn incremental_copies_stage_when_core_cow_is_unavailable() {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");
     write_reindex_semantic_fixture(workspace.path(), "cow escalate baseline");
@@ -2829,22 +2829,82 @@ fn incremental_escalates_to_complete_build_when_core_cow_is_unavailable() {
     let timings = with_core_clone_disabled(|| {
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("incremental must recover via disposable complete-build")
+            .expect("incremental must use the production copy fallback")
     });
     assert!(
-        timings.full_refresh_wall.is_some(),
-        "CoW-unavailable incremental must run the complete-build wall path"
+        timings.full_refresh_wall.is_none(),
+        "CoW-unavailable incremental must not run the complete-build wall path"
     );
     assert!(
-        timings.incremental_core_wall.is_none(),
-        "escalated refresh must not report an incremental core wall"
+        timings.incremental_core_wall.is_some(),
+        "copied refresh must report an incremental core wall"
     );
+    let stage = timings
+        .staged_snapshot_copy
+        .as_ref()
+        .expect("stage telemetry");
+    assert_eq!(stage.stage_strategy.as_deref(), Some("copied"));
+    assert_eq!(
+        stage.fallback_reason.as_deref(),
+        Some("native_clone_disabled")
+    );
+    assert_eq!(stage.cloned_bytes, 0);
+    assert_eq!(stage.copied_bytes, stage.source_bytes);
     let published = controller
         .index_publication()
         .expect("read escalated publication")
         .expect("escalated publication");
-    assert_eq!(published.mode, IndexPublicationMode::Full);
+    assert_eq!(published.mode, IndexPublicationMode::Incremental);
     assert_ne!(published.generation_id, baseline.generation_id);
+}
+
+#[test]
+fn incremental_capacity_refusal_keeps_previous_publication_and_structured_bytes() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    write_reindex_semantic_fixture(workspace.path(), "capacity baseline");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+    let baseline = controller
+        .index_publication()
+        .expect("read baseline")
+        .expect("baseline");
+    write_reindex_semantic_fixture(workspace.path(), "capacity changed");
+    let error = codestory_store::with_available_filesystem_bytes_override(0, || {
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("zero bytes must refuse stage")
+    });
+    assert_eq!(error.code, "insufficient_space");
+    let disk = error
+        .details
+        .as_ref()
+        .and_then(|details| details.disk_space.as_ref())
+        .expect("structured disk space detail");
+    assert_eq!(disk.operation, "incremental core stage");
+    assert_eq!(disk.available_bytes, 0);
+    assert!(disk.required_bytes > 0);
+    assert_eq!(disk.retry_condition, "after_space_available");
+    assert_eq!(
+        controller
+            .index_publication()
+            .expect("read preserved")
+            .expect("preserved")
+            .generation_id,
+        baseline.generation_id
+    );
+}
+
+#[test]
+fn cancelled_core_stage_keeps_the_runtime_cancellation_code() {
+    let error = crate::index_storage_error("stage", codestory_store::StorageError::Cancelled);
+    assert_eq!(error.code, "cancelled");
 }
 
 #[test]

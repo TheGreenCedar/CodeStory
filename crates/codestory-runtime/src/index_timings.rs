@@ -379,6 +379,11 @@ pub(super) fn database_snapshot_copy_timings(
         copy_ms: stats.copy_ms,
         source_bytes: stats.source_bytes,
         target_bytes: stats.target_bytes,
+        stage_strategy: Some(stats.stage_strategy.to_owned()),
+        fallback_reason: stats.fallback_reason.map(str::to_owned),
+        native_error_code: stats.native_error_code,
+        cloned_bytes: stats.cloned_bytes,
+        copied_bytes: stats.copied_bytes,
     }
 }
 

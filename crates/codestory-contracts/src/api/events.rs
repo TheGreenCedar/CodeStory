@@ -70,6 +70,16 @@ pub struct DatabaseSnapshotCopyTimings {
     pub copy_ms: u32,
     pub source_bytes: u64,
     pub target_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_error_code: Option<i32>,
+    #[serde(default)]
+    pub cloned_bytes: u64,
+    #[serde(default)]
+    pub copied_bytes: u64,
 }
 
 /// How a promotion proved the published core matched the candidate it validated.
@@ -949,6 +959,7 @@ mod tests {
             copy_ms: 13,
             source_bytes: 1_024,
             target_bytes: 1_024,
+            ..DatabaseSnapshotCopyTimings::default()
         };
         let core_promotion = CorePromotionTimings {
             total_ms: 89,
