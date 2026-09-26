@@ -878,6 +878,28 @@ pub struct GenerationRetentionApplyReport {
     pub errors: Vec<String>,
 }
 
+impl GenerationRetentionApplyReport {
+    /// The publication is committed, but cleanup never reached a remover.
+    pub(crate) fn cleanup_deferred(plan: &GenerationRetentionPlan, error: String) -> Self {
+        let mut errors = plan.errors.clone();
+        errors.push(error);
+        Self {
+            dry_run: false,
+            project_id: plan.project_id.clone(),
+            pruning_suppressed: true,
+            active_bytes: plan.active_bytes,
+            rollback_bytes: plan.rollback_bytes,
+            building_bytes: plan.building_bytes,
+            retained_bytes: plan.retained_bytes,
+            reclaimable_bytes: plan.reclaimable_bytes,
+            removed_bytes: 0,
+            remaining_reclaimable_bytes: plan.reclaimable_bytes,
+            removals: Vec::new(),
+            errors,
+        }
+    }
+}
+
 pub fn apply_generation_retention(
     plan: &GenerationRetentionPlan,
     remover: &mut dyn GenerationRemover,
