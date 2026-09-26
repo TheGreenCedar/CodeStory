@@ -1631,7 +1631,6 @@ fn open_project_summary_preserves_search_state_for_the_same_complete_publication
 }
 
 #[test]
-#[ignore = "staged core promotion requires rebound proof-resolution identity"]
 fn activation_search_preparation_preserves_resident_state_for_retrieval_only_replacement() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");
