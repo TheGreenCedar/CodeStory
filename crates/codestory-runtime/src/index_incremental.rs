@@ -1474,13 +1474,12 @@ fn run_incremental_indexing_common(
     let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
-    if let Some(receipt) = retrieval_refresh_receipt {
-        if let Err(error) =
+    if let Some(receipt) = retrieval_refresh_receipt
+        && let Err(error) =
             codestory_retrieval::install_incremental_retrieval_refresh_receipt(receipt)
-        {
-            codestory_retrieval::clear_incremental_retrieval_refresh_receipt(storage_path);
-            tracing::warn!(%error, "Discarded optional incremental retrieval refresh evidence after core commit");
-        }
+    {
+        codestory_retrieval::clear_incremental_retrieval_refresh_receipt(storage_path);
+        tracing::warn!(%error, "Discarded optional incremental retrieval refresh evidence after core commit");
     }
     let commit_wall = commit_started.elapsed();
     let mut phase_timings = core_indexing_phase_timings(
