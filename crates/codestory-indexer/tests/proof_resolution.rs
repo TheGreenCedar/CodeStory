@@ -583,6 +583,819 @@ fn go_closed_exact_subset_authorizes_package_functions_and_concrete_receivers() 
     Ok(())
 }
 
+fn assert_nominal_exact_target(
+    store: &Store,
+    root: &std::path::Path,
+    fact: &codestory_contracts::proof_resolution::CallResolutionFact,
+    target_path: &str,
+    declaration_line: u32,
+    owner_line: Option<u32>,
+) -> anyhow::Result<()> {
+    let nodes = store.get_nodes()?;
+    let file = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == root.join(target_path).display().to_string()
+        })
+        .expect("expected declaration file must exist independently of the fact");
+    let targets = nodes
+        .iter()
+        .filter(|node| {
+            node.file_node_id == Some(file.id)
+                && node.start_line == Some(declaration_line)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        1,
+        "independent target census for {target_path}:{declaration_line}: {targets:#?}"
+    );
+    let target = targets[0];
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(
+        fact.target,
+        Some(target.id),
+        "proof must select the declared nominal target, not another extant same-name node"
+    );
+    let edges = store.get_edges()?;
+    if let Some(owner_line) = owner_line {
+        let owners = nodes
+            .iter()
+            .filter(|node| {
+                node.file_node_id == Some(file.id)
+                    && node.start_line == Some(owner_line)
+                    && matches!(node.kind, NodeKind::CLASS | NodeKind::STRUCT)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners.len(),
+            1,
+            "independent owner census for {target_path}:{owner_line}"
+        );
+        let members = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::MEMBER
+                    && edge.effective_source() == owners[0].id
+                    && edge.effective_target() == target.id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members.len(),
+            1,
+            "expected owner must actually contain the nominal target"
+        );
+    }
+    let edge = edges
+        .iter()
+        .find(|edge| Some(edge.id) == fact.edge_id)
+        .expect("fact must correlate with a persisted ordinary CALL");
+    assert_eq!(edge.kind, EdgeKind::CALL);
+    assert_eq!(edge.certainty, Some(ResolutionCertainty::Certain));
+    assert_eq!(
+        edge.file_node_id.map(|id| FileId(id.0)),
+        Some(fact.callsite.file_id)
+    );
+    assert_eq!(edge.line, Some(fact.callsite.line));
+    assert_eq!(
+        edge.effective_target(),
+        target.id,
+        "projected CALL endpoint must match the independent declaration"
+    );
+    assert_eq!(edge.effective_source(), fact.caller);
+    assert_eq!(
+        fact.raw_edge_target,
+        Some(edge.target),
+        "raw CALL endpoint must remain separately authenticated"
+    );
+    assert_eq!(fact.raw_callsite_identity, edge.callsite_identity);
+    let identity = fact
+        .raw_callsite_identity
+        .as_deref()
+        .and_then(parse_canonical_callsite_identity)
+        .expect("raw CALL must carry a valid canonical identity");
+    assert_eq!(identity.file_id, fact.callsite.file_id);
+    assert_eq!(identity.line, fact.callsite.line);
+    assert_eq!(Some(identity.raw_target), fact.raw_edge_target);
+    Ok(())
+}
+
+fn assert_nominal_call_is_nonexact(
+    files: &[(&str, &str)],
+    language: &str,
+    caller_path: &str,
+    call_line: u32,
+) -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact_with_status(
+        files,
+        language,
+        caller_path,
+        call_line,
+        ProofResolutionStatus::Unsupported,
+    )
+}
+
+fn assert_nominal_call_is_nonexact_with_status(
+    files: &[(&str, &str)],
+    language: &str,
+    caller_path: &str,
+    call_line: u32,
+    expected_status: ProofResolutionStatus,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    let file = store
+        .get_nodes()?
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == project.path().join(caller_path).display().to_string()
+        })
+        .expect("independently identify actual caller file");
+    let caller = store
+        .get_nodes()?
+        .into_iter()
+        .find(|node| {
+            node.file_node_id == Some(file.id)
+                && node.start_line == Some(call_line - 1)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .expect("independently identify actual caller declaration");
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(file.id)
+                && edge.effective_source() == caller.id
+                && edge.line == Some(call_line)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "fixture requires one actual ordinary CALL at the intended line: {calls:#?}"
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language
+                && fact.callsite.file_id.0 == file.id.0
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.len(),
+        1,
+        "must collect the intended typed call, not pass with an empty census"
+    );
+    let fact = &facts[0];
+    eprintln!(
+        "{language} {caller_path}:{call_line} pre-proof CALL={:?}, fact={fact:#?}",
+        calls[0]
+    );
+    assert_eq!(
+        fact.status, expected_status,
+        "source virtual/class refusal must not depend on declaration file boundaries"
+    );
+    assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
+    assert_eq!(
+        store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == calls[0].id),
+        Some(calls[0].clone()),
+        "nonexact proof must not upgrade the ordinary nominal CALL; pre-existing graph resolution is a separate contract"
+    );
+    Ok(())
+}
+
+fn assert_nominal_call_is_exact(
+    files: &[(&str, &str)],
+    language: &str,
+    target_path: &str,
+    declaration_line: u32,
+    owner_line: u32,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let matching = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "positive must exercise one actual target call"
+    );
+    assert_nominal_exact_target(
+        &store,
+        project.path(),
+        &matching[0],
+        target_path,
+        declaration_line,
+        Some(owner_line),
+    )
+}
+
+#[test]
+fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> {
+    assert_nominal_call_is_exact(
+        &[(
+            "Worker.java",
+            "final class Worker {\n  void target() {}\n}\nclass Caller { void caller(Worker value) { value.target(); } }\n",
+        )],
+        "java",
+        "Worker.java",
+        2,
+        1,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[(
+            "Caller.java",
+            "class Worker { void target() {} }\nclass Child extends Worker { void target() {} }\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+        )],
+        "java",
+        "Caller.java",
+        5,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "Worker.java",
+                "class Worker {\n  void target() {}\n}\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "Child.java",
+                "class Child extends Worker { void target() {} }\n",
+            ),
+        ],
+        "java",
+        "Worker.java",
+        6,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "Worker.java",
+                "class Worker {\n  static void target() {}\n}\nclass Caller { void caller() { Worker.target(); } }\n",
+            ),
+            (
+                "Child.java",
+                "class Child extends Worker { static void target() {} }\n",
+            ),
+        ],
+        "java",
+        "Worker.java",
+        2,
+        1,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  void target() {}\n}\nclass Caller { void caller(Worker value) { value.target(); } }\n",
+            ),
+            (
+                "q/Worker.java",
+                "package q;\nclass Worker { void target() {} }\nclass Child extends Worker { void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Worker.java",
+        3,
+        2,
+    )?;
+    for split in [false, true] {
+        let files = if split {
+            vec![
+                (
+                    "p/Worker.java",
+                    "package p;\nclass Worker { void target() {} }\n",
+                ),
+                (
+                    "p/Child.java",
+                    "package p;\nclass Child extends Worker { void target() {} }\n",
+                ),
+                (
+                    "p/Closed.java",
+                    "package p;\nfinal class Closed {\n  void target() {}\n}\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller { void caller(Closed value) { value.target(); } }\n",
+                ),
+            ]
+        } else {
+            vec![(
+                "p/Closed.java",
+                concat!(
+                    "package p;\nfinal class Closed {\n  void target() {}\n}\n",
+                    "class Worker { void target() {} }\nclass Child extends Worker { void target() {} }\n",
+                    "class Caller { void caller(Closed value) { value.target(); } }\n",
+                ),
+            )]
+        };
+        assert_nominal_call_is_exact(&files, "java", "p/Closed.java", 3, 2)?;
+        let files = if split {
+            vec![
+                (
+                    "p/Worker.java",
+                    "package p;\nclass Worker {\n  static void target() {}\n}\n",
+                ),
+                (
+                    "p/Child.java",
+                    "package p;\nclass Child extends Worker { static void target() {} }\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller { void caller() { Worker.target(); } }\n",
+                ),
+            ]
+        } else {
+            vec![(
+                "p/Worker.java",
+                concat!(
+                    "package p;\nclass Worker {\n  static void target() {}\n}\n",
+                    "class Child extends Worker { static void target() {} }\n",
+                    "class Caller { void caller() { Worker.target(); } }\n",
+                ),
+            )]
+        };
+        assert_nominal_call_is_exact(&files, "java", "p/Worker.java", 3, 2)?;
+    }
+    for files in [
+        vec![
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker { void target() {} }\n",
+            ),
+            (
+                "p/Middle.java",
+                "package p;\nclass Middle extends Worker {}\n",
+            ),
+            (
+                "p/Child.java",
+                "package p;\nclass Child extends Middle { void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+        vec![
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker<T> { void target() {} }\n",
+            ),
+            (
+                "p/Child.java",
+                "package p;\nclass Child extends Worker<String> { void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+    ] {
+        for reverse in [false, true] {
+            let mut files = files.clone();
+            if reverse {
+                files.reverse();
+            }
+            assert_nominal_call_is_nonexact(&files, "java", "p/Caller.java", 4)?;
+        }
+    }
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\npublic class Worker { public void target() {} }\n",
+            ),
+            (
+                "q/Child.java",
+                "package q;\nimport p.Worker;\nclass Child extends Worker { public void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+        "java",
+        "p/Caller.java",
+        4,
+    )
+}
+
+#[test]
+fn f4_verifier_relative_nested_java_ancestor() -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact(
+        &[(
+            "p/Outer.java",
+            concat!(
+                "package p;\n",
+                "class Outer {\n",
+                "  static class Worker {\n",
+                "    public void target() {}\n",
+                "  }\n",
+                "  static class Caller {\n",
+                "    void caller(Worker value) {\n",
+                "      value.target();\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+                "class Child extends Outer.Worker {\n",
+                "  public void target() {}\n",
+                "}\n",
+            ),
+        )],
+        "java",
+        "p/Outer.java",
+        8,
+    )
+}
+
+#[test]
+fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Result<()> {
+    // Nested Exact authority remains unsupported, even without an override.
+    // Each geometry still requires the actual canonical CALL and matching fact.
+    for parent in [
+        "",
+        "class Child extends Outer.Worker { public void target() {} }",
+        "class Child extends p.Outer.Worker { public void target() {} }",
+    ] {
+        let outer = format!(
+            "package p;\nclass Outer {{\n  static class Worker {{\n    public void target() {{}}\n  }}\n  static class Caller {{\n    void caller(Worker value) {{\n      value.target();\n    }}\n  }}\n}}\n{parent}\n"
+        );
+        assert_nominal_call_is_nonexact(&[("p/Outer.java", &outer)], "java", "p/Outer.java", 8)?;
+    }
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Outer.java",
+                "package p;\nclass Outer {\n  static class Worker { public void target() {} }\n  static class Caller {\n    void caller(Worker value) {\n      value.target();\n    }\n  }\n}\n",
+            ),
+            (
+                "p/Child.java",
+                "package p;\nclass Child extends Outer.Worker { public void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Outer.java",
+        6,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[(
+            "Outer.java",
+            "class Outer {\n  static class Worker { public void target() {} }\n  static class Child extends Worker { public void target() {} }\n  static class Caller {\n    void caller(Worker value) {\n      value.target();\n    }\n  }\n}\n",
+        )],
+        "java",
+        "Outer.java",
+        6,
+    )?;
+
+    // A nested Worker must not be inventoried as the unrelated p.Worker.
+    // Its lexically bare parent binds Outer.Worker, not the top-level name.
+    for ancestor in ["Worker", "Outer.Worker", "p.Outer.Worker", "Worker<String>"] {
+        let nested = if ancestor == "Worker<String>" {
+            format!(
+                "package p;\nclass Outer {{\n  static class Worker<T> {{ public void target() {{}} }}\n  static class Child extends {ancestor} {{ public void target() {{}} }}\n}}\n"
+            )
+        } else {
+            format!(
+                "package p;\nclass Outer {{\n  static class Worker {{ public void target() {{}} }}\n  static class Child extends {ancestor} {{ public void target() {{}} }}\n}}\n"
+            )
+        };
+        let files = [
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            ("p/Outer.java", &nested),
+        ];
+        if ancestor == "Outer.Worker" {
+            // The relative CLASS use anchor creates two replay package spellings.
+            // Publish an explicit nonexact result instead of an invalid receipt.
+            assert_nominal_call_is_nonexact_with_status(
+                &files,
+                "java",
+                "p/Caller.java",
+                4,
+                ProofResolutionStatus::IncompleteDomain,
+            )?;
+        } else {
+            assert_nominal_call_is_exact(&files, "java", "p/Worker.java", 3, 2)?;
+        }
+    }
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "p/Outer.java",
+                "package p;\npublic class Outer { public static class Worker { public void target() {} } }\n",
+            ),
+            (
+                "q/Child.java",
+                "package q;\nimport p.Outer;\nclass Child extends Outer.Worker { public void target() {} }\n",
+            ),
+        ],
+        "java",
+        "p/Worker.java",
+        3,
+        2,
+    )?;
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "q/Worker.java",
+                "package q;\nclass Worker {\n  public void target() {}\n}\n",
+            ),
+            (
+                "q/Caller.java",
+                "package q;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+            (
+                "p/Outer.java",
+                "package p;\nclass Outer {\n  static class Worker { public void target() {} }\n  static class Child extends Outer.Worker { public void target() {} }\n}\n",
+            ),
+        ],
+        "java",
+        "q/Worker.java",
+        3,
+        2,
+    )?;
+    // A nested subclass of a genuine top-level ancestor still poisons that
+    // ancestor's instance route; imported and fully qualified forms agree.
+    for (path, source) in [
+        (
+            "p/Outer.java",
+            "package p;\nclass Outer { static class Child extends p.Worker { public void target() {} } }\n",
+        ),
+        (
+            "q/Outer.java",
+            "package q;\nimport p.Worker;\nclass Outer { static class Child extends Worker { public void target() {} } }\n",
+        ),
+        (
+            "q/Outer.java",
+            "package q;\nimport p.Worker;\nclass Outer { static class Child extends Worker<String> { public void target() {} } }\n",
+        ),
+    ] {
+        let worker = if source.contains("Worker<String>") {
+            "package p;\npublic class Worker<T> { public void target() {} }\n"
+        } else {
+            "package p;\npublic class Worker { public void target() {} }\n"
+        };
+        assert_nominal_call_is_nonexact(
+            &[
+                ("p/Worker.java", worker),
+                (path, source),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+                ),
+            ],
+            "java",
+            "p/Caller.java",
+            4,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn java_static_refusal_classification_uses_modifier_tokens() -> anyhow::Result<()> {
+    for split in [false, true] {
+        let files = if split {
+            vec![
+                (
+                    "p/Worker.java",
+                    "package p;\nclass Worker { public void target() {} }\n",
+                ),
+                (
+                    "p/Child.java",
+                    "package p;\nclass Child extends Worker { public /* static */ void target() {} }\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+                ),
+            ]
+        } else {
+            vec![(
+                "p/Caller.java",
+                "package p;\nclass Worker { public void target() {} }\nclass Child extends Worker { public /* static */ void target() {} }\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            )]
+        };
+        assert_nominal_call_is_nonexact(
+            &files,
+            "java",
+            "p/Caller.java",
+            if split { 4 } else { 6 },
+        )?;
+    }
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\npublic class Worker { public void target() {} }\n",
+            ),
+            (
+                "q/Child.java",
+                "package q;\nimport p.Worker;\n@interface Note { String value(); }\nclass Child extends Worker { @Note(\" static \") public void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+        "java",
+        "p/Caller.java",
+        4,
+    )
+}
+
+#[test]
+fn swift_class_refusal_retains_struct_positive() -> anyhow::Result<()> {
+    for modifier in ["", "public ", "open ", "final "] {
+        let source = format!(
+            "{modifier}class Worker {{\n  func target() {{}}\n}}\nfunc caller(_ value: Worker) {{\n  value.target()\n}}\n"
+        );
+        assert_nominal_call_is_nonexact(
+            &[("Sources/App/Worker.swift", &source)],
+            "swift",
+            "Sources/App/Worker.swift",
+            5,
+        )?;
+    }
+    assert_nominal_call_is_exact(
+        &[(
+            "Sources/App/Worker.swift",
+            "struct Worker {\n  func target() {}\n}\nfunc caller(_ value: Worker) {\n  value.target()\n}\n",
+        )],
+        "swift",
+        "Sources/App/Worker.swift",
+        2,
+        1,
+    )
+}
+
+#[test]
+fn java_virtual_refusal_does_not_depend_on_file_boundaries() -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact(
+        &[(
+            "p/Caller.java",
+            concat!(
+                "package p;\nclass Worker { void target() {} }\n",
+                "class Child extends Worker { void target() {} }\n",
+                "class Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        )],
+        "java",
+        "p/Caller.java",
+        6,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/Worker.java",
+                "package p;\nclass Worker { void target() {} }\n",
+            ),
+            (
+                "p/Child.java",
+                "package p;\nclass Child extends Worker { void target() {} }\n",
+            ),
+            (
+                "p/Caller.java",
+                "package p;\nclass Caller {\n  void caller(Worker value) {\n    value.target();\n  }\n}\n",
+            ),
+        ],
+        "java",
+        "p/Caller.java",
+        4,
+    )
+}
+
+#[test]
+fn kotlin_virtual_refusal_does_not_depend_on_file_boundaries() -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact(
+        &[(
+            "p/caller.kt",
+            concat!(
+                "package p\nopen class Worker {\n  open fun target() {}\n}\n",
+                "class Child: Worker() {\n  override fun target() {}\n}\n",
+                "fun caller(value: Worker) {\n  value.target()\n}\n",
+            ),
+        )],
+        "kotlin",
+        "p/caller.kt",
+        9,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/worker.kt",
+                "package p\nopen class Worker {\n  open fun target() {}\n}\n",
+            ),
+            (
+                "p/child.kt",
+                "package p\nclass Child: Worker() {\n  override fun target() {}\n}\n",
+            ),
+            (
+                "p/caller.kt",
+                "package p\nfun caller(value: Worker) {\n  value.target()\n}\n",
+            ),
+        ],
+        "kotlin",
+        "p/caller.kt",
+        3,
+    )
+}
+
+#[test]
+fn kotlin_imported_virtual_refusal_has_reachable_final_control() -> anyhow::Result<()> {
+    assert_nominal_call_is_exact(
+        &[
+            (
+                "p/worker.kt",
+                "package p\nclass Worker {\n  fun target() {}\n}\n",
+            ),
+            (
+                "p/caller.kt",
+                "package p\nimport p.Worker\nfun caller(value: Worker) {\n  value.target()\n}\n",
+            ),
+        ],
+        "kotlin",
+        "p/worker.kt",
+        3,
+        2,
+    )?;
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "p/worker.kt",
+                "package p\nopen class Worker {\n  open fun target() {}\n}\n",
+            ),
+            (
+                "p/child.kt",
+                "package p\nclass Child: Worker() {\n  override fun target() {}\n}\n",
+            ),
+            (
+                "p/caller.kt",
+                "package p\nimport p.Worker\nfun caller(value: Worker) {\n  value.target()\n}\n",
+            ),
+        ],
+        "kotlin",
+        "p/caller.kt",
+        4,
+    )
+}
+
+#[test]
+fn swift_open_class_refusal_covers_modified_headers() -> anyhow::Result<()> {
+    assert_nominal_call_is_nonexact(
+        &[
+            (
+                "Sources/WorkerModule/Worker.swift",
+                concat!(
+                    "open class Worker {\n  public init() {}\n  open func target() {}\n}\n",
+                    "public func caller(_ value: Worker) {\n  value.target()\n}\n",
+                ),
+            ),
+            (
+                "Sources/App/Child.swift",
+                "import WorkerModule\npublic class Child: Worker {\n  public override func target() {}\n}\n",
+            ),
+        ],
+        "swift",
+        "Sources/WorkerModule/Worker.swift",
+        6,
+    )
+}
+
 #[test]
 fn java_and_kotlin_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow::Result<()> {
     for (language, files, targets) in [
@@ -680,6 +1493,19 @@ fn java_and_kotlin_closed_exact_subset_emits_authenticated_exact_facts() -> anyh
                     && fact.provenance.evidence_sha256.len() == 64
                     && !fact.provenance.dependency_file_hashes.is_empty()
             }));
+            let (path, line, owner) = match (language, target) {
+                ("java", "sameFileTarget") => ("example/JavaExact.java", 4, Some(3)),
+                ("java", "packageTarget") => ("example/JavaExact.java", 5, Some(3)),
+                ("java", "importedTarget") => ("example/Imported.java", 1, Some(1)),
+                ("java", "memberTarget") => ("example/JavaExact.java", 6, Some(3)),
+                ("kotlin", "sameFileTarget") => ("example/KotlinExact.kt", 3, None),
+                ("kotlin", "importedTarget") => ("example/imported.kt", 3, Some(2)),
+                ("kotlin", "memberTarget") => ("example/KotlinExact.kt", 5, Some(4)),
+                _ => unreachable!(),
+            };
+            for fact in exact {
+                assert_nominal_exact_target(&store, project.path(), fact, path, line, owner)?;
+            }
         }
     }
     Ok(())
@@ -1066,6 +1892,24 @@ fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -
                     && fact.provenance.evidence_sha256.len() == 64
                     && !fact.provenance.dependency_file_hashes.is_empty()
             }));
+            let (path, line, owner) = match (name, target) {
+                ("csharp_same_file", "SameFileTarget") => ("src/Exact.cs", 11, Some(10)),
+                ("csharp_same_file", "Target") => ("src/Exact.cs", 3, Some(2)),
+                ("csharp_using_alias", "Target") => ("src/Lib/Worker.cs", 1, Some(1)),
+                ("swift_same_file", "sameFileTarget") => ("Sources/App/Exact.swift", 1, None),
+                ("swift_same_file", "target") => ("Sources/App/Exact.swift", 4, Some(3)),
+                ("swift_project_module", "target") => {
+                    ("Sources/WorkerModule/Worker.swift", 1, Some(1))
+                }
+                ("dart_same_library", "sameFileTarget") => ("lib/exact.dart", 1, None),
+                ("dart_same_library", "target") => ("lib/exact.dart", 4, Some(3)),
+                ("dart_exact_imports", "importedTarget") => ("lib/worker.dart", 1, None),
+                ("dart_exact_imports", "target") => ("lib/worker.dart", 2, Some(2)),
+                _ => unreachable!("{name} {target}"),
+            };
+            for fact in exact {
+                assert_nominal_exact_target(&store, project.path(), fact, path, line, owner)?;
+            }
         }
     }
     Ok(())
@@ -1559,7 +2403,7 @@ fn csharp_swift_and_dart_canonical_fixture_layouts_replay_exactly() -> anyhow::R
         (
             "csharp",
             "src/AutoMapper/Mapper.cs",
-            "namespace AutoMapper; public static class Mapper { public static void Map() {} public static void Caller() { Map(); } }\n",
+            "namespace AutoMapper; public static class Mapper {\n  public static void Map() {}\n  public static void Caller() { Map(); }\n}\n",
             "Map",
         ),
         (
@@ -1582,14 +2426,23 @@ fn csharp_swift_and_dart_canonical_fixture_layouts_replay_exactly() -> anyhow::R
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         store.validate_proof_resolution_publication(&publication(1))?;
         let facts = store.get_proof_resolution_facts()?;
-        assert!(
-            facts.iter().any(|fact| {
-                fact.provenance.language_adapter == language
-                    && fact.callsite.raw_target == target
-                    && fact.status == ProofResolutionStatus::Exact
-            }),
-            "{language} canonical fixture layout was not replay-exact: {facts:#?}"
+        let matching = facts
+            .iter()
+            .filter(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{language}: canonical actual CALL census"
         );
+        let (line, owner) = if language == "csharp" {
+            (2, Some(1))
+        } else {
+            (1, None)
+        };
+        assert_nominal_exact_target(&store, project.path(), matching[0], path, line, owner)?;
     }
     Ok(())
 }
@@ -1634,11 +2487,26 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
         index_files(project.path(), &mut store, &files)?;
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         let facts = store.get_proof_resolution_facts()?;
-        let exact = facts.iter().any(|fact| {
-            fact.provenance.language_adapter == "dart"
-                && fact.callsite.raw_target == "target"
-                && fact.status == ProofResolutionStatus::Exact
-        });
+        let matching = facts
+            .iter()
+            .filter(|fact| {
+                fact.provenance.language_adapter == "dart" && fact.callsite.raw_target == "target"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{name}: nonempty actual target call census"
+        );
+        let exact = matching[0].status == ProofResolutionStatus::Exact;
+        if should_be_exact {
+            let path = if name == "direct_exact_construction" {
+                "lib/caller.dart"
+            } else {
+                "lib/worker.dart"
+            };
+            assert_nominal_exact_target(&store, project.path(), matching[0], path, 1, Some(1))?;
+        }
         assert_eq!(exact, should_be_exact, "{name}: {facts:#?}");
     }
 
@@ -1646,14 +2514,9 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
         (
             "closed_without_override",
             vec![
-                ("lib/a.dart", "final class A { void target() {} }\n"),
                 (
-                    "lib/b.dart",
-                    "import 'a.dart';\nfinal class B extends A {}\n",
-                ),
-                (
-                    "lib/c.dart",
-                    "import 'b.dart';\nfinal class C extends B {}\n",
+                    "lib/a.dart",
+                    "final class A { void target() {} }\nfinal class B extends A {}\nfinal class C extends B {}\n",
                 ),
                 (
                     "lib/caller.dart",
@@ -1665,14 +2528,9 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
         (
             "transitive_override",
             vec![
-                ("lib/a.dart", "final class A { void target() {} }\n"),
                 (
-                    "lib/b.dart",
-                    "import 'a.dart';\nfinal class B extends A {}\n",
-                ),
-                (
-                    "lib/c.dart",
-                    "import 'b.dart';\nfinal class C extends B { @override void target() {} }\n",
+                    "lib/a.dart",
+                    "final class A { void target() {} }\nfinal class B extends A {}\nfinal class C extends B { @override void target() {} }\n",
                 ),
                 (
                     "lib/caller.dart",
@@ -1735,11 +2593,29 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
             rematerialize_proof_resolution_projection(&mut store, &publication(1))
                 .map_err(|error| anyhow::anyhow!("{name} reordered={reordered}: {error}"))?;
             let facts = store.get_proof_resolution_facts()?;
-            let exact = facts.iter().any(|fact| {
-                fact.provenance.language_adapter == "dart"
-                    && fact.callsite.raw_target == "target"
-                    && fact.status == ProofResolutionStatus::Exact
-            });
+            let matching = facts
+                .iter()
+                .filter(|fact| {
+                    fact.provenance.language_adapter == "dart"
+                        && fact.callsite.raw_target == "target"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{name} reordered={reordered}: nonempty actual target call census"
+            );
+            let exact = matching[0].status == ProofResolutionStatus::Exact;
+            if should_be_exact {
+                assert_nominal_exact_target(
+                    &store,
+                    project.path(),
+                    matching[0],
+                    "lib/a.dart",
+                    1,
+                    Some(1),
+                )?;
+            }
             assert_eq!(
                 exact, should_be_exact,
                 "{name} reordered={reordered} violated ancestry closure: {facts:#?}"
@@ -1789,14 +2665,20 @@ fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::R
         index_files(project.path(), &mut store, &files)?;
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         let facts = store.get_proof_resolution_facts()?;
-        assert!(
-            facts
-                .iter()
-                .filter(|fact| {
-                    fact.provenance.language_adapter == language
-                        && fact.callsite.raw_target == target
-                })
-                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+        let matching = facts
+            .iter()
+            .filter(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{name}: intended negative call fact must exist"
+        );
+        assert_ne!(
+            matching[0].status,
+            ProofResolutionStatus::Exact,
             "{name} bypassed import/access visibility: {facts:#?}"
         );
     }
@@ -1836,12 +2718,21 @@ fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::R
             )?;
             rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
             let facts = store.get_proof_resolution_facts()?;
-            assert!(
-                facts.iter().all(|fact| {
-                    fact.provenance.language_adapter != "swift"
-                        || fact.callsite.raw_target != target
-                        || fact.status != ProofResolutionStatus::Exact
-                }),
+            let matching = facts
+                .iter()
+                .filter(|fact| {
+                    fact.provenance.language_adapter == "swift"
+                        && fact.callsite.raw_target == target
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "Swift {visibility}/{surface}: intended negative fact must exist"
+            );
+            assert_ne!(
+                matching[0].status,
+                ProofResolutionStatus::Exact,
                 "Swift {visibility} comment forged {surface} visibility: {facts:#?}"
             );
         }
@@ -11863,6 +12754,136 @@ fn rust_glob_local_calls_preserve_repeated_source_coordinates_and_provenance() -
     let second = rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
     assert_eq!(first.fact_count, second.fact_count);
     assert_eq!(first.fact_digest, second.fact_digest);
+    Ok(())
+}
+
+#[test]
+fn stale_jvm_swift_owner_policy_inputs_refuse_then_reparse_and_reuse() -> anyhow::Result<()> {
+    for (language, path, source, line, owner_line) in [
+        (
+            "java",
+            "p/Worker.java",
+            "package p;\nclass Worker {\n  void target() {}\n}\nclass Caller { void caller(Worker value) { value.target(); } }\n",
+            3,
+            2,
+        ),
+        (
+            "kotlin",
+            "p/worker.kt",
+            "package p\nclass Worker {\n  fun target() {}\n}\nfun caller(value: Worker) { value.target() }\n",
+            3,
+            2,
+        ),
+        (
+            "swift",
+            "Sources/App/Worker.swift",
+            "struct Worker {\n  func target() {}\n}\nfunc caller(_ value: Worker) { value.target() }\n",
+            2,
+            1,
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let paths = index_files(project.path(), &mut store, &[(path, source)])?;
+        let source_before = fs::read(&paths[0])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let before = store.get_proof_resolution_facts()?;
+        let matching = before
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "initial actual CALL census for {language}"
+        );
+        assert_nominal_exact_target(
+            &store,
+            project.path(),
+            matching[0],
+            path,
+            line,
+            Some(owner_line),
+        )?;
+        let blob = store.get_connection().query_row(
+            "SELECT artifact_blob FROM index_artifact_cache",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        // This is a simulated stale identity on a current parser payload, not a
+        // claim that an old binary produced the payload.
+        let previous = if language == "java" {
+            "reference-v3"
+        } else {
+            "reference-v2"
+        };
+        artifact["resolution_file"]["adapter_version"] = previous.into();
+        for call in artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls")
+        {
+            call["adapter_version"] = previous.into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1",
+            [serde_json::to_vec(&artifact)?],
+        )?;
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("old owner policy must not authenticate a current proof");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{language}: {error}"
+        );
+        assert_eq!(
+            store.get_proof_resolution_facts()?,
+            before,
+            "rejected stale replay preserves prior proof"
+        );
+        for (generation, expected_hits) in [(2, 0), (3, 1)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "{language} generation={generation}"
+            );
+            assert_eq!(fs::read(&paths[0])?, source_before);
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            let facts = store.get_proof_resolution_facts()?;
+            let matching = facts
+                .iter()
+                .filter(|fact| fact.callsite.raw_target == "target")
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "reparse/reuse actual CALL census");
+            assert_nominal_exact_target(
+                &store,
+                project.path(),
+                matching[0],
+                path,
+                line,
+                Some(owner_line),
+            )?;
+            assert_eq!(
+                matching[0].provenance.language_adapter_version,
+                if language == "java" {
+                    "reference-v4"
+                } else {
+                    "reference-v3"
+                }
+            );
+        }
+    }
     Ok(())
 }
 

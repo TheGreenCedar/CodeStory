@@ -2,9 +2,10 @@ use crate::cache::{
     CachedCCppFile, CachedCCppNamespace, CachedCCppSourceRole, CachedCallResolutionInput,
     CachedClassBinding, CachedClassDeclaration, CachedClassMethod, CachedDeclarationKind,
     CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
-    CachedInherentMethod, CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
-    CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
-    CachedTopLevelDeclaration, decode_index_artifact, decoded_index_artifact_len,
+    CachedInherentMethod, CachedJavaClassScope, CachedPhpNamespace, CachedResolutionBinding,
+    CachedResolutionFile, CachedRustFileModule, CachedRustModule, CachedRustType,
+    CachedRustUseBinding, CachedTopLevelDeclaration, decode_index_artifact,
+    decoded_index_artifact_len,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -249,14 +250,14 @@ const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
-const JAVA_ADAPTER_VERSION: &str = "reference-v2";
-const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
+const JAVA_ADAPTER_VERSION: &str = "reference-v4";
+const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
 const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v5";
 const RUBY_ADAPTER_VERSION: &str = "reference-v4";
 const PHP_ADAPTER_VERSION: &str = "reference-v3";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
-const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
+const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
 const BASH_ADAPTER_VERSION: &str = "reference-v1";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
@@ -1440,6 +1441,8 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
+                    java_scope: None,
                 });
                 self.index.direct_exports.push(CachedDirectExport {
                     exported_name: name.clone(),
@@ -2176,6 +2179,8 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
+                    java_scope: None,
                 });
                 self.class_indices
                     .entry(name.clone())
@@ -3630,6 +3635,8 @@ impl<'index, 'tree> CCppProducer<'index, 'tree> {
             cross_module_visible: false,
             runtime_closed: false,
             super_name: None,
+            instance_method_names: Vec::new(),
+            java_scope: None,
         });
         self.index
             .class_namespace_paths
@@ -4533,8 +4540,126 @@ struct JavaKotlinWalkContext {
     callable_id: Option<usize>,
     caller: Option<NodeId>,
     owner_index: Option<usize>,
-    owner_virtual: bool,
     unsupported: bool,
+}
+
+#[derive(Default)]
+struct JavaOverridePolicy {
+    overridden_methods: HashSet<(NodeId, String)>,
+    unsupported_owners: HashSet<NodeId>,
+}
+
+impl JavaOverridePolicy {
+    fn prepare<'a>(classes: impl Iterator<Item = (&'a str, &'a CachedClassDeclaration)>) -> Self {
+        let mut classes_by_name = HashMap::<String, Vec<&CachedClassDeclaration>>::new();
+        let mut unsupported_owners = HashSet::new();
+        for (package, class) in classes {
+            let Some(scope) = &class.java_scope else {
+                unsupported_owners.insert(class.declaration);
+                continue;
+            };
+            // Nested receiver/type owner lookup is outside the source Exact domain.
+            // Direct authenticated Identifier/SameFile calls retain their route. Keep its
+            // syntax identity for ancestor refusal without granting authority.
+            if scope.type_path.len() > 1 {
+                unsupported_owners.insert(class.declaration);
+            }
+            classes_by_name
+                .entry(format!("{package}.{}", scope.type_path.join(".")))
+                .or_default()
+                .push(class);
+        }
+        let parents = |class: &CachedClassDeclaration| {
+            class.java_scope.as_ref().map_or_else(Vec::new, |scope| {
+                scope
+                    .superclass_candidates
+                    .iter()
+                    .find_map(|group| {
+                        let matches = group
+                            .iter()
+                            .filter_map(|name| classes_by_name.get(name))
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        (!matches.is_empty()).then_some(matches)
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        let mut overridden_methods = HashSet::new();
+        for class in classes_by_name.values().flatten() {
+            let mut pending = parents(class);
+            let mut visited = HashSet::new();
+            while let Some(parent) = pending.pop() {
+                if !visited.insert(parent.declaration) {
+                    continue;
+                }
+                // Ambiguous nearest identities all remain refusal candidates;
+                // no HashMap or import iteration order selects positive authority.
+                for method in &class.instance_method_names {
+                    overridden_methods.insert((parent.declaration, method.clone()));
+                }
+                pending.extend(parents(parent));
+            }
+        }
+        Self {
+            overridden_methods,
+            unsupported_owners,
+        }
+    }
+
+    fn refuses(&self, owner: NodeId, method: &str) -> bool {
+        self.unsupported_owners.contains(&owner)
+            || self
+                .overridden_methods
+                .contains(&(owner, method.to_string()))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn java_override_policy_retains_ambiguous_ancestor_identities() {
+    let class =
+        |id, name: &str, parents: Vec<Vec<String>>, methods: Vec<String>| CachedClassDeclaration {
+            name: name.to_string(),
+            declaration: NodeId(id),
+            methods: Vec::new(),
+            cross_module_visible: false,
+            runtime_closed: false,
+            super_name: None,
+            instance_method_names: methods,
+            java_scope: Some(CachedJavaClassScope {
+                type_path: vec![name.to_string()],
+                superclass_candidates: parents,
+            }),
+        };
+    let first = class(1, "Worker", Vec::new(), Vec::new());
+    let duplicate = class(2, "Worker", Vec::new(), Vec::new());
+    let imported = class(3, "Worker", Vec::new(), Vec::new());
+    let unrelated = class(4, "Worker", Vec::new(), Vec::new());
+    let child = class(
+        5,
+        "Child",
+        vec![vec!["p.Worker".to_string(), "q.Worker".to_string()]],
+        vec!["target".to_string()],
+    );
+    for reverse in [false, true] {
+        let mut inventory = vec![
+            ("p", &first),
+            ("p", &duplicate),
+            ("q", &imported),
+            ("unrelated", &unrelated),
+            ("r", &child),
+        ];
+        if reverse {
+            inventory.reverse();
+        }
+        let policy = JavaOverridePolicy::prepare(inventory.into_iter());
+        for owner in [NodeId(1), NodeId(2), NodeId(3)] {
+            assert!(policy.refuses(owner, "target"));
+        }
+        assert!(!policy.refuses(NodeId(4), "target"));
+    }
 }
 
 struct JavaKotlinResolutionIndex<'tree> {
@@ -4561,7 +4686,7 @@ struct JavaKotlinResolutionIndex<'tree> {
     package_name: Option<String>,
     wildcard_import: bool,
     overloads: HashSet<String>,
-    virtual_methods: HashSet<String>,
+    java_overrides: JavaOverridePolicy,
     extension_methods: HashSet<String>,
     has_annotated_declaration: bool,
     has_delegation: bool,
@@ -4641,7 +4766,7 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             package_name: csd_source_domain(language, source_path),
             wildcard_import: false,
             overloads: HashSet::new(),
-            virtual_methods: HashSet::new(),
+            java_overrides: JavaOverridePolicy::default(),
             extension_methods: HashSet::new(),
             has_annotated_declaration: nominal_source_poison,
             has_delegation: false,
@@ -4654,7 +4779,6 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 callable_id: None,
                 caller: None,
                 owner_index: None,
-                owner_virtual: false,
                 unsupported: false,
             },
         );
@@ -4710,6 +4834,14 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                     .push(method_index);
             }
         }
+        if language == "java" {
+            result.java_overrides = JavaOverridePolicy::prepare(
+                result
+                    .classes
+                    .iter()
+                    .map(|class| (result.package_name.as_deref().unwrap_or_default(), class)),
+            );
+        }
         result
     }
 
@@ -4755,7 +4887,6 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
         count_java_kotlin_resolution_work(4);
         if call.unsupported
             || self.wildcard_import
-            || self.virtual_methods.contains(raw_target)
             || self.extension_methods.contains(raw_target)
             || self.has_delegation
             || self.has_annotated_declaration
@@ -5012,6 +5143,9 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             );
         };
         let class = &self.classes[*class_index];
+        if self.language == "java" && self.java_overrides.refuses(class.declaration, raw_target) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
         count_java_kotlin_resolution_work(1);
         let matching_methods = self
             .class_method_indices_by_name
@@ -5028,7 +5162,12 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 },
             );
         };
-        if is_csharp_swift_dart_language(self.language) {
+        if self.language == "kotlin" && !class.runtime_closed {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self.language == "java" && self.package_name.is_some()
+            || is_csharp_swift_dart_language(self.language)
+        {
             return (
                 Some(caller),
                 CachedResolutionBinding::JavaKotlinPackageReceiver {
@@ -5200,7 +5339,6 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             || virtual_owner
             || node.child_by_field_name("type_parameters").is_some()
             || java_kotlin_has_direct_child_kind(node, "type_parameters");
-        context.owner_virtual = virtual_owner;
         context.owner_index = None;
 
         let Some(name) = declaration_name(node, self.source).map(str::to_string) else {
@@ -5214,6 +5352,8 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         let cross_module_visible = csd_cross_module_visible(node, self.source, self.index.language);
         let runtime_closed = csd_runtime_closed(node, self.source, self.index.language);
         let super_name = csd_super_name(node, self.source, self.index.language);
+        let java_scope =
+            (self.index.language == "java").then(|| self.java_class_scope(node, &name));
         self.index.classes.push(CachedClassDeclaration {
             name,
             declaration,
@@ -5221,9 +5361,76 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             cross_module_visible,
             runtime_closed,
             super_name,
+            instance_method_names: Vec::new(),
+            java_scope,
         });
         context.owner_index = Some(self.index.classes.len() - 1);
         context
+    }
+
+    fn java_class_scope(&self, node: TsNode<'tree>, name: &str) -> CachedJavaClassScope {
+        let mut type_path = Vec::new();
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if matches!(
+                ancestor.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "annotation_type_declaration"
+                    | "record_declaration"
+            ) && let Some(name) = declaration_name(ancestor, self.source)
+            {
+                type_path.push(name.to_string());
+            }
+            parent = ancestor.parent();
+        }
+        type_path.reverse();
+        let mut superclass_candidates = Vec::new();
+        if let Some(surface) = node
+            .child_by_field_name("superclass")
+            .and_then(|superclass| superclass.named_child(0))
+            .and_then(|superclass| {
+                if superclass.kind() == "generic_type" {
+                    superclass.named_child(0)
+                } else {
+                    Some(superclass)
+                }
+            })
+            .and_then(|superclass| node_text(superclass, self.source))
+        {
+            let package = self.index.package_name.as_deref().unwrap_or_default();
+            for depth in (1..=type_path.len()).rev() {
+                superclass_candidates.push(vec![format!(
+                    "{package}.{}.{surface}",
+                    type_path[..depth].join(".")
+                )]);
+            }
+            let (first, suffix) = surface.split_once('.').unwrap_or((surface, ""));
+            if let Some(imports) = self.index.type_imports_by_name.get(first) {
+                superclass_candidates.push(
+                    imports
+                        .iter()
+                        .map(|import| {
+                            let mut path =
+                                format!("{}.{}", import.package_name, import.imported_name);
+                            if !suffix.is_empty() {
+                                path.push('.');
+                                path.push_str(suffix);
+                            }
+                            path
+                        })
+                        .collect(),
+                );
+            }
+            superclass_candidates.push(vec![format!("{package}.{surface}")]);
+            superclass_candidates.push(vec![surface.to_string()]);
+        }
+        type_path.push(name.to_string());
+        CachedJavaClassScope {
+            type_path,
+            superclass_candidates,
+        }
     }
 
     fn enter_callable(
@@ -5249,14 +5456,22 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             context.callable_id = Some(node.id());
             return context;
         };
+        if self.index.language == "java"
+            && !java_kotlin_java_method_is_static(
+                declaration_node,
+                self.source,
+                self.index.language,
+            )
+            && let Some(owner_index) = context.owner_index
+        {
+            self.index.classes[owner_index]
+                .instance_method_names
+                .push(name.clone());
+        }
         count_java_kotlin_resolution_work(1);
         if !self.index.overloads.insert(name.clone()) {
             count_java_kotlin_resolution_work(1);
             self.index.overloads.insert(format!("overload:{name}"));
-        }
-        if context.owner_virtual {
-            count_java_kotlin_resolution_work(1);
-            self.index.virtual_methods.insert(name.clone());
         }
         if self.index.language == "kotlin"
             && java_kotlin_kotlin_extension_declaration(node, self.source)
@@ -5292,7 +5507,11 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                     .parent()
                     .is_some_and(|parent| parent.kind() == "program")
             } else {
-                java_kotlin_java_method_is_static(declaration_node, self.source)
+                java_kotlin_java_method_is_static(
+                    declaration_node,
+                    self.source,
+                    self.index.language,
+                )
             };
             if same_file {
                 count_java_kotlin_resolution_work(1);
@@ -5897,7 +6116,10 @@ fn csd_owner_is_unsupported(node: TsNode<'_>, source: &str, language: &str) -> b
         "csharp" => header.split_whitespace().any(|word| word == "partial"),
         "swift" => {
             let header = header.trim_start();
-            header.starts_with("class ") || header.contains("@objc") || header.contains(" dynamic ")
+            node.child_by_field_name("declaration_kind")
+                .is_some_and(|kind| kind.kind() == "class")
+                || header.contains("@objc")
+                || header.contains(" dynamic ")
         }
         "dart" => {
             let header = header.trim_start();
@@ -5978,6 +6200,20 @@ pub(crate) fn swift_declaration_cross_module_visible_at(
 fn csd_runtime_closed(node: TsNode<'_>, source: &str, language: &str) -> bool {
     let header = csd_declaration_header(node, source).trim_start();
     match language {
+        "kotlin" => {
+            let mut cursor = node.walk();
+            !node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "modifiers")
+                .any(|modifiers| {
+                    let mut cursor = modifiers.walk();
+                    modifiers.named_children(&mut cursor).any(|modifier| {
+                        matches!(modifier.kind(), "inheritance_modifier" | "class_modifier")
+                            && node_text(modifier, source)
+                                .is_some_and(|text| matches!(text, "open" | "abstract" | "sealed"))
+                    })
+                })
+        }
         "csharp" => header.split_whitespace().any(|token| token == "sealed"),
         "swift" => header.starts_with("struct ") || header.starts_with("enum "),
         "dart" => header.starts_with("final class ") || header.starts_with("sealed class "),
@@ -6052,7 +6288,19 @@ fn java_kotlin_declaration_has_annotation(node: TsNode<'_>, source: &str) -> boo
         .is_some_and(|header| header.contains('@'))
 }
 
-fn java_kotlin_java_method_is_static(node: TsNode<'_>, source: &str) -> bool {
+fn java_kotlin_java_method_is_static(node: TsNode<'_>, source: &str, language: &str) -> bool {
+    if language == "java" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "modifiers")
+            .any(|modifiers| {
+                let mut cursor = modifiers.walk();
+                modifiers
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "static")
+            });
+    }
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
@@ -8386,6 +8634,8 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 cross_module_visible: false,
                 runtime_closed: false,
                 super_name: None,
+                instance_method_names: Vec::new(),
+                java_scope: None,
             };
             self.classes_by_name
                 .entry(name.clone())
@@ -9839,6 +10089,8 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                         cross_module_visible: false,
                         runtime_closed: false,
                         super_name: None,
+                        instance_method_names: Vec::new(),
+                        java_scope: None,
                     });
                 }
                 JavascriptBindingKind::Class { owner }
@@ -16948,6 +17200,7 @@ struct JavaKotlinImportDomain {
     declarations: HashMap<(Option<String>, String), Vec<JavaKotlinImportCandidate>>,
     classes: HashMap<String, Vec<JavaKotlinImportCandidate>>,
     cross_module_visible_nodes: HashSet<NodeId>,
+    kotlin_runtime_closed_types: HashSet<String>,
     dart_runtime_closed_types: HashSet<String>,
     dart_overridden_methods: HashSet<(String, String)>,
     dart_parent_candidates: HashMap<String, Vec<Option<String>>>,
@@ -16957,6 +17210,7 @@ struct JavaKotlinImportDomain {
 
 struct JavaKotlinProjectionIndex {
     domains: HashMap<(String, String), JavaKotlinImportDomain>,
+    java_overrides: JavaOverridePolicy,
     php_domains: HashMap<CachedPhpNamespace, JavaKotlinImportDomain>,
     php_identity_by_file: HashMap<i64, CachedPhpNamespace>,
     ruby_complete: bool,
@@ -16976,6 +17230,7 @@ enum JavaKotlinImportResolution {
     Missing,
     Ambiguous,
     Incomplete,
+    Unsupported,
 }
 
 fn dart_library_root(path: &Path) -> Option<&Path> {
@@ -17137,6 +17392,49 @@ impl JavaKotlinProjectionIndex {
                     .map(|package| (record.file.file_id, package.as_str()))
             })
             .collect::<HashMap<_, _>>();
+        // Mirror Store's named Java replay-authority census. Its enclosing
+        // type set includes default-package files too. CLASS use anchors with
+        // a second package spelling cannot authorize a complete package route.
+        let java_files = records
+            .iter()
+            .filter(|record| record.file.language == "java")
+            .map(|record| record.file.file_id)
+            .collect::<HashSet<_>>();
+        let java_class_names = nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) && node
+                    .file_node_id
+                    .is_some_and(|file| java_files.contains(&file))
+            })
+            .filter_map(|node| node.qualified_name.as_deref())
+            .collect::<HashSet<_>>();
+        let mut java_replay_packages = HashMap::<NodeId, BTreeSet<&str>>::new();
+        for node in nodes.iter().filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+            ) && node
+                .file_node_id
+                .is_some_and(|file| java_files.contains(&file))
+        }) {
+            let Some(file) = node.file_node_id else {
+                continue;
+            };
+            let Some((parent, _)) = node
+                .qualified_name
+                .as_deref()
+                .and_then(|name| name.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if !parent.is_empty() && !java_class_names.contains(parent) {
+                java_replay_packages.entry(file).or_default().insert(parent);
+            }
+        }
         let mut java_package_dependency_files = HashSet::new();
         let mut java_unsupported_owner_names = HashMap::<&str, HashSet<String>>::new();
         for node in nodes.iter().filter(|node| {
@@ -17292,7 +17590,17 @@ impl JavaKotlinProjectionIndex {
             let domain = domains
                 .entry((record.file.language.clone(), package_name.clone()))
                 .or_default();
-            let file_complete = record.file.complete && record.file.lookup_input_complete;
+            let java_replay_complete = record.file.language != "java"
+                || !java_package_dependency_files.contains(&FileId(record.file.file_id.0))
+                || java_replay_packages
+                    .get(&record.file.file_id)
+                    .is_some_and(|packages| {
+                        packages.len() == 1 && packages.contains(package_name.as_str())
+                    });
+            let file_complete =
+                record.file.complete && record.file.lookup_input_complete && java_replay_complete;
+            // Keep dependencies and refusal inventory even when replay identity
+            // is incomplete; omit positive authority, never required source input.
             if domain.dependencies.is_empty() {
                 domain.complete = file_complete;
             } else {
@@ -17322,7 +17630,15 @@ impl JavaKotlinProjectionIndex {
                 }
             }
             for class in &record.file.classes {
-                domain.classes.entry(class.name.clone()).or_default().push(
+                let owner_name = if record.file.language == "java" {
+                    class
+                        .java_scope
+                        .as_ref()
+                        .map_or_else(|| class.name.clone(), |scope| scope.type_path.join("."))
+                } else {
+                    class.name.clone()
+                };
+                domain.classes.entry(owner_name.clone()).or_default().push(
                     JavaKotlinImportCandidate {
                         owner: class.declaration,
                         declaration: class.declaration,
@@ -17331,6 +17647,11 @@ impl JavaKotlinProjectionIndex {
                 );
                 if class.cross_module_visible {
                     domain.cross_module_visible_nodes.insert(class.declaration);
+                }
+                if record.file.language == "kotlin" && class.runtime_closed {
+                    domain
+                        .kotlin_runtime_closed_types
+                        .insert(class.name.clone());
                 }
                 if record.file.language == "dart" && class.runtime_closed {
                     domain.dart_runtime_closed_types.insert(class.name.clone());
@@ -17345,7 +17666,7 @@ impl JavaKotlinProjectionIndex {
                 for method in &class.methods {
                     domain
                         .declarations
-                        .entry((Some(class.name.clone()), method.name.clone()))
+                        .entry((Some(owner_name.clone()), method.name.clone()))
                         .or_default()
                         .push(JavaKotlinImportCandidate {
                             owner: class.declaration,
@@ -17365,6 +17686,23 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
+        let java_overrides = JavaOverridePolicy::prepare(
+            records
+                .iter()
+                .filter(|record| record.file.language == "java")
+                .flat_map(|record| {
+                    record.file.classes.iter().map(move |class| {
+                        (
+                            record
+                                .file
+                                .java_kotlin_package
+                                .as_deref()
+                                .unwrap_or_default(),
+                            class,
+                        )
+                    })
+                }),
+        );
         for ((language, package), domain) in &mut domains {
             if is_java_kotlin_language(language) {
                 if language == "java"
@@ -17423,6 +17761,7 @@ impl JavaKotlinProjectionIndex {
         }
         Self {
             domains,
+            java_overrides,
             php_domains,
             php_identity_by_file,
             ruby_complete,
@@ -17446,6 +17785,31 @@ impl JavaKotlinProjectionIndex {
         else {
             return JavaKotlinImportResolution::Missing;
         };
+        if matches!(language, "java" | "kotlin") {
+            if !domain.complete
+                || domain.poisoned
+                || owner_name.is_some_and(|owner| domain.unsupported_owner_names.contains(owner))
+            {
+                return JavaKotlinImportResolution::Incomplete;
+            }
+            if owner_name.is_some_and(|owner| {
+                domain
+                    .classes
+                    .get(owner)
+                    .is_some_and(|classes| classes.len() > 1)
+            }) {
+                return JavaKotlinImportResolution::Ambiguous;
+            }
+        }
+        if let Some(owner) = owner_name
+            && (language == "java"
+                && domain.classes.get(owner).is_some_and(|classes| {
+                    matches!(classes.as_slice(), [class] if self.java_overrides.refuses(class.owner, imported_name))
+                })
+                || language == "kotlin" && !domain.kotlin_runtime_closed_types.contains(owner))
+        {
+            return JavaKotlinImportResolution::Unsupported;
+        }
         let resolution = Self::resolve_domain(domain, owner_name, imported_name);
         let (Some(owner_name), JavaKotlinImportResolution::Exact { owner, .. }) =
             (owner_name, &resolution)
@@ -18115,6 +18479,47 @@ fn resolve_syntax_claim(
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
     let mut exact_node_file_expectations = vec![(caller, input.callsite.file_id)];
     let mut exact_dependency_files = vec![input.callsite.file_id];
+    let local_java_owner = match &input.binding {
+        CachedResolutionBinding::ImplicitReceiver { owner, .. }
+        | CachedResolutionBinding::ConstructorBinding {
+            class_binding: CachedClassBinding::SameFile { owner, .. },
+            ..
+        }
+        | CachedResolutionBinding::ExplicitReceiverType {
+            class_binding: CachedClassBinding::SameFile { owner, .. },
+            ..
+        } => Some(*owner),
+        _ => None,
+    };
+    if source_record.file.language == "java"
+        && local_java_owner.is_some_and(|owner| {
+            java_kotlin_index
+                .java_overrides
+                .refuses(owner, &input.callsite.raw_target)
+        })
+    {
+        let complete = source_file.complete
+            && source_record.file.complete
+            && source_record.file.lookup_input_complete;
+        return Ok(ResolvedSyntaxClaim {
+            input,
+            caller,
+            target,
+            status: if complete {
+                ProofResolutionStatus::Unsupported
+            } else {
+                ProofResolutionStatus::IncompleteDomain
+            },
+            reason: if complete {
+                ProofResolutionReason::UnsupportedConstruct
+            } else {
+                ProofResolutionReason::LookupDomainIncomplete
+            },
+            evidence_chain,
+            exact_node_file_expectations,
+            exact_dependency_files,
+        });
+    }
     match &input.binding {
         CachedResolutionBinding::SameFile {
             declaration,
@@ -18844,6 +19249,10 @@ fn resolve_syntax_claim(
                     status = ProofResolutionStatus::IncompleteDomain;
                     reason = ProofResolutionReason::LookupDomainIncomplete;
                 }
+                JavaKotlinImportResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
             }
         }
         CachedResolutionBinding::JavaKotlinImportedFunction {
@@ -18901,6 +19310,10 @@ fn resolve_syntax_claim(
             JavaKotlinImportResolution::Incomplete => {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
             }
         },
         CachedResolutionBinding::JavaKotlinPackageReceiver {
@@ -18977,6 +19390,10 @@ fn resolve_syntax_claim(
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
             }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
+            }
         },
         CachedResolutionBinding::JavaKotlinImportedReceiver {
             package_name,
@@ -19043,6 +19460,10 @@ fn resolve_syntax_claim(
             JavaKotlinImportResolution::Incomplete => {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+            JavaKotlinImportResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
             }
         },
         CachedResolutionBinding::CCppQualified { components } => {
@@ -21331,6 +21752,8 @@ mod python_complexity_tests {
                     cross_module_visible: false,
                     runtime_closed: false,
                     super_name: None,
+                    instance_method_names: Vec::new(),
+                    java_scope: None,
                 }],
                 direct_exports: Vec::new(),
                 export_poison_all: false,

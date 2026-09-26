@@ -19,6 +19,7 @@
 - Go call navigation keeps locally shadowed import aliases distinct from package calls and follows ordinary package functions and factory methods when an external test package declares the same names.
 - Ruby and PHP call proof no longer treats a receiver assigned only on a conditional path as certain. PHP calls also stop using an earlier receiver type after `extract` can replace it, until an explicit assignment establishes it again.
 - C++ call proof no longer mistakes a same-named function for a class constructor.
+- Java call proof applies the same override refusal across declaration files and leaves nested receiver and type lookups without Exact call proof. Kotlin open classes and Swift classes no longer receive closed-domain call proof.
 
 ## 0.17.6
 
