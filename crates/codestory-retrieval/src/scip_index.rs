@@ -1331,9 +1331,8 @@ fn publish_scip_component_with_cancel(
                 } else if scip_component_schema(&previous_path)? == 2 {
                     stage = Some(
                         crate::copy_on_write::stage_file(&previous_path, &temp_path, cancelled)
-                            .map_err(|error| {
+                            .inspect_err(|_| {
                                 stage_failed = true;
-                                error
                             })?,
                     );
                 }
