@@ -44,6 +44,134 @@ fn ready_preserves_a_complete_schema31_cache() {
     assert_schema31_cache_is_observational("ready");
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_and_ready_report_pending_retirement_without_changing_the_legacy_cache() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = tempdir().expect("fixture");
+    let project = fixture.path().join("project");
+    let cache = fixture.path().join("cache");
+    prepare_complete_schema31(&project, &cache);
+    let database = cache.join("codestory.db");
+    let metadata = fs::metadata(&database).expect("legacy native identity");
+    let receipt_path = cache.join("core/legacy-retirement.json");
+    fs::create_dir_all(receipt_path.parent().expect("receipt directory"))
+        .expect("create receipt directory");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source_identity": {"Unix": {"device": metadata.dev(), "inode": metadata.ino()}},
+            "candidate_generation_id": "generation-2",
+            "sidecars": [],
+            "committed": false,
+            "retired": false
+        }))
+        .expect("serialize pending receipt"),
+    )
+    .expect("write pending receipt");
+    let before = snapshot_tree(&cache);
+
+    let doctor: Value =
+        serde_json::from_str(&run_cli(&project, &cache, &["doctor", "--format", "json"]))
+            .expect("doctor json");
+    let ready: Value =
+        serde_json::from_str(&run_cli(&project, &cache, &["ready", "--format", "json"]))
+            .expect("ready json");
+    for report in [
+        &doctor["sidecar_retrieval"]["legacy_retirement"],
+        &ready["legacy_retirement"],
+    ] {
+        assert_eq!(report["pending"], true, "{report}");
+        assert!(report["legacy_bytes"].as_u64().unwrap_or(0) > 0, "{report}");
+        assert!(
+            report["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains("awaits a committed")),
+            "{report}"
+        );
+    }
+    assert_eq!(
+        snapshot_tree(&cache),
+        before,
+        "diagnostics changed the cache"
+    );
+    assert_eq!(schema_version(&database), 31);
+}
+
+#[cfg(unix)]
+#[test]
+fn retrieval_status_reports_postcommit_pending_retirement_without_cleanup() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = tempdir().expect("fixture");
+    let project = fixture.path().join("project");
+    let cache = fixture.path().join("cache");
+    prepare_complete_schema31(&project, &cache);
+    run_cli(
+        &project,
+        &cache,
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(cache.join("core/publication.json")).expect("committed core pointer"),
+    )
+    .expect("core pointer json");
+    let active = pointer["active"]["generation_id"]
+        .as_str()
+        .expect("active generation");
+    let rollback = pointer["rollback"]["generation_id"]
+        .as_str()
+        .expect("rollback generation");
+    let legacy = cache.join("codestory.db");
+    fs::copy(
+        cache
+            .join("core/generations")
+            .join(rollback)
+            .join("codestory.db"),
+        &legacy,
+    )
+    .expect("restore a deferred standalone image for observation");
+    let metadata = fs::metadata(&legacy).expect("standalone native identity");
+    let receipt_path = cache.join("core/legacy-retirement.json");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source_identity": {"Unix": {"device": metadata.dev(), "inode": metadata.ino()}},
+            "candidate_generation_id": active,
+            "sidecars": [],
+            "committed": true,
+            "retired": false,
+            "last_error": "in-use deletion deferred"
+        }))
+        .expect("serialize deferred receipt"),
+    )
+    .expect("write deferred receipt");
+    let before = snapshot_tree(&cache);
+
+    let status: Value = serde_json::from_str(&run_cli(
+        &project,
+        &cache,
+        &["retrieval", "status", "--format", "json"],
+    ))
+    .expect("retrieval status json");
+    assert_eq!(status["legacy_retirement"]["pending"], true, "{status}");
+    assert!(
+        status["legacy_retirement"]["legacy_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        status["legacy_retirement"]["errors"][0]
+            .as_str()
+            .is_some_and(|error| error.contains("in-use deletion deferred"))
+    );
+    assert_eq!(snapshot_tree(&cache), before, "status performed retirement");
+}
+
 fn assert_schema31_cache_is_observational(command: &str) {
     let fixture = tempdir().expect("fixture");
     let project = fixture.path().join("project");

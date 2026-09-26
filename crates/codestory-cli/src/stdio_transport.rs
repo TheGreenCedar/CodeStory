@@ -6534,6 +6534,7 @@ fn read_stdio_status_resource(
         "storage_exists": storage_exists,
         "retrieval_mode": retrieval_status.retrieval_mode,
         "degraded_reason": retrieval_status.degraded_reason,
+        "legacy_retirement": retrieval_status.legacy_retirement,
         "live_ready": stdio_status_is_live_ready(
             Some(retrieval_status.retrieval_mode.as_str()),
             retrieval_status.degraded_reason.as_deref(),
@@ -13692,6 +13693,57 @@ version = "0.11.20"
             runtime.activation.retrieval_contract_version(),
             codestory_retrieval::SIDECAR_SCHEMA_VERSION,
             "the runtime must report the retrieval crate's sidecar schema version"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn status_resource_observes_pending_legacy_retirement_without_mutating_cache() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("runtime context");
+        let core_root =
+            codestory_contracts::owned_artifacts::core_publication_root(&runtime.storage_path);
+        std::fs::create_dir_all(&core_root).expect("create receipt directory");
+        let receipt_path = core_root.join("legacy-retirement.json");
+        #[cfg(unix)]
+        let identity = json!({"Unix": {"device": 1, "inode": 1}});
+        #[cfg(windows)]
+        let identity = json!({"Windows": {"volume": 1, "file_id": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}});
+        let receipt = json!({
+            "version": 1,
+            "source_identity": identity,
+            "candidate_generation_id": "generation-1",
+            "sidecars": [],
+            "committed": false,
+            "retired": false
+        });
+        let receipt_bytes = serde_json::to_vec(&receipt).expect("serialize pending receipt");
+        std::fs::write(&receipt_path, &receipt_bytes).expect("write pending receipt");
+
+        let status = read_stdio_status_resource_cached(&runtime, &mut StdioServerState::default())
+            .expect("read status resource");
+        assert_eq!(
+            status.pointer("/legacy_retirement/pending"),
+            Some(&json!(true))
+        );
+        assert!(
+            status
+                .pointer("/legacy_retirement/errors/0")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("awaits a committed"))
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read receipt"),
+            receipt_bytes
+        );
+        assert!(
+            !runtime.storage_path.exists(),
+            "status cannot create a legacy database"
         );
     }
 

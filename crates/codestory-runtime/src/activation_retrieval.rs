@@ -95,6 +95,15 @@ impl ActivationService {
         Ok(report)
     }
 
+    /// Observe a pending fixed-path legacy retirement without acquiring a
+    /// cleanup lock or changing the core publication.
+    pub fn observe_legacy_retirement(
+        &self,
+        storage_path: &Path,
+    ) -> Result<codestory_store::LegacyRetirementReport, StorageError> {
+        codestory_store::observe_legacy_retirement(storage_path)
+    }
+
     /// Execute one query with a fresh caller-isolated retrieval cache.
     pub fn execute_retrieval_query(
         &self,
@@ -162,12 +171,31 @@ fn apply_core_gc_for_runtime(
     else {
         return Ok(());
     };
+    let legacy = codestory_store::apply_legacy_retirement(
+        storage_path,
+        cancelled,
+        remove_owned_legacy_file,
+    )?;
+    for error in legacy.errors {
+        tracing::warn!("Legacy database retirement deferred: {error}");
+    }
     let core =
         codestory_store::apply_core_retention(storage_path, cancelled, remove_owned_core_image)?;
     for error in core.errors {
         tracing::warn!("Core retention deferred candidate: {error}");
     }
     Ok(())
+}
+
+fn remove_owned_legacy_file(
+    parent: &Path,
+    name: &str,
+    validated_file: &File,
+) -> Result<bool, StorageError> {
+    let root = OwnedDeletionRoot::open(parent)
+        .map_err(|error| core_deletion_error("pin legacy database parent", error))?;
+    root.remove_regular_file_matching(Path::new(name), validated_file)
+        .map_err(|error| core_deletion_error("retire owned legacy file", error))
 }
 
 fn remove_owned_core_image(

@@ -42,7 +42,8 @@ mod schema;
 mod trail;
 
 pub use core_retention::{
-    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, apply_core_retention,
+    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, LegacyRetirementReport,
+    apply_core_retention, apply_legacy_retirement, observe_legacy_retirement,
 };
 pub(crate) use core_retention::{
     CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,
@@ -7142,6 +7143,10 @@ impl Storage {
         // Finish any v0.17 fixed-path journal before selecting or migrating its
         // publication. New generations need only the atomic JSON pointer.
         recover_interrupted_promotion_locked(live_path)?;
+        // A prior committed migration may have been interrupted before its
+        // cleanup receipt was marked. Preserve that evidence before another
+        // pointer can move past the first migrated generation.
+        core_retention::mark_legacy_retirement_committed(&layout)?;
         if promotion_artifacts_exist(live_path) {
             return Err(promotion_error(format!(
                 "Cannot publish an immutable core generation while legacy recovery artifacts remain for {}",
@@ -7246,13 +7251,13 @@ impl Storage {
 
         let previous_validation_started = Instant::now();
         let previous_pointer = layout.read_pointer()?;
-        let (previous_identity, predecessor_incomplete) =
+        let (previous_identity, predecessor_incomplete, legacy_original_identity) =
             if let Some(pointer) = previous_pointer.as_ref() {
                 // Pointer parsing verifies its receipt and generation path. The
                 // active database was deep-validated before that pointer was
                 // minted, so a refresh does not read the whole old image again.
                 let _ = layout.resolve_generation_database(&pointer.active.generation_id)?;
-                (Some(pointer.active.clone()), false)
+                (Some(pointer.active.clone()), false, None)
             } else if live_path.is_file() {
                 match read_recovery_database_identity(
                     live_path,
@@ -7263,6 +7268,7 @@ impl Storage {
                         // once, then preserve it as an immutable rollback generation.
                         // A cancellable SQLite backup preserves the whole
                         // committed legacy image, including WAL pages.
+                        let original_identity = core_retention::capture_legacy_identity(live_path)?;
                         let previous_bytes = database_logical_bytes_at_path(live_path)?;
                         let identity = core_generation_identity(&previous, previous_bytes);
                         let materialized = layout.materialize_existing_generation(
@@ -7283,7 +7289,7 @@ impl Storage {
                                 "Migrated immutable rollback generation changed core identity",
                             ));
                         }
-                        (Some(identity), false)
+                        (Some(identity), false, Some(original_identity))
                     }
                     None => {
                         let incomplete = is_replaceable_incomplete_legacy_predecessor(live_path)?;
@@ -7293,11 +7299,11 @@ impl Storage {
                         if !incomplete {
                             require_empty_unpublished_core(live_path)?;
                         }
-                        (None, incomplete)
+                        (None, incomplete, None)
                     }
                 }
             } else {
-                (None, false)
+                (None, false, None)
             };
         let previous_live_bytes = previous_identity
             .as_ref()
@@ -7396,7 +7402,23 @@ impl Storage {
                 "Core promotion was cancelled before pointer publication",
             ));
         }
+        if let Some(original_identity) = legacy_original_identity {
+            core_retention::prepare_legacy_retirement(
+                &layout,
+                original_identity,
+                &candidate_identity.generation_id,
+            )?;
+            if cancelled() {
+                return Err(promotion_error(
+                    "Core promotion was cancelled before pointer publication",
+                ));
+            }
+        }
         let commit = publication.commit_pointer(candidate_identity, previous_identity.clone())?;
+        if let Err(error) = core_retention::mark_legacy_retirement_committed(&layout) {
+            tracing::warn!(live_path = %live_path.display(), error = %error,
+                "legacy retirement remains pending after committed core publication");
+        }
         if let crate::CorePublicationDurabilityV1::Unconfirmed(reason) = commit.durability {
             tracing::warn!(
                 live_path = %live_path.display(),

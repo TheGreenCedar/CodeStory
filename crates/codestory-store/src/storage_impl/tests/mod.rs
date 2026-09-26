@@ -8657,6 +8657,107 @@ fn immutable_migration_copies_complete_schema31_rollback_without_cow() -> Result
 }
 
 #[test]
+fn first_immutable_publication_records_the_original_legacy_identity_for_retirement()
+-> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&candidate, &live)?;
+
+    assert!(
+        layout.root().join("legacy-retirement.json").is_file(),
+        "first committed migration must retain an identity-bound retirement receipt"
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_accepts_an_unprotected_authentic_schema31_generation() -> Result<(), StorageError> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let first = layout.create_staging_database_path()?;
+    seed_promotion_file(&first, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&first, &live)?;
+    let next = layout.create_staging_database_path()?;
+    seed_promotion_file(&next, 3, "newer.rs")?;
+    Storage::promote_staged_snapshot(&next, &live)?;
+
+    let rollback = layout.generation_database_path("generation-1")?;
+    let reader = super::core_retention::pin_exact_core(&rollback)?
+        .expect("historical generation must have a named reader lease");
+    let deferred =
+        super::core_retention::apply_core_retention(&live, &|| false, |_, _, _, _, _| {
+            panic!("live schema31 reader must block reclamation")
+        })?;
+    assert_eq!(deferred.deferred_pins, 1);
+    drop(reader);
+
+    let mut removed = Vec::new();
+    let report =
+        super::core_retention::apply_core_retention(&live, &|| false, |_, generation, _, _, _| {
+            removed.push(generation.to_owned());
+            Ok(true)
+        })?;
+    assert_eq!(
+        removed,
+        ["generation-1"],
+        "unprotected schema31 should reach owned removal"
+    );
+    assert_eq!(report.reclaimed_images, 1);
+    Ok(())
+}
+
+#[test]
+fn retention_accepts_a_second_supported_previous_schema_but_refuses_unsupported_schema()
+-> Result<(), StorageError> {
+    for (schema, reclaimable) in [
+        (SCHEMA_VERSION - 1, true),
+        (STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION, false),
+    ] {
+        let root = tempfile::tempdir().expect("migration root");
+        let live = root.path().join("codestory.db");
+        seed_promotion_file(&live, 1, "old.rs")?;
+        let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+        for (generation, name) in [(2, "new.rs"), (3, "newer.rs")] {
+            let stage = layout.create_staging_database_path()?;
+            seed_promotion_file(&stage, generation, name)?;
+            Storage::promote_staged_snapshot(&stage, &live)?;
+        }
+        let historical = layout.generation_database_path("generation-1")?;
+        crate::core_generation::make_file_owner_writable(&historical)?;
+        restamp_complete_promotion_fixture(&historical, schema)?;
+        crate::core_generation::make_file_immutable(&historical)?;
+
+        let mut removed = Vec::new();
+        let report = super::core_retention::apply_core_retention(
+            &live,
+            &|| false,
+            |_, generation, _, _, _| {
+                removed.push(generation.to_owned());
+                Ok(true)
+            },
+        )?;
+        assert_eq!(removed == ["generation-1"], reclaimable, "schema {schema}");
+        assert_eq!(report.reclaimed_images == 1, reclaimable, "schema {schema}");
+        if !reclaimable {
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("unsupported schema"))
+            );
+            assert!(historical.is_file());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn cancelled_legacy_rollback_copy_removes_its_partial_stage() -> Result<(), StorageError> {
     let root = tempfile::tempdir().expect("migration root");
     let live = root.path().join("codestory.db");
@@ -8705,6 +8806,7 @@ fn cancellation_after_legacy_copy_cannot_commit_pointer() -> Result<(), StorageE
     assert!(error.to_string().contains("cancelled"), "{error}");
     assert!(layout.read_pointer()?.is_none());
     assert_eq!(durable_sqlite_state(&live), before);
+    assert!(!layout.root().join("legacy-retirement.json").exists());
     assert!(
         Storage::open(&live)?
             .get_complete_index_publication()?
@@ -8723,6 +8825,146 @@ fn cancellation_after_legacy_copy_cannot_commit_pointer() -> Result<(), StorageE
             .generation_id,
         "generation-2"
     );
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_legacy_retirement_receipt_cannot_commit_pointer() -> Result<(), StorageError>
+{
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let before = durable_sqlite_state(&live);
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 2, "new.rs")?;
+    let receipt_path = layout.root().join("legacy-retirement.json");
+    let cancelled = || receipt_path.is_file();
+
+    let error = Storage::promote_staged_snapshot_inner(&candidate, &live, None, &cancelled)
+        .expect_err("cancellation after receipt fsync must prevent pointer publication");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(
+        receipt_path.is_file(),
+        "cancel condition must reach the receipt boundary"
+    );
+    assert!(layout.read_pointer()?.is_none());
+    assert_eq!(durable_sqlite_state(&live), before);
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(observed.pending);
+    assert!(
+        observed
+            .errors
+            .iter()
+            .any(|error| error.contains("awaits a committed"))
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_retirement_waits_for_commit_and_retries_owned_deletion_without_touching_annotations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let annotations = root.path().join("annotations.sqlite3");
+    fs::write(&annotations, b"annotation-owned sentinel").expect("annotation sentinel");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let rollback = layout.resolve_generation_database("generation-1")?;
+
+    let before_observation = fs::read(layout.root().join("legacy-retirement.json"))?;
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(observed.pending && observed.legacy_bytes > 0);
+    assert_eq!(
+        fs::read(layout.root().join("legacy-retirement.json"))?,
+        before_observation
+    );
+    let cancelled = super::core_retention::apply_legacy_retirement(&live, &|| true, |_, _, _| {
+        panic!("cancelled cleanup cannot reach deletion");
+    })?;
+    assert!(cancelled.pending && live.is_file());
+
+    let deferred = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        Err(StorageError::Other("in-use deletion refused".into()))
+    })?;
+    assert!(deferred.pending && !deferred.errors.is_empty());
+    assert!(
+        live.is_file(),
+        "failed cleanup cannot roll back committed publication"
+    );
+    let diagnostic = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(diagnostic.pending);
+    assert!(
+        diagnostic
+            .errors
+            .iter()
+            .any(|error| error.contains("in-use deletion refused"))
+    );
+
+    let retired =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retired.retired && !retired.pending);
+    assert!(!live.exists());
+    let retired_observation = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(retired_observation.retired && !retired_observation.pending);
+    assert!(retired_observation.errors.is_empty());
+    assert!(rollback.is_file(), "migration rollback remains protected");
+    assert_eq!(fs::read(&annotations)?, b"annotation-owned sentinel");
+    Ok(())
+}
+
+#[test]
+fn legacy_retirement_refuses_recreated_native_identity_then_retries_original()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir().expect("migration root");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "old.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let stage = layout.create_staging_database_path()?;
+    seed_promotion_file(&stage, 2, "new.rs")?;
+    Storage::promote_staged_snapshot(&stage, &live)?;
+    let original = root.path().join("original-held.db");
+    fs::rename(&live, &original)?;
+    fs::write(&live, b"new unowned file")?;
+    let refused = super::core_retention::apply_legacy_retirement(&live, &|| false, |_, _, _| {
+        panic!("replacement must never reach deletion callback");
+    })?;
+    assert!(refused.pending);
+    assert!(
+        refused
+            .errors
+            .iter()
+            .any(|error| error.contains("replaced native identity"))
+    );
+    let observed = super::core_retention::observe_legacy_retirement(&live)?;
+    assert!(
+        observed
+            .errors
+            .iter()
+            .any(|error| error.contains("replaced native identity"))
+    );
+    assert_eq!(
+        observed.legacy_bytes, 0,
+        "replacement bytes are not owned legacy bytes"
+    );
+    assert_eq!(fs::read(&live)?, b"new unowned file");
+    assert!(original.is_file());
+
+    fs::remove_file(&live)?;
+    fs::rename(&original, &live)?;
+    let retried =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retried.retired);
+    assert!(!live.exists());
     Ok(())
 }
 
@@ -8759,7 +9001,27 @@ fn schema31_rollback_snapshot_includes_committed_wal_rows() -> Result<(), Storag
     )?;
     assert_eq!(annotation, "committed WAL annotation");
     assert_eq!(Storage::database_schema_version(&rollback)?, 31);
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json"))
+            .expect("read migration retirement receipt"),
+    )
+    .expect("parse migration retirement receipt");
+    assert!(
+        receipt["sidecars"]
+            .as_array()
+            .is_some_and(|sidecars| sidecars.iter().any(|sidecar| sidecar["suffix"] == "-wal")),
+        "the retirement receipt must capture the live WAL identity"
+    );
     drop(writer);
+    let retirement =
+        super::core_retention::apply_legacy_retirement(&live, &|| false, |parent, name, _| {
+            fs::remove_file(parent.join(name)).expect("remove matched legacy file");
+            Ok(true)
+        })?;
+    assert!(retirement.retired);
+    assert!(!live.exists());
+    assert!(!wal.exists());
+    assert!(rollback.is_file());
     Ok(())
 }
 
@@ -9185,6 +9447,77 @@ fn staged_promotion_abort_child() {
         PathBuf::from(std::env::var_os(PROMOTION_ABORT_STAGED_ENV).expect("child staged path"));
     let result = Storage::promote_staged_snapshot(&staged_path, &live_path);
     panic!("promotion abort hook returned: {result:?}");
+}
+
+#[test]
+fn legacy_pointer_write_crash_preserves_source_and_pending_retirement_receipt() {
+    let live_path = unique_temp_db_path("legacy-pointer-write-abort-live");
+    seed_schema31_promotion_file(&live_path, 1, "old.rs").expect("authentic schema31 source");
+    let writer = Connection::open(&live_path).expect("open legacy writer");
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             INSERT INTO bookmark_category (id, name) VALUES (78, 'precommit WAL row');",
+        )
+        .expect("commit WAL row");
+    let wal = sqlite_sidecar_path(&live_path, "-wal");
+    let shm = sqlite_sidecar_path(&live_path, "-shm");
+    let main_before = fs::read(&live_path).expect("read original database");
+    let wal_before = fs::read(&wal).expect("read original WAL");
+    assert!(shm.is_file(), "live writer retains the SHM sidecar");
+
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+    let staged_path = layout.create_staging_database_path().expect("stage");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("replacement candidate");
+    let sentinel_path = unique_temp_db_path("legacy-pointer-write-abort-sentinel");
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("store test executable"))
+            .arg("--exact")
+            .arg("storage_impl::tests::staged_promotion_abort_child")
+            .env(PROMOTION_ABORT_LIVE_ENV, &live_path)
+            .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
+            .env(
+                crate::core_generation::CORE_PUBLICATION_ABORT_POINT_ENV,
+                "pointer_write",
+            )
+            .env(
+                crate::core_generation::CORE_PUBLICATION_ABORT_SENTINEL_ENV,
+                &sentinel_path,
+            )
+            .status()
+            .expect("run pointer-write abort child");
+    assert!(!status.success(), "child must abort at pointer write");
+    assert_eq!(
+        fs::read_to_string(&sentinel_path).expect("abort sentinel"),
+        "pointer_write\n"
+    );
+    assert!(layout.read_pointer().expect("pointer").is_none());
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.root().join("legacy-retirement.json")).expect("precommit receipt"),
+    )
+    .expect("receipt JSON");
+    assert_eq!(receipt["committed"], false);
+    assert_eq!(receipt["retired"], false);
+    assert_eq!(
+        fs::read(&live_path).expect("preserved original"),
+        main_before
+    );
+    assert_eq!(fs::read(&wal).expect("preserved WAL"), wal_before);
+    assert!(shm.is_file(), "the crash cannot remove the original SHM");
+    let row: String = writer
+        .query_row(
+            "SELECT name FROM bookmark_category WHERE id = 78",
+            [],
+            |row| row.get(0),
+        )
+        .expect("old writer remains usable");
+    assert_eq!(row, "precommit WAL row");
+    drop(writer);
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = fs::remove_dir_all(layout.root());
+    let _ = fs::remove_file(&sentinel_path);
+    let _ = fs::remove_file(&live_path);
 }
 
 #[test]

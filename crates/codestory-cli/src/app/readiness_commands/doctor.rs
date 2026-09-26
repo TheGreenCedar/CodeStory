@@ -168,6 +168,7 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         core_status,
         local_refresh,
         readiness_lanes,
+        legacy_retirement: readiness_sidecar.legacy_retirement,
     };
     Ok(output)
 }

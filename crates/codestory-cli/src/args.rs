@@ -1693,6 +1693,8 @@ pub(crate) struct ReadyOutput {
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_retirement: Option<codestory_runtime::LegacyRetirementReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2492,6 +2494,8 @@ pub(crate) struct RetrievalStatusOutput {
     pub(crate) precise_semantic_import_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) precise_semantic_import_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_retirement: Option<codestory_runtime::LegacyRetirementReport>,
     #[serde(flatten)]
     pub(crate) ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }

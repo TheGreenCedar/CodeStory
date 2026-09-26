@@ -310,6 +310,13 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             let _ = writeln!(markdown, "local_refresh_reason: {reason}");
         }
     }
+    if let Some(legacy) = output.legacy_retirement.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "legacy_retirement_pending: {} standalone_bytes={} errors={:?}",
+            legacy.pending, legacy.legacy_bytes, legacy.errors
+        );
+    }
     append_readiness_verdicts(&mut markdown, &output.verdicts);
     if !output.readiness_lanes.is_empty() {
         let _ = writeln!(markdown, "readiness_lanes:");
@@ -2700,6 +2707,13 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         output.sidecar_retrieval.embedding_device_state,
         output.sidecar_retrieval.embedding_cpu_allowed
     );
+    if let Some(legacy) = output.sidecar_retrieval.legacy_retirement.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "legacy_retirement_pending: {} standalone_bytes={} errors={:?}",
+            legacy.pending, legacy.legacy_bytes, legacy.errors
+        );
+    }
     let _ = writeln!(
         markdown,
         "readiness: local_navigation={} agent_packet_search={}",
@@ -4456,6 +4470,7 @@ mod tests {
                 precise_semantic_import_reason: None,
                 precise_semantic_import_revision: None,
                 precise_semantic_import_producer: None,
+                legacy_retirement: None,
                 ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
             },
             retrieval: None,

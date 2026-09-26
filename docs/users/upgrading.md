@@ -124,6 +124,15 @@ That one-time copy is cancellable and can take time proportional to the old
 database size; the old core remains in place until a complete replacement is
 published.
 
+After that first publication commits, CodeStory retires the redundant
+standalone database and its verified SQLite sidecars. The immutable rollback
+generation remains available while its rollback pointer or retrieval bindings
+need it. If an old file is in use or its identity has changed, cleanup is
+deferred and retried on a later publication or retention pass. Status, doctor,
+and readiness report pending retirement without performing cleanup; cache
+inventory lists standalone legacy bytes separately. User annotations are
+preserved in their own sidecar.
+
 Before an upgrade where rollback is required, stop clients using that cache and
 preserve a complete pre-upgrade copy, including its annotation sidecar. Keep the
 0.17.5 archive and its verified checksum with that backup. A version string

@@ -66,11 +66,11 @@ pub use storage_impl::{
     GroundingCallDegree, GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord,
     GroundingSnapshotMetadata, GroundingSnapshotState, IndexArtifactCacheEntry,
     IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
-    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    NodeFileIdentityProjection, ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats,
-    ProjectionPersistenceStats, PromotedValidation, ProofResolutionPublication,
-    RehydratedCacheRebaseStats, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
-    RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
+    IndexPublicationRecord, LegacyRetirementReport, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
+    LlmSymbolDocStats, NodeFileIdentityProjection, ProjectionFlushBreakdown,
+    ProjectionPersistenceFamilyStats, ProjectionPersistenceStats, PromotedValidation,
+    ProofResolutionPublication, RehydratedCacheRebaseStats, RetrievalCoreGenerationBinding,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
     SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
     STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
     SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
@@ -79,8 +79,9 @@ pub use storage_impl::{
     StructuralTextArtifactCacheWrite, StructuralTextProjection,
     StructuralTextPublicationCompatibility, StructuralTextUnit,
     StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    UnownedProjectionRemovalSummary, apply_core_retention, seal_call_resolution_fact,
-    stored_vector_encoding, structural_text_unit_digest,
+    UnownedProjectionRemovalSummary, apply_core_retention, apply_legacy_retirement,
+    observe_legacy_retirement, seal_call_resolution_fact, stored_vector_encoding,
+    structural_text_unit_digest,
 };
 #[cfg(debug_assertions)]
 pub use storage_impl::{

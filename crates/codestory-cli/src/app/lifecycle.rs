@@ -196,6 +196,11 @@ fn render_cache_inventory_markdown(report: &codestory_runtime::CacheInventoryRep
         "hardlink_deduplicated_bytes: {}",
         report.hardlink_deduplicated_bytes
     );
+    let _ = writeln!(
+        markdown,
+        "standalone_legacy_bytes: {}",
+        report.standalone_legacy_bytes
+    );
     match report.clone_shared_bytes {
         Some(shared) => {
             let _ = writeln!(
