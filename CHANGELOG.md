@@ -10,6 +10,7 @@
 - Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
 - Lexical search over an incremental index can reach unchanged matches even when newer updates replace the first window of results from an older index component.
 - Go call navigation keeps locally shadowed import aliases distinct from package calls and follows ordinary package functions and factory methods when an external test package declares the same names.
+- Ruby and PHP call proof no longer treats a receiver assigned only on a conditional path as certain. PHP calls also stop using an earlier receiver type after `extract` can replace it, until an explicit assignment establishes it again.
 
 ## 0.17.6
 

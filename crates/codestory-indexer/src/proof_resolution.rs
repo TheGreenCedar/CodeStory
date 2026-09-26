@@ -1301,7 +1301,17 @@ impl<'tree> RubyResolutionIndex<'tree> {
             bindings: HashMap::new(),
             require_relative: None,
         };
-        producer.visit(tree.root_node(), None, None, true, false, false);
+        producer.visit(
+            tree.root_node(),
+            RubyVisitContext {
+                caller: None,
+                owner_index: None,
+                declarations_static: true,
+                declaration_body_entry: false,
+                file_scope_entry: false,
+                conditional_context: false,
+            },
+        );
         for class_indices in producer.class_indices.values() {
             if class_indices.len() != 1 {
                 producer.index.poisoned = true;
@@ -1374,16 +1384,26 @@ struct RubyResolutionProducer<'index, 'tree> {
     require_relative: Option<(String, NodeId)>,
 }
 
+#[derive(Clone, Copy)]
+struct RubyVisitContext {
+    caller: Option<NodeId>,
+    owner_index: Option<usize>,
+    declarations_static: bool,
+    declaration_body_entry: bool,
+    file_scope_entry: bool,
+    conditional_context: bool,
+}
+
 impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
-    fn visit(
-        &mut self,
-        node: TsNode<'tree>,
-        mut caller: Option<NodeId>,
-        mut owner_index: Option<usize>,
-        declarations_static: bool,
-        declaration_body_entry: bool,
-        file_scope_entry: bool,
-    ) {
+    fn visit(&mut self, node: TsNode<'tree>, context: RubyVisitContext) {
+        let RubyVisitContext {
+            mut caller,
+            mut owner_index,
+            declarations_static,
+            declaration_body_entry,
+            file_scope_entry,
+            conditional_context,
+        } = context;
         count_ruby_php_resolution_work(1);
         let supported_declaration = matches!(node.kind(), "method" | "class" | "comment");
         let supported_file_import = file_scope_entry
@@ -1515,7 +1535,7 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
 
         self.observe_poison(node, file_scope_entry);
         if node.kind() == "assignment" {
-            self.observe_assignment(node, caller);
+            self.observe_assignment(node, caller, conditional_context);
         }
         if matches!(node.kind(), "identifier" | "constant")
             && crate::is_ruby_bare_call_site(node)
@@ -1533,6 +1553,39 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             .map(|method| method.id());
         let child_declarations_static =
             declarations_static && matches!(node.kind(), "program" | "body_statement" | "class");
+        let child_conditional_context = conditional_context
+            || matches!(
+                node.kind(),
+                "if" | "unless"
+                    | "elsif"
+                    | "else"
+                    | "case"
+                    | "when"
+                    | "while"
+                    | "until"
+                    | "for"
+                    | "block"
+                    | "do_block"
+                    | "rescue"
+                    | "ensure"
+                    | "if_modifier"
+                    | "unless_modifier"
+                    | "while_modifier"
+                    | "until_modifier"
+                    | "rescue_modifier"
+                    | "conditional"
+                    | "case_match"
+                    | "in_clause"
+            );
+        // The left operand always runs; only the right operand depends on it.
+        let short_circuit_rhs = (node.kind() == "binary"
+            && node
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(operator, self.source))
+                .is_some_and(|operator| matches!(operator, "&&" | "||" | "and" | "or")))
+        .then(|| node.child_by_field_name("right"))
+        .flatten()
+        .map(|right| right.id());
         for child in node.named_children(&mut cursor) {
             if call_method == Some(child.id()) {
                 self.observe_call(node, caller, owner_index);
@@ -1544,11 +1597,15 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                 child_declaration_body_entry && owner_index.is_none() && node.kind() == "program";
             self.visit(
                 child,
-                caller,
-                owner_index,
-                child_declarations_static,
-                child_declaration_body_entry,
-                child_file_scope_entry,
+                RubyVisitContext {
+                    caller,
+                    owner_index,
+                    declarations_static: child_declarations_static,
+                    declaration_body_entry: child_declaration_body_entry,
+                    file_scope_entry: child_file_scope_entry,
+                    conditional_context: child_conditional_context
+                        || short_circuit_rhs == Some(child.id()),
+                },
             );
         }
     }
@@ -1593,7 +1650,12 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         }
     }
 
-    fn observe_assignment(&mut self, node: TsNode<'_>, caller: Option<NodeId>) {
+    fn observe_assignment(
+        &mut self,
+        node: TsNode<'_>,
+        caller: Option<NodeId>,
+        conditional_context: bool,
+    ) {
         let (Some(caller), Some(left), Some(right)) = (
             caller,
             node.child_by_field_name("left"),
@@ -1611,12 +1673,16 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             self.index.poisoned = true;
             return;
         }
-        let binding = ruby_constructor_owner(right, self.source)
-            .map(|owner_name| RubyReceiverBinding::Exact {
-                owner_name,
-                constructor: true,
-            })
-            .unwrap_or(RubyReceiverBinding::Ambiguous);
+        let binding = if conditional_context {
+            RubyReceiverBinding::Ambiguous
+        } else {
+            ruby_constructor_owner(right, self.source)
+                .map(|owner_name| RubyReceiverBinding::Exact {
+                    owner_name,
+                    constructor: true,
+                })
+                .unwrap_or(RubyReceiverBinding::Ambiguous)
+        };
         let key = (caller, name);
         self.bindings
             .entry(key)
@@ -1931,6 +1997,12 @@ enum PhpReceiverBinding {
     Ambiguous,
 }
 
+#[derive(Clone)]
+struct PhpReceiverBindingState {
+    binding: PhpReceiverBinding,
+    established_at: usize,
+}
+
 struct PhpResolutionIndex<'tree> {
     calls: Vec<IndexedRubyPhpCall<'tree>>,
     call_indices_by_span: HashMap<(usize, usize), usize>,
@@ -1965,10 +2037,11 @@ impl<'tree> PhpResolutionIndex<'tree> {
             class_indices: HashMap::new(),
             imports: HashMap::new(),
             bindings: HashMap::new(),
+            latest_variable_table_mutation: HashMap::new(),
             namespace: None,
             namespace_invalid: false,
         };
-        producer.visit(tree.root_node(), None, None, true);
+        producer.visit(tree.root_node(), None, None, true, false);
         producer.index.namespace = if producer.namespace_invalid {
             producer.index.poisoned = true;
             CachedPhpNamespace::Invalid
@@ -2049,7 +2122,8 @@ struct PhpResolutionProducer<'index, 'tree> {
     graph_imports: HashMap<(u32, NodeKind), Vec<NodeId>>,
     class_indices: HashMap<String, Vec<usize>>,
     imports: HashMap<String, PhpImportBinding>,
-    bindings: HashMap<(NodeId, String), PhpReceiverBinding>,
+    bindings: HashMap<(NodeId, String), PhpReceiverBindingState>,
+    latest_variable_table_mutation: HashMap<NodeId, usize>,
     namespace: Option<String>,
     namespace_invalid: bool,
 }
@@ -2061,6 +2135,7 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
         mut caller: Option<NodeId>,
         mut owner_index: Option<usize>,
         declarations_static: bool,
+        conditional_context: bool,
     ) {
         count_ruby_php_resolution_work(1);
         if node.kind() == "namespace_definition" {
@@ -2169,9 +2244,9 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
             }
         }
 
-        self.observe_poison(node);
+        self.observe_poison(node, caller);
         if node.kind() == "assignment_expression" {
-            self.observe_assignment(node, caller);
+            self.observe_assignment(node, caller, conditional_context);
         }
         match node.kind() {
             "function_call_expression" => self.observe_function_call(node, caller),
@@ -2204,8 +2279,41 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                     | "class_declaration"
                     | "declaration_list"
             );
+        let child_conditional_context = conditional_context
+            || matches!(
+                node.kind(),
+                "if_statement"
+                    | "else_if_clause"
+                    | "else_clause"
+                    | "switch_statement"
+                    | "case_statement"
+                    | "while_statement"
+                    | "do_statement"
+                    | "for_statement"
+                    | "foreach_statement"
+                    | "conditional_expression"
+                    | "match_expression"
+                    | "try_statement"
+                    | "catch_clause"
+                    | "finally_clause"
+            );
+        // A constructor in the short-circuit RHS does not bind every path.
+        let short_circuit_rhs = (node.kind() == "binary_expression"
+            && node
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(operator, self.source))
+                .is_some_and(|operator| matches!(operator, "&&" | "||" | "and" | "or" | "??")))
+        .then(|| node.child_by_field_name("right"))
+        .flatten()
+        .map(|right| right.id());
         for child in node.named_children(&mut cursor) {
-            self.visit(child, caller, owner_index, child_declarations_static);
+            self.visit(
+                child,
+                caller,
+                owner_index,
+                child_declarations_static,
+                child_conditional_context || short_circuit_rhs == Some(child.id()),
+            );
         }
     }
 
@@ -2258,16 +2366,24 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                 .to_string();
             self.bindings.insert(
                 (caller, name),
-                PhpReceiverBinding::Exact {
-                    owner_name,
-                    constructor: false,
+                PhpReceiverBindingState {
+                    binding: PhpReceiverBinding::Exact {
+                        owner_name,
+                        constructor: false,
+                    },
+                    established_at: name_node.start_byte(),
                 },
             );
             count_ruby_php_resolution_work(1);
         }
     }
 
-    fn observe_assignment(&mut self, node: TsNode<'_>, caller: Option<NodeId>) {
+    fn observe_assignment(
+        &mut self,
+        node: TsNode<'_>,
+        caller: Option<NodeId>,
+        conditional_context: bool,
+    ) {
         let (Some(caller), Some(left), Some(right)) = (
             caller,
             node.child_by_field_name("left"),
@@ -2279,20 +2395,40 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
             .unwrap_or_default()
             .trim_start_matches('$')
             .to_string();
-        let binding = php_object_creation_owner(right, self.source)
-            .map(|owner_name| PhpReceiverBinding::Exact {
-                owner_name,
-                constructor: true,
-            })
-            .unwrap_or(PhpReceiverBinding::Ambiguous);
-        self.bindings
-            .entry((caller, name))
-            .and_modify(|existing| *existing = PhpReceiverBinding::Ambiguous)
-            .or_insert(binding);
+        let binding = if conditional_context {
+            PhpReceiverBinding::Ambiguous
+        } else {
+            php_object_creation_owner(right, self.source)
+                .map(|owner_name| PhpReceiverBinding::Exact {
+                    owner_name,
+                    constructor: true,
+                })
+                .unwrap_or(PhpReceiverBinding::Ambiguous)
+        };
+        let key = (caller, name);
+        let state = PhpReceiverBindingState {
+            binding,
+            established_at: node.start_byte(),
+        };
+        // extract() invalidates earlier receiver facts, but a later explicit
+        // assignment can establish a new fact without changing earlier calls.
+        let replaces_mutated_binding = self.bindings.get(&key).is_some_and(|existing| {
+            self.latest_variable_table_mutation
+                .get(&caller)
+                .is_some_and(|mutation| existing.established_at < *mutation)
+        });
+        if replaces_mutated_binding {
+            self.bindings.insert(key, state);
+        } else {
+            self.bindings
+                .entry(key)
+                .and_modify(|existing| existing.binding = PhpReceiverBinding::Ambiguous)
+                .or_insert(state);
+        }
         count_ruby_php_resolution_work(1);
     }
 
-    fn observe_poison(&mut self, node: TsNode<'_>) {
+    fn observe_poison(&mut self, node: TsNode<'_>, caller: Option<NodeId>) {
         if node.kind() == "comment"
             && node_text(node, self.source).is_some_and(|comment| {
                 let comment = comment.to_ascii_lowercase();
@@ -2324,6 +2460,16 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                 .unwrap_or_default();
             if matches!(name, "spl_autoload_register" | "call_user_func" | "eval") {
                 self.index.poisoned = true;
+            }
+            if let (true, Some(caller)) = (
+                name.trim_start_matches('\\')
+                    .eq_ignore_ascii_case("extract"),
+                caller,
+            ) {
+                self.latest_variable_table_mutation
+                    .entry(caller)
+                    .and_modify(|position| *position = (*position).max(node.start_byte()))
+                    .or_insert(node.start_byte());
             }
         }
         if node.kind() == "object_creation_expression"
@@ -2423,7 +2569,17 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                     count_ruby_php_resolution_work(1);
                     self.bindings
                         .get(&(caller, receiver_name.to_string()))
-                        .cloned()
+                        .map(|state| {
+                            if self
+                                .latest_variable_table_mutation
+                                .get(&caller)
+                                .is_some_and(|mutation| state.established_at < *mutation)
+                            {
+                                PhpReceiverBinding::Ambiguous
+                            } else {
+                                state.binding.clone()
+                            }
+                        })
                 })
                 .map(|binding| match binding {
                     PhpReceiverBinding::Exact {
