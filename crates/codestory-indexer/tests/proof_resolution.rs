@@ -11190,6 +11190,7 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
         let mut store = Store::new_in_memory()?;
         let exporter_path = format!("src/exported.{extension}");
         let importer_path = format!("src/importer.{extension}");
+        let safe_importer_path = format!("src/safe_importer.{extension}");
         let paths = index_files(
             project.path(),
             &mut store,
@@ -11206,10 +11207,13 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 (
                     &importer_path,
                     concat!(
-                        "import { C, Safe } from './exported';\n",
+                        "import { C } from './exported';\n",
                         "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
-                        "export function safeCaller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
                     ),
+                ),
+                (
+                    &safe_importer_path,
+                    "import { Safe } from './exported';\nexport function caller() {\n  const receiver = new Safe();\n  receiver.target();\n}\n",
                 ),
             ],
         )?;
@@ -11222,6 +11226,11 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             .into_iter()
             .find(|file| file.path.ends_with(&importer_path))
             .expect("independent importer file");
+        let safe_importer = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(&safe_importer_path))
+            .expect("independent clean-class importer file");
         let owner = store
             .get_nodes()?
             .into_iter()
@@ -11244,8 +11253,8 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
         let safe = before
             .iter()
             .find(|fact| {
-                fact.callsite.file_id == FileId(importer.id)
-                    && fact.callsite.line == 8
+                fact.callsite.file_id == FileId(safe_importer.id)
+                    && fact.callsite.line == 4
                     && fact.callsite.raw_target == "target"
             })
             .expect("independent clean exported class fact");
@@ -11260,7 +11269,7 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         for (file_path, blob) in entries {
             let mut artifact = decode_index_artifact_json(&blob)?;
             assert_eq!(
@@ -11313,7 +11322,7 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
                 .core_generation_id,
             publication(1).generation_id
         );
-        for (generation, expected_hits) in [(2, 0), (3, 2)] {
+        for (generation, expected_hits) in [(2, 0), (3, 3)] {
             let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
                 &mut store,
                 &RefreshInfo {
@@ -11354,8 +11363,8 @@ fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::R
             let safe = facts
                 .iter()
                 .find(|fact| {
-                    fact.callsite.file_id == FileId(importer.id)
-                        && fact.callsite.line == 8
+                    fact.callsite.file_id == FileId(safe_importer.id)
+                        && fact.callsite.line == 4
                         && fact.callsite.raw_target == "target"
                 })
                 .expect("clean exported class retained after reparse/reuse");
