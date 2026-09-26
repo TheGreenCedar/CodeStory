@@ -134,6 +134,13 @@ struct CandidateNodeSnapshot {
     is_declaration: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RelativeImportNameMatch {
+    Missing,
+    Unique(i64),
+    Ambiguous,
+}
+
 #[derive(Default, Debug)]
 struct CandidateIndex {
     nodes: Vec<CandidateNode>,
@@ -2736,12 +2743,14 @@ impl CandidateIndex {
                 let Some(offsets) = self.relative_file_path_map.get(&candidate_path) else {
                     continue;
                 };
-                if let Some(node_id) = self.first_matching_name_in_offsets(
+                match self.matching_name_in_offsets(
                     offsets,
                     imported_name,
                     imported_name_ascii_lower,
                 ) {
-                    return Some(node_id);
+                    RelativeImportNameMatch::Unique(node_id) => return Some(node_id),
+                    RelativeImportNameMatch::Ambiguous => return None,
+                    RelativeImportNameMatch::Missing => {}
                 }
             }
             None
@@ -3413,27 +3422,66 @@ impl CandidateIndex {
         })
     }
 
-    fn first_matching_name_in_offsets(
+    fn matching_name_in_offsets(
         &self,
         offsets: &[usize],
         name: &str,
         name_ascii_lower: &str,
-    ) -> Option<i64> {
-        offsets.iter().find_map(|idx| {
-            let node = &self.relative_import_nodes[*idx];
-            let serialized_tail_lower =
-                tail_component(&node.serialized_name).map(str::to_ascii_lowercase);
-            let qualified_tail_lower = node
-                .qualified_name
-                .as_deref()
-                .and_then(tail_component)
-                .map(str::to_ascii_lowercase);
-            (node.serialized_name == name
-                || node.serialized_name_ascii_lower == name_ascii_lower
-                || serialized_tail_lower.as_deref() == Some(name_ascii_lower)
-                || qualified_tail_lower.as_deref() == Some(name_ascii_lower))
-            .then_some(node.id)
+    ) -> RelativeImportNameMatch {
+        // Case-insensitive compatibility must not outrank an exact source
+        // binding, nor resolve a competing exact declaration by row order.
+        let exact = self.matching_relative_name(offsets, |node| {
+            node.serialized_name == name
+                || tail_component(&node.serialized_name) == Some(name)
+                || node.qualified_name.as_deref().and_then(tail_component) == Some(name)
+        });
+        if !matches!(exact, RelativeImportNameMatch::Missing) {
+            return exact;
+        }
+        self.matching_relative_name(offsets, |node| {
+            node.serialized_name_ascii_lower == name_ascii_lower
+                || tail_component(&node.serialized_name)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(name_ascii_lower))
+                || node
+                    .qualified_name
+                    .as_deref()
+                    .and_then(tail_component)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(name_ascii_lower))
         })
+    }
+
+    fn matching_relative_name(
+        &self,
+        offsets: &[usize],
+        matches_name: impl Fn(&CandidateNode) -> bool,
+    ) -> RelativeImportNameMatch {
+        let mut declaration = RelativeImportNameMatch::Missing;
+        let mut reference = RelativeImportNameMatch::Missing;
+        for node in offsets
+            .iter()
+            .map(|index| &self.relative_import_nodes[*index])
+        {
+            if !matches_name(node) {
+                continue;
+            }
+            let selected = if node.is_declaration {
+                &mut declaration
+            } else {
+                &mut reference
+            };
+            *selected = match *selected {
+                RelativeImportNameMatch::Missing => RelativeImportNameMatch::Unique(node.id),
+                RelativeImportNameMatch::Unique(id) if id == node.id => {
+                    RelativeImportNameMatch::Unique(id)
+                }
+                _ => RelativeImportNameMatch::Ambiguous,
+            };
+        }
+        if matches!(declaration, RelativeImportNameMatch::Missing) {
+            reference
+        } else {
+            declaration
+        }
     }
 
     fn cached_lookup<K, F>(
@@ -4721,6 +4769,55 @@ mod tests {
             ),
             Some(42)
         );
+    }
+
+    #[test]
+    fn test_relative_import_name_priority_and_ambiguity() {
+        let cases = [
+            (vec![(1, "Target", true), (2, "target", true)], Some(2)),
+            (vec![(1, "target", false), (2, "target", true)], Some(2)),
+            (vec![(1, "target", true), (2, "target", true)], None),
+            (vec![(1, "target", false), (2, "target", false)], None),
+            (vec![(1, "Target", true)], Some(1)),
+            (vec![(1, "Target", true), (2, "TARGET", true)], None),
+            (vec![(1, "Target", true), (2, "target", false)], Some(2)),
+            (vec![(1, "pkg.target", true), (2, "Target", true)], Some(1)),
+        ];
+        for (nodes, expected) in cases {
+            // Candidate insertion order must not decide endpoint authority.
+            for reverse in [false, true] {
+                let mut nodes = nodes.clone();
+                if reverse {
+                    nodes.reverse();
+                }
+                let index = CandidateIndex::from_nodes(
+                    nodes
+                        .into_iter()
+                        .map(|(id, name, is_declaration)| CandidateNode {
+                            id,
+                            kind: NodeKind::FUNCTION as i32,
+                            file_node_id: Some(2),
+                            file_path: Some("/repo/target.ts".to_string()),
+                            normalized_file_path: normalize_resolution_path("/repo/target.ts"),
+                            serialized_name: name.to_string(),
+                            serialized_name_ascii_lower: name.to_ascii_lowercase(),
+                            qualified_name: Some(name.to_string()),
+                            is_declaration,
+                        })
+                        .collect(),
+                );
+                assert_eq!(
+                    index.find_relative_import_readonly(
+                        Some("/repo/caller.ts"),
+                        "./target",
+                        "target",
+                        "target"
+                    ),
+                    expected,
+                    "reverse={reverse}"
+                );
+            }
+        }
     }
 
     #[test]

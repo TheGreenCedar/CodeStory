@@ -682,6 +682,82 @@ fn assert_nominal_exact_target(
     Ok(())
 }
 
+fn assert_nominal_caller(
+    store: &Store,
+    root: &std::path::Path,
+    fact: &codestory_contracts::proof_resolution::CallResolutionFact,
+    caller_path: &str,
+    declaration_line: u32,
+    call_line: u32,
+) -> anyhow::Result<()> {
+    let nodes = store.get_nodes()?;
+    let file = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == root.join(caller_path).display().to_string()
+        })
+        .expect("independently designated caller file");
+    let callers = nodes
+        .iter()
+        .filter(|node| {
+            node.file_node_id == Some(file.id)
+                && node.start_line == Some(declaration_line)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .collect::<Vec<_>>();
+    let [caller] = callers.as_slice() else {
+        panic!("intended callable census at {caller_path}:{declaration_line}: {callers:#?}");
+    };
+    assert_eq!(
+        fact.caller, caller.id,
+        "fact must name independently designated callable"
+    );
+    assert_eq!(fact.callsite.file_id, FileId(file.id.0));
+    assert_eq!(fact.callsite.line, call_line);
+    let edges = store.get_edges()?;
+    let call = edges
+        .iter()
+        .find(|edge| Some(edge.id) == fact.edge_id)
+        .expect("actual intended CALL");
+    assert_eq!(call.effective_source(), caller.id);
+    assert_eq!(call.file_node_id, Some(file.id));
+    assert_eq!(call.line, Some(call_line));
+    Ok(())
+}
+
+fn assert_f9_nominal_call_is_exact(
+    files: &[(&str, &str)],
+    language: &str,
+    target: (&str, u32, u32),
+    caller: (&str, u32, u32),
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("intended positive call census: {facts:#?}");
+    };
+    assert_nominal_exact_target(
+        &store,
+        project.path(),
+        fact,
+        target.0,
+        target.1,
+        Some(target.2),
+    )?;
+    assert_nominal_caller(&store, project.path(), fact, caller.0, caller.1, caller.2)
+}
+
 fn assert_nominal_call_is_nonexact(
     files: &[(&str, &str)],
     language: &str,
@@ -3202,6 +3278,71 @@ fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow:
                 .filter(|fact| fact.status == ProofResolutionStatus::Exact)
                 .collect::<Vec<_>>();
             assert_eq!(exact.len(), expected_count, "{name} {target}: {facts:#?}");
+            let (target_path, declaration_line, owner_line) = match (name, target) {
+                ("ruby_same_file_and_self", "same_file_target") => ("lib/exact.rb", 1, None),
+                ("ruby_same_file_and_self", "member_target") => ("lib/exact.rb", 8, Some(7)),
+                ("ruby_constructor_receiver", "target") => ("lib/exact.rb", 2, Some(1)),
+                ("ruby_literal_require_relative", "target") => ("lib/worker.rb", 2, Some(1)),
+                (
+                    "php_same_file_namespace_this_constructor_and_typed_receiver",
+                    "same_file_target",
+                ) => ("src/Exact.php", 3, None),
+                ("php_same_file_namespace_this_constructor_and_typed_receiver", "memberTarget") => {
+                    ("src/Exact.php", 6, Some(5))
+                }
+                ("php_exact_use_aliases", "target_alias") => ("src/Lib/Worker.php", 3, None),
+                ("php_exact_use_aliases", "memberTarget") => ("src/Lib/Worker.php", 4, Some(4)),
+                _ => unreachable!("each positive fixture must specify its intended declaration"),
+            };
+            let (caller_path, anchors): (&str, &[(u32, u32)]) = match (name, target) {
+                ("ruby_same_file_and_self", "same_file_target") => {
+                    ("lib/exact.rb", &[(4, 3), (5, 3)])
+                }
+                ("ruby_same_file_and_self", "member_target") => ("lib/exact.rb", &[(11, 10)]),
+                ("ruby_constructor_receiver", _) => ("lib/exact.rb", &[(7, 5)]),
+                ("ruby_literal_require_relative", _) => ("lib/caller.rb", &[(4, 2)]),
+                (
+                    "php_same_file_namespace_this_constructor_and_typed_receiver",
+                    "same_file_target",
+                ) => ("src/Exact.php", &[(4, 4), (4, 4)]),
+                ("php_same_file_namespace_this_constructor_and_typed_receiver", "memberTarget") => {
+                    ("src/Exact.php", &[(7, 7), (9, 9), (10, 10)])
+                }
+                ("php_exact_use_aliases", "target_alias") => ("src/App/Caller.php", &[(5, 5)]),
+                ("php_exact_use_aliases", "memberTarget") => ("src/App/Caller.php", &[(6, 6)]),
+                _ => unreachable!("each positive specifies its intended caller"),
+            };
+            let mut actual_lines = exact
+                .iter()
+                .map(|fact| fact.callsite.line)
+                .collect::<Vec<_>>();
+            actual_lines.sort_unstable();
+            let mut expected_lines = anchors.iter().map(|(call, _)| *call).collect::<Vec<_>>();
+            expected_lines.sort_unstable();
+            assert_eq!(actual_lines, expected_lines, "{name} {target} call census");
+            for fact in &exact {
+                let caller_line = anchors
+                    .iter()
+                    .find(|(call, _)| *call == fact.callsite.line)
+                    .expect("designated call")
+                    .1;
+                assert_nominal_caller(
+                    &store,
+                    project.path(),
+                    fact,
+                    caller_path,
+                    caller_line,
+                    fact.callsite.line,
+                )?;
+                assert_nominal_exact_target(
+                    &store,
+                    project.path(),
+                    fact,
+                    target_path,
+                    declaration_line,
+                    owner_line,
+                )?;
+            }
             assert!(exact.iter().all(|fact| {
                 fact.edge_id.is_some()
                     && fact.raw_edge_target.is_some()
@@ -4829,6 +4970,52 @@ fn cpp_closed_exact_subset_emits_replay_valid_authenticated_facts() -> anyhow::R
             .filter(|fact| fact.status == ProofResolutionStatus::Exact)
             .collect::<Vec<_>>();
         assert_eq!(exact.len(), expected, "{target}: {facts:#?}");
+        let (declaration_line, owner_line) = match target {
+            "free_target" => (13, None),
+            "namespaced_target" => (1, None),
+            "static_target" => (4, Some(2)),
+            "member_target" => (5, Some(2)),
+            _ => unreachable!("each C++ positive must specify its intended declaration"),
+        };
+        let anchors: &[(u32, u32)] = match target {
+            "free_target" => &[(14, 14)],
+            "namespaced_target" => &[(15, 15)],
+            "static_target" => &[(16, 16)],
+            "member_target" => &[(6, 6), (7, 7), (11, 11), (17, 17), (18, 18), (19, 19)],
+            _ => unreachable!("each C++ positive specifies intended callers"),
+        };
+        let mut actual_lines = exact
+            .iter()
+            .map(|fact| fact.callsite.line)
+            .collect::<Vec<_>>();
+        actual_lines.sort_unstable();
+        assert_eq!(
+            actual_lines,
+            anchors.iter().map(|(call, _)| *call).collect::<Vec<_>>()
+        );
+        for fact in &exact {
+            let caller_line = anchors
+                .iter()
+                .find(|(call, _)| *call == fact.callsite.line)
+                .expect("designated call")
+                .1;
+            assert_nominal_caller(
+                &store,
+                project.path(),
+                fact,
+                "fixture.cpp",
+                caller_line,
+                fact.callsite.line,
+            )?;
+            assert_nominal_exact_target(
+                &store,
+                project.path(),
+                fact,
+                "fixture.cpp",
+                declaration_line,
+                owner_line,
+            )?;
+        }
         assert!(exact.iter().all(|fact| {
             fact.edge_id.is_some()
                 && fact.target.is_some()
@@ -5998,7 +6185,7 @@ fn stale_python_namespace_and_mutation_cache_refuses_replay_and_reparses() -> an
                     && hostile.edge_id.is_none()
                     && hostile.evidence_chain.is_empty()
             );
-            assert_eq!(hostile.provenance.language_adapter_version, "reference-v18");
+            assert_eq!(hostile.provenance.language_adapter_version, "reference-v19");
             let safe = facts
                 .iter()
                 .find(|fact| {
@@ -6498,7 +6685,7 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
             static_facts.iter().all(|fact| {
                 fact.status == ProofResolutionStatus::Exact
                     && fact.edge_id.is_some()
-                    && fact.provenance.language_adapter_version == "reference-v18"
+                    && fact.provenance.language_adapter_version == "reference-v19"
             }),
             "read-only getter poisoned {target}: {static_facts:#?}"
         );
@@ -11450,9 +11637,9 @@ fn unresolved_reflection_mutation_preserves_lexical_callable_authority() -> anyh
 #[test]
 fn stale_script_export_mutation_cache_refuses_replay_and_reparses() -> anyhow::Result<()> {
     for (extension, old_version, current_version) in [
-        ("js", "reference-v15", "reference-v16"),
-        ("ts", "reference-v17", "reference-v18"),
-        ("tsx", "reference-v17", "reference-v18"),
+        ("js", "reference-v15", "reference-v17"),
+        ("ts", "reference-v17", "reference-v19"),
+        ("tsx", "reference-v17", "reference-v19"),
     ] {
         let project = tempfile::tempdir()?;
         let mut store = Store::new_in_memory()?;
@@ -14764,7 +14951,7 @@ fn stale_ruby_php_receiver_bindings_refuse_replay_and_reparse() -> anyhow::Resul
             11,
             15,
             "reference-v3",
-            "reference-v4",
+            "reference-v5",
         ),
         (
             "php",
@@ -14782,7 +14969,7 @@ fn stale_ruby_php_receiver_bindings_refuse_replay_and_reparse() -> anyhow::Resul
             6,
             8,
             "reference-v2",
-            "reference-v3",
+            "reference-v4",
         ),
         (
             "php",
@@ -14800,7 +14987,7 @@ fn stale_ruby_php_receiver_bindings_refuse_replay_and_reparse() -> anyhow::Resul
             5,
             7,
             "reference-v2",
-            "reference-v3",
+            "reference-v4",
         ),
     ] {
         let project = tempfile::tempdir()?;
@@ -15068,7 +15255,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "python")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v18")
+        Some("reference-v19")
     );
     for (language, expected) in [
         ("java", "reference-v4"),
@@ -15090,8 +15277,8 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
     for (language, version) in [
         ("c", "reference-v2"),
         ("cpp", "reference-v5"),
-        ("ruby", "reference-v4"),
-        ("php", "reference-v3"),
+        ("ruby", "reference-v5"),
+        ("php", "reference-v4"),
     ] {
         assert_eq!(
             receipt
@@ -16123,6 +16310,811 @@ fn exact_dependency_domains_require_complete_governed_ownership() -> anyhow::Res
     for mutation in mutations {
         for eligibility in eligibility_classes {
             assert_exact_dependency_mutation_downgrades(mutation, eligibility)?;
+        }
+    }
+    Ok(())
+}
+
+fn assert_ordinary_receiver_refusal(
+    path: &str,
+    source: &str,
+    language: &str,
+    target: &str,
+    caller_line: u32,
+    call_line: u32,
+    structural_nominal_declaration: Option<(u32, u32)>,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[(path, source)])?;
+    let nodes = store.get_nodes()?;
+    let file = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == project.path().join(path).display().to_string()
+        })
+        .expect("independent source file");
+    let callers = nodes
+        .iter()
+        .filter(|node| {
+            node.file_node_id == Some(file.id)
+                && node.start_line == Some(caller_line)
+                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
+        .collect::<Vec<_>>();
+    let [caller] = callers.as_slice() else {
+        panic!("independent caller census: {callers:#?}");
+    };
+    let calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.file_node_id == Some(file.id)
+                && edge.line == Some(call_line)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name.ends_with(target))
+        })
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        panic!("intended ordinary CALL must exist: {calls:#?}");
+    };
+    assert_eq!(
+        call.effective_source(),
+        caller.id,
+        "independent caller endpoint"
+    );
+    let identity = call
+        .callsite_identity
+        .as_deref()
+        .and_then(parse_canonical_callsite_identity)
+        .expect("ordinary CALL has canonical identity");
+    assert_eq!(identity.file_id, FileId(file.id.0));
+    assert_eq!(identity.line, call_line);
+    assert_eq!(identity.raw_target, call.target);
+    eprintln!("{language} {path}:{call_line} pre-proof CALL: {call:#?}");
+    let resolved = call
+        .resolved_target
+        .and_then(|id| nodes.iter().find(|node| node.id == id));
+    eprintln!("independent caller={caller:#?}; resolved declaration={resolved:#?}");
+
+    // Do not clear graph resolution metadata: projection refusal must be
+    // checked alongside the actual ordinary endpoint emitted by indexing.
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language
+                && fact.callsite.file_id == identity.file_id
+                && fact.callsite.line == call_line
+                && fact.callsite.raw_target == target
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("nonempty hostile fact census: {facts:#?}");
+    };
+    assert_eq!(fact.caller, caller.id);
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.target.is_none());
+    assert!(fact.edge_id.is_none());
+    assert!(fact.evidence_chain.is_empty());
+    if let Some((owner_line, declaration_line)) = structural_nominal_declaration {
+        // Certain is an extractor-confidence diagnostic, not runtime dispatch
+        // proof. A known nominal receiver can remain useful structural evidence
+        // while an eager member mutation closes the stricter proof domain.
+        let owners = nodes
+            .iter()
+            .filter(|node| {
+                node.file_node_id == Some(file.id)
+                    && node.start_line == Some(owner_line)
+                    && node.kind == NodeKind::CLASS
+            })
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            panic!("independent nominal owner: {owners:#?}");
+        };
+        let declarations = nodes
+            .iter()
+            .filter(|node| {
+                node.file_node_id == Some(file.id)
+                    && node.start_line == Some(declaration_line)
+                    && matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+            })
+            .collect::<Vec<_>>();
+        let [declaration] = declarations.as_slice() else {
+            panic!("independent nominal member: {declarations:#?}");
+        };
+        let members = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::MEMBER
+                    && edge.effective_source() == owner.id
+                    && edge.effective_target() == declaration.id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members.len(),
+            1,
+            "nominal owner must contain expected member"
+        );
+        assert_eq!(call.effective_target(), declaration.id);
+        assert_eq!(call.certainty, Some(ResolutionCertainty::Certain));
+    } else {
+        assert!(
+            call.resolved_target.is_none(),
+            "ordinary indexing installed false receiver binding: {call:#?}"
+        );
+        assert!(call.certainty.is_none(), "{call:#?}");
+    }
+    let replayed = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == call.id)
+        .expect("ordinary CALL survives proof replay");
+    assert_eq!(
+        &replayed, call,
+        "nonexact projection leaves ordinary CALL unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn ordinary_ruby_conditional_receiver_has_no_certain_endpoint() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "lib/receiver.rb",
+        concat!(
+            "class Worker\n  def target\n  end\nend\n",
+            "class Other\n  def target\n  end\nend\n",
+            "def caller(receiver, flag)\n  if flag\n    receiver = Worker.new\n  end\n  receiver.target\nend\n",
+        ),
+        "ruby",
+        "target",
+        9,
+        13,
+        None,
+    )
+}
+
+#[test]
+fn ordinary_php_conditional_receiver_has_no_certain_endpoint() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/Receiver.php",
+        concat!(
+            "<?php\nclass Worker { public function target() {} }\n",
+            "class Other { public function target() {} }\n",
+            "function caller($receiver, $flag) {\n  if ($flag) { $receiver = new Worker(); }\n  $receiver->target();\n}\n",
+        ),
+        "php",
+        "target",
+        4,
+        6,
+        None,
+    )
+}
+
+#[test]
+fn ordinary_php_extract_receiver_has_no_certain_endpoint() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/Receiver.php",
+        concat!(
+            "<?php\nclass Worker { public function memberTarget() {} }\n",
+            "class Other { public function memberTarget() {} }\n",
+            "function caller(Worker $worker) {\n  extract(['worker' => new Other()]);\n  $worker->memberTarget();\n}\n",
+        ),
+        "php",
+        "memberTarget",
+        4,
+        6,
+        None,
+    )
+}
+
+#[test]
+fn relative_type_value_import_prefers_exact_callable_name() -> anyhow::Result<()> {
+    for declarations in [
+        "export interface Target { value: number }\nexport function target() {}\n",
+        "export function target() {}\nexport interface Target { value: number }\n",
+    ] {
+        assert_relative_import_exact_name_and_cache(
+            "typescript",
+            "ts",
+            declarations,
+            "import { type Target, target } from './target';\nexport function caller() { target(); }\n",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn relative_javascript_import_prefers_exact_callable_name() -> anyhow::Result<()> {
+    for declarations in [
+        "export class Target {}\nexport function target() {}\n",
+        "export function target() {}\nexport class Target {}\n",
+    ] {
+        assert_relative_import_exact_name_and_cache(
+            "javascript",
+            "js",
+            declarations,
+            "import { target } from './target';\nexport function caller() { target(); }\n",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_relative_import_exact_name_and_cache(
+    language: &str,
+    extension: &str,
+    declarations: &str,
+    importer_source: &str,
+) -> anyhow::Result<()> {
+    let target_path = format!("src/target.{extension}");
+    let importer_path = format!("src/importer.{extension}");
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (&target_path, declarations),
+            (&importer_path, importer_source),
+        ],
+    )?;
+    let nodes = store.get_nodes()?;
+    let target_file = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FILE
+                && node.serialized_name == project.path().join(&target_path).display().to_string()
+        })
+        .expect("target source file");
+    let targets = nodes
+        .iter()
+        .filter(|node| {
+            node.file_node_id == Some(target_file.id)
+                && node.kind == NodeKind::FUNCTION
+                && node.serialized_name == "target"
+        })
+        .collect::<Vec<_>>();
+    let [target] = targets.as_slice() else {
+        panic!("independent FUNCTION target: {targets:#?}");
+    };
+    let edges = store.get_edges()?;
+    let imports = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && nodes.iter().any(|node| {
+                    node.id == edge.source
+                        && node
+                            .serialized_name
+                            .trim_end_matches(" (import)")
+                            .rsplit(['.', ':'])
+                            .find(|part| !part.is_empty())
+                            == Some("target")
+                })
+        })
+        .collect::<Vec<_>>();
+    let [import] = imports.as_slice() else {
+        panic!("lowercase value IMPORT census: {imports:#?}");
+    };
+    let calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(2)
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name == "target")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "ordinary intended CALL census");
+    eprintln!("mixed specifier ordinary IMPORT: {import:#?}");
+    assert_eq!(
+        import.effective_target(),
+        target.id,
+        "value import must choose exact FUNCTION, not differently cased INTERFACE"
+    );
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    let [fact] = facts.as_slice() else {
+        panic!("intended imported CALL fact census: {facts:#?}");
+    };
+    let target_line = declarations
+        .lines()
+        .position(|line| line.starts_with("export function target"))
+        .unwrap() as u32
+        + 1;
+    assert_nominal_exact_target(
+        &store,
+        project.path(),
+        fact,
+        &target_path,
+        target_line,
+        None,
+    )?;
+
+    assert_nominal_caller(&store, project.path(), fact, &importer_path, 2, 2)?;
+    let before = store.get_proof_resolution_facts()?;
+    let paths = vec![
+        project.path().join(&target_path),
+        project.path().join(&importer_path),
+    ];
+    let rows = {
+        let mut statement = store
+            .get_connection()
+            .prepare("SELECT rowid, artifact_blob FROM index_artifact_cache")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    assert_eq!(rows.len(), 2, "both real source artifacts must exist");
+    let (old_version, current_version) = if language == "javascript" {
+        ("reference-v16", "reference-v17")
+    } else {
+        ("reference-v18", "reference-v19")
+    };
+    for (row_id, blob) in rows {
+        // Simulated prior identity on actual current payload, not old-binary output.
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        artifact["resolution_file"]["adapter_version"] = old_version.into();
+        for call in artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls")
+        {
+            call["adapter_version"] = old_version.into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE rowid = ?2",
+            rusqlite::params![serde_json::to_vec(&artifact)?, row_id],
+        )?;
+    }
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("old import identity refuses strict replay");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    assert_eq!(store.get_proof_resolution_facts()?, before);
+    for (generation, expected_hits) in [(2, 0), (3, 2)] {
+        let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+            &mut store,
+            &RefreshInfo {
+                mode: BuildMode::Incremental,
+                files_to_index: paths.clone(),
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(
+            result.artifact_cache_hits, expected_hits,
+            "{language} generation={generation}"
+        );
+        assert_eq!(fs::read_to_string(&paths[0])?, declarations);
+        assert_eq!(fs::read_to_string(&paths[1])?, importer_source);
+        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+        store.validate_proof_resolution_publication(&publication(generation))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == "target"
+            })
+            .collect::<Vec<_>>();
+        let [fact] = facts.as_slice() else {
+            panic!("current imported target census: {facts:#?}");
+        };
+        assert_nominal_exact_target(
+            &store,
+            project.path(),
+            fact,
+            &target_path,
+            target_line,
+            None,
+        )?;
+        assert_nominal_caller(&store, project.path(), fact, &importer_path, 2, 2)?;
+        assert_eq!(fact.provenance.language_adapter_version, current_version);
+        let imports = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::IMPORT && edge.source == import.source)
+            .collect::<Vec<_>>();
+        let [current_import] = imports.as_slice() else {
+            panic!("current IMPORT census: {imports:#?}");
+        };
+        assert_eq!(
+            current_import.effective_target(),
+            fact.target.expect("Exact target")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_cpp_factory_collision_does_not_select_hidden_type() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/collision.cpp",
+        concat!(
+            "struct Worker { void target() {} };\nstruct Other { void target() {} };\n",
+            "Other Worker() { return {}; }\nvoid caller() {\n  Worker().target();\n}\n",
+        ),
+        "cpp",
+        "target",
+        4,
+        5,
+        None,
+    )
+}
+
+#[test]
+fn ordinary_python_factory_collision_does_not_select_hidden_type() -> anyhow::Result<()> {
+    assert_ordinary_receiver_refusal(
+        "src/collision.py",
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "class Other:\n    def target(self):\n        pass\n",
+            "def Worker():\n    return Other()\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
+        ),
+        "python",
+        "target",
+        9,
+        11,
+        None,
+    )
+}
+
+#[test]
+fn ordinary_python_replaced_member_retains_only_structural_nominal_endpoint() -> anyhow::Result<()>
+{
+    assert_ordinary_receiver_refusal(
+        "src/mutation.py",
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def replacement():\n    pass\nsetattr(Worker, 'target', replacement)\n",
+            "def caller():\n    worker = Worker()\n    worker.target()\n",
+        ),
+        "python",
+        "target",
+        7,
+        9,
+        Some((1, 2)),
+    )
+}
+
+#[test]
+fn ordinary_script_replaced_member_retains_only_structural_nominal_endpoint() -> anyhow::Result<()>
+{
+    assert_ordinary_receiver_refusal(
+        "src/mutation.js",
+        concat!(
+            "export class C {\n  target() {}\n}\nexport function other() {}\n",
+            "Reflect.set(C.prototype, 'target', other);\n",
+            "export function caller() {\n  const receiver = new C();\n  receiver.target();\n}\n",
+        ),
+        "javascript",
+        "target",
+        6,
+        8,
+        Some((1, 2)),
+    )
+}
+
+#[test]
+fn ordinary_conditional_receiver_matrix_and_clean_bindings() -> anyhow::Result<()> {
+    let ruby_prefix =
+        "class Worker\n  def target\n  end\nend\nclass Other\n  def target\n  end\nend\n";
+    for body in [
+        "  unless flag\n    receiver = Worker.new\n  end\n",
+        "  while flag\n    receiver = Worker.new\n  end\n",
+        "  flag && (receiver = Worker.new)\n",
+        "  receiver = Other.new\n  if flag\n    receiver = Worker.new\n  end\n",
+        "  receiver = Worker.new\n  receiver = Other.new\n",
+    ] {
+        let source =
+            format!("{ruby_prefix}def caller(receiver, flag)\n{body}  receiver.target\nend\n");
+        let call_line = source
+            .lines()
+            .position(|line| line == "  receiver.target")
+            .unwrap() as u32
+            + 1;
+        assert_ordinary_receiver_refusal(
+            "lib/receiver.rb",
+            &source,
+            "ruby",
+            "target",
+            9,
+            call_line,
+            None,
+        )?;
+    }
+    let ruby_clean =
+        format!("{ruby_prefix}def caller\n  receiver = Worker.new\n  receiver.target\nend\n");
+    assert_f9_nominal_call_is_exact(
+        &[("lib/receiver.rb", &ruby_clean)],
+        "ruby",
+        ("lib/receiver.rb", 2, 1),
+        ("lib/receiver.rb", 9, 11),
+    )?;
+
+    let php_prefix = "<?php\nclass Worker { public function target() {} }\nclass Other { public function target() {} }\n";
+    for body in [
+        "  while ($flag) { $receiver = new Worker(); }\n",
+        "  $flag && ($receiver = new Worker());\n",
+        "  $receiver = new Worker();\n  \\EXTRACT(['receiver' => new Other()]);\n",
+        "  if ($flag) { extract(['receiver' => new Other()]); }\n",
+        "  $receiver = new Worker();\n  $receiver = new Other();\n",
+    ] {
+        let source = format!(
+            "{php_prefix}function caller(Worker $receiver, $flag) {{\n{body}  $receiver->target();\n}}\n"
+        );
+        let call_line = source
+            .lines()
+            .position(|line| line == "  $receiver->target();")
+            .unwrap() as u32
+            + 1;
+        assert_ordinary_receiver_refusal(
+            "src/Receiver.php",
+            &source,
+            "php",
+            "target",
+            4,
+            call_line,
+            None,
+        )?;
+    }
+    for body in [
+        "  $receiver = new Worker();\n",
+        "  extract(['receiver' => new Other()]);\n  $receiver = new Worker();\n",
+    ] {
+        let source =
+            format!("{php_prefix}function caller() {{\n{body}  $receiver->target();\n}}\n");
+        let call_line = source
+            .lines()
+            .position(|line| line == "  $receiver->target();")
+            .unwrap() as u32
+            + 1;
+        assert_f9_nominal_call_is_exact(
+            &[("src/Receiver.php", &source)],
+            "php",
+            ("src/Receiver.php", 2, 2),
+            ("src/Receiver.php", 4, call_line),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_php_extract_closes_foreach_element_binding() -> anyhow::Result<()> {
+    let source = concat!(
+        "<?php\nclass Worker { public function target() {} }\nclass Other { public function target() {} }\n",
+        "function caller($items) {\n  /** @var list<Worker> $items */\n",
+        "  foreach ($items as $receiver) {\n    extract(['receiver' => new Other()]);\n    $receiver->target();\n  }\n}\n",
+    );
+    assert_ordinary_receiver_refusal("src/Receiver.php", source, "php", "target", 4, 8, None)
+}
+
+#[test]
+fn ordinary_python_namespace_owner_and_alias_controls() -> anyhow::Result<()> {
+    for source in [
+        "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    worker.target()\ndef Worker():\n    return None\n",
+        "class Worker:\n    def target(self):\n        pass\nWorker = replacement\ndef caller():\n    worker = Worker()\n    worker.target()\n",
+    ] {
+        let caller = source
+            .lines()
+            .position(|line| line == "def caller():")
+            .unwrap() as u32
+            + 1;
+        let call = source
+            .lines()
+            .position(|line| line == "    worker.target()")
+            .unwrap() as u32
+            + 1;
+        assert_ordinary_receiver_refusal(
+            "src/receiver.py",
+            source,
+            "python",
+            "target",
+            caller,
+            call,
+            None,
+        )?;
+    }
+    // A shadowed Worker spelling must not contaminate an independently named owner.
+    assert_f9_nominal_call_is_exact(
+        &[(
+            "src/receiver.py",
+            "class Worker:\n    def target(self):\n        pass\ndef Worker():\n    return None\nclass Safe:\n    def target(self):\n        pass\ndef caller():\n    worker = Safe()\n    worker.target()\n",
+        )],
+        "python",
+        ("src/receiver.py", 7, 6),
+        ("src/receiver.py", 9, 11),
+    )?;
+    // Remote owner Worker is reached through the authenticated alias Bound,
+    // while a same-spelled local function has no authority over that alias.
+    assert_f9_nominal_call_is_exact(
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/target.py",
+                "class Worker:\n    def target(self):\n        pass\n",
+            ),
+            (
+                "pkg/main.py",
+                "from .target import Worker as Bound\ndef Worker():\n    return None\ndef caller():\n    worker = Bound()\n    worker.target()\n",
+            ),
+        ],
+        "python",
+        ("pkg/target.py", 2, 1),
+        ("pkg/main.py", 4, 6),
+    )
+}
+
+#[test]
+fn stale_ordinary_receiver_artifacts_reparse_then_reuse() -> anyhow::Result<()> {
+    for (language, path, source, caller_line, call_line, old_version, current_version) in [
+        (
+            "ruby",
+            "receiver.rb",
+            concat!(
+                "class Worker\n  def target\n  end\nend\nclass Other\n  def target\n  end\nend\n",
+                "def caller(receiver, flag)\n  if flag\n    receiver = Worker.new\n  end\n  receiver.target\nend\n"
+            ),
+            9,
+            13,
+            "reference-v4",
+            "reference-v5",
+        ),
+        (
+            "php",
+            "receiver.php",
+            concat!(
+                "<?php\nclass Worker { public function target() {} }\nclass Other { public function target() {} }\n",
+                "function caller(Worker $receiver) {\n  extract(['receiver' => new Other()]);\n  $receiver->target();\n}\n"
+            ),
+            4,
+            6,
+            "reference-v3",
+            "reference-v4",
+        ),
+        (
+            "python",
+            "receiver.py",
+            concat!(
+                "class Worker:\n    def target(self):\n        pass\nclass Other:\n    def target(self):\n        pass\n",
+                "def Worker():\n    return Other()\ndef caller():\n    worker = Worker()\n    worker.target()\n"
+            ),
+            9,
+            11,
+            "reference-v18",
+            "reference-v19",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let paths = index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let before = store.get_proof_resolution_facts()?;
+        let blob = store.get_connection().query_row(
+            "SELECT artifact_blob FROM index_artifact_cache",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        // Current payload with an explicitly simulated prior adapter identity;
+        // the causal baseline separately records actual old ordinary endpoints.
+        artifact["resolution_file"]["adapter_version"] = old_version.into();
+        for call in artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls")
+        {
+            call["adapter_version"] = old_version.into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1",
+            [serde_json::to_vec(&artifact)?],
+        )?;
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("stale parser identity must refuse proof replay");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+        assert_eq!(store.get_proof_resolution_facts()?, before);
+        for (generation, expected_hits) in [(2, 0), (3, 1)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "{language} generation={generation}"
+            );
+            assert_eq!(fs::read_to_string(&paths[0])?, source);
+            let nodes = store.get_nodes()?;
+            let file = nodes
+                .iter()
+                .find(|node| node.kind == NodeKind::FILE)
+                .expect("fixture file");
+            let caller = nodes
+                .iter()
+                .find(|node| {
+                    node.file_node_id == Some(file.id)
+                        && node.start_line == Some(caller_line)
+                        && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                })
+                .expect("independent caller");
+            let calls = store
+                .get_edges()?
+                .into_iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge.file_node_id == Some(file.id)
+                        && edge.line == Some(call_line)
+                        && nodes.iter().any(|node| {
+                            node.id == edge.target && node.serialized_name.ends_with("target")
+                        })
+                })
+                .collect::<Vec<_>>();
+            let [call] = calls.as_slice() else {
+                panic!("cache replay CALL census: {calls:#?}");
+            };
+            assert_eq!(call.effective_source(), caller.id);
+            assert!(
+                call.resolved_target.is_none() && call.certainty.is_none(),
+                "{language}: {call:#?}"
+            );
+            let identity = call
+                .callsite_identity
+                .as_deref()
+                .and_then(parse_canonical_callsite_identity)
+                .expect("actual canonical CALL identity");
+            assert_eq!(identity.file_id, FileId(file.id.0));
+            assert_eq!(identity.line, call_line);
+            assert_eq!(identity.raw_target, call.target);
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            let facts = store
+                .get_proof_resolution_facts()?
+                .into_iter()
+                .filter(|fact| {
+                    fact.callsite.file_id == FileId(file.id.0)
+                        && fact.callsite.line == call_line
+                        && fact.callsite.raw_target == "target"
+                })
+                .collect::<Vec<_>>();
+            let [fact] = facts.as_slice() else {
+                panic!("nonempty cache replay fact census: {facts:#?}");
+            };
+            assert_eq!(fact.caller, caller.id);
+            assert_ne!(fact.status, ProofResolutionStatus::Exact);
+            assert!(
+                fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty()
+            );
+            assert_eq!(fact.provenance.language_adapter_version, current_version);
         }
     }
     Ok(())

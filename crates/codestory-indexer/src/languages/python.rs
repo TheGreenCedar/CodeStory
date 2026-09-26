@@ -176,6 +176,7 @@ pub(crate) fn decorator_call_specs(tree: &Tree, source: &str) -> Vec<ManualEdgeS
 
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let module_type_blockers = python_module_type_binding_blockers(tree.root_node(), source);
     let imported_type_bindings = collect_python_imported_type_bindings(tree.root_node(), source);
     let imported_module_bindings =
         collect_python_imported_module_bindings(tree.root_node(), source);
@@ -264,7 +265,55 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         }
         edges.extend(fallback_specs);
     });
+    // A capitalized call spelling is not type authority when another module
+    // binding occupies that name. Imported aliases already resolve through
+    // their own local binding table; do not poison a remote owner merely
+    // because an unrelated local callable has its exported simple name.
+    edges.retain(|spec| {
+        spec.owner_module.is_some() || !module_type_blockers.contains(&spec.owner_name)
+    });
     edges
+}
+
+fn python_module_type_binding_blockers(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut blockers = HashSet::new();
+    let mut type_bindings = HashMap::<String, usize>::new();
+    walk_tree_nodes(root, &mut |node| {
+        if enclosing_node_with_kind(node, &["function_definition", "class_definition", "lambda"])
+            .is_some()
+        {
+            return;
+        }
+        match node.kind() {
+            "class_definition" => {
+                if let Some(name) = declaration_name(node, source) {
+                    *type_bindings.entry(name).or_default() += 1;
+                }
+            }
+            "import_from_statement" => {
+                for name in python_from_import_local_binding_names(node, source) {
+                    *type_bindings.entry(name).or_default() += 1;
+                }
+            }
+            "function_definition"
+            | "assignment"
+            | "import_statement"
+            | "with_item"
+            | "for_statement" => {
+                blockers.extend(python_local_binding_names(node, source));
+            }
+            "augmented_assignment" | "named_expression" | "type_alias_statement" => {
+                collect_python_top_level_assignment_bindings(node, source, &mut blockers);
+            }
+            _ => {}
+        }
+    });
+    blockers.extend(
+        type_bindings
+            .into_iter()
+            .filter_map(|(name, count)| (count > 1).then_some(name)),
+    );
+    blockers
 }
 
 /// Exact callsites whose receiver came from `with Owner() as alias`. The graph writer uses these
