@@ -1445,6 +1445,7 @@ pub(crate) fn search_sidecar_packet_batch(
 pub(crate) struct SidecarPacketBatchOutcome {
     pub results: Vec<(String, Vec<PacketSearchHit>)>,
     pub retryable_queries: Vec<String>,
+    pub retained_deadline_queries: Vec<String>,
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
@@ -1537,6 +1538,7 @@ fn search_sidecar_packet_batch_inner(
             .is_none_or(|session| session.includes_dense_semantic());
         let mut query_results = vec![None; batch_queries.len()];
         let mut missing_indices = Vec::new();
+        let mut retained_queries = HashSet::new();
         for (index, (query, _)) in batch_queries.iter().enumerate() {
             let retained = packet_session.as_ref().and_then(|session| {
                 session.descriptor_result(
@@ -1546,6 +1548,7 @@ fn search_sidecar_packet_batch_inner(
                 )
             });
             if let Some(result) = retained {
+                retained_queries.insert(query.clone());
                 query_results[index] = Some(result);
             } else {
                 missing_indices.push(index);
@@ -1618,6 +1621,7 @@ fn search_sidecar_packet_batch_inner(
             queries,
             query_results,
             clamp_elapsed_ms(batch_started_at),
+            &retained_queries,
             |query_result, max_results| {
                 resolve_sidecar_candidates_in_read(
                     controller,
@@ -1661,6 +1665,7 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         queries,
         query_results,
         batch_query_wall_ms,
+        &HashSet::new(),
         |query_result, max_results| {
             resolve_sidecar_candidates_for_test(controller, &query_result.hits, max_results)
         },
@@ -1672,6 +1677,7 @@ fn build_sidecar_packet_batch_outcome(
     queries: &[(String, usize)],
     query_results: Vec<QueryResult>,
     batch_query_wall_ms: u32,
+    retained_queries: &HashSet<String>,
     mut resolve: impl FnMut(&QueryResult, usize) -> Result<SidecarCandidateResolutionOutcome, ApiError>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
     if query_results.len() != queries.len() {
@@ -1686,6 +1692,7 @@ fn build_sidecar_packet_batch_outcome(
     }
     let mut results = Vec::with_capacity(queries.len());
     let mut retryable_queries = Vec::new();
+    let mut retained_deadline_queries = Vec::new();
     let mut diagnostics = Vec::with_capacity(queries.len());
     for ((query, max_results), query_result) in queries.iter().zip(query_results) {
         if query_result.query != *query {
@@ -1733,7 +1740,11 @@ fn build_sidecar_packet_batch_outcome(
             if let Some("deadline" | "stage_deadline") =
                 sidecar_blocking_cancel_reason(&query_result)
             {
-                retryable_queries.push(query.clone());
+                if retained_queries.contains(query) {
+                    retained_deadline_queries.push(query.clone());
+                } else {
+                    retryable_queries.push(query.clone());
+                }
                 // A deadline-cancelled batch query used to contribute
                 // NOTHING: every candidate it had already resolved was
                 // discarded here, before any scoring, ranking or carry could
@@ -1744,7 +1755,8 @@ fn build_sidecar_packet_batch_outcome(
                 // retrieval work on every deadline-pressured packet. The
                 // batch path now matches those semantics — see
                 // [`retained_cancelled_packet_hits`] — and the query is still
-                // marked retryable, so the retry runs exactly as before.
+                // retryable only when it was freshly executed. A retained
+                // descriptor is immutable and replay cannot recover its deadline.
                 results.push((query.clone(), retained_cancelled_packet_hits(packet_hits)));
                 continue;
             }
@@ -1763,6 +1775,7 @@ fn build_sidecar_packet_batch_outcome(
     Ok(SidecarPacketBatchOutcome {
         results,
         retryable_queries,
+        retained_deadline_queries,
         diagnostics,
     })
 }
@@ -1781,8 +1794,9 @@ fn build_sidecar_packet_batch_outcome(
 /// the single-query semantics.
 ///
 /// Retention is NOT atom-gated: every resolved hit is kept, subject to every
-/// existing downstream limit, and the query is still marked retryable so the
-/// retry runs exactly as before. The atom signal only ORDERS the result —
+/// existing downstream limit. Only freshly executed queries remain retryable;
+/// retained descriptor deadlines cannot be recovered by replay. The atom signal
+/// only ORDERS the result —
 /// resolution rank first, need-first as a tiebreak among equal ranks, then
 /// the original resolution order — so that when a downstream limit binds it
 /// binds on the identities that occupy the most role positions of the
@@ -4892,6 +4906,222 @@ mod tests {
     }
 
     #[test]
+    fn planned_query_preserves_sealed_deadline_hits_without_phantom_retry() {
+        use crate::agent::packet_batch::{PacketLatencyBudget, run_packet_planned_subqueries};
+        use crate::agent::packet_budget::packet_budget_limits;
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use crate::agent::packet_plan::build_packet_plan_with_extra;
+        use crate::agent::trace::TraceRecorder;
+        use codestory_contracts::api::{
+            AgentAnswerDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+            PacketQueryCompletionDto,
+        };
+
+        for reason in ["stage_deadline", "deadline", "cancelled"] {
+            let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
+            let pinned = Rc::new(
+                PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                    .expect("begin packet descriptor pin"),
+            );
+            let session = Rc::new(PacketProofSession::new());
+            let query = "public packet freshness anchor";
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                // Execute real descriptors, then supply a deadline before the admission seal.
+                // No already-sealed receipt is changed to create this fault.
+                let mut results = with_detached_sidecar_query_cache(&fixture.controller, |cache| {
+                    pinned.session.execute_packet_descriptor_batch_with_cache(
+                        &[QueryBatchItem {
+                            query,
+                            budget_ms: Some(18_000),
+                        }],
+                        None,
+                        cache,
+                    )
+                })
+                .expect("execute complete fixture descriptor");
+                let mut result = results.pop().expect("one descriptor query result");
+                assert!(results.is_empty());
+                assert_eq!(result.trace.retrieval_mode, "full");
+                assert!(
+                    !result.hits.is_empty(),
+                    "deadline fixture must retain real candidates"
+                );
+                session.record_descriptor_trace(&result.trace);
+                result.trace.cancel_reason = Some(reason.into());
+                let publication = pinned.session.publication_identity();
+                session
+                    .retain_descriptor_result(&result, true, publication)
+                    .expect("retain deadline result before sealing");
+                admit_packet_candidate_descriptors(&session, result.hits.iter());
+                assert!(!session.receipts().is_empty());
+                let resolution = resolve_sidecar_candidates_in_read(
+                    &fixture.controller,
+                    &pinned,
+                    &result.hits,
+                    4,
+                )
+                .expect("resolve indexed metadata source before planned call");
+                assert!(
+                    !resolution.packet_hits.is_empty(),
+                    "fixture must resolve indexed hits"
+                );
+
+                let sealed = serde_json::to_value(&result).expect("serialize sealed result");
+                let plan = build_packet_plan_with_extra(
+                    "generic question",
+                    PacketBudgetModeDto::Standard,
+                    &[query.into()],
+                );
+                let mut answer = AgentAnswerDto {
+                    answer_id: "sealed-deadline".into(),
+                    prompt: "generic question".into(),
+                    summary: String::new(),
+                    freshness: None,
+                    source_coverage: Vec::new(),
+                    focused_source: None,
+                    sections: Vec::new(),
+                    citations: Vec::new(),
+                    subgraph_ids: Vec::new(),
+                    retrieval_version: "fixture".into(),
+                    graphs: Vec::new(),
+                    retrieval_trace: TraceRecorder::new(Some(18_000)).finish(
+                        "sealed-deadline".into(),
+                        AgentRetrievalPresetDto::Architecture,
+                        AgentRetrievalPolicyModeDto::LatencyFirst,
+                    ),
+                };
+                let latency = PacketLatencyBudget::new(Some(18_000));
+                assert!(latency.remaining_for_handoff().is_some());
+                let mut exhausted_answer = answer.clone();
+                let planned = run_packet_planned_subqueries(
+                    &fixture.controller,
+                    &plan,
+                    PacketBudgetModeDto::Standard,
+                    &packet_budget_limits(PacketBudgetModeDto::Standard),
+                    false,
+                    latency,
+                    &mut answer,
+                );
+                if reason == "cancelled" {
+                    assert_eq!(
+                        planned
+                            .expect_err("retained cancellation must propagate")
+                            .code,
+                        "cancelled"
+                    );
+                    assert_eq!(
+                        session.benchmark_retrieval_proof().descriptor_query_count,
+                        1
+                    );
+                    assert!(answer.citations.is_empty());
+                    return;
+                }
+                planned.expect("resolve retained deadline evidence");
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    1,
+                    "a sealed descriptor must not execute retrieval again"
+                );
+                assert!(
+                    !answer.citations.is_empty(),
+                    "resolved deadline hits must survive"
+                );
+                assert_eq!(
+                    answer.retrieval_trace.packet_sidecar_diagnostics.len(),
+                    1,
+                    "a retained deadline is one resolution, not a retry result"
+                );
+                let diagnostic = &answer.retrieval_trace.packet_sidecar_diagnostics[0];
+                assert_eq!(diagnostic.query, query);
+                assert_eq!(
+                    diagnostic.completion,
+                    PacketQueryCompletionDto::Cancelled {
+                        reason: reason.into()
+                    }
+                );
+                assert!(diagnostic.resolved_hit_count > 0);
+                assert_eq!(answer.retrieval_trace.steps.len(), 1);
+                assert!(answer.retrieval_trace.annotations.iter().any(|note|
+                    note.text.contains("packet_fused_deadline_retry_omitted reason=sealed_descriptor count=1 retained_hits=1")));
+
+                assert!(
+                    answer
+                        .retrieval_trace
+                        .annotations
+                        .iter()
+                        .all(|note| !note.text.contains("packet_fused_blocking_cancel_retry")),
+                    "sealed result replay must not claim retry execution or exhaustion: {:?}",
+                    answer.retrieval_trace.annotations
+                );
+
+                run_packet_planned_subqueries(
+                    &fixture.controller,
+                    &plan,
+                    PacketBudgetModeDto::Standard,
+                    &packet_budget_limits(PacketBudgetModeDto::Standard),
+                    false,
+                    PacketLatencyBudget {
+                        started_at: Instant::now()
+                            .checked_sub(Duration::from_secs(2))
+                            .expect("backdate exhausted allowance"),
+                        target_ms: 1_000,
+                    },
+                    &mut exhausted_answer,
+                )
+                .expect("exhausted allowance must skip before dispatch");
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    1
+                );
+                assert!(exhausted_answer.citations.is_empty());
+                assert!(
+                    exhausted_answer
+                        .retrieval_trace
+                        .packet_sidecar_diagnostics
+                        .is_empty()
+                );
+                assert!(
+                    exhausted_answer
+                        .retrieval_trace
+                        .annotations
+                        .iter()
+                        .any(|note| note.text.contains(
+                            "packet_material_queries skipped reason=latency_budget_exhausted"
+                        ))
+                );
+
+                let fresh = search_sidecar_packet_batch_inner(
+                    &fixture.controller,
+                    &[("metadata".into(), 4)],
+                    Some(18_000),
+                )
+                .expect("an absent descriptor key still executes an eligible fresh query");
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+                assert!(fresh.retained_deadline_queries.is_empty());
+                assert_eq!(
+                    fresh.diagnostics[0].completion,
+                    PacketQueryCompletionDto::Completed
+                );
+                assert!(!fresh.results[0].1.is_empty());
+
+                assert_eq!(
+                    serde_json::to_value(
+                        session
+                            .descriptor_result(query, true, publication)
+                            .expect("sealed descriptor remains available")
+                    )
+                    .expect("serialize retained result"),
+                    sealed
+                );
+            });
+        }
+    }
+
+    #[test]
     fn ineligible_sidecar_descriptor_never_exports_an_unauthenticated_identity() {
         use crate::agent::packet_candidate::PacketProofSession;
 
@@ -6110,6 +6340,7 @@ mod tests {
             &queries,
             vec![query_result(None)],
             1,
+            &HashSet::new(),
             empty_resolution,
         )
         .expect("ordinary empty result");
@@ -6121,6 +6352,7 @@ mod tests {
                 &queries,
                 vec![query_result(Some(reason))],
                 1,
+                &HashSet::new(),
                 empty_resolution,
             )
             .expect("deadline result");
@@ -6128,15 +6360,54 @@ mod tests {
             assert!(deadline.results[0].1.is_empty());
         }
 
+        for reason in ["deadline", "stage_deadline"] {
+            let mut retained = query_result(Some(reason));
+            retained.query = "retained".into();
+            let mut fresh = query_result(Some(reason));
+            fresh.query = "fresh".into();
+            let mixed = build_sidecar_packet_batch_outcome(
+                &controller,
+                &[("retained".into(), 5), ("fresh".into(), 5)],
+                vec![retained, fresh],
+                1,
+                &HashSet::from(["retained".into()]),
+                empty_resolution,
+            )
+            .expect("classify retained and freshly executed deadlines independently");
+            assert_eq!(mixed.retained_deadline_queries, ["retained"]);
+            assert_eq!(mixed.retryable_queries, ["fresh"]);
+            assert_eq!(mixed.diagnostics.len(), 2);
+            assert!(
+                mixed
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.completion
+                        == PacketQueryCompletionDto::Cancelled {
+                            reason: reason.into()
+                        })
+            );
+        }
+
         let cancelled = build_sidecar_packet_batch_outcome(
             &controller,
             &queries,
             vec![query_result(Some("cancelled"))],
             1,
+            &HashSet::new(),
             empty_resolution,
         )
         .expect_err("public cancellation must not become an empty successful batch");
         assert_eq!(cancelled.code, "cancelled");
+        let retained_cancelled = build_sidecar_packet_batch_outcome(
+            &controller,
+            &queries,
+            vec![query_result(Some("cancelled"))],
+            1,
+            &HashSet::from(["handler".into()]),
+            empty_resolution,
+        )
+        .expect_err("retained cancellation must not be converted to a deadline omission");
+        assert_eq!(retained_cancelled.code, "cancelled");
     }
 
     #[test]
