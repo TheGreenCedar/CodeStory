@@ -18,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 use codestory_contracts::proof_resolution::{
-    EXACT_CALL_RESOLUTION_ALGORITHM, INTERNAL_RESOLUTION_PRODUCER,
-    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ResolutionEvidence, ResolutionProvenance,
-    parse_canonical_callsite_identity,
+    EXACT_CALL_RESOLUTION_ALGORITHM, FileId, INTERNAL_RESOLUTION_PRODUCER,
+    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofDependencyOrder, ResolutionEvidence,
+    ResolutionProvenance, parse_canonical_callsite_identity,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2364,10 +2364,12 @@ fn valid_resolution_provenance(provenance: &ResolutionProvenance) -> bool {
         && is_lower_hex_sha256(&provenance.parser_fingerprint)
         && is_lower_hex_sha256(&provenance.evidence_sha256)
         && !provenance.dependency_file_hashes.is_empty()
-        && provenance
-            .dependency_file_hashes
-            .windows(2)
-            .all(|pair| pair[0].file_id < pair[1].file_id)
+        && ProofDependencyOrder::for_language_adapter(&provenance.language_adapter).is_canonical(
+            provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id),
+        )
         && provenance.dependency_file_hashes.iter().all(|dependency| {
             dependency.file_id.0 != 0 && is_lower_hex_sha256(&dependency.source_sha256)
         })
@@ -2662,7 +2664,15 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
         if dependencies.is_empty() {
             return Err("compact_dependency_files_missing".to_owned());
         }
-        let mut prior_file_id = None;
+        let language_adapter = compact_string(
+            compact_object(
+                &provenance_profiles[profile],
+                "compact_provenance_profile_invalid",
+            )?,
+            "language_adapter",
+            "compact_provenance_profile_invalid",
+        )?;
+        let mut dependency_ids = Vec::with_capacity(dependencies.len());
         for file in dependencies {
             let index = compact_index(
                 file,
@@ -2674,10 +2684,12 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
                 "file_node_id",
                 "compact_file_id_invalid",
             )?;
-            if prior_file_id.is_some_and(|prior| prior >= file_id) {
-                return Err("compact_dependency_files_noncanonical".to_owned());
-            }
-            prior_file_id = Some(file_id);
+            dependency_ids.push(FileId(file_id));
+        }
+        if !ProofDependencyOrder::for_language_adapter(language_adapter)
+            .is_canonical(dependency_ids)
+        {
+            return Err("compact_dependency_files_noncanonical".to_owned());
         }
     }
     if referenced_profiles.iter().any(|referenced| !referenced) {
@@ -4221,6 +4233,27 @@ pub fn project_internal_call_path_result(
     project_compact_or_budget(complete)
 }
 
+// Exercise the compact boundary independently when an earlier checked guard fails.
+// Callers supply parser/Store-built facts; this helper never exists in product builds.
+#[cfg(test)]
+pub(crate) fn project_built_receipts_for_test(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    built: BuiltCallPathFacts,
+) -> Result<InternalProjection, InternalProjectionError> {
+    let disposition = integrate_built_disposition(contract, hashes, &built);
+    let authoritative_receipts = built.receipts.clone();
+    project_internal_call_path_result(&CheckedBuiltCallPathIntegration {
+        contract: contract.clone(),
+        hashes: hashes.clone(),
+        rendering: rendering.clone(),
+        built,
+        disposition,
+        authoritative_receipts,
+    })
+}
+
 pub fn project_translation_unknown_result(
     spec: &CallPathSpec,
     hashes: &ProofHashes,
@@ -5439,6 +5472,53 @@ mod tests {
         assert_eq!(root["disposition"]["receipts"], json!([0]));
         assert_eq!(root["steps"].as_array().unwrap().len(), 1);
         assert_eq!(serialized_size, serde_json::to_vec(&root).unwrap().len());
+    }
+
+    #[test]
+    fn compact_dependency_order_uses_each_referenced_profile() {
+        // Supplemental schema-boundary fixture, not parser/Store authority evidence.
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let mut first = indexed_receipt(0, "A", "B", "first\n".to_owned());
+        first.resolution_provenance.language_adapter = "ruby".to_owned();
+        let second = indexed_receipt(1, "B", "C", "second\n".to_owned());
+        let checked = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
+        );
+        let root = complete_root(&checked);
+        assert_eq!(validate_compact_projection(&root), Ok(()));
+        assert_eq!(
+            root["identities"]["provenance_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            root["identities"]["provenance_profiles"][0]["language_adapter"],
+            "ruby"
+        );
+        assert_eq!(
+            root["identities"]["provenance_profiles"][1]["language_adapter"],
+            "rust"
+        );
+        assert_eq!(
+            root["identities"]["evidence"][1]["provenance"]["profile"],
+            1
+        );
+        let mut mutated = root.clone();
+        mutated["identities"]["evidence"][1]["provenance"]["dependency_files"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert_eq!(
+            validate_compact_projection(&mutated),
+            Err("compact_dependency_files_noncanonical".to_owned()),
+            "second sorted profile cannot inherit the first encounter profile's policy"
+        );
+        assert_eq!(validate_compact_projection(&root), Ok(()));
     }
 
     #[test]

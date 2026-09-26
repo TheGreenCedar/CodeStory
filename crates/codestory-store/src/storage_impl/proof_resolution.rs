@@ -3,10 +3,11 @@ use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, CanonicalCallsiteIdentity, DependencyFileHash,
     EXACT_CALL_RESOLUTION_ALGORITHM, ExactCallsite, ExactCallsiteCorrelationFailure,
     ExactSyntaxCallsiteCorrelationInput, FileId, INTERNAL_RESOLUTION_PRODUCER,
-    OrdinaryCallEdgeCorrelationInput, PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofResolutionAdapter,
-    ProofResolutionFunnelCounts, ProofResolutionFunnelRow, ProofResolutionProjection,
-    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
-    ResolutionProvenance, correlate_exact_syntax_callsites, parse_canonical_callsite_identity,
+    OrdinaryCallEdgeCorrelationInput, PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofDependencyOrder,
+    ProofResolutionAdapter, ProofResolutionFunnelCounts, ProofResolutionFunnelRow,
+    ProofResolutionProjection, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
+    ResolutionEvidenceKind, ResolutionProvenance, correlate_exact_syntax_callsites,
+    parse_canonical_callsite_identity,
 };
 
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0";
@@ -184,33 +185,24 @@ pub fn seal_call_resolution_fact(
     if bash_fact {
         count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
     }
-    let linear_dependency_order = matches!(
-        fact.provenance.language_adapter.as_str(),
-        "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
-    );
-    if !linear_dependency_order {
+    let dependency_order =
+        ProofDependencyOrder::for_language_adapter(&fact.provenance.language_adapter);
+    if dependency_order == ProofDependencyOrder::AscendingFileId {
         fact.provenance.dependency_file_hashes.sort();
     }
-    let unique_dependencies = if linear_dependency_order {
-        let mut members = HashSet::new();
-        fact.provenance
-            .dependency_file_hashes
-            .iter()
-            .all(|dependency| {
-                if bash_fact {
-                    count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
-                } else {
-                    count_store_replay_work(1);
+    let unique_dependencies =
+        dependency_order.is_canonical(fact.provenance.dependency_file_hashes.iter().map(
+            |dependency| {
+                if dependency_order == ProofDependencyOrder::Encounter {
+                    if bash_fact {
+                        count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+                    } else {
+                        count_store_replay_work(1);
+                    }
                 }
-                members.insert(dependency.file_id)
-            })
-    } else {
-        !fact
-            .provenance
-            .dependency_file_hashes
-            .windows(2)
-            .any(|pair| pair[0].file_id == pair[1].file_id)
-    };
+                dependency.file_id
+            },
+        ));
     if !unique_dependencies {
         return Err(proof_error(
             "dependency file hashes contain a duplicate file",
@@ -270,30 +262,21 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
     if bash_fact {
         count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
     }
-    let linear_dependency_order = matches!(
-        fact.provenance.language_adapter.as_str(),
-        "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
-    );
-    let dependencies_are_canonical = if linear_dependency_order {
-        let mut members = HashSet::new();
-        fact.provenance
-            .dependency_file_hashes
-            .iter()
-            .all(|dependency| {
-                if bash_fact {
-                    count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
-                } else {
-                    count_store_replay_work(1);
+    let dependency_order =
+        ProofDependencyOrder::for_language_adapter(&fact.provenance.language_adapter);
+    let dependencies_are_canonical =
+        dependency_order.is_canonical(fact.provenance.dependency_file_hashes.iter().map(
+            |dependency| {
+                if dependency_order == ProofDependencyOrder::Encounter {
+                    if bash_fact {
+                        count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+                    } else {
+                        count_store_replay_work(1);
+                    }
                 }
-                members.insert(dependency.file_id)
-            })
-    } else {
-        !fact
-            .provenance
-            .dependency_file_hashes
-            .windows(2)
-            .any(|pair| pair[0].file_id >= pair[1].file_id)
-    };
+                dependency.file_id
+            },
+        ));
     if fact.callsite.file_id.0 == 0
         || fact.caller.0 == 0
         || !is_sha256(&fact.callsite.source_sha256)

@@ -92,7 +92,13 @@ Schema v33 normalizes proof provenance without changing the typed fact or its
 seal. Each fact retains its callsite file and an internal reference to a unique
 `(file, source hash, parser fingerprint, canonical dependency list)` group;
 reads reconstruct the original `CallResolutionFact` before validating its fact
-and publication digests. Multiple groups for one file remain valid. Missing,
+and publication digests. Dependency sequences remain part of those sealed bytes:
+Bash, Ruby, PHP, C#, Swift and Dart retain unique source-first encounter order;
+other adapters use ascending file IDs. The shared `ProofDependencyOrder` contract
+keeps Store shape checks and checked/compact consumers consistent. Store still
+authenticates the complete language-specific source/evidence dependency sequence
+and hashes; an order check alone does not authorize a fact. Multiple groups for
+one file remain valid. Missing,
 orphaned, extra, or cross-file provenance references fail closed. The v32 row
 rewrite, its row-count/publication checks, and the schema-33 writer barrier
 commit atomically, and migration never creates a proof publication receipt.
