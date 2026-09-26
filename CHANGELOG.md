@@ -2,85 +2,51 @@
 
 ## Unreleased
 
-- Call-path qualification stops at a bounded search budget and reports an unknown result when branching evidence exceeds it.
-
-- Valid Ruby, PHP, C#, Swift and Dart call-path evidence is no longer rejected solely because its source file identity sorts after a dependency.
-
-- Call navigation avoids conditional or shadowed receiver bindings in Ruby, PHP and Python. Relative JavaScript and TypeScript imports prefer an exact name and leave competing declarations unresolved.
-
-- Derived cache reset quarantines immutable core generations as well as legacy caches, so a newer cache schema can be rebuilt. Saved annotations and their retained migration export stay in place; reset refuses live readers and caches whose reader leases cannot be verified.
-
-- Cancelling a retrieval refresh before its pointer commit preserves the previous current and rollback generations.
-
-- Bash source-call proof refuses function bindings after unknown executable commands or unset effects that can change the function namespace.
-
-- Rust source-call proof preserves library module navigation when the same directory also contains a binary crate root.
-
-- JavaScript and TypeScript call proof refuses explicit prototype mutations,
-  including mutations declared in an imported class’s defining module. Calls
-  also retain their actual caller when several functions share a source line.
-
-- Python source-call proof now refuses shadowed constructor names and explicit
-  module-executed class-member mutations while preserving read-only calls.
-
-- Search keeps candidate metadata tied to the core generation pinned for each query, so a concurrent index update cannot hide source results.
-
-- Exact file-symbol lookups find the selected file’s declaration even when many other files contain the same name, while preserving ambiguity within that file.
-- Packets report query deadlines with the already resolved hits and an explicit notice when the admitted result cannot be retried.
-
-- `doctor` and plain `ready` now inspect missing or older caches without creating or upgrading them. They report when a full index is needed to make an older cache usable.
-- First upgrades from a complete 0.17.5 cache preserve a coherent rollback copy even when the filesystem cannot clone the database or committed data remains in SQLite's WAL. A full refresh can replace an interrupted standalone index while keeping annotations; an automatic refresh that falls back to a full rebuild reports the work it actually performed.
-- Cache cleanup can reclaim older, unreferenced core index images after readers release them, while retaining the current, rollback, and retrieval-bound images.
-- Retrieval indexing reports a committed index as successful when later generation cleanup cannot start, with a visible deferred-cleanup warning.
-- Cache rehydrate copies the source generation it validated. If a new target lacks space, it leaves the target directory untouched so a later retry starts cleanly.
-- Bookmarks retain their last verified binding when a core lookup or post-index cache refresh fails, so a later refresh can still follow a unique rename or move. Direct relative-root incremental indexing reports a committed refresh as successful when optional retrieval refresh evidence cannot be used.
-- Search no longer accepts `--why` or `--plan-details`; schema-3 search returns evidence, status, and gaps rather than explanations or a search plan.
-- Schema-3 search evidence includes repository-text matches and indexed file results, with explicit gaps when a result lacks a source path or the response reaches its row limit.
-- Lexical search over an incremental index can reach unchanged matches even when newer updates replace the first window of results from an older index component.
-- Go call navigation keeps locally shadowed import aliases distinct from package calls and follows ordinary package functions and factory methods when an external test package declares the same names.
-- Ruby and PHP call proof no longer treats a receiver assigned only on a conditional path as certain. PHP calls also stop using an earlier receiver type after `extract` can replace it, until an explicit assignment establishes it again.
-- C++ call proof no longer mistakes a same-named function for a class constructor.
-- Java call proof applies the same override refusal across declaration files and leaves nested receiver and type lookups without Exact call proof. Kotlin open classes and Swift classes no longer receive closed-domain call proof.
-
 ## 0.17.6
 
-CodeStory 0.17.6 improves how agents find, inspect and follow repository evidence. It adds comment-aware search and more accurate language relationships, fixes indexing failures across several source formats, and reduces storage and startup overhead.
+### A rebuilt evidence engine for coding agents
 
-### Source inspection and navigation
+CodeStory 0.17.6 rebuilds how your agent finds code, follows relationships and keeps its understanding current. Search reaches into declaration comments. Source inspection preserves the code behind a result. Index updates publish complete generations, so an investigation can stay tied to one coherent view of your repository while files change.
 
-- **Search declarations through their comments.** Search can match terms in attached comments even when they fall outside a symbol’s short summary.
-- **Open the source behind a result.** Context and snippet results retain verified line ranges and explicit truncation limits. Qualified method names such as `Owner.method` resolve with file and ambiguity checks. Pointer-returning C and C++ functions and functions assigned to JavaScript, TypeScript and TSX variables retain their complete definitions.
-- **Keep locations distinct from source evidence.** Compact packets include complete short files when possible. Larger files can appear as navigation targets with an explicit follow-up gap, rather than an arbitrary header excerpt presented as source support.
-- **Follow more accurate relationships.** Calls and imports remain available after full indexing and parser-cache reuse. Go navigation follows local package calls, aliases and concrete factory returns into receiver methods, while avoiding false links caused by shared imports, unrelated methods or ambiguous ownership.
-- **Include tests when needed.** Graph navigation accepts `caller_scope` to include test and benchmark callers. Production callers remain the default. Affected-code results preserve graph-backed reasons and also suggest tests from the same package.
-- **Preserve search relevance and project boundaries.** Results retain their relevance order across CLI and agent responses. File matching uses the selected project rather than its checkout location, including for extensionless files and supported source symlinks. File listings default to project coverage; the framework catalog remains available on request.
-- **Inspect configuration alongside code.** Terraform `.tf` and `.tfvars` files expose structural source anchors for blocks and assignments. Route and OpenAPI declarations with identical methods and paths remain attached to their own files and handlers.
+That work reaches deep into the engine: language resolution, incremental indexing, storage, retrieval and recovery. Your agent gets a richer local code map and can distinguish verified source, navigation leads and missing coverage.
 
-### Indexing and recovery
+### Find the code behind the question
+
+- Search declarations through their attached comments, even when the relevant words fall outside a symbol's short summary. Symbol, file and repository-text matches remain available through the agent-facing search response.
+- Open verified source ranges and complete short files directly from results. Larger files remain navigable with an explicit follow-up, and truncation is visible. Qualified names such as `Owner.method` resolve with file and ambiguity checks.
+- Keep the full definition when inspecting pointer-returning C and C++ functions or functions assigned to JavaScript, TypeScript and TSX variables.
+- Keep results in relevance order, with file matching scoped to the selected project, including extensionless files and supported source symlinks.
+- Explore Terraform `.tf` and `.tfvars` blocks and assignments alongside application code. Route and OpenAPI declarations stay attached to their own files and handlers, even when methods and paths repeat.
+
+### Follow relationships with the source in view
+
+Calls and imports survive both full indexing and parser-cache reuse. Go navigation follows package aliases and concrete factory returns into receiver methods. Rust preserves library module navigation beside a binary crate root. Across supported languages, resolution accounts for scope, visibility, receiver bindings and explicit mutations rather than treating a matching name as enough evidence.
+
+Graph navigation can include test and benchmark callers through `caller_scope`; production callers remain the default. Affected-code results explain graph-backed relationships and suggest tests from the same package. File-scoped symbol lookup stays focused on the selected file even when the repository contains many declarations with the same name.
+
+### Keep the map current without starting over
+
+Indexes, parser caches and stored source provenance use compression and deduplication to reduce disk use. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
+
+Complete immutable index generations keep readers on a coherent snapshot during updates. Cancellation before publication preserves the previous generation, and cleanup reclaims older images only after their readers release them. Cache upgrades retain bookmarks and annotations, including on filesystems without database cloning. Recovery can rebuild derived caches while leaving user-authored annotations in place.
+
+### Handle the repositories you actually work in
 
 - C and C++ indexing handles deeply nested syntax without overflowing the stack. Rust async closures, interface-only Java packages, Java type visibility, duplicate OpenAPI fixtures and empty property names are handled correctly.
-- Git-tracked source beneath directories named `build` remains discoverable while untracked build output stays excluded.
-- Dangling symlinks and non-regular targets are excluded with warnings. Permission errors and other unresolved inspection failures preserve incomplete status and the previous indexed inventory.
-- Malformed text configuration no longer blocks the entire repository index; unsupported or unreadable content is reported as a coverage gap. Supported JSONC files accept comments and trailing commas while ordinary JSON remains strict.
-- Windows indexing and grounding no longer fail with `Access is denied` when syncing a staged core database.
-- Cache upgrades preserve bookmarks and annotations. Interrupted index publication retains the previous complete publication for recovery, and explicit full refresh can recover eligible incomplete state.
-- Managed CLI installation and recovery remove owned temporary extraction files left by interruptions. MCP hosts can accept retry guidance while installation is in progress.
-
-### Performance and storage
-
-- Embedding-server startup is faster on Apple Silicon while retaining executable authentication.
-- Semantic and lexical indexes, parser caches and stored source provenance use less disk through compression and deduplication. Existing formats remain readable, with applicable migrations performed during project preparation.
-- Preparation reuses unchanged indexes and compatible embedding batches. Retrieval avoids repeated admission and snapshot work, and compatible sidecars can be prepared concurrently.
-- Core-only `search --repo-text off` uses the existing symbol index without starting embeddings.
-- Packet deadlines include preparation and publication checks. Cancellation and failure diagnostics identify the operation stage when available.
+- Git-tracked source inside directories named `build` remains discoverable. Symlinks and unreadable paths receive explicit coverage diagnostics; incomplete discovery cannot silently erase the previous inventory.
+- Malformed text configuration no longer blocks the whole index. JSONC accepts comments and trailing commas while ordinary JSON remains strict.
+- Windows can sync a staged core database without the previous `Access is denied` failure. Managed CLI recovery removes owned extraction files left by interruptions.
+- `doctor` and plain `ready` inspect caches without creating or upgrading them. Bookmarks keep their last verified binding when lookup or refresh fails, and a completed retrieval update stays successful when only later cleanup must be deferred.
 
 ### Upgrading
 
-**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must use evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Obsolete packet arguments are rejected, and `--diagnostics-out` replaces `--step-trace-out`.
+**Breaking interface change:** search, context and packet responses use publication schema 3. Custom clients must handle evidence identities, status and gaps in place of the previous hit, support and disposition shapes. Install matching CLI and plugin versions and start a fresh host session.
 
-See the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback using a preserved pre-upgrade cache copy.
+Obsolete packet arguments are rejected. `--diagnostics-out` replaces `--step-trace-out`; search `--why` and `--plan-details` are retired. File listings default to project coverage, with the framework catalog available on request.
 
-Packets remain experimental and bounded to sixteen evidence rows and 16 KiB. They provide evidence and navigation limits; they do not determine whether an investigation is complete. Terraform anchors describe source structure rather than resource-graph or expression semantics. The grounding skill directs agents to keep causes unresolved when available observations cannot distinguish them and to identify the next discriminating observation.
+Read the [upgrade guide](docs/users/upgrading.md) for migration examples and rollback. Preserve a complete pre-upgrade cache before upgrading; restoring it later does not restore annotations added after that snapshot.
+
+Packets remain experimental, limited to sixteen evidence rows and 16 KiB. They expose evidence and navigation gaps, not a verdict that an investigation is complete. Terraform coverage describes source structure rather than resource-graph or expression semantics.
 
 ## 0.17.5
 
