@@ -5461,6 +5461,10 @@ pub(crate) mod activation_tests {
         let browser = fixture.runtime.browser_service();
         let source = fixture.project.path().join("metadata.rs");
         let original = fs::read(&source).expect("read indexed source");
+        let original_mtime = fs::metadata(&source)
+            .expect("stat indexed source")
+            .modified()
+            .expect("indexed source modification time");
         let first = browser
             .packet(warm_packet_request())
             .expect("prime the ready lease fingerprint memo");
@@ -5487,7 +5491,30 @@ pub(crate) mod activation_tests {
             Some(recorded),
             "the ready lease must begin with a coherent observer identity"
         );
-        fs::write(&source, "// DELAYED_OBSERVER_DRIFT\n").expect("change indexed source");
+        let mut drifted = original.clone();
+        let last_byte = drifted.len() - 2;
+        drifted[last_byte] = b'X';
+        assert_ne!(drifted, original, "the drift must change source bytes");
+        fs::write(&source, &drifted).expect("change indexed source");
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .expect("reopen drifted source")
+            .set_modified(original_mtime)
+            .expect("restore source modification time");
+        let observed_source = fs::metadata(&source).expect("stat drifted source");
+        assert_eq!(
+            observed_source.len(),
+            original.len() as u64,
+            "the drift must preserve byte length"
+        );
+        assert_eq!(
+            observed_source
+                .modified()
+                .expect("drifted modification time"),
+            original_mtime,
+            "the drift must preserve modification time"
+        );
         assert_eq!(
             controller
                 .observed_source_epoch_if_armed(fixture.project.path())
