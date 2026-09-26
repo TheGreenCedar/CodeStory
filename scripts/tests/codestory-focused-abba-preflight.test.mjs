@@ -7,6 +7,8 @@ import {
   abbaRunPlan,
   focusedAbbaReceiptTimingClaims,
   focusedAbbaTiming,
+  focusedAbbaRawRowBlockers,
+  validateFocusedAbbaRows,
   transientEmbeddingServerTransition,
 } from "../codestory-focused-abba-preflight.mjs";
 
@@ -42,8 +44,14 @@ test("focused timing preflight schedules five paired ABBA rows per arm and task"
   }
 });
 
-test("focused timing preflight gives paired arms the same cohort id", () => {
+function timingFixture() {
   const raw = {
+    status: "pass",
+    quality: { pass: true },
+    installed_agent_timing_eligible: true,
+    task_id: "dart-http-client-flow",
+    arm: "with_codestory",
+    repeat: 1,
     agent_runner_wall_ms: 100.2,
     wall_ms: 125.4,
     codestory_harness_prelude: {
@@ -73,6 +81,11 @@ test("focused timing preflight gives paired arms the same cohort id", () => {
     task_id: "dart-http-client-flow",
     repeat: 1,
   };
+  return { raw, dimensions };
+}
+
+test("focused timing preflight gives paired arms the same cohort id", () => {
+  const { raw, dimensions } = timingFixture();
   const published = focusedAbbaTiming(raw, { ...dimensions, arm: "published_0_17_5" });
   const candidate = focusedAbbaTiming(raw, { ...dimensions, arm: "candidate_0_18" });
   assert.equal(published.timing_cohort_id, candidate.timing_cohort_id);
@@ -84,6 +97,61 @@ test("focused timing preflight gives paired arms the same cohort id", () => {
     time_to_final_packet_ms: 25,
     whole_task_wall_ms: 125,
   });
+  assert.throws(() => focusedAbbaTiming({ ...raw, status: "fail" }, dimensions), /status.*fail/u);
+});
+
+test("focused timing preflight rejects failed incomplete reused and ineligible raw rows with reasons", () => {
+  const { raw, dimensions } = timingFixture();
+  assert.deepEqual(focusedAbbaRawRowBlockers(raw), []);
+  for (const [mutate, reason] of [
+    [(row) => { row.status = "fail"; }, /status=fail/u],
+    [(row) => { row.status = "cancelled"; }, /status=cancelled/u],
+    [(row) => { delete row.status; }, /status=missing/u],
+    [(row) => { row.quality.pass = false; }, /quality/u],
+    [(row) => { delete row.quality; }, /quality/u],
+    [(row) => { row.installed_agent_timing_eligible = false; }, /not eligible/u],
+    [(row) => { delete row.installed_agent_timing_eligible; }, /not eligible/u],
+    [(row) => { row.comparative_wall_time_eligible = false; }, /comparative/u],
+    [(row) => { row.comparator_reuse_provenance = {}; }, /reused/u],
+    [(row) => { row.resume_provenance = {}; }, /not fresh/u],
+    [(row) => { row.installed_agent_timing_ineligibility_reason = "preparation_overlap"; }, /preparation_overlap/u],
+    [(row) => { delete row.installed_agent_timing; }, /missing measured/u],
+    [(row) => { row.installed_agent_timing.agent_runner_ms = null; }, /agent_runner_ms/u],
+    [(row) => { row.installed_agent_timing.time_to_first_packet_ms = -1; }, /time_to_first_packet_ms/u],
+    [(row) => { row.installed_agent_timing.continuation_ms = Number.NaN; }, /continuation_ms/u],
+    [(row) => { delete row.installed_agent_timing.whole_task_wall_ms; }, /whole_task_wall_ms/u],
+    [(row) => { row.installed_agent_timing.time_to_final_packet_ms += 1; }, /inconsistent/u],
+    [(row) => { row.task_id = "other-task"; }, /scheduled task/u],
+    [(row) => { row.arm = "native_tools"; }, /single-run cell/u],
+    [(row) => { row.repeat = 2; }, /single-run cell/u],
+  ]) {
+    const row = structuredClone(raw);
+    mutate(row);
+    assert.throws(() => focusedAbbaTiming(row, dimensions), reason);
+  }
+  const noPrelude = structuredClone(raw);
+  Object.assign(noPrelude.installed_agent_timing, {
+    time_to_first_packet_ms: 0, continuation_ms: 0, time_to_final_packet_ms: 0,
+  });
+  delete noPrelude.codestory_harness_prelude;
+  assert.equal(focusedAbbaTiming(noPrelude, dimensions).time_to_final_packet_ms, 0);
+});
+
+test("focused timing receipt requires complete unique eligible paired cells", () => {
+  const { raw } = timingFixture();
+  const plan = abbaRunPlan();
+  const rows = plan.map((cell) => ({ ...structuredClone(raw), ...cell }));
+  assert.equal(validateFocusedAbbaRows(rows), true);
+  assert.throws(() => validateFocusedAbbaRows(rows.slice(1)), /incomplete/u);
+  const duplicate = structuredClone(rows);
+  duplicate[1] = structuredClone(duplicate[0]);
+  assert.throws(() => validateFocusedAbbaRows(duplicate), /duplicate/u);
+  const failed = structuredClone(rows);
+  failed[1].status = "fail";
+  assert.throws(() => validateFocusedAbbaRows(failed), /timing-ineligible.*status=fail/u);
+  const wrong = structuredClone(rows);
+  wrong[1].task_id = "unexpected";
+  assert.throws(() => validateFocusedAbbaRows(wrong), /unexpected paired cell/u);
 });
 
 test("focused timing preflight retries only a zero-row embedding-server transition", () => {

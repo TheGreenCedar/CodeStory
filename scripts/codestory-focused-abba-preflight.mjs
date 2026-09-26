@@ -71,6 +71,11 @@ function abbaRunPlan(taskIds = REQUIRED_TASK_IDS, repeats = 5) {
 }
 
 function focusedAbbaTiming(rawRow, dimensions) {
+  const blockers = focusedAbbaRawRowBlockers(rawRow);
+  if (blockers.length) throw new Error(`focused ABBA raw row is timing-ineligible: ${blockers.join("; ")}`);
+  if (rawRow.task_id !== dimensions.task_id || rawRow.arm !== "with_codestory" || rawRow.repeat !== 1) {
+    throw new Error("focused ABBA raw row does not match the scheduled task and fresh single-run cell");
+  }
   const raw = rawRow?.installed_agent_timing;
   if (!raw) throw new Error("focused ABBA row has no installed agent timing");
   const timingCohortId = installedAgentTimingCohortId(dimensions);
@@ -94,6 +99,47 @@ function focusedAbbaTiming(rawRow, dimensions) {
     continuation_ms: continuationMs,
     whole_task_wall_ms: wholeTaskWallMs,
   });
+}
+
+function focusedAbbaRawRowBlockers(row) {
+  const reasons = [];
+  if (row?.status !== "pass") reasons.push(`status=${row?.status ?? "missing"}`);
+  if (row?.quality?.pass !== true) reasons.push("quality did not pass");
+  if (row?.installed_agent_timing_eligible !== true) reasons.push("raw installed timing is not eligible");
+  if (row?.comparative_wall_time_eligible === false) reasons.push("raw comparative wall time is ineligible");
+  if (row?.comparator_reuse_provenance != null) reasons.push("reused comparator row");
+  if (row?.resume_provenance != null) reasons.push("resumed row is not fresh");
+  if (row?.installed_agent_timing_ineligibility_reason != null) {
+    reasons.push(String(row.installed_agent_timing_ineligibility_reason));
+  }
+  const timing = row?.installed_agent_timing;
+  if (!/^[0-9a-f]{64}$/u.test(timing?.timing_cohort_id ?? "")) reasons.push("missing measured timing cohort");
+  for (const field of ["agent_runner_ms", "time_to_first_packet_ms", "continuation_ms", "time_to_final_packet_ms", "whole_task_wall_ms"]) {
+    if (typeof timing?.[field] !== "number" || !Number.isFinite(timing[field]) || timing[field] < 0) {
+      reasons.push(`missing or invalid measured ${field}`);
+    }
+  }
+  if (timing && timing.time_to_final_packet_ms !== timing.time_to_first_packet_ms + timing.continuation_ms) {
+    reasons.push("measured packet timing is inconsistent");
+  }
+  return reasons;
+}
+
+function validateFocusedAbbaRows(rows, plan = abbaRunPlan()) {
+  const key = ({ task_id, arm, repeat }) => JSON.stringify([task_id, arm, repeat]);
+  const expected = new Set(plan.map(key));
+  if (!Array.isArray(rows) || rows.length !== plan.length || expected.size !== plan.length) {
+    throw new Error("focused ABBA timing set is incomplete");
+  }
+  const seen = new Set();
+  for (const row of rows) {
+    const cell = key(row);
+    if (!expected.has(cell) || seen.has(cell)) throw new Error(`focused ABBA has duplicate or unexpected paired cell ${cell}`);
+    seen.add(cell);
+    const blockers = focusedAbbaRawRowBlockers(row);
+    if (blockers.length) throw new Error(`focused ABBA paired cell ${cell} is timing-ineligible: ${blockers.join("; ")}`);
+  }
+  return true;
 }
 
 function parseArgs(argv) {
@@ -303,6 +349,7 @@ async function runFocusedAbba(opts) {
       raw_inner_timing_cohort_id: rawRow.installed_agent_timing?.timing_cohort_id ?? null,
       installed_agent_timing: timing,
       installed_agent_timing_eligible: true,
+      status: rawRow.status,
       quality: rawRow.quality,
       packet: {
         status: rawRow.codestory_harness_prelude?.packet_evidence_availability?.status ?? null,
@@ -338,6 +385,7 @@ async function runFocusedAbba(opts) {
     cli_identities: identities,
     rows,
   };
+  validateFocusedAbbaRows(rows, plan);
   receipt.receipt_sha256 = sha256Bytes(stableJson(receipt));
   await writeFile(path.join(opts.outDir, "summary.json"), `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
   process.stdout.write(`wrote ${opts.outDir}\n`);
@@ -350,6 +398,8 @@ export {
   abbaRunPlan,
   focusedAbbaReceiptTimingClaims,
   focusedAbbaTiming,
+  focusedAbbaRawRowBlockers,
+  validateFocusedAbbaRows,
   focusedAbbaTimingCellsMeasured,
   parseArgs,
   runFocusedAbba,
