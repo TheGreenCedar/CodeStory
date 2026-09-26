@@ -23,18 +23,8 @@ pub use codestory_contracts::owned_artifacts::{
 };
 pub const CORE_DATABASE_FILE: &str = "codestory.db";
 
-/// Prefix for StorageError messages when block cloning cannot stage a core image.
-///
-/// Callers must escalate to a disposable complete-build rather than silently
-/// byte-copying the live database in production.
-pub const CORE_COPY_ON_WRITE_UNAVAILABLE: &str = "core_copy_on_write_unavailable";
 const LEGACY_ROLLBACK_COPY_PAGES_PER_STEP: i32 = 16;
 const LEGACY_ROLLBACK_BUSY_RETRIES: usize = 50;
-
-#[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static CORE_CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 #[cfg(test)]
 thread_local! {
@@ -65,39 +55,10 @@ pub(crate) fn with_core_pointer_sync_failure<T>(
     })
 }
 
-/// Force core CoW clones to report unavailable for the duration of `action`.
-///
-/// Production stays fail-closed without CoW. Tests normally get a test-only
-/// `fs::copy` fallback on non-reflink filesystems; this helper disables that
-/// fallback so callers can prove the complete-build escalate path.
+/// Exercise the production byte-copy fallback on any filesystem.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_core_clone_disabled<T>(action: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CORE_CLONE_DISABLED.set(self.0);
-        }
-    }
-
-    CORE_CLONE_DISABLED.with(|disabled| {
-        let restore = Restore(disabled.replace(true));
-        let result = action();
-        drop(restore);
-        result
-    })
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn core_clone_disabled() -> bool {
-    CORE_CLONE_DISABLED.get()
-}
-
-/// True when incremental staging failed because the filesystem cannot CoW-clone.
-pub fn is_core_copy_on_write_unavailable(error: &StorageError) -> bool {
-    match error {
-        StorageError::Other(message) => message.starts_with(CORE_COPY_ON_WRITE_UNAVAILABLE),
-        _ => false,
-    }
+    crate::sealed_file_stage::with_native_clone_disabled(action)
 }
 
 const MAX_POINTER_BYTES: u64 = 16 * 1024;
@@ -329,6 +290,13 @@ impl CorePublicationLayout {
         if destination.is_file() {
             return Ok(destination);
         }
+        crate::ensure_full_size_write_capacity(
+            self.legacy_storage_path.parent().ok_or_else(|| {
+                core_publication_error("Legacy storage path has no parent".into())
+            })?,
+            crate::storage_impl::database_logical_bytes_at_path(source_database)?,
+            "legacy rollback backup",
+        )?;
         let staged = self.create_staging_database_path()?;
         let result = (|| {
             // Even a successful main-file CoW clone can omit committed WAL
@@ -352,7 +320,7 @@ impl CorePublicationLayout {
     }
 }
 
-fn copy_legacy_rollback_snapshot(
+pub(crate) fn copy_legacy_rollback_snapshot(
     source: &Path,
     destination: &Path,
     cancelled: &dyn Fn() -> bool,
@@ -484,53 +452,6 @@ pub(crate) fn publish_rehydrated_generation(
     )
 }
 
-/// Clone a sealed generation into a distinct mutable stage without copying
-/// unchanged extents. `Ok(false)` means the current platform/filesystem cannot
-/// satisfy the copy-on-write contract; callers must not silently turn an
-/// incremental refresh into a foreground full copy.
-pub(crate) fn clone_file_copy_on_write(
-    source: &Path,
-    destination: &Path,
-) -> Result<bool, StorageError> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| core_path_error("inspect clone source", source, error))?;
-    if !metadata.file_type().is_file() {
-        return Err(core_publication_error(format!(
-            "Core clone source is not a regular file: {}",
-            source.display()
-        )));
-    }
-    if fs::symlink_metadata(destination).is_ok() {
-        return Err(core_publication_error(format!(
-            "Core clone destination already exists: {}",
-            destination.display()
-        )));
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| core_path_error("create clone parent", parent, error))?;
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    if core_clone_disabled() {
-        return Ok(false);
-    }
-    let cloned = clone_file_copy_on_write_platform(source, destination)?;
-    if cloned {
-        return Ok(true);
-    }
-    // Production stays fail-closed without CoW. Tests still need to exercise
-    // publication atomicity on filesystems (ext4 CI) that cannot reflink.
-    // `with_core_clone_disabled` skips this fallback so escalate paths can run.
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        fs::copy(source, destination)
-            .map_err(|error| core_path_error("test-only full copy stage", destination, error))?;
-        Ok(true)
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    Ok(false)
-}
-
 pub fn make_file_owner_writable(path: &Path) -> Result<(), StorageError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| core_path_error("inspect stage permissions", path, error))?;
@@ -582,164 +503,6 @@ pub(crate) fn make_file_immutable(path: &Path) -> Result<(), StorageError> {
         )));
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn clone_file_copy_on_write_platform(
-    source: &Path,
-    destination: &Path,
-) -> Result<bool, StorageError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let source_c = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| core_publication_error("Core clone source contains an interior NUL".into()))?;
-    let destination_c = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
-        core_publication_error("Core clone destination contains an interior NUL".into())
-    })?;
-    // SAFETY: both paths are live NUL-terminated buffers and clonefile retains
-    // neither pointer.
-    let result = unsafe { libc::clonefile(source_c.as_ptr(), destination_c.as_ptr(), 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    let _ = fs::remove_file(destination);
-    match error.raw_os_error() {
-        Some(libc::ENOTSUP | libc::EXDEV | libc::EINVAL) => Ok(false),
-        _ => Err(core_path_error("clone core generation", destination, error)),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn clone_file_copy_on_write_platform(
-    source: &Path,
-    destination: &Path,
-) -> Result<bool, StorageError> {
-    use std::os::fd::AsRawFd;
-
-    const FICLONE: libc::c_ulong = 0x4004_9409;
-    let source_file =
-        File::open(source).map_err(|error| core_path_error("open clone source", source, error))?;
-    let destination_file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(destination)
-        .map_err(|error| core_path_error("create clone destination", destination, error))?;
-    // SAFETY: both descriptors remain valid for the ioctl and the kernel
-    // retains neither descriptor.
-    let result = unsafe {
-        libc::ioctl(
-            destination_file.as_raw_fd(),
-            FICLONE,
-            source_file.as_raw_fd(),
-        )
-    };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    drop(destination_file);
-    let _ = fs::remove_file(destination);
-    match error.raw_os_error() {
-        Some(libc::EOPNOTSUPP | libc::EXDEV | libc::ENOTTY | libc::EINVAL) => Ok(false),
-        _ => Err(core_path_error("clone core generation", destination, error)),
-    }
-}
-
-#[cfg(windows)]
-fn clone_file_copy_on_write_platform(
-    source: &Path,
-    destination: &Path,
-) -> Result<bool, StorageError> {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-
-    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
-    const ERROR_INVALID_FUNCTION: i32 = 1;
-    const ERROR_NOT_SUPPORTED: i32 = 50;
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-
-    #[repr(C)]
-    struct DuplicateExtentsData {
-        file_handle: *mut c_void,
-        source_file_offset: i64,
-        target_file_offset: i64,
-        byte_count: i64,
-    }
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn DeviceIoControl(
-            device: *mut c_void,
-            control_code: u32,
-            input: *mut c_void,
-            input_size: u32,
-            output: *mut c_void,
-            output_size: u32,
-            bytes_returned: *mut u32,
-            overlapped: *mut c_void,
-        ) -> i32;
-    }
-
-    let source_file =
-        File::open(source).map_err(|error| core_path_error("open clone source", source, error))?;
-    let length = source_file
-        .metadata()
-        .map_err(|error| core_path_error("inspect clone source", source, error))?
-        .len();
-    let byte_count = i64::try_from(length).map_err(|_| {
-        core_publication_error("Core generation is too large for Windows block cloning".into())
-    })?;
-    let destination_file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(destination)
-        .map_err(|error| core_path_error("create clone destination", destination, error))?;
-    destination_file
-        .set_len(length)
-        .map_err(|error| core_path_error("size clone destination", destination, error))?;
-    let mut request = DuplicateExtentsData {
-        file_handle: source_file.as_raw_handle().cast(),
-        source_file_offset: 0,
-        target_file_offset: 0,
-        byte_count,
-    };
-    let mut bytes_returned = 0_u32;
-    // SAFETY: both file handles and the request remain live for the synchronous
-    // call. The control operation retains no pointer.
-    let result = unsafe {
-        DeviceIoControl(
-            destination_file.as_raw_handle().cast(),
-            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-            (&mut request as *mut DuplicateExtentsData).cast(),
-            std::mem::size_of::<DuplicateExtentsData>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_returned,
-            std::ptr::null_mut(),
-        )
-    };
-    if result != 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    drop(destination_file);
-    let _ = fs::remove_file(destination);
-    match error.raw_os_error() {
-        Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER) => Ok(false),
-        _ => Err(core_path_error("clone core generation", destination, error)),
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn clone_file_copy_on_write_platform(
-    _source: &Path,
-    _destination: &Path,
-) -> Result<bool, StorageError> {
-    Ok(false)
 }
 
 pub(crate) fn pointer_receipt_digest(
@@ -990,6 +753,28 @@ pub fn remove_staging_database(path: &Path) -> Result<(), StorageError> {
     }
 }
 
+/// After a sealed-file stage fails, its file helper has already removed only
+/// the file whose identity it created. Remove the unique stage directory only
+/// if it is empty; a replacement file must remain untouched.
+pub(crate) fn remove_empty_staging_directory(path: &Path) -> Result<(), StorageError> {
+    let directory = path.parent().ok_or_else(|| {
+        core_publication_error(format!("Stage has no directory: {}", path.display()))
+    })?;
+    if directory.parent().and_then(Path::file_name)
+        != Some(std::ffi::OsStr::new(CORE_STAGING_DIRECTORY))
+    {
+        return Err(core_publication_error(format!(
+            "Refusing to remove a non-core staging directory: {}",
+            directory.display()
+        )));
+    }
+    match fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(core_path_error("remove empty stage", directory, error)),
+    }
+}
+
 fn core_publication_error(message: String) -> StorageError {
     StorageError::Other(format!("core_publication_invalid: {message}"))
 }
@@ -1118,15 +903,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_on_write_stage_is_distinct_when_the_filesystem_supports_it() {
+    fn sealed_stage_is_distinct() {
         let root = tempfile::TempDir::new().expect("tempdir");
         let source = root.path().join("source.db");
         let destination = root.path().join("stage.db");
         fs::write(&source, b"immutable generation").expect("source");
+        make_file_immutable(&source).expect("seal source");
 
-        if !clone_file_copy_on_write(&source, &destination).expect("clone") {
-            return;
-        }
+        crate::stage_sealed_file(&source, &destination, &|| false).expect("stage");
         fs::write(&destination, b"candidate generation").expect("mutate stage");
 
         assert_eq!(
@@ -1140,23 +924,72 @@ mod tests {
     }
 
     #[test]
-    fn clone_disabled_never_silent_copies_and_reports_unavailable() {
+    fn disabled_native_clone_uses_production_copy() {
         let root = tempfile::TempDir::new().expect("tempdir");
         let source = root.path().join("source.db");
         let destination = root.path().join("stage.db");
         fs::write(&source, b"immutable generation").expect("source");
+        make_file_immutable(&source).expect("seal source");
 
-        let cloned = with_core_clone_disabled(|| {
-            clone_file_copy_on_write(&source, &destination).expect("clone probe")
+        let staged = with_core_clone_disabled(|| {
+            crate::stage_sealed_file(&source, &destination, &|| false).expect("copy stage")
         });
 
-        assert!(
-            !cloned,
-            "disabled CoW must return Ok(false), not a silent full copy"
+        assert_eq!(staged.strategy, crate::SealedStageStrategy::Copied);
+        assert_eq!(staged.copied_bytes, b"immutable generation".len() as u64);
+        assert_eq!(
+            fs::read(destination).expect("copied stage"),
+            b"immutable generation"
         );
-        assert!(
-            !destination.exists(),
-            "disabled CoW must not materialize a destination via fs::copy"
-        );
+    }
+
+    #[test]
+    fn legacy_backup_refuses_insufficient_space_before_staging() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let legacy = root.path().join("legacy.db");
+        drop(crate::Store::open(&legacy).expect("seed legacy database"));
+        let layout = CorePublicationLayout::from_storage_path(&legacy).expect("layout");
+        let result = crate::with_available_filesystem_bytes_override(0, || {
+            layout.materialize_existing_generation(&legacy, "legacy-1", &|| false)
+        });
+        match result {
+            Ok(_) => panic!("legacy backup must refuse zero available bytes"),
+            Err(error) => assert!(matches!(error, StorageError::InsufficientSpace { .. })),
+        }
+        assert!(!layout.staging_root().exists());
+    }
+
+    #[test]
+    fn legacy_backup_capacity_includes_committed_wal_pages() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let legacy = root.path().join("legacy-wal.db");
+        let store = crate::Store::open(&legacy).expect("seed legacy database");
+        let connection = store.get_connection();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("retain WAL");
+        connection
+            .execute_batch("CREATE TABLE wal_capacity_probe (payload BLOB NOT NULL)")
+            .expect("probe table");
+        connection
+            .execute(
+                "INSERT INTO wal_capacity_probe(payload) VALUES (zeroblob(?1))",
+                [2 * 1024 * 1024],
+            )
+            .expect("committed WAL pages");
+        let logical = crate::storage_impl::database_logical_bytes_at_path(&legacy)
+            .expect("logical image including WAL");
+        assert!(logical > fs::metadata(&legacy).expect("main file").len());
+        let required = logical + crate::FULL_SIZE_WRITE_RESERVE_BYTES;
+        let layout = CorePublicationLayout::from_storage_path(&legacy).expect("layout");
+        let error = crate::with_available_filesystem_bytes_override(required - 1, || {
+            layout
+                .materialize_existing_generation(&legacy, "legacy-wal-1", &|| false)
+                .expect_err("committed WAL pages must enter preflight")
+        });
+        assert!(matches!(error, StorageError::InsufficientSpace {
+            required_bytes, available_bytes, ..
+        } if required_bytes == required && available_bytes == required - 1));
+        assert!(!layout.staging_root().exists());
     }
 }

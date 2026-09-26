@@ -26,7 +26,7 @@ Graph navigation can include test and benchmark callers through `caller_scope`; 
 
 ### Keep the map current without starting over
 
-Indexes, parser caches and stored source provenance use compression and deduplication to reduce disk use. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
+Incremental updates reuse unchanged work across supported filesystems, including those without database cloning. When cache space is short, CodeStory reports the required and available bytes before starting a full-size index stage. Indexes, parser caches and stored source provenance use compression and deduplication. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
 
 Complete immutable index generations keep readers on a coherent snapshot during updates. Cancellation before publication preserves the previous generation, and cleanup reclaims older images only after their readers release them. Cache upgrades retain bookmarks and annotations, including on filesystems without database cloning. Recovery can rebuild derived caches while leaving user-authored annotations in place.
 
@@ -34,7 +34,7 @@ Complete immutable index generations keep readers on a coherent snapshot during 
 
 - C and C++ indexing handles deeply nested syntax without overflowing the stack. Rust async closures, interface-only Java packages, Java type visibility, duplicate OpenAPI fixtures and empty property names are handled correctly.
 - Git-tracked source inside directories named `build` remains discoverable. Symlinks and unreadable paths receive explicit coverage diagnostics; incomplete discovery cannot silently erase the previous inventory.
-- Malformed text configuration no longer blocks the whole index. JSONC accepts comments and trailing commas while ordinary JSON remains strict.
+- Malformed text configuration no longer blocks the whole index. JSONC comments and trailing commas are accepted in `tsconfig*` and `jsconfig*` files; ordinary JSON remains strict.
 - Windows can sync a staged core database without the previous `Access is denied` failure. Managed CLI recovery removes owned extraction files left by interruptions.
 - `doctor` and plain `ready` inspect caches without creating or upgrading them. Bookmarks keep their last verified binding when lookup or refresh fails, and a completed retrieval update stays successful when only later cleanup must be deferred.
 

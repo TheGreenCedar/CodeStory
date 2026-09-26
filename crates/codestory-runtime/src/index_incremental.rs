@@ -76,9 +76,7 @@ pub(super) fn index_incremental(
 /// Refresh and republish core projections.
 ///
 /// `_annotations_owned` is unused at runtime and load-bearing at compile time:
-/// see [`crate::index_full::index_full_for_runtime`]. When incremental CoW
-/// staging is unavailable, the same proof authorizes the disposable
-/// complete-build escalate path.
+/// see [`crate::index_full::index_full_for_runtime`].
 pub(super) fn index_incremental_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -173,6 +171,7 @@ pub(super) fn full_refresh_required_error(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            disk_space: None,
             coverage_gaps: Vec::new(),
         },
     )
@@ -972,8 +971,6 @@ enum IncrementalRefreshPreparation {
         probe: IncrementalPlanProbe,
         wall: IncrementalCoreWallDurations,
     },
-    /// Filesystem cannot CoW-clone the live core; escalate to disposable complete-build.
-    EscalateToCompleteBuild,
     Prepared(Box<PreparedIncrementalRefresh>),
 }
 
@@ -1001,17 +998,11 @@ fn prepare_incremental_refresh(
         return Ok(IncrementalRefreshPreparation::Unchanged { probe, wall });
     }
     let stage_open_started = Instant::now();
-    let staged = match SnapshotStore::clone_live_to_staged(storage_path) {
-        Ok(staged) => staged,
-        Err(error) if codestory_store::is_core_copy_on_write_unavailable(&error) => {
-            return Ok(IncrementalRefreshPreparation::EscalateToCompleteBuild);
-        }
-        Err(error) => {
-            return Err(ApiError::internal(format!(
-                "Failed to clone live storage for incremental build: {error}"
-            )));
-        }
-    };
+    let cancelled = || cancel_token.is_some_and(CancellationToken::is_cancelled);
+    let staged = SnapshotStore::clone_live_to_staged_with_cancel(storage_path, &cancelled)
+        .map_err(|error| {
+            crate::index_storage_error("Failed to stage live storage for incremental build", error)
+        })?;
     wall.stage_open = stage_open_started.elapsed();
     let staging_started = Instant::now();
     let mut preparation = StagedPreparation::new(staged);
@@ -1351,7 +1342,7 @@ fn run_incremental_indexing_common(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
-    annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
     precomputed_probe: Option<IncrementalPlanProbe>,
 ) -> Result<IndexingRunSummary, ApiError> {
     let core_started = Instant::now();
@@ -1370,25 +1361,6 @@ fn run_incremental_indexing_common(
                 probe,
                 wall.finish(core_started.elapsed(), None),
             ));
-        }
-        IncrementalRefreshPreparation::EscalateToCompleteBuild => {
-            // Incremental staging requires a CoW clone of the published core.
-            // When the filesystem cannot provide that, recover with the
-            // disposable complete-build lane instead of a silent live byte-copy.
-            tracing::warn!(
-                target: "codestory::index",
-                "incremental core copy-on-write unavailable; escalating to disposable complete-build"
-            );
-            return crate::index_full::index_full_for_runtime(
-                root,
-                storage_path,
-                events_tx,
-                cancel_token,
-                runtime,
-                source_index_policy,
-                annotations_owned,
-                None,
-            );
         }
         IncrementalRefreshPreparation::Prepared(prepared) => prepared,
     };

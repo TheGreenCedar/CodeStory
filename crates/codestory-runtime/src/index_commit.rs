@@ -358,10 +358,10 @@ impl PreparedCoreCommit {
                     CoreCommitMode::Full { .. } => "storage",
                     CoreCommitMode::Incremental => "incremental storage",
                 };
-                ApiError::internal(format!(
-                    "Failed to publish staged {publication}: {error}. Rejected stage cleanup attempted at {}",
-                    staged_path.display(),
-                ))
+                crate::index_storage_error(
+                    &format!("Failed to publish staged {publication}; rejected stage cleanup attempted at {}", staged_path.display()),
+                    error,
+                )
             })?;
         let search_state = self
             .search_state

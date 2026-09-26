@@ -254,7 +254,7 @@ mod tests {
     use crate::args::{OutputFormat, ProjectArgs, RefreshMode};
 
     #[test]
-    fn index_command_reports_executed_full_fallback_when_clone_is_unavailable() {
+    fn index_command_reports_incremental_copy_when_clone_is_unavailable() {
         let temp = tempfile::tempdir().expect("isolated index command fixture");
         let project = temp.path().join("project");
         fs::create_dir(&project).expect("project root");
@@ -279,17 +279,17 @@ mod tests {
         codestory_runtime::with_core_clone_disabled_for_test(|| {
             run_index(command(RefreshMode::Auto))
         })
-        .expect("auto refresh falls back to a full publication");
+        .expect("auto refresh keeps the incremental publication");
 
         let output: serde_json::Value = serde_json::from_slice(
             &fs::read(&output_file).expect("read executed index command JSON"),
         )
         .expect("parse index command JSON");
-        assert_eq!(output["refresh"], "auto(full)");
-        assert_eq!(output["refresh_reason"], "core_copy_on_write_unavailable");
+        assert_eq!(output["refresh"], "auto(incremental)");
+        assert!(output.get("refresh_reason").is_none());
         assert!(
-            !output["phase_timings"]["full_refresh_wall"].is_null(),
-            "the command must report the full refresh that actually executed"
+            output["phase_timings"]["full_refresh_wall"].is_null(),
+            "the command must report the incremental refresh that actually executed"
         );
         let storage_path = output["storage_path"]
             .as_str()
@@ -306,7 +306,7 @@ mod tests {
         };
         assert_eq!(
             published_mode(),
-            codestory_contracts::api::IndexPublicationModeDto::Full
+            codestory_contracts::api::IndexPublicationModeDto::Incremental
         );
 
         fs::write(&source, "pub fn alpha() -> i32 { 3 }\n").expect("change source again");
@@ -321,5 +321,40 @@ mod tests {
             published_mode(),
             codestory_contracts::api::IndexPublicationModeDto::Incremental
         );
+    }
+
+    #[test]
+    fn index_command_preserves_structured_insufficient_space_error() {
+        let temp = tempfile::tempdir().expect("isolated index command fixture");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).expect("project root");
+        fs::write(project.join("lib.rs"), "pub fn alpha() {}\n").expect("source");
+        let output_file = temp.path().join("index.json");
+        let command = IndexCommand {
+            project: ProjectArgs {
+                project,
+                cache_dir: Some(temp.path().join("cache")),
+            },
+            refresh: RefreshMode::Full,
+            format: OutputFormat::Json,
+            output_file: Some(output_file.clone()),
+            dry_run: false,
+            summarize: false,
+            progress: false,
+            watch: false,
+        };
+        let error = codestory_runtime::with_available_filesystem_bytes_for_test(0, || {
+            run_index(command).expect_err("zero available bytes must fail")
+        });
+        let typed = crate::runtime::api_error_in_chain(&error).expect("typed CLI error");
+        assert_eq!(typed.code, "insufficient_space");
+        let detail = typed
+            .details
+            .as_ref()
+            .and_then(|details| details.disk_space.as_ref())
+            .expect("structured capacity detail");
+        assert_eq!(detail.available_bytes, 0);
+        assert!(detail.required_bytes > 0);
+        assert!(!output_file.exists());
     }
 }

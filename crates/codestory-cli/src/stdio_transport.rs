@@ -13871,6 +13871,79 @@ version = "0.11.20"
     }
 
     #[test]
+    fn packet_admission_reports_disk_bytes_without_a_hot_retry() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(project.path().join("lib.rs"), "pub fn anchor() {}\n").expect("source");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let active = session.active_project.as_ref().expect("active project");
+        active.runtime.activation.set_terminal_disk_space_for_test(
+            project.path(),
+            &active.runtime.storage_path,
+            80_000_000,
+            0,
+        );
+        for id in ["space-first", "space-second"] {
+            let response = codestory_runtime::with_available_filesystem_bytes_for_test(0, || {
+                handle_stdio_message(
+                    &mut session,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/call",
+                        "params": {"name": "packet", "arguments": {
+                            "project": project.path(), "question": "Where is anchor?"
+                        }}
+                    })
+                    .to_string(),
+                    &Arc::new(AtomicBool::new(false)),
+                )
+                .expect("packet admission response")
+            });
+            let content: serde_json::Value = serde_json::from_str(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("MCP error text"),
+            )
+            .expect("MCP error JSON");
+            assert_eq!(content["code"], "codestory_unavailable", "{response}");
+            assert_eq!(content["cause_code"], "insufficient_space");
+            assert_eq!(
+                content["details"]["disk_space"]["required_bytes"],
+                80_000_000
+            );
+            assert_eq!(content["details"]["disk_space"]["available_bytes"], 0);
+            assert_eq!(content["state"], "unavailable");
+            assert!(content["retry_tool"].is_null());
+            assert_eq!(content["recommended_next_calls"], json!([]));
+        }
+        let after = session
+            .active_project
+            .as_ref()
+            .expect("retained project")
+            .runtime
+            .activation
+            .snapshot()
+            .expect("retained activation");
+        assert_eq!(after.attempt, 1);
+        assert_eq!(after.failure_code.as_deref(), Some("insufficient_space"));
+    }
+
+    #[test]
     fn published_status_preserves_durable_sqlite_bytes_and_sidecar_shape() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");

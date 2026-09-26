@@ -63,6 +63,54 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
+fn index_storage_error(context: &str, error: codestory_store::StorageError) -> ApiError {
+    match error {
+        codestory_store::StorageError::Cancelled => {
+            ApiError::new("cancelled", "core stage was cancelled")
+        }
+        codestory_store::StorageError::InsufficientSpace {
+            operation,
+            required_bytes,
+            available_bytes,
+        } => ApiError::insufficient_cache_space(operation, required_bytes, available_bytes),
+        other => ApiError::internal(format!("{context}: {other}")),
+    }
+}
+
+/// Preserve a sealed component copy's disk refusal through retrieval and CLI
+/// context frames without exposing the store crate to adapter code.
+pub fn insufficient_space_api_error(error: &anyhow::Error) -> Option<ApiError> {
+    error.chain().find_map(|cause| {
+        if let Some(codestory_store::StorageError::InsufficientSpace {
+            operation,
+            required_bytes,
+            available_bytes,
+        }) = cause.downcast_ref::<codestory_store::StorageError>()
+        {
+            Some(ApiError::insufficient_cache_space(
+                *operation,
+                *required_bytes,
+                *available_bytes,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn sealed_copy_insufficient_error_for_test(
+    required_bytes: u64,
+    available_bytes: u64,
+) -> anyhow::Error {
+    anyhow::Error::new(codestory_store::StorageError::InsufficientSpace {
+        operation: "sealed_component_copy",
+        required_bytes,
+        available_bytes,
+    })
+}
+
 /// Resolve whether the logical project storage path has a published core.
 pub fn core_database_exists(storage_path: &Path) -> Result<bool, ApiError> {
     codestory_store::core_database_exists(storage_path)
@@ -82,6 +130,13 @@ pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiErr
 #[doc(hidden)]
 pub fn with_core_clone_disabled_for_test<T>(action: impl FnOnce() -> T) -> T {
     codestory_store::with_core_clone_disabled(action)
+}
+
+/// Test-support: force the cache-volume observation at the runtime boundary.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_available_filesystem_bytes_for_test<T>(bytes: u64, action: impl FnOnce() -> T) -> T {
+    codestory_store::with_available_filesystem_bytes_override(bytes, action)
 }
 
 mod affected;

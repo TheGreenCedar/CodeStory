@@ -864,6 +864,48 @@ impl ActivationService {
         state.ready_lease = None;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_terminal_disk_space_for_test(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        required_bytes: u64,
+        available_bytes: u64,
+    ) {
+        let error = ApiError::insufficient_cache_space(
+            "incremental core stage",
+            required_bytes,
+            available_bytes,
+        );
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        state.target = Some(ActivationTarget::new(project_root, storage_path));
+        state.ready_lease = None;
+        state.current = Some(ActivationSnapshot {
+            operation_id: "activation-disk-space-fixture".into(),
+            revision: 1,
+            state: ActivationState::Unavailable,
+            stage: ActivationStage::CoreFreshness,
+            progress: activation_stage_progress(ActivationStage::CoreFreshness),
+            attempt: 1,
+            retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: Some(error.code),
+            failure: Some(error.message),
+            failure_details: error.details,
+            retained_core_publication: None,
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Unavailable,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        });
+    }
+
     pub fn activate_project(
         &self,
         project_root: &Path,
@@ -1286,6 +1328,11 @@ impl ActivationService {
             {
                 drop(state);
                 continue;
+            }
+            if let Some(snapshot) = state.current.as_ref()
+                && space_pressure_persists(snapshot, storage_path)
+            {
+                return Err(snapshot_error(snapshot));
             }
             crate::agent::packet_batch::observe_packet_entry_phase(
                 crate::agent::packet_batch::PacketEntryObservationPhase::ActivationStartedWorker,
@@ -2216,6 +2263,26 @@ fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
     error
 }
 
+fn space_pressure_persists(snapshot: &ActivationSnapshot, storage_path: &Path) -> bool {
+    if snapshot.failure_code.as_deref() != Some("insufficient_space") {
+        return false;
+    }
+    let Some(required_bytes) = snapshot
+        .failure_details
+        .as_deref()
+        .and_then(|details| details.disk_space.as_ref())
+        .map(|pressure| pressure.required_bytes)
+    else {
+        return true;
+    };
+    let volume = storage_path
+        .parent()
+        .and_then(|parent| parent.ancestors().find(|ancestor| ancestor.is_dir()))
+        .unwrap_or_else(|| Path::new("."));
+    codestory_store::available_filesystem_bytes(volume)
+        .map_or(true, |available| available < required_bytes)
+}
+
 fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
     activation_api_error(
         "activation_preparing",
@@ -2232,6 +2299,9 @@ fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
 }
 
 fn map_activation_error(error: anyhow::Error) -> ApiError {
+    if let Some(refusal) = crate::insufficient_space_api_error(&error) {
+        return refusal;
+    }
     if let Some(error) = embedding_api_error(&error) {
         return classify_activation_api_error(error);
     }
@@ -2268,7 +2338,9 @@ fn classify_activation_api_error(mut error: ApiError) -> ApiError {
             error.code = "activation_retryable".into();
             error
         }
-        "cancelled" | "activation_preparing" | "activation_retryable" => error,
+        "cancelled" | "activation_preparing" | "activation_retryable" | "insufficient_space" => {
+            error
+        }
         "source_unreadable"
         | "source_malformed"
         | "source_binary"
@@ -6463,6 +6535,55 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn disk_space_refusal_keeps_typed_snapshot_without_starting_a_hot_retry() {
+        let project = tempfile::tempdir().expect("project");
+        let missing_project = project.path().join("missing");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let service = Runtime::new().activation_service();
+        service.set_terminal_disk_space_for_test(&missing_project, &storage_path, 80_000_000, 0);
+        let before = service.snapshot().expect("terminal disk snapshot");
+        for _ in 0..2 {
+            let error = codestory_store::with_available_filesystem_bytes_override(0, || {
+                service
+                    .activate_project(
+                        &missing_project,
+                        &storage_path,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .expect_err("space pressure must not restart activation")
+            });
+            assert_eq!(error.code, "insufficient_space");
+            let details = error
+                .details
+                .as_deref()
+                .and_then(|details| details.disk_space.as_ref())
+                .expect("typed capacity survived snapshot");
+            assert_eq!(
+                (details.required_bytes, details.available_bytes),
+                (80_000_000, 0)
+            );
+        }
+        let after = service.snapshot().expect("retained snapshot");
+        assert_eq!(
+            (after.operation_id, after.attempt, after.revision),
+            (before.operation_id, before.attempt, before.revision)
+        );
+        assert_eq!(service.worker_start_count_for_test(), 0);
+        let resumed = codestory_store::with_available_filesystem_bytes_override(80_000_000, || {
+            service
+                .activate_project(
+                    &missing_project,
+                    &storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .expect_err("capacity recovery starts a new attempt; missing project then fails")
+        });
+        assert_eq!(resumed.code, "project_unavailable");
+        assert_eq!(service.worker_start_count_for_test(), 1);
+        assert_eq!(service.snapshot().expect("retry snapshot").attempt, 2);
+    }
+
+    #[test]
     fn cancelling_a_waiter_does_not_cancel_or_replace_shared_activation() {
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
@@ -7397,6 +7518,28 @@ pub(crate) mod activation_tests {
         let mapped = map_activation_error(error);
 
         assert_eq!(mapped.code, "cancelled");
+    }
+
+    #[test]
+    fn sealed_copy_capacity_refusal_survives_activation_mapping() {
+        let source = anyhow::Error::new(codestory_store::StorageError::InsufficientSpace {
+            operation: "sealed_component_copy",
+            required_bytes: 68_000_000,
+            available_bytes: 0,
+        })
+        .context("retrieval index finalize");
+        let mapped = map_activation_error(source);
+        assert_eq!(mapped.code, "insufficient_space");
+        let space = mapped
+            .details
+            .as_deref()
+            .and_then(|details| details.disk_space.as_ref())
+            .expect("disk details");
+        assert_eq!(space.operation, "sealed_component_copy");
+        assert_eq!(
+            (space.required_bytes, space.available_bytes),
+            (68_000_000, 0)
+        );
     }
 
     #[test]

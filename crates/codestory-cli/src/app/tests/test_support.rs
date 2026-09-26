@@ -375,6 +375,7 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             copy_ms: 13,
             source_bytes: 1_024,
             target_bytes: 1_024,
+            ..DatabaseSnapshotCopyTimings::default()
         }),
         core_promotion: Some(CorePromotionTimings {
             total_ms: 89,

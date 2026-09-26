@@ -208,6 +208,11 @@ pub struct DatabaseSnapshotCopyStats {
     pub copy_ms: u32,
     pub source_bytes: u64,
     pub target_bytes: u64,
+    pub stage_strategy: &'static str,
+    pub fallback_reason: Option<&'static str>,
+    pub native_error_code: Option<i32>,
+    pub cloned_bytes: u64,
+    pub copied_bytes: u64,
 }
 
 /// Rows rebound or invalidated while preparing a cache for a sibling worktree.
@@ -2641,6 +2646,16 @@ fn structural_text_unit_from_row(row: &Row<'_>) -> Result<StructuralTextUnit> {
 /// Errors returned by storage facade operations.
 #[derive(Error, Debug)]
 pub enum StorageError {
+    #[error("sealed file staging was cancelled")]
+    Cancelled,
+    #[error(
+        "insufficient cache space for {operation}: required {required_bytes} bytes, available {available_bytes} bytes"
+    )]
+    InsufficientSpace {
+        operation: &'static str,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
     #[error("Database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("{0} requires a non-zero batch limit")]
@@ -5599,6 +5614,11 @@ impl Storage {
             copy_ms,
             source_bytes,
             target_bytes,
+            stage_strategy: "sqlite_backup",
+            fallback_reason: None,
+            native_error_code: None,
+            cloned_bytes: 0,
+            copied_bytes: source_bytes,
         })
     }
 
