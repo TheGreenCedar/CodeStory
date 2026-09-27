@@ -64,11 +64,14 @@ Impact hints are not test results.
 
 ## Packet and search
 
-Only trust output when `retrieval status` reports `retrieval_mode: "full"`.
+Semantic search and experimental packets require full, current retrieval.
+Explicit `search --repo-text off --refresh none` reads an existing complete
+core without embedding preparation. Readiness alone does not establish answer
+quality.
 
 ```sh
 codestory-cli packet --project <repo> --question "<broad task question>"
-codestory-cli search --project <repo> --query "<symbol or behavior>" --why
+codestory-cli search --project <repo> --query "<symbol or behavior>"
 ```
 
 Packets use the standard evidence budget by default. Pass `--budget compact`
@@ -135,19 +138,28 @@ codestory-cli doctor --project <repo> --format markdown
 ```
 
 `cache reset` requires `--derived-only` and exactly one of `--dry-run` or
-`--confirm`. It moves derived state — the core database and its SQLite
-siblings, the rollback backup, promotion journals, the search trees, and
+`--confirm`. It moves derived state — the legacy core database and its SQLite
+siblings, immutable core pointers, generations and stages, the retrieval
+publication catalog, rollback backup, promotion journals, search trees, and
 local-refresh state — into a timestamped `derived-reset-quarantine/` directory
 inside the same cache root. Nothing is deleted, so a mistaken reset is
 recoverable by moving the quarantined files back. It never opens the database,
 which is what makes it usable against a schema it cannot read.
 
-User-authored annotations live in a sidecar beside the cache and are preserved
-in place; the command reports exactly what it moved and what it preserved.
-The reset holds this project's index-writer and promotion locks for the whole
-move, so a concurrent indexing run or publication either finishes first or is
-refused with `cache_busy`; if neither releases within the wait budget the reset
-itself refuses and moves nothing.
+User-authored annotations, their SQLite siblings, and the retained annotation
+migration export stay in place. The command reports what it moved and preserved.
+Writer, promotion, and core acquisition lock files also stay at their live
+paths. Reset excludes retrieval publication and readers, waits within the
+publication budget for an indexing writer or core publisher, then takes core
+acquisition and every generation lease before moving state. A live reader,
+incomplete generation enumeration, or missing lease refuses the reset before
+any move; retry once active work is idle.
+
+Older immutable layouts without the acquisition lock or generation leases
+cannot prove that readers are idle and are refused. Restore a compatible
+complete cache backup, or stop every CodeStory client using that cache before
+manually quarantining its derived state. Keep annotations and their retained
+export. The command does not create missing reader leases to bypass this guard.
 
 Retrieval generations are reclaimed separately by
 `codestory-cli retrieval inventory --project <repo> --apply` once the rebuild

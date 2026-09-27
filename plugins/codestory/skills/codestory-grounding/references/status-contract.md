@@ -89,16 +89,20 @@ envelope. CLI JSON, HTTP, and MCP use the same stamp. When neither a core nor
 retrieval identity exists, the stamp remains present with
 `served_from=contract_only`; it must not claim a complete publication.
 
-Schema version 2 is the v0.17.0 contract. It is not a purely additive bump:
-`tools/call` arguments are validated against the published catalog and rejected
-with JSON-RPC `-32602` instead of being repaired, so a client written against
-schema 1 can see valid-looking requests refused. Compare against
-`minimum_compatible_schema_version` rather than assuming forward compatibility.
+Schema version 3 is the evidence-only contract, and its minimum compatible
+schema is also 3. Packet, context, and search expose closed evidence
+projections without proof dispositions. `tools/call` arguments are validated
+against the negotiated profile's catalog and rejected with JSON-RPC `-32602`
+instead of being repaired. Compare against `minimum_compatible_schema_version`
+rather than assuming forward compatibility.
 
 The `initialize` result carries the same stamp plus `_meta.codestory_protocol`,
 which reports the requested revision, the negotiated revision, every revision the
-server implements, and whether the two agree. The server answers with a revision
-it actually implements; it never echoes an unsupported one back as supported.
+server implements, the preferred revision, the selected discovery digest, and
+whether the two agree. Supported revisions are `2024-11-05`, `2025-03-26`,
+`2025-06-18`, and `2025-11-25`, with the newest preferred. The server answers
+with a revision it actually implements; it never echoes an unsupported one back
+as supported.
 Through the packaged plugin the launcher answers `initialize` for the host, so
 the handshake stamp is the launcher's: it is always `served_from=contract_only`
 and reports the response contract version and the pinned pair, never a

@@ -1,7 +1,7 @@
 {
   "schema": "codestory.release-freeze-acceptance-jobs/v2",
   "workflow": ".github/workflows/source-proof.yml",
-  "workflow_context_sha256": "c2c807e4ea1e830e07fdbee2ab52a47f2e765be694e3e3cb6e681840c7893250",
+  "workflow_context_sha256": "4b041d075891ef8d7a2926b6651845b84f8a88b617ce6314f16da37d289b9b3e",
   "jobs": {
     "resolve": "d5f548a981f92e6597233ca50b7184627b79515e89911e214244fcb4a29f378f",
     "freeze-hostile-mutations": "ebc27d28a1c087f848be090d2a2a458acee0177f06048c4d357e0724cf38be1a",

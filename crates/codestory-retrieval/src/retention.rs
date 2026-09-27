@@ -243,6 +243,19 @@ impl GenerationRetentionLock {
         }
     }
 
+    /// A best-effort cleanup must not wait behind a query or publisher holding
+    /// the shared global fence. Its next pass can retry after they finish.
+    pub fn try_acquire(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
+        let (path, file) = Self::open_lock_file(state_file, scope_id)?;
+        match bounded_locks::try_acquire(&file, FileLockKind::Exclusive) {
+            Ok(true) => Ok(Some(Self { file })),
+            Ok(false) => Ok(None),
+            Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
+                format!("try lock exclusive generation retention {}", path.display())
+            }),
+        }
+    }
+
     /// Observe the retention lock without creating it.
     ///
     /// A read-only pass may not be the reason a retention directory or lock
@@ -863,6 +876,28 @@ pub struct GenerationRetentionApplyReport {
     pub remaining_reclaimable_bytes: u64,
     pub removals: Vec<GenerationRemovalResult>,
     pub errors: Vec<String>,
+}
+
+impl GenerationRetentionApplyReport {
+    /// The publication is committed, but cleanup never reached a remover.
+    pub(crate) fn cleanup_deferred(plan: &GenerationRetentionPlan, error: String) -> Self {
+        let mut errors = plan.errors.clone();
+        errors.push(error);
+        Self {
+            dry_run: false,
+            project_id: plan.project_id.clone(),
+            pruning_suppressed: true,
+            active_bytes: plan.active_bytes,
+            rollback_bytes: plan.rollback_bytes,
+            building_bytes: plan.building_bytes,
+            retained_bytes: plan.retained_bytes,
+            reclaimable_bytes: plan.reclaimable_bytes,
+            removed_bytes: 0,
+            remaining_reclaimable_bytes: plan.reclaimable_bytes,
+            removals: Vec::new(),
+            errors,
+        }
+    }
 }
 
 pub fn apply_generation_retention(

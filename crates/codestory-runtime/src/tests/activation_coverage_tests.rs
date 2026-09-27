@@ -16,6 +16,266 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn malformed_source_publication_preserves_bytes_without_projection_authority() {
+    let _env = hybrid_test_env();
+    for (name, malformed, valid) in [
+        (
+            "settings.yml",
+            "options: [\n",
+            "options:\n  enabled: true\n",
+        ),
+        ("settings.json", "{\"options\":", "{\"options\": true}\n"),
+        ("settings.toml", "options = [\n", "options = true\n"),
+    ] {
+        let workspace = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let source_path = workspace.path().join(name);
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(workspace.path().join("lib.rs"), "pub fn retained() {}\n").unwrap();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+
+        // Cold, repair, and regression to malformed all use the same source policy.
+        for (index, source) in [malformed, valid, malformed].into_iter().enumerate() {
+            fs::write(&source_path, source).unwrap();
+            let mode = if index == 0 {
+                IndexMode::Full
+            } else {
+                IndexMode::Incremental
+            };
+            controller
+                .run_indexing_blocking_without_runtime_refresh(mode)
+                .expect("verified malformed source must not prevent publication");
+            let storage = Store::open_read_only(&storage_path).unwrap();
+            assert_eq!(fs::read_to_string(&source_path).unwrap(), source);
+            assert!(
+                storage
+                    .get_nodes()
+                    .unwrap()
+                    .iter()
+                    .any(|node| node.serialized_name == "retained")
+            );
+            let publication = storage.get_complete_index_publication().unwrap().unwrap();
+            let file = storage.get_file_by_path(&source_path).unwrap().unwrap();
+            let inventory = storage.files().inventory().unwrap();
+            let observed = inventory.iter().find(|entry| entry.id == file.id).unwrap();
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                observed.content_hash.as_deref(),
+                Some(format!("{:x}", Sha256::digest(source.as_bytes())).as_str()),
+                "source digest must survive {name}"
+            );
+            assert!(
+                !observed.retry_required,
+                "unchanged source must not be rescheduled"
+            );
+            let gaps = crate::stored_file_coverage_diagnostics(workspace.path(), &storage).unwrap();
+            if source == malformed {
+                assert!(!file.complete);
+                assert!(gaps.iter().any(|gap| gap.path == name
+                    && gap.reason == FileCoverageReason::Malformed
+                    && gap.verified_source
+                    && !gap.projection_available
+                    && !gap.retryable));
+                let connection = storage.get_connection();
+                let nodes: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM node WHERE file_node_id = ?1 AND id != ?1",
+                        [file.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(nodes, 0, "malformed source retained graph nodes");
+                for table in ["symbol_search_doc", "dense_anchor_input"] {
+                    let count: i64 = connection
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM {table} WHERE file_node_id = ?1"),
+                            [file.id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, 0, "malformed source retained {table}");
+                }
+                assert!(
+                    !storage
+                        .get_structural_text_projection_file_ids()
+                        .unwrap()
+                        .contains(&file.id)
+                );
+                assert_eq!(storage.proof_resolution_fact_count().unwrap(), 0);
+            } else {
+                assert!(file.complete);
+                assert!(gaps.iter().all(|gap| gap.path != name));
+                assert!(
+                    storage
+                        .get_structural_text_projection_file_ids()
+                        .unwrap()
+                        .contains(&file.id)
+                );
+            }
+            drop(storage);
+            let public_files = controller
+                .indexed_files(IndexedFilesRequest {
+                    include_framework_coverage: false,
+                    path_contains: Some(name.into()),
+                    language: None,
+                    role: None,
+                    limit: Some(10),
+                })
+                .unwrap();
+            if source == malformed {
+                assert!(public_files.coverage_gaps.iter().any(|gap| gap.path == name
+                    && gap.reason == FileCoverageReason::Malformed
+                    && gap.verified_source
+                    && !gap.projection_available));
+            }
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect("unchanged source refresh");
+            assert_eq!(
+                Store::database_index_publication(&storage_path).unwrap(),
+                Some(publication),
+                "unchanged source must preserve its publication"
+            );
+        }
+    }
+}
+
+#[test]
+fn full_refresh_verifies_sql_with_literal_escape() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let source_path = workspace.path().join("fixtures/terminal.sql");
+    fs::create_dir_all(source_path.parent().expect("fixture parent")).unwrap();
+    let source = concat!(
+        "-- café terminal fixture\n",
+        "CREATE TABLE items(note TEXT);\n",
+        "INSERT INTO items VALUES ('\x1b[31mred\x1b[0m');\n",
+    );
+    fs::write(&source_path, source.as_bytes()).unwrap();
+    let storage_path = cache.path().join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .unwrap();
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("valid UTF-8 SQL containing ESC must remain verified source");
+
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let file = storage.get_file_by_path(&source_path).unwrap().unwrap();
+    assert!(file.complete);
+    let inventory = storage.files().inventory().unwrap();
+    let observed = inventory.iter().find(|entry| entry.id == file.id).unwrap();
+    use sha2::{Digest, Sha256};
+    let expected_content_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+    assert_eq!(
+        observed.content_hash.as_deref(),
+        Some(expected_content_hash.as_str())
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source.as_bytes());
+    let gaps = crate::stored_file_coverage_diagnostics(workspace.path(), &storage).unwrap();
+    assert!(gaps.iter().all(|gap| gap.path != "fixtures/terminal.sql"));
+    assert!(
+        storage
+            .get_structural_text_projection_file_ids()
+            .unwrap()
+            .contains(&file.id)
+    );
+}
+
+#[test]
+fn malformed_source_publication_rejects_drift_and_preserves_previous_on_faults() {
+    let _env = hybrid_test_env();
+    for mode in [IndexMode::Full, IndexMode::Incremental] {
+        for scenario in [
+            "drift",
+            "unreadable",
+            "cancel",
+            "publish_failure",
+            "search_cancel",
+            "marker_failure",
+        ] {
+            if scenario == "marker_failure" && mode == IndexMode::Full {
+                continue;
+            }
+            let workspace = tempdir().unwrap();
+            let cache = tempdir().unwrap();
+            let source = workspace.path().join("settings.yml");
+            let storage_path = cache.path().join("codestory.db");
+            fs::write(&source, "options: true\n").unwrap();
+            let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .unwrap();
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .unwrap();
+            let previous = Store::database_index_publication(&storage_path).unwrap();
+            let previous_structure = super::structural_live_identity(&storage_path);
+            fs::write(&source, "options: [\n").unwrap();
+            let token = CancellationToken::new();
+            if matches!(scenario, "drift" | "unreadable") {
+                crate::arm_source_policy_before_revalidate_hook(move || {
+                    if scenario == "drift" {
+                        fs::write(&source, "options: {\n").unwrap();
+                    } else {
+                        fs::remove_file(&source).unwrap();
+                        fs::create_dir(&source).unwrap();
+                    }
+                });
+            } else {
+                arm_publication_test_fault(
+                    match scenario {
+                        "search_cancel" => PublicationTestBoundary::SearchBuild,
+                        "marker_failure" => PublicationTestBoundary::MarkerCompletion,
+                        _ => PublicationTestBoundary::DatabaseReplacement,
+                    },
+                    if matches!(scenario, "cancel" | "search_cancel") {
+                        PublicationTestAction::Cancel
+                    } else {
+                        PublicationTestAction::Fail
+                    },
+                );
+            }
+            let error = controller
+                .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, &token)
+                .expect_err("unverified or cancelled source must not publish");
+            assert_eq!(
+                error.code,
+                match scenario {
+                    "cancel" | "search_cancel" => "cancelled",
+                    "publish_failure" | "marker_failure" => "internal",
+                    _ => "source_changed",
+                }
+            );
+            assert_eq!(
+                Store::database_index_publication(&storage_path).unwrap(),
+                previous
+            );
+            assert_eq!(
+                super::structural_live_identity(&storage_path),
+                previous_structure
+            );
+            super::assert_no_staged_publication_artifacts(&storage_path);
+        }
+    }
+}
+
+#[test]
 fn full_refresh_publishes_verified_generic_tagged_template_parser_partial() {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");
@@ -78,6 +338,7 @@ fn full_refresh_publishes_verified_generic_tagged_template_parser_partial() {
         .expect("strict reader must admit the completed search generation");
     let diagnostics = controller
         .indexed_files(IndexedFilesRequest {
+            include_framework_coverage: false,
             path_contains: Some("job-store.ts".to_string()),
             language: None,
             role: None,

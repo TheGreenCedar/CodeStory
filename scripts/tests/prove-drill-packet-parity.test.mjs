@@ -7,19 +7,26 @@ import {
 } from "../prove-drill-packet-parity.mjs";
 
 function packet() {
-  const citation = { node_id: "node-1", file_path: "src/lib.rs", line: 4, display_name: "WorkspaceIndexer" };
   return {
-    plan: {
-      queries: [{ query: "WorkspaceIndexer", purpose: "explicit symbol probe from packet request" }],
-      trace: ["explicit_extra_probes=1 source=request"],
-    },
-    answer: { citations: [citation] },
-    disposition: {
-      kind: "drill_once",
-      drill: {
-        options: [{ id: "bounded_source_read:src%2Flib.rs" }],
-      },
-    },
+    kind: "complete",
+    schema_version: 3,
+    identity: { packet_id: "packet-1" },
+    status: "continuation_available",
+    evidence: [{
+      identity: { evidence_id: "evidence-1" },
+      kind: "source_range",
+      path: "src/lib.rs",
+      symbol_id: "WorkspaceIndexer",
+      start_line: 4,
+      end_line: 4,
+      summary: "WorkspaceIndexer evidence",
+    }],
+    gaps: [{
+      identity: { gap_id: "gap-1" },
+      kind: "continuation_required",
+      message: "Additional evidence is required.",
+    }],
+    continuation: { continuation_id: "continuation-1", remaining_rounds: 1 },
   };
 }
 
@@ -42,12 +49,12 @@ function proof() {
     packet: pairedPacket,
     report: {
       evidence_packet: structuredClone(pairedPacket),
-      question_search: { command: "packet" },
+      question_search: { command: "packet", status: pairedPacket.status },
       question_supplemental_searches: [],
-      anchors: [{ commands: [] }],
+      anchors: [{ anchor: "WorkspaceIndexer", commands: [] }],
       bridges: [{ command: { command: "packet" } }],
       execution_boundaries: [{ command: "packet" }],
-      next_commands: (pairedPacket.disposition.drill?.options ?? []).map((option) => option.id),
+      next_commands: [],
     },
     summary: { full_report_json: "drill-report.json", full_report_markdown: "drill-report.md" },
     markdown: "# Drill\nevidence_packet: packet\n",
@@ -67,10 +74,10 @@ test("paired packet and drill proof accepts one matching packet execution", () =
       schema_version: 3,
       graph_hash: "graph",
     },
-    sufficiency: "drill_once",
-    citation_count: 1,
+    availability: "continuation_available",
+    evidence_count: 1,
     explicit_probes: ["WorkspaceIndexer"],
-    follow_up_commands: ["bounded_source_read:src%2Flib.rs"],
+    follow_up_commands: [],
     packet_execution_count: 1,
     artifacts: ["drill-report.json", "drill-report.md", "drill-summary.json"],
   });
@@ -86,12 +93,11 @@ test("paired proof rejects generation drift and duplicate drill commands", () =>
   assert.throws(() => verifyDrillPacketParity(duplicate), /anchor commands/);
 });
 
-test("question and anchor dedupe keeps executed probe provenance", () => {
+test("report anchor handoff keeps the explicit requested probe", () => {
   const duplicate = proof();
-  duplicate.packet.plan.queries[0].purpose = "original task phrasing for retrieval-primary source-backed retrieval";
-  duplicate.report.evidence_packet.plan.queries[0].purpose = duplicate.packet.plan.queries[0].purpose;
+  duplicate.report.anchors[0].anchor = "OtherAnchor";
 
-  assert.equal(verifyDrillPacketParity(duplicate).packet_execution_count, 1);
+  assert.throws(() => verifyDrillPacketParity(duplicate), /requested probe/);
 });
 
 test("only observed non-full preflight is blocked", () => {
@@ -99,7 +105,7 @@ test("only observed non-full preflight is blocked", () => {
   assert.equal(evidenceStatusForError(new Error("packet command failed")), "failed");
 
   const mismatch = proof();
-  mismatch.report.next_commands = [];
+  mismatch.report.next_commands = ["hidden-legacy-follow-up"];
   let failure;
   try {
     verifyDrillPacketParity(mismatch);

@@ -522,22 +522,22 @@ dependencies = [
 
 [[package]]
 name = "codestory-agent"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "codestory-contracts",
  "serde",
  "serde_json",
- "serde_json_canonicalizer",
  "sha2 0.10.9",
  "tempfile",
 ]
 
 [[package]]
 name = "codestory-bench"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "clap",
+ "codestory-agent",
  "codestory-cli",
  "codestory-contracts",
  "codestory-indexer",
@@ -547,6 +547,7 @@ dependencies = [
  "codestory-workspace",
  "criterion",
  "libc",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -556,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -588,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-contracts"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -596,6 +597,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.10.9",
  "specta",
  "tempfile",
  "thiserror 2.0.18",
@@ -605,14 +607,16 @@ dependencies = [
 
 [[package]]
 name = "codestory-indexer"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
+ "flate2",
  "ignore",
+ "jsonc-parser",
  "parking_lot",
  "rayon",
  "rusqlite",
@@ -634,6 +638,7 @@ dependencies = [
  "tree-sitter-dart-orchard",
  "tree-sitter-go",
  "tree-sitter-graph",
+ "tree-sitter-hcl",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-kotlin-ng",
@@ -647,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-llama-sys"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "codestory-contracts",
  "crossbeam-channel",
@@ -662,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -671,7 +676,9 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "directories",
+ "flate2",
  "libc",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",
@@ -685,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-agent",
@@ -695,12 +702,14 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
+ "flate2",
  "nucleo-matcher",
  "parking_lot",
  "rayon",
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2 0.10.9",
  "tantivy",
  "tempfile",
@@ -711,10 +720,12 @@ dependencies = [
 
 [[package]]
 name = "codestory-store"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
+ "fs_at",
+ "libc",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -724,11 +735,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "codestory-workspace"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -2742,6 +2754,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+
+[[package]]
 name = "kasuari"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3869,8 +3887,21 @@ checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
  "dyn-clone",
  "ref-cast",
+ "schemars_derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3909,6 +3940,17 @@ name = "serde_derive"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4017,6 +4059,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -4028,6 +4071,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -4804,6 +4856,16 @@ dependencies = [
  "streaming-iterator",
  "thiserror 1.0.69",
  "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-hcl"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a7b2cc3d7121553b84309fab9d11b3ff3d420403eef9ae50f9fd1cd9d9cf012"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

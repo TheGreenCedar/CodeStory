@@ -1,6 +1,6 @@
 [package]
 name = "codestory-indexer"
-version = "0.17.5"
+version = "0.17.6"
 edition = "2024"
 
 [dev-dependencies]
@@ -13,7 +13,9 @@ codestory-contracts = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
+flate2 = "=1.1.9"
 ignore = { workspace = true }
+jsonc-parser = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 rusqlite = { workspace = true }
@@ -42,3 +44,4 @@ tree-sitter-kotlin-ng = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-dart-orchard = { workspace = true }
 tree-sitter-bash = { workspace = true }
+tree-sitter-hcl = { workspace = true }

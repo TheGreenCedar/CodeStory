@@ -5,10 +5,12 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import platform
 import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -54,6 +56,101 @@ class _UnixExitProbeState(Enum):
     GONE_OR_REUSED = "gone_or_reused"
     MATCHING = "matching"
     UNKNOWN = "unknown"
+
+
+class _MacosTimeval(ctypes.Structure):
+    _fields_ = [("seconds", ctypes.c_long), ("microseconds", ctypes.c_int32)]
+
+
+class _MacosProcStart(ctypes.Union):
+    _fields_ = [("time", _MacosTimeval), ("links", ctypes.c_void_p * 2)]
+
+
+class _MacosKinfoProcPrefix(ctypes.Structure):
+    # sys/proc.h extern_proc, the first member of sys/sysctl.h kinfo_proc.
+    # Only consume the prefix through p_pid; sysctl owns the unused tail.
+    _fields_ = [
+        ("start", _MacosProcStart),
+        ("vmspace", ctypes.c_void_p),
+        ("sigacts", ctypes.c_void_p),
+        ("flags", ctypes.c_int32),
+        ("state", ctypes.c_int8),
+        ("pid", ctypes.c_int32),
+    ]
+
+
+@dataclass(frozen=True)
+class _MacosTerminalProcessObservation:
+    pid: int
+    process_start_id: str
+    terminal_state: str = "zombie"
+    source: str = "sysctl(KERN_PROC_PID)"
+
+
+def _macos_terminal_layout_supported() -> bool:
+    # Darwin LP64 SDK offsets. Native proof checks these against the SDK;
+    # unsupported widths/architectures must never produce terminal evidence.
+    return (
+        sys.platform == "darwin"
+        and platform.machine() in {"arm64", "x86_64"}
+        and ctypes.sizeof(ctypes.c_void_p) == 8
+        and ctypes.sizeof(ctypes.c_long) == 8
+        and ctypes.sizeof(_MacosTimeval) == 16
+        and ctypes.sizeof(_MacosKinfoProcPrefix) == 48
+        and _MacosKinfoProcPrefix.start.offset == 0
+        and _MacosKinfoProcPrefix.state.offset == 36
+        and _MacosKinfoProcPrefix.pid.offset == 40
+    )
+
+
+def macos_terminal_process_observation(
+    pid: int,
+) -> _MacosTerminalProcessObservation | None:
+    """Read retained birth and terminal state together, never a live identity.
+
+    Consumers must match an already pinned birth identity. A terminal record
+    cannot authenticate an executable or establish a new live-process pin.
+    Every unavailable or malformed observation remains unknown.
+    """
+    if not _macos_terminal_layout_supported() or not 0 < pid < 2**31:
+        return None
+    try:
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        library.sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        library.sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t()
+        if library.sysctl(mib, 4, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        capacity = size.value
+        prefix_size = ctypes.sizeof(_MacosKinfoProcPrefix)
+        if not prefix_size <= capacity <= 64 * 1024:
+            return None
+        buffer = ctypes.create_string_buffer(capacity)
+        # The size query includes spare capacity. KERN_PROC_PID copies a whole
+        # record on success and reports ENOMEM for an undersized buffer; the
+        # returned actual length need not equal the original capacity.
+        if library.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not prefix_size <= size.value <= capacity:
+            return None
+        record = _MacosKinfoProcPrefix.from_buffer_copy(buffer.raw[:size.value])
+    except (OSError, ValueError):
+        return None
+    if (
+        record.pid != pid
+        or record.state != 5  # SZOMB: exited, waiting to be reaped.
+        or record.start.time.seconds <= 0
+        or not 0 <= record.start.time.microseconds < 1_000_000
+    ):
+        return None
+    return _MacosTerminalProcessObservation(
+        pid,
+        f"macos-proc:{record.start.time.seconds}:{record.start.time.microseconds}",
+    )
 
 
 def _windows_handle_process_identity(
@@ -483,10 +580,20 @@ class ExactProcessExitWaiter:
         except (FileNotFoundError, ProcessLookupError):
             return _UnixExitProbeState.GONE_OR_REUSED, "no longer exists"
         except (ProofFailure, OSError) as error:
-            # An inspection error is not exit evidence. Confirm only process
-            # absence. A present but unreadable identity stays explicitly
-            # unknown so a bounded waiter can keep polling without calling it
-            # matching or gone.
+            terminal = macos_terminal_process_observation(self.pid)
+            if (
+                terminal is not None
+                and terminal.pid == self.pid
+                and terminal.process_start_id == self.expected_start_id
+            ):
+                return (
+                    _UnixExitProbeState.GONE_OR_REUSED,
+                    "retains its exact birth identity in a terminal macOS kernel record",
+                )
+            # Without an exact terminal record, confirm only process absence.
+            # An inspection error is not exit evidence. A present but unreadable
+            # identity stays unknown so a bounded waiter can keep polling
+            # without calling it matching or gone.
             try:
                 os.kill(self.pid, 0)
             except ProcessLookupError:

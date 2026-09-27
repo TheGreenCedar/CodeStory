@@ -45,7 +45,8 @@ mod repository_hooks;
 mod repository_identity;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
-    RepositoryMetadataIssue, read_repository_changes, read_repository_metadata,
+    RepositoryMetadataIssue, RepositoryTrackingDigest, observe_repository_tracking_digest,
+    read_repository_changes, read_repository_metadata,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -62,8 +63,9 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_V2_SCHEMA_VERSION, RepositoryIdentityV2, RepositoryInstanceIdentity,
     WorkspacePathIdentity, WorkspacePathLexicalIdentity, inspect_repository_identity_v2,
     observe_logical_project_identity_v3, project_identity_v3, project_identity_v3_from_repository,
-    same_workspace_path, workspace_file_identity, workspace_id_v3_for_root,
-    workspace_path_identity, workspace_path_identity_token, workspace_path_lexical_identity,
+    same_workspace_path, workspace_file_identity, workspace_file_link_count,
+    workspace_id_v3_for_root, workspace_path_identity, workspace_path_identity_token,
+    workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -98,6 +100,7 @@ pub enum Language {
     Yaml,
     Toml,
     Json,
+    Terraform,
     Svelte,
     Vue,
     Astro,
@@ -198,13 +201,15 @@ pub struct WorkspaceManifest {
     discovery_walk_count: Cell<usize>,
 }
 
+const SYNTHETIC_BUILD_EXCLUDE_PATTERN: &str = "**/build/**";
+
 fn default_source_exclude_patterns() -> Vec<String> {
     [
         "**/node_modules/**",
         "**/target/**",
         "**/.git/**",
         "**/dist/**",
-        "**/build/**",
+        SYNTHETIC_BUILD_EXCLUDE_PATTERN,
     ]
     .into_iter()
     .map(str::to_string)
@@ -240,6 +245,7 @@ fn storage_owned_discovery_directory_roots(storage_path: &Path) -> Vec<PathBuf> 
         legacy_search_directory_for_storage(storage_path),
         search_generation_directory_for_storage(storage_path),
         codestory_contracts::owned_artifacts::derived_reset_quarantine_root(storage_path),
+        codestory_contracts::owned_artifacts::core_publication_root(storage_path),
     ]
 }
 
@@ -315,16 +321,23 @@ pub struct WorkspaceFileInventory {
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
     pub warnings: Vec<WorkspaceInventoryIssue>,
+    /// Digest of the exact repository-tracked path set used by discovery.
+    /// `NoRepository` is distinct from `None`: the latter means metadata was
+    /// incomplete and cannot back a freshness receipt.
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 /// Complete discovery split into parser candidates and verified policy exclusions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePolicyFileInventory {
     pub files: Vec<PathBuf>,
+    /// Complete pre-route discovery used by lexical source publication.
+    pub discovered_files: Vec<PathBuf>,
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
     pub warnings: Vec<WorkspaceInventoryIssue>,
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
@@ -343,6 +356,14 @@ pub struct WorkspacePolicyRefreshOutcome {
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     /// Files admitted by discovery before source-route and policy classification.
     pub admitted_file_count: usize,
+    /// Exact current files retained by the same complete discovery pass.
+    ///
+    /// Runtime carries these paths into the retrieval publication fence so an
+    /// incremental refresh does not rediscover the repository merely to seal
+    /// inputs the core planner already enumerated.
+    pub inventory_files: Vec<PathBuf>,
+    /// Repository-tracking input used by the same discovery pass.
+    pub repository_tracking_digest: Option<RepositoryTrackingDigest>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +392,7 @@ struct DiscoveryPathFilter<'a> {
     language: &'a Language,
     exclude_patterns: &'a [CompiledExcludePattern],
     discovery_exclusions: &'a ObservedDiscoveryExclusions,
+    admit_tracked_synthetic_build_source: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +812,29 @@ fn legacy_positional_policy(byte_cap: u64, policy_version: &str) -> SourceIndexP
     }
 }
 
+fn lexical_inventory_files(
+    manifest: &WorkspaceManifest,
+    inventory: &WorkspacePolicyFileInventory,
+) -> Result<Vec<PathBuf>> {
+    let root = workspace_root(manifest);
+    let excluded = inventory
+        .policy_exclusions
+        .iter()
+        .map(|candidate| candidate.normalized_path.as_str())
+        .collect::<HashSet<_>>();
+    Ok(inventory
+        .discovered_files
+        .iter()
+        .filter(|path| match normalized_policy_path(&root, path) {
+            // Policy exclusions are UTF-8 relative paths; a non-normalizable
+            // source cannot match one and must stay in the lexical inventory.
+            Ok(relative) => !excluded.contains(relative.as_str()),
+            Err(_) => true,
+        })
+        .cloned()
+        .collect())
+}
+
 impl WorkspaceDiscovery {
     /// Discover all source files for `manifest`.
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
@@ -909,14 +954,18 @@ impl WorkspaceDiscovery {
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
         let admitted_file_count = inventory.files.len();
+        let discovered_files = inventory.files.clone();
+        let repository_tracking_digest = inventory.repository_tracking_digest.clone();
         if !inventory.outcome.is_complete() {
             return Ok((
                 WorkspacePolicyFileInventory {
                     files: inventory.files,
+                    discovered_files,
                     policy_exclusions: Vec::new(),
                     outcome: inventory.outcome,
                     issues: inventory.issues,
                     warnings: inventory.warnings,
+                    repository_tracking_digest,
                 },
                 admitted_file_count,
             ));
@@ -945,6 +994,19 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
+            if is_go_module_control(&path) {
+                if metadata.len() > policy.byte_cap {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!(
+                            "Go module control exceeds the {} byte source limit",
+                            policy.byte_cap
+                        ),
+                    });
+                }
+                files.push(path);
+                continue;
+            }
             // Nothing is excluded below the smaller of the two caps, so a file
             // under it never pays for path normalization.
             if metadata.len() <= policy.minimum_byte_cap() {
@@ -1005,10 +1067,12 @@ impl WorkspaceDiscovery {
         Ok((
             WorkspacePolicyFileInventory {
                 files,
+                discovered_files,
                 policy_exclusions,
                 outcome,
                 issues,
                 warnings,
+                repository_tracking_digest,
             },
             admitted_file_count,
         ))
@@ -1020,12 +1084,13 @@ impl WorkspaceDiscovery {
         max_files: Option<usize>,
     ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
-        let (repository_tracked_paths, repository_metadata_issues) =
+        let (repository_tracked_paths, repository_metadata_issues, repository_tracking_digest) =
             repository_tracked_paths(&manifest.root_dir());
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
         let mut issues = repository_metadata_issues;
         let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
+        let mut warned_non_source_symlinks = HashSet::new();
         let mut inspected_source_roots = 0usize;
         #[cfg(test)]
         manifest.discovery_walk_count.set(0);
@@ -1043,6 +1108,7 @@ impl WorkspaceDiscovery {
                         ),
                     }],
                     warnings: Vec::new(),
+                    repository_tracking_digest,
                 });
             }
         };
@@ -1101,6 +1167,7 @@ impl WorkspaceDiscovery {
                         language: &group.language,
                         exclude_patterns: &exclude_patterns,
                         discovery_exclusions: &discovery_exclusions,
+                        admit_tracked_synthetic_build_source: false,
                     };
                     if !should_include_discovered_path(&full_path, false, &path_filter) {
                         continue;
@@ -1118,6 +1185,7 @@ impl WorkspaceDiscovery {
                             outcome: WorkspaceInventoryOutcome::Bounded,
                             issues,
                             warnings,
+                            repository_tracking_digest,
                         });
                     }
                     continue;
@@ -1152,6 +1220,7 @@ impl WorkspaceDiscovery {
                     &workspace_root_for_filter,
                     &routes_for_filter,
                     &filter_discovery_exclusions,
+                    false,
                 )
             });
             let issue_count_before_walk = issues.len();
@@ -1163,12 +1232,31 @@ impl WorkspaceDiscovery {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
+                        if let Some(skipped) = non_source_symlink_walk_skip(&error) {
+                            // Helm U08 / dep-fs fixtures: dangling or device
+                            // symlinks are observed and skipped; they must not
+                            // demote a otherwise-complete inventory to Partial.
+                            push_non_source_symlink_warning(
+                                &mut warnings,
+                                &mut warned_non_source_symlinks,
+                                skipped,
+                            );
+                            continue;
+                        }
                         record_walk_error(&mut issues, &walk.path, &error);
                         continue;
                     }
                 };
                 if let Some(error) = entry.error() {
-                    record_walk_error(&mut issues, entry.path(), error);
+                    if let Some(skipped) = non_source_symlink_walk_skip(error) {
+                        push_non_source_symlink_warning(
+                            &mut warnings,
+                            &mut warned_non_source_symlinks,
+                            skipped,
+                        );
+                    } else {
+                        record_walk_error(&mut issues, entry.path(), error);
+                    }
                 }
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     continue;
@@ -1199,21 +1287,40 @@ impl WorkspaceDiscovery {
                         outcome: WorkspaceInventoryOutcome::Bounded,
                         issues,
                         warnings,
+                        repository_tracking_digest,
                     });
                 }
             }
             let walk_had_errors = issues.len() != issue_count_before_walk;
             for tracked_path in &repository_tracked_paths {
-                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
-                    || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
-                    || !should_include_discovered_path_for_routes(
+                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path)) {
+                    continue;
+                }
+                let metadata = fs::metadata(tracked_path);
+                if let Some(warning) = non_source_tracked_symlink_skip(tracked_path, &metadata) {
+                    if should_include_tracked_symlink_warning_for_routes(
                         tracked_path,
-                        false,
                         &workspace_root,
                         &walk.routes,
                         &discovery_exclusions,
-                    )
-                {
+                        manifest.is_synthetic_default.get(),
+                    ) {
+                        push_non_source_symlink_warning(
+                            &mut warnings,
+                            &mut warned_non_source_symlinks,
+                            warning,
+                        );
+                    }
+                    continue;
+                }
+                if !should_include_discovered_path_for_routes(
+                    tracked_path,
+                    false,
+                    &workspace_root,
+                    &walk.routes,
+                    &discovery_exclusions,
+                    manifest.is_synthetic_default.get(),
+                ) {
                     continue;
                 }
                 match discovery_exclusions.file_is_excluded(tracked_path) {
@@ -1225,6 +1332,23 @@ impl WorkspaceDiscovery {
                             message: format!(
                                 "failed to observe tracked source identity against caller-owned exclusions: {error}"
                             ),
+                        });
+                        continue;
+                    }
+                }
+                match metadata {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => continue,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && tracked_path_absence_is_proven(tracked_path) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: tracked_path.clone(),
+                            message: format!("failed to inspect tracked source: {error}"),
                         });
                         continue;
                     }
@@ -1242,6 +1366,7 @@ impl WorkspaceDiscovery {
                         outcome: WorkspaceInventoryOutcome::Bounded,
                         issues,
                         warnings,
+                        repository_tracking_digest,
                     });
                 }
                 if !walk_had_errors {
@@ -1249,12 +1374,115 @@ impl WorkspaceDiscovery {
                     // route was degraded. Recording this as a warning keeps
                     // the inventory complete while leaving the degradation
                     // visible to every inventory consumer.
+                    let message = if manifest.is_synthetic_default.get()
+                        && synthetic_build_default_excludes_path_for_routes(
+                            tracked_path,
+                            &workspace_root,
+                            &walk.routes,
+                        ) {
+                        "synthetic default build-directory exclusion omitted a tracked source; the repository index restored it"
+                    } else {
+                        "repository ignore rules excluded a tracked source; the repository index restored it"
+                    };
                     warnings.push(WorkspaceInventoryIssue {
                         path: tracked_path.clone(),
-                        message: "repository ignore rules excluded a tracked source; the repository index restored it"
-                            .to_string(),
+                        message: message.to_string(),
                     });
                 }
+            }
+        }
+
+        // Go package imports depend on the nearest go.mod on every admitted
+        // Go source's ancestor chain. Observe those control files explicitly:
+        // repository ignore and source-language filters must not hide a
+        // dependency which changes the meaning of otherwise unchanged source.
+        // Caller-owned discovery exclusions remain absolute barriers.
+        let go_sources = all_files
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut go_module_controls = HashSet::new();
+        let canonical_workspace_root = workspace_root.canonicalize().ok();
+        for source in go_sources {
+            let Some(canonical_root) = canonical_workspace_root.as_ref() else {
+                continue;
+            };
+            let Ok(canonical_source) = source.canonicalize() else {
+                continue;
+            };
+            let Ok(relative) = canonical_source.strip_prefix(canonical_root) else {
+                continue;
+            };
+            let mut directory = relative.parent();
+            while let Some(parent) = directory {
+                go_module_controls.insert(workspace_root.join(parent).join("go.mod"));
+                directory = parent.parent();
+            }
+        }
+        let mut go_module_controls = go_module_controls.into_iter().collect::<Vec<_>>();
+        go_module_controls.sort();
+        for control in go_module_controls {
+            if discovery_exclusions.directory_contains(&control) {
+                issues.push(WorkspaceInventoryIssue {
+                    path: control,
+                    message: "Go module control is inside a caller-owned discovery exclusion"
+                        .to_string(),
+                });
+                continue;
+            }
+            match discovery_exclusions.file_is_excluded(&control) {
+                Ok(true) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: "Go module control is a caller-owned discovery exclusion"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: format!("failed to observe Go module control exclusion: {error}"),
+                    });
+                    continue;
+                }
+            }
+            match fs::symlink_metadata(&control) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: control,
+                        message: "Go module control must be a regular non-symlink file".to_string(),
+                    });
+                }
+                Ok(_) => {
+                    if !push_discovered_file_within_limit(
+                        &mut all_files,
+                        &mut seen,
+                        control,
+                        &workspace_root,
+                        max_files,
+                    ) {
+                        all_files.sort();
+                        return Ok(WorkspaceFileInventory {
+                            files: all_files,
+                            outcome: WorkspaceInventoryOutcome::Bounded,
+                            issues,
+                            warnings,
+                            repository_tracking_digest,
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => issues.push(WorkspaceInventoryIssue {
+                    path: control,
+                    message: format!("failed to observe Go module control: {error}"),
+                }),
             }
         }
 
@@ -1271,6 +1499,7 @@ impl WorkspaceDiscovery {
             outcome,
             issues,
             warnings,
+            repository_tracking_digest,
         })
     }
 
@@ -1306,6 +1535,7 @@ impl WorkspaceDiscovery {
             &legacy_positional_policy(byte_cap, policy_version),
             None,
         )?;
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1318,6 +1548,8 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1331,6 +1563,7 @@ impl WorkspaceDiscovery {
         let (mut inventory, admitted_file_count) =
             self.source_inventory_with_policy_inner(manifest, policy, None)?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1343,6 +1576,8 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1360,6 +1595,7 @@ impl WorkspaceDiscovery {
             &legacy_positional_policy(byte_cap, policy_version),
             Some(max_current_files),
         )?;
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1372,6 +1608,8 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1386,6 +1624,7 @@ impl WorkspaceDiscovery {
         let (mut inventory, admitted_file_count) =
             self.source_inventory_with_policy_inner(manifest, policy, Some(max_current_files))?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1398,6 +1637,8 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
+            repository_tracking_digest: inventory.repository_tracking_digest,
         })
     }
 
@@ -1534,15 +1775,34 @@ fn build_refresh_outcome_from_inventory(
         }
     }
 
+    let mut removed_go_module_control = false;
     if inventory_outcome.is_complete() {
         for (normalized_key, stored) in normalized_stored_map {
             if !current_file_keys.contains(&normalized_key) {
+                removed_go_module_control |= is_go_module_control(&stored.path);
                 files_to_remove.push(stored.id);
             }
         }
     }
     files_to_remove.sort_unstable();
     files_to_remove.dedup();
+
+    let go_module_control_changed =
+        removed_go_module_control || files_to_index.iter().any(|path| is_go_module_control(path));
+    if go_module_control_changed {
+        files_to_index.extend(
+            current_files
+                .iter()
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+                })
+                .cloned(),
+        );
+        files_to_index.sort();
+        files_to_index.dedup();
+    }
 
     Ok(WorkspaceRefreshOutcome {
         plan: RefreshPlan {
@@ -1690,9 +1950,136 @@ fn record_walk_error(
     error: &ignore::Error,
 ) {
     issues.push(WorkspaceInventoryIssue {
-        path: source_root.to_path_buf(),
+        path: ignore_error_path(error)
+            .unwrap_or(source_root)
+            .to_path_buf(),
         message: error.to_string(),
     });
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::Partial(errors) if errors.len() == 1 => ignore_error_path(&errors[0]),
+        _ => None,
+    }
+}
+
+fn attributed_walk_io_error(error: &ignore::Error) -> Option<(&Path, &io::Error)> {
+    fn visit<'a>(
+        error: &'a ignore::Error,
+        path: Option<&'a Path>,
+    ) -> Option<(&'a Path, &'a io::Error)> {
+        match error {
+            ignore::Error::WithDepth { err, .. } => visit(err, path),
+            ignore::Error::WithPath {
+                path: error_path,
+                err,
+            } if path.is_none() => visit(err, Some(error_path)),
+            ignore::Error::Io(error) => Some((path?, error)),
+            _ => None,
+        }
+    }
+
+    visit(error, None)
+}
+
+/// When `follow_links` hits a dangling symlink or a non-regular target (for
+/// example helm chart fixtures that link to `/dev/null`, or intentional
+/// broken-symlink test fixtures), discovery has observed the path and must
+/// not treat the walk error as proof the inventory is incomplete.
+fn non_source_symlink_walk_skip(error: &ignore::Error) -> Option<WorkspaceInventoryIssue> {
+    let (path, walk_io_error) = attributed_walk_io_error(error)?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_symlink() {
+        return None;
+    }
+    match fs::metadata(path) {
+        Err(target_error)
+            if walk_io_error.kind() == io::ErrorKind::NotFound
+                && target_error.kind() == io::ErrorKind::NotFound =>
+        {
+            Some(WorkspaceInventoryIssue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "skipped dangling symlink during discovery follow; not admitted as source ({error})"
+                ),
+            })
+        }
+        Err(_) => None,
+        Ok(target) if target.is_file() || target.is_dir() => None,
+        Ok(_) => Some(WorkspaceInventoryIssue {
+            path: path.to_path_buf(),
+            message: format!(
+                "skipped non-regular symlink target during discovery follow; not admitted as source ({error})"
+            ),
+        }),
+    }
+}
+
+fn push_non_source_symlink_warning(
+    warnings: &mut Vec<WorkspaceInventoryIssue>,
+    warned_paths: &mut HashSet<String>,
+    warning: WorkspaceInventoryIssue,
+) {
+    // A tracked link can be observed by the walk, tracked recovery, and more
+    // than one source route. Keep the first attributed diagnostic for its link.
+    let path = &warning.path;
+    let parent = path.parent().unwrap_or(path);
+    let stable_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexical_path(parent));
+    let stable_path = path
+        .file_name()
+        .map(|name| stable_parent.join(name))
+        .unwrap_or_else(|| normalize_lexical_path(path));
+    let key = normalize_path_key(&stable_path);
+    if warned_paths.insert(key) {
+        warnings.push(warning);
+    }
+}
+
+fn non_source_tracked_symlink_skip(
+    path: &Path,
+    target: &io::Result<fs::Metadata>,
+) -> Option<WorkspaceInventoryIssue> {
+    if !fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let message = match target {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            "skipped dangling symlink during tracked discovery follow; not admitted as source"
+        }
+        Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+            "skipped non-regular symlink target during tracked discovery follow; not admitted as source"
+        }
+        _ => return None,
+    };
+    Some(WorkspaceInventoryIssue {
+        path: path.to_path_buf(),
+        message: message.to_string(),
+    })
+}
+
+fn tracked_path_absence_is_proven(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) if current == path => return false,
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(metadata) => return metadata.is_dir(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = current.parent() else {
+                    return false;
+                };
+                current = parent;
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 fn inventory_failure_message(inventory: &WorkspaceFileInventory) -> String {
@@ -1724,66 +2111,27 @@ fn push_discovered_file_within_limit(
 
 fn repository_tracked_paths(
     repository_root: &Path,
-) -> (Vec<PathBuf>, Vec<WorkspaceInventoryIssue>) {
-    let dot_git = repository_root.join(".git");
-    let dot_git_metadata = match fs::symlink_metadata(&dot_git) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new());
-        }
+) -> (
+    Vec<PathBuf>,
+    Vec<WorkspaceInventoryIssue>,
+    Option<RepositoryTrackingDigest>,
+) {
+    let observation = match repo_metadata::observe_repository_tracking(repository_root) {
+        Ok(observation) => observation,
         Err(error) => {
             return (
                 Vec::new(),
                 vec![WorkspaceInventoryIssue {
-                    path: dot_git,
-                    message: format!("repository metadata boundary could not be observed: {error}"),
+                    path: repository_root.join(".git"),
+                    message: format!("repository tracking metadata could not be observed: {error}"),
                 }],
+                None,
             );
         }
     };
-    if dot_git_metadata.is_dir() {
-        let mut has_repository_marker = false;
-        for marker in ["HEAD", "config", "index"] {
-            match fs::symlink_metadata(dot_git.join(marker)) {
-                Ok(_) => has_repository_marker = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return (
-                        Vec::new(),
-                        vec![WorkspaceInventoryIssue {
-                            path: dot_git.join(marker),
-                            message: format!(
-                                "repository metadata marker could not be observed: {error}"
-                            ),
-                        }],
-                    );
-                }
-            }
-        }
-        if !has_repository_marker {
-            return (Vec::new(), Vec::new());
-        }
-    }
-    let metadata = read_repository_metadata(repository_root);
-    let mut issues = metadata
-        .issues
-        .into_iter()
-        .filter(|issue| {
-            matches!(
-                issue.code.as_str(),
-                "repository_open_failed" | "index_unavailable" | "repository_metadata_changed"
-            )
-        })
-        .map(|issue| WorkspaceInventoryIssue {
-            path: issue.path,
-            message: format!(
-                "repository metadata observation {} was incomplete: {}",
-                issue.code, issue.message
-            ),
-        })
-        .collect::<Vec<_>>();
+    let mut issues = Vec::new();
     let mut paths = Vec::new();
-    for encoded_path in metadata.tracked_paths {
+    for encoded_path in observation.tracked_paths {
         let path = match repo_metadata::bytes_to_path(&encoded_path) {
             Ok(path) => path,
             Err(error) => {
@@ -1810,7 +2158,7 @@ fn repository_tracked_paths(
     }
     paths.sort();
     paths.dedup();
-    (paths, issues)
+    (paths, issues, Some(observation.digest))
 }
 
 /// Clamp one filesystem timestamp to CodeStory's signed Unix-millisecond contract.
@@ -2326,6 +2674,7 @@ fn should_include_observed_discovery_path(
         filter.workspace_root,
         filter.source_root,
         filter.exclude_patterns,
+        filter.admit_tracked_synthetic_build_source,
     ) {
         return false;
     }
@@ -2340,6 +2689,7 @@ fn should_include_discovered_path_for_routes(
     workspace_root: &Path,
     routes: &[DiscoveryRoute],
     discovery_exclusions: &ObservedDiscoveryExclusions,
+    admit_tracked_synthetic_build_source: bool,
 ) -> bool {
     let Some(observed) = ObservedDiscoveryPath::observe(path, is_dir) else {
         return false;
@@ -2361,9 +2711,41 @@ fn should_include_discovered_path_for_routes(
                 language: &route.language,
                 exclude_patterns: &route.exclude_patterns,
                 discovery_exclusions,
+                admit_tracked_synthetic_build_source,
             },
         )
     })
+}
+
+fn should_include_tracked_symlink_warning_for_routes(
+    path: &Path,
+    workspace_root: &Path,
+    routes: &[DiscoveryRoute],
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+    admit_tracked_synthetic_build_source: bool,
+) -> bool {
+    let Some(mut observed) = ObservedDiscoveryPath::observe(path, false) else {
+        return false;
+    };
+    // The target is already known to be non-source. Check the tracked link's
+    // lexical route, without making an outside or missing target admissible.
+    observed.canonical = None;
+    observed.exclusion_canonical = None;
+    should_include_observed_discovery_path_globally(&observed, workspace_root, discovery_exclusions)
+        && routes.iter().any(|route| {
+            should_include_observed_discovery_path(
+                &observed,
+                &DiscoveryPathFilter {
+                    workspace_root,
+                    source_root: &route.source_root,
+                    filter_by_language: route.filter_by_language,
+                    language: &route.language,
+                    exclude_patterns: &route.exclude_patterns,
+                    discovery_exclusions,
+                    admit_tracked_synthetic_build_source,
+                },
+            )
+        })
 }
 
 fn should_include_discovered_path(
@@ -2401,19 +2783,47 @@ fn is_excluded_path(
     workspace_root: &Path,
     source_root: &Path,
     exclude_patterns: &[CompiledExcludePattern],
+    admit_tracked_synthetic_build_source: bool,
 ) -> bool {
     exclude_patterns.iter().any(|pattern| {
-        (pattern.match_absolute && pattern.matches(path))
-            || relative_path_for_matching(path, workspace_root)
-                .as_deref()
-                .is_some_and(|relative| pattern.matches(relative))
-            || relative_path_for_matching(path, source_root)
-                .as_deref()
-                .is_some_and(|relative| pattern.matches(relative))
+        !(admit_tracked_synthetic_build_source && pattern.is_synthetic_build_default())
+            && exclude_pattern_matches_path(pattern, path, workspace_root, source_root)
     })
 }
 
+fn synthetic_build_default_excludes_path_for_routes(
+    path: &Path,
+    workspace_root: &Path,
+    routes: &[DiscoveryRoute],
+) -> bool {
+    routes.iter().any(|route| {
+        route.exclude_patterns.iter().any(|pattern| {
+            pattern.is_synthetic_build_default()
+                && exclude_pattern_matches_path(pattern, path, workspace_root, &route.source_root)
+        })
+    })
+}
+
+fn exclude_pattern_matches_path(
+    pattern: &CompiledExcludePattern,
+    path: &Path,
+    workspace_root: &Path,
+    source_root: &Path,
+) -> bool {
+    (pattern.match_absolute && pattern.matches(path))
+        || relative_path_for_matching(path, workspace_root)
+            .as_deref()
+            .is_some_and(|relative| pattern.matches(relative))
+        || relative_path_for_matching(path, source_root)
+            .as_deref()
+            .is_some_and(|relative| pattern.matches(relative))
+}
+
 impl CompiledExcludePattern {
+    fn is_synthetic_build_default(&self) -> bool {
+        self.raw == SYNTHETIC_BUILD_EXCLUDE_PATTERN
+    }
+
     fn matches(&self, path: &Path) -> bool {
         self.patterns
             .iter()
@@ -2486,13 +2896,21 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
         || compatibility_extension_matches_source_group(&extension, language)
 }
 
-fn has_supported_source_route(path: &Path) -> bool {
+/// Return whether a path has an indexable parser or companion-source route.
+pub fn has_supported_source_route(path: &Path) -> bool {
+    if is_go_module_control(path) {
+        return true;
+    }
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
     let extension = codestory_contracts::language_support::normalize_extension(extension);
     codestory_contracts::language_support::language_support_profile_for_ext(&extension).is_some()
         || codestory_contracts::language_support::companion_extension_profile(&extension).is_some()
+}
+
+fn is_go_module_control(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "go.mod")
 }
 
 fn registry_extension_matches_source_group(extension: &str, language: &Language) -> bool {
@@ -2535,6 +2953,7 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Yaml, "yaml")
             | (&Language::Toml, "toml")
             | (&Language::Json, "json")
+            | (&Language::Terraform, "terraform")
     )
 }
 
@@ -2738,6 +3157,15 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    fn run_git(root: &Path, args: &[&str]) -> Result<()> {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed with {status}");
+        Ok(())
+    }
+
     fn test_source_group(
         language: Language,
         source_path: PathBuf,
@@ -2784,6 +3212,7 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Json,
+            Language::Terraform,
             Language::Svelte,
             Language::Vue,
             Language::Astro,
@@ -2952,6 +3381,427 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_inventory_preserves_tracked_build_named_source_namespace() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source = root.join("src/main/java/org/example/build/Worker.java");
+        let output = root.join("build/classes/Generated.java");
+        let nested_output = root.join("module/build/generated/Generated.java");
+        let tracked_generated = root.join("build/generated/Committed.java");
+        let tracked_target = root.join("src/target/TrackedButExcluded.java");
+        let tracked_dist = root.join("src/dist/TrackedButExcluded.java");
+        let tracked_dependency = root.join("src/node_modules/TrackedButExcluded.java");
+        for file in [
+            &source,
+            &output,
+            &nested_output,
+            &tracked_generated,
+            &tracked_target,
+            &tracked_dist,
+            &tracked_dependency,
+        ] {
+            fs::create_dir_all(file.parent().expect("file parent"))?;
+            fs::write(file, "package org.example.build; class Worker {}\n")?;
+        }
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &[
+                "add",
+                "-f",
+                "src/main/java/org/example/build/Worker.java",
+                "build/generated/Committed.java",
+                "src/target/TrackedButExcluded.java",
+                "src/dist/TrackedButExcluded.java",
+                "src/node_modules/TrackedButExcluded.java",
+            ],
+        )?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(
+            inventory.files.contains(&source),
+            "a source namespace named build must remain discoverable"
+        );
+        assert!(
+            inventory.files.contains(&tracked_generated),
+            "tracked generated source is repository-authored input under the narrow rule"
+        );
+        assert!(!inventory.files.contains(&output));
+        assert!(!inventory.files.contains(&nested_output));
+        for excluded in [&tracked_target, &tracked_dist, &tracked_dependency] {
+            assert!(
+                !inventory.files.contains(excluded),
+                "trackedness must not bypass synthetic defaults other than build: {excluded:?}"
+            );
+        }
+        assert!(inventory.warnings.iter().any(|warning| {
+            warning.path == source
+                && warning.message
+                    == "synthetic default build-directory exclusion omitted a tracked source; the repository index restored it"
+        }));
+        let plan = manifest.build_execution_plan(&RefreshInputs::default())?;
+        assert!(plan.files_to_index.contains(&source));
+        assert!(plan.files_to_index.contains(&tracked_generated));
+        assert!(!plan.files_to_index.contains(&output));
+        assert!(!plan.files_to_index.contains(&nested_output));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_tracked_build_source_preserves_stored_projection() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let build = root.join("build");
+        let tracked = build.join("Tracked.rs");
+        let visible = root.join("Visible.rs");
+        fs::create_dir_all(&build)?;
+        fs::write(&tracked, "pub fn tracked() {}\n")?;
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(&root, &["add", "-f", "build/Tracked.rs", "Visible.rs"])?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inputs = RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 41,
+                path: tracked.clone(),
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        };
+        let initial = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            initial.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(initial.plan.files_to_remove.is_empty());
+
+        let _restore = RestorePermissions {
+            path: build.clone(),
+            permissions: fs::metadata(&build)?.permissions(),
+        };
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o0))?;
+        assert_eq!(
+            fs::metadata(&tracked).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let inaccessible = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            inaccessible.inventory_outcome,
+            WorkspaceInventoryOutcome::Partial
+        );
+        assert!(inaccessible.plan.files_to_remove.is_empty());
+        assert!(
+            inaccessible
+                .inventory_issues
+                .iter()
+                .any(|issue| issue.path == tracked)
+        );
+        assert!(inaccessible.plan.files_to_index.contains(&visible));
+
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o755))?;
+        fs::remove_file(&tracked)?;
+        let absent = manifest.build_execution_outcome(&inputs)?;
+        assert_eq!(
+            absent.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(absent.plan.files_to_remove, vec![41]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruned_tracked_build_symlinks_warn_without_demoting_inventory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let build = root.join("build");
+        let dangling = build.join("Dangling.rs");
+        let nonregular = build.join("Device.rs");
+        let visible = root.join("Visible.rs");
+        fs::create_dir_all(&build)?;
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        symlink("/dev/null", &nonregular)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &[
+                "add",
+                "-f",
+                "build/Dangling.rs",
+                "build/Device.rs",
+                "Visible.rs",
+            ],
+        )?;
+
+        let inventory = WorkspaceManifest::open(root)?.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        assert!(!inventory.files.contains(&dangling));
+        assert!(!inventory.files.contains(&nonregular));
+        let dangling_warnings = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == dangling)
+            .collect::<Vec<_>>();
+        assert_eq!(dangling_warnings.len(), 1, "{inventory:?}");
+        assert!(dangling_warnings[0].message.contains("dangling symlink"));
+        let nonregular_warnings = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == nonregular)
+            .collect::<Vec<_>>();
+        assert_eq!(nonregular_warnings.len(), 1, "{inventory:?}");
+        assert!(
+            nonregular_warnings[0]
+                .message
+                .contains("non-regular symlink")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walked_tracked_symlinks_have_one_attributed_warning_each() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let dangling = root.join("Dangling.rs");
+        let nonregular = root.join("Device.rs");
+        let visible = root.join("Visible.rs");
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        symlink("/dev/null", &nonregular)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &["add", "-f", "Dangling.rs", "Device.rs", "Visible.rs"],
+        )?;
+
+        let inventory = WorkspaceManifest::open(root)?.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        for (link, kind) in [
+            (&dangling, "dangling symlink"),
+            (&nonregular, "non-regular symlink"),
+        ] {
+            assert!(!inventory.files.contains(link));
+            let matching = inventory
+                .warnings
+                .iter()
+                .filter(|warning| warning.path == *link)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{inventory:?}");
+            assert!(matching[0].message.contains(kind));
+            if link == &dangling {
+                assert!(
+                    matching[0].message.contains("during discovery follow"),
+                    "{inventory:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_coalesced_routes_warn_once_for_tracked_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let dangling = nested.join("Dangling.rs");
+        let visible = nested.join("Visible.rs");
+        fs::write(&visible, "pub fn visible() {}\n")?;
+        symlink("missing.rs", &dangling)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &["add", "-f", "nested/Dangling.rs", "nested/Visible.rs"],
+        )?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "overlapping".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, nested, &[]),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        assert!(!inventory.files.contains(&dangling));
+        let matching = inventory
+            .warnings
+            .iter()
+            .filter(|warning| warning.path == dangling)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{inventory:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_build_exclude_remains_authoritative_for_tracked_sources() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source = root.join("src/main/java/org/example/build/Worker.java");
+        let sibling = root.join("src/main/java/org/example/Worker.java");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::create_dir_all(sibling.parent().expect("sibling parent"))?;
+        fs::write(&source, "package org.example.build; class Worker {}\n")?;
+        fs::write(&sibling, "package org.example; class Worker {}\n")?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &[
+                "add",
+                "-f",
+                "src/main/java/org/example/build/Worker.java",
+                "src/main/java/org/example/Worker.java",
+            ],
+        )?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![test_source_group(
+                    Language::Java,
+                    root.clone(),
+                    &[SYNTHETIC_BUILD_EXCLUDE_PATTERN],
+                )],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&source));
+        assert!(inventory.files.contains(&sibling));
+        Ok(())
+    }
+
+    #[test]
+    fn non_git_explicit_source_root_can_select_a_build_named_namespace() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source_root = root.join("src/main/java");
+        let source = source_root.join("org/example/build/Worker.java");
+        let output = root.join("build/classes/Generated.java");
+        for file in [&source, &output] {
+            fs::create_dir_all(file.parent().expect("file parent"))?;
+            fs::write(file, "package org.example.build; class Worker {}\n")?;
+        }
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![test_source_group(Language::Java, source_root, &[])],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&source));
+        assert!(!inventory.files.contains(&output));
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_non_git_build_named_namespace_remains_excluded() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source = root.join("src/main/java/org/example/build/Worker.java");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "package org.example.build; class Worker {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&source));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_build_recovery_keeps_global_security_guards() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let outside = temp.path().join("outside.java");
+        let visible = root.join("src/build/Visible.java");
+        let owned = root.join("src/build/Owned.java");
+        let controlled_negative = root.join("src/build/fixtures/invalid.json");
+        let escaping_link = root.join("src/build/Escaping.java");
+        for file in [&visible, &owned, &controlled_negative] {
+            fs::create_dir_all(file.parent().expect("file parent"))?;
+            fs::write(file, "class Visible {}\n")?;
+        }
+        fs::write(&outside, "class Outside {}\n")?;
+        symlink(&outside, &escaping_link)?;
+        run_git(&root, &["init", "--quiet"])?;
+        run_git(
+            &root,
+            &[
+                "add",
+                "-f",
+                "src/build/Visible.java",
+                "src/build/Owned.java",
+                "src/build/fixtures/invalid.json",
+                "src/build/Escaping.java",
+            ],
+        )?;
+
+        let mut manifest = WorkspaceManifest::open(root)?;
+        manifest.exclude_discovery_files([owned.clone()]);
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&visible));
+        assert!(!inventory.files.contains(&owned));
+        assert!(!inventory.files.contains(&controlled_negative));
+        assert!(!inventory.files.contains(&escaping_link));
+        Ok(())
+    }
+
+    #[test]
     fn structural_exclusion_uses_only_workspace_relative_descendants() -> Result<()> {
         let temp = tempdir()?;
         for ancestor in ["build", "target", "vendor", "secrets"] {
@@ -3018,6 +3868,77 @@ mod tests {
         assert!(outcome.plan.files_to_index.is_empty());
         assert_eq!(outcome.plan.files_to_remove, vec![44]);
         assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn go_module_controls_bypass_ignore_and_schedule_all_go_sources_on_change_or_removal()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("pkg"))?;
+        fs::write(root.join(".gitignore"), "go.mod\n")?;
+        let module = root.join("go.mod");
+        let caller = root.join("caller.go");
+        let target = root.join("pkg/target.go");
+        fs::write(&module, "module example.com/project\n")?;
+        fs::write(&caller, "package caller\n")?;
+        fs::write(&target, "package pkg\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+        assert!(
+            inventory.files.contains(&module),
+            "gitignore must not hide an admitted Go source's module control"
+        );
+        let stored_files = inventory
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let metadata = fs::metadata(path)?;
+                let (content_hash, _) = current_content_identity(path)?;
+                Ok(StoredFileState {
+                    id: index as i64 + 1,
+                    path: path.clone(),
+                    modification_time: clamp_system_time_to_epoch_millis(metadata.modified()?),
+                    content_hash: Some(content_hash),
+                    indexed: true,
+                    complete: true,
+                    retry_required: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = RefreshInputs {
+            stored_files,
+            policy_exclusions: Vec::new(),
+            inventory: Default::default(),
+        };
+        assert!(
+            manifest
+                .build_execution_plan(&inputs)?
+                .files_to_index
+                .is_empty()
+        );
+
+        fs::write(&module, "module example.com/changed\n")?;
+        let changed = manifest.build_execution_plan(&inputs)?;
+        for source in [&caller, &target] {
+            assert!(changed.files_to_index.contains(source), "{source:?}");
+        }
+
+        fs::remove_file(&module)?;
+        let removed = manifest.build_execution_plan(&inputs)?;
+        for source in [&caller, &target] {
+            assert!(removed.files_to_index.contains(source), "{source:?}");
+        }
+        assert!(
+            inputs
+                .stored_files
+                .iter()
+                .find(|file| file.path == module)
+                .is_some_and(|file| removed.files_to_remove.contains(&file.id))
+        );
         Ok(())
     }
 
@@ -3193,6 +4114,37 @@ mod tests {
         );
         assert_eq!(inventory.policy_exclusions[0].observed_size, 65);
         assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_inventory_admits_terraform_structural_sources() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let module = root.join("main.tf");
+        let variables = root.join("prod.tfvars");
+        let unsupported = root.join("terraform.tfstate");
+        fs::write(&module, "module \"app\" { source = \"./app\" }\n")?;
+        fs::write(&variables, "region = \"ca-central-1\"\n")?;
+        fs::write(&unsupported, "{}\n")?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "terraform".to_string(),
+                version: 1,
+                source_groups: vec![test_source_group(Language::Terraform, root.clone(), &[])],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&module));
+        assert!(inventory.files.contains(&variables));
+        assert!(!inventory.files.contains(&unsupported));
+        assert!(inventory.policy_exclusions.is_empty());
         Ok(())
     }
 
@@ -4028,6 +4980,48 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_makes_inventory_partial_and_preserves_stored_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let observed = root.join("lib.rs");
+        let loop_path = root.join("loop.rs");
+        fs::write(&observed, "pub fn observed() {}\n")?;
+        symlink("loop.rs", &loop_path)?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert_eq!(inventory.issues.len(), 1, "{inventory:?}");
+        assert!(inventory.warnings.is_empty(), "{inventory:?}");
+        assert!(inventory.files.contains(&observed));
+
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 19,
+                path: loop_path,
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Partial
+        );
+        assert!(outcome.plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn unavailable_source_root_is_unreadable_and_never_deletes() -> Result<()> {
         let temp = tempdir()?;
@@ -4343,6 +5337,7 @@ mod tests {
 
         let owned_files = storage_owned_discovery_files(&storage_path);
         for path in &owned_files {
+            fs::create_dir_all(path.parent().expect("owned file parent"))?;
             fs::write(path, b"codestory-owned\n")?;
         }
         let staged_files = [
@@ -4585,7 +5580,7 @@ mod tests {
                 test_source_group(language, root.clone(), &excludes)
             })
             .collect::<Vec<_>>();
-        assert_eq!(groups.len(), 27);
+        assert_eq!(groups.len(), 28);
 
         let manifest = WorkspaceManifest::from_parts(
             WorkspaceSettings {
@@ -4752,6 +5747,7 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Json,
+            Language::Terraform,
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
@@ -4848,6 +5844,7 @@ mod tests {
             ("Yaml", Language::Yaml),
             ("Toml", Language::Toml),
             ("Json", Language::Json),
+            ("Terraform", Language::Terraform),
             ("Svelte", Language::Svelte),
             ("Vue", Language::Vue),
             ("Astro", Language::Astro),
@@ -5116,6 +6113,106 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn broken_and_device_symlinks_do_not_demote_inventory_to_partial() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return Ok(());
+        }
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("internal/third_party/dep/fs/testdata/symlinks"))?;
+        fs::create_dir_all(root.join("pkg/chartutil/testdata/frobnitz_with_dev_null"))?;
+        fs::write(root.join("main.go"), "package main\n")?;
+        // Helm U08 shape: intentional /dev/null chart fixture + broken symlink fixtures.
+        symlink(
+            "/dev/null",
+            root.join("pkg/chartutil/testdata/frobnitz_with_dev_null/null"),
+        )?;
+        symlink(
+            "nowhere-real",
+            root.join("internal/third_party/dep/fs/testdata/symlinks/invalid-symlink"),
+        )?;
+        symlink(
+            "C:\\this\\path\\does\\not\\exist",
+            root.join("internal/third_party/dep/fs/testdata/symlinks/windows-file-symlink"),
+        )?;
+        for args in [
+            ["init"][..].as_ref(),
+            ["config", "user.email", "codestory@example.invalid"][..].as_ref(),
+            ["config", "user.name", "CodeStory Test"][..].as_ref(),
+            ["add", "-A"][..].as_ref(),
+            ["commit", "-m", "init"][..].as_ref(),
+        ] {
+            let status = Command::new("git").args(args).current_dir(&root).status()?;
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+        eprintln!(
+            "outcome={:?} issues={:#?} files={}",
+            inventory.outcome,
+            inventory.issues,
+            inventory.files.len()
+        );
+        assert_eq!(
+            inventory.outcome,
+            WorkspaceInventoryOutcome::Complete,
+            "{inventory:?}"
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+        assert!(
+            inventory.warnings.len() >= 2,
+            "dangling symlink fixtures should surface as warnings: {inventory:?}"
+        );
+        assert!(
+            inventory.files.iter().any(|path| path.ends_with("main.go")),
+            "{inventory:?}"
+        );
+        assert!(
+            inventory.files.iter().all(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("null")
+                    && path.file_name().and_then(|name| name.to_str()) != Some("invalid-symlink")
+                    && path.file_name().and_then(|name| name.to_str())
+                        != Some("windows-file-symlink")
+            }),
+            "non-regular symlink fixtures must not be admitted: {inventory:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_helm_u08_tree_inventory_is_complete_when_present() -> Result<()> {
+        let Ok(pin) = std::env::var("CODESTORY_U08_HELM_PIN") else {
+            return Ok(());
+        };
+        let root = PathBuf::from(pin);
+        if !root.join(".git").exists() {
+            return Ok(());
+        }
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+        eprintln!(
+            "helm pin outcome={:?} issues={} warnings={} files={}",
+            inventory.outcome,
+            inventory.issues.len(),
+            inventory.warnings.len(),
+            inventory.files.len()
+        );
+        assert_eq!(
+            inventory.outcome,
+            WorkspaceInventoryOutcome::Complete,
+            "{inventory:?}"
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+        Ok(())
+    }
+
     #[test]
     fn source_files_reject_symlinked_directories_outside_workspace_root() -> Result<()> {
         let temp = tempdir()?;
@@ -5201,5 +6298,77 @@ mod tests {
             ),
             1_234
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod go_module_control_review {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    #[test]
+    fn required_control_barriers_preserve_inventory_uncertainty() -> Result<()> {
+        for case in ["excluded", "symlink", "directory", "oversized"] {
+            let temp = tempdir()?;
+            let root = temp.path().join("repo");
+            fs::create_dir_all(root.join("nested/pkg"))?;
+            fs::write(root.join("go.mod"), "module example.com/root\n")?;
+            fs::write(
+                root.join("nested/pkg/target.go"),
+                "package pkg\nfunc Target() {}\n",
+            )?;
+            let control = root.join("nested/go.mod");
+            let mut manifest = WorkspaceManifest::open(root.clone())?;
+            match case {
+                "excluded" => {
+                    fs::write(&control, "module example.com/nested\n")?;
+                    manifest.exclude_discovery_files([control.clone()]);
+                }
+                "symlink" => {
+                    let outside = temp.path().join("outside.mod");
+                    fs::write(&outside, "module example.com/nested\n")?;
+                    symlink(outside, &control)?;
+                }
+                "directory" => fs::create_dir(&control)?,
+                "oversized" => fs::write(&control, "x".repeat(128))?,
+                _ => unreachable!(),
+            }
+            let inventory = WorkspaceDiscovery.source_inventory_with_policy(
+                &manifest,
+                64,
+                "review-go-control-v1",
+            )?;
+            assert!(!inventory.outcome.is_complete(), "{case}: {inventory:?}");
+            assert!(
+                inventory.issues.iter().any(|issue| issue.path == control),
+                "{case}: {inventory:?}"
+            );
+            let outcome = build_refresh_outcome_from_inventory(
+                &manifest,
+                &RefreshInputs {
+                    stored_files: vec![StoredFileState {
+                        id: 314,
+                        path: root.join("previous.go"),
+                        modification_time: 0,
+                        content_hash: Some("a".repeat(64)),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    }],
+                    policy_exclusions: Vec::new(),
+                    inventory: Default::default(),
+                },
+                inventory.files,
+                inventory.outcome,
+                inventory.issues,
+                inventory.warnings,
+            )?;
+            assert!(
+                outcome.plan.files_to_remove.is_empty(),
+                "{case}: incomplete discovery cannot prove deletion"
+            );
+        }
+        Ok(())
     }
 }

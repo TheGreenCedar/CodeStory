@@ -383,6 +383,7 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "codestory-manual-friction-check.mjs"),
   path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
   path.join(repoRoot, "scripts", "fetch-holdout-repos.mjs"),
+  path.join(repoRoot, "scripts", "codestory-focused-abba-preflight.mjs"),
   path.join(repoRoot, "scripts", "lint-retrieval-generalization.mjs"),
   path.join(repoRoot, "scripts", "lib", "retrieval-generalization-lint.mjs"),
   path.join(repoRoot, "scripts", "measure-peak-memory.ps1"),

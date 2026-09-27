@@ -921,6 +921,41 @@ enum Tone {
 }
 
 #[test]
+fn test_dart_abstract_interface_keeps_declaration_anchor() -> Result<()> {
+    let source = r#"
+abstract class Player {
+  bool turn();
+}
+
+class HumanPlayer implements Player {
+  bool turn() => true;
+}
+"#;
+
+    let language_config = get_language_for_ext("dart").expect("dart extension should be supported");
+    let result = index_file(
+        Path::new("players.dart"),
+        source,
+        &language_config,
+        None,
+        None,
+    )?;
+
+    let player = result
+        .nodes
+        .iter()
+        .find(|node| node.serialized_name == "Player" && node.kind == NodeKind::INTERFACE)
+        .expect("abstract Dart class should retain its interface kind");
+    assert_eq!(
+        player.start_line,
+        Some(2),
+        "the interface must stay anchored on its abstract declaration"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_cpp_access_specifiers_are_captured_from_rules() -> Result<()> {
     let source = r#"
 class Widget {

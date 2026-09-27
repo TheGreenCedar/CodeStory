@@ -24,6 +24,13 @@ pub(super) fn compute_call_resolution(
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
 
+    if is_js_private_name_call(EdgeKind::CALL, callsite_identity.as_deref()) {
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, None, &[])?,
+            strategy: None,
+        });
+    }
+
     if is_python_dotted_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
@@ -102,6 +109,48 @@ pub(super) fn compute_call_resolution(
         return Ok(ComputedResolution {
             update,
             strategy: None,
+        });
+    }
+
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && let Some(path) =
+            receiver_owner.and_then(crate::languages::go::GoReturnPath::from_owner_marker)
+    {
+        let selected =
+            pass.find_go_return_method_readonly(candidate_index, &path, *file_id, target_name);
+        if pass.flags.store_candidates
+            && let Some(candidate) = selected
+        {
+            candidate_ids.push(candidate);
+        }
+        let resolved = selected.map(|candidate| (candidate, pass.policy.call_same_file));
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, resolved, candidate_ids.as_slice())?,
+            strategy: selected.map(|_| ResolutionStrategy::CallGlobalUnique),
+        });
+    }
+
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && let Some((modules, require_package_name)) =
+            go_package_function_imports(callsite_identity.as_deref())
+    {
+        let selected = receiver_owner.and_then(|package_name| {
+            pass.find_go_package_function_readonly(
+                candidate_index,
+                &modules,
+                require_package_name.then_some(package_name),
+                target_name,
+            )
+        });
+        if pass.flags.store_candidates
+            && let Some(candidate) = selected
+        {
+            candidate_ids.push(candidate);
+        }
+        let resolved = selected.map(|candidate| (candidate, pass.policy.call_same_file));
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, resolved, candidate_ids.as_slice())?,
+            strategy: selected.map(|_| ResolutionStrategy::CallGlobalUnique),
         });
     }
 
@@ -209,6 +258,15 @@ pub(super) fn compute_call_resolution(
     let prepared_name = PreparedName::new(lookup_target_name);
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
+    let ownerless_go_bare_call = is_go_ownerless_bare_identifier_call(
+        receiver_owner,
+        callsite_identity.as_deref(),
+        caller_file_path.as_deref(),
+    );
+    let allow_call_candidate = |candidate: i64| {
+        !ownerless_go_bare_call
+            || candidate_index.node_kind(candidate) == Some(NodeKind::FUNCTION as i32)
+    };
 
     // The parser proved that this bare JavaScript-family call shares an exact local name with a
     // runtime import binding. That proves a lexical external boundary, not the implementation
@@ -229,12 +287,13 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);
         }
-        if !is_common_unqualified
-            || should_keep_common_call_resolution(
-                &prepared_name.original,
-                candidate.confidence,
-                callsite_identity.as_deref(),
-            )
+        if allow_call_candidate(candidate.target_node_id)
+            && (!is_common_unqualified
+                || should_keep_common_call_resolution(
+                    &prepared_name.original,
+                    candidate.confidence,
+                    callsite_identity.as_deref(),
+                ))
         {
             semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
         }
@@ -317,11 +376,13 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(*target_node_id);
         }
-        selected = Some((
-            *target_node_id,
-            pass.policy.call_same_file,
-            ResolutionStrategy::CallSameFile,
-        ));
+        if allow_call_candidate(*target_node_id) {
+            selected = Some((
+                *target_node_id,
+                pass.policy.call_same_file,
+                ResolutionStrategy::CallSameFile,
+            ));
+        }
     }
 
     if selected.is_none()
@@ -335,11 +396,13 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate);
         }
-        selected = Some((
-            candidate,
-            pass.policy.call_same_file,
-            ResolutionStrategy::CallSameFile,
-        ));
+        if allow_call_candidate(candidate) {
+            selected = Some((
+                candidate,
+                pass.policy.call_same_file,
+                ResolutionStrategy::CallSameFile,
+            ));
+        }
     }
 
     if selected.is_none()
@@ -355,7 +418,7 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate);
         }
-        if !is_common_unqualified {
+        if !is_common_unqualified && allow_call_candidate(candidate) {
             selected = Some((
                 candidate,
                 pass.policy.call_same_module,
@@ -432,12 +495,14 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate);
         }
-        let confidence = if is_owner_qualified {
-            pass.policy.call_same_file
-        } else {
-            pass.policy.call_global_unique
-        };
-        selected = Some((candidate, confidence, ResolutionStrategy::CallGlobalUnique));
+        if allow_call_candidate(candidate) {
+            let confidence = if is_owner_qualified {
+                pass.policy.call_same_file
+            } else {
+                pass.policy.call_global_unique
+            };
+            selected = Some((candidate, confidence, ResolutionStrategy::CallGlobalUnique));
+        }
     }
 
     if selected.is_none()
@@ -469,12 +534,19 @@ pub(super) fn compute_call_resolution(
     if selected.is_none()
         && !is_owner_qualified
         && let Some((candidate, confidence)) = semantic_fallback.selected()
+        && allow_call_candidate(candidate)
     {
         selected = Some((
             candidate,
             confidence,
             ResolutionStrategy::CallSemanticFallback,
         ));
+    }
+
+    if ownerless_go_bare_call
+        && selected.is_some_and(|(candidate, _, _)| !allow_call_candidate(candidate))
+    {
+        selected = None;
     }
 
     if let Some((_, confidence, _)) = selected
@@ -503,6 +575,16 @@ pub(super) fn compute_call_resolution(
 
 fn is_owner_qualified_call_name(name: &str) -> bool {
     name.contains("::") || name.contains('.')
+}
+
+fn is_go_ownerless_bare_identifier_call(
+    receiver_owner: Option<&str>,
+    callsite_identity: Option<&str>,
+    caller_file_path: Option<&str>,
+) -> bool {
+    semantic_language_bucket(caller_file_path) == Some("go")
+        && receiver_owner.is_none()
+        && !is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity)
 }
 
 fn is_relative_import_module_name(name: &str) -> bool {
@@ -540,23 +622,29 @@ pub(super) fn compute_import_resolution(
     let has_alias = import_alias_mismatch(source_name, target_name);
     let has_relative_import_binding =
         is_import_binding_name(source_name) && is_relative_import_module_name(target_name);
+    let is_go_import = semantic_language_bucket(caller_file_path.as_deref()) == Some("go");
     let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
     let name_candidates = import_name_candidates(target_name, pass.flags.legacy_mode)
         .into_iter()
         .map(PreparedName::new)
         .collect::<Vec<_>>();
 
-    let mut semantic_fallback: Option<(i64, f32)> = None;
+    let mut semantic_fallback = UnambiguousBestCandidate::default();
+    let mut first_best_semantic_fallback: Option<(i64, f32)> = None;
     let mut candidate_ids = OrderedCandidateIds::with_capacity(10);
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);
         }
-        consider_selected(
-            &mut semantic_fallback,
-            candidate.target_node_id,
-            candidate.confidence,
-        );
+        if is_go_import {
+            semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
+        } else {
+            consider_selected(
+                &mut first_best_semantic_fallback,
+                candidate.target_node_id,
+                candidate.confidence,
+            );
+        }
     }
 
     let mut same_file_stage = OrderedCandidateIds::default();
@@ -697,6 +785,11 @@ pub(super) fn compute_import_resolution(
         selected = None;
     }
 
+    let semantic_fallback = if is_go_import {
+        semantic_fallback.selected()
+    } else {
+        first_best_semantic_fallback
+    };
     if selected.is_none()
         && !(has_alias || has_relative_import_binding)
         && let Some((candidate, confidence)) = semantic_fallback
@@ -773,12 +866,32 @@ mod tests {
         file_node_id: i64,
         start_line: i64,
     ) -> Result<()> {
+        insert_typed_callable(
+            conn,
+            id,
+            NodeKind::FUNCTION,
+            serialized_name,
+            qualified_name,
+            file_node_id,
+            start_line,
+        )
+    }
+
+    fn insert_typed_callable(
+        conn: &Connection,
+        id: i64,
+        kind: NodeKind,
+        serialized_name: &str,
+        qualified_name: &str,
+        file_node_id: i64,
+        start_line: i64,
+    ) -> Result<()> {
         conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
-                NodeKind::FUNCTION as i32,
+                kind as i32,
                 serialized_name,
                 qualified_name,
                 file_node_id,
@@ -819,6 +932,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
+            go_context: None,
         }
     }
 
@@ -981,6 +1095,133 @@ mod tests {
             Some(ResolutionStrategy::CallGlobalUnique)
         );
         assert_eq!(computed.update.resolved_target_node_id, Some(10));
+        Ok(())
+    }
+
+    fn go_call_row(
+        edge_id: i64,
+        file_id: i64,
+        caller_qualified: &str,
+        target_name: &str,
+        callsite_identity: Option<&str>,
+    ) -> UnresolvedEdgeRow {
+        (
+            edge_id,
+            Some(file_id),
+            Some(caller_qualified.to_string()),
+            "Convert".to_string(),
+            target_name.to_string(),
+            0,
+            Some("convert.go".to_string()),
+            callsite_identity.map(str::to_string),
+            None,
+        )
+    }
+
+    #[test]
+    fn go_ownerless_bare_call_does_not_select_same_file_method_via_suffix() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_typed_callable(
+            &conn,
+            10,
+            NodeKind::METHOD,
+            "Handler.String",
+            "probe.Handler.String",
+            1,
+            4,
+        )?;
+
+        let index =
+            CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32])?;
+        let row = go_call_row(1, 1, "probe.Convert", "string", Some("1:6:1:1"));
+        let computed = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn go_ownerless_bare_call_does_not_select_semantic_method_when_fallback_is_enabled()
+    -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_typed_callable(
+            &conn,
+            10,
+            NodeKind::METHOD,
+            "Handler.string",
+            "probe.Handler.string",
+            1,
+            4,
+        )?;
+
+        let index =
+            CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32])?;
+        let row = go_call_row(2, 1, "probe.Convert", "string", Some("1:6:1:1"));
+        let computed = compute_call_resolution(
+            &resolution_pass(false),
+            &index,
+            &row,
+            &[SemanticResolutionCandidate {
+                target_node_id: 10,
+                confidence: 0.95,
+            }],
+        )?;
+
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn go_ownerless_bare_call_keeps_package_function_with_competing_method() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_typed_callable(
+            &conn,
+            10,
+            NodeKind::METHOD,
+            "Handler.String",
+            "probe.Handler.String",
+            1,
+            4,
+        )?;
+        insert_typed_callable(
+            &conn,
+            11,
+            NodeKind::FUNCTION,
+            "string",
+            "probe.string",
+            1,
+            6,
+        )?;
+
+        let index =
+            CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32])?;
+        let row = go_call_row(3, 1, "probe.Convert", "string", Some("1:8:1:1"));
+        let with_semantic = compute_call_resolution(
+            &resolution_pass(false),
+            &index,
+            &row,
+            &[SemanticResolutionCandidate {
+                target_node_id: 10,
+                confidence: 0.95,
+            }],
+        )?;
+        let without_semantic = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+
+        assert_eq!(
+            with_semantic.strategy,
+            Some(ResolutionStrategy::CallSameFile)
+        );
+        assert_eq!(with_semantic.update.resolved_target_node_id, Some(11));
+        assert_eq!(
+            without_semantic.strategy,
+            Some(ResolutionStrategy::CallSameFile)
+        );
+        assert_eq!(without_semantic.update.resolved_target_node_id, Some(11));
         Ok(())
     }
 }

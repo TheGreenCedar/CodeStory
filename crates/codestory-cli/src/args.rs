@@ -8,16 +8,16 @@
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
-    IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
-    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SearchTargetDto, SnippetContextDto, SummaryGenerationDto,
-    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
-    validate_packet_probe,
+    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
+    IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
+    PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketProbeDto,
+    ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
+    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
+    SearchTargetDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope,
+    TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
 };
+use codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto;
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -30,17 +30,20 @@ incompatible cache and `incremental` for a compatible existing publication, so e
 forcing a full rebuild of a compatible cache. Use `none` to query the existing cache only, or `full` to force a rebuild \
 after a cache reset, schema change, or indexing failure. Explicit `incremental` never escalates to `full`.";
 const CLI_LONG_ABOUT: &str = "\
-CodeStory turns a local repository into auditable grounding evidence.
+CodeStory indexes a local repository for source navigation and retrieval.
 
 Common lanes:
-  New repo:      codestory-cli index --project <repo> --refresh full
-  Broad question: codestory-cli packet --project <repo> --question \"How does this system work?\"
-  Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
+  Prepare:       codestory-cli index --project <repo> --refresh auto
+  Find source:   codestory-cli search --project <repo> --query <name-or-behavior>
+  Existing core: codestory-cli search --project <repo> --query <symbol> --repo-text off --refresh none
+  Inspect:       codestory-cli snippet --project <repo> --id <returned-symbol-id>
 
-Packet and search initialize the embedded retrieval engine automatically and require retrieval_mode=full.";
+Use searches, source reads and relationships to investigate broad questions.
+The packet command is optional experimental evidence selection; it does not assert answer sufficiency.
+Semantic search and packets require full retrieval. Core-only search reads an existing complete index without embedding preparation.";
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
+#[command(author, version, about = "Local repository navigation and retrieval", long_about = CLI_LONG_ABOUT)]
 /// Top-level CLI parser.
 ///
 /// `Command` is the dispatch boundary used by `main`; adding a variant here
@@ -67,8 +70,13 @@ pub(crate) enum Command {
     Report(ReportCommand),
     #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),
-    #[command(about = "Answer a broad repository question with evidence.")]
+    #[command(about = "Gather an experimental bounded evidence packet for a repository question.")]
     Packet(PacketCommand),
+    #[command(
+        hide = true,
+        about = "Verify one exact indexed source call path written in the call-path/v1 grammar."
+    )]
+    VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand),
     #[command(about = "Build owner-directed task workflow packets.")]
     Task(TaskCommand),
     #[command(about = "Check cache, index, and retrieval health.")]
@@ -127,6 +135,29 @@ pub(crate) enum Command {
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
     InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
+}
+
+#[derive(Args, Debug)]
+#[command(
+    name = "verify-indexed-direct-calls",
+    about = "Verify one exact indexed source call path written in the call-path/v1 grammar."
+)]
+pub(crate) struct VerifyIndexedDirectCallsCommand {
+    #[arg(long, value_name = "ROOT")]
+    pub(crate) project: PathBuf,
+    /// A `call-path/v1` document, or `-` to read it from stdin.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) spec: PathBuf,
+    /// Compact JSON is capped at 4 KiB. Full provenance stays behind the
+    /// capability URI when available.
+    #[arg(long, value_enum, default_value_t = VerifyOutputMode::Compact)]
+    pub(crate) output: VerifyOutputMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum VerifyOutputMode {
+    Compact,
+    Full,
 }
 
 #[derive(Args, Debug)]
@@ -219,16 +250,8 @@ fn parse_packet_probe(value: &str) -> Result<PacketProbeDto, String> {
     Ok(probe)
 }
 
-fn parse_legacy_packet_probe(value: &str) -> Result<String, String> {
-    codestory_contracts::api::validate_packet_probe_request(&[], &[value.to_string()])
-        .map(|()| value.to_string())
-}
-
-pub(crate) fn validate_packet_probe_arguments(
-    probes: &[PacketProbeDto],
-    legacy_probes: &[String],
-) -> Result<(), String> {
-    codestory_contracts::api::validate_packet_probe_request(probes, legacy_probes)
+pub(crate) fn validate_packet_probe_arguments(probes: &[PacketProbeDto]) -> Result<(), String> {
+    codestory_contracts::api::validate_packet_probe_request(probes)
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -275,17 +298,6 @@ pub(crate) enum CliPacketBudget {
     Compact,
     Standard,
     Deep,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CliPacketTaskClass {
-    ArchitectureExplanation,
-    BugLocalization,
-    ChangeImpact,
-    RouteTracing,
-    SymbolOwnership,
-    DataFlow,
-    EditPlanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -513,22 +525,13 @@ pub(crate) struct PacketCommand {
     pub(crate) question: String,
     #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
-    #[arg(long, value_enum)]
-    pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
         long = "probe",
         value_name = "TAGGED_JSON",
         value_parser = parse_packet_probe,
-        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, file_symbol, free_query, continuation. Repeatable."
+        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, qualified_symbol, file_symbol, free_query, continuation. Repeatable."
     )]
     pub(crate) probes: Vec<PacketProbeDto>,
-    #[arg(
-        long = "extra-probe",
-        value_name = "QUERY",
-        value_parser = parse_legacy_packet_probe,
-        help = "Add a legacy string probe. It is normalized through the same typed resolver as --probe."
-    )]
-    pub(crate) extra_probes: Vec<String>,
     #[arg(
         long,
         value_enum,
@@ -554,11 +557,6 @@ pub(crate) struct PacketCommand {
     pub(crate) output_file: Option<PathBuf>,
     #[arg(
         long,
-        help = "Omit citation edge ids and score breakdowns from the structured packet."
-    )]
-    pub(crate) no_evidence: bool,
-    #[arg(
-        long,
         value_name = "MS",
         help = "Optional packet-level latency budget in milliseconds."
     )]
@@ -567,14 +565,14 @@ pub(crate) struct PacketCommand {
         long,
         value_name = "ID",
         requires = "option_ids",
-        help = "Parent packet id for a one-round DrillOnce continuation. Requires --option-id."
+        help = "Parent packet id for a one-round continuation. Requires --option-id."
     )]
     pub(crate) parent_packet_id: Option<String>,
     #[arg(
         long = "option-id",
         value_name = "ID",
         requires = "parent_packet_id",
-        help = "Drill option id from the parent packet's disposition. Repeatable. Requires --parent-packet-id."
+        help = "Continuation option id from the parent packet. Repeatable. Requires --parent-packet-id."
     )]
     pub(crate) option_ids: Vec<String>,
     #[arg(
@@ -591,10 +589,16 @@ pub(crate) struct PacketCommand {
     pub(crate) retrieval_generation: Option<String>,
     #[arg(
         long,
-        value_name = "PATH",
-        help = "Write per-step packet retrieval trace JSON for golden scoring."
+        value_name = "DIAGNOSTICS_OUT",
+        help = "Write the immutable packet diagnostic projection atomically to this path."
     )]
-    pub(crate) step_trace_out: Option<PathBuf>,
+    pub(crate) diagnostics_out: Option<PathBuf>,
+    #[cfg(feature = "benchmark-support")]
+    #[arg(long, hide = true)]
+    pub(crate) benchmark_disable_dense_semantic: bool,
+    #[cfg(feature = "benchmark-support")]
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub(crate) benchmark_retrieval_proof_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -629,13 +633,6 @@ pub(crate) struct TaskBriefCommand {
     )]
     pub(crate) probes: Vec<PacketProbeDto>,
     #[arg(
-        long = "extra-probe",
-        value_name = "QUERY",
-        value_parser = parse_legacy_packet_probe,
-        help = "Add a legacy string probe normalized through the typed packet resolver."
-    )]
-    pub(crate) extra_probes: Vec<String>,
-    #[arg(
         long,
         value_enum,
         default_value_t = RefreshMode::None,
@@ -650,11 +647,6 @@ pub(crate) struct TaskBriefCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Omit citation edge ids and score breakdowns from the underlying packet."
-    )]
-    pub(crate) no_evidence: bool,
     #[arg(
         long,
         value_name = "MS",
@@ -746,6 +738,8 @@ pub(crate) enum CacheAction {
         about = "Report, and optionally reclaim, cache state no live workspace or model can claim."
     )]
     Clean(CacheCleanCommand),
+    #[command(about = "Report CodeStory-owned cache state without mutating it.")]
+    Inventory(CacheInventoryCommand),
     #[command(
         about = "Quarantine this project's derived cache so it can be rebuilt.",
         long_about = "Quarantine this project's derived cache so it can be rebuilt.\n\nDerived state is moved into a quarantine directory beside the cache, never deleted, and user-authored annotations are preserved in place. Use this after rolling a CodeStory release back onto a cache written by a newer schema; the reindex step is printed on completion."
@@ -760,6 +754,18 @@ pub(crate) struct CacheCleanCommand {
         help = "Reclaim the proven candidates in the plan. Omit for a dry-run plan that leaves the cache tree untouched."
     )]
     pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheInventoryCommand {
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -1071,17 +1077,6 @@ pub(crate) struct SearchCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Show compact ranking, uncertainty, and next-action explanations for each result."
-    )]
-    pub(crate) why: bool,
-    #[arg(
-        long = "plan-details",
-        requires = "why",
-        help = "Include the full search plan in --why output. By default --why keeps provenance compact."
-    )]
-    pub(crate) plan_details: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1450,6 +1445,11 @@ pub(crate) enum ExploreProfile {
 
 #[derive(Args, Debug)]
 pub(crate) struct FilesCommand {
+    #[arg(
+        long,
+        help = "Include the global framework route capability catalog and its limitations."
+    )]
+    pub(crate) include_framework_coverage: bool,
     #[arg(long, default_value = ".", help = "Repository root to query.")]
     pub(crate) project: PathBuf,
     #[arg(
@@ -1677,13 +1677,24 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) next_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiagnosticCoreStatus {
+    Unavailable,
+    UpgradeRequired,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_status: Option<DiagnosticCoreStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_retirement: Option<codestory_runtime::LegacyRetirementReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1829,6 +1840,7 @@ pub(crate) struct VerificationTargetOutput {
 ///
 /// Retrieval readiness and repo-text mode are explicit so consumers can
 /// distinguish full retrieval evidence from degraded or fallback search paths.
+#[allow(dead_code)]
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
@@ -1882,6 +1894,7 @@ pub(crate) struct SymbolJsonOutput<'a> {
 pub(crate) struct TrailJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) trail: &'a TrailContextDto,
+    pub(crate) caller_scope: &'static str,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) notes: Vec<String>,
 }
@@ -2075,7 +2088,7 @@ pub(crate) struct DrillSummaryMechanicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after: DrillSummaryStatsOutput,
-    pub(crate) index_ready: bool,
+    pub(crate) index_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error_delta: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2118,7 +2131,7 @@ pub(crate) struct DrillSummaryAnchorStatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) slowest_command: Option<String>,
     pub(crate) slowest_command_ms: u64,
-    pub(crate) source_truth_target_count: usize,
+    pub(crate) evidence_target_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2150,45 +2163,39 @@ pub(crate) struct DrillSummaryBridgesOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummarySourceTruthTargetOutput {
+pub(crate) struct DrillSummaryEvidenceTargetOutput {
     pub(crate) path: String,
     pub(crate) role: String,
     pub(crate) rank_reason: String,
-    pub(crate) check_reasons: Vec<String>,
+    pub(crate) evidence_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummarySourceTruthOutput {
-    pub(crate) required: bool,
-    pub(crate) check_count: usize,
-    pub(crate) pending_check_count: usize,
-    pub(crate) verified_check_count: usize,
+pub(crate) struct DrillSummaryEvidenceReviewOutput {
+    pub(crate) follow_up_required: bool,
+    pub(crate) evidence_count: usize,
+    pub(crate) gap_count: usize,
+    pub(crate) continuation_gap_count: usize,
     pub(crate) target_file_count: usize,
     pub(crate) target_files: Vec<String>,
-    pub(crate) target_file_details: Vec<DrillSummarySourceTruthTargetOutput>,
-    pub(crate) checklist_item_count: usize,
-    pub(crate) claim_count: usize,
-    pub(crate) pending_claim_count: usize,
-    pub(crate) verified_claim_count: usize,
+    pub(crate) target_file_details: Vec<DrillSummaryEvidenceTargetOutput>,
+    pub(crate) pending_target_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryOpenGapsOutput {
-    pub(crate) overall_status: ClaimReadinessDto,
-    pub(crate) answer_quality_status: String,
-    pub(crate) safe_to_say_count: usize,
-    pub(crate) inferred_claim_count: usize,
-    pub(crate) needs_verification_count: usize,
-    pub(crate) needs_verification_claim_count: usize,
-    pub(crate) pending_claim_count: usize,
-    pub(crate) pending_source_truth_check_count: usize,
-    pub(crate) next_command_count: usize,
-    pub(crate) open_gap_friendly: bool,
+    pub(crate) availability_status: EvidenceAvailabilityV3Dto,
+    pub(crate) evidence_count: usize,
+    pub(crate) gap_count: usize,
+    pub(crate) continuation_gap_count: usize,
+    pub(crate) pending_target_count: usize,
+    pub(crate) continuation_available: bool,
+    pub(crate) stale_freshness: bool,
     pub(crate) status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummaryVerdictOutput {
+pub(crate) struct DrillSummaryAvailabilityOutput {
     pub(crate) status: String,
     pub(crate) reason: String,
     pub(crate) next_action: String,
@@ -2215,9 +2222,9 @@ pub(crate) struct DrillSummaryOutput {
     pub(crate) mechanical: DrillSummaryMechanicalOutput,
     pub(crate) anchors: DrillSummaryAnchorsOutput,
     pub(crate) bridges: DrillSummaryBridgesOutput,
-    pub(crate) source_truth: DrillSummarySourceTruthOutput,
+    pub(crate) evidence_review: DrillSummaryEvidenceReviewOutput,
     pub(crate) open_gaps: DrillSummaryOpenGapsOutput,
-    pub(crate) verdict: DrillSummaryVerdictOutput,
+    pub(crate) availability: DrillSummaryAvailabilityOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2240,7 +2247,7 @@ pub(crate) struct DrillOutput {
     pub(crate) execution_boundaries: Vec<DrillExecutionBoundaryOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
-    pub(crate) evidence_packet: AgentPacketDto,
+    pub(crate) evidence_packet: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
     pub(crate) next_commands: Vec<String>,
 }
 
@@ -2283,9 +2290,9 @@ pub(crate) struct DrillSuiteOutput {
     pub(crate) case_file: String,
     pub(crate) output_dir: String,
     pub(crate) repo_count: usize,
-    pub(crate) degraded_count: usize,
-    pub(crate) blocked_count: usize,
-    pub(crate) ready_count: usize,
+    pub(crate) partial_count: usize,
+    pub(crate) unavailable_count: usize,
+    pub(crate) available_count: usize,
     pub(crate) repos: Vec<DrillSuiteRepoOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retrieval_blockers: Vec<DrillSuiteRetrievalBlockerOutput>,
@@ -2487,6 +2494,8 @@ pub(crate) struct RetrievalStatusOutput {
     pub(crate) precise_semantic_import_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) precise_semantic_import_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_retirement: Option<codestory_runtime::LegacyRetirementReport>,
     #[serde(flatten)]
     pub(crate) ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }
@@ -2499,6 +2508,8 @@ pub(crate) struct RetrievalStatusOutput {
 pub(crate) struct DoctorOutput {
     pub(crate) project: String,
     pub(crate) storage_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_status: Option<DiagnosticCoreStatus>,
     pub(crate) indexed: bool,
     pub(crate) stats: codestory_contracts::api::StorageStatsDto,
     pub(crate) retrieval_mode: String,
@@ -2571,20 +2582,6 @@ impl From<CliPacketBudget> for PacketBudgetModeDto {
     }
 }
 
-impl From<CliPacketTaskClass> for PacketTaskClassDto {
-    fn from(value: CliPacketTaskClass) -> Self {
-        match value {
-            CliPacketTaskClass::ArchitectureExplanation => Self::ArchitectureExplanation,
-            CliPacketTaskClass::BugLocalization => Self::BugLocalization,
-            CliPacketTaskClass::ChangeImpact => Self::ChangeImpact,
-            CliPacketTaskClass::RouteTracing => Self::RouteTracing,
-            CliPacketTaskClass::SymbolOwnership => Self::SymbolOwnership,
-            CliPacketTaskClass::DataFlow => Self::DataFlow,
-            CliPacketTaskClass::EditPlanning => Self::EditPlanning,
-        }
-    }
-}
-
 impl From<CliFileRole> for IndexedFileRoleDto {
     fn from(value: CliFileRole) -> Self {
         match value {
@@ -2612,6 +2609,13 @@ pub(crate) fn build_trail_request(
     cmd: &TrailCommand,
 ) -> codestory_contracts::api::TrailConfigDto {
     build_trail_request_impl(root_id, cmd)
+}
+
+pub(crate) fn trail_caller_scope_wire_label(scope: TrailCallerScope) -> &'static str {
+    match scope {
+        TrailCallerScope::ProductionOnly => "production_only",
+        TrailCallerScope::IncludeTestsAndBenches => "include_tests_and_benches",
+    }
 }
 
 fn build_trail_request_impl(
@@ -2699,6 +2703,19 @@ mod tests {
             panic!("expected cache clean command");
         };
         assert!(applied.apply);
+    }
+
+    #[test]
+    fn cache_inventory_defaults_to_json_observation_only() {
+        let inventory = Cli::try_parse_from(["codestory-cli", "cache", "inventory"])
+            .expect("cache inventory should parse without flags");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Inventory(parsed),
+        }) = inventory.command
+        else {
+            panic!("expected cache inventory command");
+        };
+        assert_eq!(parsed.format, OutputFormat::Json);
     }
 
     #[test]
@@ -2794,7 +2811,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_cli_parses_tagged_and_legacy_probes() {
+    fn packet_cli_parses_tagged_probes() {
         let parsed = Cli::try_parse_from([
             "codestory-cli",
             "packet",
@@ -2802,8 +2819,6 @@ mod tests {
             "Explain the target",
             "--probe",
             r#"{"kind":"exact_path","path":"assets/desk.svg"}"#,
-            "--extra-probe",
-            "WorkspaceIndexer",
         ])
         .expect("packet probes should parse");
         let Command::Packet(packet) = parsed.command else {
@@ -2815,7 +2830,6 @@ mod tests {
                 path: "assets/desk.svg".into()
             }]
         );
-        assert_eq!(packet.extra_probes, ["WorkspaceIndexer"]);
     }
 
     #[test]
@@ -2844,7 +2858,7 @@ mod tests {
                 "packet",
                 "--question",
                 "Explain the target",
-                "--extra-probe",
+                "--probe",
                 &"x".repeat(codestory_contracts::api::PACKET_PROBE_MAX_TEXT_LENGTH + 1),
             ])
             .is_err()
@@ -2853,7 +2867,12 @@ mod tests {
             PacketProbeDto::FreeQuery { query: "x".into() };
             codestory_contracts::api::PACKET_PROBE_MAX_COUNT
         ];
-        assert!(validate_packet_probe_arguments(&typed, &["overflow".into()]).is_err());
+        assert!(validate_packet_probe_arguments(&typed).is_ok());
+        let overflow = vec![
+            PacketProbeDto::FreeQuery { query: "x".into() };
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT + 1
+        ];
+        assert!(validate_packet_probe_arguments(&overflow).is_err());
     }
 
     #[test]
@@ -2949,10 +2968,30 @@ mod tests {
         assert!(help.contains("--repo-text <REPO_TEXT>"));
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
-        assert!(help.contains("--why"));
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn search_explanation_flags_are_unknown_and_normal_search_still_parses() {
+        let help = render_subcommand_help("search");
+        for flag in ["--why", "--plan-details"] {
+            assert!(
+                !help.contains(flag),
+                "retired {flag} leaked into search help: {help}"
+            );
+            let error =
+                Cli::try_parse_from(["codestory-cli", "search", "--query", "indexing", flag])
+                    .expect_err("retired search explanation flag must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+        let parsed = Cli::try_parse_from(["codestory-cli", "search", "--query", "indexing"])
+            .expect("ordinary search must remain valid");
+        assert!(matches!(parsed.command, Command::Search(_)));
+        let ground = Cli::try_parse_from(["codestory-cli", "ground", "--why"])
+            .expect("ground keeps its explanation option");
+        assert!(matches!(ground.command, Command::Ground(_)));
     }
 
     #[test]
@@ -2964,6 +3003,50 @@ mod tests {
         assert!(help.contains("--option-id <ID>"));
         assert!(help.contains("--core-generation-id <ID>"));
         assert!(help.contains("--retrieval-generation <ID>"));
+        assert!(!help.contains("benchmark-disable-dense-semantic"));
+    }
+
+    #[cfg(not(feature = "benchmark-support"))]
+    #[test]
+    fn product_packet_rejects_dense_semantic_ablation_flag() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--benchmark-disable-dense-semantic",
+        ])
+        .expect_err("product builds must not expose the benchmark-only ablation switch");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn packet_parses_hidden_dense_semantic_ablation_flag() {
+        let packet = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--benchmark-disable-dense-semantic",
+            "--benchmark-retrieval-proof-out",
+            "/tmp/retrieval-proof.json",
+        ])
+        .expect("benchmark build should parse the hidden packet ablation flag");
+        match packet.command {
+            Command::Packet(cmd) => {
+                assert!(cmd.benchmark_disable_dense_semantic);
+                assert_eq!(
+                    cmd.benchmark_retrieval_proof_out.as_deref(),
+                    Some(std::path::Path::new("/tmp/retrieval-proof.json")),
+                );
+            }
+            _ => panic!("expected packet command"),
+        }
     }
 
     #[test]

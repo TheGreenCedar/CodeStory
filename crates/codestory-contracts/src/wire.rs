@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 ///   published catalog and rejected with JSON-RPC `-32602` instead of being
 ///   repaired, and `initialize` negotiates the protocol revision instead of
 ///   echoing whatever the client asked for.
-pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 2;
+/// * **v3** — packet, context, and search publish closed evidence projections;
+///   packet truth dispositions and its evidence opt-out are no longer public.
+pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 3;
 
 /// Oldest reader schema version that can still interpret a payload stamped with
 /// [`PUBLICATION_STAMP_SCHEMA_VERSION`] without misreading it.
@@ -38,21 +40,22 @@ pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 2;
 /// client against a v2 server receives `-32602` for requests it believes are
 /// valid. Consumers must compare against this bound rather than assuming the
 /// stamp is purely additive.
-pub const MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 2;
+pub const MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 3;
 
 /// Schema version a reader must assume when `_meta.codestory_publication` is
 /// absent from a response that should carry it.
 pub const LEGACY_PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 0;
 
-/// MCP protocol revisions this build implements, newest-preferred first.
+/// MCP protocol revisions this build implements, in stable chronological order.
 ///
 /// Advertising a revision here is a claim that the server honours it. The list
 /// stays deliberately short: an unimplemented revision echoed back to a client
 /// is a false compatibility claim, which is the defect this contract closes.
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05"];
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// Revision the server answers with when the client offers nothing usable.
-pub const PREFERRED_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PREFERRED_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Stable labels emitted for the retrieval planner's stage timing records.
 ///
@@ -221,10 +224,10 @@ mod tests {
 
     #[test]
     fn unsupported_revision_answers_with_the_server_revision() {
-        let negotiation = negotiate_mcp_protocol_version(Some("2025-06-18"));
+        let negotiation = negotiate_mcp_protocol_version(Some("2099-01-01"));
 
         assert_eq!(
-            negotiation.negotiated, "2024-11-05",
+            negotiation.negotiated, "2025-11-25",
             "an unimplemented revision must never be echoed back as supported"
         );
         assert_eq!(
@@ -232,7 +235,7 @@ mod tests {
             McpProtocolNegotiationStatus::UnsupportedClientRevision
         );
         assert!(!negotiation.compatible);
-        assert_eq!(negotiation.requested.as_deref(), Some("2025-06-18"));
+        assert_eq!(negotiation.requested.as_deref(), Some("2099-01-01"));
     }
 
     #[test]
@@ -240,7 +243,7 @@ mod tests {
         for requested in [None, Some(""), Some("   ")] {
             let negotiation = negotiate_mcp_protocol_version(requested);
 
-            assert_eq!(negotiation.negotiated, "2024-11-05");
+            assert_eq!(negotiation.negotiated, "2025-11-25");
             assert_eq!(negotiation.status, McpProtocolNegotiationStatus::Defaulted);
             assert!(negotiation.compatible);
             assert_eq!(negotiation.requested, None);
@@ -289,13 +292,16 @@ mod tests {
     #[test]
     fn published_stamp_bounds_are_the_documented_values() {
         assert_eq!(
-            PUBLICATION_STAMP_SCHEMA_VERSION, 2,
-            "the v0.17.0 wire contract publishes stamp schema 2"
+            PUBLICATION_STAMP_SCHEMA_VERSION, 3,
+            "the evidence-only v3 contract publishes stamp schema 3"
         );
-        assert_eq!(MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION, 2);
+        assert_eq!(MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION, 3);
         assert_eq!(LEGACY_PUBLICATION_STAMP_SCHEMA_VERSION, 0);
-        assert_eq!(SUPPORTED_MCP_PROTOCOL_VERSIONS, &["2024-11-05"]);
-        assert_eq!(PREFERRED_MCP_PROTOCOL_VERSION, "2024-11-05");
+        assert_eq!(
+            SUPPORTED_MCP_PROTOCOL_VERSIONS,
+            &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+        );
+        assert_eq!(PREFERRED_MCP_PROTOCOL_VERSION, "2025-11-25");
     }
 
     #[test]

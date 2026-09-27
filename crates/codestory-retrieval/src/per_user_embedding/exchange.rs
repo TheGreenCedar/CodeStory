@@ -6,7 +6,7 @@ use super::{
     EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity,
     EmbeddingOperation, EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingResult,
     EmbeddingServerProtocolSnapshot, EmbeddingServerSnapshot, EmbeddingServerStream,
-    EmbeddingTransportIdentity, PER_USER_EMBEDDING_MAX_DOCUMENT_COUNT,
+    EmbeddingTransportIdentity, EmbeddingVectorTimings, PER_USER_EMBEDDING_MAX_DOCUMENT_COUNT,
     PER_USER_EMBEDDING_MAX_METADATA_BYTES, PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES,
     PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_V1,
     PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingError,
@@ -343,13 +343,20 @@ pub(super) fn response_result(response: EmbeddingProtocolResponse) -> Result<Emb
 
 pub(super) fn vectors_result(
     result: (EmbeddingResult, Vec<u8>),
-) -> Result<(u32, u32, EmbeddingEngineIdentity, Vec<u8>)> {
+) -> Result<(
+    u32,
+    u32,
+    EmbeddingEngineIdentity,
+    EmbeddingVectorTimings,
+    Vec<u8>,
+)> {
     let (
         EmbeddingResult::Vectors {
             rows,
             columns,
             encoding,
             identity,
+            timings,
         },
         payload,
     ) = result
@@ -359,7 +366,13 @@ pub(super) fn vectors_result(
     if encoding != "f32_le" {
         bail!("embedding_vector_encoding_mismatch");
     }
-    Ok((rows, columns, *identity, payload))
+    Ok((
+        rows,
+        columns,
+        *identity,
+        timings.unwrap_or_default(),
+        payload,
+    ))
 }
 
 pub(super) fn write_frame<T: Serialize>(

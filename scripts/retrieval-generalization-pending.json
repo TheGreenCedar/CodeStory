@@ -8,7 +8,7 @@
     "count": 0,
     "ratchet_ceiling": 0,
     "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1200",
-    "reason": "Source-text claim profiles were retired in favor of typed obligations, evidence roles, source tiers, and validated graph relations.",
+    "reason": "Source-text claim profiles were retired; packet compilation now receives only admitted identities, bounded source, typed relations, ambiguity, parser completeness, and publication identity.",
     "burn_down": []
   },
   "surfaces": {}

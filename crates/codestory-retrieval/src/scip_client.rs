@@ -1,9 +1,9 @@
 use crate::candidate::{CandidateGraphDirection, CandidateGraphEvidence};
 use crate::config::SidecarLayout;
 use crate::scip_index::{
-    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, SCIP_SYMBOLS_FILE,
-    ScipAdjacencyDirection, ScipIndexMarkerError, ScipNormalizedSymbol, ScipSymbolRecord,
-    load_fresh_scip_query_view, parse_scip_index_marker,
+    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, ScipAdjacencyDirection,
+    ScipIndexMarkerError, ScipNormalizedSymbol, ScipSymbolRecord, load_fresh_scip_query_view,
+    parse_scip_index_marker, scip_symbols_component_path,
 };
 use codestory_contracts::graph::EdgeKind;
 use std::cmp::Ordering;
@@ -123,7 +123,7 @@ impl ScipClient {
         let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(provenance) = view.index().contract.provenance_label() else {
+        let Some(provenance) = view.contract().provenance_label() else {
             return Ok(Vec::new());
         };
         let profile = ScipQueryProfile::new(query);
@@ -207,7 +207,7 @@ impl ScipClient {
         let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(provenance) = view.index().contract.provenance_label() else {
+        let Some(provenance) = view.contract().provenance_label() else {
             return Ok(Vec::new());
         };
 
@@ -423,6 +423,10 @@ fn symbol_to_hit(
         start_line: Some(symbol.start_line),
         target: None,
         source_excerpt: None,
+        source_bytes_upper_bound: symbol
+            .node_id
+            .as_ref()
+            .map(|_| codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32),
         score,
         lane_scores: Default::default(),
         source: CandidateSource::Scip,
@@ -658,7 +662,7 @@ fn read_scip_revision(dir: &Path) -> Option<String> {
 }
 
 fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) -> &'static str {
-    if !project_dir.join(SCIP_SYMBOLS_FILE).is_file()
+    if !scip_symbols_component_path(project_dir).is_file()
         || !project_dir.join("revision.txt").is_file()
         || project_dir.join(SCIP_STUB_MARKER_FILE).is_file()
     {
@@ -678,7 +682,7 @@ fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) ->
         .ok()
         .flatten()
         .map_or("scip_stale", |view| {
-            if view.index().contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
+            if view.contract().evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
                 SCIP_READY_STATUS
             } else {
                 "scip_imported_diagnostic_only"
@@ -720,7 +724,7 @@ mod tests {
             proofs,
         };
         std::fs::write(
-            project_dir.join(SCIP_SYMBOLS_FILE),
+            scip_symbols_component_path(project_dir),
             serde_json::to_string_pretty(&index).expect("serialize"),
         )
         .expect("write symbols");

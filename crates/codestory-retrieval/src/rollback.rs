@@ -29,6 +29,9 @@ use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::generation::manifest_has_current_sidecar_contract;
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::sidecar_project_id_for_runtime;
+use crate::retention::{
+    GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock, global_generation_gc_state_file,
+};
 
 /// Why validated rollback activation left the current pointer alone.
 ///
@@ -200,7 +203,9 @@ pub fn observe_retained_rollback_generation(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<RetainedRollbackObservation>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for retained rollback observation")?
+    {
         return Ok(None);
     }
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)
@@ -257,6 +262,21 @@ pub(crate) fn activate_retained_rollback_generation_with_embedding(
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)
         .context("resolve project id for rollback activation")
         .map_err(RollbackActivationError::Failed)?;
+    // Applying a rollback can bind a formerly old core. Coordinate from
+    // validation through commit with core GC's global exclusive fence. The
+    // observational branch leaves retention state untouched.
+    let _global_gc_lock = if apply {
+        Some(
+            GenerationRetentionLock::acquire_shared(
+                &global_generation_gc_state_file(runtime),
+                GLOBAL_GENERATION_GC_LOCK_SCOPE,
+            )
+            .context("coordinate rollback activation with core retention")
+            .map_err(RollbackActivationError::Failed)?,
+        )
+    } else {
+        None
+    };
     let validated = validate_retained_rollback(
         storage_path,
         runtime,
@@ -368,6 +388,7 @@ fn validate_retained_rollback(
     crate::embedded_vector::validate_generation_evidence_for_publication(
         &runtime.layout,
         &storage,
+        None,
         &candidate,
         &core_publication,
         runtime,
@@ -613,6 +634,8 @@ mod tests {
             &fixture.runtime.layout,
             &fixture.rollback.manifest.semantic_generation,
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make retained rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)

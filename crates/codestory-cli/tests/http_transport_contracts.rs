@@ -448,16 +448,17 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     write!(slow, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("slow peer preamble");
     slow.flush().expect("flush slow peer preamble");
 
-    // Never send the blank line that ends the headers, and keep the connection
-    // demonstrably live with a byte well inside the 2s read window.
+    // Never send the blank line that ends the headers. Keep sending through
+    // the five-second request deadline and the response drain, so a drain
+    // timeout that restarts after each byte would hold the serial server.
     let dribbler = {
         let mut slow = slow.try_clone().expect("clone slow peer");
         thread::spawn(move || {
-            for _ in 0..30 {
+            for _ in 0..400 {
                 if write!(slow, "X").is_err() || slow.flush().is_err() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(20));
             }
         })
     };
@@ -477,7 +478,6 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
     }
     let elapsed = started.elapsed();
     let response = String::from_utf8_lossy(&response_bytes).to_string();
-    let _ = dribbler.join();
 
     assert!(
         response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
@@ -495,14 +495,96 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
         "the 408 must carry its typed code: {body}"
     );
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(7),
         "the whole-request deadline should end the peer promptly, took {elapsed:?}"
     );
 
-    // The serving thread is back: the route the slow peer was blocking answers.
+    // The serving thread is back while the sender is still attempting to
+    // dribble bytes, rather than only after the sender thread has finished.
     let health = http_get(&addr, "/health").expect("health after the slow peer");
     assert_eq!(health.status, 200, "{}", health.body);
     assert_eq!(health.body["ok"], true, "{}", health.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "continued sending must not extend the serial server's drain"
+    );
+    let _ = dribbler.join();
+}
+
+#[test]
+fn a_peer_ending_incomplete_headers_receives_the_full_bad_request_response() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+
+    let mut partial = TcpStream::connect(&addr).expect("connect partial peer");
+    partial
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("partial peer read timeout");
+    write!(partial, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("write incomplete headers");
+    partial
+        .shutdown(Shutdown::Write)
+        .expect("end incomplete request");
+
+    let mut response_bytes = Vec::new();
+    partial
+        .read_to_end(&mut response_bytes)
+        .expect("read full bad-request response through EOF");
+    let response = String::from_utf8(response_bytes).expect("response should be UTF-8");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "incomplete headers should receive a bad-request status: {response:?}"
+    );
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("bad-request response should include a body: {response:?}"));
+    let body: Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("bad-request body should be JSON: {error}: {body:?}"));
+    assert_eq!(body["error"], "bad request", "{body}");
+
+    // A different peer can disappear before reading its 400. That failed
+    // delivery must not hold the only serving thread for the next client.
+    let mut aborted = TcpStream::connect(&addr).expect("connect early-closing peer");
+    write!(aborted, "GET /health HTTP/1.1\r\nHost: {addr}\r\n")
+        .expect("write early-closing peer headers");
+    aborted
+        .shutdown(Shutdown::Both)
+        .expect("close early peer before its response");
+    drop(aborted);
+    let started = Instant::now();
+    let health = http_get(&addr, "/health").expect("health after early-closing peer");
+    assert_eq!(health.status, 200, "{}", health.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "an early close should release the serving thread promptly"
+    );
+}
+
+#[test]
+fn queued_unread_request_bytes_receive_complete_bad_request_before_clean_eof() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+    let mut peer = TcpStream::connect(&addr).expect("connect queued-byte peer");
+    peer.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {addr}\r\n{}",
+        "X".repeat(16 * 1024)
+    );
+    peer.write_all(request.as_bytes())
+        .expect("queue incomplete headers");
+    peer.shutdown(Shutdown::Write)
+        .expect("finish request writes");
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response)
+        .expect("response must end in clean EOF, not a reset");
+    let response = String::from_utf8(response).expect("UTF-8 response");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response:?}"
+    );
+    let (_, body) = response.split_once("\r\n\r\n").expect("headers and body");
+    let body: Value = serde_json::from_str(body).expect("complete JSON body");
+    assert_eq!(body["error"], "bad request");
 }
 
 fn get_json(addr: &str, target: &str) -> Value {
@@ -525,6 +607,14 @@ fn assert_nonempty_array(value: &Value, pointer: &str) -> usize {
         "expected nonempty array at {pointer}: {value}"
     );
     items.len()
+}
+
+fn required_nonempty_string<'a>(value: &'a Value, pointer: &str) -> &'a str {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| panic!("expected nonempty string at {pointer}: {value}"))
 }
 
 fn max_node_depth(value: &Value, pointer: &str) -> u64 {
@@ -747,34 +837,30 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     let (_server, addr) = spawn_http_server(&fixture);
 
     let search = http_get(&addr, "/search?q=AppController&repo_text=off")
-        .expect("search fail-closed response");
+        .expect("exact core search response");
+    assert_eq!(search.status, 200, "{}", search.body);
+    assert_eq!(search.body["schema_version"], 3, "{}", search.body);
     assert_eq!(
-        search.status, 400,
-        "HTTP /search is product search and should fail closed without full sidecars: {}",
-        search.body
-    );
-    assert_eq!(
-        search.body.pointer("/error/code").and_then(Value::as_str),
-        Some("retrieval_unavailable"),
-        "HTTP /search must preserve the runtime's machine classification: {}",
-        search.body
-    );
-    assert_eq!(
-        search
-            .body
-            .pointer("/error/details/failed_layer")
-            .and_then(Value::as_str),
-        Some("retrieval_engine"),
-        "HTTP /search must preserve the typed repair details: {}",
+        search.body["retrieval"]["state"], "symbolic",
+        "explicit repo_text=off must use the core without implying sidecar readiness: {}",
         search.body
     );
     assert!(
-        search
-            .body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("retrieval")),
-        "HTTP /search should explain the sidecar-primary boundary: {}",
+        search.body["publication"]["retrieval"].is_null()
+            && search.body["retrieval"]["generation_id"].is_null(),
+        "exact HTTP search must not name a retrieval publication: {}",
+        search.body
+    );
+    assert!(
+        search.body["evidence"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["path"] == "src/lib.rs"
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("AppController"))
+            })),
+        "exact HTTP search must return project-relative source evidence: {}",
         search.body
     );
 
@@ -782,17 +868,133 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     publish_zero_dense_agent_fixture(&search_fixture);
     let (_search_server, search_addr) = spawn_http_server(&search_fixture);
     let search = get_json(&search_addr, "/search?q=HTTP_METADATA_ANCHOR&repo_text=on");
-    assert_eq!(search["query"], "HTTP_METADATA_ANCHOR", "{search}");
+    assert_eq!(search["schema_version"], 3, "{search}");
+    assert_eq!(search["kind"], "complete", "{search}");
+    assert_eq!(search["status"], "available", "{search}");
+    assert_eq!(search["retrieval"]["state"], "full", "{search}");
     assert!(
-        search["_meta"]["codestory_publication"]["core_publication"].is_object()
-            && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
-            && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
-        "/search success must retain the complete core and retrieval publications plus operation identity: {search}"
+        search["retrieval"]["generation_id"].is_string()
+            && search["publication"]["core"]["project_id"].is_string()
+            && search["publication"]["core"]["generation_id"].is_string()
+            && search["publication"]["core"]["run_id"].is_string()
+            && search["publication"]["retrieval"].is_object(),
+        "/search success must identify the full retrieval and complete publication: {search}"
     );
     assert_eq!(
-        search["_meta"]["codestory_publication"]["retrieval_publication"]["core_generation_id"],
-        search["_meta"]["codestory_publication"]["core_publication"]["generation_id"],
+        search["publication"]["retrieval"]["core_generation_id"],
+        search["publication"]["core"]["generation_id"],
+        "/search retrieval must bind the served core generation: {search}"
+    );
+    assert_eq!(
+        search["publication"]["retrieval"]["core_run_id"], search["publication"]["core"]["run_id"],
+        "/search retrieval must bind the served core run: {search}"
+    );
+    assert_eq!(
+        search["retrieval"]["generation_id"],
+        search["publication"]["retrieval"]["retrieval_generation"],
+        "/search retrieval descriptor must name the served retrieval generation: {search}"
+    );
+    assert!(
+        search["evidence"]
+            .as_array()
+            .is_some_and(|evidence| evidence.iter().any(|row| {
+                row["path"] == "metadata.rs"
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("HTTP_METADATA_ANCHOR"))
+            })),
+        "/search evidence must retain the matched source path and anchor: {search}"
+    );
+    assert!(
+        search["gaps"].as_array().is_some_and(Vec::is_empty) && search["continuation"].is_null(),
+        "complete available /search evidence must not invent a gap or continuation: {search}"
+    );
+    for legacy_field in ["query", "hits", "proof"] {
+        assert!(
+            search.get(legacy_field).is_none(),
+            "/search schema-3 projection must omit legacy field {legacy_field}: {search}"
+        );
+    }
+    let search_text = search.to_string();
+    for proof_authority in ["disposition", "proof_status", "supported"] {
+        assert!(
+            !search_text.contains(&format!("\"{proof_authority}\"")),
+            "/search evidence must not expose proof authority {proof_authority}: {search}"
+        );
+    }
+    assert!(
+        search["_meta"]["codestory_publication"]["schema_version"] == 3
+            && search["_meta"]["codestory_publication"]["minimum_compatible_schema_version"] == 3
+            && search["_meta"]["codestory_publication"]["served_from"] == "complete_publication"
+            && search["_meta"]["codestory_publication"]["core_publication"]["mode"] == "full"
+            && search["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
+        "/search success metadata must retain schema 3 and the complete core and retrieval publications plus operation identity: {search}"
+    );
+    required_nonempty_string(&search, "/publication/core/project_id");
+    let public_core_generation_id =
+        required_nonempty_string(&search, "/publication/core/generation_id");
+    let public_core_run_id = required_nonempty_string(&search, "/publication/core/run_id");
+    let public_retrieval_core_generation_id =
+        required_nonempty_string(&search, "/publication/retrieval/core_generation_id");
+    let public_retrieval_core_run_id =
+        required_nonempty_string(&search, "/publication/retrieval/core_run_id");
+    let public_retrieval_generation =
+        required_nonempty_string(&search, "/publication/retrieval/retrieval_generation");
+    let public_retrieval_descriptor_generation =
+        required_nonempty_string(&search, "/retrieval/generation_id");
+    let metadata_core_generation_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/core_publication/generation_id",
+    );
+    let metadata_core_run_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/core_publication/run_id",
+    );
+    let metadata_retrieval_core_generation_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/core_generation_id",
+    );
+    let metadata_retrieval_core_run_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/core_run_id",
+    );
+    let metadata_retrieval_generation = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/retrieval_generation",
+    );
+    assert_eq!(
+        metadata_retrieval_core_generation_id, metadata_core_generation_id,
         "/search retrieval evidence must bind the served core publication: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_run_id, metadata_core_run_id,
+        "/search metadata retrieval evidence must bind the served core run: {search}"
+    );
+    assert_eq!(
+        metadata_core_generation_id, public_core_generation_id,
+        "/search metadata must name the public core generation: {search}"
+    );
+    assert_eq!(
+        metadata_core_run_id, public_core_run_id,
+        "/search metadata must name the public core run: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_generation_id, public_retrieval_core_generation_id,
+        "/search metadata retrieval must name the public retrieval core generation: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_run_id, public_retrieval_core_run_id,
+        "/search metadata retrieval must name the public retrieval core run: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_generation, public_retrieval_generation,
+        "/search metadata must name the public retrieval generation: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_generation, public_retrieval_descriptor_generation,
+        "/search metadata must bind the public retrieval descriptor generation: {search}"
     );
 
     let definition = get_json(&addr, "/definition?q=AppController");

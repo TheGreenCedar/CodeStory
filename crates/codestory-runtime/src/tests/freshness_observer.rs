@@ -7,8 +7,9 @@
 
 use super::{hybrid_test_env, test_sidecar_runtime_from_env};
 use crate::index_freshness::{
-    FreshnessObservation, FreshnessObservationPolicy, index_freshness_from_storage_with_policy,
-    with_index_freshness_caps_for_test,
+    FreshnessObservation, FreshnessObservationPolicy,
+    arm_before_repository_tracking_revalidation_test_hook,
+    index_freshness_from_storage_with_policy, with_index_freshness_caps_for_test,
 };
 use crate::{AppController, SourceIndexPolicy, Storage, WorkspaceManifest};
 use codestory_contracts::api::{
@@ -19,7 +20,7 @@ use codestory_workspace::filesystem_observer::{
     FilesystemObserverSession, MutationScope, ObservedFilesystemEvent, ObserverEventSource,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::{TempDir, tempdir};
 
@@ -316,6 +317,45 @@ fn a_write_that_races_the_scan_is_reported_stale_instead_of_fresh() {
 }
 
 #[test]
+fn tracking_revalidation_remains_inside_the_observed_source_window() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let racing_path = project.source.clone();
+    let event_pending = Arc::new(AtomicBool::new(false));
+    let pending_for_hook = Arc::clone(&event_pending);
+    let hook_path = racing_path.clone();
+    arm_before_repository_tracking_revalidation_test_hook(move || {
+        std::fs::write(
+            &hook_path,
+            "pub fn changed_during_tracking_revalidation() {}\n",
+        )
+        .expect("source write during repository tracking revalidation");
+        pending_for_hook.store(true, Ordering::Release);
+    });
+    let pending_for_observer = Arc::clone(&event_pending);
+    let event_path = racing_path.clone();
+    let session = scripted_session(project.root(), move |_| {
+        pending_for_observer
+            .swap(false, Ordering::AcqRel)
+            .then(|| mutated(&event_path, MutationScope::File))
+            .into_iter()
+            .collect()
+    });
+
+    let freshness = project.freshness(FreshnessObservation::Observed(&session));
+
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Stale,
+        "repository tracking revalidation must remain inside the observer window that seals the scan"
+    );
+    assert_eq!(
+        freshness.reason.as_deref(),
+        Some("source_changed_during_freshness_scan_observed_by_injected")
+    );
+}
+
+#[test]
 fn the_scan_runs_inside_the_window_the_observer_sealed() {
     let _env = hybrid_test_env();
     let project = ObservedProject::publish();
@@ -558,6 +598,51 @@ fn a_session_that_lost_coverage_stamps_no_certainty_on_a_ready_lease() {
         project.controller.observed_source_epoch(project.root()),
         None,
         "an epoch from a session that admits it missed something is not evidence"
+    );
+}
+
+fn session_losing_coverage_on_epoch_read(root: &Path) -> FilesystemObserverSession {
+    scripted_session(root, |drain| {
+        (drain == 1)
+            .then(|| ObservedFilesystemEvent::CoverageLost {
+                detail: "queue overflow while reading the epoch".to_string(),
+            })
+            .into_iter()
+            .collect()
+    })
+}
+
+#[test]
+fn coverage_lost_while_reading_epoch_stamps_no_observed_source_epoch() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let session = session_losing_coverage_on_epoch_read(project.root());
+    project
+        .controller
+        .install_source_observer_for_test(project.root(), Arc::new(session));
+
+    assert_eq!(
+        project.controller.observed_source_epoch(project.root()),
+        None,
+        "coverage lost after the initial gap read cannot back a source epoch"
+    );
+}
+
+#[test]
+fn coverage_lost_while_reading_epoch_stamps_no_observed_source_epoch_if_armed() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let session = session_losing_coverage_on_epoch_read(project.root());
+    project
+        .controller
+        .install_source_observer_for_test(project.root(), Arc::new(session));
+
+    assert_eq!(
+        project
+            .controller
+            .observed_source_epoch_if_armed(project.root()),
+        None,
+        "an already-armed session cannot retain certainty after its epoch read discovers a gap"
     );
 }
 

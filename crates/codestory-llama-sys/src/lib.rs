@@ -709,6 +709,13 @@ pub type EmbeddingRequestResult = Result<Vec<Vec<f32>>, EngineError>;
 pub struct EmbeddingRequestCompletion {
     pub vectors: Vec<Vec<f32>>,
     pub completion_sequence: u64,
+    pub timings: EmbeddingRequestTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingRequestTimings {
+    pub tokenization_ns: u64,
+    pub native_encode_ns: u64,
 }
 
 impl std::fmt::Debug for EmbeddingRequestHandle {
@@ -1151,6 +1158,7 @@ impl EmbeddingEngine {
             let _ = response.send(Ok(EmbeddingRequestCompletion {
                 vectors: Vec::new(),
                 completion_sequence: 0,
+                timings: EmbeddingRequestTimings::default(),
             }));
             return Ok(EmbeddingRequestHandle { context, result });
         }
@@ -1389,7 +1397,7 @@ fn run_resident_generation(
         let smoke_started = Instant::now();
         let smoke_context = EmbeddingRequestContext::new("engine-startup-smoke", "engine-owner", 0);
         let _ = smoke_context.activate();
-        let smoke = embed_inputs(
+        let (smoke, _) = embed_inputs(
             &model,
             &mut context,
             &telemetry,
@@ -1797,9 +1805,10 @@ fn handle_request(
         admission.finish(&request.context, request_class, result.is_ok(), cancelled);
     let _ = request
         .response
-        .send(result.map(|vectors| EmbeddingRequestCompletion {
+        .send(result.map(|(vectors, timings)| EmbeddingRequestCompletion {
             vectors,
             completion_sequence,
+            timings,
         }));
 }
 
@@ -1814,19 +1823,23 @@ fn embed_inputs(
     config: &NativeEmbeddingRequest,
     admission: &EmbeddingAdmissionTracker,
     request_context: &EmbeddingRequestContext,
-) -> Result<Vec<Vec<f32>>, EngineError> {
+) -> Result<(Vec<Vec<f32>>, EmbeddingRequestTimings), EngineError> {
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), EmbeddingRequestTimings::default()));
     }
     if inputs.iter().any(|input| input.trim().is_empty()) {
         return Err(EngineError::EmptyInput);
     }
+    let tokenization_started = Instant::now();
     let tokenized = inputs
         .iter()
         .map(|input| tokenize(model, input, config.max_input_tokens))
         .collect::<Result<Vec<_>, _>>()?;
+    let tokenization_ns =
+        u64::try_from(tokenization_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let completed_tokens = tokenized.iter().map(Vec::len).sum::<usize>();
     let mut output = Vec::with_capacity(inputs.len());
+    let mut native_encode_ns = 0_u64;
     let mut offset = 0;
     while offset < tokenized.len() {
         ensure_embedding_request_live(request_context)?;
@@ -1836,13 +1849,15 @@ fn embed_inputs(
             config.max_batch_sequences as usize,
             config.batch_tokens as usize,
         );
-        embed_token_batch(
+        let encode_elapsed = embed_token_batch(
             context,
             telemetry,
             &tokenized[offset..end],
             &mut output,
             config.dimension,
         )?;
+        native_encode_ns = native_encode_ns
+            .saturating_add(u64::try_from(encode_elapsed.as_nanos()).unwrap_or(u64::MAX));
         admission.progress(priority.request_class());
         offset = end;
         if priority == RequestPriority::Bulk && offset < tokenized.len() {
@@ -1862,7 +1877,13 @@ fn embed_inputs(
         }
     }
     request_context.record_completed_tokens(completed_tokens);
-    Ok(output)
+    Ok((
+        output,
+        EmbeddingRequestTimings {
+            tokenization_ns,
+            native_encode_ns,
+        },
+    ))
 }
 
 fn ensure_embedding_request_live(
@@ -1906,7 +1927,7 @@ fn embed_token_batch(
     sequences: &[Vec<llama_cpp_2::token::LlamaToken>],
     output: &mut Vec<Vec<f32>>,
     expected_dimension: usize,
-) -> Result<(), EngineError> {
+) -> Result<Duration, EngineError> {
     let total_tokens = sequences.iter().map(Vec::len).sum();
     let mut batch = LlamaBatch::new(total_tokens, sequences.len() as i32);
     for (sequence_id, tokens) in sequences.iter().enumerate() {
@@ -1916,7 +1937,9 @@ fn embed_token_batch(
     }
     context.clear_kv_cache();
     telemetry.begin_encode()?;
+    let encode_started = Instant::now();
     context.encode(&mut batch).map_err(llama_error)?;
+    let encode_elapsed = encode_started.elapsed();
     telemetry.complete_encode()?;
     for sequence_id in 0..sequences.len() {
         let vector = context
@@ -1931,7 +1954,7 @@ fn embed_token_batch(
         }
         output.push(vector);
     }
-    Ok(())
+    Ok(encode_elapsed)
 }
 
 pub fn materialize_embedded_model(cache_root: &Path) -> Result<MaterializedModel, EngineError> {

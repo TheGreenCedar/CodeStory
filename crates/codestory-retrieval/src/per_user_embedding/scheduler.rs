@@ -138,9 +138,9 @@ pub(super) fn spawn_server_watchdog(
                             "failed to publish embedding qualification watchdog marker"
                         );
                     }
-                    transport.fail_stop("embedding_engine_stalled");
                     state.draining.store(true, Ordering::Release);
                     state.stopped.store(true, Ordering::Release);
+                    transport.fail_stop("embedding_engine_stalled");
                     return;
                 }
             }

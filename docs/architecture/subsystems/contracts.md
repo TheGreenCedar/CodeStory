@@ -21,6 +21,7 @@ runtime, and adapters. It contains contracts, not orchestration or rendering.
 - `src/grounding.rs` and `src/trail.rs`: evidence groupings
 - `src/workspace.rs`: shared workspace contracts
 - `src/language_support.rs`: source-of-truth support labels
+- `src/proof_resolution.rs`: internal call-resolution facts and sealed dependency-order policy
 - `src/validation_receipts.rs`: sealed, process-local validation receipts
 
 ## Sealed validation receipts and their platform limit

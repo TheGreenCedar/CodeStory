@@ -1,91 +1,23 @@
 use crate::AppController;
 use crate::agent::citation::to_citation_from_hit;
-use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
-use crate::agent::packet_scoring::normalize_identifier;
-use crate::agent::packet_terms::prompt_search_terms;
+use crate::agent::packet_candidate::{PacketAdmissionDecision, active_packet_proof_session};
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
-use crate::target_resolution::{TargetResolution, TargetSelection, search_hit_matches_exact_file};
-pub(crate) use codestory_agent::packet_probes::exact_packet_probe_paths;
+use crate::target_resolution::{TargetResolution, TargetSelection};
 use codestory_agent::{PinnedReader, admit_continuation_probe};
 use codestory_contracts::api::{
     AgentCitationDto, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
     PacketProbeAmbiguityCandidateDto, PacketProbeDto, PacketProbeRejectionCodeDto,
-    PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto, SearchHit,
+    PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
     SearchHitOrigin,
 };
+use codestory_contracts::compilation::PacketContinuationSelectorV1;
 use codestory_workspace::{
     ProjectRelativePathResolution, project_identity_v3, resolve_project_relative_path,
-    same_workspace_path,
 };
 use std::path::Path;
 
-pub(crate) fn normalize_packet_probe_request(
-    probes: &[PacketProbeDto],
-    legacy_probes: &[String],
-) -> Vec<PacketProbeDto> {
-    probes
-        .iter()
-        .cloned()
-        .chain(legacy_probes.iter().map(|probe| {
-            let probe = probe.trim();
-            serde_json::from_str::<PacketProbeDto>(probe)
-                .ok()
-                .unwrap_or_else(|| legacy_packet_probe(probe))
-        }))
-        .collect()
-}
-
-fn legacy_packet_probe(probe: &str) -> PacketProbeDto {
-    if probe.parse::<i64>().is_ok() {
-        return PacketProbeDto::SymbolId {
-            id: probe.to_string(),
-        };
-    }
-    if let Some((path, symbol)) = probe.split_once(char::is_whitespace)
-        && legacy_probe_path_like(path)
-        && !symbol.trim().is_empty()
-    {
-        return PacketProbeDto::FileSymbol {
-            path: path.to_string(),
-            symbol: symbol.trim().to_string(),
-        };
-    }
-    if legacy_probe_path_like(probe) {
-        return PacketProbeDto::ExactPath {
-            path: probe.to_string(),
-        };
-    }
-    PacketProbeDto::FreeQuery {
-        query: probe.to_string(),
-    }
-}
-
-fn legacy_probe_path_like(value: &str) -> bool {
-    !value.contains("://")
-        && (value.contains('/') || value.contains('\\'))
-        && Path::new(value).extension().is_some()
-}
-
-pub(crate) fn unresolved_packet_probe_queries(probes: &[PacketProbeDto]) -> Vec<String> {
-    probes
-        .iter()
-        .filter_map(packet_probe_query)
-        .filter(|query| !query.trim().is_empty())
-        .collect()
-}
-
-pub(crate) fn resolved_packet_probe_queries(
-    resolutions: &[PacketProbeResolutionDto],
-) -> Vec<String> {
-    resolutions
-        .iter()
-        .filter(|resolution| {
-            resolution.status == PacketProbeResolutionStatusDto::FreeQuery
-                || (resolution.status == PacketProbeResolutionStatusDto::Continuation
-                    && resolution.symbol_id.is_none())
-        })
-        .filter_map(|resolution| resolution.normalized_query.clone())
-        .collect()
+pub(crate) fn normalize_packet_probe_request(probes: &[PacketProbeDto]) -> Vec<PacketProbeDto> {
+    probes.to_vec()
 }
 
 pub(crate) fn resolve_packet_probes(
@@ -95,14 +27,134 @@ pub(crate) fn resolve_packet_probes(
     probes
         .into_iter()
         .enumerate()
-        .map(|(index, probe)| resolve_packet_probe(controller, index as u32, probe))
+        .map(|(index, probe)| {
+            let input_index = index as u32;
+            let reservation = packet_probe_reservation_identity(&probe);
+            if let (Some(session), Some(identity)) =
+                (active_packet_proof_session(), reservation.as_deref())
+            {
+                match session.admit_exact_selector(
+                    identity,
+                    codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
+                    input_index,
+                ) {
+                    PacketAdmissionDecision::Admitted
+                    | PacketAdmissionDecision::AlreadyAdmitted => {}
+                    PacketAdmissionDecision::CountBudgetExceeded => {
+                        return rejected_resolution(
+                            input_index,
+                            probe,
+                            PacketProbeRejectionCodeDto::CandidateCountExceeded,
+                            "packet candidate count budget was exhausted before probe resolution",
+                        );
+                    }
+                    PacketAdmissionDecision::SourceBudgetExceeded => {
+                        return rejected_resolution(
+                            input_index,
+                            probe,
+                            PacketProbeRejectionCodeDto::SourceBudgetExceeded,
+                            "packet source budget was exhausted before probe resolution",
+                        );
+                    }
+                }
+            }
+
+            let mut resolution = resolve_packet_probe(controller, input_index, probe);
+            if let (Some(session), Some(reserved)) =
+                (active_packet_proof_session(), reservation.as_deref())
+            {
+                finalize_packet_probe_admission(&session, reserved, input_index, &mut resolution);
+            }
+            resolution
+        })
         .collect()
+}
+
+fn packet_probe_reservation_identity(probe: &PacketProbeDto) -> Option<String> {
+    match probe {
+        PacketProbeDto::ExactPath { path } => Some(format!("path:{}", path.trim())),
+        PacketProbeDto::SymbolId { id } => Some(format!("node:{}", id.trim())),
+        PacketProbeDto::QualifiedSymbol { symbol } => {
+            Some(format!("selector:qualified_symbol:{}", symbol.trim()))
+        }
+        PacketProbeDto::FileSymbol { path, symbol } => Some(format!(
+            "selector:file_symbol:{}::{}",
+            path.trim(),
+            symbol.trim()
+        )),
+        PacketProbeDto::Continuation { selector, .. } => Some(selector.stable_identity.clone()),
+        PacketProbeDto::FreeQuery { .. } => None,
+    }
+}
+
+fn packet_probe_resolution_identity(resolution: &PacketProbeResolutionDto) -> Option<String> {
+    resolution
+        .symbol_id
+        .as_deref()
+        .map(|id| format!("node:{id}"))
+        .or_else(|| {
+            matches!(
+                resolution.status,
+                PacketProbeResolutionStatusDto::ExactPath
+                    | PacketProbeResolutionStatusDto::ValidUncoveredPath
+            )
+            .then(|| {
+                resolution
+                    .path
+                    .as_deref()
+                    .map(|path| format!("path:{path}"))
+            })
+            .flatten()
+        })
+}
+
+fn finalize_packet_probe_admission(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    reserved: &str,
+    selector_ordinal: u32,
+    resolution: &mut PacketProbeResolutionDto,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut identities = packet_probe_resolution_identity(resolution)
+        .into_iter()
+        .chain(
+            resolution
+                .candidates
+                .iter()
+                .map(|candidate| format!("node:{}", candidate.symbol_id)),
+        )
+        .filter(|identity| seen.insert(identity.clone()))
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        session.consume_unresolved_reservation(reserved);
+        return;
+    }
+
+    let first = identities.remove(0);
+    session.canonicalize_identity(reserved, &first);
+    let mut admitted = std::collections::HashSet::from([first]);
+    for identity in identities {
+        match session.admit_exact_selector(
+            &identity,
+            codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
+            selector_ordinal,
+        ) {
+            PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {
+                admitted.insert(identity);
+            }
+            PacketAdmissionDecision::CountBudgetExceeded
+            | PacketAdmissionDecision::SourceBudgetExceeded => {}
+        }
+    }
+    resolution
+        .candidates
+        .retain(|candidate| admitted.contains(&format!("node:{}", candidate.symbol_id)));
 }
 
 pub(crate) fn exact_packet_probe_citations(
     controller: &AppController,
     resolutions: &[PacketProbeResolutionDto],
-    question: &str,
+    _question: &str,
     include_evidence: bool,
 ) -> Vec<AgentCitationDto> {
     let mut citations = Vec::new();
@@ -120,12 +172,6 @@ pub(crate) fn exact_packet_probe_citations(
         match resolution.status {
             PacketProbeResolutionStatusDto::ExactPath => {
                 append(exact_path_probe_citation(controller, resolution));
-                append(exact_path_probe_source_carrier_citation(
-                    controller,
-                    resolution,
-                    question,
-                    include_evidence,
-                ));
             }
             PacketProbeResolutionStatusDto::ValidUncoveredPath => {
                 append(exact_path_probe_citation(controller, resolution));
@@ -146,115 +192,6 @@ pub(crate) fn exact_packet_probe_citations(
     citations
 }
 
-fn exact_path_probe_source_carrier_citation(
-    controller: &AppController,
-    resolution: &PacketProbeResolutionDto,
-    question: &str,
-    include_evidence: bool,
-) -> Option<AgentCitationDto> {
-    let project_root = controller.require_project_root().ok()?;
-    let requested = resolution.path.as_deref()?;
-    let ProjectRelativePathResolution::Existing { absolute, relative } =
-        resolve_project_relative_path(&project_root, Path::new(requested)).ok()?
-    else {
-        return None;
-    };
-    let storage = controller.open_storage_read_only().ok()?;
-    let file_id = storage
-        .get_files()
-        .ok()?
-        .into_iter()
-        .find(|file| {
-            file.indexed
-                && file.complete
-                && same_workspace_path(
-                    &absolute,
-                    &if file.path.is_absolute() {
-                        file.path.clone()
-                    } else {
-                        project_root.join(&file.path)
-                    },
-                )
-        })?
-        .id;
-    let question_terms = prompt_search_terms(question)
-        .into_iter()
-        .map(|term| normalize_identifier(&term))
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
-    let mut candidates = storage
-        .get_grounding_root_symbols_for_files(&[file_id], 256)
-        .ok()?
-        .into_iter()
-        .filter_map(|record| {
-            let display = normalize_identifier(&record.display_name);
-            let term_hits = question_terms
-                .iter()
-                .filter(|term| {
-                    display.contains(term.as_str())
-                        || (display.len() >= 4 && term.len() >= 4 && term.contains(&display))
-                })
-                .count();
-            (!display.is_empty() && term_hits > 0).then_some((term_hits, record))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|(left_hits, left), (right_hits, right)| {
-        right_hits
-            .cmp(left_hits)
-            .then_with(|| left.node.start_line.cmp(&right.node.start_line))
-            .then_with(|| left.display_name.cmp(&right.display_name))
-            .then_with(|| left.node.id.cmp(&right.node.id))
-    });
-
-    candidates
-        .into_iter()
-        .filter_map(|(term_hits, record)| {
-            let mut citation = exact_symbol_probe_citation(
-                controller,
-                &record.node.id.to_string(),
-                include_evidence,
-            )?;
-            let cited_path = citation.file_path.as_deref()?;
-            if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
-                return None;
-            }
-            if !matches!(
-                citation.kind,
-                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
-            ) {
-                return None;
-            }
-            citation.file_path = Some(display_relative_path(&relative));
-            citation.coverage_role = None;
-            let role = packet_evidence_role(&citation)?;
-            if matches!(
-                role,
-                PacketEvidenceRole::SourceEvidence | PacketEvidenceRole::TestsAndRegressionCoverage
-            ) {
-                return None;
-            }
-            let role_rank = match role {
-                PacketEvidenceRole::CommandEntrypoint => 5,
-                PacketEvidenceRole::RequestDispatch
-                | PacketEvidenceRole::TransportAdapter
-                | PacketEvidenceRole::BufferedIo => 4,
-                PacketEvidenceRole::RuntimeOrchestration => 3,
-                _ => 2,
-            };
-            citation.coverage_role = Some(role.as_str().to_string());
-            citation.eligible_for_sufficiency = Some(true);
-            citation.score = 99.0;
-            Some((role_rank, term_hits, citation))
-        })
-        .max_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| right.2.display_name.cmp(&left.2.display_name))
-        })
-        .map(|(_, _, citation)| citation)
-}
-
 fn exact_symbol_probe_citation(
     controller: &AppController,
     symbol_id: &str,
@@ -268,8 +205,8 @@ fn exact_symbol_probe_citation(
     };
     let mut citation = to_citation_from_hit(&resolved.selected, None, None, include_evidence);
     citation.score = 100.0;
-    citation.coverage_role = Some("explicit exact probe".to_string());
-    citation.eligible_for_sufficiency = Some(false);
+    citation.evidence_producer = Some("packet_exact_symbol_probe".to_string());
+    citation.eligible_for_sufficiency = None;
     Some(citation)
 }
 
@@ -302,8 +239,7 @@ fn exact_path_probe_citation(
         evidence_producer: Some("packet_exact_path_probe".to_string()),
         resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
         loss_reason: None,
-        coverage_role: Some("explicit exact probe".to_string()),
-        eligible_for_sufficiency: Some(false),
+        eligible_for_sufficiency: None,
         source_excerpt: None,
     })
 }
@@ -319,6 +255,9 @@ fn resolve_packet_probe(
         }
         PacketProbeDto::SymbolId { id } => {
             resolve_symbol_id_probe(controller, input_index, probe, &id)
+        }
+        PacketProbeDto::QualifiedSymbol { symbol } => {
+            resolve_qualified_symbol_probe(controller, input_index, probe, &symbol)
         }
         PacketProbeDto::FileSymbol { path, symbol } => {
             resolve_file_symbol_probe(controller, input_index, probe, &path, &symbol)
@@ -346,19 +285,83 @@ fn resolve_packet_probe(
             project_id,
             core_generation_id,
             retrieval_generation,
-            symbol_id,
-            query,
+            selector,
         } => resolve_continuation_probe(
             controller,
             input_index,
             probe,
-            contract_version,
-            &project_id,
-            &core_generation_id,
-            retrieval_generation.as_deref(),
-            symbol_id.as_deref(),
-            &query,
+            ContinuationPublication {
+                contract_version,
+                project_id: &project_id,
+                core_generation_id: &core_generation_id,
+                retrieval_generation: retrieval_generation.as_deref(),
+            },
+            &selector,
         ),
+    }
+}
+
+fn resolve_qualified_symbol_probe(
+    controller: &AppController,
+    input_index: u32,
+    probe: PacketProbeDto,
+    symbol: &str,
+) -> PacketProbeResolutionDto {
+    let symbol = symbol.trim();
+    if symbol.is_empty() {
+        return rejected_resolution(
+            input_index,
+            probe,
+            PacketProbeRejectionCodeDto::MalformedProbe,
+            "qualified-symbol probe must not be empty",
+        );
+    }
+    let candidates = match controller.resolve_exact_indexed_symbol_identities(symbol) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return rejected_resolution(
+                input_index,
+                probe,
+                PacketProbeRejectionCodeDto::MissingTarget,
+                error.message,
+            );
+        }
+    };
+    match candidates.as_slice() {
+        [] => rejected_resolution(
+            input_index,
+            probe,
+            PacketProbeRejectionCodeDto::MissingTarget,
+            "qualified-symbol selector did not exactly match an indexed identity",
+        ),
+        [candidate] => {
+            let mut resolution = base_resolution(
+                input_index,
+                probe,
+                PacketProbeResolutionStatusDto::IndexedSymbol,
+                Some(symbol.to_string()),
+            );
+            resolution.symbol_id = Some(candidate.node_id.0.clone());
+            resolution
+        }
+        _ => PacketProbeResolutionDto {
+            input_index,
+            probe,
+            status: PacketProbeResolutionStatusDto::Ambiguous,
+            normalized_query: Some(symbol.to_string()),
+            path: None,
+            symbol_id: None,
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| PacketProbeAmbiguityCandidateDto {
+                    symbol_id: candidate.node_id.0,
+                    display_name: candidate.display_name,
+                    path: None,
+                    kind: NodeKind::UNKNOWN,
+                })
+                .collect(),
+            rejection: None,
+        },
     }
 }
 
@@ -402,20 +405,12 @@ fn resolve_exact_path_probe(
             let indexed = controller
                 .open_storage_read_only()
                 .ok()
-                .and_then(|storage| storage.get_files().ok())
-                .is_some_and(|files| {
-                    files.into_iter().any(|file| {
-                        if !file.indexed || !file.complete {
-                            return false;
-                        }
-                        let candidate = if file.path.is_absolute() {
-                            file.path
-                        } else {
-                            project_root.join(file.path)
-                        };
-                        same_workspace_path(&absolute, &candidate)
-                    })
-                });
+                .and_then(|storage| {
+                    storage
+                        .has_complete_indexed_file_path(&[absolute, relative])
+                        .ok()
+                })
+                .unwrap_or(false);
             let mut resolution = base_resolution(
                 input_index,
                 probe,
@@ -467,29 +462,22 @@ fn resolve_symbol_id_probe(
             "symbol-id probe must not be empty",
         );
     }
-    match controller.resolve_source_target(TargetSelection::Id(NodeId(id.to_string())), None) {
-        Ok(TargetResolution::Resolved(resolved)) => {
+    match controller.resolve_indexed_symbol_identity_by_id(&NodeId(id.to_string())) {
+        Ok(Some(identity)) => {
             let mut resolution = base_resolution(
                 input_index,
                 probe,
-                probe_status_for_hit(
-                    &resolved.selected,
-                    PacketProbeResolutionStatusDto::IndexedSymbol,
-                ),
-                Some(resolved.selected.display_name),
+                PacketProbeResolutionStatusDto::IndexedSymbol,
+                Some(identity.display_name),
             );
-            resolution.symbol_id = Some(resolved.selected.node_id.0);
-            resolution.path = resolved.selected.file_path;
+            resolution.symbol_id = Some(identity.node_id.0);
             resolution
         }
-        Ok(TargetResolution::Ambiguous(ambiguous)) => {
-            ambiguous_resolution(input_index, probe, id.to_string(), ambiguous.alternatives)
-        }
-        Ok(TargetResolution::Rejected(message)) => rejected_resolution(
+        Ok(None) => rejected_resolution(
             input_index,
             probe,
             PacketProbeRejectionCodeDto::StaleSymbolId,
-            message,
+            "symbol-id selector did not match the pinned identity index",
         ),
         Err(error) => rejected_resolution(
             input_index,
@@ -534,68 +522,48 @@ fn resolve_file_symbol_probe(
         );
     };
     let exact_path = project_root.join(&normalized_path);
-    let exact_path_filter = exact_path.to_string_lossy();
-    match controller.resolve_target(
-        TargetSelection::Query {
-            query: symbol.to_string(),
-            choose: None,
-        },
-        Some(&exact_path_filter),
+    match controller.resolve_exact_indexed_symbol_identities_in_file(
+        symbol,
+        &project_root,
+        &exact_path,
     ) {
-        Ok(TargetResolution::Resolved(resolved)) => {
-            let status = probe_status_for_hit(
-                &resolved.selected,
-                PacketProbeResolutionStatusDto::FileScopedSymbol,
-            );
+        Ok(candidates) if candidates.len() == 1 => {
+            let candidate = candidates.into_iter().next().expect("one candidate");
             let mut resolution = base_resolution(
                 input_index,
                 probe,
-                status,
+                PacketProbeResolutionStatusDto::FileScopedSymbol,
                 Some(format!("{normalized_path}::{symbol}")),
             );
             resolution.path = Some(normalized_path);
-            resolution.symbol_id = Some(resolved.selected.node_id.0);
+            resolution.symbol_id = Some(candidate.node_id.0);
             resolution
         }
-        Ok(TargetResolution::Ambiguous(ambiguous)) => ambiguous_resolution(
+        Ok(candidates) if !candidates.is_empty() => PacketProbeResolutionDto {
             input_index,
             probe,
-            format!("{normalized_path}::{symbol}"),
-            ambiguous.alternatives,
+            status: PacketProbeResolutionStatusDto::Ambiguous,
+            normalized_query: Some(format!("{normalized_path}::{symbol}")),
+            path: Some(normalized_path.clone()),
+            symbol_id: None,
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| PacketProbeAmbiguityCandidateDto {
+                    symbol_id: candidate.node_id.0,
+                    display_name: candidate.display_name,
+                    path: Some(normalized_path.clone()),
+                    kind: NodeKind::UNKNOWN,
+                })
+                .collect(),
+            rejection: None,
+        },
+        Ok(_) => rejected_resolution_with_path(
+            input_index,
+            probe,
+            PacketProbeRejectionCodeDto::MissingTarget,
+            "file-symbol selector did not exactly match the pinned identity index",
+            normalized_path,
         ),
-        Ok(TargetResolution::Rejected(message)) => {
-            let text_hit = controller
-                .resolve_indexed_symbol_candidates(symbol, 50)
-                .ok()
-                .and_then(|hits| {
-                    hits.into_iter().find(|hit| {
-                        search_hit_matches_exact_file(&project_root, hit, &exact_path)
-                            && (hit.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
-                                || hit.resolution_status
-                                    == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
-                                || !hit.resolvable)
-                    })
-                });
-            if let Some(hit) = text_hit {
-                let mut resolution = base_resolution(
-                    input_index,
-                    probe,
-                    PacketProbeResolutionStatusDto::TextHit,
-                    Some(format!("{normalized_path}::{symbol}")),
-                );
-                resolution.path = Some(normalized_path);
-                resolution.symbol_id = Some(hit.node_id.0);
-                resolution
-            } else {
-                rejected_resolution_with_path(
-                    input_index,
-                    probe,
-                    PacketProbeRejectionCodeDto::MissingTarget,
-                    message,
-                    normalized_path,
-                )
-            }
-        }
         Err(error) => rejected_resolution_with_path(
             input_index,
             probe,
@@ -603,20 +571,6 @@ fn resolve_file_symbol_probe(
             error.message,
             normalized_path,
         ),
-    }
-}
-
-fn probe_status_for_hit(
-    hit: &SearchHit,
-    resolved_status: PacketProbeResolutionStatusDto,
-) -> PacketProbeResolutionStatusDto {
-    if hit.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
-        || hit.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
-        || !hit.resolvable
-    {
-        PacketProbeResolutionStatusDto::TextHit
-    } else {
-        resolved_status
     }
 }
 
@@ -660,85 +614,54 @@ impl PinnedReader for ControllerPinnedReader<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ContinuationPublication<'a> {
+    contract_version: u32,
+    project_id: &'a str,
+    core_generation_id: &'a str,
+    retrieval_generation: Option<&'a str>,
+}
+
 fn resolve_continuation_probe(
     controller: &AppController,
     input_index: u32,
     probe: PacketProbeDto,
-    contract_version: u32,
-    project_id: &str,
-    core_generation_id: &str,
-    retrieval_generation: Option<&str>,
-    symbol_id: Option<&str>,
-    query: &str,
+    publication: ContinuationPublication<'_>,
+    selector: &PacketContinuationSelectorV1,
 ) -> PacketProbeResolutionDto {
-    let query = match admit_continuation_probe(
+    if let Err(refusal) = admit_continuation_probe(
         &ControllerPinnedReader { controller },
-        contract_version,
-        project_id,
-        core_generation_id,
-        retrieval_generation,
-        query,
+        publication.contract_version,
+        publication.project_id,
+        publication.core_generation_id,
+        publication.retrieval_generation,
     ) {
-        Ok(query) => query,
-        Err(refusal) => {
-            return rejected_resolution(input_index, probe, refusal.code(), refusal.message());
-        }
-    };
-    let query = query.as_str();
-    if let Some(symbol_id) = symbol_id {
+        return rejected_resolution(input_index, probe, refusal.code(), refusal.message());
+    }
+    if let Some(symbol_id) = selector.symbol_id.as_deref() {
+        let symbol_id = symbol_id.strip_prefix("node:").unwrap_or(symbol_id);
         let mut resolution = resolve_symbol_id_probe(controller, input_index, probe, symbol_id);
         if resolution.status == PacketProbeResolutionStatusDto::IndexedSymbol {
             resolution.status = PacketProbeResolutionStatusDto::Continuation;
         }
         return resolution;
     }
-    base_resolution(
+    if let Some(path) = selector.path.as_deref() {
+        let mut resolution = resolve_exact_path_probe(controller, input_index, probe, path);
+        if matches!(
+            resolution.status,
+            PacketProbeResolutionStatusDto::ExactPath
+                | PacketProbeResolutionStatusDto::ValidUncoveredPath
+        ) {
+            resolution.status = PacketProbeResolutionStatusDto::Continuation;
+        }
+        return resolution;
+    }
+    rejected_resolution(
         input_index,
         probe,
-        PacketProbeResolutionStatusDto::Continuation,
-        Some(query.to_string()),
+        PacketProbeRejectionCodeDto::MalformedProbe,
+        "continuation selector requires a stable path or symbol identity",
     )
-}
-
-fn packet_probe_query(probe: &PacketProbeDto) -> Option<String> {
-    match probe {
-        PacketProbeDto::ExactPath { path } => Some(path.trim().to_string()),
-        PacketProbeDto::SymbolId { id } => Some(id.trim().to_string()),
-        PacketProbeDto::FileSymbol { path, symbol } => {
-            Some(format!("{}::{}", path.trim(), symbol.trim()))
-        }
-        PacketProbeDto::FreeQuery { query } | PacketProbeDto::Continuation { query, .. } => {
-            Some(query.trim().to_string())
-        }
-    }
-}
-
-fn ambiguous_resolution(
-    input_index: u32,
-    probe: PacketProbeDto,
-    normalized_query: String,
-    alternatives: Vec<codestory_contracts::api::SearchHit>,
-) -> PacketProbeResolutionDto {
-    let candidates = alternatives
-        .into_iter()
-        .map(|hit| PacketProbeAmbiguityCandidateDto {
-            symbol_id: hit.node_id.0,
-            display_name: hit.display_name,
-            path: hit.file_path,
-            kind: hit.kind,
-        })
-        .collect();
-    PacketProbeResolutionDto {
-        input_index,
-        probe,
-        status: PacketProbeResolutionStatusDto::Ambiguous,
-        normalized_query: Some(normalized_query),
-        path: None,
-        symbol_id: None,
-        candidates,
-        rejection: None,
-    }
 }
 
 fn base_resolution(
@@ -805,755 +728,396 @@ fn display_relative_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_contracts::api::PACKET_PROBE_CONTRACT_VERSION;
-    use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
-    use codestory_store::{FileInfo, FileRole, Store};
-    use std::path::PathBuf;
-    use tempfile::TempDir;
+    use crate::agent::packet_candidate::{
+        PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
+    };
+    use codestory_contracts::compilation::{
+        PACKET_RETRIEVAL_SCORE_VERSION_V1, PacketCandidateDescriptorV1, PacketRetrievalLaneV1,
+        VersionedRetrievalScoreV1,
+    };
+    use std::rc::Rc;
 
-    fn controller_with_empty_store(project: &TempDir) -> AppController {
-        let storage_path = project.path().join(".cache").join("codestory.db");
-        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
-            .expect("create storage parent");
-        drop(Store::open(&storage_path).expect("create store"));
-        let controller = AppController::new();
-        {
-            let mut state = controller.state.lock();
-            state.project_root = Some(project.path().to_path_buf());
-            state.storage_path = Some(storage_path);
-        }
-        controller
+    struct FileSymbolFixture {
+        _workspace: tempfile::TempDir,
+        controller: AppController,
+        selected_ids: Vec<String>,
     }
 
-    fn controller_with_indexed_fixture(project: &TempDir) -> AppController {
-        let source_path = project.path().join("src").join("lib.rs");
-        std::fs::create_dir_all(source_path.parent().expect("source parent"))
-            .expect("create source parent");
-        std::fs::write(
-            &source_path,
-            "pub fn indexed_target() {}\npub fn run_stdio_server() {}\n// textual_target\n",
-        )
-        .expect("write source");
-        let duplicate_path = project.path().join("src").join("duplicate.rs");
-        std::fs::write(&duplicate_path, "pub fn indexed_target() {}\n").expect("write duplicate");
-        let script_path = project.path().join("scripts").join("entry.cjs");
-        std::fs::create_dir_all(script_path.parent().expect("script parent"))
-            .expect("create script parent");
-        std::fs::write(&script_path, "module.exports = {};\n").expect("write script");
-
-        let storage_path = project.path().join(".cache").join("codestory.db");
-        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
-            .expect("create storage parent");
-        let mut storage = Store::open(&storage_path).expect("create store");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/lib.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 3,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        storage
-            .insert_file(&FileInfo {
-                id: 10,
-                path: PathBuf::from("src/duplicate.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 1,
-                file_role: FileRole::Source,
-            })
-            .expect("insert duplicate file");
-        storage
-            .insert_file(&FileInfo {
-                id: 20,
-                path: script_path.clone(),
-                language: "javascript".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 1,
-                file_role: FileRole::Source,
-            })
-            .expect("insert symbol-free script file");
-        storage
-            .insert_nodes_batch(&[
-                Node {
-                    id: CoreNodeId(1),
-                    kind: CoreNodeKind::FILE,
-                    serialized_name: "src/lib.rs".to_string(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(2),
-                    kind: CoreNodeKind::FUNCTION,
-                    serialized_name: "indexed_target".to_string(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(3),
-                    kind: CoreNodeKind::FUNCTION,
-                    serialized_name: "textual_target".to_string(),
-                    canonical_id: Some("openapi:endpoint:get:/textual".to_string()),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(3),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(4),
-                    kind: CoreNodeKind::FUNCTION,
-                    serialized_name: "run_stdio_server".to_string(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(2),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(10),
-                    kind: CoreNodeKind::FILE,
-                    serialized_name: "src/duplicate.rs".to_string(),
-                    file_node_id: Some(CoreNodeId(10)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(11),
-                    kind: CoreNodeKind::FUNCTION,
-                    serialized_name: "indexed_target".to_string(),
-                    file_node_id: Some(CoreNodeId(10)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(20),
-                    kind: CoreNodeKind::FILE,
-                    serialized_name: script_path.to_string_lossy().to_string(),
-                    file_node_id: Some(CoreNodeId(20)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert nodes");
-        drop(storage);
-
-        let controller = AppController::new();
-        {
-            let mut state = controller.state.lock();
-            state.project_root = Some(project.path().to_path_buf());
-            state.storage_path = Some(storage_path);
-        }
-        controller
-    }
-
-    #[test]
-    fn legacy_and_tagged_probes_share_one_normalization_path() {
-        let tagged = PacketProbeDto::ExactPath {
-            path: "assets/desk.svg".into(),
+    fn file_symbol_fixture(
+        outside_count: usize,
+        selected_count: usize,
+        reverse_ids_and_insertion: bool,
+    ) -> FileSymbolFixture {
+        use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
+        use codestory_retrieval::{
+            SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults,
+            SidecarRuntimeOverrides,
         };
-        let legacy_json = serde_json::to_string(&tagged).expect("serialize tagged probe");
-        let probes = normalize_packet_probe_request(
-            std::slice::from_ref(&tagged),
-            &[legacy_json, "WorkspaceIndexer".into()],
-        );
-        assert_eq!(probes[0], tagged);
-        assert_eq!(probes[1], tagged);
-        assert_eq!(
-            probes[2],
-            PacketProbeDto::FreeQuery {
-                query: "WorkspaceIndexer".into()
-            }
-        );
-    }
 
-    #[test]
-    fn legacy_probe_parser_preserves_exact_path_symbol_and_id_intent() {
-        assert_eq!(
-            legacy_packet_probe("assets/desk.svg"),
-            PacketProbeDto::ExactPath {
-                path: "assets/desk.svg".into()
-            }
-        );
-        assert_eq!(
-            legacy_packet_probe("src/lib.rs AppController::open"),
-            PacketProbeDto::FileSymbol {
-                path: "src/lib.rs".into(),
-                symbol: "AppController::open".into()
-            }
-        );
-        assert_eq!(
-            legacy_packet_probe("-3816661223164617416"),
-            PacketProbeDto::SymbolId {
-                id: "-3816661223164617416".into()
-            }
-        );
-    }
-
-    #[test]
-    fn rejected_and_ambiguous_probes_do_not_become_packet_queries() {
-        let rejected = rejected_resolution(
-            0,
-            PacketProbeDto::ExactPath {
-                path: "../outside".into(),
-            },
-            PacketProbeRejectionCodeDto::OutOfProject,
-            "outside",
-        );
-        let ambiguous = PacketProbeResolutionDto {
-            input_index: 1,
-            probe: PacketProbeDto::FreeQuery {
-                query: "run".into(),
-            },
-            status: PacketProbeResolutionStatusDto::Ambiguous,
-            normalized_query: Some("run".into()),
-            path: None,
-            symbol_id: None,
-            candidates: Vec::new(),
-            rejection: None,
-        };
-        assert!(resolved_packet_probe_queries(&[rejected, ambiguous]).is_empty());
-    }
-
-    #[test]
-    fn exact_path_resolves_without_broad_retrieval_and_preserves_uncovered_state() {
-        let project = TempDir::new().expect("project");
-        std::fs::create_dir_all(project.path().join("assets")).expect("assets");
-        std::fs::write(project.path().join("assets").join("desk.svg"), "<svg/>\n").expect("asset");
-        let controller = controller_with_empty_store(&project);
-
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![
-                PacketProbeDto::ExactPath {
-                    path: "assets/desk.svg".into(),
-                },
-                PacketProbeDto::ExactPath {
-                    path: "../outside.svg".into(),
-                },
-            ],
-        );
-        assert_eq!(
-            resolutions[0].status,
-            PacketProbeResolutionStatusDto::ValidUncoveredPath
-        );
-        assert_eq!(resolutions[0].path.as_deref(), Some("assets/desk.svg"));
-        assert_eq!(
-            resolutions[1]
-                .rejection
-                .as_ref()
-                .map(|rejection| rejection.code),
-            Some(PacketProbeRejectionCodeDto::OutOfProject)
-        );
-        assert!(
-            resolved_packet_probe_queries(&resolutions).is_empty(),
-            "exact and valid-uncovered paths must not be replaced by broad fuzzy retrieval"
-        );
-        assert_eq!(
-            exact_packet_probe_paths(&resolutions),
-            vec!["assets/desk.svg".to_string()],
-            "only resolved in-project exact paths should constrain architecture sufficiency"
-        );
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Explain this exact asset.",
-            true,
-        );
-        assert_eq!(citations.len(), 1);
-        assert_eq!(citations[0].file_path.as_deref(), Some("assets/desk.svg"));
-        assert_eq!(
-            citations[0].evidence_producer.as_deref(),
-            Some("packet_exact_path_probe")
-        );
-        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
-    }
-
-    #[test]
-    fn indexed_exact_path_keeps_diagnostic_and_adds_distinct_source_carrier() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![PacketProbeDto::ExactPath {
-                path: "src/lib.rs".into(),
-            }],
-        );
-
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Explain the stdio server architecture.",
-            true,
-        );
-
-        assert_eq!(citations.len(), 2);
-        assert_eq!(citations[0].file_path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
-        assert_eq!(citations[1].file_path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
-        assert_eq!(
-            citations[1].coverage_role.as_deref(),
-            Some("command entrypoint")
-        );
-        assert_eq!(citations[1].display_name, "run_stdio_server");
-        assert_ne!(citations[0].node_id, citations[1].node_id);
-    }
-
-    #[test]
-    fn exact_path_carrier_selection_filters_non_semantic_matches_before_bounding() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let storage_path = project.path().join(".cache").join("codestory.db");
-        let mut storage = Store::open(&storage_path).expect("open store");
-        let decoys = (0..32)
-            .map(|index| Node {
-                id: CoreNodeId(1_000 + index),
-                kind: CoreNodeKind::FUNCTION,
-                serialized_name: format!("request_retrieval_publication_{index}"),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(1),
+        let workspace = tempfile::tempdir().expect("create isolated workspace");
+        let root = workspace.path();
+        std::fs::create_dir(root.join("src")).expect("create source directory");
+        let storage_path = root.join("codestory.db");
+        let mut nodes = Vec::new();
+        let mut files = Vec::new();
+        let mut selected_ids = Vec::new();
+        for index in 0..=outside_count {
+            let selected = index == outside_count;
+            let relative = if selected {
+                "src/selected.rs".to_string()
+            } else {
+                format!("src/outside-{index}.rs")
+            };
+            let absolute = root.join(&relative);
+            std::fs::write(&absolute, "fn shared() {}\n").expect("write source file");
+            let file_id = CoreNodeId(index as i64 + 1);
+            // Mix canonical relative and absolute file labels.
+            let label = if index % 2 == 0 {
+                relative
+            } else {
+                absolute.display().to_string()
+            };
+            nodes.push(Node {
+                id: file_id,
+                kind: CoreNodeKind::FILE,
+                serialized_name: label.clone(),
+                file_node_id: Some(file_id),
                 ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        storage
-            .insert_nodes_batch(&decoys)
-            .expect("insert lexical decoys");
-        drop(storage);
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![PacketProbeDto::ExactPath {
-                path: "src/lib.rs".into(),
-            }],
-        );
-
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Explain the request through stdio retrieval publication.",
-            true,
-        );
-
-        assert_eq!(citations.len(), 2);
-        assert_eq!(citations[1].display_name, "run_stdio_server");
-        assert_eq!(
-            citations[1].coverage_role.as_deref(),
-            Some("command entrypoint")
-        );
-        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
-    }
-
-    #[test]
-    fn indexed_symbol_free_path_remains_diagnostic_only() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![PacketProbeDto::ExactPath {
-                path: "scripts/entry.cjs".into(),
-            }],
-        );
-
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Explain the plugin stdio server architecture.",
-            true,
-        );
-
-        assert_eq!(citations.len(), 1);
-        assert_eq!(
-            citations[0].node_id.0,
-            "packet::exact_path::scripts/entry.cjs"
-        );
-        assert_eq!(citations[0].kind, NodeKind::FILE);
-        assert_eq!(citations[0].file_path.as_deref(), Some("scripts/entry.cjs"));
-        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
-    }
-
-    #[test]
-    fn indexed_exact_path_does_not_promote_an_unrelated_symbol() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![PacketProbeDto::ExactPath {
-                path: "src/lib.rs".into(),
-            }],
-        );
-
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Explain the frobnicator ownership boundary.",
-            true,
-        );
-
-        assert_eq!(citations.len(), 1);
-        assert_eq!(citations[0].file_path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
-    }
-
-    #[test]
-    fn exact_path_requires_complete_indexed_file_state() {
-        for (indexed, complete, expected) in [
-            (true, true, PacketProbeResolutionStatusDto::ExactPath),
-            (
-                true,
-                false,
-                PacketProbeResolutionStatusDto::ValidUncoveredPath,
-            ),
-            (
-                false,
-                true,
-                PacketProbeResolutionStatusDto::ValidUncoveredPath,
-            ),
-            (
-                false,
-                false,
-                PacketProbeResolutionStatusDto::ValidUncoveredPath,
-            ),
-        ] {
-            let project = TempDir::new().expect("project");
-            let source_path = project.path().join("src/lib.rs");
-            std::fs::create_dir_all(source_path.parent().expect("source parent"))
-                .expect("create source parent");
-            std::fs::write(&source_path, "pub fn target() {}\n").expect("write source");
-            let controller = controller_with_empty_store(&project);
-            let storage_path = project.path().join(".cache/codestory.db");
-            let storage = Store::open(&storage_path).expect("open store");
+            });
+            files.push(codestory_store::FileInfo {
+                id: file_id.0,
+                path: absolute,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            });
+            let count = if selected { selected_count } else { 1 };
+            for occurrence in 0..count {
+                let id = if selected {
+                    900_000 + occurrence as i64
+                } else if reverse_ids_and_insertion {
+                    10_000 + (outside_count - index) as i64
+                } else {
+                    10_000 + index as i64
+                };
+                if selected {
+                    selected_ids.push(id.to_string());
+                }
+                nodes.push(Node {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "shared".into(),
+                    qualified_name: Some("shared".into()),
+                    file_node_id: Some(file_id),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                });
+            }
+        }
+        if reverse_ids_and_insertion {
+            nodes.reverse();
+            files.reverse();
+        }
+        {
+            let mut storage = crate::Storage::open(&storage_path).expect("open fixture storage");
             storage
-                .insert_file(&FileInfo {
-                    id: 1,
-                    path: PathBuf::from("src/lib.rs"),
-                    language: "rust".to_string(),
-                    modification_time: 1,
-                    indexed,
-                    complete,
-                    line_count: 1,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert file state");
-            drop(storage);
+                .insert_nodes_batch(&nodes)
+                .expect("insert real symbol identities");
+            storage
+                .insert_files_batch(&files)
+                .expect("insert complete indexed files");
+        }
+        let defaults = SidecarProcessDefaults::new(
+            root.join("isolated-cache"),
+            SidecarRuntimeDefaults::from_process_env(),
+        );
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            SidecarProfile::Local,
+            None,
+            &defaults,
+            &SidecarRuntimeOverrides::default(),
+        );
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_with_storage_path(root.to_path_buf(), storage_path)
+            .expect("open isolated project");
+        FileSymbolFixture {
+            _workspace: workspace,
+            controller,
+            selected_ids,
+        }
+    }
 
-            let resolution = resolve_packet_probes(
-                &controller,
-                vec![PacketProbeDto::ExactPath {
-                    path: "src/lib.rs".into(),
+    fn file_symbol_resolution(fixture: &FileSymbolFixture, path: &str) -> PacketProbeResolutionDto {
+        resolve_packet_probes(
+            &fixture.controller,
+            vec![PacketProbeDto::FileSymbol {
+                path: path.into(),
+                symbol: "shared".into(),
+            }],
+        )
+        .remove(0)
+    }
+
+    #[test]
+    fn file_symbol_resolves_selected_identity_after_global_caps() {
+        let fixture = file_symbol_fixture(240, 1, false);
+        let global = fixture
+            .controller
+            .resolve_exact_indexed_symbol_identities("shared")
+            .expect("global identity lookup");
+        assert_eq!(global.len(), 17, "global admission cap remains in force");
+        assert!(
+            global
+                .iter()
+                .all(|candidate| !fixture.selected_ids.contains(&candidate.node_id.0)),
+            "selected identity sorts after both global windows"
+        );
+        let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+        assert_eq!(
+            resolution.status,
+            PacketProbeResolutionStatusDto::FileScopedSymbol,
+            "241 real same-name identities must not hide the selected-file target: {resolution:?}"
+        );
+        assert_eq!(resolution.symbol_id.as_ref(), fixture.selected_ids.first());
+        assert!(resolution.candidates.is_empty());
+    }
+
+    #[test]
+    fn file_symbol_identity_is_independent_of_global_order() {
+        // Include enough exact-name rows to cross identity page boundaries.
+        for outside_count in [18, 600] {
+            for reverse in [false, true] {
+                let fixture = file_symbol_fixture(outside_count, 1, reverse);
+                let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+                assert_eq!(
+                    resolution.status,
+                    PacketProbeResolutionStatusDto::FileScopedSymbol
+                );
+                assert_eq!(
+                    resolution.symbol_id.as_ref(),
+                    fixture.selected_ids.first(),
+                    "requested file controls identity for {outside_count} duplicates, reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_symbol_preserves_local_ambiguity_and_admission_overflow() {
+        for selected_count in [2, 18] {
+            let fixture = file_symbol_fixture(240, selected_count, true);
+            let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+            assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous);
+            assert!(resolution.symbol_id.is_none());
+            assert_eq!(
+                resolution
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.symbol_id.clone())
+                    .collect::<Vec<_>>(),
+                fixture
+                    .selected_ids
+                    .iter()
+                    .take(17)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            let global = resolve_packet_probes(
+                &fixture.controller,
+                vec![PacketProbeDto::QualifiedSymbol {
+                    symbol: "shared".into(),
                 }],
             )
             .remove(0);
-
+            assert_eq!(global.status, PacketProbeResolutionStatusDto::Ambiguous);
             assert_eq!(
-                resolution.status, expected,
-                "indexed={indexed} complete={complete}"
+                global.candidates.len(),
+                17,
+                "global unscoped limit stays unchanged"
             );
         }
+        let fixture = file_symbol_fixture(240, 18, false);
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let resolution = file_symbol_resolution(&fixture, "src/selected.rs");
+        assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous);
+        assert_eq!(resolution.candidates.len(), 16);
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(
+            session.admit_descriptor(&retrieval_descriptor(99)),
+            PacketAdmissionDecision::CountBudgetExceeded,
+            "true local overflow consumes the shared budget rather than becoming a unique target"
+        );
     }
 
     #[test]
-    fn indexed_text_missing_malformed_and_stale_targets_remain_distinct() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![
-                PacketProbeDto::ExactPath {
-                    path: "src/lib.rs".into(),
-                },
-                PacketProbeDto::FileSymbol {
-                    path: "src/lib.rs".into(),
-                    symbol: "indexed_target".into(),
-                },
-                PacketProbeDto::FileSymbol {
-                    path: "src/lib.rs".into(),
-                    symbol: "textual_target".into(),
-                },
-                PacketProbeDto::ExactPath {
-                    path: "src/missing.rs".into(),
-                },
-                PacketProbeDto::FreeQuery {
-                    query: "   ".into(),
-                },
-                PacketProbeDto::SymbolId {
-                    id: "999999".into(),
-                },
-            ],
+    fn file_symbol_missing_and_external_paths_do_not_select_other_files() {
+        let fixture = file_symbol_fixture(240, 0, false);
+        for path in ["src/selected.rs", "src/missing.rs"] {
+            let resolution = file_symbol_resolution(&fixture, path);
+            assert_eq!(resolution.status, PacketProbeResolutionStatusDto::Rejected);
+            assert_eq!(
+                resolution.rejection.expect("missing rejection").code,
+                PacketProbeRejectionCodeDto::MissingTarget
+            );
+            assert!(resolution.symbol_id.is_none());
+            assert!(resolution.candidates.is_empty());
+        }
+        let external = tempfile::tempdir().expect("create external root");
+        let external_path = external.path().join("external.rs");
+        std::fs::write(&external_path, "fn shared() {}\n").expect("write external file");
+        let resolution = file_symbol_resolution(&fixture, &external_path.display().to_string());
+        assert_eq!(
+            resolution.rejection.expect("external rejection").code,
+            PacketProbeRejectionCodeDto::OutOfProject
         );
+        assert!(resolution.symbol_id.is_none());
+        assert!(resolution.candidates.is_empty());
+    }
 
+    #[test]
+    fn file_symbol_uses_native_file_aliases() {
+        use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
+        let fixture = file_symbol_fixture(240, 1, false);
+        let root = fixture._workspace.path();
+        let alias = root.join("src/alias.rs");
+        std::fs::hard_link(root.join("src/selected.rs"), &alias).expect("create native file alias");
+        // The requested alias is independently covered; its declaration still
+        // belongs to the other native spelling in the canonical node table.
+        let mut storage = crate::Storage::open(root.join("codestory.db")).expect("open fixture");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(5000),
+                kind: CoreNodeKind::FILE,
+                serialized_name: "src/alias.rs".into(),
+                file_node_id: Some(CoreNodeId(5000)),
+                ..Default::default()
+            }])
+            .expect("insert alias identity");
+        storage
+            .insert_file(&codestory_store::FileInfo {
+                id: 5000,
+                path: alias,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert alias coverage");
+        drop(storage);
+        let resolution = file_symbol_resolution(&fixture, "src/alias.rs");
         assert_eq!(
-            resolutions[0].status,
-            PacketProbeResolutionStatusDto::ExactPath
-        );
-        assert_eq!(
-            resolutions[1].status,
+            resolution.status,
             PacketProbeResolutionStatusDto::FileScopedSymbol
         );
-        assert_eq!(
-            resolutions[2].status,
-            PacketProbeResolutionStatusDto::TextHit
-        );
-        assert_eq!(
-            resolutions[3]
-                .rejection
-                .as_ref()
-                .map(|rejection| rejection.code),
-            Some(PacketProbeRejectionCodeDto::MissingTarget)
-        );
-        assert_eq!(
-            resolutions[4]
-                .rejection
-                .as_ref()
-                .map(|rejection| rejection.code),
-            Some(PacketProbeRejectionCodeDto::MalformedProbe)
-        );
-        assert_eq!(
-            resolutions[5]
-                .rejection
-                .as_ref()
-                .map(|rejection| rejection.code),
-            Some(PacketProbeRejectionCodeDto::StaleSymbolId)
-        );
+        assert_eq!(resolution.symbol_id.as_ref(), fixture.selected_ids.first());
+        assert_eq!(resolution.path.as_deref(), Some("src/alias.rs"));
     }
 
-    #[test]
-    fn duplicate_name_symbol_and_continuation_anchors_keep_stable_node_identity() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_indexed_fixture(&project);
-        let resolutions = vec![
-            PacketProbeResolutionDto {
-                input_index: 0,
-                probe: PacketProbeDto::SymbolId { id: "2".into() },
-                status: PacketProbeResolutionStatusDto::IndexedSymbol,
-                normalized_query: Some("indexed_target".into()),
-                path: Some("src/lib.rs".into()),
-                symbol_id: Some("2".into()),
-                candidates: Vec::new(),
-                rejection: None,
+    fn retrieval_descriptor(index: usize) -> PacketCandidateDescriptorV1 {
+        PacketCandidateDescriptorV1 {
+            stable_identity: format!("node:retrieval-{index}"),
+            path: format!("src/retrieval-{index}.rs"),
+            symbol: Some(format!("retrieval_{index}")),
+            retrieval_lane: PacketRetrievalLaneV1::Lexical,
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                value: 1.0,
             },
-            PacketProbeResolutionDto {
-                input_index: 1,
-                probe: PacketProbeDto::Continuation {
-                    contract_version: PACKET_PROBE_CONTRACT_VERSION,
-                    project_id: "project".into(),
-                    core_generation_id: "generation".into(),
-                    retrieval_generation: None,
-                    symbol_id: Some("11".into()),
-                    query: "indexed_target".into(),
-                },
-                status: PacketProbeResolutionStatusDto::Continuation,
-                normalized_query: Some("indexed_target".into()),
-                path: Some("src/duplicate.rs".into()),
-                symbol_id: Some("11".into()),
-                candidates: Vec::new(),
-                rejection: None,
-            },
-        ];
-
-        let citations = exact_packet_probe_citations(
-            &controller,
-            &resolutions,
-            "Find the exact indexed targets.",
-            true,
-        );
-        assert_eq!(
-            citations
-                .iter()
-                .map(|citation| citation.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["2", "11"]
-        );
-        assert_eq!(
-            citations
-                .iter()
-                .filter_map(|citation| citation.file_path.as_deref())
-                .collect::<Vec<_>>(),
-            ["src/lib.rs", "src/duplicate.rs"]
-        );
-        assert!(
-            citations
-                .iter()
-                .all(|citation| citation.eligible_for_sufficiency == Some(false))
-        );
-        assert!(
-            resolved_packet_probe_queries(&resolutions).is_empty(),
-            "stable node identities must not be reduced back to display-name retrieval"
-        );
-    }
-
-    #[test]
-    fn continuation_fails_closed_on_project_and_generation_mismatch() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_empty_store(&project);
-        let project_id = project_identity_v3(project.path()).project_id;
-
-        let resolutions = resolve_packet_probes(
-            &controller,
-            vec![
-                PacketProbeDto::Continuation {
-                    contract_version: PACKET_PROBE_CONTRACT_VERSION + 1,
-                    project_id: project_id.clone(),
-                    core_generation_id: "generation".into(),
-                    retrieval_generation: None,
-                    symbol_id: None,
-                    query: "AppController".into(),
-                },
-                PacketProbeDto::Continuation {
-                    contract_version: PACKET_PROBE_CONTRACT_VERSION,
-                    project_id: "different-project".into(),
-                    core_generation_id: "generation".into(),
-                    retrieval_generation: None,
-                    symbol_id: None,
-                    query: "AppController".into(),
-                },
-                PacketProbeDto::Continuation {
-                    contract_version: PACKET_PROBE_CONTRACT_VERSION,
-                    project_id,
-                    core_generation_id: "stale-generation".into(),
-                    retrieval_generation: None,
-                    symbol_id: None,
-                    query: "AppController".into(),
-                },
-            ],
-        );
-        assert_eq!(
-            resolutions[0]
-                .rejection
-                .as_ref()
-                .map(|rejection| rejection.code),
-            Some(PacketProbeRejectionCodeDto::IncompatibleContinuation)
-        );
-        for resolution in &resolutions[1..] {
-            assert_eq!(
-                resolution
-                    .rejection
-                    .as_ref()
-                    .map(|rejection| rejection.code),
-                Some(PacketProbeRejectionCodeDto::StaleContinuation)
-            );
+            source_bytes_upper_bound: Some(1),
+            exact_selector_ordinal: None,
         }
     }
 
-    /// Continuation admission moved into `codestory-agent` behind `PinnedReader`,
-    /// so the runtime now *renders* a refusal the planning crate decided. This
-    /// pins the rendered wire pair — code and message — at the layer a caller
-    /// actually receives it, for every refusal a real controller can reach.
     #[test]
-    fn continuation_refusals_render_the_same_wire_code_and_message_as_before_extraction() {
-        let project = TempDir::new().expect("project");
-        let controller = controller_with_empty_store(&project);
-        let project_id = project_identity_v3(project.path()).project_id;
-        let rootless = AppController::new();
-
-        let continuation = |contract_version: u32,
-                            project_id: &str,
-                            core_generation_id: &str,
-                            retrieval_generation: Option<&str>,
-                            query: &str| {
-            PacketProbeDto::Continuation {
-                contract_version,
-                project_id: project_id.to_string(),
-                core_generation_id: core_generation_id.to_string(),
-                retrieval_generation: retrieval_generation.map(str::to_string),
-                symbol_id: None,
-                query: query.to_string(),
-            }
-        };
+    fn unresolved_exact_probe_keeps_its_packet_wide_reservation_charged() {
+        let controller = AppController::new();
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
 
         let resolutions = resolve_packet_probes(
             &controller,
-            vec![
-                continuation(
-                    PACKET_PROBE_CONTRACT_VERSION + 1,
-                    &project_id,
-                    "generation",
-                    None,
-                    "AppController",
-                ),
-                continuation(
-                    PACKET_PROBE_CONTRACT_VERSION,
-                    "different-project",
-                    "generation",
-                    None,
-                    "AppController",
-                ),
-                continuation(
-                    PACKET_PROBE_CONTRACT_VERSION,
-                    &project_id,
-                    "stale-generation",
-                    Some("retrieval-generation"),
-                    "AppController",
-                ),
-            ],
+            vec![PacketProbeDto::ExactPath {
+                path: "src/missing.rs".into(),
+            }],
         );
-        let rootless_resolutions = resolve_packet_probes(
-            &rootless,
-            vec![continuation(
-                PACKET_PROBE_CONTRACT_VERSION,
-                &project_id,
-                "generation",
-                None,
-                "AppController",
-            )],
+        assert_eq!(
+            resolutions[0].status,
+            PacketProbeResolutionStatusDto::Rejected
         );
+        assert!(session.receipts().is_empty());
+        assert_eq!(*session.hydrated_admissions.borrow(), 1);
 
-        let rendered = |resolution: &PacketProbeResolutionDto| {
-            let rejection = resolution
-                .rejection
-                .as_ref()
-                .expect("a refused continuation carries a rejection");
-            (rejection.code, rejection.message.clone())
-        };
-
-        assert_eq!(
-            rendered(&resolutions[0]),
-            (
-                PacketProbeRejectionCodeDto::IncompatibleContinuation,
-                format!(
-                    "continuation contract {} is incompatible with {PACKET_PROBE_CONTRACT_VERSION}",
-                    PACKET_PROBE_CONTRACT_VERSION + 1
-                )
-            )
-        );
-        assert_eq!(
-            rendered(&resolutions[1]),
-            (
-                PacketProbeRejectionCodeDto::StaleContinuation,
-                "continuation belongs to a different project".to_string()
-            )
-        );
-        // No core publication is pinned here, so the core check refuses before
-        // the retrieval generation this probe also names is ever consulted.
-        assert_eq!(
-            rendered(&resolutions[2]),
-            (
-                PacketProbeRejectionCodeDto::StaleContinuation,
-                "continuation core generation is no longer selected".to_string()
-            )
-        );
-        assert_eq!(
-            rendered(&rootless_resolutions[0]),
-            (
-                PacketProbeRejectionCodeDto::StaleContinuation,
-                "continuation requires an open project".to_string()
-            )
-        );
-        for resolution in resolutions.iter().chain(rootless_resolutions.iter()) {
+        for index in 0..15 {
             assert_eq!(
-                resolution.status,
-                PacketProbeResolutionStatusDto::Rejected,
-                "a refused continuation must not resolve to a reusable probe"
-            );
-            assert!(
-                resolution.normalized_query.is_none() && resolution.symbol_id.is_none(),
-                "a refused continuation must not carry a query or symbol forward"
+                session.admit_descriptor(&retrieval_descriptor(index)),
+                PacketAdmissionDecision::Admitted
             );
         }
+        assert_eq!(
+            session.admit_descriptor(&retrieval_descriptor(15)),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 16);
+        assert_eq!(session.receipts().len(), 15);
+    }
+
+    #[test]
+    fn ambiguous_exact_probe_retains_only_candidates_admitted_by_the_shared_session() {
+        let session = PacketProofSession::new();
+        let reserved = "selector:qualified_symbol:shared";
+        assert_eq!(
+            session.admit_exact_selector(
+                reserved,
+                codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
+                0,
+            ),
+            PacketAdmissionDecision::Admitted
+        );
+        let mut resolution = PacketProbeResolutionDto {
+            input_index: 0,
+            probe: PacketProbeDto::QualifiedSymbol {
+                symbol: "shared".into(),
+            },
+            status: PacketProbeResolutionStatusDto::Ambiguous,
+            normalized_query: Some("shared".into()),
+            path: None,
+            symbol_id: None,
+            candidates: (0..20)
+                .map(|index| PacketProbeAmbiguityCandidateDto {
+                    symbol_id: index.to_string(),
+                    display_name: "shared".into(),
+                    path: None,
+                    kind: NodeKind::FUNCTION,
+                })
+                .collect(),
+            rejection: None,
+        };
+
+        finalize_packet_probe_admission(&session, reserved, 0, &mut resolution);
+
+        assert_eq!(resolution.candidates.len(), 16);
+        assert_eq!(
+            resolution
+                .candidates
+                .iter()
+                .map(|candidate| candidate.symbol_id.clone())
+                .collect::<Vec<_>>(),
+            (0..16).map(|index| index.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 16);
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(
+            session.admit_descriptor(&retrieval_descriptor(99)),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
     }
 }

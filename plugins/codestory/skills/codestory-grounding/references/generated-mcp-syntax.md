@@ -21,26 +21,25 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `include_evidence`, `latency_budget_ms`, DrillOnce `parent_packet_id` / `option_ids` / generation pins | Broad questions. |
-| `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
+| `packet` | `question` | `budget`, typed `probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Experimental bounded evidence selection. No `include_evidence`, `task_class`, or `extra_probes`. |
+| `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery for adaptive source and relationship inspection. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
-| `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
+| `files` | | `language`, `path`, `role`, `limit`, `include_framework_coverage` | Refreshes the local map before dispatch. No `refresh` field. |
 | `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
 | `symbol` | `query` or `id` | `choose` | |
-| `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose` | There is no `mode` field. |
-| `callers` | `query` or `id` | `depth`, `max_nodes`, `choose` | |
-| `callees` | `query` or `id` | `depth`, `max_nodes`, `choose` | |
-| `trace` | `query` or `id` | `direction`, `depth`, `max_nodes`, `story`, `choose` | |
+| `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose`, `caller_scope` (`production_only`/`include_tests_and_benches`) | There is no `mode` field. Default caller scope hides test/bench callers. |
+| `callers` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `callees` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `trace` | `query` or `id` | `direction`, `depth`, `max_nodes`, `story`, `choose`, `caller_scope` | |
 | `get_node` | `query` or `id` | `choose` | |
-| `neighbors` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | |
-| `shortest_path` | `from_id`, `to_id` | `max_depth`, `max_nodes` | |
-| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose` | Not a substitute for `packet`. |
+| `neighbors` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose`, `caller_scope` | |
+| `shortest_path` | `from_id`, `to_id` | `max_depth`, `max_nodes`, `caller_scope` | |
+| `query_subgraph` | `query` or `id` | `direction`, `depth`, `max_nodes`, `choose`, `caller_scope` | Bounded node-centered relationship navigation. |
 | `definition` | `query` or `id` | `choose` | |
 | `references` | `query` or `id` | `choose` | Incoming references. |
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
-| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
+| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | Read a selected source target; ordinary host reads remain available. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-
 ## Resources and prompts
 
 Project-scoped resources use `{?project}` templates, for example
@@ -49,3 +48,17 @@ project-free.
 
 Host prompts `explain_symbol`, `trace_callflow`, and `impact_analysis` exist
 only if the host exposes them. Prefer the matching tool.
+
+## Wire profiles
+
+CodeStory supports MCP revisions `2024-11-05`, `2025-03-26`, `2025-06-18`,
+and `2025-11-25`, preferring the newest. The 2024 profile lists only
+`name`/`description`/`inputSchema`; March adds annotations; June and November
+add `title`, `outputSchema`, and Tool `_meta`. Older profiles return one JSON
+text object. Modern profiles return schema-valid structured content and the
+identical JSON text object. Tool errors are text-only in every profile.
+
+CodeStory publication stamps use schema 3 with minimum compatible schema 3.
+Each negotiated profile has its own discovery digest. The 2024 and March
+profiles accept ordered JSON-RPC batches and omit notification responses; June
+and November reject arrays with `-32600`.

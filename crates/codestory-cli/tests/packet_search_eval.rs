@@ -1040,7 +1040,6 @@ fn packet_search_eval_live_runs_production_cli_path() {
                 &baseline.k.to_string(),
                 "--refresh",
                 "none",
-                "--why",
                 "--profile",
                 "agent",
                 "--run-id",

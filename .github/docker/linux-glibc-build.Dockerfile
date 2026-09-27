@@ -24,13 +24,25 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # Bullseye preserves the glibc 2.31 floor but has no usable glslc package.
 # Keep its linker/runtime and run the pinned shader compiler under its own loader.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+#
+# Live debian-security indexes can publish superseded glibc .debs that 404 while
+# the base image still carries an earlier security revision. Rebind apt to the
+# snapshot dated in the rust bullseye image comments so clang pins resolve
+# against fetchable archives without raising the glibc floor.
+RUN set -eux; \
+    sed -i \
+      -e 's|^deb http://deb.debian.org/debian |deb http://snapshot.debian.org/archive/debian/20260518T000000Z |' \
+      -e 's|^deb http://deb.debian.org/debian-security |deb http://snapshot.debian.org/archive/debian-security/20260518T000000Z |' \
+      /etc/apt/sources.list; \
+    printf 'Acquire::Check-Valid-Until "false";\n' \
+      > /etc/apt/apt.conf.d/99codestory-snapshot; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
       clang-13=1:13.0.1-6~deb11u1 \
       libclang-13-dev=1:13.0.1-6~deb11u1 \
       libvulkan-dev=1.2.162.0-1 \
-      pkg-config=0.29.2-1 \
-    && rm -rf /var/lib/apt/lists/*
+      pkg-config=0.29.2-1; \
+    rm -rf /var/lib/apt/lists/*
 
 ENV CC=clang-13 \
     CXX=clang++-13 \

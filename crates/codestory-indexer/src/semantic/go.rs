@@ -68,7 +68,7 @@ impl GoSemanticResolver {
             return Ok(Vec::new());
         };
 
-        let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
+        let kinds = [NodeKind::FUNCTION as i32];
         resolve_call_candidates(
             index,
             &kinds,

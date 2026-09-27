@@ -8,12 +8,16 @@ use crate::embeddings::{
     acquire_product_embedding_residency_for_runtime, embedding_device_readiness_for_runtime,
 };
 use crate::executor::{
-    QueryExecutor, QueryResult, RetrievalPublicationIdentity, cancellation_flag,
+    CandidatePayloadMode, QueryExecutor, QueryResult, RetrievalPublicationIdentity,
+    cancellation_flag,
 };
 use crate::generation::manifest_unavailable_reason_for_runtime;
-use crate::health::probe_sidecar_health_for_runtime;
+use crate::health::{
+    probe_descriptor_sidecar_health_for_runtime, probe_sidecar_health_for_runtime,
+};
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
-use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
+use crate::mode::{RetrievalDegradedMode, derive_degraded_mode, derive_descriptor_mode};
+use crate::planner::RetrievalStageKind;
 use crate::query_features::{QueryLookupMode, classify_query};
 use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
@@ -21,7 +25,12 @@ use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::{LiveSidecarSearch, SearchExecutionContext, SidecarSearch};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::NodeId;
-use codestory_store::{FileRole, RetrievalIndexManifest, Store};
+use codestory_store::{
+    BoundRetrievalIndexManifest, CorePublicationLayout, FileRole, RetrievalIndexManifest, Store,
+    core_database_exists, resolve_core_generation_database_path,
+};
+use parking_lot::{Mutex, MutexGuard};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -116,6 +125,25 @@ pub struct QueryBatchItem<'a> {
     pub budget_ms: Option<u64>,
 }
 
+/// Numeric wall-time observation for one successful packet descriptor batch.
+///
+/// The observation deliberately excludes query text, candidates, paths, and
+/// health details. An empty or failed batch does not produce one.
+///
+/// `lexical_wall_ms` / `dense_semantic_wall_ms` are the maximum per-query stage
+/// elapsed times from the descriptor plan (Stage1 lexical / Stage1b semantic).
+/// They attribute cost inside `query_batch_wall_ms` and are not required to
+/// partition that enclosing wall.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketDescriptorBatchObservation {
+    pub query_count: u64,
+    pub health_resolution_wall_ms: u64,
+    pub query_batch_wall_ms: u64,
+    pub lexical_wall_ms: u64,
+    pub dense_semantic_wall_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryBatchRequest<'a> {
     pub project_root: &'a Path,
@@ -128,18 +156,20 @@ pub struct QueryBatchRequest<'a> {
 /// resolution. The caller may retry this whole session once when `revalidate` returns
 /// [`RetrievalPublicationChanged`]; the session itself never retries.
 pub struct PinnedQuerySession {
-    storage: Store,
+    storage: Arc<Mutex<Store>>,
     storage_path: PathBuf,
+    core_database_path: PathBuf,
     project_root: PathBuf,
     project_id: String,
     runtime: SidecarRuntimeConfig,
     manifest: RetrievalIndexManifest,
-    file_roles: Arc<HashMap<String, FileRole>>,
+    file_roles: RefCell<Option<Arc<HashMap<String, FileRole>>>>,
     embedding_device: EmbeddingDeviceReadiness,
     publication_identity: RetrievalPublicationIdentity,
     sidecars: Arc<dyn SidecarSearch>,
     _generation_lease: GenerationRetentionLease,
     _embedding_residency: ProductEmbeddingResidencyLease,
+    full_readiness_validated: Cell<bool>,
     transaction_active: bool,
 }
 
@@ -149,7 +179,28 @@ impl PinnedQuerySession {
         storage_path: &Path,
         runtime: &SidecarRuntimeConfig,
     ) -> Result<Self> {
-        if !storage_path.exists() {
+        Self::begin_with_scope(project_root, storage_path, runtime, true)
+    }
+
+    /// Pin the exact core/retrieval publication needed to query descriptor
+    /// sidecars without loading repository file records, nodes, source, graph
+    /// neighborhoods, or dense-anchor rows. Packet admission must be sealed
+    /// before [`Self::validate_full_readiness`] is called.
+    pub fn begin_packet_descriptor(
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: &SidecarRuntimeConfig,
+    ) -> Result<Self> {
+        Self::begin_with_scope(project_root, storage_path, runtime, false)
+    }
+
+    fn begin_with_scope(
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: &SidecarRuntimeConfig,
+        validate_full_readiness: bool,
+    ) -> Result<Self> {
+        if !core_database_exists(storage_path).context("resolve core publication for query")? {
             let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
             bail!(
                 "retrieval sidecar storage is missing; run retrieval index for project {project_id}"
@@ -158,26 +209,58 @@ impl PinnedQuerySession {
 
         let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
         let generation_lease = GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
-        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
-        storage
-            .get_connection()
-            .execute_batch("BEGIN DEFERRED TRANSACTION")
-            .context("pin core publication for retrieval query")?;
-
-        let manifest = storage
-            .get_retrieval_index_manifest(&project_id)
-            .context("load retrieval manifest")?
+        let publication_storage =
+            Store::open_read_only(storage_path).context("open retrieval publication pointer")?;
+        let bound_manifest = publication_storage
+            .get_bound_retrieval_index_manifest(&project_id)
+            .context("load core-bound retrieval manifest")?
             .with_context(|| {
                 format!(
                     "retrieval sidecar manifest is missing; run retrieval index for project {project_id}"
                 )
             })?;
+        let core_layout = CorePublicationLayout::from_storage_path(storage_path)
+            .context("resolve retrieval query core layout")?;
+        let has_immutable_publication = core_layout
+            .read_pointer()
+            .context("read retrieval query core publication pointer")?
+            .is_some();
+        let core_path =
+            resolve_core_generation_database_path(storage_path, &bound_manifest.core.generation_id)
+                .context("resolve retrieval publication core generation")?;
+        drop(publication_storage);
+        let storage = if has_immutable_publication {
+            Store::open_immutable_generation(&core_path)
+                .context("open exact immutable core generation for retrieval query")?
+        } else {
+            // Legacy stores have no immutable generation directory. They must
+            // use a normal read-only SQLite snapshot; `immutable=1` would
+            // ignore concurrent WAL changes and can surface a newer row under
+            // an older retrieval identity.
+            Store::open_read_only(&core_path)
+                .context("open legacy core snapshot for retrieval query")?
+        };
+        storage
+            .get_connection()
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .context("pin core publication for retrieval query")?;
+
+        let manifest = bound_manifest.manifest.clone();
         if let Some(reason) =
             manifest_unavailable_reason_for_runtime(&project_id, &storage, &manifest, runtime)
         {
             bail!(
                 "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
             );
+        }
+        let core_publication = storage
+            .get_complete_index_publication()
+            .context("load pinned core publication for retrieval query")?
+            .context("pinned retrieval query requires a complete core publication")?;
+        if core_publication.generation_id != bound_manifest.core.generation_id
+            || core_publication.run_id != bound_manifest.core.run_id
+        {
+            bail!("retrieval publication core binding does not match immutable core contents");
         }
 
         // Acquire residency before strict readiness and keep it through candidate resolution.
@@ -191,42 +274,10 @@ impl PinnedQuerySession {
                 u32::try_from(crate::embeddings::semantic_vector_dim())
                     .context("embedding dimension exceeds evidence contract")?,
             )?;
-        if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
-            project_root,
-            storage_path,
-            &storage,
-            runtime,
-            &producer_compatibility_identity,
-        ) {
-            bail!(
-                "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
-            );
-        }
-        let file_roles = storage
-            .get_files()
-            .map(|files| {
-                files
-                    .into_iter()
-                    .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let publication_identity =
-            retrieval_publication_identity_from_storage(&storage, &project_id)?;
-        let core_publication = storage
-            .get_complete_index_publication()
-            .context("load pinned core publication for vector evidence")?
-            .context("pinned retrieval query requires a complete core publication")?;
-        crate::embedded_vector::validate_generation_evidence_for_publication(
-            &runtime.layout,
-            &storage,
-            &manifest,
-            &core_publication,
-            runtime,
-            &embedding_device,
-            embedding_residency.identity(),
-        )
-        .context("validate attested vector generation")?;
+        let publication_identity = retrieval_publication_identity_from_bound(&bound_manifest)?;
+        // Share this exact read transaction with full-payload stage enrichment.
+        // In particular, reopening a legacy path would observe newer WAL rows.
+        let storage = Arc::new(Mutex::new(storage));
         let sidecars = Arc::new(
             LiveSidecarSearch::new_for_runtime_with_embedding_device(
                 runtime,
@@ -235,28 +286,153 @@ impl PinnedQuerySession {
                 Some(&manifest),
                 Some(embedding_device.clone()),
             )?
-            .with_core_candidate_context(project_root, storage_path),
+            .with_core_candidate_context(project_root, Arc::clone(&storage)),
         );
 
-        Ok(Self {
+        let session = Self {
             storage,
             storage_path: storage_path.to_path_buf(),
+            core_database_path: core_path,
             project_root: project_root.to_path_buf(),
             project_id,
             runtime: runtime.clone(),
             manifest,
-            file_roles: Arc::new(file_roles),
+            file_roles: RefCell::new(None),
             embedding_device,
             publication_identity,
             sidecars,
             _generation_lease: generation_lease,
             _embedding_residency: embedding_residency,
+            full_readiness_validated: Cell::new(false),
             transaction_active: true,
-        })
+        };
+        if validate_full_readiness {
+            session
+                .validate_full_readiness_with_identity(&producer_compatibility_identity, None)?;
+        }
+        Ok(session)
     }
 
-    pub fn storage(&self) -> &Store {
-        &self.storage
+    /// Complete the repository/core consistency checks after packet-wide
+    /// descriptor admission has been sealed and before any admitted identity
+    /// is hydrated. Ordinary query sessions perform this during `begin`.
+    pub fn validate_full_readiness(&self) -> Result<()> {
+        let producer_compatibility_identity =
+            crate::embedded_vector::vector_producer_compatibility_identity(
+                &self.embedding_device,
+                self._embedding_residency.identity(),
+                u32::try_from(crate::embeddings::semantic_vector_dim())
+                    .context("embedding dimension exceeds evidence contract")?,
+            )?;
+        self.validate_full_readiness_with_identity(&producer_compatibility_identity, None)
+    }
+
+    /// Compatibility seam for carrying the retrieval request's existing
+    /// deadline and cancellation state through deferred packet readiness.
+    fn validate_full_readiness_with_context(&self, context: &SearchExecutionContext) -> Result<()> {
+        context
+            .clone()
+            .with_stage_boundary("deferred_full_readiness_entry")
+            .check_cancelled()?;
+        let producer_compatibility_identity =
+            crate::embedded_vector::vector_producer_compatibility_identity(
+                &self.embedding_device,
+                self._embedding_residency.identity(),
+                u32::try_from(crate::embeddings::semantic_vector_dim())
+                    .context("embedding dimension exceeds evidence contract")?,
+            )?;
+        context
+            .clone()
+            .with_stage_boundary("deferred_full_readiness_after_producer_identity")
+            .check_cancelled()?;
+        self.validate_full_readiness_with_identity(&producer_compatibility_identity, Some(context))
+    }
+
+    /// Validate deferred packet readiness under the descriptor phase's
+    /// existing absolute deadline and request cancellation flag.
+    pub fn validate_full_readiness_with_control(
+        &self,
+        deadline: Instant,
+        request_cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let context = SearchExecutionContext::new(
+            deadline,
+            request_cancelled,
+            Arc::new(AtomicBool::new(false)),
+        );
+        self.validate_full_readiness_with_context(&context)
+    }
+
+    fn validate_full_readiness_with_identity(
+        &self,
+        producer_compatibility_identity: &str,
+        context: Option<&SearchExecutionContext>,
+    ) -> Result<()> {
+        if let Some(context) = context {
+            context
+                .clone()
+                .with_stage_boundary(
+                    "deferred_full_readiness_before_cached_success_or_strict_validation",
+                )
+                .check_cancelled()?;
+        }
+        if self.full_readiness_validated.get() {
+            return Ok(());
+        }
+        let storage = self.storage.lock();
+        if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
+            &self.project_root,
+            &self.storage_path,
+            &storage,
+            &self.runtime,
+            producer_compatibility_identity,
+        ) {
+            bail!(
+                "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {}",
+                self.project_id
+            );
+        }
+        if let Some(context) = context {
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_strict_validation")
+                .check_cancelled()?;
+        }
+        let core_publication = storage
+            .get_complete_index_publication()
+            .context("load pinned core publication for vector validation")?
+            .context("pinned retrieval query requires a complete core publication")?;
+        if let Some(context) = context {
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_core_publication")
+                .check_cancelled()?;
+        }
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &self.runtime.layout,
+            &storage,
+            Some(&self.core_database_path),
+            &self.manifest,
+            &core_publication,
+            &self.runtime,
+            &self.embedding_device,
+            self._embedding_residency.identity(),
+        )
+        .context("validate attested vector generation")?;
+        if let Some(context) = context {
+            context
+                .clone()
+                .with_stage_boundary("deferred_full_readiness_after_vector_validation")
+                .check_cancelled()?;
+        }
+        self.full_readiness_validated.set(true);
+        Ok(())
+    }
+
+    /// Borrow the pinned core for one read operation. Drop the guard before
+    /// executing sidecar queries, whose enrichment borrows the same snapshot.
+    pub fn storage(&self) -> MutexGuard<'_, Store> {
+        self.storage.lock()
     }
 
     pub fn project_root(&self) -> &Path {
@@ -291,13 +467,77 @@ impl PinnedQuerySession {
             sidecars: Arc::clone(&self.sidecars),
             cache,
             manifest: Some(self.manifest.clone()),
-            file_roles: Arc::clone(&self.file_roles),
+            file_roles: self.file_roles()?,
             cancelled,
             mode_override: None,
         };
         let mut result = executor.execute(query, budget_ms)?;
         self.enrich_and_rerank_candidates(&mut result)?;
         refresh_cached_query_result(cache, &self.manifest, &result);
+        Ok(result.with_publication_identity(&self.publication_identity))
+    }
+
+    /// Execute the sidecars and return only pre-hydration packet descriptors.
+    ///
+    /// This path deliberately skips core enrichment. Packet admission must
+    /// choose stable identities before any core node, file, source, or graph
+    /// record is opened. The ordinary search path above keeps its richer
+    /// post-query enrichment.
+    pub fn execute_packet_descriptors_with_cache(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, true)
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub fn execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, false)
+    }
+
+    fn execute_packet_descriptors_with_cache_policy(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+        include_dense_semantic: bool,
+    ) -> Result<QueryResult> {
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let mut executor = QueryExecutor {
+            sidecars: Arc::clone(&self.sidecars),
+            cache,
+            manifest: Some(self.manifest.clone()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled,
+            mode_override: None,
+        };
+        let mut result = if include_dense_semantic {
+            executor.execute_packet_descriptors(query, budget_ms)?
+        } else {
+            #[cfg(feature = "benchmark-support")]
+            {
+                executor.execute_packet_descriptors_without_dense_semantic_for_benchmark(
+                    query, budget_ms,
+                )?
+            }
+            #[cfg(not(feature = "benchmark-support"))]
+            unreachable!("dense semantic packet control requires benchmark-support")
+        };
+        sanitize_packet_candidate_descriptors(&mut result.hits);
         Ok(result.with_publication_identity(&self.publication_identity))
     }
 
@@ -331,7 +571,7 @@ impl PinnedQuerySession {
         let mut results = execute_strict_retrieval_query_batch_against_sidecars(
             Arc::clone(&self.sidecars),
             Some(self.manifest.clone()),
-            Arc::clone(&self.file_roles),
+            self.file_roles()?,
             cancelled,
             mode,
             queries,
@@ -346,10 +586,152 @@ impl PinnedQuerySession {
         Ok(results)
     }
 
+    pub fn execute_packet_descriptor_batch_with_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, true, false,
+        )
+        .map(|(results, _)| results)
+    }
+
+    #[doc(hidden)]
+    pub fn execute_packet_descriptor_batch_with_observation_and_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, true, true,
+        )
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub fn execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, false, false,
+        )
+        .map(|(results, _)| results)
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[doc(hidden)]
+    pub fn execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
+        self.execute_packet_descriptor_batch_with_cache_policy(
+            queries, cancelled, cache, false, true,
+        )
+    }
+
+    fn execute_packet_descriptor_batch_with_cache_policy(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+        include_dense_semantic: bool,
+        observe_wall_intervals: bool,
+    ) -> Result<(Vec<QueryResult>, Option<PacketDescriptorBatchObservation>)> {
+        if queries.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let health_started_at = observe_wall_intervals.then(Instant::now);
+        let (mode, degraded_reason) = resolve_descriptor_batch_mode(
+            self.sidecars.as_ref(),
+            Some(&self.manifest),
+            &self.embedding_device,
+            &self.runtime,
+        );
+        let health_resolution_wall_ms =
+            health_started_at.map(|started_at| duration_millis_ceil(started_at.elapsed()));
+        if mode != RetrievalDegradedMode::Full {
+            bail!(
+                "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+                mode.as_str(),
+                degraded_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        let query_batch_started_at = observe_wall_intervals.then(Instant::now);
+        let mut results = execute_strict_retrieval_descriptor_batch_against_sidecars(
+            Arc::clone(&self.sidecars),
+            Some(self.manifest.clone()),
+            Arc::new(HashMap::new()),
+            cancelled,
+            mode,
+            queries,
+            cache,
+            strict_batch_worker_limit(queries.len()),
+            include_dense_semantic,
+        )?;
+        let query_batch_wall_ms =
+            query_batch_started_at.map(|started_at| duration_millis_ceil(started_at.elapsed()));
+        let lexical_wall_ms = observe_wall_intervals
+            .then(|| max_descriptor_stage_elapsed_ms(&results, RetrievalStageKind::Stage1Lexical));
+        let dense_semantic_wall_ms = observe_wall_intervals.then(|| {
+            max_descriptor_stage_elapsed_ms(&results, RetrievalStageKind::Stage1bSemantic)
+        });
+        for result in &mut results {
+            sanitize_packet_candidate_descriptors(&mut result.hits);
+            result.publication_identity = Some(self.publication_identity.clone());
+        }
+        let observation = health_resolution_wall_ms.zip(query_batch_wall_ms).map(
+            |(health_resolution_wall_ms, query_batch_wall_ms)| PacketDescriptorBatchObservation {
+                query_count: u64::try_from(queries.len()).unwrap_or(u64::MAX),
+                health_resolution_wall_ms,
+                query_batch_wall_ms,
+                lexical_wall_ms: lexical_wall_ms.unwrap_or(0),
+                dense_semantic_wall_ms: dense_semantic_wall_ms.unwrap_or(0),
+            },
+        );
+        Ok((results, observation))
+    }
+
     fn enrich_and_rerank_candidates(&self, result: &mut QueryResult) -> Result<()> {
-        enrich_candidates_from_core(&self.storage, &self.project_root, &mut result.hits)?;
+        enrich_candidates_from_core(&self.storage.lock(), &self.project_root, &mut result.hits)?;
         result.hits = rank_candidates(&result.features, std::mem::take(&mut result.hits));
         Ok(())
+    }
+
+    /// Load repository-wide file roles only for the ordinary enriched search
+    /// path. Packet descriptor queries must reach their global admission gate
+    /// without opening any candidate file records.
+    fn file_roles(&self) -> Result<Arc<HashMap<String, FileRole>>> {
+        if let Some(file_roles) = self.file_roles.borrow().as_ref() {
+            return Ok(Arc::clone(file_roles));
+        }
+        let file_roles = Arc::new(
+            self.storage
+                .lock()
+                .get_files()
+                .context("load file roles for enriched retrieval query")?
+                .into_iter()
+                .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
+                .collect(),
+        );
+        self.file_roles.replace(Some(Arc::clone(&file_roles)));
+        Ok(file_roles)
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    fn file_roles_loaded(&self) -> bool {
+        self.file_roles.borrow().is_some()
     }
 
     pub fn ensure_result_identity(
@@ -373,17 +755,7 @@ impl PinnedQuerySession {
         let current = Store::open_read_only(&self.storage_path)
             .context("open current retrieval publication")
             .and_then(|storage| {
-                let snapshot = storage
-                    .read_snapshot()
-                    .context("pin current retrieval publication")?;
-                let identity = retrieval_publication_identity_from_storage(
-                    snapshot.storage(),
-                    &self.project_id,
-                );
-                snapshot
-                    .finish()
-                    .context("finish current retrieval publication")?;
-                identity
+                retrieval_publication_identity_from_storage(&storage, &self.project_id)
             });
         let current = current.map_err(|error| {
             RetrievalPublicationChanged::unreadable(
@@ -401,6 +773,14 @@ impl PinnedQuerySession {
             .into());
         }
         Ok(())
+    }
+}
+
+fn sanitize_packet_candidate_descriptors(candidates: &mut [CandidateHit]) {
+    for candidate in candidates {
+        candidate.source_excerpt = None;
+        candidate.structural_kind = None;
+        candidate.rank_features = None;
     }
 }
 
@@ -490,7 +870,11 @@ fn refresh_cached_query_result(
 impl Drop for PinnedQuerySession {
     fn drop(&mut self) {
         if self.transaction_active {
-            let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+            let _ = self
+                .storage
+                .lock()
+                .get_connection()
+                .execute_batch("ROLLBACK");
             self.transaction_active = false;
         }
     }
@@ -554,6 +938,59 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
     cache: &mut RetrievalCache,
     worker_limit: usize,
 ) -> Result<Vec<QueryResult>> {
+    execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+        sidecars,
+        manifest,
+        file_roles,
+        cancelled,
+        mode,
+        queries,
+        cache,
+        worker_limit,
+        CandidatePayloadMode::Full,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strict_retrieval_descriptor_batch_against_sidecars(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: Arc<HashMap<String, FileRole>>,
+    cancelled: Arc<AtomicBool>,
+    mode: RetrievalDegradedMode,
+    queries: &[QueryBatchItem<'_>],
+    cache: &mut RetrievalCache,
+    worker_limit: usize,
+    include_dense_semantic: bool,
+) -> Result<Vec<QueryResult>> {
+    execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+        sidecars,
+        manifest,
+        file_roles,
+        cancelled,
+        mode,
+        queries,
+        cache,
+        worker_limit,
+        CandidatePayloadMode::DescriptorOnly,
+        include_dense_semantic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: Arc<HashMap<String, FileRole>>,
+    cancelled: Arc<AtomicBool>,
+    mode: RetrievalDegradedMode,
+    queries: &[QueryBatchItem<'_>],
+    cache: &mut RetrievalCache,
+    worker_limit: usize,
+    payload: CandidatePayloadMode,
+    include_dense_semantic: bool,
+) -> Result<Vec<QueryResult>> {
     if mode != RetrievalDegradedMode::Full {
         bail!(
             "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason=unknown)",
@@ -570,8 +1007,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         if cancelled.load(Ordering::Acquire) {
             bail!("retrieval query batch cancelled during cache lookup");
         }
-        if let Some(result) =
-            cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
+        if payload == CandidatePayloadMode::Full
+            && let Some(result) =
+                cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
         {
             results[index] = Some(result);
         } else {
@@ -579,8 +1017,11 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         }
     }
 
-    let (sidecars, prefetch_elapsed) =
-        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled);
+    let (sidecars, prefetch_elapsed) = if payload == CandidatePayloadMode::Full {
+        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled)
+    } else {
+        (sidecars, Duration::ZERO)
+    };
     let prefetch_elapsed_ms = duration_millis_ceil(prefetch_elapsed);
 
     for wave in misses.chunks(worker_limit.max(1)) {
@@ -606,15 +1047,31 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
                         cancelled,
                         mode_override: Some(mode),
                     };
-                    let result =
-                        executor
-                            .execute(query, Some(remaining_budget_ms))
-                            .map(|mut result| {
-                                result.trace.total_budget_ms = total_budget_ms;
-                                result.trace.elapsed_ms =
-                                    result.trace.elapsed_ms.saturating_add(prefetch_elapsed_ms);
-                                result
-                            });
+                    let result = match payload {
+                        CandidatePayloadMode::Full => {
+                            executor.execute(query, Some(remaining_budget_ms))
+                        }
+                        CandidatePayloadMode::DescriptorOnly if include_dense_semantic => executor
+                            .execute_packet_descriptors(query, Some(remaining_budget_ms)),
+                        CandidatePayloadMode::DescriptorOnly => {
+                            #[cfg(feature = "benchmark-support")]
+                            {
+                                executor
+                                    .execute_packet_descriptors_without_dense_semantic_for_benchmark(
+                                        query,
+                                        Some(remaining_budget_ms),
+                                    )
+                            }
+                            #[cfg(not(feature = "benchmark-support"))]
+                            unreachable!("dense semantic packet control requires benchmark-support")
+                        }
+                    }
+                    .map(|mut result| {
+                        result.trace.total_budget_ms = total_budget_ms;
+                        result.trace.elapsed_ms =
+                            result.trace.elapsed_ms.saturating_add(prefetch_elapsed_ms);
+                        result
+                    });
                     (*index, result)
                 }));
             }
@@ -633,7 +1090,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
             if cancelled.load(Ordering::Acquire) {
                 bail!("retrieval query batch cancelled after worker wave");
             }
-            cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
+            if payload == CandidatePayloadMode::Full {
+                cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
+            }
             results[index] = Some(result);
         }
     }
@@ -768,6 +1227,16 @@ fn duration_millis_ceil(duration: Duration) -> u64 {
     ))
 }
 
+fn max_descriptor_stage_elapsed_ms(results: &[QueryResult], kind: RetrievalStageKind) -> u64 {
+    results
+        .iter()
+        .flat_map(|result| result.trace.stages.iter())
+        .filter(|stage| stage.stage == kind)
+        .map(|stage| stage.elapsed_ms)
+        .max()
+        .unwrap_or(0)
+}
+
 struct PreparedBatchSidecars {
     inner: Arc<dyn SidecarSearch>,
     prepared_lexical: HashMap<String, Vec<CandidateHit>>,
@@ -807,7 +1276,14 @@ impl SidecarSearch for PreparedBatchSidecars {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.check_cancelled()?;
-        let hits = self.lexical_search(query, limit)?;
+        let hits = if let Some(prepared) = self.prepared_lexical.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            hits
+        } else {
+            self.inner
+                .lexical_search_with_context(query, limit, context)?
+        };
         context.check_cancelled()?;
         Ok(hits)
     }
@@ -828,7 +1304,14 @@ impl SidecarSearch for PreparedBatchSidecars {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.check_cancelled()?;
-        let hits = self.semantic_search(query, limit)?;
+        let hits = if let Some(prepared) = self.prepared_semantic.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            hits
+        } else {
+            self.inner
+                .semantic_search_with_context(query, limit, context)?
+        };
         context.check_cancelled()?;
         Ok(hits)
     }
@@ -935,27 +1418,34 @@ pub fn retrieval_publication_identity_from_storage(
     storage: &Store,
     project_id: &str,
 ) -> Result<RetrievalPublicationIdentity> {
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load complete core publication")?
-        .context("complete core publication is missing")?;
-    let manifest = storage
-        .get_retrieval_index_manifest(project_id)
-        .context("load retrieval manifest identity")?
+    let bound = storage
+        .get_bound_retrieval_index_manifest(project_id)
+        .context("load core-bound retrieval manifest identity")?
         .context("retrieval manifest is missing")?;
+    retrieval_publication_identity_from_bound(&bound)
+}
+
+fn retrieval_publication_identity_from_bound(
+    bound: &BoundRetrievalIndexManifest,
+) -> Result<RetrievalPublicationIdentity> {
+    let manifest = &bound.manifest;
     Ok(RetrievalPublicationIdentity {
-        core_generation_id: publication.generation_id,
-        core_run_id: publication.run_id,
+        core_generation_id: bound.core.generation_id.clone(),
+        core_run_id: bound.core.run_id.clone(),
         sidecar_generation: manifest
             .sidecar_generation
+            .as_deref()
             .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
             .context("retrieval manifest sidecar generation is missing")?,
         sidecar_input_hash: manifest
             .sidecar_input_hash
+            .as_deref()
             .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
             .context("retrieval manifest input hash is missing")?,
         semantic_generation: (!manifest.semantic_generation.trim().is_empty())
-            .then_some(manifest.semantic_generation)
+            .then(|| manifest.semantic_generation.clone())
             .context("retrieval manifest semantic generation is missing")?,
     })
 }
@@ -988,6 +1478,34 @@ fn resolve_batch_mode(
     )
 }
 
+fn resolve_descriptor_batch_mode(
+    sidecars: &dyn SidecarSearch,
+    manifest: Option<&RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &SidecarRuntimeConfig,
+) -> (RetrievalDegradedMode, Option<String>) {
+    if let Some(manifest) = manifest {
+        let Some(layout) = sidecars.layout() else {
+            return (
+                RetrievalDegradedMode::Unavailable,
+                Some("sidecar_layout_missing".into()),
+            );
+        };
+        let report = probe_descriptor_sidecar_health_for_runtime(
+            layout,
+            &manifest.project_id,
+            Some(manifest.clone()),
+            embedding_device,
+            runtime,
+        );
+        return derive_descriptor_mode(&report.lexical, &report.semantic);
+    }
+    (
+        RetrievalDegradedMode::LexicalOnly,
+        Some("manifest_missing".into()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,9 +1515,348 @@ mod tests {
     use crate::test_support::retrieval_manifest_fixture;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(feature = "test-support")]
+    struct PinnedEnrichmentFixtureSidecars {
+        live: Arc<dyn SidecarSearch>,
+        enrichments: AtomicUsize,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl SidecarSearch for PinnedEnrichmentFixtureSidecars {
+        fn layout(&self) -> Option<&crate::SidecarLayout> {
+            self.live.layout()
+        }
+
+        fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
+            self.live.embedding_device_readiness()
+        }
+
+        fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+            self.live.runtime_config()
+        }
+
+        fn enrich_candidates(&self, candidates: &mut [CandidateHit]) -> Result<()> {
+            self.enrichments.fetch_add(1, Ordering::SeqCst);
+            self.live.enrich_candidates(candidates)
+        }
+
+        fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok((1..=4)
+                .map(|id| {
+                    let mut hit = CandidateHit::lexical_stub("lib.rs", 1.0);
+                    hit.node_id = Some(id.to_string());
+                    hit.symbol_name = Some(format!("symbol_{id}"));
+                    if id == 4 {
+                        hit.file_role = Some(FileRole::Test);
+                    }
+                    hit
+                })
+                .collect())
+        }
+
+        fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_expand(
+            &self,
+            _anchors: &[CandidateHit],
+            _limit: usize,
+        ) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn full_payload_pin_survives_core_change(immutable: bool) {
+        use crate::test_support::{
+            env_lock, publish_complete_core_fixture, publish_zero_dense_pinned_query_fixture,
+        };
+        use codestory_contracts::core_publication::CoreGenerationIdentityV1;
+        use codestory_store::{
+            CorePublishTransaction, IndexPublicationMode, IndexPublicationRecord, SnapshotStore,
+        };
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("retrieval cache");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn symbol_1() {}\npub fn symbol_2() {}\n")
+            .expect("write source");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = |generation, generation_id: &str| IndexPublicationRecord {
+            generation,
+            generation_id: generation_id.into(),
+            run_id: format!("run-{generation}"),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: generation as i64,
+        };
+        let first = publication(1, "11111111-1111-4111-8111-111111111111");
+        let second = publication(2, "22222222-2222-4222-8222-222222222222");
+        let seed = |path: &Path, publication: &IndexPublicationRecord, replacement: bool| {
+            let mut storage = Store::open(path).expect("open fixture core");
+            storage
+                .insert_file(&FileInfo {
+                    id: 10,
+                    path: source_path.clone(),
+                    language: "rust".into(),
+                    modification_time: live_mtime_millis(&source_path),
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert source file");
+            let nodes = (1..=4)
+                .map(|id| Node {
+                    id: NodeId(id),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("symbol_{id}"),
+                    qualified_name: Some(if id == 3 || (replacement && id == 1) {
+                        format!("tests::symbol_{id}")
+                    } else {
+                        format!("source::symbol_{id}")
+                    }),
+                    canonical_id: Some(format!("rust:symbol_{id}")),
+                    file_node_id: Some(NodeId(10)),
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(1),
+                    end_col: Some(1),
+                })
+                .chain(std::iter::once(Node {
+                    id: NodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().into_owned(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: None,
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(2),
+                    end_col: Some(1),
+                }))
+                .collect::<Vec<_>>();
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert core nodes");
+            publish_complete_core_fixture(&mut storage, project.path(), publication)
+                .expect("publish complete fixture core");
+        };
+        let identity =
+            |path: &Path, publication: &IndexPublicationRecord| CoreGenerationIdentityV1 {
+                generation_id: publication.generation_id.clone(),
+                run_id: publication.run_id.clone(),
+                logical_bytes: std::fs::metadata(path).expect("core bytes").len(),
+                published_at_epoch_ms: publication.published_at_epoch_ms,
+            };
+        if immutable {
+            let stage = SnapshotStore::staged_path(&storage_path).expect("stage A");
+            seed(&stage, &first, false);
+            let first_identity = identity(&stage, &first);
+            CorePublishTransaction::begin_from_stage(&storage_path, stage)
+                .expect("begin A publication")
+                .commit_pointer(first_identity, None)
+                .expect("activate A");
+        } else {
+            seed(&storage_path, &first, false);
+        }
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish retrieval binding A");
+        let mut session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("pin complete A");
+        let pinned_name = |session: &PinnedQuerySession| {
+            session
+                .storage()
+                .get_connection()
+                .query_row("SELECT qualified_name FROM node WHERE id=1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("pinned raw SQLite node")
+        };
+        assert_eq!(pinned_name(&session), "source::symbol_1");
+        let fixture = Arc::new(PinnedEnrichmentFixtureSidecars {
+            live: Arc::clone(&session.sidecars),
+            enrichments: AtomicUsize::new(0),
+        });
+        session.sidecars = fixture.clone();
+        if immutable {
+            let stage = SnapshotStore::staged_path(&storage_path).expect("stage B");
+            seed(&stage, &second, true);
+            let second_identity = identity(&stage, &second);
+            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+            let old = layout
+                .read_pointer()
+                .expect("old pointer")
+                .expect("A pointer")
+                .active;
+            CorePublishTransaction::begin_from_stage(&storage_path, stage)
+                .expect("begin B publication")
+                .commit_pointer(second_identity, Some(old))
+                .expect("activate B");
+            assert_eq!(
+                layout
+                    .read_pointer()
+                    .expect("new pointer")
+                    .expect("B pointer")
+                    .active
+                    .generation_id,
+                second.generation_id
+            );
+        } else {
+            let writer = Store::open(&storage_path).expect("legacy WAL writer");
+            writer.get_connection().execute_batch(
+                "PRAGMA wal_autocheckpoint=0; UPDATE node SET qualified_name='tests::symbol_1' WHERE id=1;"
+            ).expect("commit new metadata into WAL");
+            assert!(
+                std::fs::metadata(storage_path.with_extension("db-wal"))
+                    .expect("live WAL")
+                    .len()
+                    > 0
+            );
+        }
+        let current = Store::open_read_only(&storage_path).expect("current B metadata");
+        assert_eq!(
+            current
+                .get_nodes_by_ids(&[NodeId(1)])
+                .expect("current node")[&NodeId(1)]
+                .qualified_name
+                .as_deref(),
+            Some("tests::symbol_1")
+        );
+        session
+            .revalidate()
+            .expect("retrieval binding remains A despite newer core metadata");
+        // Read SQLite directly so the legacy snapshot control is not satisfied
+        // by a warmed Store node cache. Live enrichment must use this read view.
+        assert_eq!(pinned_name(&session), "source::symbol_1");
+        let expected_identity = session.publication_identity().clone();
+        let assert_hits = |result: &QueryResult| {
+            let ids = result
+                .hits
+                .iter()
+                .filter_map(|hit| hit.node_id.as_deref())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                ids,
+                HashSet::from(["1", "2"]),
+                "A source hit must survive pre-fusion metadata filtering"
+            );
+            assert!(
+                result.hits.iter().all(|hit| matches!(
+                    hit.file_role,
+                    Some(FileRole::Source | FileRole::Entrypoint)
+                )),
+                "retained A hits must remain primary source candidates: {:?}",
+                result.hits
+            );
+            assert_eq!(
+                result
+                    .hits
+                    .iter()
+                    .find(|hit| hit.node_id.as_deref() == Some("1"))
+                    .expect("source hit")
+                    .qualified_name
+                    .as_deref(),
+                Some("source::symbol_1")
+            );
+            assert_eq!(
+                result.publication_identity.as_ref(),
+                Some(&expected_identity)
+            );
+        };
+        let mut cache = RetrievalCache::new();
+        assert_hits(
+            &session
+                .execute_with_cache("find service implementation", Some(500), None, &mut cache)
+                .expect("execute full query against A"),
+        );
+        let queries = [
+            QueryBatchItem {
+                query: "locate service implementation",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "explain service implementation",
+                budget_ms: Some(500),
+            },
+        ];
+        for result in session
+            .execute_batch_with_cache(&queries, None, &mut cache)
+            .expect("parallel full queries")
+        {
+            assert_hits(&result);
+        }
+        assert!(
+            fixture.enrichments.load(Ordering::SeqCst) >= 3,
+            "full stages must invoke live enrichment"
+        );
+        let before_descriptors = fixture.enrichments.load(Ordering::SeqCst);
+        session
+            .execute_packet_descriptors_with_cache(
+                "describe service implementation",
+                Some(500),
+                None,
+                &mut cache,
+            )
+            .expect("descriptor query");
+        assert_eq!(
+            fixture.enrichments.load(Ordering::SeqCst),
+            before_descriptors,
+            "descriptor execution must not hydrate core candidates"
+        );
+        session
+            .revalidate()
+            .expect("old retrieval binding remains usable");
+        assert!(
+            crate::retention::GenerationRetentionLock::try_acquire(
+                &runtime.layout.state_file,
+                session.project_id(),
+            )
+            .expect("observe cleanup fence")
+            .is_none(),
+            "query session retains its cleanup lease"
+        );
+        let project_id = session.project_id().to_owned();
+        drop(session);
+        assert!(
+            crate::retention::GenerationRetentionLock::try_acquire(
+                &runtime.layout.state_file,
+                &project_id,
+            )
+            .expect("cleanup fence after query")
+            .is_some(),
+            "cleanup can resume after the session ends"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn full_payload_enrichment_uses_pinned_core_after_pointer_swap() {
+        full_payload_pin_survives_core_change(true);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn full_payload_enrichment_uses_pinned_legacy_wal_snapshot() {
+        full_payload_pin_survives_core_change(false);
+    }
 
     #[test]
     fn strict_batch_fanout_stays_bounded_when_the_host_has_many_cores() {
@@ -1103,10 +1960,22 @@ mod tests {
                 .expect("publish first strict generation");
         let first_session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
             .expect("first strict query admission");
+        assert!(
+            !first_session.file_roles_loaded(),
+            "pinning a retrieval publication must not hydrate repository file records"
+        );
         assert_eq!(
             first_session.publication_identity().core_generation_id,
             first_core.generation_id
         );
+        let live_context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        first_session
+            .validate_full_readiness_with_context(&live_context)
+            .expect("live context must preserve an already validated session");
         drop(first_session);
 
         let mut store = Store::open(&storage_path).expect("open identity-only writer");
@@ -1149,6 +2018,286 @@ mod tests {
             second_session.publication_identity().core_run_id,
             second_core.run_id
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn packet_descriptor_pin_defers_file_inventory_until_after_admission() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+
+        let writer = Store::open(&storage_path).expect("open hostile writer");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = X'FF' WHERE id = 1", [])
+            .expect("poison full file projection");
+        drop(writer);
+
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("descriptor pin must not decode repository file rows");
+        assert!(!session.file_roles_loaded());
+        let error = session
+            .validate_full_readiness()
+            .expect_err("post-admission full readiness must still fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("retrieval sidecar manifest is unavailable"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(all(feature = "test-support", feature = "benchmark-support"))]
+    #[test]
+    fn packet_descriptor_batch_wall_observation_covers_success_empty_and_error() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("begin descriptor session");
+        let mut cache = RetrievalCache::new();
+
+        let (empty_results, empty_observation) = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &[],
+                None,
+                &mut cache,
+            )
+            .expect("empty descriptor batch");
+        assert!(empty_results.is_empty());
+        assert_eq!(empty_observation, None);
+
+        let queries = [QueryBatchItem {
+            query: "visible",
+            budget_ms: Some(500),
+        }];
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &queries,
+                Some(cancelled),
+                &mut cache,
+            )
+            .expect_err("cancelled descriptor batch must preserve its preflight error");
+        assert_eq!(
+            error.to_string(),
+            "retrieval query batch cancelled before preflight"
+        );
+
+        let (results, observation) = session
+            .execute_packet_descriptor_batch_without_dense_semantic_for_benchmark_with_observation_and_cache(
+                &queries,
+                None,
+                &mut cache,
+            )
+            .expect("successful observed descriptor batch");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query, "visible");
+        assert_eq!(
+            results[0].publication_identity.as_ref(),
+            Some(session.publication_identity())
+        );
+        let observation = observation.expect("successful non-empty batch observation");
+        assert_eq!(observation.query_count, 1);
+        assert!(
+            observation.query_batch_wall_ms >= observation.lexical_wall_ms,
+            "lexical stage attribution must stay inside the enclosing query-batch wall"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn packet_descriptor_full_readiness_refuses_expired_or_cancelled_context_before_validation() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn visible() {}\n").expect("write source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open storage");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish descriptor fixture");
+
+        let writer = Store::open(&storage_path).expect("open hostile writer");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = X'FF' WHERE id = 1", [])
+            .expect("poison full file projection");
+        drop(writer);
+
+        let session =
+            PinnedQuerySession::begin_packet_descriptor(project.path(), &storage_path, &runtime)
+                .expect("descriptor pin must not decode repository file rows");
+        let expired = SearchExecutionContext::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("expired deadline"),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let expired_error = session
+            .validate_full_readiness_with_context(&expired)
+            .expect_err("expired readiness must stop before strict validation");
+        assert_eq!(
+            expired_error.to_string(),
+            "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry",
+            "expired readiness reached work after the entry checkpoint"
+        );
+        assert!(!session.full_readiness_validated.get());
+
+        let cancelled = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let cancelled_error = session
+            .validate_full_readiness_with_context(&cancelled)
+            .expect_err("cancelled readiness must stop before strict validation");
+        assert_eq!(
+            cancelled_error.to_string(),
+            "retrieval stopped: reason=request_cancelled stage=deferred_full_readiness_entry",
+            "cancelled readiness reached work after the entry checkpoint"
+        );
+        assert!(!session.full_readiness_validated.get());
+
+        let live = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let ordinary_error = session
+            .validate_full_readiness_with_context(&live)
+            .expect_err("live readiness must still inspect the poisoned inventory");
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("retrieval sidecar manifest is unavailable"),
+            "ordinary validation did not preserve the strict failure: {ordinary_error:#}"
+        );
+        assert!(!session.full_readiness_validated.get());
     }
 
     #[test]
@@ -1284,6 +2433,69 @@ mod tests {
             ]
         );
         assert_eq!(sidecars.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn benchmark_descriptor_batch_executes_no_dense_semantic_stage() {
+        struct DenseSemanticTripwire;
+
+        impl SidecarSearch for DenseSemanticTripwire {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                panic!("dense semantic retrieval must not execute in the descriptor batch control")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let queries = [
+            QueryBatchItem {
+                query: "alpha flow",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "beta flow",
+                budget_ms: Some(500),
+            },
+        ];
+        let results = execute_strict_retrieval_descriptor_batch_against_sidecars(
+            Arc::new(DenseSemanticTripwire),
+            Some(manifest_for("testproj", "descriptor-control", 2)),
+            Arc::new(HashMap::new()),
+            cancellation_flag(),
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut RetrievalCache::new(),
+            2,
+            false,
+        )
+        .expect("descriptor batch control");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            result
+                .trace
+                .stages
+                .iter()
+                .all(|stage| stage.stage != crate::planner::RetrievalStageKind::Stage1bSemantic)
+        }));
     }
 
     #[test]
@@ -1448,6 +2660,232 @@ mod tests {
                 .iter()
                 .any(|hit| hit.file_path.starts_with("src/prepared-"))
         }));
+    }
+
+    #[test]
+    fn prepared_batch_sidecars_preserve_context_on_partial_prefetch_misses() {
+        struct ContextRecordingSidecars {
+            ordinary_lexical_calls: AtomicUsize,
+            contextual_lexical_calls: AtomicUsize,
+            ordinary_semantic_calls: AtomicUsize,
+            contextual_semantic_calls: AtomicUsize,
+            semantic_batch_calls: AtomicUsize,
+            expected_context_address: AtomicUsize,
+            contextual_calls: Mutex<Vec<(String, usize)>>,
+            delegate_stage_cancelled: Arc<AtomicBool>,
+        }
+
+        impl SidecarSearch for ContextRecordingSidecars {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.ordinary_lexical_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/ordinary-lexical-{query}.rs"),
+                    0.5,
+                )])
+            }
+
+            fn lexical_search_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                assert_eq!(
+                    std::ptr::from_ref(context).addr(),
+                    self.expected_context_address.load(Ordering::SeqCst),
+                    "prepared cache miss must preserve the original context object"
+                );
+                context.timeout(Duration::from_secs(1))?;
+                self.contextual_lexical_calls.fetch_add(1, Ordering::SeqCst);
+                self.contextual_calls
+                    .lock()
+                    .expect("record contextual lexical call")
+                    .push((format!("lexical:{query}"), limit));
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/contextual-lexical-{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn lexical_search_batch(
+                &self,
+                queries: &[(String, usize)],
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                Ok(Some(
+                    queries
+                        .iter()
+                        .map(|(query, _)| {
+                            vec![
+                                CandidateHit::lexical_stub(
+                                    format!("src/prepared-first-{query}.rs"),
+                                    1.0,
+                                ),
+                                CandidateHit::lexical_stub(
+                                    format!("src/prepared-second-{query}.rs"),
+                                    0.9,
+                                ),
+                            ]
+                        })
+                        .collect(),
+                ))
+            }
+
+            fn semantic_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.ordinary_semantic_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/ordinary-semantic-{query}.rs"),
+                    0.5,
+                )])
+            }
+
+            fn semantic_search_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                assert_eq!(
+                    std::ptr::from_ref(context).addr(),
+                    self.expected_context_address.load(Ordering::SeqCst),
+                    "prepared cache miss must preserve the original context object"
+                );
+                self.contextual_semantic_calls
+                    .fetch_add(1, Ordering::SeqCst);
+                self.contextual_calls
+                    .lock()
+                    .expect("record contextual semantic call")
+                    .push((format!("semantic:{query}"), limit));
+                if query == "cancel during semantic miss" {
+                    self.delegate_stage_cancelled.store(true, Ordering::Release);
+                    context.check_cancelled()?;
+                }
+                context.timeout(Duration::from_secs(1))?;
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/contextual-semantic-{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn semantic_search_batch(
+                &self,
+                _queries: &[String],
+                _limit: usize,
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                self.semantic_batch_calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("simulated semantic prefetch failure")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let request_cancelled = Arc::new(AtomicBool::new(false));
+        let delegate_stage_cancelled = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(ContextRecordingSidecars {
+            ordinary_lexical_calls: AtomicUsize::new(0),
+            contextual_lexical_calls: AtomicUsize::new(0),
+            ordinary_semantic_calls: AtomicUsize::new(0),
+            contextual_semantic_calls: AtomicUsize::new(0),
+            semantic_batch_calls: AtomicUsize::new(0),
+            expected_context_address: AtomicUsize::new(0),
+            contextual_calls: Mutex::new(Vec::new()),
+            delegate_stage_cancelled: Arc::clone(&delegate_stage_cancelled),
+        });
+        let misses = vec![
+            (0, "alpha behavior".to_string(), Some(1_000)),
+            (1, "beta behavior".to_string(), Some(1_000)),
+        ];
+        let (prepared, _) = prepare_batched_sidecars(
+            inner.clone(),
+            Some(&manifest_for("testproj", "partial-context", 2)),
+            &misses,
+            &request_cancelled,
+        );
+        let context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&request_cancelled),
+            Arc::clone(&delegate_stage_cancelled),
+        );
+        inner
+            .expected_context_address
+            .store(std::ptr::from_ref(&context).addr(), Ordering::SeqCst);
+        assert_eq!(inner.semantic_batch_calls.load(Ordering::SeqCst), 1);
+
+        let prepared_hit = prepared
+            .lexical_search_with_context("alpha behavior", 1, &context)
+            .expect("prepared lexical hit");
+        assert_eq!(prepared_hit.len(), 1);
+        assert_eq!(
+            prepared_hit[0].file_path,
+            "src/prepared-first-alpha behavior.rs"
+        );
+        assert_eq!(inner.ordinary_lexical_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_lexical_calls.load(Ordering::SeqCst), 0);
+
+        let lexical_miss = prepared
+            .lexical_search_with_context("gamma behavior", 7, &context)
+            .expect("contextual lexical miss");
+        let semantic_miss = prepared
+            .semantic_search_with_context("gamma behavior", 9, &context)
+            .expect("contextual semantic miss");
+        assert_eq!(
+            lexical_miss[0].file_path,
+            "src/contextual-lexical-gamma behavior.rs"
+        );
+        assert_eq!(
+            semantic_miss[0].file_path,
+            "src/contextual-semantic-gamma behavior.rs"
+        );
+        assert_eq!(inner.ordinary_lexical_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.ordinary_semantic_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_semantic_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *inner
+                .contextual_calls
+                .lock()
+                .expect("read contextual calls"),
+            [
+                ("lexical:gamma behavior".to_string(), 7),
+                ("semantic:gamma behavior".to_string(), 9),
+            ]
+        );
+
+        request_cancelled.store(true, Ordering::Release);
+        let calls_before_cancelled_hit = inner.contextual_calls.lock().unwrap().len();
+        assert!(
+            prepared
+                .lexical_search_with_context("alpha behavior", 1, &context)
+                .is_err()
+        );
+        assert!(
+            prepared
+                .semantic_search_with_context("delta behavior", 1, &context)
+                .is_err()
+        );
+        assert_eq!(
+            inner.contextual_calls.lock().unwrap().len(),
+            calls_before_cancelled_hit
+        );
+
+        request_cancelled.store(false, Ordering::Release);
+        let cancellation = prepared
+            .semantic_search_with_context("cancel during semantic miss", 3, &context)
+            .expect_err("delegate cancellation must propagate");
+        assert!(cancellation.to_string().contains("cancelled"));
+        assert_eq!(inner.ordinary_semantic_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.contextual_semantic_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

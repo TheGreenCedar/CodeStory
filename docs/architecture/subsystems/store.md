@@ -13,6 +13,8 @@ recovery.
 - grounding snapshots and canonical paged search-symbol reads from the node
   table; the legacy materialized search projection remains compatibility-only;
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
+- sealed call-resolution facts, with source hash, parser fingerprint, and
+  canonical dependency hashes stored once per distinct file-provenance group;
 - verified source-policy exclusion rows and their project/workspace/core-bound
   count-and-digest manifest;
 - versioned structural text units, per-file complete projections, their
@@ -22,27 +24,69 @@ recovery.
 
 ## Publication and reads
 
-Full refresh builds and validates a staged database. Promotion durably records a
-prepared journal with previous and candidate identities, installs and validates
-the candidate, records committed, then performs best-effort cleanup. Recovery
-may restore only a valid recorded prepared backup; a committed publication is
-never rolled back merely because a backup remains.
+Full refresh builds and validates a staged database. Publication seals and
+installs the candidate as an immutable generation, then atomically replaces
+the current/rollback pointer. Pinned readers keep their selected generation.
+Legacy promotion-journal recovery remains bounded by recorded candidate and
+backup identities; backup existence alone never authorizes rollback.
 
 The fresh full-refresh stage is explicitly disposable until publication. It
 keeps WAL so a bounded artifact-cache reader can be opened when verified
 structural rows were copied forward, uses relaxed synchronous writes with a
-bounded nonzero checkpoint window, and is never served or resumed. Parser rows
-are not copied, and a stage with no copied structural rows opens no cache
-reader. Its consuming publish path restores NORMAL synchronization, completes a
-TRUNCATE checkpoint, syncs the standalone database and directory, and permits
-no later stage writes before entering the promotion journal. Live stores,
-generic build callers, and staged incremental clones remain WAL/NORMAL.
+bounded nonzero checkpoint window, limits retained WAL allocation to that same
+window when SQLite can safely reset the journal, and is never served or resumed.
+Active WAL growth may exceed the retention limit while a transaction or pinned
+reader needs its frames. Parser rows are not copied, and a stage with no copied
+structural rows opens no cache reader. Its consuming publish path restores
+NORMAL synchronization, completes a TRUNCATE checkpoint, syncs the standalone
+database and directory, and permits no later stage writes before immutable
+generation publication. Live stores, generic build callers, and staged incremental
+clones remain WAL/NORMAL with their default journal retention.
 
-Incremental refresh writes a durable clone and promotes the completed
-replacement through the same journal. Readers that need publication coherence
+Incremental refresh stages a sealed, immutable core image with a native file
+clone where available, or a cancellable chunked byte copy. The source stays
+under a generation reader lease for the entire stage. The stage is create-new,
+synced before use, and removed on failure only when its native file identity
+still matches the file this operation created. A source with SQLite WAL/SHM
+sidecars cannot use this path; mutable legacy databases use a coherent SQLite
+online backup instead. Full builds, incremental stages, and one-time legacy
+backups check available cache-volume space against the source's logical SQLite
+bytes plus a 64 MiB reserve before writing a full-size image. A refusal leaves
+the previous publication in place. The completed replacement is installed as
+an immutable generation and selected by the same atomic pointer. Readers that need publication coherence
 use store read snapshots and compare the recorded generation/run identity;
 retrieval owns the session that combines that transaction with immutable
 generation leases before returning evidence.
+
+Each newly installed immutable core image has a writer-provisioned lease.
+Readers pin the selected image across their Store lifetime; a short
+acquisition lock closes the pointer-to-lease race without holding every old
+reader behind cleanup. Successful publication schedules best-effort core
+retention, and explicit retrieval GC can retry it. The runtime coordinates
+retrieval publication, while the store protects active and rollback core
+identities plus every current or rollback retrieval binding. A pass completes
+its root and generation-directory scan before deleting anything, then removes
+at most 16 authenticated, unpinned images. Discovery is O(directory entries),
+not constant time. Unknown neighbors, old images without a provisioned lease,
+and SQLite images whose WAL, journal, or sidecar state cannot be observed
+safely are retained. Unix may retain an empty generation directory after its
+image is removed because the final directory pathname cannot be removed with
+the same handle-bound identity guarantee. Its final file unlink is also
+name-based after a native identity recheck; the acquisition and publication
+fences exclude CodeStory writers in that interval, while an external actor
+replacing the name at the last syscall remains outside that guarantee.
+
+The first immutable publication records the native identity of the original
+standalone database before making its coherent rollback image. A durable
+receipt becomes eligible for retirement only after the new pointer commits.
+Under the same publication and acquisition fences, runtime cleanup removes
+only files whose recorded identities still match, using its owned-deletion
+boundary. In-use files remain pending for a later pass; a failed cleanup does
+not undo the committed pointer. Annotation sidecars are outside this receipt.
+Historical core retention accepts complete supported images from schema 29
+through the current schema, while preserving the same reader leases, pointer
+and retrieval references, and native identity checks. Older or incomplete
+images remain in place with an error report.
 
 The dense-anchor manifest is part of the core publication boundary. It binds
 the complete row count and digest, policy version, migration state, and every
@@ -65,6 +109,29 @@ hash, graph rows, units, projection, and dedicated cache entry is atomic and
 invalidates the complete manifest until runtime republishes it. Schema migration
 creates the tables but no synthetic completeness claim.
 
+Schema v33 normalizes proof provenance without changing the typed fact or its
+seal. Each fact retains its callsite file and an internal reference to a unique
+`(file, source hash, parser fingerprint, canonical dependency list)` group;
+reads reconstruct the original `CallResolutionFact` before validating its fact
+and publication digests. Dependency sequences remain part of those sealed bytes:
+Bash, Ruby, PHP, C#, Swift and Dart retain unique source-first encounter order;
+other adapters use ascending file IDs. The shared `ProofDependencyOrder` contract
+keeps Store shape checks and checked/compact consumers consistent. Store still
+authenticates the complete language-specific source/evidence dependency sequence
+and hashes; an order check alone does not authorize a fact. Multiple groups for
+one file remain valid. Missing,
+orphaned, extra, or cross-file provenance references fail closed. The v32 row
+rewrite, its row-count/publication checks, and the schema-33 writer barrier
+commit atomically, and migration never creates a proof publication receipt.
+
+Schema v34 replaces the full canonical-ID index with a 32-byte binary suffix
+expression index. Canonical strings and node IDs remain unchanged. The suffix
+selects a candidate bucket only; exact canonical-string equality still
+authorizes every result, including multiple nodes with the same canonical
+string and suffix collisions. Live migration replaces the indexes and advances
+the schema version in one transaction, while staged builds use the existing
+deferred-index fence.
+
 The projection transaction also replaces file-scoped errors and marks
 grounding summary/detail plus resolution-support state dirty. Those writes do
 not follow the graph commit as independent autocommits. Store telemetry counts
@@ -72,11 +139,11 @@ logical row attempts, prepared-statement executions, and estimated raw bind
 payload bytes by family; the byte count describes input shape, not database,
 WAL, or physical-write bytes.
 
-Promotion journals record candidate and rollback structural identities.
-Prepared install, committed recovery, and rollback validate the recorded
-manifest and current row digest before accepting a database. Missing, legacy,
-or corrupt structural publication state therefore cannot become the current
-core generation.
+Legacy promotion journals record candidate and rollback structural identities.
+Their recovery validates the recorded manifest and current row digest before
+accepting a database. Current publication installs a sealed immutable generation
+and atomically replaces its pointer after validation. Missing, legacy, or
+corrupt structural publication state cannot become the current core generation.
 
 Schema v25 also stores the current retrieval manifest and its deeply verified
 rollback record in the same SQLite row. They change in one transaction. The
@@ -137,6 +204,13 @@ whether the qualified name matched exactly one symbol anywhere. An inference may
 only rest on evidence that was discriminating when it was proven, so a surviving
 same-shaped sibling never inherits a deleted symbol's annotation.
 
+Selective anchor lookup errors are not evidence that a symbol is absent. A
+rebind resolves every bookmark before writing and commits the outcomes in one
+sidecar transaction; a failed query or write leaves the prior evidence intact.
+That persisted generation is the retry checkpoint: the next core writer catches
+it up against the still-current complete generation before publishing another.
+The adjacent-generation rule for changed anchors remains unchanged.
+
 The migration is paired with the schema-31 core writer barrier. Forward-only
 migration already refuses a newer schema, so a 0.16.3 CLI opening a migrated
 database fails closed on the whole database instead of silently writing the
@@ -152,7 +226,18 @@ annotation afterwards.
 
 **Downgrade path.** There is no bookmark export/import command. Recovery after
 a newer schema is `cache reset --derived-only` from a 0.17 binary, then
-`index --refresh full`. Internal controller export/import types are test
+`index --refresh full`. Reset includes the immutable pointer, generations,
+stages and retrieval-publication database without opening them. The canonical
+artifact registry preserves annotations and their retained migration export,
+and leaves writer, promotion and acquisition coordination inodes at their live
+paths. Its exclusion order is the global retrieval fence, index writer,
+promotion, acquisition, then all named generation leases. The complete locked
+enumeration must prove every generation idle before any quarantine move; an
+unknown entry, enumeration error, absent lease or held reader fails closed.
+The plan is refreshed under those exclusions. Older unprovisioned immutable
+layouts require a compatible cache backup or manual recovery after all clients
+are stopped; reset cannot prove their readers idle.
+Internal controller export/import types are test
 helpers, not an operator workflow.
 
 ## Entry points
@@ -163,6 +248,7 @@ helpers, not an operator workflow.
   cutover, and the native-root location registry
 - `src/annotations/resolution.rs`: the conservative rebind ladder
 - `src/snapshot_store.rs`: staged and live grounding snapshots
+- `src/sealed_file_stage.rs`: shared sealed-file native clone or cancellable copy
 - `src/file_store.rs`: focused file persistence
 - `src/storage_impl/trail.rs`: trail queries
 

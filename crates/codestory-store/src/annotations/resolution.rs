@@ -35,6 +35,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::annotations::AnnotationBookmark;
+use crate::storage_impl::StorageError;
 
 /// Durable resolution state stored beside each bookmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,10 +190,13 @@ pub struct CoreAnchorCandidate {
 pub trait CoreAnchorIndex {
     /// Current core publication generation, `None` when core has never
     /// published.
-    fn current_generation(&self) -> Option<i64>;
+    fn current_generation(&self) -> Result<Option<i64>, StorageError>;
 
     /// Candidates carrying exactly this durable canonical symbol id.
-    fn candidates_by_canonical_id(&self, canonical_id: &str) -> Vec<CoreAnchorCandidate>;
+    fn candidates_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError>;
 
     /// Candidates matching the complete `(file_identity, qualified_name, kind)`
     /// tuple.
@@ -201,7 +205,7 @@ pub trait CoreAnchorIndex {
         file_identity: &str,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate>;
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError>;
 
     /// Candidates carrying this `(qualified_name, kind)` pair in any file.
     ///
@@ -211,7 +215,7 @@ pub trait CoreAnchorIndex {
         &self,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate>;
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError>;
 
     /// Candidates carrying this normalized signature inside one file and kind.
     ///
@@ -222,21 +226,21 @@ pub trait CoreAnchorIndex {
         normalized_signature: &str,
         file_identity: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate>;
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError>;
 }
 
 /// Resolve one bookmark against the live core without ever guessing.
 pub fn resolve_bookmark(
     bookmark: &AnnotationBookmark,
     index: &dyn CoreAnchorIndex,
-) -> AnnotationResolution {
-    let generation = index.current_generation();
+) -> Result<AnnotationResolution, StorageError> {
+    let generation = index.current_generation()?;
 
     if let Some(canonical_id) = bookmark.canonical_id.as_deref() {
-        match unique_candidate(index.candidates_by_canonical_id(canonical_id)) {
+        match unique_candidate(index.candidates_by_canonical_id(canonical_id)?) {
             CandidateSet::Unique(candidate) => return bound(candidate, generation, index),
             CandidateSet::Ambiguous => {
-                return orphaned(OrphanReason::AmbiguousMatch);
+                return Ok(orphaned(OrphanReason::AmbiguousMatch));
             }
             CandidateSet::Empty => {}
         }
@@ -248,26 +252,26 @@ pub fn resolve_bookmark(
         .zip(bookmark.qualified_name.as_deref())
         .zip(bookmark.kind);
     let Some(((file_identity, qualified_name), kind)) = tuple else {
-        return orphaned(if bookmark.canonical_id.is_some() {
+        return Ok(orphaned(if bookmark.canonical_id.is_some() {
             OrphanReason::TargetDeleted
         } else {
             OrphanReason::UnresolvableAnchor
-        });
+        }));
     };
 
-    match unique_candidate(index.candidates_by_anchor_tuple(file_identity, qualified_name, kind)) {
+    match unique_candidate(index.candidates_by_anchor_tuple(file_identity, qualified_name, kind)?) {
         CandidateSet::Unique(candidate) => return bound(candidate, generation, index),
-        CandidateSet::Ambiguous => return orphaned(OrphanReason::AmbiguousMatch),
+        CandidateSet::Ambiguous => return Ok(orphaned(OrphanReason::AmbiguousMatch)),
         CandidateSet::Empty => {}
     }
 
     // Beyond this point the anchor itself has to change, so the conservative
     // rebind gates apply.
     let Some(signature) = bookmark.normalized_signature.as_deref() else {
-        return orphaned(OrphanReason::TargetDeleted);
+        return Ok(orphaned(OrphanReason::TargetDeleted));
     };
     if !is_adjacent_generation(bookmark, generation) {
-        return orphaned(OrphanReason::GenerationGap);
+        return Ok(orphaned(OrphanReason::GenerationGap));
     }
     let discrimination = bookmark
         .last_known_evidence
@@ -280,7 +284,7 @@ pub fn resolve_bookmark(
     // that disagrees means the code there is not the code the user annotated,
     // and that is a visible `SignatureChanged` orphan rather than a guess.
     let moved = index
-        .candidates_by_qualified_name(qualified_name, kind)
+        .candidates_by_qualified_name(qualified_name, kind)?
         .into_iter()
         .filter(|candidate| candidate.file_identity.as_deref() != Some(file_identity))
         .collect::<Vec<_>>();
@@ -290,14 +294,14 @@ pub fn resolve_bookmark(
                 // The name already named more than one symbol when the anchor
                 // was last proven, so "the name turned up elsewhere" is not
                 // evidence that this symbol went there.
-                orphaned(OrphanReason::AmbiguousMatch)
+                Ok(orphaned(OrphanReason::AmbiguousMatch))
             } else if candidate.normalized_signature.as_deref() == Some(signature) {
                 bound(candidate, generation, index)
             } else {
-                orphaned(OrphanReason::SignatureChanged)
+                Ok(orphaned(OrphanReason::SignatureChanged))
             };
         }
-        CandidateSet::Ambiguous => return orphaned(OrphanReason::AmbiguousMatch),
+        CandidateSet::Ambiguous => return Ok(orphaned(OrphanReason::AmbiguousMatch)),
         CandidateSet::Empty => {}
     }
 
@@ -308,9 +312,10 @@ pub fn resolve_bookmark(
     // rename from one would hand a bookmark on a deleted stub to whichever
     // stub happened to survive.
     if !is_shape_signature(signature) {
-        return orphaned(OrphanReason::TargetDeleted);
+        return Ok(orphaned(OrphanReason::TargetDeleted));
     }
-    let renamed_in_place = index.candidates_by_normalized_signature(signature, file_identity, kind);
+    let renamed_in_place =
+        index.candidates_by_normalized_signature(signature, file_identity, kind)?;
     match unique_candidate(renamed_in_place) {
         CandidateSet::Unique(candidate) => {
             // A signature that already matched a sibling when the anchor was
@@ -320,11 +325,11 @@ pub fn resolve_bookmark(
             if discrimination.is_some_and(|it| it.signature_unique_in_file) {
                 bound(candidate, generation, index)
             } else {
-                orphaned(OrphanReason::AmbiguousMatch)
+                Ok(orphaned(OrphanReason::AmbiguousMatch))
             }
         }
-        CandidateSet::Ambiguous => orphaned(OrphanReason::AmbiguousMatch),
-        CandidateSet::Empty => orphaned(OrphanReason::TargetDeleted),
+        CandidateSet::Ambiguous => Ok(orphaned(OrphanReason::AmbiguousMatch)),
+        CandidateSet::Empty => Ok(orphaned(OrphanReason::TargetDeleted)),
     }
 }
 
@@ -337,8 +342,8 @@ pub fn anchor_evidence(
     candidate: &CoreAnchorCandidate,
     generation: Option<i64>,
     index: &dyn CoreAnchorIndex,
-) -> BookmarkAnchorEvidence {
-    BookmarkAnchorEvidence {
+) -> Result<BookmarkAnchorEvidence, StorageError> {
+    Ok(BookmarkAnchorEvidence {
         generation,
         node_id: Some(candidate.node_id),
         canonical_id: candidate.canonical_id.clone(),
@@ -347,40 +352,42 @@ pub fn anchor_evidence(
         kind: candidate.kind,
         normalized_signature: candidate.normalized_signature.clone(),
         start_line: candidate.start_line,
-        discrimination: anchor_discrimination(candidate, index),
-    }
+        discrimination: anchor_discrimination(candidate, index)?,
+    })
 }
 
 fn anchor_discrimination(
     candidate: &CoreAnchorCandidate,
     index: &dyn CoreAnchorIndex,
-) -> Option<AnchorDiscrimination> {
-    let kind = candidate.kind?;
+) -> Result<Option<AnchorDiscrimination>, StorageError> {
+    let Some(kind) = candidate.kind else {
+        return Ok(None);
+    };
     let signature_unique_in_file = match (
         candidate.normalized_signature.as_deref(),
         candidate.file_identity.as_deref(),
     ) {
         (Some(signature), Some(file_identity)) => {
             index
-                .candidates_by_normalized_signature(signature, file_identity, kind)
+                .candidates_by_normalized_signature(signature, file_identity, kind)?
                 .len()
                 == 1
         }
         _ => false,
     };
-    let qualified_name_unique = candidate
-        .qualified_name
-        .as_deref()
-        .is_some_and(|qualified_name| {
+    let qualified_name_unique = match candidate.qualified_name.as_deref() {
+        Some(qualified_name) => {
             index
-                .candidates_by_qualified_name(qualified_name, kind)
+                .candidates_by_qualified_name(qualified_name, kind)?
                 .len()
                 == 1
-        });
-    Some(AnchorDiscrimination {
+        }
+        None => false,
+    };
+    Ok(Some(AnchorDiscrimination {
         signature_unique_in_file,
         qualified_name_unique,
-    })
+    }))
 }
 
 /// Whether the recorded evidence is close enough for an inferred rebind.
@@ -431,11 +438,11 @@ fn bound(
     candidate: CoreAnchorCandidate,
     generation: Option<i64>,
     index: &dyn CoreAnchorIndex,
-) -> AnnotationResolution {
-    AnnotationResolution::Bound {
+) -> Result<AnnotationResolution, StorageError> {
+    Ok(AnnotationResolution::Bound {
         node_id: candidate.node_id,
-        evidence: anchor_evidence(&candidate, generation, index),
-    }
+        evidence: anchor_evidence(&candidate, generation, index)?,
+    })
 }
 
 fn orphaned(reason: OrphanReason) -> AnnotationResolution {

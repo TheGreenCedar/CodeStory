@@ -246,12 +246,15 @@ Do not copy issue history or benchmark narration into Rustdoc, and do not enable
 a workspace-wide `missing_docs` lint until the existing public surface is
 deliberately reduced.
 
-## Reading order for large changes
+## Task-specific references
 
-1. [Architecture overview](../architecture/overview.md)
-2. the owning subsystem page under `docs/architecture/subsystems/`
-3. [Runtime execution path](../architecture/runtime-execution-path.md) when orchestration changes
-4. [Indexing pipeline](../architecture/indexing-pipeline.md) when discovery or publication changes
-5. [Debugging guide](debugging.md)
-6. [Testing matrix](testing-matrix.md)
-7. [Retrieval engine operations](../ops/retrieval-engine.md) for embedding or retrieval work
+Do not pre-read this stack for every large change. Open the page that matches
+the work, then run the verification that page (and the testing matrix) require.
+
+- Changed contracts: [Architecture overview](../architecture/overview.md) and
+  the owning subsystem page under `docs/architecture/subsystems/`
+- Orchestration: [Runtime execution path](../architecture/runtime-execution-path.md)
+- Discovery or publication: [Indexing pipeline](../architecture/indexing-pipeline.md)
+- Embedding or retrieval operations: [Retrieval engine operations](../ops/retrieval-engine.md)
+- Failures: [Debugging guide](debugging.md)
+- Proof selection: the relevant lane in [Testing matrix](testing-matrix.md)

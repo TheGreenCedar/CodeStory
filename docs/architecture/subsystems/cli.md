@@ -56,15 +56,27 @@ retry for a complete public response. The same whole-response service wraps
 ordinary CLI packet, search, context, drill, and graph-assisted reads, so stdio
 is not a stronger consistency boundary than the CLI.
 
+The stdio request remains open across the runtime's five-second foreground
+activation slices. Its preparation deadline is fixed at request entry: two
+minutes for ordinary activating tools, or the existing `packet.latency_budget_ms`
+(18 seconds by default) for packet. Packet execution inherits that same spent
+budget after preparation. A client-supplied progress token receives ordered
+stage updates; without one the call still waits. A deadline result supplies
+callable `minimum_next.arguments` with an optional exact operation-and-attempt
+resume pair. The adapter consumes that pair before product argument parsing,
+and runtime rejects a replaced attempt. Cancellation stops only the waiter;
+the shared activation remains owned by its other callers.
+
 Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.
 
 The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
-`probes[]` accept the same five kinds; `--extra-probe` and stdio
-`extra_probes[]` remain compatibility inputs and are passed to the same runtime
-resolver without adapter-side inference. Both adapters enforce one combined
-16-probe limit and the shared 240-character field limit. The generated MCP
-schema is a strict tagged union, so fields from another probe kind are rejected.
+`probes[]` accept the same typed probe kinds. The retired free-string
+`--extra-probe` and `extra_probes[]` inputs are rejected; callers that need a
+generic supplemental query use the typed `free_query` probe. Both adapters
+enforce the shared 16-probe limit and 240-character field limit. The generated
+MCP schema is a strict tagged union, so fields from another probe kind are
+rejected.
 Search and definition links bind continuations to the selected project, stable
 node ID, contract version, and evidence generation.
 

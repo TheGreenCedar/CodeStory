@@ -19,7 +19,7 @@
 
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{NodeId, NodeKind};
-use codestory_indexer::WorkspaceIndexer;
+use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_store::Store as Storage;
 use rusqlite::types::Value;
 use std::collections::HashMap;
@@ -28,6 +28,14 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn reindex(root: &Path, storage: &mut Storage, path: &Path) -> anyhow::Result<()> {
+    reindex_with_stats(root, storage, path).map(|_| ())
+}
+
+fn reindex_with_stats(
+    root: &Path,
+    storage: &mut Storage,
+    path: &Path,
+) -> anyhow::Result<IncrementalIndexingStats> {
     let indexer = WorkspaceIndexer::new(root.to_path_buf());
     let event_bus = EventBus::new();
     let refresh_info = codestory_workspace::RefreshInfo {
@@ -36,8 +44,7 @@ fn reindex(root: &Path, storage: &mut Storage, path: &Path) -> anyhow::Result<()
         files_to_remove: vec![],
         existing_file_ids: HashMap::new(),
     };
-    indexer.run_incremental(storage, &refresh_info, &event_bus, None)?;
-    Ok(())
+    indexer.run_incremental(storage, &refresh_info, &event_bus, None)
 }
 
 /// Every projection table whose rows the reposition repair is responsible for,
@@ -139,6 +146,118 @@ fn file_node_id(storage: &Storage) -> anyhow::Result<NodeId> {
         .find(|node| node.kind == NodeKind::FILE)
         .expect("file node")
         .id)
+}
+
+fn call_lines(storage: &Storage) -> anyhow::Result<Vec<(String, u32)>> {
+    let names = storage
+        .get_nodes()?
+        .into_iter()
+        .map(|node| (node.id, node.serialized_name))
+        .collect::<HashMap<_, _>>();
+    let mut calls = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == codestory_contracts::graph::EdgeKind::CALL)
+        .filter_map(|edge| {
+            edge.line
+                .filter(|line| matches!(*line, 7 | 8))
+                .map(|line| (names.get(&edge.target).cloned().unwrap_or_default(), line))
+        })
+        .collect::<Vec<_>>();
+    calls.sort();
+    Ok(calls)
+}
+
+#[test]
+fn same_width_java_access_edit_matches_fresh_projection() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("Outer.java");
+    fs::write(&path, "class Outer { public class Inner {} }\n")?;
+    let mut incremental = Storage::new_in_memory()?;
+    reindex(dir.path(), &mut incremental, &path)?;
+    let inner = incremental
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.kind == NodeKind::CLASS && node.serialized_name.ends_with("Inner"))
+        .expect("nested class")
+        .id;
+    assert_eq!(
+        incremental.get_component_access(inner)?,
+        Some(codestory_contracts::graph::AccessKind::Public)
+    );
+    let unchanged_graph = projection_snapshot(&incremental)?[..4].to_vec();
+    let category = incremental.create_bookmark_category("review")?;
+    let bookmark = incremental.add_bookmark(category, inner, Some("stable type"))?;
+
+    fs::write(&path, "class Outer { static class Inner {} }\n")?;
+    let stats = reindex_with_stats(dir.path(), &mut incremental, &path)?;
+    assert!(
+        stats.graph_projection_changed,
+        "access edit must invalidate graph reuse"
+    );
+    assert_eq!(projection_snapshot(&incremental)?[..4], unchanged_graph);
+    assert!(
+        incremental
+            .get_bookmarks(Some(category))?
+            .iter()
+            .any(|entry| entry.id == bookmark && entry.node_id == inner)
+    );
+    let mut fresh = Storage::new_in_memory()?;
+    reindex(dir.path(), &mut fresh, &path)?;
+    assert!(
+        incremental
+            .get_nodes()?
+            .into_iter()
+            .any(|node| node.id == inner)
+    );
+    assert_repaired_like_a_fresh_index(&incremental, &fresh, "java access edit")?;
+    Ok(())
+}
+
+#[test]
+fn tsx_duplicate_callable_keys_do_not_hide_swapped_calls() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("main.tsx");
+    let before = "function View() { return (\n  <main></main>\n); }\nfunction foo() {}\nfunction bar() {}\nfunction main() {\n  foo();\n  bar();\n}\n";
+    let after = "function View() { return (\n  <main></main>\n); }\nfunction foo() {}\nfunction bar() {}\nfunction main() {\n  bar();\n  foo();\n}\n";
+    fs::write(&path, before)?;
+    let mut incremental = Storage::new_in_memory()?;
+    reindex(dir.path(), &mut incremental, &path)?;
+    assert_eq!(
+        incremental
+            .get_nodes()?
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "main")
+            .count(),
+        2,
+        "fixture must contain both declaration and JSX main nodes"
+    );
+    assert_eq!(
+        incremental
+            .get_callable_projection_states_for_file(file_node_id(&incremental)?.0)?
+            .into_iter()
+            .filter(|state| state.symbol_key.ends_with(":main"))
+            .count(),
+        1,
+        "SQLite must retain one of the colliding callable keys"
+    );
+    assert_eq!(
+        call_lines(&incremental)?,
+        [("bar".into(), 8), ("foo".into(), 7)]
+    );
+
+    fs::write(&path, after)?;
+    let stats = reindex_with_stats(dir.path(), &mut incremental, &path)?;
+    assert!(
+        stats.graph_projection_changed,
+        "swapped calls must invalidate graph reuse"
+    );
+    let mut fresh = Storage::new_in_memory()?;
+    reindex(dir.path(), &mut fresh, &path)?;
+    assert_eq!(call_lines(&fresh)?, [("bar".into(), 7), ("foo".into(), 8)]);
+    assert_eq!(call_lines(&incremental)?, call_lines(&fresh)?);
+    assert_repaired_like_a_fresh_index(&incremental, &fresh, "tsx swapped calls")?;
+    Ok(())
 }
 
 /// One language family's fixture.

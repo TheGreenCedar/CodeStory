@@ -94,6 +94,7 @@ fn readiness_lane_prefers_live_agent_status_over_aggregate_failure() {
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+        legacy_retirement: None,
         ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
     };
     let aggregate_verdict = codestory_contracts::api::ReadinessVerdictDto {
@@ -154,6 +155,7 @@ fn agent_preflight_allows_full_surfaces_from_full_agent_lane() {
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+        legacy_retirement: None,
         ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
     };
     let agent_status = RetrievalStatusOutput {
@@ -176,6 +178,7 @@ fn agent_preflight_allows_full_surfaces_from_full_agent_lane() {
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+        legacy_retirement: None,
         ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
     };
     let stats = StorageStatsDto {

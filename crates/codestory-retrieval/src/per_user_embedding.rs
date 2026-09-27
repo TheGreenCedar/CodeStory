@@ -63,7 +63,7 @@ pub use protocol::{
     EmbeddingServerActiveRequestSnapshot, EmbeddingServerAuthoritySnapshot,
     EmbeddingServerClockSnapshot, EmbeddingServerEngineSnapshot, EmbeddingServerFailureSnapshot,
     EmbeddingServerProcessSnapshot, EmbeddingServerProtocolSnapshot,
-    EmbeddingServerSchedulerSnapshot, EmbeddingServerSnapshot,
+    EmbeddingServerSchedulerSnapshot, EmbeddingServerSnapshot, EmbeddingVectorTimings,
     PER_USER_EMBEDDING_BOOTSTRAP_VERSION, PER_USER_EMBEDDING_CONSTANT_SET_FROZEN,
     PER_USER_EMBEDDING_CONSTANT_SET_SHA256, PER_USER_EMBEDDING_MAX_DOCUMENT_COUNT,
     PER_USER_EMBEDDING_MAX_INPUT_BYTES, PER_USER_EMBEDDING_MAX_METADATA_BYTES,

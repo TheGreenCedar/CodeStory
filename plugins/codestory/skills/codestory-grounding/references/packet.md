@@ -1,8 +1,8 @@
-# `packet` - Broad Task Packet With Typed Stop/Drill
+# `packet` - Experimental Evidence Selection
 
-Builds a bounded answer packet for a broad repository question. Use it before
-ordinary source-file reads when the task is explanation, planning, route
-tracing, ownership discovery, or change-impact analysis.
+Builds an experimental bounded source selection for a repository question.
+Use it when useful; search, source reads and relation navigation
+remain available before and after a packet. It never asserts answer sufficiency.
 
 ## Syntax
 
@@ -13,58 +13,60 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Packet with compiled `support` units, then `disposition`. |
-| Supported / NotEstablished / Unavailable | Stop. For Supported, answer from `support`. For NotEstablished, answer every directly supported claim and name the material gaps without completing the chain by inference. For Unavailable, report the typed preparation reason. | Terminal. Do not search. |
-| DrillOnce | Call `packet` once more with the exact original `question`, `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
-| User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
-| Integration edge | Use JSON/MCP structured content. Compact text projects support units first, then disposition. Preserve exact source identifiers from support summaries and citation display names. | Comparable agent loops without a follow-up command list. |
+| Repository question | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
+| `available` | Use the returned evidence rows first. Follow an exact identity with `snippet`, `context`, or an explicit graph operation when the task still needs it. | The packet never asserts answer sufficiency. |
+| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded compiler continuation; ordinary exact navigation remains available afterward. |
+| `no_useful_evidence` / `unavailable` | Preserve the reported gap and use exact search, source, or relations if the task can still be grounded. | Do not turn absence of packet evidence into an absence claim. |
+| Explicit target | `search`, `context`, `trail`, or `snippet` may be used directly when the user or prior evidence identifies the target. | These are independent navigation operations. |
+| Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
 
 ## Notes
 
 - `packet` is for broad questions; `context` is for one concrete target.
-- Prefer the default standard packet before manually opening source files for a
-  broad explanation or plan. Select `compact` explicitly when minimizing
-  context is more important than retaining the fuller evidence set.
+- When the user supplies an exact packet question, copy it verbatim into
+  `question`, including its punctuation. Do not paraphrase or trim it, and use
+  the same bytes for an offered continuation.
+- Use the standard budget unless the task benefits from a smaller `compact`
+  selection. The packet does not replace source inspection or decide when the
+  investigation is complete.
 - `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
-  `file_symbol`, `free_query`, or `continuation`. For example,
+  `qualified_symbol`, `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
-  project-relative file without fuzzy substitution. Typed and legacy probes share
-  one combined 16-item limit; every string field is limited to 240 characters.
+  project-relative file without fuzzy substitution. The request accepts at most
+  sixteen typed probes; every string field is limited to 240 characters.
+- Use an exact probe only for an identity supplied by the user or already
+  established by repository evidence. Do not translate prose into guessed
+  paths, symbols, answer stages, or relation policy.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
   into display-name searches.
-- A continuation also supplies `contract_version`, `project_id`,
-  `core_generation_id`, optional `retrieval_generation`, optional exact
-  `symbol_id`, and `query`; reuse fails closed when the selected evidence
-  generation changes. Search and definition links emit this bound form.
-- `extra_probes` remains a legacy compatibility input. It enters the same
-  runtime resolver. Neither typed nor legacy probes replace the compiled
-  disposition.
-- Judge the answer from compiled support units (symbol locations, source
-  ranges, typed CALL/INHERITANCE/import edges, and complete-query negatives).
-  `disposition.kind=supported` means that evidence is present. It does not mean
-  an English flow-catalog family was closed. Do not treat a missing named
-  family such as `handler_processing` as a reason to search again.
+- A continuation supplies `contract_version`, `project_id`,
+  `core_generation_id`, optional `retrieval_generation`, and one typed stable
+  selector carrying the exact uncovered structural reason. Reuse fails closed
+  when the selected publication changes. Diagnostic text is never reissued as
+  a retrieval query.
+- Judge each claim from the concrete evidence rows: exact source, structural
+  source, graph relations, and retrieval excerpts. A bounded negative query is
+  a gap, never proof that something is absent. A path or stable identity in an
+  evidence row may be followed with an exact source or relation operation when
+  the agent still needs more evidence.
 - A parser-partial coverage observation does not invalidate a retained exact
   `source_range` from the same file. That range supports only what its source
   text directly shows; the coverage warning still forbids file-wide absence or
   completeness claims.
-- `drill_once` is only for objectively missing, closable evidence: a deadline-
-  lost candidate, omitted mandatory support, or one bounded source read of a
-  known path. Repeat the exact original question and execute the listed option
-  ids once. Do not invent a second search system. CLI `drill` remains the
-  maintainer report and is not this agent path.
-- `not_established` is terminal. It may be a complete zero-hit, an ambiguous
-  probe that needs a user choice, or a packet with useful support whose material
-  chain is still incomplete after bounded retrieval. State the supported parts
-  and the exact gaps, then stop.
-- `unavailable` is stale publication, a dead sidecar, or a hard retrieval
-  error. Typed retry or preparation, not search.
-- JSON packets include `plan.obligations.version=1`. The obligation ledger
-  still records planned flow steps for query planning. It is not an
-  agent-facing conclusion.
-- CLI JSON, HTTP, and MCP consumers detect the `reported` proof-status value through
-  `_meta.codestory_publication.schema_version`, which is `2` for this contract, and should also
-  inspect `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is
-  surfaced as `contract_runtime.known_override_skew_channel`. The stamp rides on the `initialize`
-  result too, so the version is known before the first tool call.
+- A compiler continuation is bounded to one round. It names stable selectors
+  and a structural gap, never a claim that the current packet is insufficient
+  for the answer. After that round, let the task determine whether exact
+  navigation is useful rather than manufacturing another packet policy.
+- `no_useful_evidence` and `unavailable` describe the packet result, not the
+  repository. Preserve the gap when falling back to exact navigation.
+- Packet JSON is a closed root object. It contains no internal plan,
+  obligations, score, eligibility, or proof-disposition fields.
+- Evidence is limited to sixteen rows and the complete MCP ToolResult to 16 KiB. If the mandatory envelope
+  cannot fit, packet returns the explicit `budget_exceeded` variant with no
+  partial evidence. Diagnostics remain immutable and separately capability-
+  addressed for ten minutes in the serving session.
+- CLI, HTTP, and MCP consumers use CodeStory publication
+  `schema_version=minimum_compatible_schema_version=3`. MCP protocol revision
+  negotiation is separate: CodeStory supports `2024-11-05`, `2025-03-26`,
+  `2025-06-18`, and `2025-11-25`, preferring the newest.

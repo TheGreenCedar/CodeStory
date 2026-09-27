@@ -35,6 +35,9 @@ project-scoped MCP runtime with the adapter setup described in their guides.
 
 Codex is the most automatic install, not the product ICP.
 
+For existing installations and custom integrations, read the
+[0.17.6 upgrade guide](upgrading.md) before switching versions.
+
 ## First use
 
 1. Install the plugin or adapter for your host.

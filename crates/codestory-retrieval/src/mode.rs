@@ -68,6 +68,28 @@ pub fn derive_degraded_mode(
     (RetrievalDegradedMode::Full, None)
 }
 
+/// Packet descriptors use lexical and semantic identity metadata only. Graph
+/// health is checked when admitted evidence asks for graph data, not while the
+/// descriptor list is still wider than the packet budget.
+pub(crate) fn derive_descriptor_mode(
+    lexical: &ComponentHealth,
+    semantic: &ComponentHealth,
+) -> (RetrievalDegradedMode, Option<String>) {
+    if lexical.status != ComponentStatus::Healthy || !lexical.capabilities.lexical {
+        return (
+            RetrievalDegradedMode::Unavailable,
+            mandatory_failure_reason(lexical, "lexical"),
+        );
+    }
+    if semantic.status != ComponentStatus::Healthy || !semantic.capabilities.semantic {
+        return (
+            RetrievalDegradedMode::NoSemantic,
+            mandatory_failure_reason(semantic, "semantic"),
+        );
+    }
+    (RetrievalDegradedMode::Full, None)
+}
+
 fn mandatory_failure_reason(component: &ComponentHealth, name: &str) -> Option<String> {
     let state = if component.status == ComponentStatus::Unavailable {
         "unavailable"
@@ -147,6 +169,34 @@ mod tests {
         assert_eq!(
             derive_degraded_mode(&lexical_down, &semantic_up, &scip_up).0,
             RetrievalDegradedMode::Unavailable
+        );
+    }
+
+    #[test]
+    fn descriptor_mode_never_requires_graph_capability() {
+        let lexical = component(
+            "lexical",
+            ComponentStatus::Healthy,
+            None,
+            SidecarCapabilities {
+                lexical: true,
+                semantic: false,
+                graph: false,
+            },
+        );
+        let semantic = component(
+            "semantic",
+            ComponentStatus::Healthy,
+            None,
+            SidecarCapabilities {
+                lexical: false,
+                semantic: true,
+                graph: false,
+            },
+        );
+        assert_eq!(
+            derive_descriptor_mode(&lexical, &semantic),
+            (RetrievalDegradedMode::Full, None)
         );
     }
 

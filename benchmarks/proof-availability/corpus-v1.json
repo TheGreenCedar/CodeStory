@@ -1,0 +1,162 @@
+{
+  "cohorts": [
+    {
+      "commit": "74753c1766c80f8cf27873943409bd509bc30350",
+      "path_count": 30,
+      "path_file": "paths/codestory-rust.json",
+      "path_file_sha256": "5db46aa0833bb697f1a565cf35bbc8c56bce273eb0798459b484fbf7cb5a57f8",
+      "path_length_distribution": [
+        {
+          "path_count": 10,
+          "path_length": 1
+        },
+        {
+          "path_count": 7,
+          "path_length": 2
+        },
+        {
+          "path_count": 5,
+          "path_length": 3
+        },
+        {
+          "path_count": 3,
+          "path_length": 4
+        },
+        {
+          "path_count": 3,
+          "path_length": 5
+        },
+        {
+          "path_count": 2,
+          "path_length": 6
+        }
+      ],
+      "positive_step_count": 78,
+      "repository": "https://github.com/TheGreenCedar/CodeStory.git",
+      "repository_id": "codestory-rust",
+      "source_tree_sha256": "65e0e6502603b44e3dd5b7606c7d4bda9a32f130e4eb6adc01e0d96c85f56d0b",
+      "workspace": "."
+    },
+    {
+      "commit": "80a333a23103ced0442d4463d1191433d90f5e19",
+      "path_count": 30,
+      "path_file": "paths/vite-ts-js.json",
+      "path_file_sha256": "6bebe9a335fe273d5483f798bf7060a85f82a70771ffb7fb873498111c15527e",
+      "path_length_distribution": [
+        {
+          "path_count": 10,
+          "path_length": 1
+        },
+        {
+          "path_count": 7,
+          "path_length": 2
+        },
+        {
+          "path_count": 5,
+          "path_length": 3
+        },
+        {
+          "path_count": 3,
+          "path_length": 4
+        },
+        {
+          "path_count": 3,
+          "path_length": 5
+        },
+        {
+          "path_count": 2,
+          "path_length": 6
+        }
+      ],
+      "positive_step_count": 78,
+      "repository": "https://github.com/vitejs/vite.git",
+      "repository_id": "vite-ts-js",
+      "source_tree_sha256": "2406a2c231edba90ba52555ca5f5eb7c870d1576586fd4bde2e7ffe0ed09ac25",
+      "workspace": "packages/vite"
+    },
+    {
+      "commit": "7fff56f5172c48b6f3aedf17ee14ef5c2533dfd1",
+      "path_count": 30,
+      "path_file": "paths/flask-python.json",
+      "path_file_sha256": "800e3ebf64e3ca5ec6701f59c7b0d2274e2811eb3b149da04e821d49b0df1876",
+      "path_length_distribution": [
+        {
+          "path_count": 10,
+          "path_length": 1
+        },
+        {
+          "path_count": 7,
+          "path_length": 2
+        },
+        {
+          "path_count": 5,
+          "path_length": 3
+        },
+        {
+          "path_count": 3,
+          "path_length": 4
+        },
+        {
+          "path_count": 3,
+          "path_length": 5
+        },
+        {
+          "path_count": 2,
+          "path_length": 6
+        }
+      ],
+      "positive_step_count": 78,
+      "repository": "https://github.com/pallets/flask.git",
+      "repository_id": "flask-python",
+      "source_tree_sha256": "ec2f9da979c62cdc2a15f5b6696c30d15f07023aad92ffe285f16acb4a14724f",
+      "workspace": "."
+    },
+    {
+      "commit": "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11",
+      "path_count": 30,
+      "path_file": "paths/gin-go.json",
+      "path_file_sha256": "0c11532fe5d599a60df8833167c66c784ae2f8e2768e2aa20f620207efff0a3a",
+      "path_length_distribution": [
+        {
+          "path_count": 10,
+          "path_length": 1
+        },
+        {
+          "path_count": 7,
+          "path_length": 2
+        },
+        {
+          "path_count": 5,
+          "path_length": 3
+        },
+        {
+          "path_count": 3,
+          "path_length": 4
+        },
+        {
+          "path_count": 3,
+          "path_length": 5
+        },
+        {
+          "path_count": 2,
+          "path_length": 6
+        }
+      ],
+      "positive_step_count": 78,
+      "repository": "https://github.com/gin-gonic/gin.git",
+      "repository_id": "gin-go",
+      "source_tree_sha256": "6a895f11edb676bbdd8ee1f7bb02972a5ee3980c36c7f8e6e1c873900a07a98d",
+      "workspace": "."
+    }
+  ],
+  "corpus_id": "proof-availability-v1",
+  "curator": "codex-corpus-curator",
+  "methodology_sha256": "28f11893fc1d0c17c1b1b70aeda74818a311009e24b85d899b2d52fa6c8e0dcf",
+  "negative_request_count": 240,
+  "positive_request_count": 120,
+  "positive_step_count": 312,
+  "review_date": "2026-08-21",
+  "reviewer": "codex-corpus-reviewer",
+  "schema": "codestory.proof-availability-corpus/v1",
+  "thresholds_sha256": "c10242b9bd3d288070a50493af890ec9180cab3f16bb0df7762a7f6db5f74bca"
+}

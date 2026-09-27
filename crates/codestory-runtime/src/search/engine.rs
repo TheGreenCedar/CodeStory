@@ -302,6 +302,7 @@ pub struct SymbolIndexSession<'a> {
     id_field: Field,
     symbols_start_len: usize,
     docs_written: usize,
+    failed: bool,
     finished: bool,
 }
 
@@ -825,6 +826,7 @@ impl SearchEngine {
             id_field,
             symbols_start_len,
             docs_written: 0,
+            failed: false,
             finished: false,
         })
     }
@@ -974,18 +976,38 @@ impl SymbolIndexSession<'_> {
     where
         I: IntoIterator<Item = (NodeId, String)>,
     {
+        if self.failed {
+            bail!("symbol index session has failed");
+        }
         let start_count = self.docs_written;
         for (id, name) in nodes {
             #[cfg(test)]
             if take_symbol_index_test_fault(SymbolIndexTestFault::AddDocument) {
+                self.failed = true;
                 bail!("injected symbol index add-document failure");
             }
             let fuzzy_name = Utf32String::from(name.as_str());
-            if let Some(writer) = self.writer.as_mut() {
-                writer.add_document(doc!(
+            if let Some(writer) = self.writer.as_mut()
+                && let Err(add_error) = writer.add_document(doc!(
                     self.name_field => name,
                     self.id_field => id.0
-                ))?;
+                ))
+            {
+                self.failed = true;
+                let mut failed_writer = self.writer.take().expect("failed writer is present");
+                // add_document only reports a disconnected/killed pipeline.
+                // Closing it and joining the workers recovers the original
+                // I/O error. Drop already joins these workers on failure.
+                let prepared = failed_writer.prepare_commit()?;
+                // A rejected add must never publish even if all workers
+                // unexpectedly completed successfully.
+                prepared.abort().map_err(|abort_error| {
+                    let message = format!(
+                        "Failed to abort rejected symbol index write: {abort_error}; add-document error: {add_error}"
+                    );
+                    anyhow::Error::new(abort_error).context(message)
+                })?;
+                return Err(add_error.into());
             }
             self.engine.symbols.push((fuzzy_name, id));
             self.docs_written = self.docs_written.saturating_add(1);
@@ -994,6 +1016,9 @@ impl SymbolIndexSession<'_> {
     }
 
     pub fn finish(mut self) -> Result<SymbolIndexWriteStats> {
+        if self.failed {
+            bail!("cannot finish a failed symbol index session");
+        }
         let writer_count = usize::from(self.writer.is_some());
         let mut commit_count = 0;
         let mut reload_count = 0;
@@ -1088,6 +1113,23 @@ pub(crate) fn search_symbols_with_scores(
         .filter(|(id, _)| seen.insert(*id))
         .take(200)
         .collect()
+}
+
+/// Rank canonical core symbols without opening a persisted search generation.
+///
+/// Exact core search uses this adapter after streaming the immutable core's
+/// identity projection. Keeping UTF-32 conversion here preserves the same
+/// matcher and ordering as the resident search engine without acquiring or
+/// creating any search-generation artifact.
+pub(crate) fn search_core_symbol_names_with_scores(
+    symbols: &[(NodeId, String)],
+    query: &str,
+) -> Vec<(NodeId, f32)> {
+    let symbols = symbols
+        .iter()
+        .map(|(id, name)| (Utf32String::from(name.as_str()), *id))
+        .collect::<Vec<_>>();
+    search_symbols_with_scores(&symbols, query)
 }
 
 fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolCandidateRank {
@@ -1588,6 +1630,147 @@ fn truncate_node_scores(scored: &mut Vec<(NodeId, f32)>, limit: usize) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // Delegate real persistence and locking; only segment creation is refused.
+    #[derive(Clone, Debug)]
+    struct FailingSegmentDirectory {
+        inner: tantivy::directory::MmapDirectory,
+        fail_segments: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tantivy::Directory for FailingSegmentDirectory {
+        fn get_file_handle(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<
+            std::sync::Arc<dyn tantivy::directory::FileHandle>,
+            tantivy::directory::error::OpenReadError,
+        > {
+            self.inner.get_file_handle(path)
+        }
+
+        fn delete(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<(), tantivy::directory::error::DeleteError> {
+            self.inner.delete(path)
+        }
+
+        fn exists(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<bool, tantivy::directory::error::OpenReadError> {
+            self.inner.exists(path)
+        }
+
+        fn open_write(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<
+            tantivy::directory::WritePtr,
+            tantivy::directory::error::OpenWriteError,
+        > {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "store")
+                && self.fail_segments.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(tantivy::directory::error::OpenWriteError::wrap_io_error(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "segment write refused",
+                    ),
+                    path.to_path_buf(),
+                ));
+            }
+            self.inner.open_write(path)
+        }
+
+        fn atomic_read(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
+            self.inner.atomic_read(path)
+        }
+
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.inner.atomic_write(path, data)
+        }
+
+        fn sync_directory(&self) -> std::io::Result<()> {
+            self.inner.sync_directory()
+        }
+
+        fn watch(
+            &self,
+            callback: tantivy::directory::WatchCallback,
+        ) -> tantivy::Result<tantivy::directory::WatchHandle> {
+            self.inner.watch(callback)
+        }
+    }
+
+    #[test]
+    fn symbol_index_worker_failure_preserves_cause_and_previous_commit() -> Result<()> {
+        let directory = tempdir()?;
+        let fail_segments = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let index = Index::create(
+            FailingSegmentDirectory {
+                inner: tantivy::directory::MmapDirectory::open(directory.path())?,
+                fail_segments: fail_segments.clone(),
+            },
+            SearchEngine::build_schema(),
+            tantivy::IndexSettings::default(),
+        )?;
+        let mut engine = SearchEngine::new_with_index(index, None)?;
+        // Select the real full-text path without mutating process configuration.
+        engine.full_text_index_enabled = true;
+        engine.index_nodes(vec![(NodeId(1), "PreviousCompleteSymbol".into())])?;
+        let previous_meta = std::fs::read(directory.path().join("meta.json"))?;
+        fail_segments.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = {
+            let mut session = engine.begin_symbol_index()?;
+            // More than Tantivy's bounded document queue: the failed real worker
+            // disconnects the producer without a sleep or scheduler assumption.
+            let error = session
+                .add_nodes((2..20_002).map(|id| (NodeId(id), "UnpublishedPrivateSymbol".into())))
+                .expect_err("segment I/O failure must stop the producer");
+            assert!(
+                error.to_string().contains("segment write refused"),
+                "original worker cause was lost: {error:#}"
+            );
+            assert!(!error.to_string().contains("UnpublishedPrivateSymbol"));
+            assert!(
+                session
+                    .add_nodes(vec![(NodeId(30_000), "Later".into())])
+                    .is_err()
+            );
+            session
+                .finish()
+                .expect_err("a failed session must never commit");
+            error
+        };
+        assert!(matches!(
+            error.downcast_ref::<tantivy::TantivyError>(),
+            Some(tantivy::TantivyError::OpenWriteError(
+                tantivy::directory::error::OpenWriteError::IoError { io_error, .. }
+            )) if io_error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(engine.symbols().len(), 1);
+        assert_eq!(
+            engine.search_symbol("PreviousCompleteSymbol"),
+            vec![NodeId(1)]
+        );
+        engine.reader.reload()?;
+        assert_eq!(engine.tantivy_doc_count(), 1);
+        assert_eq!(
+            std::fs::read(directory.path().join("meta.json"))?,
+            previous_meta
+        );
+        let reopened = SearchEngine::new_with_index(Index::open_in_dir(directory.path())?, None)?;
+        assert_eq!(reopened.tantivy_doc_count(), 1);
+        Ok(())
+    }
 
     fn test_axis_embedding(axis: usize) -> Vec<f32> {
         let mut embedding = vec![0.0; EMBEDDING_DIM];

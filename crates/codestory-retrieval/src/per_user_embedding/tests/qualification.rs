@@ -34,6 +34,8 @@ struct CrashReceiptTransport {
     clock: Arc<TestClock>,
     event_path: PathBuf,
     observed_durable_receipt: AtomicBool,
+    observed_draining_before_fail_stop: AtomicBool,
+    state: Arc<super::super::PerUserEmbeddingServerState>,
 }
 
 impl EmbeddingServerTransport for CrashReceiptTransport {
@@ -61,6 +63,10 @@ impl EmbeddingServerTransport for CrashReceiptTransport {
         assert_eq!(
             event["snapshot"]["process"]["process_start_id"],
             "server-start"
+        );
+        self.observed_draining_before_fail_stop.store(
+            self.state.draining.load(Ordering::Acquire),
+            Ordering::Release,
         );
         self.observed_durable_receipt.store(true, Ordering::Release);
     }
@@ -98,6 +104,8 @@ fn accepted_crash_receipt_pins_the_exact_server_before_fail_stop() {
         clock: TestClock::new(),
         event_path,
         observed_durable_receipt: AtomicBool::new(false),
+        observed_draining_before_fail_stop: AtomicBool::new(false),
+        state: Arc::clone(&state),
     };
 
     super::super::qualification_control::poll_server_qualification_command(&state, &transport)
@@ -108,8 +116,14 @@ fn accepted_crash_receipt_pins_the_exact_server_before_fail_stop() {
         "fail-stop ran before the exact accepted crash receipt was durable"
     );
     assert!(
+        transport
+            .observed_draining_before_fail_stop
+            .load(Ordering::Acquire),
+        "drain must arm before fail-stop so endpoint release is not stranded behind process termination"
+    );
+    assert!(
         state.draining.load(Ordering::Acquire),
-        "an accepted crash control did not drain the server"
+        "an accepted crash control must leave the server draining"
     );
 }
 

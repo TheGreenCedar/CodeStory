@@ -20,10 +20,14 @@ use rayon::prelude::*;
 use rusqlite::OptionalExtension;
 use rusqlite::{limits::Limit, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Instant;
+use tree_sitter::Parser;
 
 mod candidate_selection;
 mod pipeline;
@@ -63,8 +67,24 @@ type SameFileCacheKey = (i64, String, String);
 type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
+const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
+    EdgeKind::TYPE_USAGE,
+    EdgeKind::USAGE,
+    EdgeKind::CALL,
+    EdgeKind::INHERITANCE,
+    EdgeKind::OVERRIDE,
+    EdgeKind::TYPE_ARGUMENT,
+    EdgeKind::TEMPLATE_SPECIALIZATION,
+    EdgeKind::INCLUDE,
+    EdgeKind::IMPORT,
+    EdgeKind::MACRO_USAGE,
+    EdgeKind::ANNOTATION_USAGE,
+];
 /// Version for cached resolution-support snapshots.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 5;
+///
+/// Bumped when import-candidate snapshots began excluding Go import occurrence
+/// placeholders from declaration-target indexes.
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -93,21 +113,32 @@ struct ResolutionLookupCache {
 #[derive(Debug, Clone)]
 struct CandidateNode {
     id: i64,
+    kind: i32,
     file_node_id: Option<i64>,
     file_path: Option<String>,
     normalized_file_path: Option<String>,
     serialized_name: String,
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
+    is_declaration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CandidateNodeSnapshot {
     id: i64,
+    kind: i32,
     file_node_id: Option<i64>,
     file_path: Option<String>,
     serialized_name: String,
     qualified_name: Option<String>,
+    is_declaration: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelativeImportNameMatch {
+    Missing,
+    Unique(i64),
+    Ambiguous,
 }
 
 #[derive(Default, Debug)]
@@ -721,6 +752,368 @@ pub struct ResolutionPass {
     flags: ResolutionFlags,
     policy: ResolutionPolicy,
     semantic_resolvers: SemanticResolverRegistry,
+    go_context: Option<GoResolutionContext>,
+}
+
+#[derive(Debug)]
+struct GoPackageIdentity {
+    import_path: String,
+    package_name: String,
+    is_test_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GoReturnDeclarationKey {
+    import_path: String,
+    package_name: String,
+    owner: Option<String>,
+    function: String,
+}
+
+type GoReturnResults = Option<Vec<Option<String>>>;
+type GoReturnDeclarationCatalog = HashMap<GoReturnDeclarationKey, GoReturnResults>;
+
+#[derive(Default)]
+struct GoReturnDeclarationCatalogs {
+    all: GoReturnDeclarationCatalog,
+    importable: GoReturnDeclarationCatalog,
+}
+
+#[derive(Debug, Default)]
+struct GoResolutionContext {
+    packages_by_file_node_id: HashMap<i64, GoPackageIdentity>,
+    importable_package_names: HashMap<String, HashSet<String>>,
+    ambiguous_import_paths: HashSet<String>,
+    return_declarations: GoReturnDeclarationCatalog,
+    importable_return_declarations: GoReturnDeclarationCatalog,
+}
+
+#[derive(Debug)]
+struct GoModuleControl {
+    directory: PathBuf,
+    module_path: Option<String>,
+}
+
+// Full refresh deliberately defers graph indexes. Materialize self-imports
+// once, then exclude only those package nodes; a correlated anti-join scans
+// the entire edge table for every MODULE node in that staged shape.
+const GO_PACKAGE_NAMES_QUERY: &str = "WITH self_import AS MATERIALIZED (
+         SELECT DISTINCT source_node_id
+         FROM edge
+         WHERE kind = ?2 AND source_node_id = target_node_id
+     )
+     SELECT package.file_node_id, package.serialized_name
+     FROM node AS package
+     LEFT JOIN self_import ON self_import.source_node_id = package.id
+     WHERE package.kind = ?1 AND self_import.source_node_id IS NULL";
+
+fn load_go_package_names(conn: &rusqlite::Connection) -> Result<HashMap<i64, Option<String>>> {
+    let mut package_names = HashMap::<i64, Option<String>>::new();
+    let mut stmt = conn.prepare(GO_PACKAGE_NAMES_QUERY)?;
+    let rows = stmt.query_map(
+        params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    for row in rows {
+        let (Some(file_node_id), package_name) = row? else {
+            continue;
+        };
+        match package_names.entry(file_node_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(package_name));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+    Ok(package_names)
+}
+
+impl GoResolutionContext {
+    fn load(root: &Path, storage: &Storage) -> Result<Self> {
+        let files = storage.get_files()?;
+        // Controls only inform package identity for indexed Go source files.
+        // A go.mod/go.work-only repository has no Go claims to resolve.
+        if !files.iter().any(|file| file.language == "go") {
+            return Ok(Self::default());
+        }
+        let Ok(canonical_root) = root.canonicalize() else {
+            return Ok(Self::default());
+        };
+        let mut controls = Vec::new();
+        for file in files
+            .iter()
+            .filter(|file| file.language == "go-module-control")
+        {
+            let path = &file.path;
+            let Ok(canonical_path) = path.canonicalize() else {
+                return Ok(Self::default());
+            };
+            if !canonical_path.starts_with(&canonical_root)
+                || fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+                    .unwrap_or(true)
+            {
+                return Ok(Self::default());
+            }
+            let expected_hash = storage.get_file_content_hash(file.id)?;
+            let module_path = expected_hash
+                .as_deref()
+                .and_then(|expected| verified_control_source(path, expected))
+                .and_then(|source| crate::languages::go::parse_module_path(&source));
+            if let Some(directory) = canonical_path.parent() {
+                controls.push(GoModuleControl {
+                    directory: directory.to_path_buf(),
+                    module_path,
+                });
+            }
+        }
+        controls.sort_by_key(|control| std::cmp::Reverse(control.directory.components().count()));
+
+        let conn = storage.get_connection();
+        let package_names = load_go_package_names(conn)?;
+
+        let mut packages_by_file_node_id = HashMap::new();
+        let mut importable_package_names = HashMap::<String, HashSet<String>>::new();
+        let mut package_directories_by_import = HashMap::<String, HashSet<PathBuf>>::new();
+        for file in files.iter().filter(|file| file.language == "go") {
+            let Some(package_name) = package_names.get(&file.id).and_then(Clone::clone) else {
+                continue;
+            };
+            let Ok(canonical_file) = file.path.canonicalize() else {
+                continue;
+            };
+            if !canonical_file.starts_with(&canonical_root) {
+                continue;
+            }
+            let Some(control) = controls
+                .iter()
+                .find(|control| canonical_file.starts_with(&control.directory))
+            else {
+                continue;
+            };
+            let Some(module_path) = control.module_path.as_deref() else {
+                continue;
+            };
+            let Some(package_directory) = canonical_file.parent() else {
+                continue;
+            };
+            let Ok(relative_directory) = package_directory.strip_prefix(&control.directory) else {
+                continue;
+            };
+            let relative = relative_directory.to_string_lossy().replace('\\', "/");
+            let import_path = if relative.is_empty() {
+                module_path.to_string()
+            } else {
+                format!("{}/{relative}", module_path.trim_end_matches('/'))
+            };
+            // Go test files may declare a separate package in the same
+            // directory, but neither its declarations nor same-package test
+            // helpers are importable by ordinary package clients.
+            let is_test_file = [&file.path, &canonical_file].into_iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_test.go"))
+            });
+            if !is_test_file {
+                importable_package_names
+                    .entry(import_path.clone())
+                    .or_default()
+                    .insert(package_name.clone());
+            }
+            package_directories_by_import
+                .entry(import_path.clone())
+                .or_default()
+                .insert(package_directory.to_path_buf());
+            packages_by_file_node_id.insert(
+                file.id,
+                GoPackageIdentity {
+                    import_path,
+                    package_name,
+                    is_test_file,
+                },
+            );
+        }
+        let ambiguous_import_paths = package_directories_by_import
+            .into_iter()
+            .filter_map(|(import_path, directories)| (directories.len() > 1).then_some(import_path))
+            .collect();
+        let return_catalogs = load_go_return_declarations(
+            &files,
+            &packages_by_file_node_id,
+            &canonical_root,
+            storage,
+        );
+        Ok(Self {
+            packages_by_file_node_id,
+            importable_package_names,
+            ambiguous_import_paths,
+            return_declarations: return_catalogs.all,
+            importable_return_declarations: return_catalogs.importable,
+        })
+    }
+
+    fn importable_package_name(&self, module: &str, required: Option<&str>) -> Option<&str> {
+        let mut names = self.importable_package_names.get(module)?.iter();
+        let name = names.next()?;
+        if names.next().is_some() || required.is_some_and(|required| required != name.as_str()) {
+            return None;
+        }
+        Some(name)
+    }
+}
+
+fn load_go_return_declarations(
+    files: &[codestory_store::FileInfo],
+    packages: &HashMap<i64, GoPackageIdentity>,
+    canonical_root: &Path,
+    storage: &Storage,
+) -> GoReturnDeclarationCatalogs {
+    const MAX_FILES: usize = 4_096;
+    const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+    let go_files = files
+        .iter()
+        .filter(|file| file.language == "go")
+        .collect::<Vec<_>>();
+    if go_files.len() > MAX_FILES {
+        return GoReturnDeclarationCatalogs::default();
+    }
+    let mut total_bytes = 0usize;
+    let mut pending = Vec::new();
+    let mut concrete_types = HashMap::<(String, String), HashSet<String>>::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
+        return GoReturnDeclarationCatalogs::default();
+    }
+    for file in go_files {
+        let Some(package) = packages.get(&file.id) else {
+            continue;
+        };
+        let Ok(canonical_path) = file.path.canonicalize() else {
+            return GoReturnDeclarationCatalogs::default();
+        };
+        if !canonical_path.starts_with(canonical_root) {
+            return GoReturnDeclarationCatalogs::default();
+        }
+        let Some(expected_hash) = storage.get_file_content_hash(file.id).ok().flatten() else {
+            return GoReturnDeclarationCatalogs::default();
+        };
+        let Some(source) = verified_go_source(&file.path, &expected_hash, MAX_FILE_BYTES) else {
+            return GoReturnDeclarationCatalogs::default();
+        };
+        total_bytes = total_bytes.saturating_add(source.len());
+        if total_bytes > MAX_TOTAL_BYTES {
+            return GoReturnDeclarationCatalogs::default();
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            return GoReturnDeclarationCatalogs::default();
+        };
+        concrete_types
+            .entry((package.import_path.clone(), package.package_name.clone()))
+            .or_default()
+            .extend(crate::languages::go::go_concrete_return_types(
+                &tree, &source,
+            ));
+        for declaration in crate::languages::go::go_return_declarations(&tree, &source) {
+            let key = GoReturnDeclarationKey {
+                import_path: package.import_path.clone(),
+                package_name: package.package_name.clone(),
+                owner: declaration.owner,
+                function: declaration.function,
+            };
+            pending.push((key, declaration.results, package.is_test_file));
+        }
+    }
+    let mut catalogs = GoReturnDeclarationCatalogs::default();
+    for (key, mut results, is_test_file) in pending {
+        let package_types =
+            concrete_types.get(&(key.import_path.clone(), key.package_name.clone()));
+        if key
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !package_types.is_some_and(|types| types.contains(owner)))
+        {
+            continue;
+        }
+        for result in &mut results {
+            if result
+                .as_ref()
+                .is_some_and(|owner| !package_types.is_some_and(|types| types.contains(owner)))
+            {
+                *result = None;
+            }
+        }
+        if !is_test_file {
+            insert_go_return_declaration(&mut catalogs.importable, key.clone(), results.clone());
+        }
+        insert_go_return_declaration(&mut catalogs.all, key, results);
+    }
+    catalogs
+}
+
+fn insert_go_return_declaration(
+    declarations: &mut GoReturnDeclarationCatalog,
+    key: GoReturnDeclarationKey,
+    results: Vec<Option<String>>,
+) {
+    match declarations.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(results));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
+        }
+    }
+}
+
+fn verified_go_source(path: &Path, expected_hash: &str, max_bytes: usize) -> Option<String> {
+    let path_metadata = fs::symlink_metadata(path).ok()?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if before.len() > max_bytes as u64 || !before.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if bytes.len() > max_bytes
+        || before.len() != after.len()
+        || before.modified().ok()? != after.modified().ok()?
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn verified_control_source(path: &Path, expected_hash: &str) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if bytes.len() > 1024 * 1024
+        || before.len() != after.len()
+        || before.modified().ok()? != after.modified().ok()?
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -746,7 +1139,174 @@ impl ResolutionPass {
             flags,
             policy,
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
+            go_context: None,
         }
+    }
+
+    pub(crate) fn for_workspace(root: &Path, storage: &Storage) -> Result<Self> {
+        let mut pass = Self::new();
+        pass.go_context = Some(GoResolutionContext::load(root, storage)?);
+        Ok(pass)
+    }
+
+    pub(crate) fn invalidate_go_package_function_resolutions(
+        &self,
+        storage: &Storage,
+    ) -> Result<usize> {
+        sql::invalidate_go_package_function_resolutions(storage.get_connection())
+    }
+
+    pub(crate) fn invalidate_go_return_method_resolutions(
+        &self,
+        storage: &Storage,
+    ) -> Result<usize> {
+        sql::invalidate_go_return_method_resolutions(storage.get_connection())
+    }
+
+    fn find_go_package_function_readonly(
+        &self,
+        candidates: &CandidateIndex,
+        modules: &[&str],
+        package_name: Option<&str>,
+        function_name: &str,
+    ) -> Option<i64> {
+        let context = self.go_context.as_ref()?;
+        let mut eligible_modules = modules
+            .iter()
+            .copied()
+            .filter(|module| !context.ambiguous_import_paths.contains(*module))
+            .filter(|module| {
+                context
+                    .importable_package_name(module, package_name)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        eligible_modules.sort_unstable();
+        eligible_modules.dedup();
+        let [eligible_module] = eligible_modules.as_slice() else {
+            return None;
+        };
+        let eligible_package_name =
+            context.importable_package_name(eligible_module, package_name)?;
+        let mut matches = candidates
+            .exact_map
+            .get(function_name)
+            .into_iter()
+            .flatten()
+            .filter_map(|offset| candidates.nodes.get(*offset))
+            .filter(|node| {
+                node.kind == NodeKind::FUNCTION as i32
+                    && node.is_declaration
+                    && node.serialized_name == function_name
+            })
+            .filter_map(|node| {
+                let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
+                (!package.is_test_file
+                    && package.package_name == eligible_package_name
+                    && *eligible_module == package.import_path)
+                    .then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    fn find_go_return_method_readonly(
+        &self,
+        candidates: &CandidateIndex,
+        path: &crate::languages::go::GoReturnPath,
+        caller_file_id: Option<i64>,
+        method_name: &str,
+    ) -> Option<i64> {
+        let context = self.go_context.as_ref()?;
+        let local_package = path.module == ".";
+        let (module, required_package_name) = if local_package {
+            let package = context.packages_by_file_node_id.get(&caller_file_id?)?;
+            (
+                package.import_path.clone(),
+                Some(package.package_name.clone()),
+            )
+        } else {
+            let mut eligible = path
+                .module
+                .split(',')
+                .filter(|module| !context.ambiguous_import_paths.contains(*module))
+                .filter(|module| {
+                    context
+                        .importable_package_name(module, path.package_name.as_deref())
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            eligible.sort_unstable();
+            eligible.dedup();
+            let [module] = eligible.as_slice() else {
+                return None;
+            };
+            ((*module).to_string(), path.package_name.clone())
+        };
+        if context.ambiguous_import_paths.contains(&module) {
+            return None;
+        }
+        let package_name = if local_package {
+            required_package_name?
+        } else {
+            context
+                .importable_package_name(&module, required_package_name.as_deref())?
+                .to_string()
+        };
+        let declarations = if local_package {
+            &context.return_declarations
+        } else {
+            &context.importable_return_declarations
+        };
+        let initial = declarations
+            .get(&GoReturnDeclarationKey {
+                import_path: module.clone(),
+                package_name: package_name.clone(),
+                owner: None,
+                function: path.function.clone(),
+            })?
+            .as_ref()?;
+        if initial.len() != path.result_arity {
+            return None;
+        }
+        let mut owner = initial.get(path.result_index)?.clone()?;
+        for hop in &path.methods {
+            let results = declarations
+                .get(&GoReturnDeclarationKey {
+                    import_path: module.clone(),
+                    package_name: package_name.clone(),
+                    owner: Some(owner.clone()),
+                    function: hop.clone(),
+                })?
+                .as_ref()?;
+            if results.len() != 1 {
+                return None;
+            }
+            owner = results.first()?.clone()?;
+        }
+        let expected = format!("{owner}.{method_name}");
+        let mut matches = candidates
+            .owner_member_candidate_offsets(&owner, method_name)
+            .into_iter()
+            .filter_map(|offset| candidates.nodes.get(offset))
+            .filter(|node| {
+                node.kind == NodeKind::METHOD as i32
+                    && node.is_declaration
+                    && node.serialized_name == expected
+            })
+            .filter_map(|node| {
+                let package = context.packages_by_file_node_id.get(&node.file_node_id?)?;
+                (package.import_path == module
+                    && package.package_name == package_name
+                    && (local_package || !package.is_test_file))
+                    .then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
 
     /// Resolve all eligible unresolved edges in the store.
@@ -1276,6 +1836,7 @@ fn semantic_lookup_from_row<'a>(
 
 fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResolutionRequestKey> {
     if semantic_language_bucket(lookup.file_path).is_none()
+        || is_js_private_name_call(lookup.edge_kind, lookup.callsite_identity)
         || is_python_dotted_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_cpp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_js_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
@@ -1301,6 +1862,15 @@ fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResol
         file_path: lookup.file_path.map(str::to_string),
         target_name: semantic_request_target_name(lookup),
     })
+}
+
+fn is_js_private_name_call(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    edge_kind == EdgeKind::CALL
+        && callsite_identity.is_some_and(|identity| {
+            identity
+                .split('|')
+                .any(|part| part == crate::languages::javascript::PRIVATE_NAME_CALLSITE_MARKER)
+        })
 }
 
 fn semantic_request_target_name(lookup: &SemanticEdgeLookup<'_>) -> String {
@@ -1519,6 +2089,22 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
         })
 }
 
+fn go_package_function_imports(callsite_identity: Option<&str>) -> Option<(Vec<&str>, bool)> {
+    let parts = callsite_identity?.split('|').collect::<Vec<_>>();
+    if parts.contains(&crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER) {
+        return receiver_module_from_callsite(callsite_identity)
+            .map(|module| (vec![module], false));
+    }
+    let encoded = parts.iter().find_map(|part| {
+        part.strip_prefix(crate::languages::go::PACKAGE_FUNCTION_IMPORT_SET_PREFIX)
+    })?;
+    let modules = encoded
+        .split(',')
+        .filter(|module| !module.is_empty())
+        .collect::<Vec<_>>();
+    (!modules.is_empty()).then_some((modules, true))
+}
+
 fn requires_python_context_manager_self_return(callsite_identity: Option<&str>) -> bool {
     callsite_identity.is_some_and(|identity| {
         identity.split('|').any(|part| {
@@ -1601,6 +2187,8 @@ impl PreparedResolutionState {
         telemetry.support_snapshot_load_ms = duration_ms_u64(snapshot_load_started.elapsed());
 
         let conn = storage.get_connection();
+        let go_import_occurrence_node_ids =
+            CandidateIndex::load_go_import_occurrence_node_ids(conn)?;
         let call_candidate_started = Instant::now();
         let call_candidate_index = CandidateIndex::load_with_import_bindings(
             conn,
@@ -1621,6 +2209,7 @@ impl PreparedResolutionState {
                 NodeKind::PACKAGE as i32,
             ],
             semantic_candidate_kinds(EdgeKind::IMPORT),
+            &go_import_occurrence_node_ids,
         )?;
         telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
 
@@ -1631,8 +2220,11 @@ impl PreparedResolutionState {
             telemetry.call_semantic_index_ms = duration_ms_u64(call_semantic_started.elapsed());
 
             let import_semantic_started = Instant::now();
-            let import_semantic_index =
-                SemanticCandidateIndex::load(conn, semantic_candidate_kinds(EdgeKind::IMPORT))?;
+            let import_semantic_index = SemanticCandidateIndex::load_excluding(
+                conn,
+                semantic_candidate_kinds(EdgeKind::IMPORT),
+                &go_import_occurrence_node_ids,
+            )?;
             telemetry.import_semantic_index_ms = duration_ms_u64(import_semantic_started.elapsed());
             (call_semantic_index, import_semantic_index)
         } else {
@@ -1754,17 +2346,44 @@ impl CandidateIndex {
         conn: &rusqlite::Connection,
         kinds: &[i32],
         relative_import_kinds: &[i32],
+        excluded_node_ids: &HashSet<i64>,
     ) -> Result<Self> {
-        let nodes = Self::load_nodes(conn, kinds)?;
-        let relative_import_nodes = if relative_import_kinds.is_empty() {
+        let mut nodes = Self::load_nodes(conn, kinds)?;
+        nodes.retain(|node| !excluded_node_ids.contains(&node.id));
+        let mut relative_import_nodes = if relative_import_kinds.is_empty() {
             Vec::new()
         } else {
             Self::load_nodes(conn, relative_import_kinds)?
         };
+        relative_import_nodes.retain(|node| !excluded_node_ids.contains(&node.id));
         Ok(Self::from_primary_and_relative_nodes(
             nodes,
             relative_import_nodes,
         ))
+    }
+
+    fn load_go_import_occurrence_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT target.id, file_node.serialized_name
+             FROM edge AS import_edge
+             JOIN node AS target ON target.id = import_edge.target_node_id
+             JOIN node AS file_node ON file_node.id = target.file_node_id
+             WHERE import_edge.kind = ?1
+               AND import_edge.source_node_id = import_edge.target_node_id
+               AND target.kind = ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![EdgeKind::IMPORT as i32, NodeKind::MODULE as i32],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            let (node_id, file_path) = row?;
+            if semantic_language_bucket(Some(&file_path)) == Some("go") {
+                ids.insert(node_id);
+            }
+        }
+        Ok(ids)
     }
 
     fn load_import_binding_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
@@ -1801,9 +2420,10 @@ impl CandidateIndex {
     }
 
     fn load_nodes(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Vec<CandidateNode>> {
+        let reference_node_ids = Self::load_reference_node_ids(conn)?;
         let kind_clause = kind_clause(kinds);
         let query = format!(
-            "SELECT n.id, n.file_node_id, n.serialized_name, n.qualified_name, file_node.serialized_name
+            "SELECT n.id, n.file_node_id, n.kind, n.serialized_name, n.qualified_name, file_node.serialized_name
              FROM node n
              LEFT JOIN node file_node ON file_node.id = n.file_node_id
              WHERE n.kind IN ({})
@@ -1812,16 +2432,19 @@ impl CandidateIndex {
         );
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
-            let serialized_name: String = row.get(2)?;
-            let file_path: Option<String> = row.get(4)?;
+            let serialized_name: String = row.get(3)?;
+            let file_path: Option<String> = row.get(5)?;
+            let id = row.get(0)?;
             Ok(CandidateNode {
-                id: row.get(0)?,
+                id,
                 file_node_id: row.get(1)?,
+                kind: row.get(2)?,
                 normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
                 file_path,
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
-                qualified_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                is_declaration: !reference_node_ids.contains(&id),
             })
         })?;
 
@@ -1831,6 +2454,40 @@ impl CandidateIndex {
         }
 
         Ok(nodes)
+    }
+
+    fn load_reference_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let has_edge_table = conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_edge_table {
+            return Ok(HashSet::new());
+        }
+
+        let reference_kinds = REFERENCE_SINK_EDGE_KINDS.map(|kind| kind as i32);
+        let query = format!(
+            "SELECT DISTINCT reference_node.id
+             FROM node reference_node
+             JOIN edge reference_edge ON reference_edge.target_node_id = reference_node.id
+             WHERE reference_edge.kind IN ({})
+               AND (
+                   reference_edge.resolved_target_node_id IS NULL
+                   OR reference_edge.resolved_target_node_id != reference_edge.target_node_id
+               )
+               AND (
+                   reference_edge.line IS NULL
+                   OR reference_node.start_line IS NULL
+                   OR reference_edge.line = reference_node.start_line
+               )",
+            kind_clause(&reference_kinds)
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     fn from_snapshot_nodes_with_import_bindings(
@@ -1864,10 +2521,12 @@ impl CandidateIndex {
             .iter()
             .map(|node| CandidateNodeSnapshot {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
                 qualified_name: node.qualified_name.clone(),
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -1877,10 +2536,12 @@ impl CandidateIndex {
             .iter()
             .map(|node| CandidateNodeSnapshot {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
                 qualified_name: node.qualified_name.clone(),
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -1905,6 +2566,7 @@ impl CandidateIndex {
             .into_iter()
             .map(|node| CandidateNode {
                 id: node.id,
+                kind: node.kind,
                 file_node_id: node.file_node_id,
                 normalized_file_path: node
                     .file_path
@@ -1914,6 +2576,7 @@ impl CandidateIndex {
                 serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
                 serialized_name: node.serialized_name,
                 qualified_name: node.qualified_name,
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -1998,6 +2661,13 @@ impl CandidateIndex {
         self.import_binding_node_ids.contains(&node_id)
     }
 
+    fn node_kind(&self, node_id: i64) -> Option<i32> {
+        self.node_offset_by_id
+            .get(&node_id)
+            .and_then(|offset| self.nodes.get(*offset))
+            .map(|node| node.kind)
+    }
+
     #[cfg(test)]
     fn find_same_file(&self, file_id: Option<i64>, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
@@ -2073,12 +2743,14 @@ impl CandidateIndex {
                 let Some(offsets) = self.relative_file_path_map.get(&candidate_path) else {
                     continue;
                 };
-                if let Some(node_id) = self.first_matching_name_in_offsets(
+                match self.matching_name_in_offsets(
                     offsets,
                     imported_name,
                     imported_name_ascii_lower,
                 ) {
-                    return Some(node_id);
+                    RelativeImportNameMatch::Unique(node_id) => return Some(node_id),
+                    RelativeImportNameMatch::Ambiguous => return None,
+                    RelativeImportNameMatch::Missing => {}
                 }
             }
             None
@@ -2716,9 +3388,24 @@ impl CandidateIndex {
 
     fn first_in_file(&self, candidates: Option<&Vec<usize>>, file_id: i64) -> Option<i64> {
         candidates.and_then(|candidates| {
-            candidates.iter().find_map(|idx| {
-                let node = &self.nodes[*idx];
-                (node.file_node_id == Some(file_id)).then_some(node.id)
+            let same_file = candidates
+                .iter()
+                .filter_map(|idx| {
+                    let node = &self.nodes[*idx];
+                    (node.file_node_id == Some(file_id)).then_some(node)
+                })
+                .collect::<Vec<_>>();
+            let mut declarations = same_file
+                .iter()
+                .filter_map(|node| node.is_declaration.then_some(node.id));
+            let candidate = declarations.next();
+            if declarations.next().is_some() {
+                return None;
+            }
+            candidate.or_else(|| {
+                let mut references = same_file.iter().map(|node| node.id);
+                let candidate = references.next()?;
+                references.next().is_none().then_some(candidate)
             })
         })
     }
@@ -2735,27 +3422,66 @@ impl CandidateIndex {
         })
     }
 
-    fn first_matching_name_in_offsets(
+    fn matching_name_in_offsets(
         &self,
         offsets: &[usize],
         name: &str,
         name_ascii_lower: &str,
-    ) -> Option<i64> {
-        offsets.iter().find_map(|idx| {
-            let node = &self.relative_import_nodes[*idx];
-            let serialized_tail_lower =
-                tail_component(&node.serialized_name).map(str::to_ascii_lowercase);
-            let qualified_tail_lower = node
-                .qualified_name
-                .as_deref()
-                .and_then(tail_component)
-                .map(str::to_ascii_lowercase);
-            (node.serialized_name == name
-                || node.serialized_name_ascii_lower == name_ascii_lower
-                || serialized_tail_lower.as_deref() == Some(name_ascii_lower)
-                || qualified_tail_lower.as_deref() == Some(name_ascii_lower))
-            .then_some(node.id)
+    ) -> RelativeImportNameMatch {
+        // Case-insensitive compatibility must not outrank an exact source
+        // binding, nor resolve a competing exact declaration by row order.
+        let exact = self.matching_relative_name(offsets, |node| {
+            node.serialized_name == name
+                || tail_component(&node.serialized_name) == Some(name)
+                || node.qualified_name.as_deref().and_then(tail_component) == Some(name)
+        });
+        if !matches!(exact, RelativeImportNameMatch::Missing) {
+            return exact;
+        }
+        self.matching_relative_name(offsets, |node| {
+            node.serialized_name_ascii_lower == name_ascii_lower
+                || tail_component(&node.serialized_name)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(name_ascii_lower))
+                || node
+                    .qualified_name
+                    .as_deref()
+                    .and_then(tail_component)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(name_ascii_lower))
         })
+    }
+
+    fn matching_relative_name(
+        &self,
+        offsets: &[usize],
+        matches_name: impl Fn(&CandidateNode) -> bool,
+    ) -> RelativeImportNameMatch {
+        let mut declaration = RelativeImportNameMatch::Missing;
+        let mut reference = RelativeImportNameMatch::Missing;
+        for node in offsets
+            .iter()
+            .map(|index| &self.relative_import_nodes[*index])
+        {
+            if !matches_name(node) {
+                continue;
+            }
+            let selected = if node.is_declaration {
+                &mut declaration
+            } else {
+                &mut reference
+            };
+            *selected = match *selected {
+                RelativeImportNameMatch::Missing => RelativeImportNameMatch::Unique(node.id),
+                RelativeImportNameMatch::Unique(id) if id == node.id => {
+                    RelativeImportNameMatch::Unique(id)
+                }
+                _ => RelativeImportNameMatch::Ambiguous,
+            };
+        }
+        if matches!(declaration, RelativeImportNameMatch::Missing) {
+            reference
+        } else {
+            declaration
+        }
     }
 
     fn cached_lookup<K, F>(
@@ -3642,6 +4368,187 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn go_control_without_go_sources_skips_unindexed_graph() -> Result<()> {
+        let root = tempdir()?;
+        let control = root.path().join("go.mod");
+        let source = b"module example.org/project\n";
+        fs::write(&control, source)?;
+        let storage = Storage::new_in_memory()?;
+        let conn = storage.get_connection();
+        conn.execute(
+            "INSERT INTO file (id, path, language, modification_time, indexed, complete, content_hash)
+             VALUES (1, ?1, 'go-module-control', 0, 1, 1, ?2)",
+            params![control.to_string_lossy(), format!("{:x}", Sha256::digest(source))],
+        )?;
+
+        // A full staged build defers graph indexes. Unrelated MODULE and IMPORT
+        // rows must not make a control-only repository run a graph-wide lookup.
+        for table in ["node", "edge"] {
+            let mut indexes = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")?;
+            let names = indexes
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in names {
+                conn.execute(&format!("DROP INDEX \"{name}\""), [])?;
+            }
+        }
+        for index in 0..384_i64 {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name) VALUES (?1, ?2, ?3)",
+                params![
+                    1_000 + index,
+                    NodeKind::MODULE as i32,
+                    format!("module{index}")
+                ],
+            )?;
+        }
+        for index in 0..384_i64 {
+            conn.execute(
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    2_000 + index,
+                    1_000 + index,
+                    1_000 + (index + 1) % 384,
+                    EdgeKind::IMPORT as i32
+                ],
+            )?;
+        }
+        let mut ticks = 0;
+        conn.progress_handler(
+            1_000,
+            Some(move || {
+                ticks += 1;
+                ticks >= 100
+            }),
+        )?;
+        let loaded = ResolutionPass::for_workspace(root.path(), &storage);
+        conn.progress_handler(0, None::<fn() -> bool>)?;
+        let pass = loaded?;
+        let context = pass.go_context.expect("workspace has Go context");
+        assert!(context.packages_by_file_node_id.is_empty());
+        assert!(context.ambiguous_import_paths.is_empty());
+        assert!(context.return_declarations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn go_package_names_scan_unindexed_edges_once_and_keep_identity_rules() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                kind INTEGER NOT NULL
+            );",
+        )?;
+        for (id, kind, file_id, name) in [
+            (1, NodeKind::MODULE, Some(10), "alpha"),
+            (2, NodeKind::MODULE, Some(11), "self_import"),
+            (3, NodeKind::MODULE, Some(12), "duplicate_a"),
+            (4, NodeKind::MODULE, Some(12), "duplicate_b"),
+            (5, NodeKind::FUNCTION, Some(13), "not_package"),
+            (6, NodeKind::MODULE, None, "no_file"),
+            (7, NodeKind::MODULE, Some(14), "nonself_import"),
+        ] {
+            conn.execute(
+                "INSERT INTO node (id, kind, file_node_id, serialized_name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, kind as i32, file_id, name],
+            )?;
+        }
+        for (id, source, target, kind) in [
+            (1, 1, 1, EdgeKind::CALL),
+            (2, 2, 2, EdgeKind::IMPORT),
+            (3, 7, 1, EdgeKind::IMPORT),
+        ] {
+            conn.execute(
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, source, target, kind as i32],
+            )?;
+        }
+
+        let packages = load_go_package_names(&conn)?;
+        assert_eq!(packages.get(&10), Some(&Some("alpha".to_string())));
+        assert!(!packages.contains_key(&11));
+        assert_eq!(packages.get(&12), Some(&None));
+        assert!(!packages.contains_key(&13));
+        assert_eq!(packages.get(&14), Some(&Some("nonself_import".to_string())));
+
+        let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {GO_PACKAGE_NAMES_QUERY}"))?;
+        let details = plan
+            .query_map(
+                params![NodeKind::MODULE as i32, EdgeKind::IMPORT as i32],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("SCAN edge"))
+                .count(),
+            1,
+            "unindexed edge table must be scanned once: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("CORRELATED")),
+            "package lookup must not repeat the edge scan: {details:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn go_source_keeps_module_control_package_identity() -> Result<()> {
+        let root = tempdir()?;
+        let control = root.path().join("go.mod");
+        let source_file = root.path().join("alpha.go");
+        let control_bytes = b"module example.org/project\n";
+        let source_bytes = b"package alpha\nfunc F() {}\n";
+        fs::write(&control, control_bytes)?;
+        fs::write(&source_file, source_bytes)?;
+        let storage = Storage::new_in_memory()?;
+        let conn = storage.get_connection();
+        for (id, path, language, bytes) in [
+            (1, &control, "go-module-control", control_bytes.as_slice()),
+            (2, &source_file, "go", source_bytes.as_slice()),
+        ] {
+            conn.execute(
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, content_hash)
+                 VALUES (?1, ?2, ?3, 0, 1, 1, ?4)",
+                params![
+                    id,
+                    path.to_string_lossy(),
+                    language,
+                    format!("{:x}", Sha256::digest(bytes))
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name) VALUES (2, ?1, ?2)",
+            params![NodeKind::FILE as i32, source_file.to_string_lossy()],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, file_node_id, serialized_name)
+             VALUES (100, ?1, 2, 'alpha')",
+            [NodeKind::MODULE as i32],
+        )?;
+
+        let context = GoResolutionContext::load(root.path(), &storage)?;
+        let package = context
+            .packages_by_file_node_id
+            .get(&2)
+            .expect("Go source has a package identity from go.mod");
+        assert_eq!(package.import_path, "example.org/project");
+        assert_eq!(package.package_name, "alpha");
+        assert!(context.ambiguous_import_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn resolution_cancellation_signal_is_typed() {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
@@ -3839,12 +4746,14 @@ mod tests {
     fn test_relative_import_lookup_matches_imported_file_symbol() {
         let index = CandidateIndex::from_nodes(vec![CandidateNode {
             id: 42,
+            kind: NodeKind::FUNCTION as i32,
             file_node_id: Some(2),
             file_path: Some(r"\\?\C:\repo\lib\client.js".to_string()),
             normalized_file_path: normalize_resolution_path(r"\\?\C:\repo\lib\client.js"),
             serialized_name: "Client".to_string(),
             serialized_name_ascii_lower: "client".to_string(),
             qualified_name: Some("Client".to_string()),
+            is_declaration: true,
         }]);
 
         assert_eq!(
@@ -3863,26 +4772,79 @@ mod tests {
     }
 
     #[test]
+    fn test_relative_import_name_priority_and_ambiguity() {
+        let cases = [
+            (vec![(1, "Target", true), (2, "target", true)], Some(2)),
+            (vec![(1, "target", false), (2, "target", true)], Some(2)),
+            (vec![(1, "target", true), (2, "target", true)], None),
+            (vec![(1, "target", false), (2, "target", false)], None),
+            (vec![(1, "Target", true)], Some(1)),
+            (vec![(1, "Target", true), (2, "TARGET", true)], None),
+            (vec![(1, "Target", true), (2, "target", false)], Some(2)),
+            (vec![(1, "pkg.target", true), (2, "Target", true)], Some(1)),
+        ];
+        for (nodes, expected) in cases {
+            // Candidate insertion order must not decide endpoint authority.
+            for reverse in [false, true] {
+                let mut nodes = nodes.clone();
+                if reverse {
+                    nodes.reverse();
+                }
+                let index = CandidateIndex::from_nodes(
+                    nodes
+                        .into_iter()
+                        .map(|(id, name, is_declaration)| CandidateNode {
+                            id,
+                            kind: NodeKind::FUNCTION as i32,
+                            file_node_id: Some(2),
+                            file_path: Some("/repo/target.ts".to_string()),
+                            normalized_file_path: normalize_resolution_path("/repo/target.ts"),
+                            serialized_name: name.to_string(),
+                            serialized_name_ascii_lower: name.to_ascii_lowercase(),
+                            qualified_name: Some(name.to_string()),
+                            is_declaration,
+                        })
+                        .collect(),
+                );
+                assert_eq!(
+                    index.find_relative_import_readonly(
+                        Some("/repo/caller.ts"),
+                        "./target",
+                        "target",
+                        "target"
+                    ),
+                    expected,
+                    "reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_owner_alias_lookup_uses_member_candidate_offsets() {
         let mut nodes = (0..250)
             .map(|idx| CandidateNode {
                 id: 10_000 + idx,
+                kind: NodeKind::METHOD as i32,
                 file_node_id: Some(1),
                 file_path: None,
                 normalized_file_path: None,
                 serialized_name: format!("Noise{idx}.unrelated"),
                 serialized_name_ascii_lower: format!("noise{idx}.unrelated"),
                 qualified_name: None,
+                is_declaration: true,
             })
             .collect::<Vec<_>>();
         nodes.push(CandidateNode {
             id: 42,
+            kind: NodeKind::METHOD as i32,
             file_node_id: Some(1),
             file_path: None,
             normalized_file_path: None,
             serialized_name: "Storage.open".to_string(),
             serialized_name_ascii_lower: "storage.open".to_string(),
             qualified_name: None,
+            is_declaration: true,
         });
         let index = CandidateIndex::from_nodes(nodes);
 
@@ -3949,6 +4911,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let rows = vec![
             (
@@ -3999,6 +4962,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let rows = vec![(
             1_i64,
@@ -4050,6 +5014,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(false),
+            go_context: None,
         };
         let row = (
             1_i64,
@@ -4091,6 +5056,7 @@ mod tests {
             flags,
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
+            go_context: None,
         };
         let row = (
             2_i64,

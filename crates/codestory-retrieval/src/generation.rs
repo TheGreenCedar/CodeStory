@@ -2,7 +2,7 @@
 use codestory_contracts::graph::NodeKind;
 use codestory_store::{RetrievalIndexManifest, Store};
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 6;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 7;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v3";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";

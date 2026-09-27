@@ -1,8 +1,15 @@
 name: Platform and integration proof
 
+run-name: ${{ inputs.coordinator_dispatch_id && format('codestory-release:{0}', inputs.coordinator_dispatch_id) || 'Platform and integration proof' }}
+
 on:
   workflow_dispatch:
     inputs:
+      coordinator_dispatch_id:
+        description: Optional release coordinator identity for resumable dispatch ownership.
+        required: false
+        default: ""
+        type: string
       mode:
         description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, or prove current dev.
         required: true

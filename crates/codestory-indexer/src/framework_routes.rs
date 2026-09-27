@@ -2972,6 +2972,182 @@ async def show_user():
     }
 
     #[test]
+    fn test_fastapi_route_identity_is_owned_by_declaring_file() -> Result<()> {
+        let first = super::super::index_file(
+            Path::new("apps/first.py"),
+            r#"from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/shared")
+async def first_handler():
+    return "first"
+"#,
+            &super::super::get_language_for_ext("py").expect("python config"),
+            None,
+            None,
+        )?;
+        let second = super::super::index_file(
+            Path::new("apps/second.py"),
+            r#"from fastapi import APIRouter
+router = APIRouter()
+
+@router.get("/shared")
+async def second_handler():
+    return "second"
+"#,
+            &super::super::get_language_for_ext("py").expect("python config"),
+            None,
+            None,
+        )?;
+
+        let first_file = first
+            .nodes
+            .iter()
+            .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
+            .expect("first file node");
+        let second_file = second
+            .nodes
+            .iter()
+            .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
+            .expect("second file node");
+        let first_route = first
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("first route");
+        let second_route = second
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("second route");
+        let first_handler = first
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "first_handler")
+            .expect("first handler");
+        let second_handler = second
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "second_handler")
+            .expect("second handler");
+
+        assert_ne!(first_file.id, second_file.id);
+        assert_ne!(
+            first_route.id, second_route.id,
+            "unrelated files must not share a route node solely because method and path match"
+        );
+        assert_ne!(
+            first_route.canonical_id.as_deref(),
+            second_route.canonical_id.as_deref(),
+            "route canonical identity must include its declaring file"
+        );
+        for (artifact, file, route, handler) in [
+            (&first, first_file, first_route, first_handler),
+            (&second, second_file, second_route, second_handler),
+        ] {
+            assert_eq!(route.file_node_id, Some(file.id));
+            assert!(artifact.edges.iter().any(|edge| {
+                edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+                    && edge.source == file.id
+                    && edge.target == route.id
+            }));
+            assert!(artifact.edges.iter().any(|edge| {
+                edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                    && edge.source == route.id
+                    && edge.target == handler.id
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastapi_route_identity_preserves_repeated_same_file_declarations() -> Result<()> {
+        let result = super::super::index_file(
+            Path::new("apps/repeated.py"),
+            r#"from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/shared")
+async def first_handler():
+    return "first"
+
+@app.get("/shared")
+async def second_handler():
+    return "second"
+"#,
+            &super::super::get_language_for_ext("py").expect("python config"),
+            None,
+            None,
+        )?;
+
+        let file = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
+            .expect("file node");
+        let mut routes = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by_key(|node| node.start_line);
+        assert_eq!(
+            routes.len(),
+            2,
+            "each retained declaration line must produce its own route node"
+        );
+        assert_ne!(routes[0].id, routes[1].id);
+        assert_ne!(
+            routes[0].canonical_id.as_deref(),
+            routes[1].canonical_id.as_deref()
+        );
+
+        let first_handler = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "first_handler")
+            .expect("first handler");
+        let second_handler = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "second_handler")
+            .expect("second handler");
+        let member_targets = result
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+                    && edge.source == file.id
+                    && routes.iter().any(|route| route.id == edge.target)
+            })
+            .map(|edge| edge.target)
+            .collect::<HashSet<_>>();
+        assert_eq!(member_targets, HashSet::from([routes[0].id, routes[1].id]));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                && edge.source == routes[0].id
+                && edge.target == first_handler.id
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                && edge.source == routes[1].id
+                && edge.target == second_handler.id
+        }));
+        assert!(!result.edges.iter().any(|edge| {
+            edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                && ((edge.source == routes[0].id && edge.target == second_handler.id)
+                    || (edge.source == routes[1].id && edge.target == first_handler.id))
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn test_fastapi_syntax_error_fallback_stays_structural() -> Result<()> {
         let source = r#"from fastapi import FastAPI
 app = FastAPI()

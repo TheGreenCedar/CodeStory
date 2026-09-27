@@ -1,6 +1,5 @@
 (function_definition
-  declarator: (function_declarator
-    declarator: (identifier) @name)) @def
+  declarator: (_) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"

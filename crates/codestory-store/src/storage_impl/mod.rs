@@ -1,7 +1,9 @@
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
+use codestory_contracts::core_publication::CoreGenerationIdentityV1;
 use codestory_contracts::owned_artifacts;
+use codestory_contracts::validation_receipts::{ArtifactSeal, SealedReceiptCache};
 
 use codestory_contracts::graph::{
     AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
@@ -23,6 +25,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,11 +33,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod bookmarks;
+mod core_retention;
 mod helpers;
+mod proof_resolution;
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
 mod trail;
+
+pub use core_retention::{
+    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, LegacyRetirementReport,
+    apply_core_retention, apply_legacy_retirement, observe_legacy_retirement,
+};
+pub(crate) use core_retention::{
+    CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,
+};
 
 use crate::annotations::{
     AnnotationCategory, CoreAnchorCandidate, LegacyAnnotationSnapshot, LegacyBookmarkRow,
@@ -46,8 +59,33 @@ use helpers::{
 };
 
 pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+pub(crate) use proof_resolution::ProofResolutionPublicationValidation;
+#[cfg(debug_assertions)]
+pub use proof_resolution::{
+    BashStoreResolutionWork, bash_store_resolution_work, reset_bash_store_resolution_work,
+    reset_store_replay_work, store_replay_work,
+};
+pub use proof_resolution::{ProofResolutionPublication, seal_call_resolution_fact};
 
-const SCHEMA_VERSION: u32 = 31;
+#[derive(Debug, Clone)]
+pub(crate) struct CoreCandidateReceipt {
+    publication: IndexPublicationRecord,
+    source_policy_digest: String,
+    structural_validation: StructuralTextPublicationValidation,
+    proof_validation: ProofResolutionPublicationValidation,
+    dense_anchor_validation: DenseAnchorPublicationValidation,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SealedCoreCandidateReceipt {
+    receipt: CoreCandidateReceipt,
+    artifacts: Vec<ArtifactSeal>,
+}
+
+const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
+const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
+const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
+const SCHEMA_VERSION: u32 = ATTACHED_COMMENT_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -86,6 +124,37 @@ const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node
        AND e.source_node_id = ?1
        AND e.resolved_source_node_id IS NULL
      ORDER BY id ASC";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRawCallEdges {
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
+
+/// A bounded edge-only neighborhood. Unlike trail traversal, this projection
+/// never joins or materializes endpoint nodes or file records.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRawIncidentEdges {
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCallEdgeProjection {
+    pub edge_id: EdgeId,
+    pub raw_source: NodeId,
+    pub raw_target: NodeId,
+    pub raw_kind: EdgeKind,
+    pub file_node_id: Option<NodeId>,
+    pub line: Option<u32>,
+    pub callsite_identity: Option<String>,
+    pub raw_target_kind: NodeKind,
+    pub raw_target_file_node_id: Option<NodeId>,
+    pub raw_target_start_line: Option<u32>,
+    pub raw_target_name: String,
+    pub caller: NodeId,
+    pub target: NodeId,
+}
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -105,30 +174,29 @@ const INDEX_ARTIFACT_CACHE_SELECT_SQL: &str = "SELECT artifact_blob
      FROM index_artifact_cache
      WHERE file_path = ?1
        AND cache_key = ?2";
-#[cfg(test)]
-const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
-#[cfg(test)]
-const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
 const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
 const SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION: u32 = 5;
-const PROMOTION_JOURNAL_VERSION: u32 = 6;
+const ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION: u32 = 6;
+const PROMOTION_JOURNAL_VERSION: u32 = 7;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
 // identity at schema 28. Journal v4 binds the structural-unit source-policy
 // identity added at schema 29. Journal v5 admits the semantic-projection
 // publication mode added at schema 30. Journal v6 admits the annotation-sidecar
 // cutover at schema 31, which moves user annotations out of the promoted
-// database entirely. Recovery runs before schema migration, so these
-// boundaries are part of the durable journal contract.
+// database entirely. Journal v7 binds the optional proof-resolution projection
+// added at schema 32. Recovery runs before schema migration, so these boundaries
+// are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
 const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
 const ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION: u32 = 31;
+const PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 32;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -141,6 +209,11 @@ pub struct DatabaseSnapshotCopyStats {
     pub copy_ms: u32,
     pub source_bytes: u64,
     pub target_bytes: u64,
+    pub stage_strategy: &'static str,
+    pub fallback_reason: Option<&'static str>,
+    pub native_error_code: Option<i32>,
+    pub cloned_bytes: u64,
+    pub copied_bytes: u64,
 }
 
 /// Rows rebound or invalidated while preparing a cache for a sibling worktree.
@@ -154,11 +227,13 @@ pub struct RehydratedCacheRebaseStats {
 
 /// Successful core promotion timing and logical database-image sizes.
 ///
-/// These phases are nested within the caller's publication wall. Optional
-/// backup phases are present only when a previous live publication existed.
+/// These phases are nested within the caller's publication wall. Legacy
+/// fixed-path backup/journal/restore fields remain for receipt compatibility
+/// and are empty or zero for immutable-generation publication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CorePromotionStats {
     pub total_ms: u32,
+    pub lock_wait_ms: u32,
     pub lock_recovery_ms: u32,
     pub candidate_validation_ms: u32,
     pub previous_validation_ms: u32,
@@ -170,15 +245,22 @@ pub struct CorePromotionStats {
     pub staged_to_live_restore_ms: u32,
     pub promoted_validation_ms: u32,
     pub committed_journal_ms: u32,
+    /// Rename of the sealed staging directory into its immutable generation.
+    pub generation_install_ms: u32,
+    /// Atomic replacement of `core/publication.json`.
+    pub pointer_publication_ms: u32,
     pub cleanup_ms: u32,
     pub unattributed_ms: u32,
     pub candidate_bytes: u64,
     pub previous_live_bytes: Option<u64>,
     pub rollback_backup_bytes: Option<u64>,
-    /// Which post-restore identity fence the promotion actually satisfied.
+    /// Logical bytes retained by reference as the immutable rollback generation.
+    pub rollback_generation_bytes: Option<u64>,
+    /// Which post-install identity fence the promotion actually satisfied.
     pub promoted_validation: PromotedValidation,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PromotionJournalWriteStats {
     write: Duration,
@@ -188,17 +270,12 @@ struct PromotionJournalWriteStats {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CorePromotionDurations {
+    lock_wait: Duration,
     lock_recovery: Duration,
     candidate_validation: Duration,
     previous_validation: Duration,
-    rollback_backup_copy: Option<Duration>,
-    backup_validation: Option<Duration>,
-    prepared_journal_write: Duration,
-    prepared_journal_file_sync: Duration,
-    prepared_journal_directory_sync: Duration,
-    staged_to_live_restore: Duration,
-    promoted_validation: Duration,
-    committed_journal: Duration,
+    generation_install: Duration,
+    pointer_publication: Duration,
     cleanup: Duration,
 }
 
@@ -209,51 +286,46 @@ impl CorePromotionDurations {
         candidate_bytes: u64,
         previous_live_bytes: Option<u64>,
         rollback_backup_bytes: Option<u64>,
+        rollback_generation_bytes: Option<u64>,
         promoted_validation: PromotedValidation,
     ) -> CorePromotionStats {
         let total_ms = duration_ms(total);
+        let lock_wait_ms = duration_ms(self.lock_wait);
         let lock_recovery_ms = duration_ms(self.lock_recovery);
         let candidate_validation_ms = duration_ms(self.candidate_validation);
         let previous_validation_ms = duration_ms(self.previous_validation);
-        let rollback_backup_copy_ms = self.rollback_backup_copy.map(duration_ms);
-        let backup_validation_ms = self.backup_validation.map(duration_ms);
-        let prepared_journal_write_ms = duration_ms(self.prepared_journal_write);
-        let prepared_journal_file_sync_ms = duration_ms(self.prepared_journal_file_sync);
-        let prepared_journal_directory_sync_ms = duration_ms(self.prepared_journal_directory_sync);
-        let staged_to_live_restore_ms = duration_ms(self.staged_to_live_restore);
-        let promoted_validation_ms = duration_ms(self.promoted_validation);
-        let committed_journal_ms = duration_ms(self.committed_journal);
+        let generation_install_ms = duration_ms(self.generation_install);
+        let pointer_publication_ms = duration_ms(self.pointer_publication);
         let cleanup_ms = duration_ms(self.cleanup);
-        let named_ms = lock_recovery_ms
+        let named_ms = lock_wait_ms
+            .saturating_add(lock_recovery_ms)
             .saturating_add(candidate_validation_ms)
             .saturating_add(previous_validation_ms)
-            .saturating_add(rollback_backup_copy_ms.unwrap_or_default())
-            .saturating_add(backup_validation_ms.unwrap_or_default())
-            .saturating_add(prepared_journal_write_ms)
-            .saturating_add(prepared_journal_file_sync_ms)
-            .saturating_add(prepared_journal_directory_sync_ms)
-            .saturating_add(staged_to_live_restore_ms)
-            .saturating_add(promoted_validation_ms)
-            .saturating_add(committed_journal_ms)
+            .saturating_add(generation_install_ms)
+            .saturating_add(pointer_publication_ms)
             .saturating_add(cleanup_ms);
         CorePromotionStats {
             total_ms,
+            lock_wait_ms,
             lock_recovery_ms,
             candidate_validation_ms,
             previous_validation_ms,
-            rollback_backup_copy_ms,
-            backup_validation_ms,
-            prepared_journal_write_ms,
-            prepared_journal_file_sync_ms,
-            prepared_journal_directory_sync_ms,
-            staged_to_live_restore_ms,
-            promoted_validation_ms,
-            committed_journal_ms,
+            rollback_backup_copy_ms: None,
+            backup_validation_ms: None,
+            prepared_journal_write_ms: 0,
+            prepared_journal_file_sync_ms: 0,
+            prepared_journal_directory_sync_ms: 0,
+            staged_to_live_restore_ms: 0,
+            promoted_validation_ms: 0,
+            committed_journal_ms: 0,
+            generation_install_ms,
+            pointer_publication_ms,
             cleanup_ms,
             unattributed_ms: total_ms.saturating_sub(named_ms),
             candidate_bytes,
             previous_live_bytes,
             rollback_backup_bytes,
+            rollback_generation_bytes,
             promoted_validation,
         }
     }
@@ -283,11 +355,32 @@ fn database_logical_bytes(connection: &Connection) -> Result<u64, StorageError> 
     })
 }
 
-fn database_logical_bytes_at_path(path: &Path) -> Result<u64, StorageError> {
-    let connection = Connection::open_with_flags(
-        sqlite_path::open_path(path),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+fn core_generation_identity(
+    publication: &IndexPublicationRecord,
+    logical_bytes: u64,
+) -> CoreGenerationIdentityV1 {
+    CoreGenerationIdentityV1 {
+        generation_id: publication.generation_id.clone(),
+        run_id: publication.run_id.clone(),
+        logical_bytes,
+        published_at_epoch_ms: publication.published_at_epoch_ms,
+    }
+}
+
+pub(crate) fn database_logical_bytes_at_path(path: &Path) -> Result<u64, StorageError> {
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let has_live_wal = fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0);
+    let connection = if has_live_wal {
+        Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?
+    } else {
+        Connection::open_with_flags(
+            sqlite_path::observational_uri(path, true),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    };
     database_logical_bytes(&connection)
 }
 
@@ -602,9 +695,13 @@ impl RecoveryDatabaseContract {
                     ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
                     .contains(&schema_version)
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION) => {
                 (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
                     ..=ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION)
                     .contains(&schema_version)
             }
             Self::Journal(_) => false,
@@ -628,6 +725,10 @@ struct PromotionJournal {
     previous_structural_text: Option<StructuralTextUnitRollbackIdentity>,
     #[serde(default)]
     candidate_structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    #[serde(default)]
+    previous_proof_resolution: Option<ProofResolutionRollbackIdentity>,
+    #[serde(default)]
+    candidate_proof_resolution: Option<ProofResolutionRollbackIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +761,16 @@ struct StructuralTextUnitRollbackIdentity {
     projection_digest: String,
     descriptor_version: u32,
     migration_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProofResolutionRollbackIdentity {
+    core_generation_id: String,
+    core_run_id: String,
+    core_published_at_epoch_ms: i64,
+    fact_schema_version: u32,
+    fact_count: u64,
+    fact_digest: String,
 }
 
 fn read_source_policy_exclusion_rollback_identity(
@@ -1007,13 +1118,124 @@ fn require_candidate_structural_text_identity(
     require_recorded_structural_text_identity(path, publication, expected, role)
 }
 
-/// Byte extent of the SQLite database header.
+fn read_proof_resolution_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<ProofResolutionRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let schema_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+        .max(0) as u32;
+    let fact_table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'proof_resolution_fact'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    let publication_table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'proof_resolution_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if fact_table_exists == 0 || publication_table_exists == 0 {
+        if schema_version < PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION
+            && fact_table_exists == 0
+            && publication_table_exists == 0
+        {
+            return Ok(None);
+        }
+        return Err(promotion_error(format!(
+            "Proof resolution rollback tables are missing from {}",
+            path.display()
+        )));
+    }
+    let legacy_v32_shape = if schema_version == PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
+        let mut statement = conn.prepare("PRAGMA table_info(proof_resolution_fact)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        ["source_sha256", "dependency_json", "parser_fingerprint"]
+            .iter()
+            .all(|column| columns.contains(*column))
+            && !columns.contains("provenance_id")
+    } else {
+        false
+    };
+    let storage = Storage {
+        conn,
+        retrieval_publication_path: None,
+        _core_generation_lease: None,
+        cache: StorageCache::default(),
+        deferred_secondary_indexes: false,
+        durability_profile: SqliteDurabilityProfile::Durable,
+    };
+    let fact_count = storage.proof_resolution_fact_count()?;
+    let Some(_) = storage.get_proof_resolution_publication()? else {
+        if fact_count == 0 {
+            return Ok(None);
+        }
+        return Err(promotion_error(format!(
+            "Proof resolution rollback facts have no publication in {}",
+            path.display()
+        )));
+    };
+    let receipt = if legacy_v32_shape {
+        storage.validate_stored_legacy_v32_proof_resolution_publication(publication)
+    } else {
+        storage.validate_stored_proof_resolution_publication(publication)
+    }
+    .map_err(|error| {
+        promotion_error(format!(
+            "Proof resolution rollback identity does not match {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(ProofResolutionRollbackIdentity {
+        core_generation_id: receipt.core_generation_id,
+        core_run_id: receipt.core_run_id,
+        core_published_at_epoch_ms: receipt.published_at_epoch_ms,
+        fact_schema_version: receipt.fact_schema_version,
+        fact_count: receipt.fact_count,
+        fact_digest: receipt.fact_digest,
+    }))
+}
+
+fn require_recorded_proof_resolution_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<ProofResolutionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if &read_proof_resolution_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} proof resolution identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Byte extent of the SQLite database header in retained legacy-promotion
+/// tests.
+#[cfg(test)]
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 
 /// Header slots SQLite rewrites as bookkeeping when it commits or completes a
 /// `sqlite3_backup`, and which therefore carry no database content: the file
 /// change counter (24..28), the schema cookie (40..44), and the version-valid-for
 /// counter (92..96). Every other byte of the file, header included, participates.
+#[cfg(test)]
 const SQLITE_VOLATILE_HEADER_SLOTS: [(usize, usize); 3] = [(24, 28), (40, 44), (92, 96)];
 
 /// Rollback-journal sidecars that can hold database content outside the main
@@ -1026,6 +1248,7 @@ const SQLITE_CONTENT_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-journal"];
 /// This is content evidence, not a handle: two databases with the same image
 /// hold the same pages, so a validation that passed on one is a validation of
 /// the other. It is deliberately opaque so no caller can manufacture one.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PromotionDatabaseImage([u8; 32]);
 
@@ -1036,6 +1259,7 @@ struct PromotionDatabaseImage([u8; 32]);
 /// puts content outside the main file, and a file shorter than the header is not
 /// a database. An unprovable image never admits reuse; it forces full
 /// revalidation.
+#[cfg(test)]
 fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage>, StorageError> {
     for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
         let sidecar = sqlite_sidecar_path(path, suffix);
@@ -1076,26 +1300,81 @@ fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage
     Ok(Some(PromotionDatabaseImage(hasher.finalize().into())))
 }
 
-/// How the post-restore fence was satisfied for one promotion.
+fn require_standalone_core_candidate(path: &Path) -> Result<(), StorageError> {
+    for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match fs::metadata(&sidecar) {
+            Ok(metadata) if metadata.len() > 0 => {
+                return Err(promotion_error(format!(
+                    "Immutable core candidate {} retains SQLite content in {}",
+                    path.display(),
+                    sidecar.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(promotion_path_error("inspect", &sidecar, error)),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn seal_core_candidate_receipt(
+    path: &Path,
+    receipt: CoreCandidateReceipt,
+) -> Result<SealedCoreCandidateReceipt, StorageError> {
+    require_standalone_core_candidate(path)?;
+    remove_closed_core_sidecars(path)?;
+    crate::core_generation::sync_staging_database(path)?;
+    crate::core_generation::make_file_immutable(path)?;
+    let artifacts = vec![
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-journal"),
+    ];
+    let artifacts = ArtifactSeal::observe_all(&artifacts).map_err(|error| {
+        promotion_error(format!("failed to seal staged core candidate: {error}"))
+    })?;
+    Ok(SealedCoreCandidateReceipt { receipt, artifacts })
+}
+
+fn remove_closed_core_sidecars(path: &Path) -> Result<(), StorageError> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(promotion_path_error(
+                    "remove closed candidate sidecar",
+                    &sidecar,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How the published-generation validation fence was satisfied for one
+/// promotion.
 ///
 /// This is reported, not merely logged, because whether a promotion can prove
 /// the published file byte-identical to the candidate it validated is the
-/// property any replacement for whole-database restore has to keep. A design
-/// that assembles the live image in place — a staged delta or an
-/// attached-database apply — never produces a file identical to a
-/// pre-validated candidate, so it can only ever report `Revalidated`. Without
-/// this field the difference is invisible in telemetry and the promotion fence
-/// could be weakened without any measurement moving.
+/// property every immutable-generation publisher has to keep. The current
+/// publisher validates the sealed candidate once and then renames that exact
+/// staging directory into place, so its receipt remains valid without another
+/// whole-file read.
 ///
 /// `Revalidated` is the default because it is the weaker claim: an unset or
 /// older payload must not read as a proven byte-identical publication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PromotedValidation {
-    /// The restored file is byte-identical to the validated candidate, so the
+    /// The installed immutable generation is the validated candidate, so the
     /// candidate's receipt covers it.
     ReusedCandidateReceipt,
-    /// The restored file could not be proven identical, so it was validated in
-    /// full.
+    /// The installed artifact could not reuse the candidate receipt, so it was
+    /// validated in full.
     #[default]
     Revalidated,
 }
@@ -1117,12 +1396,14 @@ impl PromotedValidation {
 /// sealed to that candidate's validation — which proves the two files hold the
 /// same pages, so re-deriving the same verdict from them is redundant work. A
 /// missing image on either side, or any difference at all, revalidates in full.
+#[cfg(test)]
 fn validate_promoted_live_database(
     live_path: &Path,
     staged_path: &Path,
     candidate: &IndexPublicationRecord,
     candidate_source_policy: &Option<SourcePolicyExclusionRollbackIdentity>,
     candidate_structural_text: &Option<StructuralTextUnitRollbackIdentity>,
+    candidate_proof_resolution: &Option<ProofResolutionRollbackIdentity>,
     candidate_image: Option<PromotionDatabaseImage>,
 ) -> Result<PromotedValidation, StorageError> {
     let published =
@@ -1148,6 +1429,12 @@ fn validate_promoted_live_database(
         live_path,
         &published,
         candidate_structural_text,
+        "Promoted live database",
+    )?;
+    require_recorded_proof_resolution_identity(
+        live_path,
+        &published,
+        candidate_proof_resolution,
         "Promoted live database",
     )?;
     Ok(PromotedValidation::Revalidated)
@@ -1212,10 +1499,19 @@ fn inspect_promotion_database(path: &Path) -> Result<Option<(Connection, u32)>, 
     if !path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(
-        sqlite_path::open_path(path),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let has_live_wal = fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0);
+    let conn = if has_live_wal {
+        Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?
+    } else {
+        Connection::open_with_flags(
+            sqlite_path::observational_uri(path, true),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    };
     let _ = conn.busy_timeout(Duration::from_millis(2_500));
     let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
@@ -1256,6 +1552,21 @@ fn read_recovery_database_identity(
     };
     match schema_version {
         0 => Ok(None),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+            if contract == RecoveryDatabaseContract::CurrentPromotion =>
+        {
+            // A prior incremental writer can retain its old publication row
+            // while fencing the image. Neither that row nor material graph
+            // state makes the interrupted image a rollback generation.
+            if has_incomplete_incremental_marker(&conn)? {
+                Ok(None)
+            } else {
+                Err(promotion_error(format!(
+                    "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
+                    path.display()
+                )))
+            }
+        }
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
         }
@@ -1271,6 +1582,14 @@ fn read_recovery_database_identity(
             path.display(),
         ))),
     }
+}
+
+fn is_replaceable_incomplete_legacy_predecessor(path: &Path) -> Result<bool, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(false);
+    };
+    Ok(schema_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+        && has_incomplete_incremental_marker(&conn)?)
 }
 
 fn require_complete_promotion_database_identity(
@@ -1298,6 +1617,42 @@ fn require_recovery_database_identity(
     })
 }
 
+fn require_empty_unpublished_core(path: &Path) -> Result<(), StorageError> {
+    let connection = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    for table in [
+        "file",
+        "node",
+        "edge",
+        "occurrence",
+        "index_publication",
+        "bookmark_node",
+        "bookmark_category",
+        "retrieval_index_manifest",
+    ] {
+        let exists: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table],
+            |row| row.get(0),
+        )?;
+        if exists != 0 {
+            let rows: i64 =
+                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            if rows != 0 {
+                return Err(promotion_error(format!(
+                    "Legacy live core {} has unpublished material state in {table}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError> {
     let bytes = fs::read(path).map_err(|error| promotion_path_error("read", path, error))?;
     let journal: PromotionJournal = serde_json::from_slice(&bytes)
@@ -1309,6 +1664,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
             | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
             | SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION
+            | ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -1332,6 +1688,7 @@ fn sync_promotion_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn write_promotion_journal(
     path: &Path,
     journal: &PromotionJournal,
@@ -1372,21 +1729,6 @@ fn write_promotion_journal(
         file_sync,
         directory_sync,
     })
-}
-
-fn commit_promotion_journal(
-    prepared_path: &Path,
-    committed_path: &Path,
-) -> Result<(), StorageError> {
-    if committed_path.exists() {
-        return Err(promotion_error(format!(
-            "Cannot commit promotion while prior journal {} remains",
-            committed_path.display()
-        )));
-    }
-    fs::rename(prepared_path, committed_path)
-        .map_err(|error| promotion_path_error("commit journal as", committed_path, error))?;
-    sync_promotion_parent(committed_path)
 }
 
 fn remove_promotion_file(path: &Path) -> Result<(), StorageError> {
@@ -1529,6 +1871,14 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 "Legacy committed live database",
             )?;
         }
+        if committed.version >= PROMOTION_JOURNAL_VERSION {
+            require_recorded_proof_resolution_identity(
+                path,
+                &live_identity,
+                &committed.candidate_proof_resolution,
+                "Committed live database",
+            )?;
+        }
         if let Err(error) = cleanup_committed_promotion_artifacts(path) {
             tracing::warn!(
                 live_path = %path.display(),
@@ -1614,6 +1964,14 @@ fn rollback_prepared_promotion(
                     "Prepared candidate",
                 )?;
             }
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_proof_resolution,
+                    "Prepared candidate",
+                )?;
+            }
         } else if prepared.previous.as_ref() == Some(live_identity) {
             require_recorded_source_policy_identity(
                 live_path,
@@ -1627,6 +1985,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Prepared previous live database",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.previous_proof_resolution,
+                    "Prepared previous live database",
+                )?;
+            }
         }
     }
 
@@ -1655,6 +2021,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Prepared recovery backup",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    &backup_path,
+                    &backup_identity,
+                    &prepared.previous_proof_resolution,
+                    "Prepared recovery backup",
+                )?;
+            }
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
@@ -1681,6 +2055,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Restored live database",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    &restored,
+                    &prepared.previous_proof_resolution,
+                    "Restored live database",
+                )?;
+            }
             remove_promotion_file(&prepared_path)?;
             cleanup_sqlite_sidecars(&backup_path)
         }
@@ -1699,34 +2081,39 @@ fn rollback_prepared_promotion(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryAuxiliaryIdentities {
+    source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    proof_resolution: Option<ProofResolutionRollbackIdentity>,
+}
+
 fn read_journal_less_recovery_auxiliary_identities(
     path: &Path,
     publication: &IndexPublicationRecord,
     schema_version: u32,
     role: &str,
-) -> Result<
-    (
-        Option<SourcePolicyExclusionRollbackIdentity>,
-        Option<StructuralTextUnitRollbackIdentity>,
-    ),
-    StorageError,
-> {
+) -> Result<RecoveryAuxiliaryIdentities, StorageError> {
     let source_policy = if schema_version >= SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
         read_source_policy_exclusion_rollback_identity(path, publication)?
     } else {
         None
     };
-    if schema_version == SCHEMA_VERSION && source_policy.is_none() {
+    // Schema 27 introduced the source-policy receipt as optional recovery
+    // metadata. Schema 28 made it part of every complete structural
+    // publication, so later feature schemas must carry it even after the
+    // current schema advances.
+    if schema_version >= STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION && source_policy.is_none() {
         return Err(promotion_error(format!(
-            "Current-schema {role} {} has no complete source policy exclusion manifest",
+            "Feature-schema {role} {} has no complete source policy exclusion manifest",
             path.display()
         )));
     }
-    let structural_text = if schema_version == SCHEMA_VERSION {
+    let structural_text = if schema_version >= STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
         let identity = read_structural_text_unit_rollback_identity(path, publication)?;
         if identity.is_none() {
             return Err(promotion_error(format!(
-                "Current-schema {role} {} has no complete structural text unit manifest",
+                "Feature-schema {role} {} has no complete structural text unit manifest",
                 path.display()
             )));
         }
@@ -1734,7 +2121,16 @@ fn read_journal_less_recovery_auxiliary_identities(
     } else {
         None
     };
-    Ok((source_policy, structural_text))
+    let proof_resolution = if schema_version >= PROOF_RESOLUTION_PROMOTION_MIN_SCHEMA_VERSION {
+        read_proof_resolution_rollback_identity(path, publication)?
+    } else {
+        None
+    };
+    Ok(RecoveryAuxiliaryIdentities {
+        source_policy,
+        structural_text,
+        proof_resolution,
+    })
 }
 
 fn recover_legacy_promotion_backup(
@@ -1755,13 +2151,12 @@ fn recover_legacy_promotion_backup(
         "Legacy promotion backup",
         recovery_contract,
     )?;
-    let (backup_source_policy, backup_structural_text) =
-        read_journal_less_recovery_auxiliary_identities(
-            backup_path,
-            &backup_identity,
-            backup_schema_version,
-            "legacy promotion backup",
-        )?;
+    let backup_auxiliary = read_journal_less_recovery_auxiliary_identities(
+        backup_path,
+        &backup_identity,
+        backup_schema_version,
+        "legacy promotion backup",
+    )?;
     let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
@@ -1783,12 +2178,7 @@ fn recover_legacy_promotion_backup(
                 live_schema_version,
                 "live database",
             ) {
-                Ok((live_source_policy, live_structural_text))
-                    if live_source_policy == backup_source_policy
-                        && live_structural_text == backup_structural_text =>
-                {
-                    false
-                }
+                Ok(live_auxiliary) if live_auxiliary == backup_auxiliary => false,
                 Ok(_) | Err(_) => true,
             }
         }
@@ -1835,13 +2225,19 @@ fn recover_legacy_promotion_backup(
         require_recorded_source_policy_identity(
             live_path,
             &restored,
-            &backup_source_policy,
+            &backup_auxiliary.source_policy,
             "Recovered live database",
         )?;
         require_recorded_structural_text_identity(
             live_path,
             &restored,
-            &backup_structural_text,
+            &backup_auxiliary.structural_text,
+            "Recovered live database",
+        )?;
+        require_recorded_proof_resolution_identity(
+            live_path,
+            &restored,
+            &backup_auxiliary.proof_resolution,
             "Recovered live database",
         )?;
     }
@@ -2095,6 +2491,90 @@ fn outside_file_node_predicate(qualifier: &str, file_param: &str) -> String {
     format!("({qualifier}file_node_id IS NULL OR {qualifier}file_node_id != {file_param})")
 }
 
+/// Drop the inherited proof facts that reference edges a projection cleanup is
+/// about to delete.
+///
+/// `proof_resolution_fact.edge_id` is a foreign key into `edge`, and
+/// `begin_incremental_run` deliberately keeps inherited facts so a
+/// source-identity-only refresh can rebind them. Every caller of this helper is
+/// a graph change, which forces a full proof rematerialization afterwards, so
+/// the dependent facts are stale rather than rebindable. `edge_predicate` must
+/// be the exact predicate the edge delete uses, with `?1` bound to the file
+/// node id.
+fn delete_proof_facts_for_removed_edges_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    edge_predicate: &str,
+    file_node_id: i64,
+) -> Result<BTreeSet<i64>, StorageError> {
+    delete_proof_facts_matching_in_tx(
+        tx,
+        &format!("edge_id IN (SELECT id FROM edge WHERE {edge_predicate})"),
+        file_node_id,
+    )
+}
+
+fn delete_proof_facts_matching_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    fact_predicate: &str,
+    file_node_id: i64,
+) -> Result<BTreeSet<i64>, StorageError> {
+    let missing_provenance: i64 = tx.query_row(
+        &format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM proof_resolution_fact AS f
+                LEFT JOIN proof_resolution_provenance AS p
+                  ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id
+                WHERE f.rowid IN (
+                    SELECT rowid FROM proof_resolution_fact WHERE {fact_predicate}
+                ) AND p.provenance_id IS NULL
+            )"
+        ),
+        params![file_node_id],
+        |row| row.get(0),
+    )?;
+    if missing_provenance != 0 {
+        return Err(StorageError::Other(
+            "affected proof facts have missing or cross-file provenance".to_string(),
+        ));
+    }
+    let mut statement = tx.prepare(&format!(
+        "DELETE FROM proof_resolution_fact
+         WHERE {fact_predicate}
+         RETURNING provenance_id"
+    ))?;
+    let provenance_ids = statement
+        .query_map(params![file_node_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(provenance_ids)
+}
+
+fn delete_orphan_proof_provenance_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    provenance_ids: &BTreeSet<i64>,
+) -> Result<usize, StorageError> {
+    let mut deleted = 0;
+    for chunk in provenance_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks(400)
+    {
+        let placeholders = numbered_placeholders(1, chunk.len());
+        deleted += tx.execute(
+            &format!(
+                "DELETE FROM proof_resolution_provenance
+                 WHERE provenance_id IN ({placeholders})
+                   AND NOT EXISTS (
+                     SELECT 1 FROM proof_resolution_fact AS f
+                     WHERE f.provenance_id = proof_resolution_provenance.provenance_id
+                   )"
+            ),
+            params_from_iter(chunk.iter()),
+        )?;
+    }
+    Ok(deleted)
+}
+
 fn get_index_artifact_cache_from_connection(
     connection: &Connection,
     path: &Path,
@@ -2167,6 +2647,16 @@ fn structural_text_unit_from_row(row: &Row<'_>) -> Result<StructuralTextUnit> {
 /// Errors returned by storage facade operations.
 #[derive(Error, Debug)]
 pub enum StorageError {
+    #[error("sealed file staging was cancelled")]
+    Cancelled,
+    #[error(
+        "insufficient cache space for {operation}: required {required_bytes} bytes, available {available_bytes} bytes"
+    )]
+    InsufficientSpace {
+        operation: &'static str,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
     #[error("Database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("{0} requires a non-zero batch limit")]
@@ -2210,6 +2700,12 @@ pub struct BuildNodeLookup {
 /// after mutating graph/search projections.
 pub struct Storage {
     conn: Connection,
+    /// Mutable retrieval pointer kept outside immutable core generations.
+    /// Staged and legacy stores retain `None` and use their embedded row only
+    /// as a migration input.
+    retrieval_publication_path: Option<PathBuf>,
+    /// A writer-provisioned immutable generation stays alive for this handle.
+    _core_generation_lease: Option<CoreGenerationLease>,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
     durability_profile: SqliteDurabilityProfile,
@@ -2633,6 +3129,9 @@ fn record_projection_statement(
 struct StorageCache {
     nodes:
         Arc<RwLock<HashMap<codestory_contracts::graph::NodeId, codestory_contracts::graph::Node>>>,
+    produced_dense_anchor_validation: Arc<RwLock<Option<DenseAnchorPublicationValidation>>>,
+    produced_structural_text_validation: Arc<RwLock<Option<StructuralTextPublicationValidation>>>,
+    produced_proof_resolution_validation: Arc<RwLock<Option<ProofResolutionPublicationValidation>>>,
 }
 
 /// Stored file row persisted with graph projections.
@@ -2658,6 +3157,17 @@ pub struct FileInfo {
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+/// Opaque parser-cache payload retained for one source path.
+///
+/// The store deliberately does not interpret this blob. Indexer-owned
+/// publication builders use the complete ordered set to rematerialize private
+/// derived projections after core graph construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexArtifactCacheEntry {
+    pub file_path: PathBuf,
+    pub artifact_blob: Vec<u8>,
 }
 
 pub const STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION: u32 = 1;
@@ -2721,6 +3231,30 @@ pub struct StructuralTextUnitPublicationManifest {
     pub migration_state: String,
     pub published_at_epoch_ms: i64,
 }
+
+/// Content-derived verdict for one complete structural-text publication.
+///
+/// The file-id set is the bounded rebind fence: a source-identity-only refresh
+/// may retain this publication only when none of its changed files owned
+/// structural evidence in the immutable predecessor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructuralTextPublicationValidation {
+    manifest: StructuralTextUnitPublicationManifest,
+    projection_file_ids: BTreeSet<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StructuralTextReceiptKey {
+    database_path: PathBuf,
+    core_generation_id: String,
+    core_run_id: String,
+}
+
+const STRUCTURAL_TEXT_RECEIPT_CAPACITY: usize = 64;
+static STRUCTURAL_TEXT_PUBLICATION_RECEIPTS: SealedReceiptCache<
+    StructuralTextReceiptKey,
+    StructuralTextPublicationValidation,
+> = SealedReceiptCache::new(STRUCTURAL_TEXT_RECEIPT_CAPACITY);
 
 /// Structural publication state accepted by an explicit projection-only writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2934,6 +3468,21 @@ fn structural_text_unit_content_summary(
         format!("{:x}", hasher.finalize()),
         descriptor_versions,
     ))
+}
+
+fn structural_text_receipt_key(
+    database_path: &Path,
+    publication: &IndexPublicationRecord,
+) -> StructuralTextReceiptKey {
+    StructuralTextReceiptKey {
+        database_path: database_path.to_path_buf(),
+        core_generation_id: publication.generation_id.clone(),
+        core_run_id: publication.run_id.clone(),
+    }
+}
+
+fn structural_text_receipt_artifacts(database_path: &Path) -> Vec<PathBuf> {
+    owned_artifacts::sqlite_file_with_sidecars(database_path)
 }
 
 pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
@@ -3793,6 +4342,17 @@ pub struct SearchSymbolProjectionDetail {
     pub end_line: Option<u32>,
 }
 
+/// Identity-only link from one symbol node to its owning indexed file.
+///
+/// Packet admission may use this projection to constrain an explicit symbol
+/// selector by path. It deliberately excludes symbol text, kind, ranges, and
+/// every source-bearing field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeFileIdentityProjection {
+    pub node_id: NodeId,
+    pub file_path: Option<String>,
+}
+
 /// Stored generated symbol document and embedding payload.
 ///
 /// The document records graph-derived text and embedding metadata. Dense
@@ -3907,6 +4467,17 @@ pub struct DenseAnchorInputReuseMetadata {
     pub source_identity: String,
 }
 
+/// Stable document identity from one validated dense-anchor publication.
+///
+/// Retrieval admission needs only this projection to prove that a vector
+/// generation names the exact documents selected by the core. Keeping it with
+/// the sealed core receipt avoids paging the full anchor text a second time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorContentIdentity {
+    pub node_id: NodeId,
+    pub document_hash: String,
+}
+
 /// Row-count shape of the published dense-anchor table.
 ///
 /// Freshness checks only need the counts and the policy-version agreement, so
@@ -3922,8 +4493,8 @@ pub struct DenseAnchorInputStats {
     pub selection_reason_counts: BTreeMap<String, u32>,
 }
 
-pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 1;
-pub const DENSE_ANCHOR_MIGRATION_STATE_NATIVE: &str = "native_v1";
+pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 2;
+pub const DENSE_ANCHOR_MIGRATION_STATE_NATIVE: &str = "native_v2";
 const DENSE_ANCHOR_DIGEST_DOMAIN: &[u8] = b"codestory-dense-anchor-publication-v1\0";
 
 /// Complete dense-anchor input publication bound to one core generation.
@@ -3938,10 +4509,43 @@ pub struct DenseAnchorPublicationManifest {
     pub core_run_id: String,
     pub anchor_count: u64,
     pub anchor_digest: String,
+    /// Stable identity of the anchor contents. A graph-equivalent core may
+    /// bind this same immutable anchor set without rewriting every row.
+    #[serde(default)]
+    pub anchor_source_identity: String,
     pub policy_version: String,
     pub migration_state: String,
     pub published_at_epoch_ms: i64,
 }
+
+/// Content-derived verdict for one complete dense-anchor publication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorPublicationValidation {
+    pub manifest: DenseAnchorPublicationManifest,
+    pub anchors: Vec<DenseAnchorContentIdentity>,
+}
+
+#[derive(Debug)]
+struct DenseAnchorContentSummary {
+    count: u64,
+    digest: String,
+    policies: HashSet<String>,
+    source_identities: HashSet<String>,
+    anchors: Vec<DenseAnchorContentIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DenseAnchorReceiptKey {
+    database_path: PathBuf,
+    core_generation_id: String,
+    core_run_id: String,
+}
+
+const DENSE_ANCHOR_RECEIPT_CAPACITY: usize = 64;
+static DENSE_ANCHOR_PUBLICATION_RECEIPTS: SealedReceiptCache<
+    DenseAnchorReceiptKey,
+    DenseAnchorPublicationValidation,
+> = SealedReceiptCache::new(DENSE_ANCHOR_RECEIPT_CAPACITY);
 
 fn hash_dense_anchor_part(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_le_bytes());
@@ -3950,11 +4554,12 @@ fn hash_dense_anchor_part(hasher: &mut Sha256, value: &[u8]) {
 
 fn dense_anchor_content_summary(
     conn: &Connection,
-) -> Result<(u64, String, HashSet<String>), StorageError> {
+) -> Result<DenseAnchorContentSummary, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT node_id, file_node_id, kind, display_name, qualified_name,
                 file_path, start_line, end_line, file_role, source_provenance,
-                document_text, document_hash, selection_reason, policy_version
+                document_text, document_hash, selection_reason, policy_version,
+                source_identity
          FROM dense_anchor_input ORDER BY node_id ASC",
     )?;
     let mut rows = stmt.query([])?;
@@ -3962,6 +4567,8 @@ fn dense_anchor_content_summary(
     hasher.update(DENSE_ANCHOR_DIGEST_DOMAIN);
     let mut count = 0_u64;
     let mut policies = HashSet::new();
+    let mut source_identities = HashSet::new();
+    let mut anchors = Vec::new();
     while let Some(row) = rows.next()? {
         let values = [
             row.get::<_, i64>(0)?.to_string(),
@@ -3986,12 +4593,74 @@ fn dense_anchor_content_summary(
             row.get::<_, String>(13)?,
         ];
         policies.insert(values[13].clone());
+        source_identities.insert(row.get::<_, String>(14)?);
+        anchors.push(DenseAnchorContentIdentity {
+            node_id: NodeId(row.get(0)?),
+            document_hash: values[11].clone(),
+        });
         for value in values {
             hash_dense_anchor_part(&mut hasher, value.as_bytes());
         }
         count = count.saturating_add(1);
     }
-    Ok((count, format!("{:x}", hasher.finalize()), policies))
+    Ok(DenseAnchorContentSummary {
+        count,
+        digest: format!("{:x}", hasher.finalize()),
+        policies,
+        source_identities,
+        anchors,
+    })
+}
+
+fn write_dense_anchor_publication_manifest(
+    conn: &Connection,
+    manifest: &DenseAnchorPublicationManifest,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO dense_anchor_publication (
+            id, schema_version, complete, core_generation_id, core_run_id,
+            anchor_count, anchor_digest, anchor_source_identity, policy_version,
+            migration_state, published_at_epoch_ms
+         ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            complete = excluded.complete,
+            core_generation_id = excluded.core_generation_id,
+            core_run_id = excluded.core_run_id,
+            anchor_count = excluded.anchor_count,
+            anchor_digest = excluded.anchor_digest,
+            anchor_source_identity = excluded.anchor_source_identity,
+            policy_version = excluded.policy_version,
+            migration_state = excluded.migration_state,
+            published_at_epoch_ms = excluded.published_at_epoch_ms",
+        params![
+            manifest.schema_version as i64,
+            &manifest.core_generation_id,
+            &manifest.core_run_id,
+            manifest.anchor_count.min(i64::MAX as u64) as i64,
+            &manifest.anchor_digest,
+            &manifest.anchor_source_identity,
+            &manifest.policy_version,
+            &manifest.migration_state,
+            manifest.published_at_epoch_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn dense_anchor_receipt_key(
+    database_path: &Path,
+    publication: &IndexPublicationRecord,
+) -> DenseAnchorReceiptKey {
+    DenseAnchorReceiptKey {
+        database_path: database_path.to_path_buf(),
+        core_generation_id: publication.generation_id.clone(),
+        core_run_id: publication.run_id.clone(),
+    }
+}
+
+fn dense_anchor_receipt_artifacts(database_path: &Path) -> Vec<PathBuf> {
+    owned_artifacts::sqlite_file_with_sidecars(database_path)
 }
 
 pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 2;
@@ -4265,9 +4934,52 @@ pub struct SymbolSearchDoc {
     pub doc_text: String,
     pub doc_version: u32,
     pub doc_hash: String,
+    /// `Some("")` proves absence; `None` is valid only with an unavailable
+    /// state and makes no comment-coverage claim.
+    pub attached_comment_text: Option<String>,
+    pub attached_comment_state: String,
+    pub attached_comment_policy: String,
+    pub attached_comment_hash: String,
     pub policy_version: String,
     pub source_provenance: String,
     pub updated_at_epoch_ms: i64,
+}
+
+impl SymbolSearchDoc {
+    pub const ATTACHED_COMMENT_POLICY_VERSION: &'static str =
+        "attached-comment-v1-nearest64-lines-256-proxy-units";
+    pub const ATTACHED_COMMENT_VERIFIED: &'static str = "verified";
+    pub const ATTACHED_COMMENT_UNAVAILABLE: &'static str = "bounded_source_unavailable";
+
+    pub fn attached_comment_hash(state: &str, text: Option<&str>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(Self::ATTACHED_COMMENT_POLICY_VERSION.as_bytes());
+        hasher.update([0]);
+        hasher.update(state.as_bytes());
+        hasher.update([0]);
+        match text {
+            Some(text) => {
+                hasher.update([1]);
+                hasher.update(text.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn attached_comment_is_valid(&self) -> bool {
+        self.attached_comment_policy == Self::ATTACHED_COMMENT_POLICY_VERSION
+            && match self.attached_comment_state.as_str() {
+                Self::ATTACHED_COMMENT_VERIFIED => self.attached_comment_text.is_some(),
+                Self::ATTACHED_COMMENT_UNAVAILABLE => self.attached_comment_text.is_none(),
+                _ => false,
+            }
+            && self.attached_comment_hash
+                == Self::attached_comment_hash(
+                    &self.attached_comment_state,
+                    self.attached_comment_text.as_deref(),
+                )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4279,10 +4991,122 @@ pub struct SymbolSummaryRecord {
     pub updated_at_epoch_ms: i64,
 }
 
+/// Resolve one logical core path to the exact database image SQLite must
+/// attach for copy-forward reads. Immutable publication keeps the logical
+/// `codestory.db` path separate from `core/generations/<id>/codestory.db`; an
+/// attach of the logical path would otherwise read an empty legacy shell.
+fn resolved_copy_source_database_path(
+    logical_path: &Path,
+) -> Result<Option<PinnedCopySource>, StorageError> {
+    let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
+    let mut pinned = pin_active_core(&layout)?;
+    if pinned.is_none() {
+        recover_interrupted_promotion(logical_path)?;
+        pinned = pin_active_core(&layout)?;
+    }
+    if let Some(pinned) = pinned {
+        // The attach remains bound to this image for its whole caller scope.
+        drop(Storage::open_immutable_generation(&pinned.path)?);
+        return Ok(Some(PinnedCopySource {
+            path: pinned.path,
+            _lease: pinned.lease,
+            immutable: true,
+        }));
+    }
+    if !logical_path.is_file() {
+        return Ok(None);
+    }
+    drop(Storage::open_read_only(logical_path)?);
+    Ok(Some(PinnedCopySource {
+        path: logical_path.to_path_buf(),
+        _lease: None,
+        immutable: false,
+    }))
+}
+
+struct PinnedCopySource {
+    path: PathBuf,
+    _lease: Option<CoreGenerationLease>,
+    immutable: bool,
+}
+
+impl PinnedCopySource {
+    fn attach_argument(&self) -> String {
+        if self.immutable {
+            sqlite_path::observational_uri(&self.path, true)
+        } else {
+            sqlite_path::attach_argument(&self.path)
+        }
+    }
+}
+
+impl std::ops::Deref for PinnedCopySource {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+/// Open the active core without materializing SQLite lock sidecars beside an
+/// immutable generation. Legacy fixed-path databases may still carry live WAL
+/// state and therefore retain the ordinary read-only open.
+fn open_core_database_read_only(
+    logical_path: &Path,
+    recover_legacy: bool,
+    operation: &str,
+) -> Result<PinnedCoreConnection, StorageError> {
+    let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
+    let mut pinned = pin_active_core(&layout)?;
+    if pinned.is_none() && recover_legacy {
+        recover_interrupted_promotion(logical_path)?;
+        pinned = pin_active_core(&layout)?;
+    }
+    let (resolved, published, lease) = match pinned {
+        Some(pinned) => (pinned.path, true, pinned.lease),
+        None => (logical_path.to_path_buf(), false, None),
+    };
+    if !resolved.is_file() {
+        return Err(StorageError::Other(format!(
+            "{operation} requires an existing database: {}",
+            logical_path.display()
+        )));
+    }
+    let conn = if published {
+        Connection::open_with_flags(
+            sqlite_path::observational_uri(&resolved, true),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    } else {
+        Connection::open_with_flags(
+            sqlite_path::open_path(&resolved),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?
+    };
+    Ok(PinnedCoreConnection {
+        conn,
+        _lease: lease,
+    })
+}
+
+struct PinnedCoreConnection {
+    conn: Connection,
+    _lease: Option<CoreGenerationLease>,
+}
+
+impl std::ops::Deref for PinnedCoreConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
     FreshnessFence,
+    ProofValidation,
     SchemaVersion,
 }
 
@@ -4310,11 +5134,100 @@ impl Storage {
     /// concurrent readers must not contend with a staged refresh merely by
     /// opening the live database.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let logical_path = path.as_ref();
+        let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
+        let mut pinned = pin_active_core(&layout)?;
+        if pinned.is_none() {
+            recover_interrupted_promotion(logical_path)?;
+            pinned = pin_active_core(&layout)?;
+        }
+        let (path, published, core_generation_lease) = match pinned {
+            Some(pinned) => (pinned.path, true, pinned.lease),
+            None => (logical_path.to_path_buf(), false, None),
+        };
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
+                "Read-only storage requires an existing database: {}",
+                logical_path.display()
+            )));
+        }
+        let conn = if published {
+            Connection::open_with_flags(
+                sqlite_path::observational_uri(&path, true),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        } else {
+            Connection::open_with_flags(
+                sqlite_path::open_path(&path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?
+        };
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            // The incomplete-run fence stamps a sentinel above the current
+            // schema number; keep the ordinary mismatch wording so callers can
+            // distinguish it from a true forward-incompatible cache.
+            if version > SCHEMA_VERSION && version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+                return Err(StorageError::Other(format!(
+                    "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
+                )));
+            }
+            return Err(StorageError::Other(format!(
+                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Self {
+            conn,
+            retrieval_publication_path: published.then(|| layout.retrieval_publication_path()),
+            _core_generation_lease: core_generation_lease,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
+        })
+    }
+
+    /// Open one exact immutable core generation without resolving the mutable
+    /// current-core pointer or materializing SQLite lock sidecars.
+    ///
+    /// Retrieval publications use this path to validate the old coherent
+    /// core/retrieval pair while a newer local core is current. A non-empty WAL
+    /// is rejected because `immutable=1` intentionally ignores WAL content.
+    pub fn open_immutable_generation<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
-        recover_interrupted_promotion(path)?;
+        let lease = pin_exact_core(path)?;
+        Self::open_immutable_generation_with_lease(path, lease)
+    }
+
+    pub(crate) fn open_immutable_generation_with_lease(
+        path: &Path,
+        core_generation_lease: Option<CoreGenerationLease>,
+    ) -> Result<Self, StorageError> {
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
+                "Immutable core generation requires an existing database: {}",
+                path.display()
+            )));
+        }
+        let wal_path = sqlite_sidecar_path(path, "-wal");
+        if fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0) {
+            return Err(StorageError::Other(format!(
+                "Immutable core generation has live WAL content: {}",
+                wal_path.display()
+            )));
+        }
+        let journal_path = sqlite_sidecar_path(path, "-journal");
+        if journal_path.exists() {
+            return Err(StorageError::Other(format!(
+                "Immutable core generation has rollback-journal content: {}",
+                journal_path.display()
+            )));
+        }
         let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            sqlite_path::observational_uri(path, true),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -4322,11 +5235,13 @@ impl Storage {
         let version = version.max(0) as u32;
         if version != SCHEMA_VERSION {
             return Err(StorageError::Other(format!(
-                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
+                "Immutable core generation requires schema version {SCHEMA_VERSION}, found {version}"
             )));
         }
         Ok(Self {
             conn,
+            retrieval_publication_path: None,
+            _core_generation_lease: core_generation_lease,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -4338,6 +5253,17 @@ impl Storage {
     /// activating writer; an observer reports those states instead.
     pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
+    }
+
+    /// Open the current database for one persistent proof-validation observer.
+    ///
+    /// This keeps the same nonmutating promotion and sidecar fences as ordinary
+    /// observation, and requires an already-complete WAL/SHM pair. The
+    /// persistent non-immutable reader observes later in-place commits via
+    /// `PRAGMA data_version`; refusing a standalone database prevents this
+    /// observer from materializing SQLite sidecars itself.
+    pub fn open_proof_validation_observer<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::ProofValidation)
     }
 
     /// Open storage only to inspect index freshness without repairing,
@@ -4358,21 +5284,28 @@ impl Storage {
     }
 
     fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
-        if promotion_artifacts_exist(path) {
+        let logical_path = path;
+        let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
+        if promotion_artifacts_exist(logical_path) {
             return Err(StorageError::Other(format!(
                 "Observational storage cannot inspect {} while promotion recovery is pending",
-                path.display()
+                logical_path.display()
             )));
         }
+        let pinned = pin_active_core(&layout)?;
+        let (path, published, core_generation_lease) = match pinned {
+            Some(pinned) => (pinned.path, true, pinned.lease),
+            None => (logical_path.to_path_buf(), false, None),
+        };
         if !path.is_file() {
             return Err(StorageError::Other(format!(
                 "Observational storage requires an existing database: {}",
                 path.display()
             )));
         }
-        let wal_path = sqlite_sidecar_path(path, "-wal");
-        let shm_path = sqlite_sidecar_path(path, "-shm");
-        let journal_path = sqlite_sidecar_path(path, "-journal");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+        let journal_path = sqlite_sidecar_path(&path, "-journal");
         if journal_path.exists() {
             return Err(StorageError::Other(format!(
                 "Observational storage cannot inspect {} while rollback recovery is pending",
@@ -4387,17 +5320,47 @@ impl Storage {
                 path.display()
             )));
         }
+        if policy == NonmutatingOpenPolicy::ProofValidation {
+            // Sealed immutable generations cannot host a persistent non-immutable
+            // WAL observer. Accidental `-wal`/`-shm` beside a published generation
+            // must not reopen a mutable proof fence; callers fall through to the
+            // Direct/Unavailable single-shot validation path instead.
+            if published {
+                return Err(StorageError::Other(format!(
+                    "Proof validation observer is unavailable for immutable core generation: {}",
+                    path.display()
+                )));
+            }
+            if !wal_exists {
+                return Err(StorageError::Other(format!(
+                    "Proof validation requires an existing complete WAL sidecar pair: {}",
+                    path.display()
+                )));
+            }
+        }
         // `immutable=1` guarantees that a standalone database cannot acquire
         // locks or sidecars, but it intentionally ignores committed WAL state.
         // When a complete WAL/SHM pair already exists, a normal read-only
         // connection observes it without materializing either sidecar. SQLite
         // may update transient reader marks inside the existing SHM wal-index;
         // durable database and WAL bytes remain observationally unchanged.
-        let uri = sqlite_path::observational_uri(path, !wal_exists);
-        let conn = Connection::open_with_flags(
-            uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        let conn = if policy == NonmutatingOpenPolicy::ProofValidation {
+            // A plain read-only filename stays non-immutable, so this
+            // persistent connection can observe later commits through
+            // `data_version`. The complete pair above was established by the
+            // active read path, rather than this observer.
+            Connection::open_with_flags(
+                sqlite_path::open_path(&path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?
+        } else {
+            let immutable = !wal_exists;
+            let uri = sqlite_path::observational_uri(&path, immutable);
+            Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        };
         if policy == NonmutatingOpenPolicy::FreshnessFence {
             // The freshness decision combines the schema sentinel, durable
             // fence, stored inventory, and workspace comparison. Pin one
@@ -4429,11 +5392,18 @@ impl Storage {
                     "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
                 )));
             }
+            NonmutatingOpenPolicy::ProofValidation if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Proof validation requires schema version {SCHEMA_VERSION}, found {version}"
+                )));
+            }
             NonmutatingOpenPolicy::SchemaVersion => {}
             _ => {}
         }
         Ok(Self {
             conn,
+            retrieval_publication_path: published.then(|| layout.retrieval_publication_path()),
+            _core_generation_lease: core_generation_lease,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -4495,6 +5465,10 @@ impl Storage {
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
         if matches!(mode, StorageOpenMode::Live) {
+            let layout = crate::CorePublicationLayout::from_storage_path(path)?;
+            if layout.read_pointer()?.is_some() {
+                return Self::open_read_only(path);
+            }
             recover_interrupted_promotion(path)?;
         }
         let conn = Connection::open(sqlite_path::open_path(path))?;
@@ -4515,6 +5489,11 @@ impl Storage {
                     .saturating_add(page_size - 1)
                     / page_size;
                 conn.pragma_update(None, "wal_autocheckpoint", checkpoint_pages)?;
+                conn.pragma_update(
+                    None,
+                    "journal_size_limit",
+                    DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64,
+                )?;
             }
         }
         if matches!(mode, StorageOpenMode::Build) {
@@ -4526,6 +5505,8 @@ impl Storage {
         }
         let storage = Self {
             conn,
+            retrieval_publication_path: None,
+            _core_generation_lease: None,
             cache: StorageCache::default(),
             deferred_secondary_indexes: matches!(mode, StorageOpenMode::Build),
             durability_profile,
@@ -4535,11 +5516,7 @@ impl Storage {
     }
 
     pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
-        recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = open_core_database_read_only(path, true, "Schema version")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
     }
@@ -4551,10 +5528,7 @@ impl Storage {
     /// still own them, so this read accepts whatever schema is on disk and
     /// treats absent tables as zero.
     pub fn database_legacy_annotation_count(path: &Path) -> Result<u64, StorageError> {
-        let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = open_core_database_read_only(path, false, "Legacy annotation count")?;
         let mut total = 0_i64;
         for table in ["bookmark_category", "bookmark_node"] {
             let exists: Option<i64> = conn
@@ -4576,11 +5550,7 @@ impl Storage {
 
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
     pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
-        recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = open_core_database_read_only(path, true, "Incomplete-run fence")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && version > SCHEMA_VERSION {
@@ -4601,11 +5571,7 @@ impl Storage {
     pub fn database_index_publication(
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
-        recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = open_core_database_read_only(path, true, "Index publication")?;
         read_index_publication(&conn)
     }
 
@@ -4614,11 +5580,7 @@ impl Storage {
     pub fn database_complete_index_publication(
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
-        recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(
-            sqlite_path::open_path(path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = open_core_database_read_only(path, true, "Complete index publication")?;
         read_complete_index_publication(&conn)
     }
 
@@ -4626,7 +5588,7 @@ impl Storage {
         source_path: &Path,
         target_path: &Path,
     ) -> Result<DatabaseSnapshotCopyStats, StorageError> {
-        recover_interrupted_promotion(source_path)?;
+        let source = open_core_database_read_only(source_path, true, "Database snapshot")?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 StorageError::Other(format!(
@@ -4635,10 +5597,6 @@ impl Storage {
                 ))
             })?;
         }
-        let source = Connection::open_with_flags(
-            sqlite_path::open_path(source_path),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
         let source_bytes = database_logical_bytes(&source)?;
         let copy_started = Instant::now();
         // `backup` opens the target as a second SQLite database.
@@ -4657,6 +5615,11 @@ impl Storage {
             copy_ms,
             source_bytes,
             target_bytes,
+            stage_strategy: "sqlite_backup",
+            fallback_reason: None,
+            native_error_code: None,
+            cloned_bytes: 0,
+            copied_bytes: source_bytes,
         })
     }
 
@@ -4666,6 +5629,8 @@ impl Storage {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let storage = Self {
             conn,
+            retrieval_publication_path: None,
+            _core_generation_lease: None,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
             durability_profile: SqliteDurabilityProfile::Durable,
@@ -4680,6 +5645,18 @@ impl Storage {
     /// schema invariants and derived snapshot freshness manually.
     pub fn get_connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Return SQLite's connection-local commit observation counter.
+    ///
+    /// A persistent read-only observer compares this value before reusing a
+    /// previously validated publication. SQLite changes it when another
+    /// connection commits, so it detects in-place mutations without treating
+    /// file metadata as publication authority.
+    pub fn sqlite_data_version(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(StorageError::from)
     }
 
     /// Open a query-only artifact-cache reader for this file-backed store.
@@ -4723,6 +5700,24 @@ impl Storage {
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_index_artifact_cache_entries(
+        &self,
+    ) -> Result<Vec<IndexArtifactCacheEntry>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_path, artifact_blob
+             FROM index_artifact_cache
+             ORDER BY file_path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(IndexArtifactCacheEntry {
+                file_path: PathBuf::from(row.get::<_, String>(0)?),
+                artifact_blob: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn get_structural_text_artifact_cache(
@@ -4779,10 +5774,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -4842,11 +5837,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn.execute(
             "ATTACH DATABASE ?1 AS structural_cache_source",
             params![source],
@@ -5110,9 +6104,67 @@ impl Storage {
         Ok(())
     }
 
-    /// Mark a live incremental index run incomplete before it mutates projections.
+    /// Rebind the bounded file-summary rows after a refresh whose callable and
+    /// structural fences proved the graph projection byte-for-byte equivalent.
+    /// Node, edge, repository, and detail snapshots remain valid; only the file
+    /// identity fields changed.
+    pub fn rebind_grounding_file_snapshots(&self, file_ids: &[i64]) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for file_id in file_ids {
+            let updated = tx.execute(
+                "UPDATE grounding_file_snapshot
+                 SET path = (SELECT path FROM file WHERE id = ?1),
+                     language = (SELECT language FROM file WHERE id = ?1),
+                     modification_time = (SELECT modification_time FROM file WHERE id = ?1),
+                     indexed = (SELECT indexed FROM file WHERE id = ?1),
+                     complete = (SELECT complete FROM file WHERE id = ?1),
+                     line_count = (SELECT line_count FROM file WHERE id = ?1)
+                 WHERE file_id = ?1
+                   AND EXISTS (SELECT 1 FROM file WHERE id = ?1)",
+                params![file_id],
+            )?;
+            if updated != 1 {
+                return Err(StorageError::Other(format!(
+                    "source-identity snapshot rebind expected one inherited file row for {file_id}, updated {updated}"
+                )));
+            }
+        }
+        let now = current_epoch_ms();
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Ready,
+            GroundingSnapshotState::Ready,
+            Some(now),
+            Some(now),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a staged incremental index run incomplete before it mutates projections.
+    ///
+    /// The inherited proof projection remains intact until the caller either
+    /// rebinds a source-identity-only change or atomically replaces it after a
+    /// graph change. The staged generation is unpublished, so deleting 80k+
+    /// facts up front adds work without creating a reader-safety boundary.
     pub fn begin_incremental_run(&self) -> Result<(), StorageError> {
+        self.begin_index_run(false)
+    }
+
+    /// Mark a staged derived-projection rebuild incomplete without discarding
+    /// core-bound proof facts. This path never mutates the graph and rebinds
+    /// the authenticated proof publication before promotion.
+    pub fn begin_derived_projection_run(&self) -> Result<(), StorageError> {
+        self.begin_index_run(false)
+    }
+
+    fn begin_index_run(&self, invalidate_proof_resolution: bool) -> Result<(), StorageError> {
         let transaction = self.conn.unchecked_transaction()?;
+        if invalidate_proof_resolution {
+            transaction.execute("DELETE FROM proof_resolution_publication", [])?;
+            transaction.execute("DELETE FROM proof_resolution_fact", [])?;
+            transaction.execute("DELETE FROM proof_resolution_provenance", [])?;
+        }
         transaction.execute(
             "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
              VALUES (1, ?1)
@@ -5146,6 +6198,101 @@ impl Storage {
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Mint the in-process receipt consumed by immutable generation
+    /// publication. Every expensive producer has already validated the rows it
+    /// wrote; this fence checks their complete manifests and common core
+    /// identity without replaying those repository-scale scans a second time.
+    pub(crate) fn mint_core_candidate_receipt(&self) -> Result<CoreCandidateReceipt, StorageError> {
+        let publication = self
+            .get_complete_index_publication()?
+            .ok_or_else(|| promotion_error("staged core candidate is not complete"))?;
+        let source_policy = self
+            .get_source_policy_exclusion_manifest()?
+            .filter(|manifest| {
+                manifest.complete
+                    && manifest.schema_version == SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION
+                    && manifest.core_generation_id == publication.generation_id
+                    && manifest.core_run_id == publication.run_id
+                    && manifest.published_at_epoch_ms == publication.published_at_epoch_ms
+                    && !manifest.exclusion_digest.is_empty()
+            })
+            .ok_or_else(|| {
+                promotion_error("staged core candidate source-policy receipt is incomplete")
+            })?;
+        let structural_validation = self
+            .cache
+            .produced_structural_text_validation
+            .read()
+            .clone()
+            .filter(|validation| {
+                let manifest = &validation.manifest;
+                manifest.complete
+                    && manifest.schema_version == STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION
+                    && manifest.descriptor_version == STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+                    && manifest.migration_state == STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+                    && manifest.core_generation_id == publication.generation_id
+                    && manifest.core_run_id == publication.run_id
+                    && manifest.published_at_epoch_ms == publication.published_at_epoch_ms
+                    && !manifest.unit_digest.is_empty()
+                    && !manifest.projection_digest.is_empty()
+                    && validation.projection_file_ids.len() as u64 == manifest.projection_count
+            })
+            .ok_or_else(|| {
+                promotion_error("staged core candidate structural-text receipt is incomplete")
+            })?;
+        let proof_validation = self
+            .cache
+            .produced_proof_resolution_validation
+            .read()
+            .clone()
+            .filter(|validation| {
+                let manifest = &validation.manifest;
+                manifest.complete
+                    && manifest.fact_schema_version
+                        == codestory_contracts::proof_resolution::PROOF_RESOLUTION_FACT_SCHEMA_VERSION
+                    && manifest.core_generation_id == publication.generation_id
+                    && manifest.core_run_id == publication.run_id
+                    && manifest.published_at_epoch_ms == publication.published_at_epoch_ms
+                    && !manifest.fact_digest.is_empty()
+                    && validation.sorted_fact_ids.len() as u64 == manifest.fact_count
+            })
+            .ok_or_else(|| {
+                promotion_error("staged core candidate proof receipt is incomplete")
+            })?;
+        let dense_anchor_validation = self
+            .cache
+            .produced_dense_anchor_validation
+            .read()
+            .clone()
+            .filter(|validation| {
+                let manifest = &validation.manifest;
+                manifest.complete
+                    && manifest.schema_version == DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+                    && manifest.migration_state == DENSE_ANCHOR_MIGRATION_STATE_NATIVE
+                    && manifest.core_generation_id == publication.generation_id
+                    && manifest.core_run_id == publication.run_id
+                    && manifest.published_at_epoch_ms == publication.published_at_epoch_ms
+                    && !manifest.anchor_digest.is_empty()
+                    && !manifest.anchor_source_identity.is_empty()
+                    && validation.anchors.len() as u64 == manifest.anchor_count
+            })
+            .ok_or_else(|| {
+                promotion_error("staged core candidate dense-anchor receipt is incomplete")
+            })?;
+        if !self.has_ready_grounding_snapshots()? {
+            return Err(promotion_error(
+                "staged core candidate grounding snapshots are incomplete",
+            ));
+        }
+        Ok(CoreCandidateReceipt {
+            publication,
+            source_policy_digest: source_policy.exclusion_digest,
+            structural_validation,
+            proof_validation,
+            dense_anchor_validation,
+        })
     }
 
     /// Return the durable identity of the currently stored core generation.
@@ -5237,6 +6384,30 @@ impl Storage {
             )
             .optional()
             .map(|value| value.flatten())
+            .map_err(StorageError::from)
+    }
+
+    /// Whether one file owns the current structural-text projection row.
+    ///
+    /// Packet coverage uses this bounded identity lookup after admission. It
+    /// must not materialize the repository-wide projection inventory.
+    pub fn has_structural_text_projection_for_file(
+        &self,
+        file_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM structural_text_projection
+                    WHERE file_id = ?1
+                      AND descriptor_version = ?2
+                    LIMIT 1
+                 )",
+                params![file_id, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|found| found != 0)
             .map_err(StorageError::from)
     }
 
@@ -5573,6 +6744,9 @@ impl Storage {
 
     pub fn clear(&self) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM proof_resolution_publication", [])?;
+        tx.execute("DELETE FROM proof_resolution_fact", [])?;
+        tx.execute("DELETE FROM proof_resolution_provenance", [])?;
         tx.execute("DELETE FROM callable_projection_state", [])?;
         tx.execute("DELETE FROM structural_text_unit_publication", [])?;
         tx.execute("DELETE FROM structural_text_unit", [])?;
@@ -5939,233 +7113,331 @@ impl Storage {
         staged_path: &Path,
         live_path: &Path,
     ) -> Result<CorePromotionStats, StorageError> {
+        Self::promote_staged_snapshot_inner(staged_path, live_path, None, &|| false)
+    }
+
+    pub(crate) fn promote_staged_snapshot_with_receipt(
+        staged_path: &Path,
+        live_path: &Path,
+        receipt: SealedCoreCandidateReceipt,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CorePromotionStats, StorageError> {
+        Self::promote_staged_snapshot_inner(staged_path, live_path, Some(receipt), cancelled)
+    }
+
+    fn promote_staged_snapshot_inner(
+        staged_path: &Path,
+        live_path: &Path,
+        sealed_receipt: Option<SealedCoreCandidateReceipt>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CorePromotionStats, StorageError> {
         let promotion_started = Instant::now();
         let mut durations = CorePromotionDurations::default();
+        let layout = crate::CorePublicationLayout::from_storage_path(live_path)?;
 
-        let lock_recovery_started = Instant::now();
+        let lock_wait_started = Instant::now();
         let _promotion_lock = PromotionLock::acquire(live_path)?;
+        durations.lock_wait = lock_wait_started.elapsed();
+
+        let recovery_started = Instant::now();
+        // Finish any v0.17 fixed-path journal before selecting or migrating its
+        // publication. New generations need only the atomic JSON pointer.
         recover_interrupted_promotion_locked(live_path)?;
+        // A prior committed migration may have been interrupted before its
+        // cleanup receipt was marked. Preserve that evidence before another
+        // pointer can move past the first migrated generation.
+        core_retention::mark_legacy_retirement_committed(&layout)?;
         if promotion_artifacts_exist(live_path) {
             return Err(promotion_error(format!(
-                "Cannot start a new promotion while prior artifacts remain for {}",
+                "Cannot publish an immutable core generation while legacy recovery artifacts remain for {}",
                 live_path.display()
             )));
         }
-        let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
-        let prepared_path = promotion_prepared_journal_path(live_path);
-        let committed_path = promotion_committed_journal_path(live_path);
-        durations.lock_recovery = lock_recovery_started.elapsed();
+        durations.lock_recovery = recovery_started.elapsed();
 
         let candidate_validation_started = Instant::now();
-        let candidate_image_before_validation = promotion_database_image(staged_path)?;
-        let candidate = require_complete_promotion_database_identity(
-            staged_path,
-            "Staged promotion candidate",
-        )?;
-        let candidate_source_policy =
-            read_source_policy_exclusion_rollback_identity(staged_path, &candidate)?;
-        if candidate_source_policy.is_none() {
-            return Err(promotion_error(format!(
-                "Staged promotion candidate {} has no complete source policy exclusion manifest",
-                staged_path.display()
-            )));
-        }
-        let candidate_structural_text =
-            read_structural_text_unit_rollback_identity(staged_path, &candidate)?;
-        if candidate_structural_text.is_none() {
-            return Err(promotion_error(format!(
-                "Staged promotion candidate {} has no complete structural text unit manifest",
-                staged_path.display()
-            )));
-        }
-        // A receipt may only seal bytes the validation above actually read, so
-        // the image is taken on both sides of it. A staged file that moved under
-        // its own validation seals nothing and the promoted copy is revalidated.
-        let candidate_image = match (
-            candidate_image_before_validation,
-            promotion_database_image(staged_path)?,
-        ) {
-            (Some(before), Some(after)) if before == after => Some(after),
-            _ => None,
+        require_standalone_core_candidate(staged_path)?;
+        #[cfg(test)]
+        crate::core_generation::abort_after_publication_point("stage_fsync")?;
+        let (
+            candidate,
+            candidate_bytes,
+            dense_anchor_validation,
+            structural_validation,
+            proof_validation,
+        ) = if let Some(sealed) = sealed_receipt {
+            let artifacts = vec![
+                staged_path.to_path_buf(),
+                sqlite_sidecar_path(staged_path, "-wal"),
+                sqlite_sidecar_path(staged_path, "-journal"),
+            ];
+            let observed = ArtifactSeal::observe_all(&artifacts).map_err(|error| {
+                promotion_error(format!(
+                    "failed to verify staged core candidate seal: {error}"
+                ))
+            })?;
+            if observed != sealed.artifacts
+                || !sealed
+                    .artifacts
+                    .first()
+                    .is_some_and(ArtifactSeal::is_present)
+            {
+                return Err(promotion_error(
+                    "staged core candidate changed after its validation receipt was sealed",
+                ));
+            }
+            let receipt = sealed.receipt;
+            if receipt.source_policy_digest.is_empty()
+                || receipt
+                    .structural_validation
+                    .manifest
+                    .unit_digest
+                    .is_empty()
+                || receipt
+                    .structural_validation
+                    .manifest
+                    .projection_digest
+                    .is_empty()
+                || receipt.proof_validation.manifest.fact_digest.is_empty()
+                || receipt
+                    .dense_anchor_validation
+                    .manifest
+                    .anchor_digest
+                    .is_empty()
+            {
+                return Err(promotion_error(
+                    "staged core candidate receipt omitted a required component digest",
+                ));
+            }
+            let candidate_bytes = fs::metadata(staged_path)
+                .map_err(|error| promotion_path_error("inspect", staged_path, error))?
+                .len();
+            (
+                receipt.publication,
+                candidate_bytes,
+                Some(receipt.dense_anchor_validation),
+                Some(receipt.structural_validation),
+                Some(receipt.proof_validation),
+            )
+        } else {
+            crate::core_generation::sync_staging_database(staged_path)?;
+            let candidate = require_complete_promotion_database_identity(
+                staged_path,
+                "Staged immutable core candidate",
+            )?;
+            let candidate_source_policy =
+                read_source_policy_exclusion_rollback_identity(staged_path, &candidate)?;
+            if candidate_source_policy.is_none() {
+                return Err(promotion_error(format!(
+                    "Staged immutable core candidate {} has no complete source policy exclusion manifest",
+                    staged_path.display()
+                )));
+            }
+            let candidate_structural_text =
+                read_structural_text_unit_rollback_identity(staged_path, &candidate)?;
+            if candidate_structural_text.is_none() {
+                return Err(promotion_error(format!(
+                    "Staged immutable core candidate {} has no complete structural text unit manifest",
+                    staged_path.display()
+                )));
+            }
+            let _candidate_proof_resolution =
+                read_proof_resolution_rollback_identity(staged_path, &candidate)?;
+            let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
+            (candidate, candidate_bytes, None, None, None)
         };
-        let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
+        let candidate_identity = core_generation_identity(&candidate, candidate_bytes);
         durations.candidate_validation = candidate_validation_started.elapsed();
 
         let previous_validation_started = Instant::now();
-        let recovery_contract = RecoveryDatabaseContract::CurrentPromotion;
-        let previous = read_recovery_database_identity(live_path, recovery_contract)?;
-        let previous_source_policy = match previous.as_ref() {
-            Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
-            None => None,
-        };
-        let previous_structural_text = match previous.as_ref() {
-            Some(previous) => read_structural_text_unit_rollback_identity(live_path, previous)?,
-            None => None,
-        };
-        cleanup_sqlite_sidecars(&backup_path)?;
-        let previous_live_bytes = previous
+        let previous_pointer = layout.read_pointer()?;
+        let (previous_identity, predecessor_incomplete, legacy_original_identity) =
+            if let Some(pointer) = previous_pointer.as_ref() {
+                // Pointer parsing verifies its receipt and generation path. The
+                // active database was deep-validated before that pointer was
+                // minted, so a refresh does not read the whole old image again.
+                let _ = layout.resolve_generation_database(&pointer.active.generation_id)?;
+                (Some(pointer.active.clone()), false, None)
+            } else if live_path.is_file() {
+                match read_recovery_database_identity(
+                    live_path,
+                    RecoveryDatabaseContract::CurrentPromotion,
+                )? {
+                    Some(previous) => {
+                        // One-time v0.17 migration. Validate the legacy publication
+                        // once, then preserve it as an immutable rollback generation.
+                        // A cancellable SQLite backup preserves the whole
+                        // committed legacy image, including WAL pages.
+                        let original_identity = core_retention::capture_legacy_identity(live_path)?;
+                        let previous_bytes = database_logical_bytes_at_path(live_path)?;
+                        let identity = core_generation_identity(&previous, previous_bytes);
+                        let materialized = layout.materialize_existing_generation(
+                            live_path,
+                            &identity.generation_id,
+                            cancelled,
+                        )?;
+                        // This is the unchanged predecessor, not a new candidate.
+                        // Preserve its supported legacy schema rather than requiring
+                        // the schema of the replacement we already validated above.
+                        let materialized_publication = require_recovery_database_identity(
+                            &materialized,
+                            "Migrated immutable rollback generation",
+                            RecoveryDatabaseContract::CurrentPromotion,
+                        )?;
+                        if materialized_publication != previous {
+                            return Err(promotion_error(
+                                "Migrated immutable rollback generation changed core identity",
+                            ));
+                        }
+                        (Some(identity), false, Some(original_identity))
+                    }
+                    None => {
+                        let incomplete = is_replaceable_incomplete_legacy_predecessor(live_path)?;
+                        // A marked legacy image is replaceable after the complete
+                        // candidate is validated, but never rollback eligible.
+                        // Other unpublished material remains ambiguous.
+                        if !incomplete {
+                            require_empty_unpublished_core(live_path)?;
+                        }
+                        let original_identity = core_retention::capture_legacy_identity(live_path)?;
+                        (None, incomplete, Some(original_identity))
+                    }
+                }
+            } else {
+                (None, false, None)
+            };
+        let previous_live_bytes = previous_identity
             .as_ref()
-            .map(|_| database_logical_bytes_at_path(live_path))
-            .transpose()?;
+            .map(|identity| identity.logical_bytes);
         durations.previous_validation = previous_validation_started.elapsed();
 
-        let mut rollback_backup_bytes = None;
-        if previous.is_some() {
-            let rollback_backup_copy_started = Instant::now();
-            let live_conn = Connection::open(sqlite_path::open_path(live_path))?;
-            let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
-            live_conn.backup(
-                MAIN_DB,
-                sqlite_path::open_path(&backup_path),
-                None::<fn(rusqlite::backup::Progress)>,
+        let generation_install_started = Instant::now();
+        // Validation readers may have materialized empty WAL/SHM lock files
+        // beside the standalone stage. Recheck that no committed pages live
+        // there, then remove every sidecar before the directory becomes an
+        // immutable generation.
+        require_standalone_core_candidate(staged_path)?;
+        remove_closed_core_sidecars(staged_path)?;
+        let publication =
+            crate::CorePublishTransaction::begin_from_stage(live_path, staged_path.to_path_buf())?;
+        let final_database = publication.generation_database_path(&candidate.generation_id)?;
+        if final_database.is_file() {
+            let installed = require_complete_promotion_database_identity(
+                &final_database,
+                "Existing immutable candidate generation",
             )?;
-            drop(live_conn);
-            durations.rollback_backup_copy = Some(rollback_backup_copy_started.elapsed());
-
-            let backup_validation_started = Instant::now();
-            let backup_identity = require_recovery_database_identity(
-                &backup_path,
-                "Promotion backup",
-                recovery_contract,
-            )?;
-            if Some(&backup_identity) != previous.as_ref() {
+            if installed != candidate {
                 return Err(promotion_error(format!(
-                    "Promotion backup identity does not match live database {}",
-                    live_path.display()
+                    "Existing immutable candidate generation {} has a different publication identity",
+                    final_database.display()
                 )));
             }
-            require_recorded_source_policy_identity(
-                &backup_path,
-                &backup_identity,
-                &previous_source_policy,
-                "Promotion backup",
-            )?;
-            require_recorded_structural_text_identity(
-                &backup_path,
-                &backup_identity,
-                &previous_structural_text,
-                "Promotion backup",
-            )?;
-            rollback_backup_bytes = Some(database_logical_bytes_at_path(&backup_path)?);
-            durations.backup_validation = Some(backup_validation_started.elapsed());
-        }
-
-        let prepared = PromotionJournal {
-            version: PROMOTION_JOURNAL_VERSION,
-            previous: previous.clone(),
-            candidate: candidate.clone(),
-            previous_source_policy,
-            candidate_source_policy: candidate_source_policy.clone(),
-            previous_structural_text,
-            candidate_structural_text: candidate_structural_text.clone(),
-        };
-        let journal_write_stats = match write_promotion_journal(&prepared_path, &prepared) {
-            Ok(stats) => stats,
-            Err(error) => {
-                if !prepared_path.exists() {
-                    let _ = cleanup_sqlite_sidecars(&backup_path);
-                }
-                return Err(error);
-            }
-        };
-        durations.prepared_journal_write = journal_write_stats.write;
-        durations.prepared_journal_file_sync = journal_write_stats.file_sync;
-        durations.prepared_journal_directory_sync = journal_write_stats.directory_sync;
-
-        let staged_to_live_restore_started = Instant::now();
-        let mut live_conn = Connection::open(sqlite_path::open_path(live_path))?;
-        let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
-        live_conn.pragma_update(None, "synchronous", "FULL")?;
-
-        // `restore` opens the staged database itself, so it needs the same
-        // conversion as the live connection above.
-        #[cfg(test)]
-        let restore_result = if let Some(sentinel_path) =
-            std::env::var_os(PROMOTION_ABORT_SENTINEL_ENV).map(PathBuf::from)
-        {
-            live_conn.restore(
-                MAIN_DB,
-                sqlite_path::open_path(staged_path),
-                Some(move |_progress| {
-                    let mut sentinel = std::fs::File::create(&sentinel_path)
-                        .expect("create promotion abort sentinel");
-                    sentinel
-                        .write_all(PROMOTION_ABORT_SENTINEL)
-                        .expect("write promotion abort sentinel");
-                    sentinel.sync_all().expect("sync promotion abort sentinel");
-                    std::process::abort();
-                }),
-            )
+            cleanup_sqlite_sidecars(staged_path)?;
+            crate::core_generation::remove_staging_database(staged_path)?;
         } else {
-            live_conn.restore(
-                MAIN_DB,
-                sqlite_path::open_path(staged_path),
-                None::<fn(rusqlite::backup::Progress)>,
+            publication.install_generation(&candidate.generation_id)?;
+        }
+        if let Some(validation) = dense_anchor_validation {
+            let key = dense_anchor_receipt_key(&final_database, &candidate);
+            let artifacts = dense_anchor_receipt_artifacts(&final_database);
+            if !DENSE_ANCHOR_PUBLICATION_RECEIPTS.seal_produced(key, &artifacts, validation) {
+                return Err(promotion_error(
+                    "published immutable core could not seal its dense-anchor validation receipt",
+                ));
+            }
+        }
+        if let Some(validation) = structural_validation {
+            let key = structural_text_receipt_key(&final_database, &candidate);
+            let artifacts = structural_text_receipt_artifacts(&final_database);
+            if !STRUCTURAL_TEXT_PUBLICATION_RECEIPTS.seal_produced(key, &artifacts, validation) {
+                return Err(promotion_error(
+                    "published immutable core could not seal its structural-text validation receipt",
+                ));
+            }
+        }
+        if let Some(validation) = proof_validation
+            && !proof_resolution::seal_proof_resolution_publication_receipt(
+                &final_database,
+                &candidate,
+                validation,
             )
-        };
-        #[cfg(not(test))]
-        let restore_result = live_conn.restore(
-            MAIN_DB,
-            sqlite_path::open_path(staged_path),
-            None::<fn(rusqlite::backup::Progress)>,
-        );
-
-        if let Err(err) = restore_result {
-            drop(live_conn);
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(StorageError::Other(format!(
-                "Failed to promote staged snapshot {} -> {}: {err}",
-                staged_path.display(),
-                live_path.display()
-            )));
+        {
+            return Err(promotion_error(
+                "published immutable core could not seal its proof-resolution validation receipt",
+            ));
         }
-        drop(live_conn);
-        durations.staged_to_live_restore = staged_to_live_restore_started.elapsed();
+        durations.generation_install = generation_install_started.elapsed();
 
-        let promoted_validation_started = Instant::now();
-        let promoted_validation = match validate_promoted_live_database(
-            live_path,
-            staged_path,
-            &candidate,
-            &candidate_source_policy,
-            &candidate_structural_text,
-            candidate_image,
-        ) {
-            Ok(promoted_validation) => promoted_validation,
-            Err(error) => {
-                let _ = rollback_prepared_promotion(live_path, &prepared);
-                return Err(error);
-            }
-        };
-        tracing::debug!(
-            live_path = %live_path.display(),
-            promoted_validation = promoted_validation.as_str(),
-            "promotion fenced the restored live database"
-        );
-        durations.promoted_validation = promoted_validation_started.elapsed();
+        #[cfg(test)]
+        crate::core_generation::abort_after_publication_point("generation_rename")?;
 
-        let committed_journal_started = Instant::now();
-        if let Err(error) = commit_promotion_journal(&prepared_path, &committed_path) {
-            if !committed_path.exists() {
-                let _ = rollback_prepared_promotion(live_path, &prepared);
-            }
-            return Err(error);
+        let pointer_started = Instant::now();
+        if previous_pointer.is_none() {
+            let retained_retrieval = if live_path.is_file() && !predecessor_incomplete {
+                retrieval_manifest::read_embedded_retrieval_publications(live_path)?
+            } else {
+                Vec::new()
+            };
+            retrieval_manifest::initialize_external_retrieval_publication(
+                &layout.retrieval_publication_path(),
+                &retained_retrieval,
+                &retrieval_manifest::RetrievalCoreGenerationBinding {
+                    generation_id: previous_identity
+                        .as_ref()
+                        .unwrap_or(&candidate_identity)
+                        .generation_id
+                        .clone(),
+                    run_id: previous_identity
+                        .as_ref()
+                        .unwrap_or(&candidate_identity)
+                        .run_id
+                        .clone(),
+                },
+            )?;
         }
-        durations.committed_journal = committed_journal_started.elapsed();
-
-        let cleanup_started = Instant::now();
-        if let Err(error) = cleanup_sqlite_sidecars(staged_path) {
+        // Copying a legacy predecessor and installing the candidate can take
+        // time after the last backup step. Cancellation still has to win before
+        // the one atomic publication change.
+        if cancelled() {
+            return Err(promotion_error(
+                "Core promotion was cancelled before pointer publication",
+            ));
+        }
+        if let Some(original_identity) = legacy_original_identity {
+            core_retention::prepare_legacy_retirement(
+                &layout,
+                original_identity,
+                &candidate_identity.generation_id,
+            )?;
+            if cancelled() {
+                return Err(promotion_error(
+                    "Core promotion was cancelled before pointer publication",
+                ));
+            }
+        }
+        let commit = publication.commit_pointer(candidate_identity, previous_identity.clone())?;
+        if let Err(error) = core_retention::mark_legacy_retirement_committed(&layout) {
+            tracing::warn!(live_path = %live_path.display(), error = %error,
+                "legacy retirement remains pending after committed core publication");
+        }
+        if let crate::CorePublicationDurabilityV1::Unconfirmed(reason) = commit.durability {
             tracing::warn!(
-                staged_path = %staged_path.display(),
-                error = %error,
-                "committed promotion left a staged cleanup artifact"
+                live_path = %live_path.display(),
+                reason = ?reason,
+                generation_id = %commit.pointer.active.generation_id,
+                "core pointer was committed but directory durability could not be confirmed"
             );
         }
+        durations.pointer_publication = pointer_started.elapsed();
+
+        let cleanup_started = Instant::now();
+        #[cfg(test)]
+        crate::core_generation::abort_after_publication_point("cleanup")?;
         if let Err(error) = cleanup_committed_promotion_artifacts(live_path) {
             tracing::warn!(
                 live_path = %live_path.display(),
                 error = %error,
-                "committed promotion retained recovery artifacts"
+                "immutable core publication retained legacy recovery artifacts"
             );
         }
         durations.cleanup = cleanup_started.elapsed();
@@ -6173,8 +7445,9 @@ impl Storage {
             promotion_started.elapsed(),
             candidate_bytes,
             previous_live_bytes,
-            rollback_backup_bytes,
-            promoted_validation,
+            None,
+            previous_identity.map(|identity| identity.logical_bytes),
+            PromotedValidation::ReusedCandidateReceipt,
         ))
     }
 
@@ -6436,6 +7709,89 @@ impl Storage {
         Ok(())
     }
 
+    /// Authenticates existing CALL edges with exact syntax resolution metadata.
+    ///
+    /// Raw graph identity is immutable here: this updates only the resolved
+    /// endpoints and resolution metadata. The whole batch commits or rolls back
+    /// together so a staged proof projection cannot observe a partial upgrade.
+    pub fn project_exact_call_edge_resolutions(
+        &mut self,
+        projections: &[ExactCallEdgeProjection],
+    ) -> Result<(), StorageError> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        let mut edge_ids = HashSet::with_capacity(projections.len());
+        if projections
+            .iter()
+            .any(|projection| !edge_ids.insert(projection.edge_id))
+        {
+            return Err(StorageError::Other(
+                "exact CALL edge projection contains a duplicate edge ID".to_owned(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "UPDATE edge
+                 SET resolved_source_node_id = ?2,
+                     resolved_target_node_id = ?3,
+                     confidence = 1.0,
+                     certainty = 'certain',
+                     candidate_target_node_ids = '[]'
+                 WHERE id = ?1
+                   AND source_node_id = ?4
+                   AND target_node_id = ?5
+                   AND kind = ?6
+                   AND file_node_id IS ?7
+                   AND line IS ?8
+                   AND callsite_identity IS ?9
+                   AND EXISTS (
+                       SELECT 1
+                       FROM node raw
+                       WHERE raw.id = edge.target_node_id
+                         AND raw.kind = ?10
+                         AND raw.file_node_id IS ?11
+                         AND raw.start_line IS ?12
+                         AND raw.serialized_name = ?13
+                   )",
+            )?;
+            for projection in projections {
+                let updated = statement.execute(params![
+                    projection.edge_id.0,
+                    projection.caller.0,
+                    projection.target.0,
+                    projection.raw_source.0,
+                    projection.raw_target.0,
+                    projection.raw_kind as i32,
+                    projection.file_node_id.map(|id| id.0),
+                    projection.line,
+                    projection.callsite_identity.as_deref(),
+                    projection.raw_target_kind as i32,
+                    projection.raw_target_file_node_id.map(|id| id.0),
+                    projection.raw_target_start_line,
+                    &projection.raw_target_name,
+                ])?;
+                if updated != 1 {
+                    return Err(StorageError::Other(format!(
+                        "exact CALL edge projection did not match one CALL edge: {}",
+                        projection.edge_id.0
+                    )));
+                }
+            }
+        }
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        Self::invalidate_resolution_support_snapshot_on(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // Batch operations
     pub fn insert_nodes_batch(&mut self, nodes: &[Node]) -> Result<(), StorageError> {
         let prepared_nodes = self.prepared_nodes_for_insert(nodes)?;
@@ -6651,11 +8007,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -6806,20 +8161,19 @@ impl Storage {
             .map(|canonical_id| (canonical_id, Vec::new()))
             .collect::<BTreeMap<_, _>>();
 
-        for batch in unique_canonical_ids.chunks(variable_limit) {
-            let placeholders = question_placeholders(batch.len());
-            let query = format!(
-                "SELECT canonical_id, id
-                 FROM node
-                 WHERE canonical_id IN ({placeholders})
-                 ORDER BY canonical_id ASC, id ASC"
-            );
-            let mut stmt = self.conn.prepare(&query)?;
-            let mut rows = stmt.query(params_from_iter(batch.iter()))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id
+             FROM node AS n
+             WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                   COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+               AND n.canonical_id = ?1
+             ORDER BY n.id ASC",
+        )?;
+        for canonical_id in &unique_canonical_ids {
+            let mut rows = stmt.query(params![canonical_id])?;
             while let Some(row) = rows.next()? {
-                let canonical_id: String = row.get(0)?;
-                let node_id = NodeId(row.get(1)?);
-                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(&canonical_id) {
+                let node_id = NodeId(row.get(0)?);
+                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(canonical_id) {
                     node_ids.push(node_id);
                 }
             }
@@ -6964,6 +8318,134 @@ impl Storage {
     ) -> Result<Vec<Edge>, StorageError> {
         let mut stmt = self.conn.prepare(RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL)?;
         let mut rows = stmt.query(params![source_node_id.0, EdgeKind::CALL as i32])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        Ok(edges)
+    }
+
+    /// Reads at most `maximum` raw CALL edges and detects one additional row.
+    ///
+    /// Callers that use this for proof construction must treat `truncated` as
+    /// an unclassified result. The retained prefix is diagnostic evidence, not
+    /// authorization to prove over a partial candidate set.
+    pub fn get_bounded_raw_call_edges_by_effective_source(
+        &self,
+        source_node_id: NodeId,
+        maximum: u32,
+    ) -> Result<BoundedRawCallEdges, StorageError> {
+        let sql = format!("{RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL} LIMIT ?3");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let query_limit = i64::from(maximum) + 1;
+        let mut rows = stmt.query(params![
+            source_node_id.0,
+            EdgeKind::CALL as i32,
+            query_limit
+        ])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        let truncated = edges.len() > maximum as usize;
+        edges.truncate(maximum as usize);
+        Ok(BoundedRawCallEdges { edges, truncated })
+    }
+
+    /// Reads a bounded incident edge neighborhood without opening endpoint
+    /// nodes or file records. Packet admission uses this after admitting the
+    /// center identity, then discards edges whose other endpoint was not
+    /// admitted before any endpoint hydration occurs.
+    pub fn get_bounded_raw_incident_edges(
+        &self,
+        node_id: NodeId,
+        maximum: usize,
+    ) -> Result<BoundedRawIncidentEdges, StorageError> {
+        let query_limit = maximum.saturating_add(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line,
+                    e.resolved_source_node_id, e.resolved_target_node_id, e.confidence,
+                    e.callsite_identity, e.certainty, e.candidate_target_node_ids
+             FROM edge e
+             WHERE e.source_node_id = ?1
+                OR e.target_node_id = ?1
+                OR e.resolved_source_node_id = ?1
+                OR e.resolved_target_node_id = ?1
+             ORDER BY e.id ASC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            node_id.0,
+            i64::try_from(query_limit).unwrap_or(i64::MAX)
+        ])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        let truncated = edges.len() > maximum;
+        edges.truncate(maximum);
+        Ok(BoundedRawIncidentEdges { edges, truncated })
+    }
+
+    /// Return one certain edge representative for every directed pair and
+    /// relation kind whose effective endpoints are both in `node_ids`.
+    ///
+    /// This is an induced-edge read: it never opens endpoint nodes or file
+    /// records, and dense parallel edges for one pair cannot consume the rows
+    /// needed to expose a different admitted pair.
+    pub fn get_certain_edge_representatives_between_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Edge>, StorageError> {
+        let unique_node_ids = node_ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique_node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if unique_node_ids.len() > EDGE_NODE_LOOKUP_BATCH_SIZE {
+            return Err(StorageError::Other(format!(
+                "induced edge lookup accepts at most {EDGE_NODE_LOOKUP_BATCH_SIZE} node ids"
+            )));
+        }
+
+        let admitted_values = (1..=unique_node_ids.len())
+            .map(|index| format!("(?{index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "WITH admitted(id) AS (VALUES {admitted_values}),
+             ranked AS (
+                 SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id,
+                        e.line, e.resolved_source_node_id, e.resolved_target_node_id,
+                        e.confidence, e.callsite_identity, e.certainty,
+                        e.candidate_target_node_ids,
+                        COALESCE(e.resolved_source_node_id, e.source_node_id) AS effective_source,
+                        COALESCE(e.resolved_target_node_id, e.target_node_id) AS effective_target,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                COALESCE(e.resolved_source_node_id, e.source_node_id),
+                                COALESCE(e.resolved_target_node_id, e.target_node_id),
+                                e.kind
+                            ORDER BY e.id ASC
+                        ) AS typed_pair_rank
+                 FROM edge e
+                 JOIN admitted source_node
+                   ON source_node.id = COALESCE(e.resolved_source_node_id, e.source_node_id)
+                 JOIN admitted target_node
+                   ON target_node.id = COALESCE(e.resolved_target_node_id, e.target_node_id)
+                 WHERE e.certainty = 'certain'
+             )
+             SELECT id, source_node_id, target_node_id, kind, file_node_id, line,
+                    resolved_source_node_id, resolved_target_node_id, confidence,
+                    callsite_identity, certainty, candidate_target_node_ids
+             FROM ranked
+             WHERE typed_pair_rank = 1
+             ORDER BY CASE WHEN effective_source = effective_target THEN 1 ELSE 0 END ASC,
+                      effective_source ASC, effective_target ASC, kind ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(
+            unique_node_ids.iter().map(|node_id| Value::from(node_id.0)),
+        ))?;
         let mut edges = Vec::new();
         while let Some(row) = rows.next()? {
             edges.push(Self::edge_from_row(row)?);
@@ -7270,6 +8752,21 @@ impl Storage {
     pub fn flush_projection_batch(
         &mut self,
         batch: ProjectionBatch<'_>,
+    ) -> Result<ProjectionFlushBreakdown, StorageError> {
+        self.flush_projection_batch_with_derived_state(batch, false)
+    }
+
+    pub(crate) fn flush_source_identity_projection_batch(
+        &mut self,
+        batch: ProjectionBatch<'_>,
+    ) -> Result<ProjectionFlushBreakdown, StorageError> {
+        self.flush_projection_batch_with_derived_state(batch, true)
+    }
+
+    fn flush_projection_batch_with_derived_state(
+        &mut self,
+        batch: ProjectionBatch<'_>,
+        preserve_graph_derived_state: bool,
     ) -> Result<ProjectionFlushBreakdown, StorageError> {
         let mut breakdown = ProjectionFlushBreakdown::default();
         if batch.files.is_empty()
@@ -7848,12 +9345,14 @@ impl Storage {
             1,
             projection_scalar_binds(3),
         );
-        Self::invalidate_resolution_support_snapshot_on(&tx)?;
-        record_projection_statement(
-            &mut breakdown.persistence.dirty_state,
-            1,
-            projection_scalar_binds(1),
-        );
+        if !preserve_graph_derived_state {
+            Self::invalidate_resolution_support_snapshot_on(&tx)?;
+            record_projection_statement(
+                &mut breakdown.persistence.dirty_state,
+                1,
+                projection_scalar_binds(1),
+            );
+        }
         breakdown.persistence.dirty_state.wall_ms =
             clamp_i64_to_u32(dirty_started.elapsed().as_millis() as i64);
 
@@ -7916,15 +9415,18 @@ impl Storage {
         // indexer counts the same two kinds, and anything else is fenced by the
         // file-structural row instead; the three definitions have to agree or a
         // delta leaves a row nothing rewrote.
+        let removed_edge_predicate = format!(
+            "file_node_id = ?1
+             AND source_node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
+             AND kind IN ({}, {})",
+            EdgeKind::CALL as i32,
+            EdgeKind::USAGE as i32
+        );
+        let provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_id)?;
+        delete_orphan_proof_provenance_in_tx(&tx, &provenance_ids)?;
         let removed_edges = tx.execute(
-            &format!(
-                "DELETE FROM edge
-                 WHERE file_node_id = ?1
-                 AND source_node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
-                 AND kind IN ({}, {})",
-                EdgeKind::CALL as i32,
-                EdgeKind::USAGE as i32
-            ),
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_id],
         )?;
 
@@ -8020,20 +9522,23 @@ impl Storage {
         // two kinds the caller-scoped cleanup rewrites *and* a projected
         // callable of this file sources it. Scoped to `file_node_id` because
         // that is the set this file's parse re-emits.
+        let removed_edge_predicate = format!(
+            "file_node_id = ?1
+             AND NOT (
+                kind IN ({}, {})
+                AND source_node_id IN (
+                    SELECT node_id FROM callable_projection_state
+                    WHERE file_id = ?1 AND node_id <> ?1
+                )
+             )",
+            EdgeKind::CALL as i32,
+            EdgeKind::USAGE as i32
+        );
+        let provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_node_id)?;
+        delete_orphan_proof_provenance_in_tx(&tx, &provenance_ids)?;
         let removed_edges = tx.execute(
-            &format!(
-                "DELETE FROM edge
-                 WHERE file_node_id = ?1
-                 AND NOT (
-                    kind IN ({}, {})
-                    AND source_node_id IN (
-                        SELECT node_id FROM callable_projection_state
-                        WHERE file_id = ?1 AND node_id <> ?1
-                    )
-                 )",
-                EdgeKind::CALL as i32,
-                EdgeKind::USAGE as i32
-            ),
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_node_id],
         )?;
 
@@ -8060,6 +9565,26 @@ impl Storage {
             return Ok(Some(row_mapping::access_kind_from_db(raw)));
         }
         Ok(None)
+    }
+
+    /// Remove access rows whose stable nodes no longer project explicit access.
+    /// The incremental writer upserts the remaining current rows in its batch.
+    pub fn delete_component_access_for_nodes(
+        &mut self,
+        node_ids: &[NodeId],
+    ) -> Result<(), StorageError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare("DELETE FROM component_access WHERE node_id = ?1")?;
+            for node_id in node_ids {
+                statement.execute(params![node_id.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_component_access_map_for_nodes(
@@ -8290,6 +9815,89 @@ impl Storage {
         Ok(symbols)
     }
 
+    /// Read a page of exact canonical display-name matches and their file identities.
+    ///
+    /// This is a pre-hydration identity query. The page limit is a streaming
+    /// bound, not a global admission cap: callers apply native file identity
+    /// before bounding the admitted local matches.
+    pub fn get_exact_symbol_file_identities_after(
+        &self,
+        display_name: &str,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<NodeFileIdentityProjection>, StorageError> {
+        let limit =
+            canonical_search_symbol_batch_limit("get_exact_symbol_file_identities_after", limit)?;
+        let mut sql = String::from(
+            "SELECT node.id, file.serialized_name
+             FROM node
+             LEFT JOIN node file ON file.id = node.file_node_id
+             WHERE (CASE
+                WHEN node.qualified_name IS NOT NULL AND TRIM(node.qualified_name) != ''
+                THEN node.qualified_name ELSE node.serialized_name END) = ?",
+        );
+        let mut query_params = vec![Value::Text(display_name.to_string())];
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" AND node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut identities = Vec::new();
+        while let Some(row) = rows.next()? {
+            identities.push(NodeFileIdentityProjection {
+                node_id: NodeId(row.get(0)?),
+                file_path: row.get(1)?,
+            });
+        }
+        Ok(identities)
+    }
+
+    /// Read only the file identity attached to an explicit bounded node set.
+    ///
+    /// `limit` bounds both the input identities consulted and the rows
+    /// returned. This is an identity-index operation for pre-hydration packet
+    /// admission, not a source or node-detail projection.
+    pub fn get_node_file_identities_by_ids(
+        &self,
+        node_ids: &[NodeId],
+        limit: usize,
+    ) -> Result<Vec<NodeFileIdentityProjection>, StorageError> {
+        canonical_search_symbol_batch_limit("get_node_file_identities_by_ids", limit)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut identities = BTreeMap::new();
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable_by_key(|id| id.0);
+        unique.dedup();
+        unique.truncate(limit);
+        for chunk in unique.chunks(500) {
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT
+                    node.id,
+                    file.serialized_name
+                 FROM node
+                 LEFT JOIN node file ON file.id = node.file_node_id
+                 WHERE node.id IN ({placeholders})
+                 ORDER BY node.id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let identity = NodeFileIdentityProjection {
+                    node_id: NodeId(row.get(0)?),
+                    file_path: row.get(1)?,
+                };
+                identities.insert(identity.node_id, identity);
+            }
+        }
+        Ok(identities.into_values().collect())
+    }
+
     /// Counts lexical-search symbols in the canonical node table.
     pub fn get_canonical_search_symbol_count(&self) -> Result<u32, StorageError> {
         let count = self
@@ -8479,8 +10087,8 @@ impl Storage {
         self.conn
             .query_row(
                 "SELECT schema_version, complete, core_generation_id, core_run_id,
-                        anchor_count, anchor_digest, policy_version, migration_state,
-                        published_at_epoch_ms
+                        anchor_count, anchor_digest, anchor_source_identity,
+                        policy_version, migration_state, published_at_epoch_ms
                  FROM dense_anchor_publication WHERE id = 1",
                 [],
                 |row| {
@@ -8493,9 +10101,10 @@ impl Storage {
                         core_run_id: row.get(3)?,
                         anchor_count: anchor_count.max(0) as u64,
                         anchor_digest: row.get(5)?,
-                        policy_version: row.get(6)?,
-                        migration_state: row.get(7)?,
-                        published_at_epoch_ms: row.get(8)?,
+                        anchor_source_identity: row.get(6)?,
+                        policy_version: row.get(7)?,
+                        migration_state: row.get(8)?,
+                        published_at_epoch_ms: row.get(9)?,
                     })
                 },
             )
@@ -8595,6 +10204,7 @@ impl Storage {
         &mut self,
         publication: &IndexPublicationRecord,
     ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        *self.cache.produced_structural_text_validation.write() = None;
         if publication.generation_id.trim().is_empty()
             || publication.run_id.trim().is_empty()
             || publication.published_at_epoch_ms < 0
@@ -8715,6 +10325,20 @@ impl Storage {
             ],
         )?;
         tx.commit()?;
+        let projection_file_ids = self
+            .get_structural_text_projection_file_ids()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if projection_file_ids.len() as u64 != manifest.projection_count {
+            return Err(StorageError::Other(
+                "structural projection identity count changed after publication".into(),
+            ));
+        }
+        *self.cache.produced_structural_text_validation.write() =
+            Some(StructuralTextPublicationValidation {
+                manifest: manifest.clone(),
+                projection_file_ids,
+            });
         Ok(manifest)
     }
 
@@ -8722,6 +10346,14 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        self.validate_structural_text_unit_publication_contents(publication)
+            .map(|validation| validation.manifest)
+    }
+
+    fn validate_structural_text_unit_publication_contents(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextPublicationValidation, StorageError> {
         let manifest = self
             .get_structural_text_unit_publication_manifest()?
             .ok_or_else(|| {
@@ -8776,7 +10408,183 @@ impl Storage {
         }
         validate_structural_text_projection_rows(&self.conn)?;
         validate_structural_text_artifact_cache_rows(&self.conn)?;
-        Ok(manifest)
+        let projection_file_ids = self
+            .get_structural_text_projection_file_ids()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if projection_file_ids.len() as u64 != manifest.projection_count {
+            return Err(StorageError::Other(
+                "structural projection identity count does not match its manifest".into(),
+            ));
+        }
+        Ok(StructuralTextPublicationValidation {
+            manifest,
+            projection_file_ids,
+        })
+    }
+
+    pub(crate) fn load_structural_text_rebind_validation(
+        &self,
+        database_path: &Path,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextPublicationValidation, StorageError> {
+        let receipt_key = structural_text_receipt_key(database_path, publication);
+        let receipt_artifacts = structural_text_receipt_artifacts(database_path);
+        if let Some(validation) =
+            STRUCTURAL_TEXT_PUBLICATION_RECEIPTS.reuse_sealed(&receipt_key, &receipt_artifacts)
+        {
+            return Ok(validation);
+        }
+        let manifest = self
+            .get_structural_text_unit_publication_manifest()?
+            .ok_or_else(|| {
+                StorageError::Other("structural text unit publication is missing".into())
+            })?;
+        if manifest.schema_version != STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+            || manifest.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            || manifest.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+            || manifest.unit_digest.is_empty()
+            || manifest.projection_digest.is_empty()
+        {
+            return Err(StorageError::Other(
+                "structural text unit publication is not eligible for bounded rebind".into(),
+            ));
+        }
+        let projection_file_ids = self
+            .get_structural_text_projection_file_ids()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if projection_file_ids.len() as u64 != manifest.projection_count {
+            return Err(StorageError::Other(
+                "structural projection identity count does not match its manifest".into(),
+            ));
+        }
+        Ok(StructuralTextPublicationValidation {
+            manifest,
+            projection_file_ids,
+        })
+    }
+
+    pub(crate) fn rebind_structural_text_unit_generation(
+        &mut self,
+        inherited: &StructuralTextPublicationValidation,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<StructuralTextUnitPublicationManifest>, StorageError> {
+        *self.cache.produced_structural_text_validation.write() = None;
+        let prior = &inherited.manifest;
+        if prior.schema_version != STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION
+            || !prior.complete
+            || prior.core_generation_id != previous.generation_id
+            || prior.core_run_id != previous.run_id
+            || prior.published_at_epoch_ms != previous.published_at_epoch_ms
+            || prior.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            || prior.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+            || inherited.projection_file_ids.len() as u64 != prior.projection_count
+            || changed_file_ids
+                .iter()
+                .any(|file_id| inherited.projection_file_ids.contains(file_id))
+        {
+            return Ok(None);
+        }
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || publication.published_at_epoch_ms < 0
+        {
+            return Err(StorageError::Other(
+                "structural text unit rebind identity is invalid".into(),
+            ));
+        }
+        let (unit_count, projection_count, artifact_cache_count) = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM structural_text_unit),
+                (SELECT COUNT(*) FROM structural_text_projection),
+                (SELECT COUNT(*) FROM structural_text_artifact_cache)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            },
+        )?;
+        if unit_count != prior.unit_count
+            || projection_count != prior.projection_count
+            || artifact_cache_count > prior.projection_count
+        {
+            return Ok(None);
+        }
+        let current = self.get_structural_text_unit_publication_manifest()?;
+        if current.as_ref().is_some_and(|manifest| manifest != prior) {
+            return Err(StorageError::Other(
+                "structural text publication changed during graph-equivalent rebind".into(),
+            ));
+        }
+        let manifest = StructuralTextUnitPublicationManifest {
+            schema_version: prior.schema_version,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            unit_count: prior.unit_count,
+            unit_digest: prior.unit_digest.clone(),
+            projection_count: prior.projection_count,
+            projection_digest: prior.projection_digest.clone(),
+            descriptor_version: prior.descriptor_version,
+            migration_state: prior.migration_state.clone(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        let tx = self.conn.transaction()?;
+        let current_identity = current.as_ref().map(|manifest| {
+            (
+                manifest.core_generation_id.as_str(),
+                manifest.core_run_id.as_str(),
+                manifest.published_at_epoch_ms,
+            )
+        });
+        if current_identity.is_some() {
+            tx.execute(
+                "DELETE FROM structural_text_unit_publication
+                 WHERE id = 1 AND core_generation_id = ?1 AND core_run_id = ?2
+                   AND published_at_epoch_ms = ?3",
+                params![
+                    prior.core_generation_id,
+                    prior.core_run_id,
+                    prior.published_at_epoch_ms,
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO structural_text_unit_publication (
+                id, schema_version, complete, core_generation_id, core_run_id,
+                unit_count, unit_digest, projection_count, projection_digest,
+                descriptor_version, migration_state, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                manifest.schema_version as i64,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.unit_count.min(i64::MAX as u64) as i64,
+                &manifest.unit_digest,
+                manifest.projection_count.min(i64::MAX as u64) as i64,
+                &manifest.projection_digest,
+                manifest.descriptor_version as i64,
+                &manifest.migration_state,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        *self.cache.produced_structural_text_validation.write() =
+            Some(StructuralTextPublicationValidation {
+                manifest: manifest.clone(),
+                projection_file_ids: inherited.projection_file_ids.clone(),
+            });
+        Ok(Some(manifest))
     }
 
     /// Validate the structural state admitted by semantic projection republish.
@@ -8824,6 +10632,27 @@ impl Storage {
         &self,
     ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
         read_source_policy_exclusions(&self.conn)
+    }
+
+    /// Check one normalized source-policy path without reading the complete
+    /// exclusion publication into memory.
+    pub fn has_source_policy_exclusion_path(
+        &self,
+        normalized_path: &str,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM source_policy_exclusion
+                    WHERE normalized_path = ?1
+                    LIMIT 1
+                 )",
+                params![normalized_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|found| found != 0)
+            .map_err(StorageError::from)
     }
 
     pub fn get_source_policy_exclusion_manifest(
@@ -9141,7 +10970,7 @@ impl Storage {
         Ok(manifest)
     }
 
-    /// Rebind every carried-forward row and atomically publish its complete manifest.
+    /// Publish a newly materialized dense-anchor generation.
     pub fn publish_dense_anchor_generation(
         &mut self,
         publication: &IndexPublicationRecord,
@@ -9159,15 +10988,20 @@ impl Storage {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE dense_anchor_input SET source_identity = ?1",
-            params![source_identity],
+            params![&source_identity],
         )?;
-        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&tx)?;
-        if policies.iter().any(|policy| policy != policy_version)
-            || (anchor_count > 0 && policies.len() != 1)
+        let summary = dense_anchor_content_summary(&tx)?;
+        if summary
+            .policies
+            .iter()
+            .any(|policy| policy != policy_version)
+            || (summary.count > 0 && summary.policies.len() != 1)
+            || (summary.count > 0
+                && summary.source_identities != HashSet::from([source_identity.clone()]))
         {
             return Err(StorageError::Other(format!(
                 "dense anchor publication contains policies {:?}, expected {policy_version}",
-                policies
+                summary.policies
             )));
         }
         let manifest = DenseAnchorPublicationManifest {
@@ -9175,41 +11009,90 @@ impl Storage {
             complete: true,
             core_generation_id: publication.generation_id.clone(),
             core_run_id: publication.run_id.clone(),
-            anchor_count,
-            anchor_digest,
+            anchor_count: summary.count,
+            anchor_digest: summary.digest,
+            anchor_source_identity: source_identity,
             policy_version: policy_version.to_string(),
             migration_state: DENSE_ANCHOR_MIGRATION_STATE_NATIVE.to_string(),
             published_at_epoch_ms: publication.published_at_epoch_ms,
         };
-        tx.execute(
-            "INSERT INTO dense_anchor_publication (
-                id, schema_version, complete, core_generation_id, core_run_id,
-                anchor_count, anchor_digest, policy_version, migration_state,
-                published_at_epoch_ms
-             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO UPDATE SET
-                schema_version = excluded.schema_version,
-                complete = excluded.complete,
-                core_generation_id = excluded.core_generation_id,
-                core_run_id = excluded.core_run_id,
-                anchor_count = excluded.anchor_count,
-                anchor_digest = excluded.anchor_digest,
-                policy_version = excluded.policy_version,
-                migration_state = excluded.migration_state,
-                published_at_epoch_ms = excluded.published_at_epoch_ms",
-            params![
-                manifest.schema_version as i64,
-                &manifest.core_generation_id,
-                &manifest.core_run_id,
-                manifest.anchor_count.min(i64::MAX as u64) as i64,
-                &manifest.anchor_digest,
-                &manifest.policy_version,
-                &manifest.migration_state,
-                manifest.published_at_epoch_ms,
-            ],
-        )?;
+        write_dense_anchor_publication_manifest(&tx, &manifest)?;
         tx.commit()?;
+        *self.cache.produced_dense_anchor_validation.write() =
+            Some(DenseAnchorPublicationValidation {
+                manifest: manifest.clone(),
+                anchors: summary.anchors,
+            });
         Ok(manifest)
+    }
+
+    /// Bind an already validated, graph-equivalent anchor set to a new core.
+    ///
+    /// The staged snapshot owns the construction proof: it was cloned from the
+    /// immutable predecessor after that predecessor passed deep validation,
+    /// and the runtime calls this only when semantic projection made no anchor
+    /// changes. The cheap row-shape checks catch accidental count, policy, or
+    /// source-identity drift without rescanning document text.
+    pub fn rebind_dense_anchor_generation(
+        &mut self,
+        inherited: &DenseAnchorPublicationValidation,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        policy_version: &str,
+    ) -> Result<Option<DenseAnchorPublicationManifest>, StorageError> {
+        let prior = &inherited.manifest;
+        if prior.schema_version != DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+            || !prior.complete
+            || prior.core_generation_id != previous.generation_id
+            || prior.core_run_id != previous.run_id
+            || prior.migration_state != DENSE_ANCHOR_MIGRATION_STATE_NATIVE
+            || prior.policy_version != policy_version
+            || prior.anchor_source_identity.trim().is_empty()
+            || inherited.anchors.len() as u64 != prior.anchor_count
+        {
+            return Ok(None);
+        }
+        let (count, mismatched_policy, mismatched_source) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN policy_version <> ?1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN source_identity <> ?2 THEN 1 ELSE 0 END)
+             FROM dense_anchor_input",
+            params![policy_version, &prior.anchor_source_identity],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+                ))
+            },
+        )?;
+        if count.max(0) as u64 != prior.anchor_count
+            || mismatched_policy != 0
+            || mismatched_source != 0
+        {
+            return Ok(None);
+        }
+        let manifest = DenseAnchorPublicationManifest {
+            schema_version: DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            anchor_count: prior.anchor_count,
+            anchor_digest: prior.anchor_digest.clone(),
+            anchor_source_identity: prior.anchor_source_identity.clone(),
+            policy_version: prior.policy_version.clone(),
+            migration_state: DENSE_ANCHOR_MIGRATION_STATE_NATIVE.to_string(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        let tx = self.conn.transaction()?;
+        write_dense_anchor_publication_manifest(&tx, &manifest)?;
+        tx.commit()?;
+        *self.cache.produced_dense_anchor_validation.write() =
+            Some(DenseAnchorPublicationValidation {
+                manifest: manifest.clone(),
+                anchors: inherited.anchors.clone(),
+            });
+        Ok(Some(manifest))
     }
 
     /// Validate the manifest against both the pinned publication and current rows.
@@ -9217,6 +11100,16 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<DenseAnchorPublicationManifest, StorageError> {
+        self.validate_dense_anchor_publication_contents(publication)
+            .map(|validation| validation.manifest)
+    }
+
+    /// Deep-validate the manifest and return the stable vector-document
+    /// identities derived during that same row scan.
+    pub fn validate_dense_anchor_publication_contents(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<DenseAnchorPublicationValidation, StorageError> {
         let manifest = self
             .get_dense_anchor_publication_manifest()?
             .ok_or_else(|| StorageError::Other("dense anchor publication is missing".into()))?;
@@ -9225,36 +11118,56 @@ impl Storage {
             || manifest.core_generation_id != publication.generation_id
             || manifest.core_run_id != publication.run_id
             || manifest.migration_state != DENSE_ANCHOR_MIGRATION_STATE_NATIVE
+            || manifest.anchor_source_identity.trim().is_empty()
             || manifest.policy_version.trim().is_empty()
         {
             return Err(StorageError::Other(
                 "dense anchor publication does not match the complete core publication".into(),
             ));
         }
-        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&self.conn)?;
-        if manifest.anchor_count != anchor_count
-            || manifest.anchor_digest != anchor_digest
-            || policies
+        let summary = dense_anchor_content_summary(&self.conn)?;
+        if manifest.anchor_count != summary.count
+            || manifest.anchor_digest != summary.digest
+            || summary
+                .policies
                 .iter()
                 .any(|policy| policy != &manifest.policy_version)
-            || (anchor_count > 0 && policies.len() != 1)
+            || (summary.count > 0 && summary.policies.len() != 1)
+            || (summary.count > 0
+                && summary.source_identities
+                    != HashSet::from([manifest.anchor_source_identity.clone()]))
         {
             return Err(StorageError::Other(
                 "dense anchor publication rows do not match their manifest".into(),
             ));
         }
-        let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
-        let mismatched_sources = self.conn.query_row(
-            "SELECT COUNT(*) FROM dense_anchor_input WHERE source_identity <> ?1",
-            params![expected_source],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if mismatched_sources != 0 {
-            return Err(StorageError::Other(
-                "dense anchor publication contains stale source identities".into(),
-            ));
-        }
-        Ok(manifest)
+        Ok(DenseAnchorPublicationValidation {
+            manifest,
+            anchors: summary.anchors,
+        })
+    }
+
+    /// Deep-validate once per immutable core artifact, then answer from its
+    /// native identity seal while the file and SQLite sidecars remain fixed.
+    pub fn validate_dense_anchor_publication_sealed(
+        &self,
+        database_path: &Path,
+        publication: &IndexPublicationRecord,
+    ) -> Result<DenseAnchorPublicationValidation, StorageError> {
+        let key = dense_anchor_receipt_key(database_path, publication);
+        let artifacts = dense_anchor_receipt_artifacts(database_path);
+        DENSE_ANCHOR_PUBLICATION_RECEIPTS.validate_sealed(key, &artifacts, || {
+            self.validate_dense_anchor_publication_contents(publication)
+        })
+    }
+
+    #[cfg(test)]
+    fn dense_anchor_publication_receipt_stats(
+        database_path: &Path,
+        publication: &IndexPublicationRecord,
+    ) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
+        DENSE_ANCHOR_PUBLICATION_RECEIPTS
+            .stats(&dense_anchor_receipt_key(database_path, publication))
     }
 
     pub fn clear_dense_anchor_inputs(&mut self) -> Result<usize, StorageError> {
@@ -9269,11 +11182,10 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
         let copy_result = self.conn.execute(
@@ -9398,6 +11310,11 @@ impl Storage {
         if docs.is_empty() {
             return Ok(());
         }
+        if docs.iter().any(|doc| !doc.attached_comment_is_valid()) {
+            return Err(StorageError::Other(
+                "symbol search document has invalid attached-comment evidence".into(),
+            ));
+        }
 
         let tx = self.conn.transaction()?;
         {
@@ -9415,9 +11332,14 @@ impl Storage {
                     doc_hash,
                     policy_version,
                     source_provenance,
-                    updated_at_epoch_ms
+                    updated_at_epoch_ms,
+                    attached_comment_text,
+                    attached_comment_state,
+                    attached_comment_policy,
+                    attached_comment_hash
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -9431,7 +11353,11 @@ impl Storage {
                     doc_hash = excluded.doc_hash,
                     policy_version = excluded.policy_version,
                     source_provenance = excluded.source_provenance,
-                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms,
+                    attached_comment_text = excluded.attached_comment_text,
+                    attached_comment_state = excluded.attached_comment_state,
+                    attached_comment_policy = excluded.attached_comment_policy,
+                    attached_comment_hash = excluded.attached_comment_hash",
             )?;
             for doc in docs {
                 stmt.execute(params![
@@ -9448,6 +11374,10 @@ impl Storage {
                     doc.policy_version,
                     doc.source_provenance,
                     doc.updated_at_epoch_ms,
+                    doc.attached_comment_text,
+                    doc.attached_comment_state,
+                    doc.attached_comment_policy,
+                    doc.attached_comment_hash,
                 ])?;
             }
         }
@@ -9474,7 +11404,11 @@ impl Storage {
                 doc_hash,
                 policy_version,
                 source_provenance,
-                updated_at_epoch_ms
+                updated_at_epoch_ms,
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy,
+                attached_comment_hash
              FROM symbol_search_doc
              WHERE (?1 IS NULL OR node_id > ?1)
              ORDER BY node_id ASC
@@ -9501,6 +11435,10 @@ impl Storage {
                 policy_version: row.get(10)?,
                 source_provenance: row.get(11)?,
                 updated_at_epoch_ms: row.get(12)?,
+                attached_comment_text: row.get(13)?,
+                attached_comment_state: row.get(14)?,
+                attached_comment_policy: row.get(15)?,
+                attached_comment_hash: row.get(16)?,
             });
         }
         Ok(docs)
@@ -9525,7 +11463,9 @@ impl Storage {
                 "SELECT
                     node_id, file_node_id, kind, display_name, qualified_name,
                     file_path, start_line, doc_text, doc_version, doc_hash,
-                    policy_version, source_provenance, updated_at_epoch_ms
+                    policy_version, source_provenance, updated_at_epoch_ms,
+                    attached_comment_text, attached_comment_state,
+                    attached_comment_policy, attached_comment_hash
                  FROM symbol_search_doc
                  WHERE node_id IN ({placeholders})
                  ORDER BY node_id ASC"
@@ -9549,6 +11489,10 @@ impl Storage {
                     policy_version: row.get(10)?,
                     source_provenance: row.get(11)?,
                     updated_at_epoch_ms: row.get(12)?,
+                    attached_comment_text: row.get(13)?,
+                    attached_comment_state: row.get(14)?,
+                    attached_comment_policy: row.get(15)?,
+                    attached_comment_hash: row.get(16)?,
                 });
             }
         }
@@ -9570,17 +11514,33 @@ impl Storage {
         expected_version: u32,
         expected_policy_version: &str,
     ) -> Result<bool, StorageError> {
-        let mismatch = self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM symbol_search_doc
-                WHERE doc_version <> ?1 OR policy_version <> ?2
-                LIMIT 1
-            )",
-            params![expected_version as i64, expected_policy_version],
-            |row| row.get::<_, bool>(0),
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_version, policy_version, attached_comment_text,
+                    attached_comment_state, attached_comment_policy, attached_comment_hash
+             FROM symbol_search_doc",
         )?;
-        Ok(mismatch)
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let doc_version: i64 = row.get(0)?;
+            let policy_version: String = row.get(1)?;
+            let text: Option<String> = row.get(2)?;
+            let state: String = row.get(3)?;
+            let comment_policy: String = row.get(4)?;
+            let comment_hash: String = row.get(5)?;
+            if doc_version != expected_version as i64
+                || policy_version != expected_policy_version
+                || comment_policy != SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION
+                || !matches!(
+                    (state.as_str(), text.as_ref()),
+                    (SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED, Some(_))
+                        | (SymbolSearchDoc::ATTACHED_COMMENT_UNAVAILABLE, None)
+                )
+                || comment_hash != SymbolSearchDoc::attached_comment_hash(&state, text.as_deref())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn clear_symbol_search_docs(&mut self) -> Result<usize, StorageError> {
@@ -9592,14 +11552,23 @@ impl Storage {
         &mut self,
         source_path: &Path,
     ) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
-        let copy_result = self.conn.execute(
+        let source_has_comments = self
+            .conn
+            .prepare("SELECT attached_comment_state FROM source_snapshot.symbol_search_doc LIMIT 0")
+            .is_ok();
+        let comment_columns = if source_has_comments {
+            "source_doc.attached_comment_text, source_doc.attached_comment_state,
+             source_doc.attached_comment_policy, source_doc.attached_comment_hash"
+        } else {
+            "NULL, '', '', ''"
+        };
+        let copy_sql = format!(
             "INSERT OR REPLACE INTO symbol_search_doc (
                 node_id,
                 file_node_id,
@@ -9613,7 +11582,11 @@ impl Storage {
                 doc_hash,
                 policy_version,
                 source_provenance,
-                updated_at_epoch_ms
+                updated_at_epoch_ms,
+                attached_comment_text,
+                attached_comment_state,
+                attached_comment_policy,
+                attached_comment_hash
              )
              SELECT
                 source_doc.node_id,
@@ -9628,7 +11601,8 @@ impl Storage {
                 source_doc.doc_hash,
                 source_doc.policy_version,
                 source_doc.source_provenance,
-                source_doc.updated_at_epoch_ms
+                source_doc.updated_at_epoch_ms,
+                {comment_columns}
              FROM source_snapshot.symbol_search_doc source_doc
              WHERE EXISTS (
                 SELECT 1 FROM node WHERE node.id = source_doc.node_id
@@ -9638,9 +11612,9 @@ impl Storage {
                 OR EXISTS (
                     SELECT 1 FROM node WHERE node.id = source_doc.file_node_id
                 )
-             )",
-            [],
+             )"
         );
+        let copy_result = self.conn.execute(&copy_sql, []);
         let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
         let copied = copy_result?;
         detach_result?;
@@ -10310,11 +12284,10 @@ impl Storage {
     }
 
     pub fn copy_llm_symbol_docs_from(&mut self, source_path: &Path) -> Result<usize, StorageError> {
-        if !source_path.exists() {
+        let Some(source_path) = resolved_copy_source_database_path(source_path)? else {
             return Ok(0);
-        }
-        drop(Storage::open(source_path)?);
-        let source = sqlite_path::attach_argument(source_path);
+        };
+        let source = source_path.attach_argument();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -10635,6 +12608,25 @@ impl Storage {
     ) -> Result<BuildNodeLookup, StorageError> {
         const OPERATION: &str = "get_nodes_by_ids_no_cache_for_build";
         self.require_build_mode(OPERATION)?;
+        self.get_nodes_by_ids_no_cache(ids)
+    }
+
+    /// Loads canonical node identities from SQLite without consulting or
+    /// populating `StorageCache`. Callers holding a read snapshot therefore
+    /// receive identities from the same pinned database view as adjacent rows.
+    pub fn get_node_canonical_ids_by_ids_no_cache(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, Option<String>>, StorageError> {
+        Ok(self
+            .get_nodes_by_ids_no_cache(ids)?
+            .nodes
+            .into_iter()
+            .map(|(node_id, node)| (node_id, node.canonical_id))
+            .collect())
+    }
+
+    fn get_nodes_by_ids_no_cache(&self, ids: &[NodeId]) -> Result<BuildNodeLookup, StorageError> {
         if ids.is_empty() {
             return Ok(BuildNodeLookup {
                 nodes: HashMap::new(),
@@ -10894,6 +12886,37 @@ impl Storage {
             }
         }
         Ok(files)
+    }
+
+    /// Check exact path membership through the file identity index without
+    /// materializing a file record. Packet admission uses this before source,
+    /// node bodies, or other file metadata may be opened.
+    pub fn has_complete_indexed_file_path(&self, paths: &[PathBuf]) -> Result<bool, StorageError> {
+        for chunk in paths.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM file
+                    WHERE path IN ({placeholders})
+                      AND indexed = 1
+                      AND complete = 1
+                    LIMIT 1
+                )"
+            );
+            let found = self.conn.query_row(
+                &sql,
+                params_from_iter(chunk.iter().map(|path| path.to_string_lossy().to_string())),
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn get_file_roles_by_paths(
@@ -11717,6 +13740,31 @@ impl Storage {
         }
     }
 
+    /// Read one file record by its graph/file identity.
+    pub fn get_file_by_id(&self, file_id: i64) -> Result<Option<FileInfo>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, path, language, modification_time, indexed, complete, line_count, file_role
+                 FROM file
+                 WHERE id = ?1",
+                params![file_id],
+                |row| {
+                    Ok(FileInfo {
+                        id: row.get(0)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        language: row.get(2)?,
+                        modification_time: row.get(3)?,
+                        indexed: row.get::<_, i32>(4)? != 0,
+                        complete: row.get::<_, i32>(5)? != 0,
+                        line_count: row.get(6)?,
+                        file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     pub fn get_node_kinds_for_files(
         &self,
         file_ids: &[i64],
@@ -12120,13 +14168,30 @@ impl Storage {
             params![file_node_id],
         )?;
 
-        let removed_edges = tx.execute(
+        let removed_edge_predicate = format!(
+            "source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+             OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+             OR file_node_id = ?1"
+        );
+
+        // Inherited proof facts hold foreign keys into the edge, node, and file
+        // rows removed below, so they have to go first.
+        let mut provenance_ids =
+            delete_proof_facts_for_removed_edges_in_tx(tx, &removed_edge_predicate, file_node_id)?;
+        provenance_ids.extend(delete_proof_facts_matching_in_tx(
+            tx,
             &format!(
-                "DELETE FROM edge
-                 WHERE source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                "file_id = ?1
+                 OR caller_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 OR file_node_id = ?1"
+                 OR raw_edge_target_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
             ),
+            file_node_id,
+        )?);
+        delete_orphan_proof_provenance_in_tx(tx, &provenance_ids)?;
+
+        let removed_edges = tx.execute(
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_node_id],
         )?;
 
@@ -12315,6 +14380,26 @@ impl Storage {
         Ok(errors)
     }
 
+    /// Read only the coverage reasons attached to one admitted file.
+    pub fn get_file_coverage_reasons(
+        &self,
+        file_id: i64,
+    ) -> Result<Vec<FileCoverageReason>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT coverage_reason
+             FROM error
+             WHERE file_id = ?1
+               AND coverage_reason IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let reason = row?;
+            FileCoverageReason::try_from(reason.as_str()).map_err(StorageError::from)
+        })
+        .collect()
+    }
+
     /// Clear all errors
     pub fn clear_errors(&self) -> Result<(), StorageError> {
         self.conn.execute("DELETE FROM error", [])?;
@@ -12471,7 +14556,13 @@ impl Storage {
         canonical_id: &str,
     ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
         self.annotation_anchors(
-            &format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.canonical_id = ?1 ORDER BY n.id ASC"),
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE COALESCE(substr(CAST(n.canonical_id AS BLOB), -32), X'') =
+                       COALESCE(substr(CAST(?1 AS BLOB), -32), X'')
+                   AND n.canonical_id = ?1
+                 ORDER BY n.id ASC"
+            ),
             params![canonical_id],
         )
     }
@@ -13364,7 +15455,10 @@ mod grounding_snapshot_fast_path_tests {
     }
 }
 
-pub use retrieval_manifest::{RetrievalIndexManifest, RetrievalIndexRollbackRecord};
+pub use retrieval_manifest::{
+    BoundRetrievalIndexManifest, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
+    RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
+};
 
 #[cfg(test)]
 mod tests;

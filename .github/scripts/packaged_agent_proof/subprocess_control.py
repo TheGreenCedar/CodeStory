@@ -135,6 +135,278 @@ def extract_resource(
     raise ProofFailure(f"resource response did not contain {uri}")
 
 
+_READINESS_CODE_STATES = frozenset(
+    (
+        ("codestory_preparing", "preparing"),
+        ("codestory_updating", "updating"),
+    )
+)
+_READINESS_KIND_STATES = frozenset(
+    (
+        ("preparing", "preparing"),
+        ("updating", "updating"),
+    )
+)
+_LEGACY_SEARCH_RETRIEVAL_STATES = frozenset(("ready", "degraded"))
+_SCHEMA3_SEARCH_RETRIEVAL_STATES = frozenset(("full", "degraded"))
+_SEARCH_CONVERGED_RETRIEVAL_STATES = frozenset(("ready", "full"))
+
+
+def is_schema3_search_projection(state: dict) -> bool:
+    """True when the payload is the agent evidence projection (schema_version 3)."""
+
+    return state.get("schema_version") == 3
+
+
+def resolve_search_snippet_anchor(state: dict) -> dict:
+    """Resolve a snippet-capable node from legacy hits or schema-3 evidence.
+
+    Returns ``{"node_id": str, "snippet_link_uri": str | None}``.
+
+    Legacy installed-host proofs decorate resolvable hits with ``links`` that
+    include a ``rel=snippet`` continuation URI. Live schema-3 search returns
+    evidence rows with ``symbol_id`` and omits those links; callers then
+    synthesize the project-bound snippet URI from ``node_id``. Fail closed on
+    missing or malformed shapes rather than inventing an anchor.
+    """
+
+    require(
+        isinstance(state, dict),
+        f"MCP search returned a non-object projection for snippet anchoring: {state!r}",
+    )
+    if is_schema3_search_projection(state):
+        require(
+            state.get("kind") == "complete",
+            f"MCP search did not return a complete schema-3 evidence projection: {state!r}",
+        )
+        evidence = state.get("evidence")
+        require(
+            isinstance(evidence, list),
+            f"MCP search returned non-array evidence: {state!r}",
+        )
+        for row in evidence:
+            if not isinstance(row, dict):
+                continue
+            symbol_id = row.get("symbol_id")
+            if isinstance(symbol_id, str) and symbol_id:
+                return {"node_id": symbol_id, "snippet_link_uri": None}
+        raise ProofFailure(
+            "packaged search omitted resolvable schema-3 evidence with "
+            f"symbol_id: {state!r}"
+        )
+
+    hits = state.get("hits")
+    require(
+        isinstance(hits, list),
+        f"MCP search returned non-array hits: {state!r}",
+    )
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        node_id = hit.get("node_id")
+        links = hit.get("links")
+        if not (
+            isinstance(node_id, str)
+            and node_id
+            and isinstance(links, list)
+        ):
+            continue
+        snippet_uri = next(
+            (
+                link.get("uri")
+                for link in links
+                if isinstance(link, dict)
+                and link.get("rel") == "snippet"
+                and isinstance(link.get("uri"), str)
+                and link.get("uri")
+            ),
+            None,
+        )
+        if isinstance(snippet_uri, str):
+            return {"node_id": node_id, "snippet_link_uri": snippet_uri}
+    raise ProofFailure(
+        "packaged search omitted a resolvable hit with continuation links: "
+        f"{state!r}"
+    )
+
+
+def resolve_quality_search_hits(payload: dict) -> list:
+    """Return ordered hits for publication quality ranking.
+
+    Legacy CLI ``SearchOutput`` exposes ``indexed_symbol_hits``. Live
+    agent-profile search emits schema-3 ``evidence`` rows and omits that
+    field. Accept either shape; fail closed on incomplete or non-array
+    projections rather than inventing hits.
+    """
+
+    require(
+        isinstance(payload, dict),
+        f"qualification search returned a non-object projection: {payload!r}",
+    )
+    if is_schema3_search_projection(payload):
+        require(
+            payload.get("kind") == "complete",
+            "qualification search did not return a complete schema-3 "
+            f"evidence projection: {payload!r}",
+        )
+        evidence = payload.get("evidence")
+        require(
+            isinstance(evidence, list),
+            f"qualification search returned non-array evidence: {payload!r}",
+        )
+        return evidence
+
+    hits = payload.get("indexed_symbol_hits")
+    require(
+        isinstance(hits, list),
+        "qualification search omitted indexed symbol hits",
+    )
+    return hits
+
+
+def quality_search_hit_matches(hit: object, expected: str) -> bool:
+    """True when a legacy or schema-3 hit carries ``expected`` for ranking.
+
+    Legacy rows match ``display_name``. Schema-3 evidence rows drop that
+    field and keep ``excerpt`` / ``path``; qualification anchors appear in
+    the pinned source window excerpt for indexed symbol hits.
+    """
+
+    if not isinstance(hit, dict) or not isinstance(expected, str) or not expected:
+        return False
+    for key in ("display_name", "excerpt", "path"):
+        value = hit.get(key)
+        if isinstance(value, str) and expected in value:
+            return True
+    return False
+
+
+def search_retrieval_state(state: dict, *, query: object) -> str:
+    """Validate an MCP search projection and return its retrieval.state.
+
+    Legacy installed-host proofs echoed ``query`` / ``hits`` with
+    ``retrieval.state∈{ready,degraded}``. Live schema-3 search returns an
+    evidence envelope (``kind`` / ``evidence`` / ``retrieval.state∈{full,degraded}``)
+    and omits those legacy fields. Accept either shape; never treat
+    ``unavailable`` (or other non-ready states) as convergence.
+    """
+
+    if is_schema3_search_projection(state):
+        require(
+            state.get("kind") == "complete",
+            f"MCP search did not return a complete schema-3 evidence projection: {state!r}",
+        )
+        require(
+            isinstance(state.get("evidence"), list),
+            f"MCP search returned non-array evidence: {state!r}",
+        )
+        retrieval = state.get("retrieval")
+        require(
+            isinstance(retrieval, dict)
+            and retrieval.get("state") in _SCHEMA3_SEARCH_RETRIEVAL_STATES,
+            f"MCP search did not return the ready installed retrieval projection: {state!r}",
+        )
+        return retrieval["state"]
+
+    require(
+        isinstance(query, str) and state.get("query") == query,
+        f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+    )
+    require(
+        isinstance(state.get("hits"), list),
+        f"MCP search returned non-array hits: {state!r}",
+    )
+    retrieval = state.get("retrieval")
+    require(
+        isinstance(retrieval, dict)
+        and retrieval.get("state") in _LEGACY_SEARCH_RETRIEVAL_STATES,
+        f"MCP search did not return the ready installed retrieval projection: {state!r}",
+    )
+    return retrieval["state"]
+
+
+def tool_result_envelope(result: dict, *, name: str, attempt: int) -> dict:
+    """Resolve the tool payload for MCP 2024-11-05 text envelopes and structuredContent.
+
+    Protocol revisions that omit structuredContent on fail-open preparing still carry the
+    same JSON object in content[0].text. Callers must treat those as equivalent; parsing
+    here is not a readiness bypass for terminal failures.
+    """
+
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    content = result.get("content")
+    if isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict) and first.get("type") == "text":
+            text = first.get("text")
+            if isinstance(text, str) and text:
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ProofFailure(
+                        f"MCP {name} attempt {attempt} returned non-JSON text content: {result!r}"
+                    ) from exc
+                if isinstance(parsed, dict):
+                    return parsed
+    raise ProofFailure(
+        f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}"
+    )
+
+
+def is_readiness_retry_envelope(envelope: dict) -> bool:
+    return (envelope.get("code"), envelope.get("state")) in _READINESS_CODE_STATES or (
+        envelope.get("kind"),
+        envelope.get("state"),
+    ) in _READINESS_KIND_STATES
+
+
+def readiness_retry_after_ms(envelope: dict) -> int | None:
+    retry_after_ms = envelope.get("retry_after_ms")
+    if (
+        isinstance(retry_after_ms, int)
+        and not isinstance(retry_after_ms, bool)
+        and retry_after_ms >= 0
+    ):
+        return retry_after_ms
+    minimum_next = envelope.get("minimum_next")
+    if isinstance(minimum_next, dict):
+        after_ms = minimum_next.get("after_ms")
+        if (
+            isinstance(after_ms, int)
+            and not isinstance(after_ms, bool)
+            and after_ms >= 0
+        ):
+            return after_ms
+    return None
+
+
+def allows_same_request_retry(envelope: dict, tool_name: str) -> bool:
+    if envelope.get("retry_tool") == tool_name:
+        return True
+    minimum_next = envelope.get("minimum_next")
+    return (
+        isinstance(minimum_next, dict)
+        and minimum_next.get("kind") == "retry_same_request"
+    )
+
+
+def attach_structured_content(response: dict, envelope: dict) -> dict:
+    """Expose a parsed text envelope as structuredContent for proof callers."""
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return response
+    if isinstance(result.get("structuredContent"), dict):
+        return response
+    normalized = dict(response)
+    normalized_result = dict(result)
+    normalized_result["structuredContent"] = envelope
+    normalized["result"] = normalized_result
+    return normalized
+
+
 class McpProcess:
     def __init__(
         self,
@@ -319,16 +591,8 @@ class McpProcess:
                 isinstance(result, dict),
                 f"MCP {name} attempt {attempt} returned a non-object result: {result!r}",
             )
-            state = result.get("structuredContent")
-            require(
-                isinstance(state, dict),
-                f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}",
-            )
-            retryable = (state.get("code"), state.get("state")) in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            )
-            if retryable:
+            state = tool_result_envelope(result, name=name, attempt=attempt)
+            if is_readiness_retry_envelope(state):
                 self._wait_for_readiness_retry(
                     name,
                     attempt,
@@ -341,7 +605,7 @@ class McpProcess:
                     False,
                     f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
                 )
-            return response, attempt
+            return attach_structured_content(response, state), attempt
 
     def _wait_for_readiness_retry(
         self,
@@ -351,22 +615,16 @@ class McpProcess:
         deadline: float,
     ) -> None:
         require(
-            (state.get("code"), state.get("state"))
-            in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            ),
+            is_readiness_retry_envelope(state),
             f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
         )
         require(
-            state.get("retry_tool") == name,
+            allows_same_request_retry(state, name),
             f"MCP {name} attempt {attempt} returned the wrong retry tool: {state!r}",
         )
-        retry_after_ms = state.get("retry_after_ms")
+        retry_after_ms = readiness_retry_after_ms(state)
         require(
-            isinstance(retry_after_ms, int)
-            and not isinstance(retry_after_ms, bool)
-            and retry_after_ms >= 0,
+            retry_after_ms is not None,
             f"MCP {name} attempt {attempt} returned invalid retry_after_ms: {state!r}",
         )
         remaining = deadline - time.monotonic()
@@ -391,27 +649,17 @@ class McpProcess:
             total_attempts += attempts
             self.tool_attempt_counts[request_id] = total_attempts
             state = response["result"]["structuredContent"]
-            query = arguments.get("query")
-            require(
-                isinstance(query, str) and state.get("query") == query,
-                f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+            retrieval_state = search_retrieval_state(
+                state, query=arguments.get("query")
             )
-            require(
-                isinstance(state.get("hits"), list),
-                f"MCP search returned non-array hits: {state!r}",
-            )
-            retrieval = state.get("retrieval")
-            require(
-                isinstance(retrieval, dict)
-                and retrieval.get("state") in ("ready", "degraded"),
-                f"MCP search did not return the ready installed retrieval projection: {state!r}",
-            )
-            if retrieval.get("state") == "ready":
+            if retrieval_state in _SEARCH_CONVERGED_RETRIEVAL_STATES:
                 return response, total_attempts
             # The projection reports the real retrieval state, so a fresh install
             # answers lexically while the semantic sidecar is still publishing.
             # That degraded window is convergence, not failure: keep asking until
             # the shared deadline, and let a host that never converges fail loud.
+            # Schema-3 uses retrieval.state=full once hybrid is published; degraded
+            # still means "keep polling", never "pass".
             remaining = deadline - time.monotonic()
             require(
                 remaining > 0,

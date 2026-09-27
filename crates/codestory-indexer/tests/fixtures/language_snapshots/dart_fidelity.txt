@@ -4,7 +4,7 @@ node CLASS name=Repository qn=Repository canonical=<ROOT>/fidelity.dart:Reposito
 node CLASS name=Workflow qn=Workflow canonical=<ROOT>/fidelity.dart:Workflow line=25 col=1 end=35:2 file=FILE:<ROOT>/fidelity.dart@1
 node FILE name=<ROOT>/fidelity.dart qn=<ROOT>/fidelity.dart canonical=<ROOT>/fidelity.dart:<ROOT>/fidelity.dart:1 line=1 col=1 end=41:0 file=FILE:<ROOT>/fidelity.dart@1
 node FUNCTION name=orchestrateDart qn=orchestrateDart canonical=<ROOT>/fidelity.dart:orchestrateDart#0 line=37 col=1 end=37:23 file=FILE:<ROOT>/fidelity.dart@1
-node INTERFACE name=Notifier qn=Notifier canonical=<ROOT>/fidelity.dart:Notifier line=7 col=34 end=7:42 file=FILE:<ROOT>/fidelity.dart@1
+node INTERFACE name=Notifier qn=Notifier canonical=<ROOT>/fidelity.dart:Notifier line=3 col=1 end=5:2 file=FILE:<ROOT>/fidelity.dart@1
 node METHOD name=ConsoleNotifier.notify qn=ConsoleNotifier.notify canonical=<ROOT>/fidelity.dart:ConsoleNotifier.notify#0 line=8 col=3 end=8:27 file=FILE:<ROOT>/fidelity.dart@1
 node METHOD name=Notifier.notify qn=Notifier.notify canonical=<ROOT>/fidelity.dart:Notifier.notify#0 line=4 col=3 end=4:28 file=FILE:<ROOT>/fidelity.dart@1
 node METHOD name=Repository.save qn=Repository.save canonical=<ROOT>/fidelity.dart:Repository.save#0 line=14 col=3 end=14:25 file=FILE:<ROOT>/fidelity.dart@1
@@ -27,9 +27,9 @@ edge CALL src=METHOD:Workflow.run@26 dst=METHOD:Notifier.notify@4 resolved_src=M
 edge CALL src=METHOD:Workflow.run@26 dst=METHOD:Repository.save@14 resolved_src=METHOD:Workflow.run@26 resolved_dst=METHOD:Repository.save@14 line=28 confidence=1.0000 certainty=Certain callsite=h0:28:1:h3 candidates=[]
 edge CALL src=METHOD:Workflow.run@26 dst=METHOD:Workflow.decorate@32 resolved_src=METHOD:Workflow.run@26 resolved_dst=METHOD:Workflow.decorate@32 line=29 confidence=1.0000 certainty=Certain callsite=h0:29:1:h4 candidates=[]
 edge IMPORT src=MODULE:'dart:math'@1 dst=MODULE:'dart:math'@1 resolved_src=MODULE:'dart:math'@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=CLASS:ConsoleNotifier@7 dst=INTERFACE:Notifier@7 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@7 dst=INTERFACE:Notifier@3 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:ConsoleNotifier@7 dst=METHOD:ConsoleNotifier.notify@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Repository@13 dst=METHOD:Repository.save@14 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Workflow@25 dst=METHOD:Workflow.decorate@32 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Workflow@25 dst=METHOD:Workflow.run@26 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=INTERFACE:Notifier@7 dst=METHOD:Notifier.notify@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Notifier@3 dst=METHOD:Notifier.notify@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

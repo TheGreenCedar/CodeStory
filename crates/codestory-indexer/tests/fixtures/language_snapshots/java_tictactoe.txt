@@ -322,6 +322,16 @@ occurrence element=UNKNOWN:stringOut@173 kind=DEFINITION span=173:17-173:26
 occurrence element=UNKNOWN:stringOut@276 kind=DEFINITION span=276:21-276:30
 occurrence element=UNKNOWN:stringOut@281 kind=DEFINITION span=281:21-281:30
 occurrence element=UNKNOWN:turn@270 kind=DEFINITION span=270:42-270:46
+access node=CLASS:Entry.ArtificialPlayer.Node@181 kind=Default
+access node=CLASS:Entry.ArtificialPlayer@180 kind=Default
+access node=CLASS:Entry.Field.Move@34 kind=Default
+access node=CLASS:Entry.Field@21 kind=Default
+access node=CLASS:Entry.GameObject@17 kind=Default
+access node=CLASS:Entry.HumanPlayer@145 kind=Default
+access node=CLASS:Entry.Player@133 kind=Default
+access node=CLASS:Entry.TicTacToe@243 kind=Default
+access node=CLASS:Entry@4 kind=Public
+access node=ENUM:Entry.Field.Token@22 kind=Default
 access node=FIELD:Entry.ArtificialPlayer.Node.move@182 kind=Default
 access node=FIELD:Entry.ArtificialPlayer.Node.value@183 kind=Default
 access node=FIELD:Entry.Field.Move.col@36 kind=Default

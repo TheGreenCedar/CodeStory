@@ -26,6 +26,8 @@ pub(super) const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 thread_local! {
     static AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
+    static BEFORE_REPOSITORY_TRACKING_REVALIDATION_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
     static INDEX_FRESHNESS_CAPS_TEST_OVERRIDE: RefCell<Option<(usize, usize)>> =
         const { RefCell::new(None) };
 }
@@ -33,6 +35,21 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn arm_after_index_freshness_fence_test_hook(hook: impl FnOnce() + 'static) {
     AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(super) fn arm_before_repository_tracking_revalidation_test_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_REPOSITORY_TRACKING_REVALIDATION_TEST_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_repository_tracking_revalidation_test_hook() {
+    let hook =
+        BEFORE_REPOSITORY_TRACKING_REVALIDATION_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +98,7 @@ pub(super) fn with_index_freshness_caps_for_test<T>(
 /// one, because their verdict is the thing an observer can keep honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FreshnessObservationPolicy {
+    #[allow(dead_code)]
     Unobserved,
     ObserveSourceRoot,
 }
@@ -218,6 +236,7 @@ struct IndexFreshnessPlan {
     plan: codestory_contracts::workspace::RefreshPlan,
     current_policy_exclusions: Vec<codestory_workspace::OversizedSourceExclusionCandidate>,
     admitted_file_count: usize,
+    repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
 }
 
 #[derive(Clone, Copy)]
@@ -387,6 +406,7 @@ fn plan_index_freshness(
         plan: refresh.refresh.plan,
         current_policy_exclusions: refresh.policy_exclusions,
         admitted_file_count: refresh.admitted_file_count,
+        repository_tracking_digest: refresh.repository_tracking_digest,
     })
 }
 
@@ -605,7 +625,7 @@ where
 
     // The observer is armed before the scan and sealed after it, so its window is exactly the
     // stretch during which the scan's answer could go out of date underneath it.
-    let (scan, coverage) = match observation {
+    let (scan, coverage, current_repository_tracking) = match observation {
         FreshnessObservation::Unobserved => (
             load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Bounded)
                 .and_then(|inventory| {
@@ -621,10 +641,15 @@ where
                     }
                 }),
             None,
+            None,
         ),
         FreshnessObservation::Observed(session) => {
-            let (mut scan, coverage) = session.observe_window(|| {
-                load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Complete)
+            let ((mut scan, current_repository_tracking), coverage) =
+                session.observe_window(|| {
+                    let scan = load_index_freshness_inventory(
+                        storage,
+                        IndexFreshnessInventoryBound::Complete,
+                    )
                     .and_then(|inventory| {
                         let indexed_file_count = inventory.indexed_file_count;
                         match plan_index_freshness(
@@ -636,15 +661,20 @@ where
                             Ok(planned) => Ok((inventory, planned)),
                             Err(reason) => Err((reason, indexed_file_count)),
                         }
-                    })
-            });
+                    });
+                    #[cfg(test)]
+                    run_before_repository_tracking_revalidation_test_hook();
+                    let current_repository_tracking =
+                        codestory_workspace::observe_repository_tracking_digest(root);
+                    (scan, current_repository_tracking)
+                });
             if coverage.proven().is_none()
                 && let Ok((inventory, planned)) = &scan
                 && let Err(reason) = complete_scan_within_bounded_caps(inventory, planned)
             {
                 scan = Err((reason, inventory.indexed_file_count));
             }
-            (scan, Some(coverage))
+            (scan, Some(coverage), Some(current_repository_tracking))
         }
     };
     let (inventory, planned) = match scan {
@@ -657,6 +687,29 @@ where
             ));
         }
     };
+    if let Some(current_repository_tracking) = current_repository_tracking {
+        let current_repository_tracking = match current_repository_tracking {
+            Ok(digest) => digest,
+            Err(error) => {
+                return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                    NotCheckedReason::unavailable(format!(
+                        "repository tracking could not be revalidated after source discovery: {error}"
+                    )),
+                    inventory.indexed_file_count,
+                    started_at,
+                ));
+            }
+        };
+        if planned.repository_tracking_digest.as_ref() != Some(&current_repository_tracking) {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                NotCheckedReason::unavailable(
+                    "repository tracking changed during source discovery",
+                ),
+                inventory.indexed_file_count,
+                started_at,
+            ));
+        }
+    }
     let changes = classify_index_freshness_changes(root, &inventory, &planned);
     let identity =
         account_index_freshness_identities(&planned, &inventory.removed_paths, identities);
@@ -986,6 +1039,7 @@ pub(super) fn workspace_member_storage_summaries(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(super) struct CachedIndexFreshness {
     pub(super) root: PathBuf,
     pub(super) storage_path: PathBuf,
@@ -994,6 +1048,7 @@ pub(super) struct CachedIndexFreshness {
     pub(super) cached_at: Instant,
 }
 
+#[allow(dead_code)]
 pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
     std::env::var("CODESTORY_INDEX_FRESHNESS_TTL_SECS")
         .ok()
@@ -1002,6 +1057,7 @@ pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
         .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
 }
 
+#[allow(dead_code)]
 pub(super) fn storage_fingerprint(path: &Path) -> String {
     [
         storage_path_fingerprint(path),
@@ -1040,12 +1096,19 @@ pub(super) fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
 }
 
 pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
-    if !path.is_file() {
-        return Err(ApiError::new(
-            "project_unavailable",
-            "no complete project storage is available",
-        ));
-    }
+    let resolved = match codestory_store::resolve_core_database_path(path) {
+        Ok(resolved) => resolved,
+        Err(_) if path.is_file() => path.to_path_buf(),
+        Err(_) => {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "no complete project storage is available",
+            ));
+        }
+    };
+    // Inspect through the logical path so immutable-generation context is
+    // preserved. Opening the resolved generation as a legacy database lets
+    // SQLite materialize WAL/SHM files beside a sealed read target.
     let schema = Storage::database_schema_version(path).map_err(|error| {
         ApiError::internal(format!("Failed to inspect storage schema: {error}"))
     })?;
@@ -1058,6 +1121,7 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
         ));
     }
     Storage::open_read_only(path)
+        .or_else(|_| Storage::open_read_only(&resolved))
         .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
 }
 

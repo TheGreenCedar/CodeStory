@@ -1,5 +1,67 @@
 use super::*;
 
+pub(super) fn invalidate_go_package_function_resolutions(
+    conn: &rusqlite::Connection,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL,
+             confidence = NULL,
+             certainty = NULL,
+             candidate_target_node_ids = NULL
+         WHERE kind = ?1
+           AND (
+               resolved_target_node_id IS NOT NULL
+               OR confidence IS NOT NULL
+               OR certainty IS NOT NULL
+               OR candidate_target_node_ids IS NOT NULL
+           )
+           AND (
+               instr('|' || callsite_identity || '|', ?2) > 0
+               OR instr('|' || callsite_identity || '|', ?3) > 0
+           )",
+        params![
+            EdgeKind::CALL as i32,
+            format!(
+                "|{}|",
+                crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER
+            ),
+            format!(
+                "|{}",
+                crate::languages::go::PACKAGE_FUNCTION_IMPORT_SET_PREFIX
+            )
+        ],
+    )?)
+}
+
+pub(super) fn invalidate_go_return_method_resolutions(
+    conn: &rusqlite::Connection,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL,
+             confidence = NULL,
+             certainty = NULL,
+             candidate_target_node_ids = NULL
+         WHERE kind = ?1
+           AND (
+               resolved_target_node_id IS NOT NULL
+               OR confidence IS NOT NULL
+               OR certainty IS NOT NULL
+               OR candidate_target_node_ids IS NOT NULL
+           )
+           AND instr('|' || callsite_identity || '|', ?2) > 0",
+        params![
+            EdgeKind::CALL as i32,
+            format!(
+                "|{}{}",
+                crate::RECEIVER_OWNER_CALLSITE_PREFIX,
+                crate::languages::go::RETURN_PATH_OWNER_PREFIX
+            )
+        ],
+    )?)
+}
+
 pub(super) fn cleanup_stale_call_resolutions(
     conn: &rusqlite::Connection,
     flags: ResolutionFlags,

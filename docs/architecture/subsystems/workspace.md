@@ -43,6 +43,15 @@ verified source hashes where available. They identify new, changed, retained,
 removable, and verified policy-excluded files without depending on a live store
 handle.
 
+For each admitted Go source, discovery also probes its native-contained ancestor
+chain for `go.mod`. These manifests are required inventory-only control inputs:
+source filters and ignore rules do not hide them, but caller-owned exclusions,
+unreadable or non-regular controls, and controls outside the native project root
+remain barriers. A created, changed, or removed control schedules every admitted
+Go source because package ownership can change while the source bytes do not.
+This rule does not discover external Go dependencies or publish manifest source
+as graph evidence.
+
 A matching modification time never authorises reuse on its own: the content
 hash is the verification, because same-mtime drift is a defended invariant.
 `source_freshness.rs` therefore caches the *verdict*, not the metadata. A

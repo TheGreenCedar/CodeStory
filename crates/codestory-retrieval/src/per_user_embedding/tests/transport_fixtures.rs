@@ -259,6 +259,8 @@ pub(super) enum ScriptOutcome {
     Loss,
     WriteDisconnect,
     HelloLoss,
+    HelloCapacity,
+    HelloHandlerCapacity,
     Capacity,
     TimedBulk {
         hello_delay: Duration,
@@ -279,6 +281,7 @@ pub(super) struct ScriptStream {
     pub(super) compatibility: EmbeddingCompatibility,
     pub(super) read_gate: Option<Arc<AtomicBool>>,
     pub(super) hello_completed: bool,
+    pub(super) server_instance_id: String,
 }
 
 impl ScriptStream {
@@ -291,7 +294,25 @@ impl ScriptStream {
             compatibility,
             read_gate: None,
             hello_completed: false,
+            server_instance_id: "server".to_owned(),
         }
+    }
+
+    pub(super) fn with_server_instance(mut self, server_instance_id: impl Into<String>) -> Self {
+        self.server_instance_id = server_instance_id.into();
+        self
+    }
+
+    fn snapshot(&self) -> super::super::EmbeddingServerSnapshot {
+        let mut snapshot = test_snapshot();
+        snapshot.process.server_instance_id = self.server_instance_id.clone();
+        snapshot
+    }
+
+    fn engine_identity(&self) -> super::super::EmbeddingEngineIdentity {
+        let mut identity = test_engine_identity();
+        identity.server_instance_id = self.server_instance_id.clone();
+        identity
     }
 
     pub(super) fn prepare_response(&mut self) -> io::Result<()> {
@@ -329,7 +350,7 @@ impl ScriptStream {
                 success_response(
                     &request_id,
                     EmbeddingResult::Snapshot {
-                        snapshot: Box::new(test_snapshot()),
+                        snapshot: Box::new(self.snapshot()),
                         lease: None,
                         identity: None,
                     },
@@ -353,6 +374,37 @@ impl ScriptStream {
         if matches!(self.outcome, ScriptOutcome::HelloLoss) {
             return Ok(None);
         }
+        if matches!(
+            self.outcome,
+            ScriptOutcome::HelloCapacity | ScriptOutcome::HelloHandlerCapacity
+        ) {
+            let mut pressure = test_capacity();
+            pressure.reason = match &self.outcome {
+                ScriptOutcome::HelloCapacity => "pre_request_full",
+                ScriptOutcome::HelloHandlerCapacity => "connection_handler_full",
+                _ => unreachable!("matched handshake capacity"),
+            }
+            .into();
+            pressure.queue_class = "connection".into();
+            pressure.capacity = 8;
+            pressure.depth = 8;
+            pressure.retry_after_ms = 1;
+            pressure.retry_condition = "an authenticated connection handler completes".into();
+            return Ok(Some((
+                failure_response(
+                    request_id,
+                    EmbeddingProtocolError {
+                        code: "embedding_capacity".into(),
+                        message: "embedding connection admission is full".into(),
+                        retry_class: "after_delay".into(),
+                        retry_after_ms: 1,
+                        retry_condition: pressure.retry_condition.clone(),
+                        capacity: Some(pressure),
+                    },
+                ),
+                Vec::new(),
+            )));
+        }
         if let ScriptOutcome::TimedBulk { hello_delay, .. } = self.outcome {
             thread::sleep(hello_delay);
         }
@@ -361,7 +413,7 @@ impl ScriptStream {
                 request_id,
                 EmbeddingResult::Hello {
                     compatibility_sha256: self.compatibility.digest().map_err(io::Error::other)?,
-                    snapshot: Box::new(test_snapshot()),
+                    snapshot: Box::new(self.snapshot()),
                 },
             ),
             Vec::new(),
@@ -398,7 +450,8 @@ impl ScriptStream {
                             rows: 1,
                             columns: RETRIEVAL_EMBEDDING_DIM as u32,
                             encoding: "f32_le".into(),
-                            identity: Box::new(test_engine_identity()),
+                            identity: Box::new(self.engine_identity()),
+                            timings: None,
                         },
                     ),
                     encode_vectors(&[vector]).map_err(io::Error::other)?,
@@ -425,7 +478,11 @@ impl ScriptStream {
                     Vec::new(),
                 )))
             }
-            ScriptOutcome::HelloLoss => Err(io::Error::other("query reached hello-loss stream")),
+            ScriptOutcome::HelloLoss
+            | ScriptOutcome::HelloCapacity
+            | ScriptOutcome::HelloHandlerCapacity => {
+                Err(io::Error::other("query reached handshake-only stream"))
+            }
             ScriptOutcome::WriteDisconnect => Err(io::Error::other(
                 "query write must fail before a response is produced",
             )),
@@ -466,7 +523,8 @@ impl ScriptStream {
                     rows: input_count as u32,
                     columns: RETRIEVAL_EMBEDDING_DIM as u32,
                     encoding: "f32_le".into(),
-                    identity: Box::new(test_engine_identity()),
+                    identity: Box::new(self.engine_identity()),
+                    timings: None,
                 },
             ),
             encode_vectors(&vectors).map_err(io::Error::other)?,

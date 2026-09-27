@@ -17,16 +17,16 @@ use codestory_contracts::api::{
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
     IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
-    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
-    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
-    TrailContextDto, WorkspaceMemberIndexDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, RouteEndpointKindDto,
+    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
+    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
+    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
+    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
+    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
+    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
+    StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
+    WorkspaceMemberIndexDto,
 };
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -63,16 +63,98 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
+fn index_storage_error(context: &str, error: codestory_store::StorageError) -> ApiError {
+    match error {
+        codestory_store::StorageError::Cancelled => {
+            ApiError::new("cancelled", "core stage was cancelled")
+        }
+        codestory_store::StorageError::InsufficientSpace {
+            operation,
+            required_bytes,
+            available_bytes,
+        } => ApiError::insufficient_cache_space(operation, required_bytes, available_bytes),
+        other => ApiError::internal(format!("{context}: {other}")),
+    }
+}
+
+/// Preserve a sealed component copy's disk refusal through retrieval and CLI
+/// context frames without exposing the store crate to adapter code.
+pub fn insufficient_space_api_error(error: &anyhow::Error) -> Option<ApiError> {
+    error.chain().find_map(|cause| {
+        if let Some(codestory_store::StorageError::InsufficientSpace {
+            operation,
+            required_bytes,
+            available_bytes,
+        }) = cause.downcast_ref::<codestory_store::StorageError>()
+        {
+            Some(ApiError::insufficient_cache_space(
+                *operation,
+                *required_bytes,
+                *available_bytes,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn sealed_copy_insufficient_error_for_test(
+    required_bytes: u64,
+    available_bytes: u64,
+) -> anyhow::Error {
+    anyhow::Error::new(codestory_store::StorageError::InsufficientSpace {
+        operation: "sealed_component_copy",
+        required_bytes,
+        available_bytes,
+    })
+}
+
+/// Resolve whether the logical project storage path has a published core.
+pub fn core_database_exists(storage_path: &Path) -> Result<bool, ApiError> {
+    codestory_store::core_database_exists(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
+/// Resolve the active published core database for a logical storage path.
+pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiError> {
+    codestory_store::resolve_core_database_path(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
+/// Test-support: force the core clone attempt to report unavailable while an
+/// owning command runs. Consumer tests exercise their real command boundary
+/// without adding a production configuration override or a store dependency.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_core_clone_disabled_for_test<T>(action: impl FnOnce() -> T) -> T {
+    codestory_store::with_core_clone_disabled(action)
+}
+
+/// Test-support: force the cache-volume observation at the runtime boundary.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_available_filesystem_bytes_for_test<T>(bytes: u64, action: impl FnOnce() -> T) -> T {
+    codestory_store::with_available_filesystem_bytes_override(bytes, action)
+}
+
 mod affected;
 mod agent;
+mod call_path_grammar;
+mod call_path_kernel;
+mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;
 mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
-#[cfg(any(test, feature = "test-support"))]
 mod indexed_source_call_path_v1;
+#[cfg(feature = "proof-qualification-support")]
+#[doc(hidden)]
+pub mod proof_qualification_support;
+pub mod public_call_path;
 mod publication;
 mod repo_text;
 mod root_rank;
@@ -88,22 +170,28 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
+#[cfg(test)]
 mod source_coverage;
+#[cfg(feature = "v3-evidence-separation-support")]
+#[doc(hidden)]
+pub mod v3_evidence_qualification_support;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{
     bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
     packet_step_trace_json, plan_packet,
 };
+pub use evidence_projection_v3::{
+    PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
+    finalize_packet_projection_v3_for_representation,
+    packet_budget_exceeded_projection_v3_from_envelope, project_context_v3, project_packet_v3,
+    project_search_v3,
+};
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod agent_test_support {
-    use codestory_contracts::api::{AgentAnswerDto, IndexFreshnessDto, PacketClaimDto};
-
-    pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
-        crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
-    }
+    use codestory_contracts::api::IndexFreshnessDto;
 
     pub fn fresh_index_observation() -> IndexFreshnessDto {
         crate::agent::packet_freshness::fresh_index_observation()
@@ -130,7 +218,8 @@ use index_freshness::{
 use publication::{
     PUBLICATION_TEST_FAULT, PublicationTestAction, PublicationTestBoundary,
     arm_activation_search_before_revalidate_hook, arm_full_refresh_staged_store_hook,
-    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_incremental_staged_store_hook, arm_postcommit_before_annotation_rebind_hook,
+    arm_postcommit_cache_refresh_error, arm_publication_test_fault,
     arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
     arm_source_policy_before_revalidate_hook,
 };
@@ -279,8 +368,6 @@ use semantic_projection::{
     sort_pending_dense_anchor_inputs, stream_pending_llm_symbol_docs_from_env,
     truncate_semantic_doc_text_to_token_budget,
 };
-#[cfg(test)]
-pub(crate) use snippets::markdown_snippet;
 pub(crate) use snippets::{
     BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
 };
@@ -306,6 +393,7 @@ pub use path_resolution::resolve_project_file_path_from_root;
 mod process_config;
 pub use process_config::RuntimeProcessConfig;
 mod activation_retrieval;
+pub use activation_retrieval::{DerivedCacheResetExclusion, acquire_derived_cache_reset_exclusion};
 mod query_language;
 mod repository_identity;
 mod retrieval_boundary;
@@ -340,6 +428,7 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use browser::{SourceRangeRequest, SourceRangeSnippet};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
+pub use codestory_store::LegacyRetirementReport;
 pub(crate) use graph_dto::{
     app_graph_flags, edge_certainty_label, graph_edge_dto, is_structural_kind, member_access_dto,
 };
@@ -350,13 +439,14 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
+    CacheCleanPlan, CacheCleanReport, CacheInventoryReport, FinalizeComponentWork,
+    FinalizeIndexOutcome, FinalizePhaseTiming, GenerationRetentionApplyReport,
     GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
     RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
     RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
     RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
     RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarGcReport, SidecarInventoryReport, apply_cache_clean,
+    SidecarGcReport, SidecarInventoryReport, apply_cache_clean, cache_inventory,
     ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
@@ -385,6 +475,11 @@ pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRun
         &codestory_retrieval::SidecarRuntimeOverrides::default(),
     )
 }
+#[doc(hidden)]
+pub use agent::packet_batch::{
+    PacketEntryObservationPhase, PacketLatencyScopeGuard, enter_packet_latency_scope,
+    observe_packet_entry_phase,
+};
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
@@ -395,11 +490,11 @@ use semantic_doc_text::{
 pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
     ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
-    ActivationFailStopHook, ActivationOperation, ActivationQuiescence, ActivationRun,
-    ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
+    ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
+    ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error, set_activation_fail_stop_hook,
+    TrailService, embedding_api_error, search_operation_name, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -459,6 +554,9 @@ thread_local! {
     static ACTIVE_CORE_READ: RefCell<Option<ActiveCoreRead>> = const { RefCell::new(None) };
 }
 
+// Pinned is a cheap Rc; Owned holds the full Storage. Prefer the size skew over
+// boxing every owned open on the observational read path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReadStorage {
     Pinned(Rc<Storage>),
     Owned(Storage),
@@ -540,7 +638,10 @@ impl Runtime {
     }
 
     pub fn agent_service(&self) -> AgentService {
-        AgentService::new(self.controller.clone())
+        AgentService::new_with_public_operation(
+            self.controller.clone(),
+            self.public_operation.clone(),
+        )
     }
 
     pub fn bookmark_service(&self) -> BookmarkService {
@@ -613,6 +714,7 @@ pub struct AppController {
     pub(crate) canonical_symbol_names:
         Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
     source_observer: Arc<Mutex<SourceObserverState>>,
+    proof_validation_cache: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
@@ -644,6 +746,7 @@ pub(crate) struct ObservedSourceEpoch {
     session_id: String,
     backend: &'static str,
     epoch: codestory_workspace::filesystem_observer::ObserverEpoch,
+    repository_tracking_digest: codestory_workspace::RepositoryTrackingDigest,
 }
 
 #[derive(Debug)]

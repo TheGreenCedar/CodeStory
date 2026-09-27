@@ -69,6 +69,7 @@ impl AppController {
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
             source_observer: Arc::new(Mutex::new(SourceObserverState::default())),
+            proof_validation_cache: Arc::new(Mutex::new(None)),
             events_tx,
             events_rx,
             runtime_config: Arc::new(config),
@@ -215,6 +216,7 @@ impl AppController {
         }
         let storage_path = self.require_storage_path()?;
         let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
+        self.prepare_armed_proof_publication_validation()?;
         let installed_storage = Rc::clone(&storage);
         let snapshot = storage.read_snapshot().map_err(|error| {
             ApiError::internal(format!(
@@ -250,6 +252,9 @@ impl AppController {
                 "Failed to finish public operation snapshot: {error}"
             ))
         })?;
+        // Revalidate through the logical path. Passing the resolved generation
+        // path loses its immutable-publication context and lets SQLite create
+        // WAL/SHM sidecars beside a sealed generation merely to observe it.
         let live = Store::database_complete_index_publication(&storage_path).map_err(|error| {
             ApiError::internal(format!("Failed to revalidate public operation: {error}"))
         })?;
@@ -383,13 +388,15 @@ impl AppController {
     /// and a lease stamped `None` keeps exactly the EV-7 answer it had before.
     pub(crate) fn observed_source_epoch(&self, root: &Path) -> Option<ObservedSourceEpoch> {
         let session = self.source_observer_session(root)?;
-        if session.gap().is_some() {
-            return None;
-        }
+        let (repository_tracking_digest, coverage) = session
+            .observe_window(|| codestory_workspace::observe_repository_tracking_digest(root));
+        let repository_tracking_digest = repository_tracking_digest.ok()?;
+        let coverage = coverage.proven()?;
         Some(ObservedSourceEpoch {
-            session_id: session.identity().session_id().to_string(),
-            backend: session.identity().backend().id(),
-            epoch: session.epoch(),
+            session_id: coverage.identity().session_id().to_string(),
+            backend: coverage.identity().backend().id(),
+            epoch: coverage.sealed_epoch(),
+            repository_tracking_digest,
         })
     }
 
@@ -406,13 +413,15 @@ impl AppController {
             return None;
         }
         let session = state.session.as_ref()?;
-        if session.gap().is_some() {
-            return None;
-        }
+        let (repository_tracking_digest, coverage) = session
+            .observe_window(|| codestory_workspace::observe_repository_tracking_digest(root));
+        let repository_tracking_digest = repository_tracking_digest.ok()?;
+        let coverage = coverage.proven()?;
         Some(ObservedSourceEpoch {
-            session_id: session.identity().session_id().to_string(),
-            backend: session.identity().backend().id(),
-            epoch: session.epoch(),
+            session_id: coverage.identity().session_id().to_string(),
+            backend: coverage.identity().backend().id(),
+            epoch: coverage.sealed_epoch(),
+            repository_tracking_digest,
         })
     }
 

@@ -277,7 +277,7 @@ fn top_level_help_names_command_purposes() {
         ("search", "Find symbols and repo text evidence."),
         (
             "packet",
-            "Answer a broad repository question with evidence.",
+            "Gather an experimental bounded evidence packet for a repository question.",
         ),
         ("doctor", "Check cache, index, and retrieval health."),
         (

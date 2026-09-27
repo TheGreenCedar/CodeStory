@@ -16,12 +16,13 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
+use codestory_contracts::language_support::normalize_extension;
 use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
 use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -37,6 +38,48 @@ use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
 use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 
+#[cfg(test)]
+thread_local! {
+    static MANUAL_RECEIVER_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_METHOD_IDENTITY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_manual_receiver_lookup_work(amount: usize) {
+    #[cfg(test)]
+    MANUAL_RECEIVER_LOOKUP_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_manual_receiver_lookup_work() {
+    MANUAL_RECEIVER_LOOKUP_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn manual_receiver_lookup_work() -> usize {
+    MANUAL_RECEIVER_LOOKUP_WORK.with(std::cell::Cell::get)
+}
+
+#[inline]
+fn count_go_method_identity_work(amount: usize) {
+    #[cfg(test)]
+    GO_METHOD_IDENTITY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_go_method_identity_work() {
+    GO_METHOD_IDENTITY_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn go_method_identity_work() -> usize {
+    GO_METHOD_IDENTITY_WORK.with(std::cell::Cell::get)
+}
+
 mod cache;
 pub mod cancellation;
 pub mod compilation_database;
@@ -44,6 +87,8 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+mod native_declarators;
+mod proof_resolution;
 
 /// SRC-C2 fence classification: lives in its own file because
 /// `codestory-indexer`'s own source is indexed by
@@ -58,10 +103,18 @@ pub mod symbol_table;
 pub mod template_pipeline;
 use cache::{
     CachedIndexArtifact, CachedStructuralArtifact, build_index_artifact_cache_key,
-    build_structural_artifact_cache_key, index_artifact_cache_path,
+    build_structural_artifact_cache_key, decode_index_artifact, encode_index_artifact,
+    index_artifact_cache_path,
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
+#[cfg(debug_assertions)]
+pub use proof_resolution::{BashResolutionWork, bash_resolution_work, reset_bash_resolution_work};
+pub use proof_resolution::{
+    ProofResolutionProgress, build_funnel as build_proof_resolution_funnel,
+    current_proof_resolution_adapter_roster, rematerialize_proof_resolution_projection,
+    rematerialize_proof_resolution_projection_with_progress,
+};
 use symbol_table::SymbolTable;
 
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -198,7 +251,7 @@ struct TagDefinition {
 #[derive(Default)]
 struct TagDefinitionIndex {
     by_key: HashMap<TagDefinitionKey, TagDefinition>,
-    fallback_index: HashMap<(String, u32), TagDefinitionKey>,
+    fallback_index: HashMap<(String, u32), Vec<TagDefinitionKey>>,
 }
 
 fn make_language_config(
@@ -224,7 +277,16 @@ impl TagDefinitionIndex {
             Some(existing) if !should_replace_tag_definition(existing, &definition) => {}
             _ => {
                 self.fallback_index
-                    .insert((key.name.clone(), key.start_line), key.clone());
+                    .entry((key.name.clone(), key.start_line))
+                    .or_default()
+                    .push(key.clone());
+                if let Some(keys) = self
+                    .fallback_index
+                    .get_mut(&(key.name.clone(), key.start_line))
+                {
+                    keys.sort_by_key(|key| key.start_col);
+                    keys.dedup();
+                }
                 self.by_key.insert(key, definition);
             }
         }
@@ -243,15 +305,33 @@ impl TagDefinitionIndex {
                 start_col,
             };
             if let Some(definition) = self.by_key.remove(&exact_key) {
-                self.fallback_index.remove(&(name.to_string(), start_line));
+                self.remove_fallback_key(name, start_line, &exact_key);
                 return Some(definition);
             }
         }
 
-        let fallback_key = self
-            .fallback_index
-            .remove(&(name.to_string(), start_line))?;
+        let lookup = (name.to_string(), start_line);
+        let fallback_key = {
+            let keys = self.fallback_index.get_mut(&lookup)?;
+            let index = start_col
+                .and_then(|start_col| keys.iter().position(|key| key.start_col >= start_col))
+                .unwrap_or(0);
+            keys.remove(index)
+        };
+        if self.fallback_index.get(&lookup).is_some_and(Vec::is_empty) {
+            self.fallback_index.remove(&lookup);
+        }
         self.by_key.remove(&fallback_key)
+    }
+
+    fn remove_fallback_key(&mut self, name: &str, start_line: u32, key: &TagDefinitionKey) {
+        let lookup = (name.to_string(), start_line);
+        if let Some(keys) = self.fallback_index.get_mut(&lookup) {
+            keys.retain(|candidate| candidate != key);
+            if keys.is_empty() {
+                self.fallback_index.remove(&lookup);
+            }
+        }
     }
 
     fn into_remaining(self) -> Vec<TagDefinition> {
@@ -562,9 +642,13 @@ fn cpp_language_config() -> LanguageConfig {
 }
 
 fn path_is_c_header(path: &Path) -> bool {
+    normalized_path_extension(path).as_deref() == Some("h")
+}
+
+pub(crate) fn normalized_path_extension(path: &Path) -> Option<String> {
     path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|ext| ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h"))
+        .and_then(|extension| extension.to_str())
+        .map(normalize_extension)
 }
 
 fn header_source_has_cpp_signals(source: &str) -> bool {
@@ -611,11 +695,11 @@ fn get_language_config_for_path(
     path: &Path,
     compilation_info: Option<&compilation_database::CompilationInfo>,
 ) -> Option<LanguageConfig> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h") {
+    let ext = normalized_path_extension(path).unwrap_or_default();
+    if ext == "h" {
         return Some(infer_header_language_config(compilation_info));
     }
-    get_language_for_ext(ext)
+    get_language_for_ext(&ext)
 }
 
 /// Batch sizes used while flushing incremental indexing output.
@@ -886,6 +970,15 @@ impl ArtifactCacheFamilyStats {
 /// Timings and counters collected during a workspace indexing run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IncrementalIndexingStats {
+    /// Whether this run changed any graph-owned projection row rather than
+    /// only refreshing verified file identity and diagnostics.
+    pub graph_projection_changed: bool,
+    /// A source-only refresh changed content bytes, so raw-source proof
+    /// adapters must run again even when the graph projection is unchanged.
+    pub proof_inputs_changed: bool,
+    /// Existing files whose parser projection was byte-for-byte stable while
+    /// their source identity changed.
+    pub source_identity_only_files: usize,
     pub setup_existing_projection_ids_ms: u64,
     pub setup_seed_symbol_table_ms: u64,
     /// Full source preparation wall time, including artifact-cache lookups.
@@ -927,6 +1020,8 @@ pub struct IncrementalIndexingStats {
     pub flush_component_access_ms: u64,
     pub flush_callable_projection_ms: u64,
     pub edge_resolution_ms: u64,
+    /// Wall time for post-flush same-root TYPE_USAGE finalize (not resolution).
+    pub type_usage_finalize_ms: u64,
     pub error_flush_ms: u64,
     pub cleanup_ms: u64,
     pub unresolved_calls_start: usize,
@@ -987,6 +1082,7 @@ struct PreparedIndexInput {
     full_path: PathBuf,
     artifact_cache_path: Option<PathBuf>,
     source: String,
+    source_utf8_exact: bool,
     compilation_info: Option<compilation_database::CompilationInfo>,
     language_config: LanguageConfig,
     artifact_cache_key: Option<String>,
@@ -996,6 +1092,7 @@ struct PreparedIndexInput {
 #[derive(Debug)]
 struct PreparedStructuralInput {
     full_path: PathBuf,
+    role_classification_path: PathBuf,
     artifact_cache_path: Option<PathBuf>,
     artifact_cache_key: Option<String>,
     source: String,
@@ -1210,6 +1307,7 @@ struct ProjectionWriter<'a> {
     existing_projection_file_ids: &'a HashSet<i64>,
     replaced_projection_ids: HashSet<i64>,
     batched_storage: IntermediateStorage,
+    batched_source_identity_only: bool,
     all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     pending_file_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     fallback_file_error_ids: HashSet<i64>,
@@ -1235,6 +1333,7 @@ impl<'a> ProjectionWriter<'a> {
             existing_projection_file_ids,
             replaced_projection_ids: HashSet::new(),
             batched_storage: IntermediateStorage::default(),
+            batched_source_identity_only: true,
             all_errors: Vec::new(),
             pending_file_errors: Vec::new(),
             fallback_file_error_ids: HashSet::new(),
@@ -1315,6 +1414,8 @@ impl<'a> ProjectionWriter<'a> {
                     .delete_files_batch(&[exclusion.file_id])
                     .map_err(|error| anyhow!("Storage policy-exclusion cleanup error: {error}"))?;
                 self.replaced_projection_ids.insert(exclusion.file_id);
+                self.stats.graph_projection_changed = true;
+                self.batched_source_identity_only = false;
             }
             self.policy_exclusions.push(exclusion.candidate);
         }
@@ -1329,41 +1430,126 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
-        if let Some((file_id, file_complete)) = local_storage
+        // A verified malformed snapshot replaces the old projection with source
+        // identity only. An operational failure cannot authorize that removal.
+        let verified_malformed = !local_storage.file_content_hashes.is_empty()
+            && !local_storage.errors.is_empty()
+            && local_storage
+                .errors
+                .iter()
+                .all(|error| error.coverage_reason == Some(FileCoverageReason::Malformed));
+        let mut source_identity_only = false;
+        if let Some((file_id, file_complete, file_path)) = local_storage
             .files
             .first()
-            .map(|file_info| (file_info.id, file_info.complete))
+            .map(|file_info| (file_info.id, file_info.complete, file_info.path.clone()))
             && self.mode == codestory_workspace::BuildMode::Incremental
             && self.existing_projection_file_ids.contains(&file_id)
             && self.replaced_projection_ids.insert(file_id)
         {
-            if !file_complete {
+            let previous_file = self
+                .storage
+                .get_files_by_paths(std::slice::from_ref(&file_path))
+                .map_err(|error| anyhow!("Storage file lookup error: {error}"))?
+                .remove(&file_path);
+            let existing_states = self
+                .storage
+                .get_callable_projection_states_for_file(file_id)
+                .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
+            let replace_file_owned_projection = verified_malformed
+                || !local_storage.structural_text_projections.is_empty()
+                || local_storage
+                    .files
+                    .first()
+                    .is_some_and(|file| file.language == "openapi");
+            let (component_access_changed, obsolete_component_access) =
+                if replace_file_owned_projection {
+                    (false, Vec::new())
+                } else {
+                    let node_ids = local_storage
+                        .nodes
+                        .iter()
+                        .map(|node| node.id)
+                        .collect::<Vec<_>>();
+                    let previous_access = self
+                        .storage
+                        .get_component_access_map_for_nodes(&node_ids)
+                        .map_err(|error| anyhow!("Storage access lookup error: {error}"))?;
+                    let current_access = local_storage
+                        .component_access
+                        .iter()
+                        .copied()
+                        .collect::<HashMap<_, _>>();
+                    let obsolete = previous_access
+                        .keys()
+                        .filter(|node_id| !current_access.contains_key(node_id))
+                        .copied()
+                        .collect::<Vec<_>>();
+                    (previous_access != current_access, obsolete)
+                };
+            let compatible_file_metadata = previous_file.as_ref().is_some_and(|previous| {
+                local_storage.files.first().is_some_and(|current| {
+                    previous.complete == current.complete
+                        && previous.language == current.language
+                        && previous.file_role == current.file_role
+                })
+            });
+            let classified_mode = classify_projection_update(
+                &existing_states,
+                &local_storage.callable_projection_states,
+            );
+            let access_only = component_access_changed
+                && file_complete
+                && compatible_file_metadata
+                && matches!(&classified_mode, ProjectionUpdateMode::NoChanges);
+            let update_mode =
+                if replace_file_owned_projection || component_access_changed && !access_only {
+                    ProjectionUpdateMode::FullReplace
+                } else {
+                    classified_mode
+                };
+            source_identity_only = matches!(&update_mode, ProjectionUpdateMode::NoChanges)
+                && compatible_file_metadata
+                && !component_access_changed;
+            if access_only {
+                // The graph rows and stable node identities are unchanged.
+                // Replace only access metadata, preserving their annotations.
+                self.storage
+                    .delete_component_access_for_nodes(&obsolete_component_access)
+                    .map_err(|error| anyhow!("Storage access cleanup error: {error}"))?;
+                retain_file_identity_rows(&mut local_storage, file_id, true);
+                self.stats.graph_projection_changed = true;
+            } else if source_identity_only {
+                // Graph equality does not prove raw-source proof equivalence.
+                // Keep the fast rebind only when the content hash is unchanged
+                // (for example, a metadata-only refresh).
+                let previous_hash = self
+                    .storage
+                    .get_file_content_hash(file_id)
+                    .map_err(|error| anyhow!("Storage content hash lookup error: {error}"))?;
+                let current_hash = local_storage
+                    .file_content_hashes
+                    .iter()
+                    .find(|hash| hash.file_id == file_id)
+                    .map(|hash| hash.content_hash.as_str());
+                self.stats.proof_inputs_changed |=
+                    current_hash.is_none() || previous_hash.as_deref() != current_hash;
+                // The callable and file-structural fences prove the graph is
+                // unchanged. Keep the inherited immutable rows and flush only
+                // the new file identity, content hash, and diagnostics.
+                retain_file_identity_rows(&mut local_storage, file_id, false);
+                self.stats.source_identity_only_files =
+                    self.stats.source_identity_only_files.saturating_add(1);
+            } else if !file_complete && !verified_malformed {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
+                self.stats.graph_projection_changed = true;
             } else {
-                let existing_states = self
-                    .storage
-                    .get_callable_projection_states_for_file(file_id)
-                    .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
                 let cleanup_started = Instant::now();
-                let replace_file_owned_projection =
-                    !local_storage.structural_text_projections.is_empty()
-                        || local_storage
-                            .files
-                            .first()
-                            .is_some_and(|file| file.language == "openapi");
-                let update_mode = if replace_file_owned_projection {
-                    ProjectionUpdateMode::FullReplace
-                } else {
-                    classify_projection_update(
-                        &existing_states,
-                        &local_storage.callable_projection_states,
-                    )
-                };
                 match update_mode {
                     ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
                     ProjectionUpdateMode::Delta { changed_callers } => {
@@ -1388,11 +1574,16 @@ impl<'a> ProjectionWriter<'a> {
                             .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
                     }
                 }
+                self.stats.graph_projection_changed = true;
                 self.stats.cleanup_ms = self
                     .stats
                     .cleanup_ms
                     .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
             }
+        } else if !local_storage.files.is_empty() {
+            // Full refresh and newly indexed files both publish graph work.
+            // Only the existing incremental identity-only branch can reuse it.
+            self.stats.graph_projection_changed = true;
         }
         let owning_file_ids = self
             .batched_storage
@@ -1434,6 +1625,7 @@ impl<'a> ProjectionWriter<'a> {
                 .structural_text_cache_writes
                 .retain(|write| !incoming_file_ids.contains(&write.file_id));
         }
+        self.batched_source_identity_only &= source_identity_only;
         self.batched_storage.merge(local_storage);
 
         let should_flush = !self.batched_storage.files.is_empty()
@@ -1461,7 +1653,9 @@ impl<'a> ProjectionWriter<'a> {
                 &mut self.pending_file_errors,
                 &mut self.had_edges,
                 &mut self.stats,
+                self.batched_source_identity_only,
             )?;
+            self.batched_source_identity_only = true;
             accumulate_flush_breakdown(&mut self.stats, breakdown);
             WorkspaceIndexer::flush_fallback_file_errors(
                 self.storage,
@@ -1493,6 +1687,7 @@ impl<'a> ProjectionWriter<'a> {
             &mut self.pending_file_errors,
             &mut self.had_edges,
             &mut self.stats,
+            self.batched_source_identity_only,
         )?;
         accumulate_flush_breakdown(&mut self.stats, breakdown);
         WorkspaceIndexer::flush_fallback_file_errors(
@@ -1630,6 +1825,11 @@ impl WorkspaceIndexer {
     }
 
     /// Run an incremental plan built from legacy `RefreshInfo`.
+    ///
+    /// The caller owns freshness and dependency expansion on this compatibility
+    /// path. In particular, a caller that supplies a changed `go.mod` must also
+    /// schedule the admitted Go sources whose package ownership can change.
+    /// Workspace-built plans perform that expansion automatically.
     pub fn run_incremental(
         &self,
         storage: &mut Storage,
@@ -1675,6 +1875,37 @@ impl WorkspaceIndexer {
         cancel_token: Option<&CancellationToken>,
     ) -> Result<WorkspaceIndexingOutcome> {
         let plan = plan.clone();
+        let go_module_control_changed = plan
+            .files_to_index
+            .iter()
+            .any(|path| path.file_name().is_some_and(|name| name == "go.mod"))
+            || plan
+                .files_to_remove
+                .iter()
+                .try_fold(false, |changed, file_id| {
+                    if changed {
+                        return Ok::<_, codestory_store::StorageError>(true);
+                    }
+                    Ok(storage
+                        .get_file_by_id(*file_id)?
+                        .is_some_and(|file| file.language == "go-module-control"))
+                })?;
+        let go_return_inputs_changed = go_module_control_changed
+            || plan
+                .files_to_index
+                .iter()
+                .any(|path| path.extension().is_some_and(|extension| extension == "go"))
+            || plan
+                .files_to_remove
+                .iter()
+                .try_fold(false, |changed, file_id| {
+                    if changed {
+                        return Ok::<_, codestory_store::StorageError>(true);
+                    }
+                    Ok(storage
+                        .get_file_by_id(*file_id)?
+                        .is_some_and(|file| file.language == "go"))
+                })?;
         event_bus.publish(Event::IndexingStarted {
             file_count: plan.files_to_index.len(),
         });
@@ -1858,6 +2089,7 @@ impl WorkspaceIndexer {
         if plan.mode == codestory_workspace::BuildMode::Incremental
             && !plan.files_to_remove.is_empty()
         {
+            stats.graph_projection_changed = true;
             let cleanup_started = Instant::now();
             let removal = storage
                 .delete_files_batch(&plan.files_to_remove)
@@ -1879,7 +2111,11 @@ impl WorkspaceIndexer {
         // 3.4 Complete the pending same-root TYPE_USAGE channel now that all
         // of the run's declarations are flushed (producer-side, not part of
         // the resolution pipeline; see `finalize_pending_type_usage_edges`).
+        let type_usage_finalize_started = Instant::now();
         finalize_pending_type_usage_edges(storage)?;
+        stats.type_usage_finalize_ms = stats
+            .type_usage_finalize_ms
+            .saturating_add(duration_ms_u64(type_usage_finalize_started.elapsed()));
 
         // 3.5 Resolve call/import edges post-pass
         let (resolution_scope_file_ids, expanded_resolution_scope_files) =
@@ -1897,12 +2133,26 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
-        if had_edges
-            || expanded_resolution_scope_files > 0
-            || !removal_affected_caller_file_ids.is_empty()
+        if (stats.graph_projection_changed || go_return_inputs_changed)
+            && (had_edges
+                || expanded_resolution_scope_files > 0
+                || !removal_affected_caller_file_ids.is_empty()
+                || go_return_inputs_changed)
         {
-            let resolver = resolution::ResolutionPass::new();
-            let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
+            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let resolution_scope = if go_return_inputs_changed {
+                // Factory signatures and module ownership can change without a
+                // caller source byte changing. Reset and recompute this narrow
+                // call class repository-wide.
+                let mut invalidated = resolver.invalidate_go_return_method_resolutions(storage)?;
+                if go_module_control_changed {
+                    invalidated = invalidated.saturating_add(
+                        resolver.invalidate_go_package_function_resolutions(storage)?,
+                    );
+                }
+                stats.graph_projection_changed |= invalidated > 0;
+                None
+            } else if plan.mode == codestory_workspace::BuildMode::Incremental {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
             } else {
                 None
@@ -2120,9 +2370,13 @@ impl WorkspaceIndexer {
             .saturating_add(source_prepare_ms);
 
         let parse_started = Instant::now();
+        #[cfg(test)]
+        let resolution_work = proof_resolution::resolution_work_counter();
         let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
             .par_iter()
             .map(|prepared_input| {
+                #[cfg(test)]
+                let _resolution_work = proof_resolution::inherit_resolution_work(&resolution_work);
                 #[cfg(test)]
                 if let Some(hook) = &self.pipeline_test_hooks.before_parse_job {
                     hook(_chunk_index);
@@ -2835,6 +3089,7 @@ impl WorkspaceIndexer {
         file_errors: &mut Vec<codestory_contracts::graph::ErrorInfo>,
         had_edges: &mut bool,
         stats: &mut IncrementalIndexingStats,
+        preserve_graph_derived_state: bool,
     ) -> Result<codestory_store::ProjectionFlushBreakdown> {
         reconcile_rust_impl_anchors(storage, batched_storage)?;
         let has_rows = projection_batch_has_rows(batched_storage);
@@ -2849,22 +3104,29 @@ impl WorkspaceIndexer {
                 artifact_blob: &write.artifact_blob,
             })
             .collect::<Vec<_>>();
-        let breakdown = storage
-            .projections()
-            .flush_projection_batch(codestory_store::ProjectionBatch {
-                files: &batched_storage.files,
-                file_content_hashes: &batched_storage.file_content_hashes,
-                nodes: &batched_storage.nodes,
-                structural_text_units: &batched_storage.structural_text_units,
-                structural_text_projections: &batched_storage.structural_text_projections,
-                structural_text_cache_writes: &structural_cache_writes,
-                edges: &batched_storage.edges,
-                occurrences: &batched_storage.occurrences,
-                component_access: &batched_storage.component_access,
-                callable_projection_states: &batched_storage.callable_projection_states,
-                file_errors,
-            })
-            .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        let projection_batch = codestory_store::ProjectionBatch {
+            files: &batched_storage.files,
+            file_content_hashes: &batched_storage.file_content_hashes,
+            nodes: &batched_storage.nodes,
+            structural_text_units: &batched_storage.structural_text_units,
+            structural_text_projections: &batched_storage.structural_text_projections,
+            structural_text_cache_writes: &structural_cache_writes,
+            edges: &batched_storage.edges,
+            occurrences: &batched_storage.occurrences,
+            component_access: &batched_storage.component_access,
+            callable_projection_states: &batched_storage.callable_projection_states,
+            file_errors,
+        };
+        let breakdown = if preserve_graph_derived_state {
+            storage
+                .projections()
+                .flush_source_identity_batch(projection_batch)
+        } else {
+            storage
+                .projections()
+                .flush_projection_batch(projection_batch)
+        }
+        .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         if let Some(flush_started) = flush_started {
             let batch_wall_ms = duration_ms_u64(flush_started.elapsed());
             debug_assert!(batch_wall_ms >= projection_flush_breakdown_ms(&breakdown));
@@ -2913,7 +3175,8 @@ impl WorkspaceIndexer {
             .or_else(|| {
                 is_text_only_candidate_path(&full_path).then(|| text_only_language_name(&full_path))
             })
-            .or_else(|| is_openapi_candidate_path(&full_path).then_some("openapi"));
+            .or_else(|| is_openapi_candidate_path(&full_path).then_some("openapi"))
+            .or_else(|| companion_inventory_language(&full_path));
         let Some(source_language) = source_language else {
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
@@ -3025,7 +3288,26 @@ impl WorkspaceIndexer {
                     }
                 };
             }
-            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+            return match index_inventory_only_file(&full_path, source_language) {
+                Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
+                Err(error) => Err(incomplete_file_storage(
+                    &full_path,
+                    None,
+                    source_language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Failed to inventory companion source file {:?}: {}",
+                            path, error
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
+                    },
+                )),
+            };
         };
 
         let bytes = match std::fs::read(&full_path) {
@@ -3049,16 +3331,19 @@ impl WorkspaceIndexer {
             }
         };
         let content_hash = source_content_hash(&bytes);
-        // Decode before building the cache key so source-aware header detection can choose
-        // the same parser that will be used for indexing.
-        let source = match String::from_utf8(bytes) {
-            Ok(source) => source,
-            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
-        };
-        if let Some(upgraded) =
-            maybe_upgrade_header_language_from_source(&full_path, &source, &language_config)
+        let source_utf8_exact = std::str::from_utf8(&bytes).is_ok();
+        // Inspect the parser source before building the cache key so source-aware header
+        // detection chooses the same language that will be used for indexing. The key remains
+        // bound to the raw bytes even when ordinary graph indexing uses a lossy view.
         {
-            language_config = upgraded;
+            let parser_source = String::from_utf8_lossy(&bytes);
+            if let Some(upgraded) = maybe_upgrade_header_language_from_source(
+                &full_path,
+                &parser_source,
+                &language_config,
+            ) {
+                language_config = upgraded;
+            }
         }
         let flags = index_feature_flags();
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
@@ -3066,13 +3351,17 @@ impl WorkspaceIndexer {
             build_index_artifact_cache_key(
                 root,
                 cache_path,
-                source.as_bytes(),
+                &bytes,
                 &language_config,
                 compilation_info.as_ref(),
                 flags.legacy_edge_identity,
                 flags.lazy_graph_execution,
             )
         });
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+        };
         stats.parser_artifact_cache.record_lookup();
 
         let Some(cache_path) = artifact_cache_path.as_ref() else {
@@ -3082,6 +3371,7 @@ impl WorkspaceIndexer {
                 full_path,
                 artifact_cache_path,
                 source,
+                source_utf8_exact,
                 compilation_info,
                 language_config,
                 artifact_cache_key,
@@ -3095,6 +3385,7 @@ impl WorkspaceIndexer {
                 full_path,
                 artifact_cache_path,
                 source,
+                source_utf8_exact,
                 compilation_info,
                 language_config,
                 artifact_cache_key,
@@ -3103,8 +3394,15 @@ impl WorkspaceIndexer {
         };
 
         match cache_access.get_parser(cache_path, cache_key, &mut stats.parser_artifact_cache) {
-            Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
-                Ok(artifact) => {
+            Ok(Some(blob)) => match decode_index_artifact(&blob) {
+                Ok(artifact)
+                    if proof_resolution::cached_resolution_inputs_are_current(
+                        &artifact,
+                        language_config.language_name,
+                        &resolution_parser_fingerprint(&language_config),
+                        &content_hash,
+                    ) =>
+                {
                     let mut artifact = rebase_cached_index_artifact(
                         artifact,
                         &full_path,
@@ -3176,6 +3474,8 @@ impl WorkspaceIndexer {
                             });
                             return Err(local_storage);
                         }
+                        stats.source_identity_only_files =
+                            stats.source_identity_only_files.saturating_add(1);
                         return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
                     }
                     Self::seed_symbol_table_from_nodes(symbol_table, &artifact.nodes);
@@ -3190,7 +3490,7 @@ impl WorkspaceIndexer {
                     }
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     stats.artifact_cache_invalid_entries += 1;
                     stats.artifact_cache_misses += 1;
                     stats.parser_artifact_cache.misses += 1;
@@ -3198,6 +3498,7 @@ impl WorkspaceIndexer {
                         full_path,
                         artifact_cache_path,
                         source,
+                        source_utf8_exact,
                         compilation_info,
                         language_config,
                         artifact_cache_key,
@@ -3212,6 +3513,7 @@ impl WorkspaceIndexer {
                     full_path,
                     artifact_cache_path,
                     source,
+                    source_utf8_exact,
                     compilation_info,
                     language_config,
                     artifact_cache_key,
@@ -3225,6 +3527,7 @@ impl WorkspaceIndexer {
                     full_path,
                     artifact_cache_path,
                     source,
+                    source_utf8_exact,
                     compilation_info,
                     language_config,
                     artifact_cache_key,
@@ -3244,6 +3547,9 @@ impl WorkspaceIndexer {
         stats: &mut IncrementalIndexingStats,
     ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
         let full_path = Self::normalize_index_path(root, path);
+        let role_classification_path =
+            codestory_workspace::workspace_relative_path(root, &full_path)
+                .unwrap_or_else(|| path.to_path_buf());
         let language = structural::structural_language_name(&full_path);
         let producer = structural::structural_producer(&full_path)
             .expect("admitted structural paths have one producer");
@@ -3324,6 +3630,7 @@ impl WorkspaceIndexer {
         stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
             full_path: full_path.clone(),
+            role_classification_path: role_classification_path.clone(),
             artifact_cache_path: artifact_cache_path.clone(),
             artifact_cache_key: artifact_cache_key.clone(),
             source: source.clone(),
@@ -3500,6 +3807,8 @@ impl WorkspaceIndexer {
             path_text.as_ref(),
         ) || codestory_contracts::language_support::is_docker_compose_file_path(
             path_text.as_ref(),
+        ) || codestory_contracts::language_support::is_typescript_config_jsonc_file_path(
+            path_text.as_ref(),
         ) {
             return Ok(None);
         }
@@ -3614,9 +3923,10 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedIndexInput,
         symbol_table: &Arc<SymbolTable>,
     ) -> PreparedIndexJobResult {
-        let index_result = index_file(
+        let index_result = index_file_with_resolution_inputs(
             &prepared_input.full_path,
             &prepared_input.source,
+            &prepared_input.content_hash,
             &prepared_input.language_config,
             prepared_input.compilation_info.clone(),
             Some(Arc::clone(symbol_table)),
@@ -3638,23 +3948,34 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok(mut index_result) => {
+            Ok((mut index_result, mut call_resolution_inputs, mut resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
-                let artifact = CachedIndexArtifact::from_index_result(index_result);
+                if !prepared_input.source_utf8_exact {
+                    call_resolution_inputs.clear();
+                    if let Some(file) = resolution_file.as_mut() {
+                        file.source_sha256 = prepared_input.content_hash.clone();
+                        file.lookup_input_complete = false;
+                    }
+                }
+                let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
+                    index_result,
+                    call_resolution_inputs,
+                    resolution_file,
+                );
                 let cache_write = prepared_input
                     .artifact_cache_path
                     .as_ref()
                     .zip(prepared_input.artifact_cache_key.as_ref())
                     .and_then(|(path, cache_key)| {
-                        serde_json::to_vec(&artifact)
-                            .ok()
-                            .map(|artifact_blob| ArtifactCacheWrite {
+                        encode_index_artifact(&artifact).ok().map(|artifact_blob| {
+                            ArtifactCacheWrite {
                                 path: path.clone(),
                                 cache_key: cache_key.clone(),
                                 artifact_blob,
-                            })
+                            }
+                        })
                     });
                 let mut local_storage = artifact.into_intermediate_storage();
                 if let Some(file_info) = local_storage.files.first() {
@@ -3714,8 +4035,9 @@ impl WorkspaceIndexer {
             .as_ref()
             .map(|policy| policy.structural_unit_cap)
             .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
-        let collected = match structural::index_structural_source_with_unit_cap(
+        let collected = match structural::index_structural_source_with_role_and_unit_cap(
             &prepared_input.full_path,
+            &prepared_input.role_classification_path,
             &prepared_input.source,
             structural_unit_cap,
             self.structural_source_byte_cap,
@@ -3801,24 +4123,46 @@ impl WorkspaceIndexer {
                         FileCoverageReason::Oversized
                     }
                 };
-                return PreparedIndexJobResult {
-                    local_storage: incomplete_file_storage(
+                let mut local_storage = incomplete_file_storage(
+                    &prepared_input.full_path,
+                    Some(&prepared_input.source),
+                    language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Failed to index structural file {:?}: {}",
+                            prepared_input.full_path, error
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        coverage_reason: Some(reason),
+                    },
+                );
+                if reason == FileCoverageReason::Malformed {
+                    match verify_source_snapshot(
                         &prepared_input.full_path,
-                        Some(&prepared_input.source),
-                        language,
-                        codestory_contracts::graph::ErrorInfo {
-                            message: format!(
-                                "Failed to index structural file {:?}: {}",
-                                prepared_input.full_path, error
-                            ),
-                            file_id: None,
-                            line: None,
-                            column: None,
-                            is_fatal: false,
-                            index_step: codestory_contracts::graph::IndexStep::Indexing,
-                            coverage_reason: Some(reason),
-                        },
-                    ),
+                        &prepared_input.content_hash,
+                    ) {
+                        Ok(modification_time) => {
+                            let file = &mut local_storage.files[0];
+                            file.modification_time = modification_time;
+                            local_storage.file_content_hashes.push(
+                                codestory_store::FileContentHash {
+                                    file_id: file.id,
+                                    content_hash: prepared_input.content_hash.clone(),
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            local_storage =
+                                changed_source_storage(&prepared_input.full_path, language, error);
+                        }
+                    }
+                }
+                return PreparedIndexJobResult {
+                    local_storage,
                     cache_write: None,
                     policy_exclusion: None,
                 };
@@ -3912,6 +4256,28 @@ impl WorkspaceIndexer {
 
 fn source_content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-proof-parser-rules-v4\0");
+    hasher.update(language_config.language_name.as_bytes());
+    hasher.update(language_config.language.abi_version().to_be_bytes());
+    hasher.update(language_config.graph_query.as_bytes());
+    if let Some(tags_query) = language_config.tags_query {
+        hasher.update(tags_query.as_bytes());
+    }
+    for id in 0..language_config.language.node_kind_count() {
+        hasher.update((id as u64).to_be_bytes());
+        if let Some(kind) = language_config.language.node_kind_for_id(id as u16) {
+            hasher.update(kind.as_bytes());
+        }
+        hasher.update([
+            u8::from(language_config.language.node_kind_is_named(id as u16)),
+            u8::from(language_config.language.node_kind_is_visible(id as u16)),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
@@ -4045,10 +4411,34 @@ fn projection_flush_breakdown_ms(breakdown: &codestory_store::ProjectionFlushBre
         .saturating_add(u64::from(breakdown.callable_projection_ms))
 }
 
+fn retain_file_identity_rows(
+    storage: &mut IntermediateStorage,
+    file_id: i64,
+    keep_component_access: bool,
+) {
+    storage.nodes.retain(|node| node.id == NodeId(file_id));
+    storage.structural_unit_node_ids.clear();
+    storage.structural_text_units.clear();
+    storage.structural_text_projections.clear();
+    storage.structural_text_cache_writes.clear();
+    storage.edges.clear();
+    storage.occurrences.clear();
+    if !keep_component_access {
+        storage.component_access.clear();
+    }
+    storage.callable_projection_states.clear();
+    storage.impl_anchor_node_ids.clear();
+}
+
 fn accumulate_projection_writer_stats(
     stats: &mut IncrementalIndexingStats,
     writer_stats: &IncrementalIndexingStats,
 ) {
+    stats.graph_projection_changed |= writer_stats.graph_projection_changed;
+    stats.proof_inputs_changed |= writer_stats.proof_inputs_changed;
+    stats.source_identity_only_files = stats
+        .source_identity_only_files
+        .saturating_add(writer_stats.source_identity_only_files);
     stats.artifact_cache_write_ms = stats
         .artifact_cache_write_ms
         .saturating_add(writer_stats.artifact_cache_write_ms);
@@ -4155,6 +4545,14 @@ pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String,
     (file_node, file_identity, file_id)
 }
 
+fn rebase_framework_route_canonical_id(canonical_id: &str, file_id: NodeId) -> Option<String> {
+    let raw = canonical_id.strip_prefix("route_endpoint:")?;
+    let mut metadata = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let declaration = metadata.get_mut("declaration")?.as_object_mut()?;
+    declaration.insert("file_node_id".to_string(), serde_json::json!(file_id.0));
+    Some(format!("route_endpoint:{metadata}"))
+}
+
 fn rebase_cached_index_artifact(
     mut artifact: CachedIndexArtifact,
     full_path: &Path,
@@ -4164,20 +4562,26 @@ fn rebase_cached_index_artifact(
 ) -> CachedIndexArtifact {
     let file_name = full_path.to_string_lossy().to_string();
     let file_identity = WorkspaceIndexer::file_identity_path(full_path);
+    let rebased_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
     for node in &mut artifact.nodes {
         if node.kind == NodeKind::FILE {
             node.serialized_name = file_name.clone();
             node.qualified_name = None;
             node.canonical_id = None;
+        } else if let Some(canonical_id) = node
+            .canonical_id
+            .as_deref()
+            .and_then(|value| rebase_framework_route_canonical_id(value, rebased_file_id))
+        {
+            node.canonical_id = Some(canonical_id);
         }
     }
 
     let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
     let (nodes, id_remap) = canonicalize_nodes(&file_identity, artifact.nodes, &HashMap::new());
-    let fallback_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
     let new_file_id = old_file_id
         .and_then(|file_id| id_remap.get(&file_id).copied())
-        .unwrap_or(fallback_file_id);
+        .unwrap_or(rebased_file_id);
     let final_node_ids = nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
 
     artifact.nodes = nodes;
@@ -4202,6 +4606,225 @@ fn rebase_cached_index_artifact(
         .collect();
     artifact.impl_anchor_node_ids.sort_unstable();
     artifact.impl_anchor_node_ids.dedup();
+    for input in &mut artifact.call_resolution_inputs {
+        input.callsite.file_id = codestory_contracts::proof_resolution::FileId(new_file_id.0);
+        input.caller = input
+            .caller
+            .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
+        use cache::CachedResolutionBinding;
+        input.binding = match input.binding.clone() {
+            CachedResolutionBinding::SameFile {
+                declaration,
+                rust_glob_local_module,
+            } => CachedResolutionBinding::SameFile {
+                declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                rust_glob_local_module,
+            },
+            CachedResolutionBinding::StaticImport {
+                import,
+                module_specifier,
+                imported_name,
+                is_default,
+            } => CachedResolutionBinding::StaticImport {
+                import: id_remap.get(&import).copied().unwrap_or(import),
+                module_specifier,
+                imported_name,
+                is_default,
+            },
+            CachedResolutionBinding::ImplicitReceiver {
+                owner,
+                declaration,
+                owner_name,
+            } => CachedResolutionBinding::ImplicitReceiver {
+                owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                owner_name,
+            },
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding,
+                method_name,
+            } => CachedResolutionBinding::ConstructorBinding {
+                class_binding: match class_binding {
+                    cache::CachedClassBinding::SameFile { owner, owner_name } => {
+                        cache::CachedClassBinding::SameFile {
+                            owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                            owner_name,
+                        }
+                    }
+                    cache::CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    } => cache::CachedClassBinding::StaticImport {
+                        import: id_remap.get(&import).copied().unwrap_or(import),
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    },
+                },
+                method_name,
+            },
+            CachedResolutionBinding::ExplicitReceiverType {
+                class_binding,
+                method_name,
+            } => CachedResolutionBinding::ExplicitReceiverType {
+                class_binding: match class_binding {
+                    cache::CachedClassBinding::SameFile { owner, owner_name } => {
+                        cache::CachedClassBinding::SameFile {
+                            owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                            owner_name,
+                        }
+                    }
+                    cache::CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    } => cache::CachedClassBinding::StaticImport {
+                        import: id_remap.get(&import).copied().unwrap_or(import),
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    },
+                },
+                method_name,
+            },
+            CachedResolutionBinding::RustPath {
+                module_path,
+                components,
+                import,
+                associated_owner,
+            } => CachedResolutionBinding::RustPath {
+                module_path,
+                components,
+                import: import.map(|mut import| {
+                    import.import = id_remap
+                        .get(&import.import)
+                        .copied()
+                        .unwrap_or(import.import);
+                    import
+                }),
+                associated_owner: associated_owner
+                    .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner)),
+            },
+            CachedResolutionBinding::RustImplicitReceiver {
+                module_path,
+                owner_name,
+                mut import,
+                declaration,
+            } => {
+                import.import = id_remap
+                    .get(&import.import)
+                    .copied()
+                    .unwrap_or(import.import);
+                CachedResolutionBinding::RustImplicitReceiver {
+                    module_path,
+                    owner_name,
+                    import,
+                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                }
+            }
+            CachedResolutionBinding::RustExplicitReceiver {
+                module_path,
+                owner_name,
+                import,
+                constructor,
+                constructor_record,
+                constructor_method,
+            } => CachedResolutionBinding::RustExplicitReceiver {
+                module_path,
+                owner_name,
+                import: import.map(|mut import| {
+                    import.import = id_remap
+                        .get(&import.import)
+                        .copied()
+                        .unwrap_or(import.import);
+                    import
+                }),
+                constructor,
+                constructor_record,
+                constructor_method,
+            },
+            CachedResolutionBinding::CCppQualified { components } => {
+                CachedResolutionBinding::CCppQualified {
+                    components: components
+                        .into_iter()
+                        .map(|component| id_remap.get(&component).copied().unwrap_or(component))
+                        .collect(),
+                }
+            }
+            other => other,
+        };
+    }
+    if let Some(resolution_file) = &mut artifact.resolution_file {
+        resolution_file.file_id = new_file_id;
+        for export in &mut resolution_file.direct_exports {
+            export.declaration = id_remap
+                .get(&export.declaration)
+                .copied()
+                .unwrap_or(export.declaration);
+        }
+        for declaration in &mut resolution_file.top_level_declarations {
+            declaration.declaration = id_remap
+                .get(&declaration.declaration)
+                .copied()
+                .unwrap_or(declaration.declaration);
+        }
+        for method in &mut resolution_file.inherent_methods {
+            method.declaration = id_remap
+                .get(&method.declaration)
+                .copied()
+                .unwrap_or(method.declaration);
+            method.owner = method
+                .owner
+                .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner));
+        }
+        for rust_type in &mut resolution_file.rust_types {
+            rust_type.declaration = id_remap
+                .get(&rust_type.declaration)
+                .copied()
+                .unwrap_or(rust_type.declaration);
+        }
+        for rust_use in &mut resolution_file.rust_uses {
+            rust_use.import = id_remap
+                .get(&rust_use.import)
+                .copied()
+                .unwrap_or(rust_use.import);
+        }
+        for rust_module in &mut resolution_file.rust_modules {
+            rust_module.declaration = rust_module
+                .declaration
+                .map(|declaration| id_remap.get(&declaration).copied().unwrap_or(declaration));
+            for child in &mut rust_module.file_children {
+                child.declaration = id_remap
+                    .get(&child.declaration)
+                    .copied()
+                    .unwrap_or(child.declaration);
+            }
+        }
+        for class in &mut resolution_file.classes {
+            class.declaration = id_remap
+                .get(&class.declaration)
+                .copied()
+                .unwrap_or(class.declaration);
+            for method in &mut class.methods {
+                method.declaration = id_remap
+                    .get(&method.declaration)
+                    .copied()
+                    .unwrap_or(method.declaration);
+            }
+        }
+        if let Some(c_cpp_file) = &mut resolution_file.c_cpp_file {
+            c_cpp_file.source_path = full_path.to_path_buf();
+            for namespace in &mut c_cpp_file.namespaces {
+                namespace.declaration = id_remap
+                    .get(&namespace.declaration)
+                    .copied()
+                    .unwrap_or(namespace.declaration);
+            }
+        }
+    }
 
     if let Some(file_info) = artifact.files.first_mut() {
         file_info.id = new_file_id.0;
@@ -4570,7 +5193,7 @@ struct ManualPreciseCallSpec {
     line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GraphNodeSpan {
     start_line: u32,
     start_col: u32,
@@ -5289,10 +5912,32 @@ fn walk_tree_nodes<'tree, F>(node: TsNode<'tree>, visit: &mut F)
 where
     F: FnMut(TsNode<'tree>),
 {
+    // Root-first named-child preorder on the heap. Visit the start node even
+    // when it is unnamed, then skip unnamed child subtrees entirely so the
+    // walk matches `named_children` recursion without a call-stack frame per
+    // depth. TreeCursor sibling/parent moves stay inside this subtree.
     visit(node);
+    let start_id = node.id();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_tree_nodes(child, visit);
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let current = cursor.node();
+        if current.is_named() {
+            visit(current);
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() || cursor.node().id() == start_id {
+                return;
+            }
+        }
     }
 }
 
@@ -7335,6 +7980,37 @@ fn javascript_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
     None
 }
 
+// None means the graph capture is not an ordinary callee capture. Some(None)
+// is a proven module-level call; it must not acquire a nearby callable owner.
+fn javascript_call_callable_span(
+    tree: &Tree,
+    lines: &LineOffsets,
+    callee_span: GraphNodeSpan,
+) -> Option<Option<GraphNodeSpan>> {
+    let byte_at = |line: u32, col: u32| {
+        lines
+            .starts
+            .get(line.checked_sub(1)? as usize)?
+            .checked_add(col.checked_sub(1)? as usize)
+    };
+    let start = byte_at(callee_span.start_line, callee_span.start_col)?;
+    let end = byte_at(callee_span.end_line, callee_span.end_col)?;
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)?;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "call_expression" {
+            let function = parent.child_by_field_name("function")?;
+            if function.start_byte() <= start && function.end_byte() >= end {
+                return Some(javascript_enclosing_callable(parent).map(ts_node_graph_span));
+            }
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
 fn javascript_runtime_import_binding_visible_at_call(
     tree: &Tree,
     source: &str,
@@ -8083,9 +8759,7 @@ fn language_member_specs(
 }
 
 struct ManualMemberEdgeContext<'a> {
-    language_name: &'a str,
-    tree: &'a Tree,
-    source: &'a str,
+    specs: &'a [ManualMemberEdgeSpec],
     unique_nodes: &'a HashMap<NodeId, Node>,
     file_id: NodeId,
     flags: IndexFeatureFlags,
@@ -8095,8 +8769,9 @@ fn append_manual_member_edges(
     context: ManualMemberEdgeContext<'_>,
     result_edges: &mut Vec<Edge>,
     edge_keys: &mut HashSet<EdgeDedupKey>,
-) {
-    for spec in language_member_specs(context.language_name, context.tree, context.source) {
+) -> HashSet<NodeId> {
+    let mut target_ids = HashSet::new();
+    for spec in context.specs {
         let Some(source_id) = node_id_by_name_and_span(
             context.unique_nodes,
             &spec.source_name,
@@ -8114,6 +8789,7 @@ fn append_manual_member_edges(
             continue;
         };
 
+        target_ids.insert(target_id);
         let mut edge = Edge {
             id: EdgeId(0),
             source: source_id,
@@ -8129,6 +8805,74 @@ fn append_manual_member_edges(
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, context.flags));
         result_edges.push(edge);
+    }
+    target_ids
+}
+
+fn apply_go_receiver_method_identities(
+    language_name: &str,
+    nodes: &mut HashMap<NodeId, Node>,
+    specs: &[ManualMemberEdgeSpec],
+    local_member_targets: &HashSet<NodeId>,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) {
+    if language_name != "go" || specs.is_empty() {
+        return;
+    }
+
+    let mut methods_by_span = HashMap::<(u32, u32, u32, u32, String), Vec<NodeId>>::new();
+    for node in nodes.values() {
+        count_go_method_identity_work(1);
+        if node.kind != NodeKind::METHOD
+            || !matches!(
+                canonical_roles.get(&node.id),
+                Some(
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                )
+            )
+        {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        methods_by_span
+            .entry((
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                short_member_name(&node.serialized_name).to_string(),
+            ))
+            .or_default()
+            .push(node.id);
+    }
+
+    for spec in specs {
+        count_go_method_identity_work(1);
+        let key = (
+            spec.target_span.start_line,
+            spec.target_span.start_col,
+            spec.target_span.end_line,
+            spec.target_span.end_col,
+            spec.target_name.clone(),
+        );
+        let Some([method_id]) = methods_by_span.get(&key).map(Vec::as_slice) else {
+            continue;
+        };
+        if local_member_targets.contains(method_id) {
+            continue;
+        }
+        let Some(method) = nodes.get_mut(method_id) else {
+            continue;
+        };
+        let receiver_qualified = format!("{}.{}", spec.source_name, spec.target_name);
+        method.serialized_name = receiver_qualified.clone();
+        method.qualified_name = Some(receiver_qualified);
     }
 }
 
@@ -8233,6 +8977,9 @@ fn append_manual_receiver_call_edges(
     } else {
         HashSet::new()
     };
+    let member_targets = PreparedMemberTargetIndex::prepare(unique_nodes, result_edges);
+    let python_local_owner_lines =
+        (language_name == "python").then(|| PythonLocalOwnerLineIndex::prepare(tree, source));
 
     for spec in language_receiver_call_specs(language_name, tree, source) {
         let extra_callsite_marker = context_manager_alias_callsites
@@ -8431,13 +9178,15 @@ fn append_manual_receiver_call_edges(
             continue;
         }
 
-        let Some(target_id) = member_target_id_by_owner_and_method(
-            unique_nodes,
-            result_edges,
+        let python_local_owner_line = python_local_owner_lines
+            .as_ref()
+            .and_then(|index| index.unique_line(&spec.owner_name));
+        let Some(target_id) = member_targets.target(
             &spec.owner_name,
             &spec.method_name,
             file_id,
             spec.allow_global_fallback,
+            python_local_owner_line,
         ) else {
             let should_annotate = match language_name {
                 "python" => !languages::python::is_implicit_receiver(&spec.receiver_name),
@@ -8749,11 +9498,19 @@ fn append_manual_type_usage_edges(
 /// certainty-gated check and are re-finalized (or removed with their file)
 /// by the next run.
 fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
+    // Keep SQLite variable bindings well under the default limit while still
+    // batching enough ids to avoid per-row commits on large repositories.
+    const ID_CHUNK: usize = 400;
+    // One binding per bare name (reused across exact / `.` / `::` predicates on
+    // serialized_name and qualified_name) plus six fixed kind/prefix params —
+    // stay under SQLite's default 999-variable limit.
+    const NAME_CHUNK: usize = 120;
+
     let conn = storage.get_connection();
     let mut pending = Vec::new();
     {
         let mut statement = conn.prepare(
-            "SELECT e.id, e.source_node_id, n.canonical_id
+            "SELECT e.id, e.source_node_id, e.target_node_id, n.canonical_id
              FROM edge e
              JOIN node n ON n.id = e.target_node_id
              WHERE e.kind = ?1
@@ -8769,7 +9526,8 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )?;
@@ -8781,52 +9539,122 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
         return Ok(());
     }
 
-    // Declaration candidates by bare name (the last segment of the qualified
-    // name, so nested types match too).
+    // Declaration candidates by bare name (short_member_name of serialized or
+    // qualified identity, so owner-qualified nested types like Outer.Inner
+    // still match a pending bare `Inner`). Only load names referenced by
+    // pending edges — a full node scan here was a major @20 dwell on
+    // multi-language cores.
+    let mut needed_names: HashSet<String> = HashSet::new();
+    for (_, _, _, canonical_id) in &pending {
+        let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
+            continue;
+        };
+        let mut parts = suffix.rsplitn(3, ':');
+        if let Some(target_name) = parts.next()
+            && !target_name.is_empty()
+        {
+            needed_names.insert(target_name.to_string());
+        }
+    }
+
     let mut declarations_by_name: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-    {
-        let mut statement = conn.prepare(
-            "SELECT id, qualified_name FROM node
-             WHERE kind IN (?1, ?2, ?3, ?4)
-               AND qualified_name LIKE '%.%'
-               AND (canonical_id IS NULL
-                    OR (canonical_id NOT LIKE ?5 AND canonical_id NOT LIKE ?6))",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![
+    if !needed_names.is_empty() {
+        let names: Vec<String> = needed_names.into_iter().collect();
+        for chunk in names.chunks(NAME_CHUNK) {
+            let mut name_predicates = Vec::with_capacity(chunk.len());
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 6);
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::CLASS as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::STRUCT as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::INTERFACE as i32,
+            )));
+            params.push(rusqlite::types::Value::Integer(i64::from(
                 NodeKind::ENUM as i32,
-                format!("{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"),
-                format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"),
-            ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-        )?;
-        for row in rows {
-            let (id, qualified) = row?;
-            let Some(qualified) = qualified else { continue };
-            let Some(name) = qualified.rsplit('.').next() else {
-                continue;
-            };
-            declarations_by_name
-                .entry(name.to_string())
-                .or_default()
-                .push((id, qualified.clone()));
+            )));
+            for (offset, name) in chunk.iter().enumerate() {
+                // Reuse one bound value per bare name across exact / `.` /
+                // `::` matches on both serialized_name and qualified_name.
+                let base = offset + 5;
+                name_predicates.push(format!(
+                    "(serialized_name = ?{base}
+                      OR serialized_name LIKE '%.' || ?{base}
+                      OR serialized_name LIKE '%::' || ?{base}
+                      OR qualified_name = ?{base}
+                      OR qualified_name LIKE '%.' || ?{base}
+                      OR qualified_name LIKE '%::' || ?{base})"
+                ));
+                params.push(rusqlite::types::Value::Text(name.clone()));
+            }
+            let ref_idx = chunk.len() + 5;
+            let pending_idx = ref_idx + 1;
+            params.push(rusqlite::types::Value::Text(format!(
+                "{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"
+            )));
+            params.push(rusqlite::types::Value::Text(format!(
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"
+            )));
+            let sql = format!(
+                "SELECT id, qualified_name, serialized_name FROM node
+                 WHERE kind IN (?1, ?2, ?3, ?4)
+                   AND (qualified_name LIKE '%.%' OR qualified_name LIKE '%::%')
+                   AND ({})
+                   AND (canonical_id IS NULL
+                        OR (canonical_id NOT LIKE ?{ref_idx}
+                            AND canonical_id NOT LIKE ?{pending_idx}))",
+                name_predicates.join(" OR "),
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, qualified, serialized) = row?;
+                let Some(qualified) = qualified else { continue };
+                // Key by short_member_name so Outer.Inner / Outer::Inner land
+                // under the same bare pending target the edge carried.
+                let name = short_member_name(&qualified).to_string();
+                let name = if name.is_empty() {
+                    serialized
+                        .as_deref()
+                        .map(short_member_name)
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    name
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                declarations_by_name
+                    .entry(name)
+                    .or_default()
+                    .push((id, qualified));
+            }
         }
     }
 
     let mut resolutions: Vec<(i64, i64)> = Vec::new();
-    let mut removals: Vec<i64> = Vec::new();
-    for (edge_id, source_node_id, canonical_id) in pending {
+    // Failed-closed edges carry their pending reference target so orphan
+    // cleanup can delete by known ids instead of scanning every node row.
+    let mut removals: Vec<(i64, i64)> = Vec::new();
+    for (edge_id, source_node_id, target_node_id, canonical_id) in pending {
         let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
+            removals.push((edge_id, target_node_id));
             continue;
         };
         // Suffix is `{file}:{referencing_namespace}:{bare_name}`; identifiers
         // and namespaces never contain `:`, so parse from the right.
         let mut parts = suffix.rsplitn(3, ':');
         let (Some(target_name), Some(referencing_namespace)) = (parts.next(), parts.next()) else {
-            removals.push(edge_id);
+            removals.push((edge_id, target_node_id));
             continue;
         };
         let Some(referencing_root) = referencing_namespace
@@ -8834,7 +9662,7 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             .next()
             .filter(|root| !root.is_empty())
         else {
-            removals.push(edge_id);
+            removals.push((edge_id, target_node_id));
             continue;
         };
         let mut candidates = declarations_by_name
@@ -8853,44 +9681,91 @@ fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
             [declaration_id] if *declaration_id != source_node_id => {
                 resolutions.push((edge_id, *declaration_id));
             }
-            _ => removals.push(edge_id),
+            _ => removals.push((edge_id, target_node_id)),
         }
     }
 
+    let orphan_candidates: Vec<i64> = {
+        let mut ids = removals
+            .iter()
+            .map(|(_, target_node_id)| *target_node_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    let tx = conn.unchecked_transaction()?;
     {
-        let mut resolve = conn.prepare(
+        let mut resolve = tx.prepare(
             "UPDATE edge SET resolved_target_node_id = ?2, certainty = 'certain' WHERE id = ?1",
         )?;
         for (edge_id, declaration_id) in &resolutions {
             resolve.execute(rusqlite::params![edge_id, declaration_id])?;
         }
-        let mut remove = conn.prepare("DELETE FROM edge WHERE id = ?1")?;
-        for edge_id in &removals {
+        let mut remove = tx.prepare("DELETE FROM edge WHERE id = ?1")?;
+        for (edge_id, _) in &removals {
             remove.execute(rusqlite::params![edge_id])?;
         }
     }
 
-    // Pending reference nodes nothing references any more (their edge failed
-    // closed) leave with their occurrences.
-    let orphan_filter = "canonical_id LIKE ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM edge e
-                   WHERE e.source_node_id = node.id
-                      OR e.target_node_id = node.id
-                      OR e.resolved_source_node_id = node.id
-                      OR e.resolved_target_node_id = node.id
-               )";
-    conn.execute(
-        &format!(
-            "DELETE FROM occurrence WHERE element_id IN
-             (SELECT id FROM node WHERE {orphan_filter})"
-        ),
-        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
-    )?;
-    conn.execute(
-        &format!("DELETE FROM node WHERE {orphan_filter}"),
-        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
-    )?;
+    let mut still_referenced = HashSet::new();
+    for chunk in orphan_candidates.chunks(ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT source_node_id FROM edge WHERE source_node_id IN ({placeholders})
+             UNION
+             SELECT target_node_id FROM edge WHERE target_node_id IN ({placeholders})
+             UNION
+             SELECT resolved_source_node_id FROM edge
+             WHERE resolved_source_node_id IN ({placeholders})
+             UNION
+             SELECT resolved_target_node_id FROM edge
+             WHERE resolved_target_node_id IN ({placeholders})"
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(
+            chunk
+                .iter()
+                .copied()
+                .chain(chunk.iter().copied())
+                .chain(chunk.iter().copied())
+                .chain(chunk.iter().copied()),
+        );
+        let rows = statement.query_map(params, |row| row.get::<_, Option<i64>>(0))?;
+        for row in rows {
+            if let Some(node_id) = row? {
+                still_referenced.insert(node_id);
+            }
+        }
+    }
+
+    let orphans: Vec<i64> = orphan_candidates
+        .into_iter()
+        .filter(|node_id| !still_referenced.contains(node_id))
+        .collect();
+    for chunk in orphans.chunks(ID_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let occurrence_sql = format!("DELETE FROM occurrence WHERE element_id IN ({placeholders})");
+        let node_sql = format!("DELETE FROM node WHERE id IN ({placeholders})");
+        tx.execute(
+            &occurrence_sql,
+            rusqlite::params_from_iter(chunk.iter().copied()),
+        )?;
+        tx.execute(&node_sql, rusqlite::params_from_iter(chunk.iter().copied()))?;
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -9203,81 +10078,216 @@ fn callsite_has_receiver_annotation(callsite_identity: Option<&str>) -> bool {
     })
 }
 
-fn member_target_id_by_owner_and_method(
-    nodes: &HashMap<NodeId, Node>,
-    edges: &[Edge],
-    owner_name: &str,
-    method_name: &str,
-    file_id: NodeId,
-    allow_global_fallback: bool,
-) -> Option<NodeId> {
-    let mut owners = nodes
-        .values()
-        .filter(|node| is_type_like_kind(node.kind))
-        .filter(|node| node_matches_name(node, owner_name))
-        .collect::<Vec<_>>();
-    owners.sort_by(|left, right| {
-        left.start_line
-            .unwrap_or(u32::MAX)
-            .cmp(&right.start_line.unwrap_or(u32::MAX))
-            .then_with(|| node_span_width(right).cmp(&node_span_width(left)))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+#[derive(Clone, Copy)]
+struct PreparedMemberOwner {
+    id: NodeId,
+    file_node_id: Option<NodeId>,
+    start_line: Option<u32>,
+    span_width: u32,
+}
 
-    let mut candidates = Vec::new();
-    for owner in owners {
-        let mut targets = edges
+#[derive(Clone, Copy)]
+struct PreparedMemberTarget {
+    file_node_id: Option<NodeId>,
+    id: NodeId,
+    start_line: Option<u32>,
+}
+
+#[derive(Default)]
+struct PreparedMemberTargetIndex {
+    owners_by_name: HashMap<String, Vec<PreparedMemberOwner>>,
+    targets_by_owner_and_name: HashMap<(NodeId, String), Vec<PreparedMemberTarget>>,
+}
+
+impl PreparedMemberTargetIndex {
+    fn prepare(nodes: &HashMap<NodeId, Node>, edges: &[Edge]) -> Self {
+        let mut index = Self::default();
+        for node in nodes.values() {
+            count_manual_receiver_lookup_work(1);
+            if !is_type_like_kind(node.kind) {
+                continue;
+            }
+            let owner = PreparedMemberOwner {
+                id: node.id,
+                file_node_id: node.file_node_id,
+                start_line: node.start_line,
+                span_width: node_span_width(node),
+            };
+            for name in prepared_node_names(node, true) {
+                index.owners_by_name.entry(name).or_default().push(owner);
+            }
+        }
+        for edge in edges {
+            count_manual_receiver_lookup_work(1);
+            if edge.kind != EdgeKind::MEMBER {
+                continue;
+            }
+            let Some(target) = nodes.get(&edge.target) else {
+                continue;
+            };
+            if !matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                continue;
+            }
+            let prepared = PreparedMemberTarget {
+                file_node_id: target.file_node_id,
+                id: target.id,
+                start_line: target.start_line,
+            };
+            for name in prepared_node_names(target, false) {
+                index
+                    .targets_by_owner_and_name
+                    .entry((edge.source, name))
+                    .or_default()
+                    .push(prepared);
+            }
+        }
+        for owners in index.owners_by_name.values_mut() {
+            owners.sort_by(|left, right| {
+                left.start_line
+                    .unwrap_or(u32::MAX)
+                    .cmp(&right.start_line.unwrap_or(u32::MAX))
+                    .then_with(|| right.span_width.cmp(&left.span_width))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            owners.dedup_by_key(|owner| owner.id);
+        }
+        for targets in index.targets_by_owner_and_name.values_mut() {
+            targets.sort_by_key(|target| (target.start_line.unwrap_or(u32::MAX), target.id));
+            targets.dedup_by_key(|target| target.id);
+        }
+        index
+    }
+
+    fn target(
+        &self,
+        owner_name: &str,
+        method_name: &str,
+        file_id: NodeId,
+        allow_global_fallback: bool,
+        owner_start_line: Option<u32>,
+    ) -> Option<NodeId> {
+        count_manual_receiver_lookup_work(1);
+        let owner_lookup_name = owner_start_line
+            .and_then(|_| owner_name.rsplit_once('.').map(|(_, name)| name))
+            .unwrap_or(owner_name);
+        let owners = self
+            .owners_by_name
+            .get(owner_lookup_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut candidates = Vec::new();
+        for owner in owners {
+            count_manual_receiver_lookup_work(1);
+            if owner_start_line.is_some_and(|line| owner.start_line != Some(line)) {
+                continue;
+            }
+            if let Some(targets) = self
+                .targets_by_owner_and_name
+                .get(&(owner.id, method_name.to_owned()))
+            {
+                for target in targets {
+                    count_manual_receiver_lookup_work(1);
+                    candidates.push((owner.file_node_id, target.file_node_id, target.id));
+                }
+            }
+        }
+        let mut same_file_matches = candidates
             .iter()
-            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.source == owner.id)
-            .filter_map(|edge| nodes.get(&edge.target))
-            .filter(|node| {
-                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                    && node_matches_name(node, method_name)
+            .filter_map(|(owner_file_id, target_file_id, target_id)| {
+                (owner_file_id.is_none()
+                    || target_file_id.is_none()
+                    || *owner_file_id == Some(file_id)
+                    || *target_file_id == Some(file_id))
+                .then_some(*target_id)
             })
             .collect::<Vec<_>>();
-        targets.sort_by(|left, right| {
-            left.start_line
-                .unwrap_or(u32::MAX)
-                .cmp(&right.start_line.unwrap_or(u32::MAX))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        for target in targets {
-            candidates.push((owner.file_node_id, target.file_node_id, target.id));
+        same_file_matches.sort_unstable();
+        same_file_matches.dedup();
+        match same_file_matches.as_slice() {
+            [target] => return Some(*target),
+            [] => {}
+            _ => return None,
+        }
+        if !allow_global_fallback {
+            return None;
+        }
+        let mut global_matches = candidates
+            .into_iter()
+            .map(|(_, _, target_id)| target_id)
+            .collect::<Vec<_>>();
+        global_matches.sort_unstable();
+        global_matches.dedup();
+        match global_matches.as_slice() {
+            [target] => Some(*target),
+            _ => None,
         }
     }
+}
 
-    let mut same_file_matches = candidates
-        .iter()
-        .filter_map(|(owner_file_id, target_file_id, target_id)| {
-            (owner_file_id.is_none()
-                || target_file_id.is_none()
-                || *owner_file_id == Some(file_id)
-                || *target_file_id == Some(file_id))
-            .then_some(*target_id)
-        })
-        .collect::<Vec<_>>();
-    same_file_matches.sort_unstable();
-    same_file_matches.dedup();
-    if same_file_matches.len() == 1 {
-        return Some(same_file_matches[0]);
+fn prepared_node_names(node: &Node, include_qualified_suffixes: bool) -> Vec<String> {
+    let mut names = vec![
+        node.serialized_name.clone(),
+        short_member_name(&node.serialized_name).to_owned(),
+    ];
+    if let Some(qualified) = node.qualified_name.as_deref() {
+        names.push(qualified.to_owned());
+        names.push(short_member_name(qualified).to_owned());
+        if include_qualified_suffixes {
+            names.extend(
+                qualified
+                    .match_indices('.')
+                    .map(|(index, _)| qualified[index + 1..].to_owned()),
+            );
+        }
     }
-    if same_file_matches.len() > 1 {
-        return None;
-    }
-    if !allow_global_fallback {
-        return None;
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[derive(Default)]
+struct PythonLocalOwnerLineIndex {
+    lines_by_owner: HashMap<String, Vec<u32>>,
+}
+
+impl PythonLocalOwnerLineIndex {
+    fn prepare(tree: &Tree, source: &str) -> Self {
+        let mut index = Self::default();
+        walk_tree_nodes(tree.root_node(), &mut |node| {
+            count_manual_receiver_lookup_work(1);
+            if node.kind() != "class_definition" {
+                return;
+            }
+            let Some(class_name) = declaration_name(node, source) else {
+                return;
+            };
+            let Some(callable) = enclosing_node_with_kind(node, &["function_definition"]) else {
+                return;
+            };
+            let Some(callable_name) = declaration_name(callable, source) else {
+                return;
+            };
+            index
+                .lines_by_owner
+                .entry(format!("{callable_name}.{class_name}"))
+                .or_default()
+                .push(node.start_position().row as u32 + 1);
+        });
+        for lines in index.lines_by_owner.values_mut() {
+            lines.sort_unstable();
+            lines.dedup();
+        }
+        index
     }
 
-    let mut global_matches = candidates
-        .into_iter()
-        .map(|(_, _, target_id)| target_id)
-        .collect::<Vec<_>>();
-    global_matches.sort_unstable();
-    global_matches.dedup();
-    if global_matches.len() == 1 {
-        Some(global_matches[0])
-    } else {
-        None
+    fn unique_line(&self, owner_name: &str) -> Option<u32> {
+        count_manual_receiver_lookup_work(1);
+        self.lines_by_owner
+            .get(owner_name)
+            .and_then(|lines| match lines.as_slice() {
+                [line] => Some(*line),
+                _ => None,
+            })
     }
 }
 
@@ -9754,27 +10764,6 @@ fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
         .join(".")
 }
 
-fn surface_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let separator = callable.rfind('.')?;
-    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
-    let method = callable[separator + 1..]
-        .trim()
-        .trim_start_matches('?')
-        .trim();
-    Some((
-        normalized_receiver_surface(receiver)?,
-        normalize_parameter_name(method)?,
-    ))
-}
-
 fn normalized_receiver_surface(raw: &str) -> Option<String> {
     let terminal = raw
         .rsplit([' ', '\t', '\n', '\r', '(', '[', '{'])
@@ -9934,45 +10923,6 @@ fn append_runtime_import_edges(
     }
 }
 
-fn annotate_exact_runtime_import_bare_calls(
-    specs: &[RuntimeImportSpec],
-    unique_nodes: &HashMap<NodeId, Node>,
-    edges: &mut [Edge],
-    edge_keys: &mut HashSet<EdgeDedupKey>,
-    flags: IndexFeatureFlags,
-) {
-    let exact_target_spans = specs
-        .iter()
-        .flat_map(|spec| spec.exact_bare_call_target_spans.iter())
-        .map(|span| (span.start_line, span.start_col, span.end_line, span.end_col))
-        .collect::<HashSet<_>>();
-    if exact_target_spans.is_empty() {
-        return;
-    }
-
-    for edge in edges {
-        if edge.kind != EdgeKind::CALL
-            || !unique_nodes
-                .get(&edge.target)
-                .and_then(|target| {
-                    Some((
-                        target.start_line?,
-                        target.start_col?,
-                        target.end_line?,
-                        target.end_col?,
-                    ))
-                })
-                .is_some_and(|span| exact_target_spans.contains(&span))
-        {
-            continue;
-        }
-        edge_keys.remove(&edge_dedup_key(edge, flags));
-        append_callsite_marker(edge, languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER);
-        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
-        edge_keys.insert(edge_dedup_key(edge, flags));
-    }
-}
-
 fn collect_c_enum_member_pairs(tree: &Tree, source: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
@@ -10111,8 +11061,17 @@ fn infer_access_from_source(
     source: &str,
     lines: &LineOffsets,
     start_line: u32,
+    start_col: u32,
     kind: NodeKind,
 ) -> Option<AccessKind> {
+    if language_name == "java"
+        && matches!(
+            kind,
+            NodeKind::CLASS | NodeKind::INTERFACE | NodeKind::ENUM | NodeKind::ANNOTATION
+        )
+    {
+        return languages::java::type_declaration_access(tree, start_line, start_col, kind);
+    }
     if !matches!(
         kind,
         NodeKind::METHOD
@@ -10334,9 +11293,11 @@ fn qualified_name_delimiter(language_name: &str) -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanonicalNodeRole {
+    Definition,
     Declaration,
     ForwardDeclaration,
     ImplAnchor,
+    Reference,
     Unspecified,
 }
 
@@ -10351,10 +11312,11 @@ fn canonical_role_from_graph_attr(value: &str) -> CanonicalNodeRole {
 
 fn canonical_role_priority(role: CanonicalNodeRole) -> u8 {
     match role {
+        CanonicalNodeRole::Definition => 4,
         CanonicalNodeRole::Declaration => 3,
         CanonicalNodeRole::Unspecified => 2,
         CanonicalNodeRole::ForwardDeclaration => 1,
-        CanonicalNodeRole::ImplAnchor => 0,
+        CanonicalNodeRole::ImplAnchor | CanonicalNodeRole::Reference => 0,
     }
 }
 
@@ -10458,7 +11420,7 @@ fn preserved_canonical_id(node: &Node) -> Option<&str> {
     })
 }
 
-/// Declaration ordinals for every qualified name that needs a discriminator.
+/// Canonical ordinals for every qualified name that needs a discriminator.
 ///
 /// Two callables in one file can share a qualified name — Java and C++
 /// overloads, an unresolved call placeholder beside the function it names, a
@@ -10468,13 +11430,15 @@ fn preserved_canonical_id(node: &Node) -> Option<&str> {
 /// incremental indexing could only replace the whole file (CR-008) and every
 /// annotation anchored to it was destroyed (ARCH-001).
 ///
-/// The ordinal is the rank of the declaration's line among the distinct lines
-/// that share its qualified name, so it is invariant under any edit that moves
-/// declarations without reordering them. Declarations that share a line still
-/// share an id, exactly as the line-suffixed form grouped them: this is a
-/// relabelling of the same groups, not a regrouping.
-fn declaration_ordinals(nodes: &[Node]) -> HashMap<String, BTreeMap<u32, usize>> {
-    let mut lines_by_name: HashMap<String, BTreeSet<u32>> = HashMap::new();
+/// Declarations receive the first source-ordered ordinals for their qualified
+/// name. Reference/placeholder nodes are ordered only after that declaration
+/// range, so adding or moving a callsite cannot rename a declaration. Columns
+/// keep distinct declarations on the same line distinct.
+fn canonical_node_ordinals(
+    nodes: &[Node],
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) -> HashMap<NodeId, usize> {
+    let mut nodes_by_name: HashMap<String, Vec<&Node>> = HashMap::new();
     for node in nodes {
         if preserved_canonical_id(node).is_some() || !node_needs_declaration_ordinal(node) {
             continue;
@@ -10483,22 +11447,36 @@ fn declaration_ordinals(nodes: &[Node]) -> HashMap<String, BTreeMap<u32, usize>>
             .qualified_name
             .clone()
             .unwrap_or_else(|| node.serialized_name.clone());
-        lines_by_name
-            .entry(qualified_name)
-            .or_default()
-            .insert(node.start_line.unwrap_or(1));
+        nodes_by_name.entry(qualified_name).or_default().push(node);
     }
-    lines_by_name
-        .into_iter()
-        .map(|(qualified_name, lines)| {
-            let ordinals = lines
-                .into_iter()
-                .enumerate()
-                .map(|(ordinal, line)| (line, ordinal))
-                .collect::<BTreeMap<_, _>>();
-            (qualified_name, ordinals)
-        })
-        .collect()
+    let mut ordinals = HashMap::new();
+    for nodes in nodes_by_name.values_mut() {
+        nodes.sort_by_key(|node| {
+            (
+                node.start_line.unwrap_or(u32::MAX),
+                node.start_col.unwrap_or(u32::MAX),
+                node.end_line.unwrap_or(u32::MAX),
+                node.end_col.unwrap_or(u32::MAX),
+                node.kind as i32,
+                node.id,
+            )
+        });
+        let (declarations, references): (Vec<_>, Vec<_>) =
+            nodes.iter().copied().partition(|node| {
+                matches!(
+                    canonical_roles.get(&node.id),
+                    Some(
+                        CanonicalNodeRole::Definition
+                            | CanonicalNodeRole::Declaration
+                            | CanonicalNodeRole::ForwardDeclaration
+                    )
+                )
+            });
+        for (ordinal, node) in declarations.into_iter().chain(references).enumerate() {
+            ordinals.insert(node.id, ordinal);
+        }
+    }
+    ordinals
 }
 
 fn canonicalize_nodes_with_file_identity(
@@ -10509,7 +11487,7 @@ fn canonicalize_nodes_with_file_identity(
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
-    let ordinals_by_name = declaration_ordinals(&final_nodes);
+    let ordinals_by_node = canonical_node_ordinals(&final_nodes, canonical_roles);
 
     for mut node in final_nodes {
         let qualified_name = node
@@ -10526,11 +11504,7 @@ fn canonicalize_nodes_with_file_identity(
                 } else if node.kind == NodeKind::FILE {
                     format!("{file_identity}:{file_identity}:1")
                 } else {
-                    let start_line = node.start_line.unwrap_or(1);
-                    let ordinal = ordinals_by_name
-                        .get(&qualified_name)
-                        .and_then(|ordinals| ordinals.get(&start_line).copied())
-                        .unwrap_or(0);
+                    let ordinal = ordinals_by_node.get(&node.id).copied().unwrap_or(0);
                     format!("{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
                 }
             });
@@ -10544,10 +11518,21 @@ fn canonicalize_nodes_with_file_identity(
             id_remap.insert(node.id, new_id);
         }
 
+        // The canonical role selects the authoritative source anchor, while a
+        // type reference can still carry the more specific semantic kind.
+        let semantic_type_kind = nodes
+            .iter()
+            .filter(|node| is_type_like_kind(node.kind))
+            .max_by_key(|node| type_anchor_priority(node.kind))
+            .map(|node| node.kind);
+
         let mut node = nodes
             .into_iter()
             .max_by(|left, right| compare_canonical_node_candidates(left, right, canonical_roles))
             .unwrap_or_default();
+        if let Some(kind) = semantic_type_kind {
+            node.kind = kind;
+        }
         let selected_role = canonical_roles
             .get(&node.id)
             .copied()
@@ -10742,37 +11727,50 @@ fn rewrite_override_placeholders(file_id: NodeId, nodes: &mut Vec<Node>, edges: 
     }
 }
 
+fn canonical_declaration_ordinal(node: &Node) -> Option<usize> {
+    node.canonical_id
+        .as_deref()?
+        .rsplit_once(DECLARATION_ORDINAL_SEPARATOR)?
+        .1
+        .parse()
+        .ok()
+}
+
+fn should_replace_reference_candidate(candidate: &Node, current: &Node) -> bool {
+    canonical_declaration_ordinal(candidate)
+        .cmp(&canonical_declaration_ordinal(current))
+        .then_with(|| {
+            candidate
+                .start_line
+                .unwrap_or(u32::MAX)
+                .cmp(&current.start_line.unwrap_or(u32::MAX))
+                .then_with(|| node_span_width(current).cmp(&node_span_width(candidate)))
+        })
+        .is_lt()
+}
+
 fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
     let node_by_id = nodes
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
+    let mut declaration_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     for node in nodes {
         let key = (
             node.kind,
             short_member_name(&node.serialized_name).to_string(),
         );
-        let replace = best_by_key
+        let replace_declaration = declaration_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
-            .map(|current| {
-                node.start_line
-                    .unwrap_or(u32::MAX)
-                    .cmp(&current.start_line.unwrap_or(u32::MAX))
-                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
-                    .is_lt()
-            })
+            .map(|current| should_replace_reference_candidate(node, current))
             .unwrap_or(true);
-        if replace {
-            best_by_key.insert(key, node.id);
+        if replace_declaration {
+            declaration_by_key.insert(key, node.id);
         }
     }
 
-    for edge in edges
-        .iter_mut()
-        .filter(|edge| matches!(edge.kind, EdgeKind::USAGE | EdgeKind::CALL))
-    {
+    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::USAGE) {
         let Some(target_node) = node_by_id.get(&edge.target).copied() else {
             continue;
         };
@@ -10780,7 +11778,9 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
             target_node.kind,
             short_member_name(&target_node.serialized_name).to_string(),
         );
-        let Some(candidate_id) = best_by_key.get(&key).copied() else {
+        // CALL targets retain each raw occurrence until callable attribution
+        // and resolution. Rewriting a self-edge here loses its owning caller.
+        let Some(candidate_id) = declaration_by_key.get(&key).copied() else {
             continue;
         };
         edge.target = candidate_id;
@@ -10824,13 +11824,7 @@ fn prune_tsx_duplicate_reference_nodes(
         let should_replace = best_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
-            .map(|current| {
-                node.start_line
-                    .unwrap_or(u32::MAX)
-                    .cmp(&current.start_line.unwrap_or(u32::MAX))
-                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
-                    .is_lt()
-            })
+            .map(|current| should_replace_reference_candidate(node, current))
             .unwrap_or(true);
         if should_replace {
             best_by_key.insert(key, node.id);
@@ -11415,6 +12409,55 @@ fn text_only_language_name(path: &Path) -> &'static str {
     }
 }
 
+/// Return the source-group identity for a companion extension that discovery
+/// admits but no parser or structural collector owns.
+///
+/// This identity is inventory metadata only. It must not be added to the
+/// public language-support registry because doing so would advertise a graph
+/// or source-proof claim that the indexer cannot make.
+fn companion_inventory_language(path: &Path) -> Option<&'static str> {
+    if path.file_name().is_some_and(|name| name == "go.mod") {
+        return Some("go-module-control");
+    }
+    let extension = path.extension()?.to_str()?;
+    let profile = codestory_contracts::language_support::companion_extension_profile(extension)?;
+    profile
+        .surface_language
+        .or_else(|| profile.source_group_languages.first().copied())
+}
+
+/// Persist exact source identity for a discovered companion file without
+/// emitting non-file graph evidence.
+///
+/// `complete = false` keeps proof and absence reasoning conservative. The
+/// verified content hash makes an unchanged file stable across incremental
+/// refreshes, while an actual byte change still schedules the file again.
+fn index_inventory_only_file(path: &Path, language: &str) -> Result<IntermediateStorage> {
+    let bytes = std::fs::read(path)?;
+    let content_hash = source_content_hash(&bytes);
+    let source = String::from_utf8_lossy(&bytes);
+    let (file_node, _file_name, file_id) = file_node_from_source(path, &source);
+    let mut local_storage = IntermediateStorage::default();
+    local_storage.files.push(codestory_store::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: language.to_string(),
+        modification_time: file_modification_time(path),
+        indexed: true,
+        complete: false,
+        line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
+    });
+    local_storage.nodes.push(file_node);
+    local_storage
+        .file_content_hashes
+        .push(codestory_store::FileContentHash {
+            file_id: file_id.0,
+            content_hash,
+        });
+    Ok(local_storage)
+}
+
 fn prepare_template_index_work(
     path: &Path,
     template_kind: template_pipeline::TemplateKind,
@@ -11866,7 +12909,7 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
         if !seen.insert((endpoint.method.clone(), endpoint.path.clone())) {
             continue;
         }
-        let node_id = schema_endpoint_node_id(&endpoint.method, &endpoint.path);
+        let node_id = schema_endpoint_node_id(file_id, &endpoint.method, &endpoint.path);
         let label = schema_endpoint_label(&endpoint.method, &endpoint.path);
         local_storage.nodes.push(Node {
             id: node_id,
@@ -12034,9 +13077,14 @@ fn schema_endpoint_label(method: &str, path: &str) -> String {
     )
 }
 
-fn schema_endpoint_node_id(method: &str, path: &str) -> NodeId {
+fn schema_endpoint_node_id(file_id: NodeId, method: &str, path: &str) -> NodeId {
+    // Endpoint node ids must be file-owned. A global method+path hash collides when
+    // sibling OpenAPI/Swagger fixtures share routes (U03 localstack tests/aws/files,
+    // U06 kratos openapi+swagger); INSERT OR REPLACE then rebinds file_node_id and
+    // full-refresh coverage reports collector_failure with verified_source.
     NodeId(generate_id(&format!(
-        "openapi:endpoint:{}",
+        "openapi:endpoint:{}:{}",
+        file_id.0,
         schema_endpoint_label(method, path)
     )))
 }
@@ -13441,10 +14489,14 @@ fn framework_route_label(route: &FrameworkRoute) -> String {
     )
 }
 
-fn framework_route_canonical_id(route: &FrameworkRoute) -> String {
+fn framework_route_canonical_id(file_id: NodeId, route: &FrameworkRoute) -> String {
     format!(
         "route_endpoint:{}",
         serde_json::json!({
+            "declaration": {
+                "file_node_id": file_id.0,
+                "line": route.line,
+            },
             "kind": "framework_route",
             "framework": route.framework,
             "method": route.method.as_str(),
@@ -13483,15 +14535,16 @@ fn route_params(path: &str) -> Vec<String> {
 
 fn framework_route_node(file_id: NodeId, route: &FrameworkRoute) -> Node {
     let label = framework_route_label(route);
+    let canonical_id = framework_route_canonical_id(file_id, route);
     Node {
-        id: NodeId(generate_id(&framework_route_canonical_id(route))),
+        id: NodeId(generate_id(&canonical_id)),
         kind: NodeKind::FUNCTION,
         serialized_name: label.clone(),
         qualified_name: Some(format!(
             "framework::{}::{} {}",
             route.framework, route.method, route.path
         )),
-        canonical_id: Some(framework_route_canonical_id(route)),
+        canonical_id: Some(canonical_id),
         file_node_id: Some(file_id),
         start_line: Some(route.line),
         start_col: Some(1),
@@ -13985,7 +15038,7 @@ fn append_schema_endpoint_call_edges(
     }
 
     for call in collect_api_endpoint_calls(source) {
-        let target = schema_endpoint_node_id(&call.method, &call.path);
+        let target = schema_endpoint_node_id(file_id, &call.method, &call.path);
         let target_label = schema_endpoint_label(&call.method, &call.path);
         let source_id =
             enclosing_callable_node_id(sinks.unique_nodes, call.line).unwrap_or(file_id);
@@ -14981,6 +16034,30 @@ pub fn index_file(
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
+    let source_sha256 = source_content_hash(source.as_bytes());
+    index_file_with_resolution_inputs(
+        path,
+        source,
+        &source_sha256,
+        language_config,
+        compilation_info,
+        symbol_table,
+    )
+    .map(|(result, _, _)| result)
+}
+
+fn index_file_with_resolution_inputs(
+    path: &Path,
+    source: &str,
+    raw_source_sha256: &str,
+    language_config: &LanguageConfig,
+    compilation_info: Option<compilation_database::CompilationInfo>,
+    symbol_table: Option<Arc<SymbolTable>>,
+) -> Result<(
+    IndexResult,
+    Vec<cache::CachedCallResolutionInput>,
+    Option<cache::CachedResolutionFile>,
+)> {
     let flags = index_feature_flags();
     let is_jsx_like_file = path
         .extension()
@@ -15000,6 +16077,8 @@ pub fn index_file(
     let mut tag_definitions = extract_tag_definitions(compiled_rules, &tree, source)?;
     let declaration_span_overrides =
         collect_declaration_span_overrides(language_config.language_name, &tree, source);
+    let native_callable_names =
+        native_declarators::callable_names(language_config.language_name, &tree, source);
 
     let mut variables = Variables::new();
     if let Some(info) = &compilation_info {
@@ -15017,6 +16096,21 @@ pub fn index_file(
         .graph_file
         .execute(&tree, source, &config, &NoCancellation)
         .map_err(|e| anyhow!("Graph execution error: {:?}", e))?;
+
+    let mut reference_graph_nodes = HashSet::new();
+    for source_ref in graph.iter_nodes() {
+        for (sink_ref, edge) in graph[source_ref].iter_edges() {
+            let relation = edge.attributes.iter().find_map(|(attr, value)| {
+                (attr.as_str() == "kind")
+                    .then(|| value.as_str().ok())
+                    .flatten()
+                    .and_then(edge_kind_from_str)
+            });
+            if relation.is_some_and(graph_relation_sink_is_reference) {
+                reference_graph_nodes.insert(sink_ref);
+            }
+        }
+    }
 
     let mut result_files = Vec::new();
     let mut result_nodes = Vec::new();
@@ -15045,6 +16139,9 @@ pub fn index_file(
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
+    // A canonical reference node can represent multiple same-line calls.
+    // Keep each graph capture's address until its individual edge is built.
+    let mut graph_capture_spans = HashMap::new();
     let line_offsets = LineOffsets::new(source);
     let mut unique_nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut component_access_by_node_id: HashMap<NodeId, AccessKind> = HashMap::new();
@@ -15084,6 +16181,26 @@ pub fn index_file(
                 "rust_impl_expr" => rust_impl_expr = true,
                 _ => {}
             }
+        }
+        if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) =
+            (start_row, start_col, end_row, end_col)
+        {
+            graph_capture_spans.insert(
+                node_id,
+                GraphNodeSpan {
+                    start_line: start_row + 1,
+                    start_col: start_col + 1,
+                    end_line: end_row + 1,
+                    end_col: end_col + 1,
+                },
+            );
+        }
+        if canonical_role == CanonicalNodeRole::Unspecified {
+            canonical_role = if reference_graph_nodes.contains(&node_id) {
+                CanonicalNodeRole::Reference
+            } else {
+                CanonicalNodeRole::Definition
+            };
         }
         let has_token_surface_edge = node_data.iter_edges().any(|(_, edge)| {
             edge.attributes
@@ -15133,6 +16250,21 @@ pub fn index_file(
             let mut start_col_1 = start_col.map(|v| v + 1).unwrap_or(1);
             let mut end_line_1 = end_row.map(|v| v + 1).unwrap_or(start_line);
             let mut end_col_1 = end_col.map(|v| v + 1).unwrap_or(start_col_1);
+            if matches!(language_config.language_name, "c" | "cpp") && kind == NodeKind::FUNCTION {
+                let span = GraphNodeSpan {
+                    start_line,
+                    start_col: start_col_1,
+                    end_line: end_line_1,
+                    end_col: end_col_1,
+                };
+                if let Some(name) = native_callable_names.get(&span) {
+                    // A missing name on a definition is unknown. Other
+                    // function-shaped captures (prototypes, lambdas) retain
+                    // their own syntax-specific extraction.
+                    let Some(name) = name else { continue };
+                    name_str.clone_from(name);
+                }
+            }
             if let Some((
                 normalized_name,
                 normalized_start_line,
@@ -15196,19 +16328,75 @@ pub fn index_file(
                 end_line_1 = override_span.end_line;
                 end_col_1 = override_span.end_col;
             }
-            let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
+            let canonical_seed = if matches!(
+                canonical_role,
+                CanonicalNodeRole::Definition
+                    | CanonicalNodeRole::Declaration
+                    | CanonicalNodeRole::ForwardDeclaration
+            ) {
+                format!("{}:{}:{}:{}", file_name, name_str, start_line, start_col_1)
+            } else {
+                format!("{}:{}:{}", file_name, name_str, start_line)
+            };
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
-            let effective_access = access_kind.or_else(|| {
-                infer_access_from_source(
-                    language_config.language_name,
-                    &tree,
-                    source,
-                    &line_offsets,
-                    start_line,
+            let effective_access = if language_config.language_name == "swift"
+                && matches!(
                     kind,
+                    NodeKind::STRUCT
+                        | NodeKind::CLASS
+                        | NodeKind::ENUM
+                        | NodeKind::FUNCTION
+                        | NodeKind::METHOD
                 )
-            });
+                && matches!(
+                    canonical_role,
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                ) {
+                Some(
+                    if proof_resolution::swift_declaration_cross_module_visible_at(
+                        &tree,
+                        source,
+                        start_line,
+                        start_col_1,
+                    ) {
+                        AccessKind::Public
+                    } else {
+                        AccessKind::Default
+                    },
+                )
+            } else {
+                access_kind.or_else(|| {
+                    if language_config.language_name == "java"
+                        && matches!(
+                            kind,
+                            NodeKind::CLASS
+                                | NodeKind::INTERFACE
+                                | NodeKind::ENUM
+                                | NodeKind::ANNOTATION
+                        )
+                        && !matches!(
+                            canonical_role,
+                            CanonicalNodeRole::Definition
+                                | CanonicalNodeRole::Declaration
+                                | CanonicalNodeRole::ForwardDeclaration
+                        )
+                    {
+                        return None;
+                    }
+                    infer_access_from_source(
+                        language_config.language_name,
+                        &tree,
+                        source,
+                        &line_offsets,
+                        start_line,
+                        start_col_1,
+                        kind,
+                    )
+                })
+            };
 
             unique_nodes.insert(
                 nid,
@@ -15239,8 +16427,8 @@ pub fn index_file(
 
     for definition in tag_definitions.into_remaining() {
         let canonical_seed = format!(
-            "{}:{}:{}",
-            file_name, definition.key.name, definition.key.start_line
+            "{}:{}:{}:{}",
+            file_name, definition.key.name, definition.key.start_line, definition.key.start_col
         );
         let nid = NodeId(generate_id(&canonical_seed));
         unique_nodes.entry(nid).or_insert_with(|| Node {
@@ -15253,9 +16441,14 @@ pub fn index_file(
             end_col: Some(definition.end_col),
             ..Default::default()
         });
-        if definition.canonical_role != CanonicalNodeRole::Unspecified {
-            canonical_role_by_node_id.insert(nid, definition.canonical_role);
-        }
+        canonical_role_by_node_id.insert(
+            nid,
+            if definition.canonical_role == CanonicalNodeRole::Unspecified {
+                CanonicalNodeRole::Definition
+            } else {
+                definition.canonical_role
+            },
+        );
         if let Some(access) = definition.access {
             component_access_by_node_id.insert(nid, access);
         }
@@ -15272,6 +16465,41 @@ pub fn index_file(
         &mut unique_nodes,
         symbol_table.as_ref(),
     );
+    let runtime_import_call_spans = runtime_import_specs
+        .iter()
+        .flat_map(|spec| spec.exact_bare_call_target_spans.iter().copied())
+        .collect::<HashSet<_>>();
+    let private_call_spans = if matches!(language_config.language_name, "javascript" | "typescript")
+    {
+        languages::javascript::private_name_call_spans(&tree, source)
+    } else {
+        HashSet::new()
+    };
+
+    // Keep syntax ownership separate from canonical node merging. Multiple
+    // same-line callees can share a node, but each graph capture still has its
+    // own address and the nearest callable has one exact definition span.
+    let is_script = matches!(language_config.language_name, "javascript" | "typescript");
+    let mut script_callable_ids = HashMap::<GraphNodeSpan, Option<NodeId>>::new();
+    if is_script {
+        for (graph_id, node_id) in &graph_to_node_id {
+            if unique_nodes
+                .get(node_id)
+                .is_some_and(|node| is_callable_kind(node.kind))
+                && canonical_role_by_node_id.get(node_id) == Some(&CanonicalNodeRole::Definition)
+                && let Some(span) = graph_capture_spans.get(graph_id)
+            {
+                script_callable_ids
+                    .entry(*span)
+                    .and_modify(|current| {
+                        if *current != Some(*node_id) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert(Some(*node_id));
+            }
+        }
+    }
 
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
@@ -15348,6 +16576,29 @@ pub fn index_file(
                 callsite_identity,
                 ..Default::default()
             };
+            let callee_span = graph_capture_spans.get(&sink_ref).copied();
+            if edge.kind == EdgeKind::CALL && is_script {
+                if edge.source == edge.target
+                    && let Some(scope) = callee_span
+                        .and_then(|span| javascript_call_callable_span(&tree, &line_offsets, span))
+                {
+                    // Exact syntax cannot be replaced by a line-only guess.
+                    // Unrepresented/ambiguous nearest callables and module
+                    // calls retain their reference occurrence, but no CALL.
+                    let Some(owner) =
+                        scope.and_then(|span| script_callable_ids.get(&span).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    edge.source = owner;
+                    edge.resolved_source = Some(owner);
+                }
+                col = col.or_else(|| {
+                    callee_span
+                        .filter(|span| Some(span.start_line) == edge.line)
+                        .map(|span| span.start_col)
+                });
+            }
             if edge.kind == EdgeKind::CALL
                 && !flags.legacy_edge_identity
                 && edge.callsite_identity.is_none()
@@ -15362,6 +16613,24 @@ pub fn index_file(
             }
             if let Some(marker) = callsite_marker {
                 append_callsite_marker(&mut edge, marker);
+            }
+            if edge.kind == EdgeKind::CALL
+                && let Some(span) = graph_capture_spans.get(&sink_ref)
+            {
+                for (spans, marker) in [
+                    (
+                        &runtime_import_call_spans,
+                        languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER,
+                    ),
+                    (
+                        &private_call_spans,
+                        languages::javascript::PRIVATE_NAME_CALLSITE_MARKER,
+                    ),
+                ] {
+                    if spans.contains(span) {
+                        append_callsite_marker(&mut edge, marker);
+                    }
+                }
             }
             if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
                 continue;
@@ -15416,11 +16685,10 @@ pub fn index_file(
         &mut edge_keys,
         flags,
     );
-    append_manual_member_edges(
+    let manual_member_specs = language_member_specs(language_config.language_name, &tree, source);
+    let local_member_targets = append_manual_member_edges(
         ManualMemberEdgeContext {
-            language_name: language_config.language_name,
-            tree: &tree,
-            source,
+            specs: &manual_member_specs,
             unique_nodes: &unique_nodes,
             file_id,
             flags,
@@ -15465,13 +16733,6 @@ pub fn index_file(
         &runtime_import_specs,
         &unique_nodes,
         file_id,
-        &mut result_edges,
-        &mut edge_keys,
-        flags,
-    );
-    annotate_exact_runtime_import_bare_calls(
-        &runtime_import_specs,
-        &unique_nodes,
         &mut result_edges,
         &mut edge_keys,
         flags,
@@ -15537,6 +16798,14 @@ pub fn index_file(
         apply_rust_receiver_call_hints(&tree, source, &mut unique_nodes);
     }
 
+    apply_go_receiver_method_identities(
+        language_config.language_name,
+        &mut unique_nodes,
+        &manual_member_specs,
+        &local_member_targets,
+        &canonical_role_by_node_id,
+    );
+
     if !unique_nodes.is_empty() {
         result_nodes.extend(unique_nodes.values().cloned());
     }
@@ -15600,15 +16869,30 @@ pub fn index_file(
         }
     }
 
-    Ok(IndexResult {
-        files: result_files,
-        nodes: final_nodes,
-        edges: result_edges,
-        occurrences: result_occurrences,
-        component_access,
-        callable_projection_states,
-        impl_anchor_node_ids,
-    })
+    let resolution_inputs = proof_resolution::collect_call_resolution_inputs(
+        &tree,
+        source,
+        raw_source_sha256,
+        path,
+        language_config.language_name,
+        &resolution_parser_fingerprint(language_config),
+        file_id,
+        &final_nodes,
+    );
+
+    Ok((
+        IndexResult {
+            files: result_files,
+            nodes: final_nodes,
+            edges: result_edges,
+            occurrences: result_occurrences,
+            component_access,
+            callable_projection_states,
+            impl_anchor_node_ids,
+        },
+        resolution_inputs.calls,
+        resolution_inputs.file,
+    ))
 }
 
 /// Return the public language-support profile for a file extension.
@@ -15756,6 +17040,12 @@ fn apply_line_range_call_attribution(
         .map(|node| node.id)
         .collect();
 
+    let callable_files = nodes
+        .iter()
+        .filter(|node| is_callable_kind(node.kind))
+        .filter_map(|node| node.file_node_id.map(|file| (node.id, file)))
+        .collect::<HashMap<_, _>>();
+
     for node in nodes {
         if !is_callable_kind(node.kind) {
             continue;
@@ -15787,7 +17077,11 @@ fn apply_line_range_call_attribution(
 
     for edge in edges.iter_mut() {
         if edge.kind == EdgeKind::CALL {
-            let placeholder_source = edge.source == edge.target;
+            let exact_owned = edge.resolved_source == Some(edge.source)
+                && edge
+                    .file_node_id
+                    .is_some_and(|file| callable_files.get(&edge.source) == Some(&file));
+            let placeholder_source = edge.source == edge.target && !exact_owned;
             if placeholder_source
                 && let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
                 && let Some(ranges) = functions_by_file.get(&file_id)
@@ -15857,6 +17151,23 @@ fn edge_kind_from_str(kind: &str) -> Option<EdgeKind> {
     }
 }
 
+fn graph_relation_sink_is_reference(kind: EdgeKind) -> bool {
+    match kind {
+        EdgeKind::MEMBER | EdgeKind::UNKNOWN => false,
+        EdgeKind::TYPE_USAGE
+        | EdgeKind::USAGE
+        | EdgeKind::CALL
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::INCLUDE
+        | EdgeKind::IMPORT
+        | EdgeKind::MACRO_USAGE
+        | EdgeKind::ANNOTATION_USAGE => true,
+    }
+}
+
 fn generate_edge_id(source: i64, target: i64, kind: codestory_contracts::graph::EdgeKind) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut update = |val: i64| {
@@ -15902,3 +17213,285 @@ fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proof_resolution_cache_tests {
+    use super::*;
+    use crate::cache::{
+        CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
+        CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
+        CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
+        CachedTopLevelDeclaration,
+    };
+    use codestory_contracts::proof_resolution::{CalleeForm, ExactCallsite, FileId};
+    use codestory_store::{FileInfo, FileRole};
+
+    #[test]
+    fn rebases_every_cached_receiver_inventory_and_binding_node_id() {
+        let old_file = NodeId(1);
+        let old_owner = NodeId(2);
+        let old_method = NodeId(3);
+        let old_import = NodeId(4);
+        let old_caller = NodeId(5);
+        let node = |id: NodeId, kind: NodeKind, name: &str| Node {
+            id,
+            kind,
+            serialized_name: name.to_owned(),
+            file_node_id: (id != old_file).then_some(old_file),
+            start_line: Some(id.0 as u32),
+            start_col: Some(1),
+            end_line: Some(id.0 as u32),
+            end_col: Some(10),
+            ..Default::default()
+        };
+        let callsite = ExactCallsite {
+            file_id: FileId(old_file.0),
+            source_sha256: "a".repeat(64),
+            start_byte: 20,
+            end_byte_exclusive: 26,
+            line: 5,
+            column: 1,
+            callee_form: CalleeForm::ExplicitReceiver,
+            raw_target: "target".to_owned(),
+        };
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 7,
+            files: vec![FileInfo {
+                id: old_file.0,
+                path: "old.ts".into(),
+                language: "typescript".to_owned(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 5,
+                file_role: FileRole::Source,
+            }],
+            nodes: vec![
+                node(old_file, NodeKind::FILE, "old.ts"),
+                node(old_owner, NodeKind::CLASS, "C"),
+                node(old_method, NodeKind::METHOD, "C.target"),
+                node(old_import, NodeKind::UNKNOWN, "C"),
+                node(old_caller, NodeKind::FUNCTION, "caller"),
+            ],
+            edges: Vec::new(),
+            occurrences: Vec::new(),
+            component_access: Vec::new(),
+            callable_projection_states: Vec::new(),
+            impl_anchor_node_ids: Vec::new(),
+            call_resolution_inputs: vec![
+                CachedCallResolutionInput {
+                    callsite: callsite.clone(),
+                    caller: Some(old_caller),
+                    binding: CachedResolutionBinding::ConstructorBinding {
+                        class_binding: CachedClassBinding::SameFile {
+                            owner: old_owner,
+                            owner_name: "C".to_owned(),
+                        },
+                        method_name: "target".to_owned(),
+                    },
+                    language: "typescript".to_owned(),
+                    adapter_version: "reference-v9".to_owned(),
+                    parser_fingerprint: "b".repeat(64),
+                },
+                CachedCallResolutionInput {
+                    callsite,
+                    caller: Some(old_caller),
+                    binding: CachedResolutionBinding::ExplicitReceiverType {
+                        class_binding: CachedClassBinding::StaticImport {
+                            import: old_import,
+                            module_specifier: "./other".to_owned(),
+                            imported_name: "C".to_owned(),
+                            is_default: false,
+                        },
+                        method_name: "target".to_owned(),
+                    },
+                    language: "typescript".to_owned(),
+                    adapter_version: "reference-v9".to_owned(),
+                    parser_fingerprint: "b".repeat(64),
+                },
+            ],
+            resolution_file: Some(CachedResolutionFile {
+                file_id: old_file,
+                source_sha256: "a".repeat(64),
+                language: "typescript".to_owned(),
+                adapter_version: "reference-v9".to_owned(),
+                parser_fingerprint: "b".repeat(64),
+                complete: true,
+                lookup_input_complete: true,
+                typescript_module: true,
+                top_level_declarations: vec![CachedTopLevelDeclaration {
+                    name: "target".to_owned(),
+                    declaration: old_method,
+                    module_path: Vec::new(),
+                    cross_module_visible: false,
+                }],
+                inherent_methods: vec![CachedInherentMethod {
+                    owner_name: "C".to_owned(),
+                    method_name: "target".to_owned(),
+                    declaration: old_method,
+                    module_path: Vec::new(),
+                    owner: Some(old_owner),
+                    has_self: true,
+                    return_owner: None,
+                    domain_complete: true,
+                    cross_module_visible: false,
+                }],
+                classes: vec![CachedClassDeclaration {
+                    name: "C".to_owned(),
+                    declaration: old_owner,
+                    methods: vec![CachedClassMethod {
+                        name: "target".to_owned(),
+                        declaration: old_method,
+                        cross_module_visible: false,
+                    }],
+                    cross_module_visible: false,
+                    runtime_closed: false,
+                    super_name: None,
+                    instance_method_names: Vec::new(),
+                    java_scope: None,
+                }],
+                direct_exports: vec![CachedDirectExport {
+                    exported_name: "C".to_owned(),
+                    declaration: old_owner,
+                    is_default: false,
+                    declaration_kind: CachedDeclarationKind::Class,
+                }],
+                export_poison_all: false,
+                poisoned_export_names: vec!["unrelated".to_owned()],
+                rust_modules: Vec::new(),
+                rust_types: Vec::new(),
+                rust_uses: Vec::new(),
+                go_package: None,
+                java_kotlin_package: None,
+                php_namespace: CachedPhpNamespace::Invalid,
+                c_cpp_file: None,
+            }),
+        };
+
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            Path::new("/tmp/rebased.ts"),
+            "export class C { target() {} }",
+            "typescript",
+            index_feature_flags(),
+        );
+        let id = |kind, name: &str| {
+            rebased
+                .nodes
+                .iter()
+                .find(|node| node.kind == kind && node.serialized_name.ends_with(name))
+                .expect("rebased node")
+                .id
+        };
+        let new_file = id(NodeKind::FILE, "rebased.ts");
+        let new_owner = id(NodeKind::CLASS, "C");
+        let new_method = id(NodeKind::METHOD, "C.target");
+        let new_import = id(NodeKind::UNKNOWN, "C");
+        let new_caller = id(NodeKind::FUNCTION, "caller");
+        assert_ne!(
+            (new_file, new_owner, new_method, new_import, new_caller),
+            (old_file, old_owner, old_method, old_import, old_caller)
+        );
+        assert!(rebased.call_resolution_inputs.iter().all(|input| {
+            input.callsite.file_id == FileId(new_file.0) && input.caller == Some(new_caller)
+        }));
+        assert!(matches!(
+            &rebased.call_resolution_inputs[0].binding,
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding: CachedClassBinding::SameFile { owner, .. }, ..
+            } if *owner == new_owner
+        ));
+        assert!(matches!(
+            &rebased.call_resolution_inputs[1].binding,
+            CachedResolutionBinding::ExplicitReceiverType {
+                class_binding: CachedClassBinding::StaticImport { import, .. }, ..
+            } if *import == new_import
+        ));
+        let file = rebased.resolution_file.expect("resolution file");
+        assert_eq!(file.file_id, new_file);
+        assert_eq!(file.top_level_declarations[0].declaration, new_method);
+        assert_eq!(file.inherent_methods[0].declaration, new_method);
+        assert_eq!(file.classes[0].declaration, new_owner);
+        assert_eq!(file.classes[0].methods[0].declaration, new_method);
+        assert_eq!(file.direct_exports[0].declaration, new_owner);
+        assert!(!file.export_poison_all);
+        assert_eq!(file.poisoned_export_names, ["unrelated"]);
+    }
+
+    #[test]
+    fn rebases_cached_framework_route_declaration_identity() -> Result<()> {
+        let source = r#"from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/shared")
+async def handler():
+    return "ok"
+"#;
+        let indexed = index_file(
+            Path::new("/tmp/original/routes.py"),
+            source,
+            &get_language_for_ext("py").expect("python config"),
+            None,
+            None,
+        )?;
+        let old_route_id = indexed
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("original route")
+            .id;
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: indexed.files,
+            nodes: indexed.nodes,
+            edges: indexed.edges,
+            occurrences: indexed.occurrences,
+            component_access: indexed.component_access,
+            callable_projection_states: indexed.callable_projection_states,
+            impl_anchor_node_ids: indexed.impl_anchor_node_ids,
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        };
+
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            Path::new("/tmp/rebased/routes.py"),
+            source,
+            "python",
+            index_feature_flags(),
+        );
+        let file_id = rebased
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FILE)
+            .expect("rebased file")
+            .id;
+        let route = rebased
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name == "GET /shared (fastapi route; confidence=decorator)"
+            })
+            .expect("rebased route");
+        let handler = rebased
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "handler")
+            .expect("rebased handler");
+
+        assert_ne!(route.id, old_route_id);
+        assert_eq!(route.file_node_id, Some(file_id));
+        let canonical_id = route.canonical_id.as_deref().expect("route canonical id");
+        assert!(canonical_id.contains(&format!(r#""file_node_id":{}"#, file_id.0)));
+        assert!(canonical_id.contains(r#""line":4"#));
+        assert!(rebased.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == file_id && edge.target == route.id
+        }));
+        assert!(rebased.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL && edge.source == route.id && edge.target == handler.id
+        }));
+        Ok(())
+    }
+}

@@ -31,6 +31,7 @@ pub(crate) const VALIDATED_KEYWORDS: &[&str] = &[
     "additionalProperties",
     "allOf",
     "anyOf",
+    "const",
     "default",
     "description",
     "enum",
@@ -93,8 +94,17 @@ pub(crate) fn validate_tool_arguments(
     tool: &str,
     arguments: Option<&Value>,
 ) -> Result<(), Vec<ArgumentViolation>> {
-    let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
-        return Ok(());
+    let proof_schema;
+    let schema = if crate::prove_call_path::is_proof_tool_name(tool) {
+        proof_schema = crate::stdio_v3::catalog::proof_tool_source_v3();
+        proof_schema
+            .get("inputSchema")
+            .expect("proof tool source declares inputSchema")
+    } else {
+        let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
+            return Ok(());
+        };
+        schema
     };
     // The dispatcher deliberately admits absent and null arguments; both mean
     // "no arguments supplied", which the schema still has to accept or reject.
@@ -146,30 +156,45 @@ fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<Ar
     let Some(schema) = schema.as_object() else {
         return;
     };
-    if let Some(declared) = schema.get("type") {
-        if !type_matches(declared, value) {
-            out.push(ArgumentViolation::new(
-                "invalid_type",
-                pointer,
-                format!(
-                    "expected type {}, received {}",
-                    render_type(declared),
-                    json_type_name(value)
-                ),
-            ));
-            return;
-        }
-        // A declared-nullable member carries no further constraints when null.
-        if value.is_null() {
-            return;
-        }
+    if let Some(declared) = schema.get("type")
+        && !type_matches(declared, value)
+    {
+        out.push(ArgumentViolation::new(
+            "invalid_type",
+            pointer,
+            format!(
+                "expected type {}, received {}",
+                render_type(declared),
+                json_type_name(value)
+            ),
+        ));
+        return;
     }
+    validate_const(schema, value, pointer, out);
     validate_enum(schema, value, pointer, out);
     validate_number_bounds(schema, value, pointer, out);
     validate_string_length(schema, value, pointer, out);
     validate_array(schema, value, pointer, out);
     validate_object(schema, value, pointer, out);
     validate_combinators(schema, value, pointer, out);
+}
+
+fn validate_const(
+    schema: &Map<String, Value>,
+    value: &Value,
+    pointer: &str,
+    out: &mut Vec<ArgumentViolation>,
+) {
+    let Some(expected) = schema.get("const") else {
+        return;
+    };
+    if expected != value {
+        out.push(ArgumentViolation::new(
+            "invalid_const_value",
+            pointer,
+            format!("expected {}", render_literal(expected)),
+        ));
+    }
 }
 
 fn validate_enum(
@@ -253,6 +278,16 @@ fn validate_string_length(
             pointer,
             format!("expected at most {maximum} character(s)"),
         ));
+    }
+    if pointer == "/call_path" || pointer.ends_with("/call_path") {
+        let max_bytes = crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES as u64;
+        if text.len() as u64 > max_bytes {
+            out.push(ArgumentViolation::new(
+                "above_max_length",
+                pointer,
+                format!("expected at most {max_bytes} byte(s)"),
+            ));
+        }
     }
 }
 
@@ -366,16 +401,31 @@ fn validate_combinators(
             ));
         }
     }
-    if let Some(constraints) = schema.get("allOf").and_then(Value::as_array)
-        && let Some(failed) = constraints
-            .iter()
-            .find(|constraint| !accepts(constraint, value))
-    {
-        out.push(combined_constraint_violation(
-            constraints.len(),
-            failed,
-            pointer,
-        ));
+    if let Some(constraints) = schema.get("allOf").and_then(Value::as_array) {
+        // Split-budget clauses are one user-facing constraint. Ordinary
+        // intersections preserve every leaf diagnostic, including project routing.
+        let combined_budget = constraints.len() > 1
+            && constraints.iter().all(|constraint| {
+                constraint
+                    .pointer("/not/required")
+                    .is_some_and(Value::is_array)
+            });
+        if combined_budget {
+            if let Some(failed) = constraints
+                .iter()
+                .find(|constraint| !accepts(constraint, value))
+            {
+                out.push(combined_constraint_violation(
+                    constraints.len(),
+                    failed,
+                    pointer,
+                ));
+            }
+        } else {
+            for constraint in constraints {
+                validate_value(constraint, value, pointer, out);
+            }
+        }
     }
     if let Some(forbidden) = schema.get("not")
         && accepts(forbidden, value)
@@ -560,7 +610,8 @@ mod tests {
                     || members.contains_key("allOf")
                     || members.contains_key("not")
                     || members.contains_key("items")
-                    || members.contains_key("enum");
+                    || members.contains_key("enum")
+                    || members.contains_key("const");
                 for (key, value) in members {
                     if is_schema {
                         found.insert(key.clone());
@@ -607,9 +658,17 @@ mod tests {
     fn every_tool_declares_a_published_input_schema() {
         for tool in crate::stdio_catalog::tool_names() {
             let schema = crate::stdio_catalog::tool_input_schema(tool).expect("published schema");
-            assert_eq!(
-                schema.get("additionalProperties"),
-                Some(&json!(false)),
+            let mut violations = Vec::new();
+            validate_value(
+                schema,
+                &json!({"undeclared_argument": true}),
+                "/arguments",
+                &mut violations,
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.code == "unknown_property"),
                 "{tool} must deny undeclared arguments"
             );
         }
@@ -662,6 +721,80 @@ mod tests {
                 })
             ),
             vec!["unknown_property", "invalid_selector"]
+        );
+    }
+
+    #[test]
+    fn composed_selectors_preserve_all_argument_diagnostics() {
+        let common = json!({
+            "type": "object", "additionalProperties": false, "required": ["project"],
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "id": {"type": "string", "minLength": 1},
+                "query": {"type": "string", "minLength": 1}
+            }
+        });
+        let selectors = json!({"oneOf": [{"required": ["id"]}, {"required": ["query"]}]});
+        let mut flat = common.clone();
+        flat.as_object_mut()
+            .unwrap()
+            .extend(selectors.as_object().unwrap().clone());
+        let composed = json!({"type": "object", "allOf": [common, selectors]});
+        for value in [
+            json!(null),
+            json!([]),
+            json!(1),
+            json!("x"),
+            json!({}),
+            json!({"id": "a"}),
+            json!({"project": "", "id": ""}),
+            json!({"project": "/repo", "id": "a", "query": "b", "extra": true}),
+            json!({"project": "/repo", "query": "b"}),
+        ] {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            validate_value(&flat, &value, "/arguments", &mut before);
+            validate_value(&composed, &value, "/arguments", &mut after);
+            assert_eq!(
+                before
+                    .iter()
+                    .map(ArgumentViolation::to_json)
+                    .collect::<Vec<_>>(),
+                after
+                    .iter()
+                    .map(ArgumentViolation::to_json)
+                    .collect::<Vec<_>>(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_enforces_const_and_single_all_of_constraints() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "kind": {"type": "string", "const": "tagged"},
+                "value": {"anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "integer", "minimum": 1}
+                ]}
+            },
+            "required": ["kind", "value"],
+            "allOf": [{"not": {
+                "properties": {"value": {"const": "forbidden"}},
+                "required": ["value"]
+            }}]
+        });
+
+        assert_eq!(
+            validate_structured_content(&schema, &json!({"kind":"tagged","value":1})),
+            Ok(())
+        );
+        assert_eq!(
+            codes_from_output(&schema, json!({"kind":"wrong","value":"forbidden"})),
+            vec!["invalid_const_value", "forbidden_combination"]
         );
     }
 
@@ -1147,9 +1280,7 @@ mod tests {
                     "project": "/repo",
                     "question": "how does routing work",
                     "budget": "compact",
-                    "task_class": null,
                     "probes": [{"kind": "free_query", "query": "router"}],
-                    "extra_probes": ["router"],
                     "latency_budget_ms": 5000,
                     "parent_packet_id": "packet-1",
                     "option_ids": ["bounded_source_read:src%2Funread.rs"],
@@ -1336,7 +1467,7 @@ mod tests {
             ),
             vec!["/arguments/probes/1".to_string()]
         );
-        let probes = (0..codestory_contracts::api::PACKET_PROBE_MAX_COUNT - 1)
+        let probes = (0..=codestory_contracts::api::PACKET_PROBE_MAX_COUNT)
             .map(|index| json!({"kind": "free_query", "query": format!("probe-{index}")}))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1345,20 +1476,24 @@ mod tests {
                 json!({
                     "project": "/repo",
                     "question": "why",
-                    "probes": probes,
-                    "extra_probes": ["one", "two"]
+                    "probes": probes
                 })
             ),
-            vec!["combined_item_limit"]
+            vec!["above_max_items"]
         );
     }
 
     #[test]
     fn nullable_members_accept_null_and_non_nullable_members_do_not() {
+        assert!(
+            crate::stdio_catalog::tool_input_schema("packet")
+                .and_then(|schema| schema.pointer("/properties/latency_budget_ms"))
+                .is_some()
+        );
         assert_eq!(
             validate_tool_arguments(
                 "packet",
-                Some(&json!({"project": "/repo", "question": "why", "task_class": null}))
+                Some(&json!({"project": "/repo", "question": "why", "latency_budget_ms": null}))
             ),
             Ok(())
         );
@@ -1368,6 +1503,15 @@ mod tests {
                 json!({"project": "/repo", "question": "why", "budget": null})
             ),
             vec!["invalid_type"]
+        );
+    }
+
+    #[test]
+    fn nullable_type_does_not_bypass_enum_constraints() {
+        let schema = json!({"type":["string","null"],"enum":["ready"]});
+        assert_eq!(
+            codes_from_output(&schema, Value::Null),
+            vec!["invalid_enum_value"]
         );
     }
 
@@ -1421,6 +1565,21 @@ const ARGUMENT_SYNONYMS: &[&[&str]] = &[
     &["depth", "max_depth"],
 ];
 
+fn schema_declares_property(schema: &Value, name: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(name))
+        || schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| schema_declares_property(branch, name))
+            })
+}
+
 /// Rewrite supplied argument names to the spelling this tool's schema declares.
 ///
 /// Only ever renames when exactly one member of a synonym group is declared and the caller
@@ -1431,14 +1590,13 @@ pub(crate) fn reconcile_argument_synonyms(tool: &str, arguments: &mut Value) {
     let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
         return;
     };
-    let Some(declared) = schema.get("properties").and_then(Value::as_object) else {
-        return;
-    };
     let Some(supplied) = arguments.as_object_mut() else {
         return;
     };
     for group in ARGUMENT_SYNONYMS {
-        let mut accepted = group.iter().filter(|name| declared.contains_key(**name));
+        let mut accepted = group
+            .iter()
+            .filter(|name| schema_declares_property(schema, name));
         let (Some(canonical), None) = (accepted.next(), accepted.next()) else {
             continue;
         };

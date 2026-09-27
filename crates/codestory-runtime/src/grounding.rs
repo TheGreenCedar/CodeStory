@@ -5,21 +5,19 @@ use super::{
     GroundingEdgeKindCount, GroundingFileDigestDto, GroundingNodeRecord,
     GroundingOrientationConfidenceDto, GroundingOrientationDto, GroundingOrientationUncertaintyDto,
     GroundingSnapshotDto, GroundingSymbolDigestDto, NodeDetailsRequest, NodeId, NodeKind,
-    RetrievalScoreBreakdownDto, SearchHit, SnippetContextDto, StorageStatsDto, SymbolContextDto,
-    SymbolSummaryRecord, TrailConfigDto, TrailContextDto, clamp_i64_to_u32, current_epoch_ms,
-    edge_digest_for_node, is_structural_kind, node_display_name, normalize_symbol_query,
-    retrieval_state_from_storage_for_runtime, terminal_symbol_segment,
+    SnippetContextDto, StorageStatsDto, SymbolContextDto, SymbolSummaryRecord, TrailConfigDto,
+    TrailContextDto, clamp_i64_to_u32, current_epoch_ms, edge_digest_for_node, is_structural_kind,
+    node_display_name, normalize_symbol_query, retrieval_state_from_storage_for_runtime,
+    terminal_symbol_segment,
 };
-use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
+use crate::agent::packet_evidence::diagnostic_source_evidence;
 use crate::root_rank::{
     CallDegrees, DegreeTier, EntryEvidence, RootDiversityState, SUBSYSTEM_FILE_QUOTA, degree_tier,
     diversify_root_order_within, entry_evidence, helper_like_name_or_path, is_production_file_role,
     structural_depth, structural_path_rank, subsystem_key_for_path,
 };
 use crate::trail_story::build_trail_story;
-use codestory_contracts::api::{
-    PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
-};
+use codestory_contracts::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
 use codestory_store::{FileRole, StructuralTextUnit};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1003,101 +1001,6 @@ fn recommended_grounding_queries(
         }
     }
     recommended
-}
-
-pub(crate) fn grounding_explanation_search_hits(
-    snapshot: &GroundingSnapshotDto,
-    limit: usize,
-) -> Vec<SearchHit> {
-    let mut candidates = Vec::new();
-    let mut order = 0usize;
-    for symbol in snapshot
-        .files
-        .iter()
-        .flat_map(|file| file.symbols.iter())
-        .chain(snapshot.root_symbols.iter())
-    {
-        let name = grounding_symbol_name(symbol);
-        if name.is_empty() || is_import_like_name(&name) {
-            continue;
-        }
-        candidates.push(RecommendationCandidate {
-            path: grounding_symbol_path(symbol),
-            symbol,
-            name,
-            order,
-        });
-        order = order.saturating_add(1);
-    }
-    candidates.sort_by(compare_recommendation_candidates);
-
-    let use_primary_candidates = candidates
-        .iter()
-        .any(|candidate| !low_value_recommendation_candidate(candidate));
-    let mut seen = HashSet::new();
-    let mut hits = Vec::new();
-    for candidate in candidates {
-        if use_primary_candidates && low_value_recommendation_candidate(&candidate) {
-            continue;
-        }
-        let key = normalized_recommendation_key(&candidate.name);
-        if key.is_empty() || !seen.insert(key) {
-            continue;
-        }
-        hits.push(search_hit_from_grounding_recommendation(&candidate));
-        if hits.len() >= limit {
-            break;
-        }
-    }
-    hits
-}
-
-fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<'_>) -> SearchHit {
-    let evidence_tier = candidate
-        .symbol
-        .evidence_tier
-        .unwrap_or(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph);
-    let resolution_status = candidate
-        .symbol
-        .resolution_status
-        .unwrap_or(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved);
-    let mut hit = SearchHit {
-        node_id: candidate.symbol.id.clone(),
-        display_name: candidate.name.clone(),
-        kind: candidate.symbol.kind,
-        file_path: candidate.path.clone(),
-        line: candidate.symbol.line,
-        score: 1.0,
-        origin: SearchHitOrigin::IndexedSymbol,
-        target: None,
-        match_quality: None,
-        resolvable: true,
-        evidence_tier: Some(evidence_tier),
-        evidence_producer: candidate
-            .symbol
-            .evidence_producer
-            .clone()
-            .or_else(|| Some("grounding_recommendation".to_string())),
-        resolution_status: Some(resolution_status),
-        loss_reason: None,
-        coverage_role: None,
-        eligible_for_sufficiency: None,
-        source_excerpt: None,
-        verification_targets: Vec::new(),
-        score_breakdown: Some(RetrievalScoreBreakdownDto {
-            lexical: 0.45,
-            semantic: 0.0,
-            graph: 0.55,
-            total: 1.0,
-            tier_cap: None,
-            boosts: Vec::new(),
-            dampening: Vec::new(),
-            final_rank_reason: None,
-            provenance: Vec::new(),
-        }),
-    };
-    decorate_search_hit_evidence(&mut hit);
-    hit
 }
 
 impl AppController {
@@ -3310,20 +3213,6 @@ mod tests {
             symbol.resolution_status,
             Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-
-        let hit = grounding_explanation_search_hits(&snapshot, 8)
-            .into_iter()
-            .find(|hit| hit.node_id == symbol.id)
-            .expect("grounding explanation hit");
-        assert_eq!(
-            hit.evidence_tier,
-            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
-        );
-        assert_eq!(
-            hit.resolution_status,
-            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
-        );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -3379,27 +3268,6 @@ mod tests {
             symbol.resolution_status,
             Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-
-        let candidate = RecommendationCandidate {
-            symbol,
-            name: "GET /api/users".to_string(),
-            path: Some("openapi.json".to_string()),
-            order: 0,
-        };
-        let hit = search_hit_from_grounding_recommendation(&candidate);
-        assert_eq!(
-            hit.evidence_tier,
-            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
-        );
-        assert_eq!(
-            hit.evidence_producer.as_deref(),
-            Some("openapi_endpoint_schema")
-        );
-        assert_eq!(
-            hit.resolution_status,
-            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
-        );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]

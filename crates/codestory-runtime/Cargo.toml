@@ -1,14 +1,17 @@
 [package]
 name = "codestory-runtime"
-version = "0.17.5"
+version = "0.17.6"
 edition = "2024"
 
 [features]
-benchmark-support = []
+default = []
+benchmark-support = ["codestory-retrieval/benchmark-support"]
+proof-qualification-support = []
+v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-support"]
 # The runtime test hooks now partly live in codestory-agent (fresh_index_observation
 # moved with packet_freshness), so turning this on has to turn the agent crate's
 # hooks on too. Only dev/test edges enable it; no product build does.
-test-support = ["codestory-agent/test-support"]
+test-support = ["codestory-agent/test-support", "codestory-store/test-support"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -24,6 +27,7 @@ parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 sha2 = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
@@ -33,6 +37,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 codestory-agent = { workspace = true, features = ["test-support"] }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
+codestory-store = { workspace = true, features = ["test-support"] }
 codestory-workspace = { workspace = true, features = ["test-support"] }
+flate2 = "=1.1.9"
 rusqlite = { workspace = true }
 tempfile = { workspace = true }

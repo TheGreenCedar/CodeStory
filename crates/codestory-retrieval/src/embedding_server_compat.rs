@@ -122,6 +122,31 @@ pub fn embed_prepared_via_server_with_control(
     )
 }
 
+pub(crate) fn embed_prepared_via_server_with_control_and_timings(
+    runtime: &SidecarRuntimeConfig,
+    inputs: &[String],
+    maximum_timeout: Option<Duration>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(
+    Vec<Vec<f32>>,
+    crate::per_user_embedding::EmbeddingVectorTimings,
+)> {
+    let raw = inputs
+        .iter()
+        .map(|input| {
+            input
+                .strip_prefix(crate::embedding_contract::CODERANK_DOCUMENT_PREFIX)
+                .unwrap_or(input)
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    PerUserEmbeddingClient::for_runtime(runtime)?.embed_documents_with_control_and_timings(
+        &raw,
+        maximum_timeout,
+        cancelled,
+    )
+}
+
 pub fn embed_prepared_query_via_server_with_control(
     runtime: &SidecarRuntimeConfig,
     input: String,

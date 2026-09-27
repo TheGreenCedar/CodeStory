@@ -308,7 +308,7 @@ const EXPECTED_LITERAL_SITES = {
   cpuTestSeamAllowedJobs: { workflowNames: 1 },
   crateDurabilityFile: { workflowNames: 1 },
   draftRunCommands: { stepNames: 9 },
-  draftSourcePolicyViolations: { stepNames: 8 },
+  draftSourcePolicyViolations: { stepNames: 9 },
   draftStepSequence: { stepNames: 15 },
   draftWorkflowPaths: { workflowNames: 2 },
   draftWorkflowPolicyViolations: { permissionTuples: 1 },

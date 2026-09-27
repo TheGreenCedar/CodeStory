@@ -62,7 +62,7 @@ impl PacketCoverageInput {
     }
 
     /// Whether any file this packet rested on could not be proven covered.
-    pub fn caps_sufficiency(&self) -> bool {
+    pub fn blocks_packet_availability(&self) -> bool {
         !self.unprovable.is_empty()
     }
 
@@ -114,12 +114,12 @@ mod tests {
     }
 
     #[test]
-    fn an_excluded_observation_caps_sufficiency() {
+    fn an_excluded_observation_blocks_packet_availability() {
         let input = PacketCoverageInput::from_observations(&[observation(
             "data/big.json",
             SourceCoverageStatusDto::PolicyExcluded,
         )]);
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(input.gaps()[0].starts_with(PACKET_COVERAGE_GAP_PREFIX));
         assert_eq!(input.unprovable_paths(), vec!["data/big.json"]);
     }
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn no_observations_cap_nothing() {
         let input = PacketCoverageInput::from_observations(&[]);
-        assert!(!input.caps_sufficiency());
+        assert!(!input.blocks_packet_availability());
         assert!(input.gaps().is_empty());
     }
 
@@ -141,7 +141,7 @@ mod tests {
             "src/main.rs",
             SourceCoverageStatusDto::Indexed,
         )]);
-        assert!(!input.caps_sufficiency());
+        assert!(!input.blocks_packet_availability());
     }
 
     /// Every status must map to a definite answer. Fails if a variant is added
@@ -155,7 +155,7 @@ mod tests {
             SourceCoverageStatusDto::NotEstablished,
         ] {
             let caps = PacketCoverageInput::from_observations(&[observation("f.rs", status)])
-                .caps_sufficiency();
+                .blocks_packet_availability();
             assert_eq!(
                 caps,
                 status != SourceCoverageStatusDto::Indexed,
@@ -170,12 +170,12 @@ mod tests {
     fn an_unnamed_defect_is_still_unprovable() {
         let incomplete = observation("src/odd.rs", SourceCoverageStatusDto::Incomplete);
         let input = PacketCoverageInput::from_observations(&[incomplete]);
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(input.gaps()[0].contains("reason_unreported"));
 
         let unestablished = observation("src/odd.rs", SourceCoverageStatusDto::NotEstablished);
         let input = PacketCoverageInput::from_observations(&[unestablished]);
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(input.gaps()[0].contains("cause_unreported"));
     }
 
@@ -185,7 +185,7 @@ mod tests {
         observation.not_established_cause =
             Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable);
         let input = PacketCoverageInput::from_observations(&[observation]);
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(input.gaps()[0].contains("lookup_unavailable"));
     }
 

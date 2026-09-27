@@ -1,268 +1,769 @@
-//! Compile retained packet evidence into support units and a machine disposition.
+//! Runtime adapter for the pure repository-derived packet compiler.
 //!
-//! Runtime owns this classification. Budget may drop traces and duplicate ledgers
-//! before support units; it must not re-run a fixpoint that changes disposition.
+//! Runtime owns publication checks and converts pinned repository records into
+//! [`PacketCompilationInputV1`]. Selection itself lives in
+//! `codestory-agent` and cannot see the question.
 
+use crate::agent::packet_candidate::PacketProofSession;
 use crate::agent::packet_coverage::PacketCoverageInput;
-use crate::agent::packet_degradation::packet_primary_retrieval_truncated;
-use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_freshness::PacketFreshnessInput;
-use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_scoring::packet_display_path;
-use codestory_agent::packet_obligations::{
-    PacketProofEvidenceExtras, reconcile_packet_proof_obligations_after_compile,
+use crate::{AppController, BoundedSnippetRangeOptions};
+use codestory_agent::evidence_compiler::{
+    RepositoryDerivedCompilationV1, compile_repository_evidence,
 };
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
-    EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
-    PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
-    PACKET_DRILL_MAX_OPTIONS, PacketClaimObligationDto, PacketClaimObligationKindDto,
-    PacketDispositionDto, PacketDispositionKindDto, PacketObligationProofStatusDto, PacketPlanDto,
-    PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SourceCoverageStatusDto,
-    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto,
+    EmbeddingVectorPublicationIdentityDto, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH,
+    PACKET_DRILL_MAX_HITS, PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto,
+    PacketProbeResolutionDto, PacketProbeResolutionStatusDto, SourceCoverageNotEstablishedCauseDto,
+    SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
+    decode_drill_option_id,
 };
-use codestory_contracts::graph::FileCoverageReason;
-use std::collections::BTreeSet;
+use codestory_contracts::compilation::{
+    INTERIM_SOURCE_ROW_UPPER_BOUND, PACKET_COMPILATION_CONTRACT_VERSION_V1,
+    PacketAdmissionGapKindV1, PacketAdmissionGapV1, PacketAdmissionOriginV1,
+    PacketAdmissionReceiptV1, PacketCompilationInputV1, PacketCompilationPublicationV1,
+    PacketContinuationSelectorV1, PacketDirectedRelationV1, PacketHydratedSourceRangeV1,
+    PacketIdentityAmbiguityV1, PacketParserCompletenessV1, PacketRelationCertaintyV1,
+    PacketRelationKindV1, PacketStructuralGapReasonV1,
+};
+use codestory_contracts::graph::{
+    EdgeKind as CoreEdgeKind, FileCoverageReason, Node as CoreNode, NodeId as CoreNodeId,
+    NodeKind as CoreNodeKind, ResolutionCertainty,
+};
+use codestory_store::{FileInfo, Store};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-pub fn compile_packet_evidence(
-    packet_id: &str,
-    question: &str,
-    plan: &PacketPlanDto,
-    answer: &AgentAnswerDto,
-    request: Option<&AgentPacketRequestDto>,
-) -> (Vec<SupportUnitDto>, PacketDispositionDto) {
-    compile_packet_evidence_with_source_ranges(packet_id, question, plan, answer, &[], request)
+const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
+const FILE_NAVIGATION_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct FrozenPacketCompilationV1 {
+    pub(crate) product: RepositoryDerivedCompilationV1,
+    pub(crate) source_coverage: Vec<SourceCoverageObservationDto>,
+    publication: PacketCompilationPublicationV1,
 }
 
-fn compile_packet_evidence_with_source_ranges(
-    packet_id: &str,
-    question: &str,
-    plan: &PacketPlanDto,
-    answer: &AgentAnswerDto,
-    source_ranges: &[SupportUnitDto],
-    request: Option<&AgentPacketRequestDto>,
-) -> (Vec<SupportUnitDto>, PacketDispositionDto) {
-    let support = compile_support_units_with_source_ranges(answer, source_ranges);
-    let publication = answer.retrieval_trace.retrieval_publication.as_ref();
-    let already_drilled = request.is_some_and(|request| {
-        request.parent_packet_id.is_some() || !request.option_ids.is_empty()
-    });
-    let disposition = classify_packet_disposition(ClassifyPacketDispositionInput {
-        packet_id,
-        question,
-        plan,
-        answer,
-        support: &support,
+#[derive(Debug, Clone)]
+struct AuthenticatedPacketAdmissionV1 {
+    receipt: PacketAdmissionReceiptV1,
+    core_node_id: CoreNodeId,
+}
+
+/// Hydrate exactly the packet-wide admitted identities and compile their
+/// repository evidence while the core/retrieval publication is pinned. This
+/// runs before any presentation or output-budget mutation.
+pub(crate) fn freeze_packet_compilation(
+    controller: &AppController,
+    project_id: &str,
+    probe_resolutions: &[PacketProbeResolutionDto],
+    publication: Option<&EmbeddingVectorPublicationIdentityDto>,
+    session: &PacketProofSession,
+) -> Result<FrozenPacketCompilationV1, codestory_contracts::api::ApiError> {
+    let admissions = session.receipts();
+    let mut admission_gaps = session.gaps();
+    let storage = controller.open_storage_read_only()?;
+    let (authenticated_admissions, mut sources, file_navigation_paths) =
+        hydrate_admitted_sources(controller, &storage, &admissions, &mut admission_gaps)?;
+    let source_paths = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    let source_coverage = observe_admitted_source_coverage(controller, &storage, &source_paths);
+    for source in &mut sources {
+        source.parser_completeness = parser_completeness_for_path(&source.path, &source_coverage);
+    }
+    let relations = hydrate_induced_relations(&storage, &authenticated_admissions)?;
+    let admissions = authenticated_admissions
+        .into_iter()
+        .map(|admission| admission.receipt)
+        .collect();
+    let publication = PacketCompilationPublicationV1 {
+        project_id: project_id.to_string(),
+        core_generation_id: publication
+            .map(|publication| publication.core_generation_id.clone())
+            .unwrap_or_default(),
+        retrieval_generation: publication
+            .map(|publication| publication.retrieval_generation.clone()),
+    };
+    let input = PacketCompilationInputV1 {
+        contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+        publication: publication.clone(),
+        admissions,
+        sources,
+        relations,
+        ambiguities: probe_ambiguities(probe_resolutions),
+        admission_gaps,
+    };
+    let mut product = compile_repository_evidence(&input);
+    attach_file_navigation_paths(&mut product.support, &file_navigation_paths);
+    Ok(FrozenPacketCompilationV1 {
+        product,
+        source_coverage,
         publication,
-        already_drilled,
-        request,
-    });
-    (support, disposition)
+    })
 }
 
-fn compile_support_units_with_source_ranges(
-    answer: &AgentAnswerDto,
-    source_ranges: &[SupportUnitDto],
-) -> Vec<SupportUnitDto> {
-    let mut units = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for citation in answer
-        .citations
-        .iter()
-        .filter(|citation| citation_sufficiency_eligible(citation))
-    {
-        let id = format!("symbol:{}", citation.node_id.0);
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let path = citation.file_path.as_deref().map(packet_display_path);
-        let summary = match (path.as_deref(), citation.line) {
-            (Some(path), Some(line)) => {
-                format!("{} at {path}:{line}", citation.display_name)
-            }
-            (Some(path), None) => format!("{} at {path}", citation.display_name),
-            _ => citation.display_name.clone(),
-        };
-        units.push(SupportUnitDto {
-            id,
-            kind: SupportUnitKindDto::SymbolLocation,
-            summary,
-            path,
-            symbol_id: Some(citation.node_id.0.clone()),
-            start_line: citation.line,
-            end_line: None,
-            snippet: None,
-            edge_kind: None,
-            from_symbol: None,
-            to_symbol: None,
-            query: None,
-        });
-        for source_range in source_ranges.iter().filter(|unit| {
-            unit.kind == SupportUnitKindDto::SourceRange
-                && unit.symbol_id.as_deref() == Some(citation.node_id.0.as_str())
-                && unit
-                    .snippet
-                    .as_deref()
-                    .is_some_and(|snippet| !snippet.is_empty())
-        }) {
-            if seen.insert(source_range.id.clone()) {
-                units.push(source_range.clone());
-            }
-        }
-    }
-
-    for artifact in &answer.graphs {
-        let GraphArtifactDto::Uml { graph, .. } = artifact else {
-            continue;
-        };
-        units.extend(typed_edge_support_units(graph, &mut seen));
-    }
-
-    for diagnostic in &answer.retrieval_trace.packet_sidecar_diagnostics {
-        if !matches!(diagnostic.completion, PacketQueryCompletionDto::Completed)
-            || diagnostic.resolved_hit_count > 0
-            || diagnostic.candidate_count > 0
+fn attach_file_navigation_paths(support: &mut [SupportUnitDto], paths: &HashMap<String, String>) {
+    for unit in support {
+        if unit.kind == SupportUnitKindDto::SymbolLocation
+            && let Some(identity) = unit.id.strip_prefix("symbol:")
+            && let Some(path) = paths.get(identity)
         {
-            continue;
+            unit.path = Some(path.clone());
         }
-        let id = format!("negative:{}", diagnostic.query);
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        units.push(SupportUnitDto {
-            id,
-            kind: SupportUnitKindDto::CompleteQueryNegative,
-            summary: format!("searched `{}`, zero hits", diagnostic.query),
-            path: None,
-            symbol_id: None,
-            start_line: None,
-            end_line: None,
-            snippet: None,
-            edge_kind: None,
-            from_symbol: None,
-            to_symbol: None,
-            query: Some(diagnostic.query.clone()),
-        });
     }
-
-    units
 }
 
-fn typed_edge_support_units(
-    graph: &GraphResponse,
-    seen: &mut BTreeSet<String>,
-) -> Vec<SupportUnitDto> {
-    let labels = graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.0.as_str(), node.label.as_str()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut units = Vec::new();
-    for edge in &graph.edges {
-        // R2 visibility: TYPE_USAGE and USAGE join the public typed-support
-        // allow-list so retained atom receipts appear in the scored payload
-        // (landed in the same change as the budget-cap protection widening).
-        if !matches!(
-            edge.kind,
-            EdgeKind::CALL
-                | EdgeKind::INHERITANCE
-                | EdgeKind::IMPORT
-                | EdgeKind::TYPE_USAGE
-                | EdgeKind::USAGE
-        ) {
+pub(crate) fn apply_frozen_packet_compilation(
+    packet: &mut AgentPacketDto,
+    request: Option<&AgentPacketRequestDto>,
+    frozen: FrozenPacketCompilationV1,
+) {
+    packet.support = frozen.product.support;
+    crate::agent::packet_batch::observe_packet_raf_final_support(
+        &final_support_identities_for_observation(&packet.support),
+    );
+    packet.disposition = classify_packet_disposition(
+        packet,
+        request,
+        &frozen.product.continuation,
+        frozen.publication.core_generation_id,
+        frozen.publication.retrieval_generation,
+    );
+}
+
+fn final_support_identities_for_observation(support: &[SupportUnitDto]) -> Vec<String> {
+    let mut identities = Vec::new();
+    let mut seen = BTreeSet::new();
+    for unit in support {
+        let Some(identity) = final_support_stable_identity(unit) else {
             continue;
-        }
-        let id = format!("edge:{}", edge.id.0);
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let from = labels
-            .get(edge.source.0.as_str())
-            .copied()
-            .unwrap_or(edge.source.0.as_str());
-        let to = labels
-            .get(edge.target.0.as_str())
-            .copied()
-            .unwrap_or(edge.target.0.as_str());
-        let kind = match edge.kind {
-            EdgeKind::CALL => "CALL",
-            EdgeKind::INHERITANCE => "INHERITANCE",
-            EdgeKind::IMPORT => "IMPORT",
-            EdgeKind::TYPE_USAGE => "TYPE_USAGE",
-            EdgeKind::USAGE => "USAGE",
-            _ => continue,
         };
-        units.push(SupportUnitDto {
-            id,
-            kind: SupportUnitKindDto::TypedGraphEdge,
-            summary: format!("`{from}` {kind} `{to}`"),
-            path: None,
-            symbol_id: None,
-            start_line: None,
-            end_line: None,
-            snippet: None,
-            edge_kind: Some(kind.to_string()),
-            from_symbol: Some(from.to_string()),
-            to_symbol: Some(to.to_string()),
-            query: None,
-        });
-    }
-    units
-}
-
-struct ClassifyPacketDispositionInput<'a> {
-    packet_id: &'a str,
-    question: &'a str,
-    plan: &'a PacketPlanDto,
-    answer: &'a AgentAnswerDto,
-    support: &'a [SupportUnitDto],
-    publication: Option<&'a EmbeddingVectorPublicationIdentityDto>,
-    already_drilled: bool,
-    request: Option<&'a AgentPacketRequestDto>,
-}
-
-fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> PacketDispositionDto {
-    if let Some(request) = input.request
-        && let Some(expected) = request.core_generation_id.as_deref()
-    {
-        let actual = input
-            .publication
-            .map(|publication| publication.core_generation_id.as_str());
-        if actual != Some(expected) {
-            return PacketDispositionDto::unavailable(format!(
-                "pinned core generation `{expected}` is no longer current"
-            ));
+        if seen.insert(identity.clone()) {
+            identities.push(identity);
         }
-        if let Some(expected_retrieval) = request.retrieval_generation.as_deref() {
-            let actual_retrieval = input
-                .publication
-                .map(|publication| publication.retrieval_generation.as_str());
-            if actual_retrieval != Some(expected_retrieval) {
-                return PacketDispositionDto::unavailable(format!(
-                    "pinned retrieval generation `{expected_retrieval}` is no longer current"
-                ));
+    }
+    identities
+}
+
+fn final_support_stable_identity(unit: &SupportUnitDto) -> Option<String> {
+    match unit.kind {
+        SupportUnitKindDto::SymbolLocation => unit
+            .id
+            .strip_prefix("symbol:")
+            .map(str::to_string)
+            .or_else(|| {
+                unit.symbol_id
+                    .as_ref()
+                    .map(|symbol_id| format!("node:{symbol_id}"))
+            }),
+        SupportUnitKindDto::SourceRange => unit
+            .symbol_id
+            .as_ref()
+            .map(|symbol_id| format!("node:{symbol_id}"))
+            .or_else(|| {
+                unit.path
+                    .as_ref()
+                    .filter(|path| !path.trim().is_empty())
+                    .map(|path| format!("path:{path}"))
+            }),
+        SupportUnitKindDto::TypedGraphEdge | SupportUnitKindDto::CompleteQueryNegative => None,
+    }
+}
+
+type HydratedAdmittedSources = (
+    Vec<AuthenticatedPacketAdmissionV1>,
+    Vec<PacketHydratedSourceRangeV1>,
+    HashMap<String, String>,
+);
+
+fn hydrate_admitted_sources(
+    controller: &AppController,
+    storage: &Store,
+    admissions: &[PacketAdmissionReceiptV1],
+    admission_gaps: &mut Vec<PacketAdmissionGapV1>,
+) -> Result<HydratedAdmittedSources, codestory_contracts::api::ApiError> {
+    let project_root = controller.require_project_root()?;
+    let mut authenticated = Vec::new();
+    let mut sources = Vec::new();
+    let mut file_navigation_paths = HashMap::new();
+    for admission in admissions {
+        let (core_node_id, result) =
+            if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
+                let Some(node) = authenticated_node(storage, raw_id)? else {
+                    push_admission_gap(
+                        admission_gaps,
+                        admission,
+                        PacketAdmissionGapKindV1::StableIdentityMissing,
+                        false,
+                    );
+                    continue;
+                };
+                if let Some(file_id) = (node.kind == CoreNodeKind::FILE)
+                    .then_some(node.id)
+                    .or(node.file_node_id)
+                    && let Some(file) = storage.get_file_by_id(file_id.0).map_err(|error| {
+                        codestory_contracts::api::ApiError::internal(format!(
+                            "Failed to authenticate admitted packet file: {error}"
+                        ))
+                    })?
+                    && let Some(path) = authenticated_file_navigation_path(controller, &file)
+                {
+                    file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                }
+                (
+                    node.id,
+                    hydrate_admitted_node_source(controller, storage, admission, &node),
+                )
+            } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
+                let Some(file) = find_admitted_file(storage, &project_root, path)? else {
+                    push_admission_gap(
+                        admission_gaps,
+                        admission,
+                        PacketAdmissionGapKindV1::StableIdentityMissing,
+                        false,
+                    );
+                    continue;
+                };
+                if let Some(path) = authenticated_file_navigation_path(controller, &file) {
+                    file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                }
+                (
+                    CoreNodeId(file.id),
+                    hydrate_admitted_file_source(controller, storage, admission, &file),
+                )
+            } else {
+                push_admission_gap(
+                    admission_gaps,
+                    admission,
+                    PacketAdmissionGapKindV1::StableIdentityMissing,
+                    false,
+                );
+                continue;
+            };
+        match result {
+            Ok(source) => {
+                authenticated.push(AuthenticatedPacketAdmissionV1 {
+                    receipt: admission.clone(),
+                    core_node_id,
+                });
+                sources.push(source);
+            }
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded) => {
+                authenticated.push(AuthenticatedPacketAdmissionV1 {
+                    receipt: admission.clone(),
+                    core_node_id,
+                });
+                push_admission_gap(
+                    admission_gaps,
+                    admission,
+                    PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                    true,
+                );
+            }
+            Err(kind) => {
+                file_navigation_paths.remove(&admission.stable_identity);
+                push_admission_gap(admission_gaps, admission, kind, true);
             }
         }
     }
+    Ok((authenticated, sources, file_navigation_paths))
+}
 
-    if let Some(ambiguous) = first_ambiguous_probe(input.plan) {
-        return PacketDispositionDto::not_established(format!(
-            "probe `{ambiguous}` is ambiguous and needs a user choice"
-        ));
+fn authenticated_file_navigation_path(
+    controller: &AppController,
+    file: &FileInfo,
+) -> Option<String> {
+    let path = file.path.to_string_lossy();
+    let resolved = controller.resolve_project_file_path(&path, false).ok()?;
+    let project_root = controller.require_project_root().ok()?;
+    let indexed_path = if file.path.is_absolute() {
+        file.path.clone()
+    } else {
+        project_root.join(&file.path)
+    };
+    if !codestory_workspace::same_workspace_path(&resolved, &indexed_path) {
+        return None;
+    }
+    codestory_workspace::workspace_relative_path(&project_root, &resolved)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn push_admission_gap(
+    admission_gaps: &mut Vec<PacketAdmissionGapV1>,
+    admission: &PacketAdmissionReceiptV1,
+    kind: PacketAdmissionGapKindV1,
+    expose_authenticated_identity: bool,
+) {
+    admission_gaps.push(PacketAdmissionGapV1 {
+        kind,
+        stable_identity: expose_authenticated_identity.then(|| admission.stable_identity.clone()),
+        exact_selector_ordinal: (admission.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+            .then_some(admission.packet_ordinal),
+    });
+}
+
+fn authenticated_node(
+    storage: &Store,
+    raw_id: &str,
+) -> Result<Option<CoreNode>, codestory_contracts::api::ApiError> {
+    let Ok(node_id) = raw_id.parse::<i64>() else {
+        return Ok(None);
+    };
+    storage.get_node(CoreNodeId(node_id)).map_err(|error| {
+        codestory_contracts::api::ApiError::internal(format!(
+            "Failed to authenticate admitted packet node: {error}"
+        ))
+    })
+}
+
+fn hydrate_admitted_node_source(
+    controller: &AppController,
+    storage: &Store,
+    admission: &PacketAdmissionReceiptV1,
+    node: &CoreNode,
+) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    let file_id = if node.kind == CoreNodeKind::FILE {
+        node.id
+    } else {
+        node.file_node_id
+            .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?
+    };
+    let file = storage
+        .get_file_by_id(file_id.0)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if node.kind == CoreNodeKind::FILE {
+        return hydrate_admitted_file_source(controller, storage, admission, &file);
+    }
+    let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
+        .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
+    let (_, bounded) = controller
+        .bounded_file_snippet_range(
+            &file.path.to_string_lossy(),
+            BoundedSnippetRangeOptions {
+                focus_line: start_line,
+                start_line,
+                end_line,
+                context_lines: 0,
+                max_bytes: source_byte_cap(admission),
+                truncation_suffix: COMPILER_SOURCE_TRUNCATION_SUFFIX,
+            },
+        )
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    hydrated_source(
+        admission,
+        &file.path.to_string_lossy(),
+        Some(
+            node.qualified_name
+                .clone()
+                .unwrap_or_else(|| node.serialized_name.clone()),
+        ),
+        &bounded.markdown,
+    )
+}
+
+fn hydrate_admitted_file_source(
+    controller: &AppController,
+    storage: &Store,
+    admission: &PacketAdmissionReceiptV1,
+    file: &FileInfo,
+) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    // A file identity has no source focus. Preserve a complete short file when
+    // its pinned bytes fit the admission; otherwise leave it as navigation.
+    // Reading its first few lines would falsely promote an arbitrary header
+    // to a source witness for the retrieval question.
+    if !file.indexed || !file.complete || file.line_count == 0 {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let expected_hash = storage
+        .get_file_content_hash(file.id)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let path = file.path.to_string_lossy();
+    let resolved = controller
+        .resolve_project_file_path(&path, false)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let project_root = controller
+        .require_project_root()
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let indexed_path = if file.path.is_absolute() {
+        file.path.clone()
+    } else {
+        project_root.join(&file.path)
+    };
+    if !codestory_workspace::same_workspace_path(&resolved, &indexed_path) {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let cap = source_byte_cap(admission);
+    let mut bytes = Vec::new();
+    std::fs::File::open(&resolved)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
+        .take((FILE_NAVIGATION_VERIFICATION_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if bytes.len() > FILE_NAVIGATION_VERIFICATION_MAX_BYTES {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    };
+    if text.lines().count() != file.line_count as usize {
+        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+    }
+    if text.len() > cap {
+        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+    }
+    let markdown = complete_file_markdown(&text, file.line_count, cap)?;
+    hydrated_source(admission, &path, None, &markdown)
+}
+
+fn complete_file_markdown(
+    text: &str,
+    line_count: u32,
+    cap: usize,
+) -> Result<String, PacketAdmissionGapKindV1> {
+    // The focused-snippet helper caps context at 50 lines. File admission is
+    // different: it may claim source only when every line fits the row cap.
+    let mut markdown = String::from("```text\n");
+    for (index, line) in text.lines().enumerate() {
+        let marker = if index == 0 { ">" } else { " " };
+        writeln!(markdown, "{marker}{:>5} | {line}", index + 1)
+            .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+        if markdown.len().saturating_add(3) > cap {
+            return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+        }
+    }
+    markdown.push_str("```");
+    if source_receipt_line_range(&markdown) != Some((1, line_count)) {
+        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+    }
+    Ok(markdown)
+}
+
+fn hydrated_source(
+    admission: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
+    path: &str,
+    symbol: Option<String>,
+    source: &str,
+) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    if source.trim().is_empty() {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let (start_line, end_line) =
+        source_receipt_line_range(source).ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
+    Ok(PacketHydratedSourceRangeV1 {
+        stable_identity: admission.stable_identity.clone(),
+        path: packet_display_path(path),
+        symbol,
+        start_line,
+        end_line,
+        source: source.to_string(),
+        parser_completeness: PacketParserCompletenessV1::Unknown,
+    })
+}
+
+fn source_byte_cap(admission: &PacketAdmissionReceiptV1) -> usize {
+    (admission.reserved_source_bytes as usize).clamp(1, INTERIM_SOURCE_ROW_UPPER_BOUND)
+}
+
+fn find_admitted_file(
+    storage: &Store,
+    project_root: &Path,
+    path: &str,
+) -> Result<Option<FileInfo>, codestory_contracts::api::ApiError> {
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        let file = storage.get_file_by_path(&candidate).map_err(|error| {
+            codestory_contracts::api::ApiError::internal(format!(
+                "Failed to authenticate admitted packet path: {error}"
+            ))
+        })?;
+        if file.is_some() {
+            return Ok(file);
+        }
+    }
+    Ok(None)
+}
+
+fn admitted_file_lookup_paths(project_root: &Path, path: &str) -> Vec<PathBuf> {
+    let candidate = PathBuf::from(path);
+    let mut paths = vec![candidate.clone()];
+    if !candidate.is_absolute() {
+        let joined = project_root.join(candidate);
+        if !paths.contains(&joined) {
+            paths.push(joined);
+        }
+    }
+    paths
+}
+
+fn valid_source_bounds(start_line: Option<u32>, end_line: Option<u32>) -> Option<(u32, u32)> {
+    let start_line = start_line.filter(|line| *line > 0)?;
+    let end_line = end_line.filter(|line| *line >= start_line)?;
+    Some((start_line, end_line))
+}
+
+fn source_receipt_line_range(markdown: &str) -> Option<(u32, u32)> {
+    let mut start = None;
+    let mut end = None;
+    for line in markdown.lines() {
+        let line = line
+            .trim_start()
+            .strip_prefix("> ")
+            .unwrap_or(line.trim_start());
+        let Some((line_number, _)) = line.split_once(" | ") else {
+            continue;
+        };
+        let Ok(line_number) = line_number.trim().parse::<u32>() else {
+            continue;
+        };
+        start = Some(start.map_or(line_number, |current: u32| current.min(line_number)));
+        end = Some(end.map_or(line_number, |current: u32| current.max(line_number)));
+    }
+    start.zip(end)
+}
+
+fn observe_admitted_source_coverage(
+    controller: &AppController,
+    storage: &Store,
+    paths: &[String],
+) -> Vec<SourceCoverageObservationDto> {
+    let Ok(project_root) = controller.require_project_root() else {
+        return paths
+            .iter()
+            .map(|path| source_coverage_not_established(path))
+            .collect();
+    };
+    let mut seen = BTreeSet::new();
+    paths
+        .iter()
+        .filter(|path| seen.insert(packet_display_path(path)))
+        .map(|path| {
+            observe_one_admitted_source_coverage(storage, &project_root, path)
+                .unwrap_or_else(|_| source_coverage_not_established(path))
+        })
+        .collect()
+}
+
+fn observe_one_admitted_source_coverage(
+    storage: &Store,
+    project_root: &Path,
+    path: &str,
+) -> Result<SourceCoverageObservationDto, codestory_store::StorageError> {
+    let mut file = None;
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        if let Some(found) = storage.get_file_by_path(&candidate)? {
+            file = Some(found);
+            break;
+        }
+    }
+    let Some(file) = file else {
+        return Ok(source_coverage_not_established(path));
+    };
+    let relative_path = codestory_workspace::workspace_relative_path(project_root, &file.path)
+        .unwrap_or_else(|| file.path.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
+    if storage.has_source_policy_exclusion_path(&relative_path)? {
+        return Ok(SourceCoverageObservationDto {
+            path: path.to_string(),
+            status: SourceCoverageStatusDto::PolicyExcluded,
+            reason: None,
+            not_established_cause: None,
+            observed_size: None,
+            byte_cap: None,
+        });
     }
 
-    let freshness = PacketFreshnessInput::from_observation(input.answer.freshness.as_ref());
-    if freshness.caps_sufficiency() {
+    let verified_source = storage.get_file_content_hash(file.id)?.is_some();
+    let structural_projection = if file.language == "openapi" {
+        storage.has_file_owned_openapi_endpoint_projection(file.id)?
+    } else if codestory_indexer::structural::is_structural_candidate_path(&file.path) {
+        storage.has_structural_text_projection_for_file(file.id)?
+    } else {
+        true
+    };
+    let errors = storage.get_file_coverage_reasons(file.id)?;
+    let reason = if !file.complete || !file.indexed || !verified_source || !structural_projection {
+        errors
+            .first()
+            .copied()
+            .or_else(|| {
+                (file.indexed && verified_source && !file.complete)
+                    .then_some(FileCoverageReason::ParserPartial)
+            })
+            .or(Some(FileCoverageReason::CollectorFailure))
+    } else {
+        None
+    };
+    Ok(SourceCoverageObservationDto {
+        path: path.to_string(),
+        status: if reason.is_some() {
+            SourceCoverageStatusDto::Incomplete
+        } else {
+            SourceCoverageStatusDto::Indexed
+        },
+        reason,
+        not_established_cause: None,
+        observed_size: None,
+        byte_cap: None,
+    })
+}
+
+fn source_coverage_not_established(path: &str) -> SourceCoverageObservationDto {
+    SourceCoverageObservationDto {
+        path: path.to_string(),
+        status: SourceCoverageStatusDto::NotEstablished,
+        reason: None,
+        not_established_cause: Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable),
+        observed_size: None,
+        byte_cap: None,
+    }
+}
+
+fn parser_completeness_for_path(
+    path: &str,
+    source_coverage: &[SourceCoverageObservationDto],
+) -> PacketParserCompletenessV1 {
+    source_coverage
+        .iter()
+        .find(|observation| packet_display_path(&observation.path) == packet_display_path(path))
+        .map(|observation| match observation.status {
+            SourceCoverageStatusDto::Indexed => PacketParserCompletenessV1::Complete,
+            SourceCoverageStatusDto::Incomplete => PacketParserCompletenessV1::Partial,
+            SourceCoverageStatusDto::PolicyExcluded | SourceCoverageStatusDto::NotEstablished => {
+                PacketParserCompletenessV1::Unknown
+            }
+        })
+        .unwrap_or(PacketParserCompletenessV1::Unknown)
+}
+
+fn hydrate_induced_relations(
+    storage: &Store,
+    admissions: &[AuthenticatedPacketAdmissionV1],
+) -> Result<Vec<PacketDirectedRelationV1>, codestory_contracts::api::ApiError> {
+    let mut stable_identity_by_node = HashMap::new();
+    for admission in admissions {
+        stable_identity_by_node
+            .entry(admission.core_node_id)
+            .or_insert_with(|| admission.receipt.stable_identity.clone());
+    }
+    let node_ids = admissions
+        .iter()
+        .map(|admission| admission.core_node_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    storage
+        .get_certain_edge_representatives_between_node_ids(&node_ids)
+        .map_err(|error| {
+            codestory_contracts::api::ApiError::internal(format!(
+                "Failed to load admitted packet relations: {error}"
+            ))
+        })
+        .map(|edges| {
+            edges
+                .into_iter()
+                .filter_map(|edge| {
+                    let (from, to) = edge.effective_endpoints();
+                    Some(PacketDirectedRelationV1 {
+                        relation_id: edge.id.0.to_string(),
+                        from_identity: stable_identity_by_node.get(&from)?.clone(),
+                        to_identity: stable_identity_by_node.get(&to)?.clone(),
+                        relation_kind: packet_relation_kind(edge.kind),
+                        certainty: relation_certainty(edge.certainty),
+                    })
+                })
+                .collect()
+        })
+}
+
+fn packet_relation_kind(kind: CoreEdgeKind) -> PacketRelationKindV1 {
+    use CoreEdgeKind as EdgeKind;
+    match kind {
+        EdgeKind::MEMBER => PacketRelationKindV1::Member,
+        EdgeKind::TYPE_USAGE => PacketRelationKindV1::TypeUsage,
+        EdgeKind::USAGE => PacketRelationKindV1::Usage,
+        EdgeKind::CALL => PacketRelationKindV1::Call,
+        EdgeKind::INHERITANCE => PacketRelationKindV1::Inheritance,
+        EdgeKind::OVERRIDE => PacketRelationKindV1::Override,
+        EdgeKind::TYPE_ARGUMENT => PacketRelationKindV1::TypeArgument,
+        EdgeKind::TEMPLATE_SPECIALIZATION => PacketRelationKindV1::TemplateSpecialization,
+        EdgeKind::INCLUDE => PacketRelationKindV1::Include,
+        EdgeKind::IMPORT => PacketRelationKindV1::Import,
+        EdgeKind::MACRO_USAGE => PacketRelationKindV1::MacroUsage,
+        EdgeKind::ANNOTATION_USAGE => PacketRelationKindV1::AnnotationUsage,
+        EdgeKind::UNKNOWN => PacketRelationKindV1::Unknown,
+    }
+}
+
+fn relation_certainty(certainty: Option<ResolutionCertainty>) -> PacketRelationCertaintyV1 {
+    match certainty {
+        Some(ResolutionCertainty::Certain) => PacketRelationCertaintyV1::Certain,
+        Some(ResolutionCertainty::Probable) => PacketRelationCertaintyV1::Probable,
+        Some(ResolutionCertainty::Uncertain) => PacketRelationCertaintyV1::Uncertain,
+        _ => PacketRelationCertaintyV1::Unknown,
+    }
+}
+
+fn probe_ambiguities(
+    probe_resolutions: &[PacketProbeResolutionDto],
+) -> Vec<PacketIdentityAmbiguityV1> {
+    probe_resolutions
+        .iter()
+        .filter(|resolution| resolution.status == PacketProbeResolutionStatusDto::Ambiguous)
+        .map(|resolution| PacketIdentityAmbiguityV1 {
+            selector: format!("probe:{}", resolution.input_index),
+            candidate_identities: resolution
+                .candidates
+                .iter()
+                .map(|candidate| format!("node:{}", candidate.symbol_id))
+                .collect(),
+        })
+        .collect()
+}
+
+fn classify_packet_disposition(
+    packet: &AgentPacketDto,
+    request: Option<&AgentPacketRequestDto>,
+    continuation: &[PacketContinuationSelectorV1],
+    core_generation_id: String,
+    retrieval_generation: Option<String>,
+) -> PacketDispositionDto {
+    if let Some(request) = request {
+        if let Some(expected) = request.core_generation_id.as_deref()
+            && expected != core_generation_id
+        {
+            return PacketDispositionDto::unavailable("pinned core publication changed");
+        }
+        if let Some(expected) = request.retrieval_generation.as_deref()
+            && Some(expected) != retrieval_generation.as_deref()
+        {
+            return PacketDispositionDto::unavailable("pinned retrieval publication changed");
+        }
+    }
+
+    let freshness = PacketFreshnessInput::from_observation(packet.answer.freshness.as_ref());
+    if freshness.blocks_packet_availability() {
         return PacketDispositionDto::unavailable(
             freshness
                 .gap()
                 .unwrap_or_else(|| "publication freshness is not established".to_string()),
         );
     }
-    let coverage = packet_coverage_for_disposition(input.answer, input.support);
-    if coverage.caps_sufficiency() {
+    let coverage = packet_coverage_for_disposition(&packet.answer.source_coverage, &packet.support);
+    if coverage.blocks_packet_availability() {
         return PacketDispositionDto::unavailable(
             coverage
                 .gaps()
@@ -271,73 +772,55 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
                 .unwrap_or_else(|| "source coverage is not established".to_string()),
         );
     }
-    if dead_required_sidecar(input.answer) {
-        return PacketDispositionDto::unavailable(
-            "a required retrieval sidecar did not complete".to_string(),
-        );
-    }
-    if input.answer.retrieval_trace.steps.iter().any(|step| {
+    if packet.answer.retrieval_trace.steps.iter().any(|step| {
         matches!(
             step.status,
             codestory_contracts::api::AgentRetrievalStepStatusDto::Error
         )
     }) {
-        return PacketDispositionDto::unavailable("retrieval recorded a hard error".to_string());
+        return PacketDispositionDto::unavailable("retrieval recorded a hard error");
     }
 
-    let drill_options = collect_drill_options(input.question, input.plan, input.answer);
-    let has_unmet_material = packet_has_unmet_blocking_material(input.plan);
-    if input.already_drilled {
-        return terminal_after_drill(input.support, drill_options, has_unmet_material);
-    }
-    if !drill_options.is_empty() {
-        let gap_ids = drill_options
+    let already_drilled = request.is_some_and(|request| {
+        request.parent_packet_id.is_some() || !request.option_ids.is_empty()
+    });
+    if !already_drilled {
+        let options = continuation
             .iter()
-            .map(|option| option.gap_id.clone())
-            .collect();
-        return PacketDispositionDto::drill_once(
-            "evidence is objectively missing and closable by the listed options",
-            BoundedDrillPlanDto {
-                parent_packet_id: input.packet_id.to_string(),
-                core_generation_id: input
-                    .publication
-                    .map(|publication| publication.core_generation_id.clone())
-                    .unwrap_or_default(),
-                retrieval_generation: input
-                    .publication
-                    .map(|publication| publication.retrieval_generation.clone()),
-                gap_ids,
-                options: drill_options,
-                max_bytes: PACKET_DRILL_MAX_BYTES,
-                max_hits: PACKET_DRILL_MAX_HITS,
-                max_depth: PACKET_DRILL_MAX_DEPTH,
-                remaining_rounds: 1,
-            },
-        );
+            .filter_map(drill_option_from_selector)
+            .take(PACKET_DRILL_MAX_OPTIONS)
+            .collect::<Vec<_>>();
+        if !options.is_empty() {
+            return PacketDispositionDto::drill_once(
+                "bounded structural continuation available",
+                BoundedDrillPlanDto {
+                    parent_packet_id: packet.packet_id.clone(),
+                    core_generation_id,
+                    retrieval_generation,
+                    gap_ids: options.iter().map(|option| option.gap_id.clone()).collect(),
+                    options,
+                    max_bytes: PACKET_DRILL_MAX_BYTES,
+                    max_hits: PACKET_DRILL_MAX_HITS,
+                    max_depth: PACKET_DRILL_MAX_DEPTH,
+                    remaining_rounds: 1,
+                },
+            );
+        }
     }
-    if has_unmet_material {
-        return PacketDispositionDto::not_established(
-            "material packet obligations remain unproven after the bounded retrieval pass"
-                .to_string(),
-        );
-    }
-    if has_positive_support(input.support) {
-        PacketDispositionDto::supported()
+
+    if packet.support.is_empty() {
+        PacketDispositionDto::not_established("no bounded repository evidence was retained")
+    } else if already_drilled && !continuation.is_empty() {
+        PacketDispositionDto::not_established("the bounded continuation left a structural gap")
     } else {
-        PacketDispositionDto::not_established(
-            "complete queries returned nothing that could support an answer".to_string(),
-        )
+        // This legacy internal state means only that positive evidence exists.
+        // Public v3 never projects it as answer sufficiency.
+        PacketDispositionDto::supported()
     }
 }
 
-/// Preserve exact positive evidence from a parser-partial file without claiming the file was
-/// completely indexed. The runtime has reread every retained `SourceRange` from source after
-/// retrieval and before disposition. That range can therefore support what it literally shows;
-/// the index's parser-partial diagnostic remains serialized for the agent and still prevents any
-/// unsupported range from passing. Complete-discovery and absence claims remain guarded by their
-/// independently material obligations.
 fn packet_coverage_for_disposition(
-    answer: &AgentAnswerDto,
+    observations: &[codestory_contracts::api::SourceCoverageObservationDto],
     support: &[SupportUnitDto],
 ) -> PacketCoverageInput {
     let verified_source_paths = support
@@ -350,8 +833,7 @@ fn packet_coverage_for_disposition(
         })
         .filter_map(|unit| unit.path.as_deref().map(packet_display_path))
         .collect::<BTreeSet<_>>();
-    let blocking_observations = answer
-        .source_coverage
+    let blocking = observations
         .iter()
         .filter(|observation| {
             observation.status != SourceCoverageStatusDto::Incomplete
@@ -360,275 +842,69 @@ fn packet_coverage_for_disposition(
         })
         .cloned()
         .collect::<Vec<_>>();
-    PacketCoverageInput::from_observations(&blocking_observations)
+    PacketCoverageInput::from_observations(&blocking)
 }
 
-fn has_positive_support(support: &[SupportUnitDto]) -> bool {
-    support
-        .iter()
-        .any(|unit| !matches!(unit.kind, SupportUnitKindDto::CompleteQueryNegative))
-}
-
-fn terminal_after_drill(
-    support: &[SupportUnitDto],
-    remaining_options: Vec<DrillOptionDto>,
-    has_unmet_material: bool,
-) -> PacketDispositionDto {
-    let disposition = if has_unmet_material || !remaining_options.is_empty() {
-        PacketDispositionDto::not_established(
-            "the bounded drill did not establish every material evidence obligation".to_string(),
-        )
-    } else if has_positive_support(support) {
-        PacketDispositionDto::supported()
+fn drill_option_from_selector(selector: &PacketContinuationSelectorV1) -> Option<DrillOptionDto> {
+    let gap_id = format!(
+        "{}:{}",
+        structural_reason_label(selector.reason),
+        selector.stable_identity
+    );
+    let mut option = if let Some(path) = selector
+        .path
+        .as_deref()
+        .or_else(|| selector.stable_identity.strip_prefix("path:"))
+    {
+        DrillOptionDto::bounded_source_read(gap_id, path)
     } else {
-        PacketDispositionDto::not_established(
-            "the bounded drill did not establish additional support".to_string(),
-        )
-    };
-    debug_assert_ne!(
-        disposition.kind,
-        PacketDispositionKindDto::DrillOnce,
-        "merge cannot emit another drill"
-    );
-    disposition
-}
-
-/// A generated free-text identity is a useful retrieval lead, but it is not an explicit typed
-/// probe and cannot turn an otherwise complete broad packet into a false negative. Behavioral and
-/// structural flow rows remain blocking, as do exact probes the caller explicitly bound.
-fn material_claim_blocks_supported(obligation: &PacketClaimObligationDto) -> bool {
-    obligation.material
-        && (obligation.kind != PacketClaimObligationKindDto::ExactProbe
-            || obligation.probe_binding.is_some())
-}
-
-fn packet_has_unmet_blocking_material(plan: &PacketPlanDto) -> bool {
-    plan.obligations.claim_obligations.iter().any(|obligation| {
-        material_claim_blocks_supported(obligation)
-            && obligation.proof_status != PacketObligationProofStatusDto::Proven
-    }) || plan.obligations.query_obligations.iter().any(|obligation| {
-        obligation.material && !material_query_obligation_is_satisfied(obligation)
-    })
-}
-
-/// Bounded retrieval often skips sibling seeds once a flow step is already
-/// carried. `not_dispatched` records that skip; it is not a missing search.
-fn material_query_obligation_is_satisfied(
-    obligation: &codestory_contracts::api::PacketQueryObligationDto,
-) -> bool {
-    match obligation.completion.as_ref() {
-        Some(PacketQueryCompletionDto::Completed) => true,
-        Some(PacketQueryCompletionDto::Cancelled { reason }) if reason == "not_dispatched" => true,
-        _ => false,
-    }
-}
-
-fn first_ambiguous_probe(plan: &PacketPlanDto) -> Option<String> {
-    plan.probe_resolutions.iter().find_map(|resolution| {
-        matches!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous)
-            .then(|| format!("probe-{}", resolution.input_index))
-    })
-}
-
-fn dead_required_sidecar(answer: &AgentAnswerDto) -> bool {
-    answer
-        .retrieval_trace
-        .packet_sidecar_diagnostics
-        .iter()
-        .any(|diagnostic| {
-            matches!(
-                diagnostic.completion,
-                PacketQueryCompletionDto::Cancelled { .. }
-            ) && diagnostic.blocking_unresolved_candidate_count > 0
-        })
-}
-
-fn collect_drill_options(
-    question: &str,
-    plan: &PacketPlanDto,
-    answer: &AgentAnswerDto,
-) -> Vec<DrillOptionDto> {
-    let mut options = Vec::new();
-    let mut seen = BTreeSet::new();
-    let cited_paths = answer
-        .citations
-        .iter()
-        .filter(|citation| citation_sufficiency_eligible(citation))
-        .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
-        .collect::<BTreeSet<_>>();
-
-    if packet_primary_retrieval_truncated(answer) {
-        for query in plan.queries.iter().take(PACKET_DRILL_MAX_OPTIONS) {
-            let option = DrillOptionDto::deadline_lost_query(
-                format!("deadline-lost:{}", query.query),
-                query.query.clone(),
-            );
-            if seen.insert(option.id.clone()) {
-                options.push(option);
-            }
-        }
-    }
-
-    for path in exact_packet_probe_paths(&plan.probe_resolutions) {
-        let display = packet_display_path(&path);
-        if cited_paths.contains(&display) {
-            continue;
-        }
-        let option =
-            DrillOptionDto::bounded_source_read(format!("named-path:{display}"), display.clone());
-        if seen.insert(option.id.clone()) {
-            options.push(option);
-        }
-    }
-
-    for obligation in plan
-        .obligations
-        .claim_obligations
-        .iter()
-        .filter(|obligation| {
-            material_claim_blocks_supported(obligation)
-                && obligation.proof_status != PacketObligationProofStatusDto::Proven
-        })
-    {
-        if let Some(edge_kind) = obligation.required_edge_kind
-            && matches!(edge_kind, EdgeKind::CALL | EdgeKind::INHERITANCE)
-            && obligation.carrier_edge_proofs.is_empty()
-            && let Some(target) = obligation.carrier_node_ids.first()
-        {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-edge:{}", obligation.id),
-                &target.0,
-            );
-            if seen.insert(option.id.clone()) {
-                options.push(option);
-            }
-        }
-        let named_schema_gap = obligation
-            .reason
+        let symbol_id = selector
+            .symbol_id
             .as_deref()
-            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
-        if !named_schema_gap && let Some(node) = obligation.carrier_node_ids.first() {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-material:{}", obligation.id),
-                &node.0,
-            );
-            if seen.insert(option.id.clone()) {
-                options.push(option);
-            }
-        } else if !named_schema_gap && let Some(path) = obligation.carrier_paths.first() {
-            let display = packet_display_path(path);
-            if !cited_paths.contains(&display) {
-                let option = DrillOptionDto::bounded_source_read(
-                    format!("omitted-material-path:{}", obligation.id),
-                    display,
-                );
-                if seen.insert(option.id.clone()) {
-                    options.push(option);
-                }
-            }
-        }
-        if obligation
-            .kind
-            .eq(&codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe)
-            && obligation.carrier_paths.is_empty()
-            && let Some(path) = obligation
-                .probe_binding
-                .as_ref()
-                .and_then(|binding| binding.path.clone())
-        {
-            let display = packet_display_path(&path);
-            if !cited_paths.contains(&display) {
-                let option =
-                    DrillOptionDto::bounded_source_read(format!("omitted-path:{display}"), display);
-                if seen.insert(option.id.clone()) {
-                    options.push(option);
-                }
-            }
-        }
-    }
-
-    for token in question
-        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';' | '(' | ')'))
-    {
-        let token = token.trim_matches(|c: char| {
-            !c.is_ascii_alphanumeric() && !matches!(c, '/' | '\\' | '.' | '_' | '-')
-        });
-        if !(token.contains('/') && token.contains('.')) {
-            continue;
-        }
-        let display = packet_display_path(token);
-        if cited_paths.contains(&display) {
-            continue;
-        }
-        let option = DrillOptionDto::bounded_source_read(format!("named-path:{display}"), display);
-        if seen.insert(option.id.clone()) {
-            options.push(option);
-        }
-    }
-
-    options.truncate(PACKET_DRILL_MAX_OPTIONS);
-    options
+            .or_else(|| selector.stable_identity.strip_prefix("node:"))?;
+        DrillOptionDto::omitted_symbol(gap_id, symbol_id)
+    };
+    option.structural_reason = Some(selector.reason);
+    Some(option)
 }
 
-pub fn apply_compiled_evidence(
-    packet: &mut AgentPacketDto,
-    request: Option<&AgentPacketRequestDto>,
-) {
-    let (support, disposition) = compile_packet_evidence_with_source_ranges(
-        &packet.packet_id,
-        &packet.question,
-        &packet.plan,
-        &packet.answer,
-        &packet.support,
-        request,
-    );
-    packet.support = support;
-    packet.disposition = disposition;
-}
-
-/// [`apply_compiled_evidence`] followed by the R5 reconciliation: the compile
-/// pass rewrites `packet.support` and `packet.disposition` but never touches
-/// `plan.obligations`, so every formula-proven obligation is re-verified
-/// against the COMPILED support and the live `answer.graphs`. On any missing
-/// receipt the obligation is demoted fail-closed (reason recorded) and the
-/// disposition is recomputed on the post-demotion state, so
-/// `packet.disposition` and the obligations agree at return.
-pub fn apply_compiled_evidence_with_proof_reconciliation(
-    packet: &mut AgentPacketDto,
-    request: Option<&AgentPacketRequestDto>,
-    proof_evidence_extras: &PacketProofEvidenceExtras,
-) {
-    apply_compiled_evidence(packet, request);
-    let demoted = reconcile_packet_proof_obligations_after_compile(
-        &packet.question,
-        packet.plan.task_class,
-        &mut packet.plan.obligations,
-        &packet.answer,
-        &packet.support,
-        proof_evidence_extras,
-    );
-    if demoted {
-        apply_compiled_evidence(packet, request);
+fn structural_reason_label(reason: PacketStructuralGapReasonV1) -> &'static str {
+    match reason {
+        PacketStructuralGapReasonV1::CandidateCountExceeded => "candidate_count_exceeded",
+        PacketStructuralGapReasonV1::SourceBudgetExceeded => "source_budget_exceeded",
+        PacketStructuralGapReasonV1::SourceUnavailable => "source_unavailable",
+        PacketStructuralGapReasonV1::AmbiguousSelector => "ambiguous_selector",
+        PacketStructuralGapReasonV1::DisconnectedSeed => "disconnected_seed",
     }
 }
 
+/// Decode only stable path or symbol continuations. Historical query-text
+/// options are deliberately not reintroduced as retrieval policy.
 pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
     option_ids
         .iter()
         .filter_map(|id| {
             let (kind, target) = decode_drill_option_id(id)?;
-            Some(match kind {
-                codestory_contracts::api::DrillGapKindDto::BoundedSourceRead => {
-                    DrillOptionDto::bounded_source_read(format!("named-path:{target}"), target)
+            match kind {
+                DrillGapKindDto::BoundedSourceRead => Some(DrillOptionDto::bounded_source_read(
+                    format!("source_unavailable:{target}"),
+                    target,
+                )),
+                DrillGapKindDto::OmittedMandatorySupport => {
+                    if let Some(path) = target.strip_prefix("path:") {
+                        Some(DrillOptionDto::omitted_source_path(
+                            format!("disconnected_seed:{path}"),
+                            path,
+                        ))
+                    } else {
+                        let symbol = target.strip_prefix("symbol:")?;
+                        Some(DrillOptionDto::omitted_symbol(
+                            format!("disconnected_seed:{symbol}"),
+                            symbol,
+                        ))
+                    }
                 }
-                codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport => {
-                    let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
-                    DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
-                }
-                codestory_contracts::api::DrillGapKindDto::DeadlineLostCandidate => {
-                    DrillOptionDto::deadline_lost_query(format!("deadline-lost:{target}"), target)
-                }
-            })
+            }
         })
         .take(PACKET_DRILL_MAX_OPTIONS)
         .collect()
@@ -637,926 +913,859 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::packet_budget::tests::test_packet;
-    use crate::agent::packet_freshness::fresh_index_observation;
-    use codestory_agent::packet_command::packet_follow_up_argv;
-    use codestory_contracts::api::{
-        AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-        AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketBudgetModeDto, PacketPlanDto,
-        PacketProbeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-        PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
-        SearchHitOrigin, SourceCoverageObservationDto,
-    };
-    use std::path::Path;
+    use codestory_contracts::graph::{Edge as CoreEdge, EdgeId as CoreEdgeId};
+    use codestory_store::FileRole;
 
-    fn eligible_citation(name: &str, path: &str) -> AgentCitationDto {
-        AgentCitationDto {
-            node_id: NodeId(name.to_string()),
-            display_name: name.to_string(),
-            kind: NodeKind::FUNCTION,
-            file_path: Some(path.to_string()),
-            line: Some(10),
-            score: 1.0,
-            origin: SearchHitOrigin::IndexedSymbol,
-            target: None,
-            resolvable: true,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: None,
-            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource),
-            evidence_producer: None,
-            resolution_status: Some(
-                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+    #[test]
+    fn frozen_public_packet_keeps_only_admitted_sources_and_induced_relations() {
+        use crate::agent::packet_candidate::PacketAdmissionDecision;
+        use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+        use serde_json::json;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let project = tempfile::tempdir().expect("isolated source project");
+        let cache = tempfile::tempdir().expect("isolated Store");
+        let database = cache.path().join("core.sqlite3");
+        let mut storage = Store::open(&database).expect("real file-backed Store");
+        // Source bodies and bounds are stored independently of admission. The
+        // unrelated rows must remain present throughout the test.
+        let files = [
+            (10, "src/alpha.rs", "fn alpha() {}\n"),
+            (20, "src/beta.rs", "fn beta() {}\n"),
+            (30, "src/gamma.rs", "fn gamma() {}\n"),
+            (40, "src/reference.rs", "const REFERENCE: usize = 1;\n"),
+            (90, "noise/outside.rs", "fn NOISE_OUTSIDE() {}\n"),
+            (190, "noise/unrelated.rs", "fn NOISE_UNRELATED() {}\n"),
+        ];
+        for (id, relative, source) in files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("source directory");
+            std::fs::write(&path, source).expect("real source bytes");
+            let file = FileInfo {
+                id,
+                path,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).expect("file row");
+            storage
+                .update_file_metadata(
+                    &file,
+                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+                )
+                .expect("pinned source digest");
+            storage
+                .insert_nodes_batch(&[CoreNode {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: relative.into(),
+                    file_node_id: Some(CoreNodeId(id)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                }])
+                .expect("file node");
+        }
+        for (id, file_id, name) in [
+            (11, 10, "alpha"),
+            (21, 20, "beta"),
+            (31, 30, "gamma"),
+            (99, 90, "NOISE_OUTSIDE"),
+            (199, 190, "NOISE_UNRELATED"),
+        ] {
+            storage
+                .insert_nodes_batch(&[CoreNode {
+                    id: CoreNodeId(id),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: name.into(),
+                    file_node_id: Some(CoreNodeId(file_id)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                }])
+                .expect("stored symbol");
+        }
+        let kinds = [
+            (CoreEdgeKind::MEMBER, PacketRelationKindV1::Member),
+            (CoreEdgeKind::TYPE_USAGE, PacketRelationKindV1::TypeUsage),
+            (CoreEdgeKind::USAGE, PacketRelationKindV1::Usage),
+            (CoreEdgeKind::CALL, PacketRelationKindV1::Call),
+            (CoreEdgeKind::INHERITANCE, PacketRelationKindV1::Inheritance),
+            (CoreEdgeKind::OVERRIDE, PacketRelationKindV1::Override),
+            (
+                CoreEdgeKind::TYPE_ARGUMENT,
+                PacketRelationKindV1::TypeArgument,
             ),
-            loss_reason: None,
-            coverage_role: None,
-            eligible_for_sufficiency: Some(true),
-            source_excerpt: None,
+            (
+                CoreEdgeKind::TEMPLATE_SPECIALIZATION,
+                PacketRelationKindV1::TemplateSpecialization,
+            ),
+            (CoreEdgeKind::INCLUDE, PacketRelationKindV1::Include),
+            (CoreEdgeKind::IMPORT, PacketRelationKindV1::Import),
+            (CoreEdgeKind::MACRO_USAGE, PacketRelationKindV1::MacroUsage),
+            (
+                CoreEdgeKind::ANNOTATION_USAGE,
+                PacketRelationKindV1::AnnotationUsage,
+            ),
+            (CoreEdgeKind::UNKNOWN, PacketRelationKindV1::Unknown),
+        ];
+        let mut expected_relations = Vec::new();
+        for (base, from, to) in [(100, 11, 21), (200, 21, 31)] {
+            for (offset, (kind, expected_kind)) in kinds.into_iter().enumerate() {
+                let id = base + offset as i64;
+                for representative in [id, id + 1_000] {
+                    storage
+                        .insert_edge(&CoreEdge {
+                            id: CoreEdgeId(representative),
+                            source: CoreNodeId(from),
+                            target: CoreNodeId(to),
+                            kind,
+                            certainty: Some(ResolutionCertainty::Certain),
+                            ..Default::default()
+                        })
+                        .expect("certain kind/pair and duplicate");
+                }
+                expected_relations.push((
+                    id.to_string(),
+                    format!("node:{from}"),
+                    format!("node:{to}"),
+                    expected_kind,
+                ));
+            }
         }
-    }
-
-    fn retained_source_range(symbol_id: &str, path: &str) -> SupportUnitDto {
-        SupportUnitDto {
-            id: format!("source:{symbol_id}:10"),
-            kind: SupportUnitKindDto::SourceRange,
-            summary: format!("source for {symbol_id} at {path}:10-11"),
-            path: Some(path.to_string()),
-            symbol_id: Some(symbol_id.to_string()),
-            start_line: Some(10),
-            end_line: Some(11),
-            snippet: Some("fn verified_from_source() {}".to_string()),
-            edge_kind: None,
-            from_symbol: None,
-            to_symbol: None,
-            query: None,
+        // Both directions of a one-admitted-endpoint edge, a wholly unrelated
+        // pair, and an earlier probable duplicate cannot become induced evidence.
+        for (id, from, to, certainty) in [
+            (1, 11, 99, ResolutionCertainty::Certain),
+            (2, 199, 21, ResolutionCertainty::Certain),
+            (3, 99, 199, ResolutionCertainty::Certain),
+            (4, 11, 21, ResolutionCertainty::Probable),
+        ] {
+            storage
+                .insert_edge(&CoreEdge {
+                    id: CoreEdgeId(id),
+                    source: CoreNodeId(from),
+                    target: CoreNodeId(to),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(certainty),
+                    ..Default::default()
+                })
+                .expect("hostile stored edge");
         }
-    }
-
-    fn incomplete_observation(
-        path: &str,
-        reason: FileCoverageReason,
-    ) -> SourceCoverageObservationDto {
-        SourceCoverageObservationDto {
-            path: path.to_string(),
-            status: SourceCoverageStatusDto::Incomplete,
-            reason: Some(reason),
-            not_established_cause: None,
-            observed_size: None,
-            byte_cap: None,
-        }
-    }
-
-    fn empty_plan() -> PacketPlanDto {
-        PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
-            inferred_task_class: true,
-            queries: Vec::new(),
-            probe_resolutions: Vec::new(),
-            obligations: Default::default(),
-            trace: Vec::new(),
-        }
-    }
-
-    fn claim_obligation(
-        kind: PacketClaimObligationKindDto,
-        status: PacketObligationProofStatusDto,
-    ) -> PacketClaimObligationDto {
-        PacketClaimObligationDto {
-            id: "material-flow".to_string(),
-            kind,
-            binding_terms: Vec::new(),
-            probe_binding: None,
-            material: true,
-            allowed_node_kinds: Vec::new(),
-            required_edge_kind: None,
-            requires_complete_discovery: false,
-            proof_status: status,
-            reason: None,
-            carrier_node_ids: Vec::new(),
-            carrier_paths: Vec::new(),
-            carrier_edge_proofs: Vec::new(),
-            open_next_candidates: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn positive_support_cannot_hide_an_unproven_material_flow() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
-        let mut obligation = claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Reported,
-        );
-        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![obligation];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::DrillOnce);
-        let options = disposition.drill.expect("bounded drill").options;
-        assert!(
-            options
-                .iter()
-                .any(|option| { option.symbol_id.as_deref() == Some("Router.use") })
-        );
-    }
-
-    #[test]
-    fn typed_drill_continuation_proves_omitted_http_handle_after_one_round() {
-        let mut packet = test_packet(
-            "Trace how an HTTP server dispatches an incoming request to a handler.",
-            98_304,
-        );
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
-        let mut obligation = claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Reported,
-        );
-        obligation.id = "request_dispatch".to_string();
-        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![obligation];
-
-        let (_support, first) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-        assert_eq!(first.kind, PacketDispositionKindDto::DrillOnce);
-        let drill = first.drill.expect("bounded drill");
-        let argv = packet_follow_up_argv(
-            Path::new("/tmp/project"),
-            &packet.question,
-            PacketBudgetModeDto::Standard,
-            Some(&drill),
-        )
-        .expect("drill_once must publish a typed continuation");
-        assert!(argv.contains(&"--parent-packet-id".to_string()));
-        assert!(argv.contains(&packet.packet_id));
-        assert!(argv.contains(&"--option-id".to_string()));
-        assert!(argv.iter().any(|argument| argument.contains("Router.use")));
-        assert!(!argv.iter().any(|argument| argument == "deep"));
-        assert!(
-            !argv.contains(&"--core-generation-id".to_string()),
-            "empty generation pins must not be forwarded"
-        );
-
-        packet.answer.citations.push(eligible_citation(
-            "ServerEngine.handleHTTPRequest",
-            "src/router.rs",
-        ));
-        packet.plan.obligations.claim_obligations[0].proof_status =
-            PacketObligationProofStatusDto::Proven;
-        packet.plan.obligations.claim_obligations[0]
-            .carrier_node_ids
-            .push(NodeId("ServerEngine.handleHTTPRequest".to_string()));
-        let request = AgentPacketRequestDto {
-            question: packet.question.clone(),
-            budget: Default::default(),
-            task_class: None,
-            probes: Vec::new(),
-            extra_probes: Vec::new(),
-            include_evidence: true,
-            latency_budget_ms: None,
-            parent_packet_id: Some(packet.packet_id.clone()),
-            option_ids: drill
-                .options
-                .iter()
-                .map(|option| option.id.clone())
-                .collect(),
-            core_generation_id: None,
-            retrieval_generation: None,
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "h7-core-generation".into(),
+            run_id: "h7-core-run".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
         };
-        let (_support, continuation) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            Some(&request),
-        );
-        assert_eq!(continuation.kind, PacketDispositionKindDto::Supported);
-        assert!(continuation.is_terminal());
-    }
+        storage
+            .put_index_publication(&publication)
+            .expect("complete fixture publication");
+        assert_eq!(storage.get_nodes().unwrap().len(), 11);
+        assert_eq!(storage.get_edges().unwrap().len(), 56);
+        drop(storage);
 
-    #[test]
-    fn an_obligation_name_cannot_be_published_as_a_drill_symbol_id() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
-        let mut obligation = claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Unsupported,
-        );
-        obligation.id = "request_dispatch".to_string();
-        obligation.required_edge_kind = Some(EdgeKind::CALL);
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![obligation];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
-        assert!(disposition.drill.is_none());
-    }
-
-    #[test]
-    fn a_material_flow_still_unproven_after_drill_is_terminal_not_established() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
-        let mut obligation = claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Reported,
-        );
-        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![obligation];
-        let request = AgentPacketRequestDto {
-            question: packet.question.clone(),
-            budget: Default::default(),
-            task_class: None,
-            probes: Vec::new(),
-            extra_probes: Vec::new(),
-            include_evidence: true,
-            latency_budget_ms: None,
-            parent_packet_id: Some(packet.packet_id.clone()),
-            option_ids: vec!["omitted_mandatory_support:symbol%3ARouter.use".to_string()],
-            core_generation_id: None,
-            retrieval_generation: None,
+        let controller = AppController::new();
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(database);
+        }
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let session = PacketProofSession::new();
+        let admitted = ["node:11", "node:21", "node:31", "path:src/reference.rs"];
+        for identity in admitted {
+            assert_eq!(
+                session.admit(identity, INTERIM_SOURCE_ROW_UPPER_BOUND),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(json!({"question":"stored evidence fixture"})).unwrap();
+        let trace = json!({"request_id":"h7-request", "resolved_profile":"investigate",
+            "policy_mode":"latency_first", "total_latency_ms":0, "sla_missed":false,
+            "semantic_fallback_count":0, "semantic_fallbacks":[], "semantic_stage_timeout_zero_hits":0,
+            "semantic_abstained_count":0, "annotations":[], "steps":[], "packet_sidecar_diagnostics":[]});
+        // Only the input packet envelope is a fixture. Evidence comes from the
+        // real runtime hydration/compiler and real v3 projection below.
+        let mut packet: AgentPacketDto = serde_json::from_value(json!({
+            "packet_id":"h7-request", "question":request.question, "plan":{"queries":[],"trace":[]},
+            "answer":{"answer_id":"h7-answer", "prompt":request.question, "summary":"fixture",
+                "sections":[], "citations":[], "subgraph_ids":[], "retrieval_version":"fixture",
+                "graphs":[], "retrieval_trace":trace}, "support":[],
+            "disposition":{"kind":"not_established"},
+            "budget":{"requested":"standard", "limits":{"max_anchors":16,"max_files":16,
+                "max_snippets":16,"max_trail_edges":16,"max_output_bytes":65536},
+                "used":{"anchors":0,"files":0,"snippets":0,"trail_edges":0,"output_bytes":0},
+                "truncated":false, "next_deeper_command":null},
+            "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,"search_steps":0,"trail_steps":0}
+        })).expect("typed internal packet envelope");
+        let projected = service
+            .run_observational_with_cancel(
+                "h7-packet-compilation",
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    assert_eq!(controller.active_core_publication().unwrap(), publication);
+                    let pinned = controller.open_storage_read_only()?;
+                    let mut gaps = Vec::new();
+                    let (authenticated, sources, _) = hydrate_admitted_sources(
+                        &controller,
+                        &pinned,
+                        &session.receipts(),
+                        &mut gaps,
+                    )?;
+                    assert!(gaps.is_empty());
+                    assert_eq!(
+                        authenticated
+                            .iter()
+                            .map(|item| item.receipt.stable_identity.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(admitted)
+                    );
+                    assert_eq!(
+                        sources
+                            .iter()
+                            .map(|source| source.stable_identity.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(admitted)
+                    );
+                    let induced = hydrate_induced_relations(&pinned, &authenticated)?;
+                    assert!(
+                        induced
+                            .iter()
+                            .all(|edge| edge.certainty == PacketRelationCertaintyV1::Certain)
+                    );
+                    let mut observed = induced
+                        .iter()
+                        .map(|edge| {
+                            (
+                                edge.relation_id.clone(),
+                                edge.from_identity.clone(),
+                                edge.to_identity.clone(),
+                                edge.relation_kind,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    observed.sort();
+                    expected_relations.sort();
+                    assert_eq!(observed, expected_relations);
+                    assert_eq!(
+                        induced.len(),
+                        26,
+                        "all kinds for both admitted directed pairs before forest selection"
+                    );
+                    let frozen =
+                        freeze_packet_compilation(&controller, "h7-project", &[], None, &session)?;
+                    assert_eq!(
+                        frozen
+                            .source_coverage
+                            .iter()
+                            .map(|row| row.path.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            "src/alpha.rs",
+                            "src/beta.rs",
+                            "src/gamma.rs",
+                            "src/reference.rs"
+                        ])
+                    );
+                    packet.answer.source_coverage = frozen.source_coverage.clone();
+                    apply_frozen_packet_compilation(&mut packet, Some(&request), frozen);
+                    assert_eq!(
+                        packet.support.len(),
+                        6,
+                        "four real source rows and two forest relations fit caps"
+                    );
+                    assert_eq!(
+                        final_support_identities_for_observation(&packet.support)
+                            .into_iter()
+                            .collect::<BTreeSet<_>>(),
+                        admitted.into_iter().map(str::to_owned).collect()
+                    );
+                    let source_units = packet
+                        .support
+                        .iter()
+                        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        source_units
+                            .iter()
+                            .map(|unit| (unit.symbol_id.as_deref(), unit.path.as_deref()))
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            (Some("11"), Some("src/alpha.rs")),
+                            (Some("21"), Some("src/beta.rs")),
+                            (Some("31"), Some("src/gamma.rs")),
+                            (None, Some("src/reference.rs"))
+                        ])
+                    );
+                    assert!(
+                        source_units
+                            .iter()
+                            .all(|unit| unit.start_line == Some(1) && unit.end_line == Some(1))
+                    );
+                    for (path, body) in [
+                        ("src/alpha.rs", "fn alpha() {}"),
+                        ("src/beta.rs", "fn beta() {}"),
+                        ("src/gamma.rs", "fn gamma() {}"),
+                        ("src/reference.rs", "const REFERENCE: usize = 1;"),
+                    ] {
+                        let source = source_units
+                            .iter()
+                            .find(|unit| unit.path.as_deref() == Some(path))
+                            .expect("expected admitted source row");
+                        assert!(
+                            source
+                                .snippet
+                                .as_ref()
+                                .is_some_and(|text| text.contains(body)),
+                            "source body must match its admitted path: {path}"
+                        );
+                    }
+                    assert_eq!(
+                        packet
+                            .support
+                            .iter()
+                            .filter(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
+                            .map(|unit| (
+                                unit.id.as_str(),
+                                unit.from_symbol.as_deref(),
+                                unit.to_symbol.as_deref(),
+                                unit.edge_kind.as_deref()
+                            ))
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([
+                            ("edge:100", Some("11"), Some("21"), Some("member")),
+                            ("edge:200", Some("21"), Some("31"), Some("member"))
+                        ])
+                    );
+                    crate::evidence_projection_v3::project_packet_v3(
+                        &service,
+                        "h7-caller",
+                        &request,
+                        &packet,
+                        |projection| {
+                            serde_json::to_vec(projection)
+                                .map(|bytes| bytes.len())
+                                .map_err(|_| ())
+                        },
+                    )
+                },
+            )
+            .expect("normal pinned freeze-to-public projection")
+            .value;
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = &projected.projection else {
+            panic!("small admitted fixture must not exceed public output budget")
         };
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            Some(&request),
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
-        assert!(disposition.is_terminal());
-    }
-
-    #[test]
-    fn generated_free_text_exact_lead_does_not_block_a_complete_broad_packet() {
-        let mut packet = test_packet("explain the AutoMapper APIs", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation(
-            "MapperConfiguration.BuildExecutionPlan",
-            "src/mapper_configuration.cs",
-        )];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![claim_obligation(
-            PacketClaimObligationKindDto::ExactProbe,
-            PacketObligationProofStatusDto::Unsupported,
-        )];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
-    }
-
-    #[test]
-    fn proven_material_flow_with_positive_support_is_supported() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Proven,
-        )];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
-    }
-
-    #[test]
-    fn skipped_sibling_queries_do_not_block_a_proven_material_flow() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Proven,
-        )];
-        packet.plan.obligations.query_obligations = vec![PacketQueryObligationDto {
-            id: "query:0".to_string(),
-            kind: PacketQueryObligationKindDto::RequiredFlow,
-            query: "transport send".to_string(),
-            material: true,
-            completion: Some(PacketQueryCompletionDto::Cancelled {
-                reason: "not_dispatched".to_string(),
-            }),
-        }];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
-    }
-
-    #[test]
-    fn a_hard_cancelled_material_query_still_blocks_supported() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
-        packet.plan = empty_plan();
-        packet.plan.obligations.claim_obligations = vec![claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Proven,
-        )];
-        packet.plan.obligations.query_obligations = vec![PacketQueryObligationDto {
-            id: "query:0".to_string(),
-            kind: PacketQueryObligationKindDto::RequiredFlow,
-            query: "transport send".to_string(),
-            material: true,
-            completion: Some(PacketQueryCompletionDto::Cancelled {
-                reason: "stage_deadline".to_string(),
-            }),
-        }];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
-    }
-
-    #[test]
-    fn exact_source_range_preserves_positive_support_from_a_parser_partial_file() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
-        packet.answer.source_coverage = vec![incomplete_observation(
-            "/checkout/repos/example/src/router.ts",
-            FileCoverageReason::ParserPartial,
-        )];
-        packet.plan = empty_plan();
-        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
-
-        apply_compiled_evidence(&mut packet, None);
-
-        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::Supported);
-        assert!(packet.support.iter().any(|unit| {
-            unit.kind == SupportUnitKindDto::SourceRange
-                && unit.path.as_deref() == Some("src/router.ts")
-        }));
+        assert_eq!(evidence.as_slice().len(), 6);
+        assert!(!gaps.as_slice().iter().any(|gap| gap.kind
+            == codestory_contracts::packet_projection_v3::GapKindV3Dto::OutputBudgetExceeded));
         assert_eq!(
-            packet.answer.source_coverage[0].status,
-            SourceCoverageStatusDto::Incomplete,
-            "the parser-partial diagnostic stays visible"
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
+                .map(|row| (
+                    row.symbol_id.as_ref().map(|id| id.as_str()),
+                    row.path.as_ref().map(|path| path.as_str())
+                ))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (Some("11"), Some("src/alpha.rs")),
+                (Some("21"), Some("src/beta.rs")),
+                (Some("31"), Some("src/gamma.rs")),
+                (None, Some("src/reference.rs"))
+            ])
         );
-    }
-
-    #[test]
-    fn parser_partial_file_without_its_exact_source_range_remains_unavailable() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
-        packet.answer.source_coverage = vec![incomplete_observation(
-            "src/router.ts",
-            FileCoverageReason::ParserPartial,
-        )];
-        packet.plan = empty_plan();
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Unavailable);
-    }
-
-    #[test]
-    fn exact_source_range_does_not_excuse_an_unreadable_file() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
-        packet.answer.source_coverage = vec![incomplete_observation(
-            "src/router.ts",
-            FileCoverageReason::Unreadable,
-        )];
-        packet.plan = empty_plan();
-        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
-
-        apply_compiled_evidence(&mut packet, None);
-
         assert_eq!(
-            packet.disposition.kind,
-            PacketDispositionKindDto::Unavailable
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
+                .map(|row| row.summary.as_ref().unwrap().as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["11 -[member]-> 21", "21 -[member]-> 31"])
+        );
+        let public_json =
+            serde_json::to_string(&projected.projection).expect("actual public serialization");
+        for noise in ["NOISE_", "noise/"] {
+            assert!(
+                !public_json.contains(noise),
+                "unadmitted stored evidence leaked: {noise}"
+            );
+        }
+        let retained = controller.open_storage_read_only().unwrap();
+        assert!(retained.get_node(CoreNodeId(99)).unwrap().is_some());
+        assert_eq!(
+            retained.get_edges().unwrap().len(),
+            56,
+            "exclusion is not deletion of stored noise"
         );
     }
 
     #[test]
-    fn exact_source_range_does_not_prove_complete_discovery() {
-        let mut packet = test_packet("is this route unused?", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
-        packet.answer.source_coverage = vec![incomplete_observation(
-            "src/router.ts",
-            FileCoverageReason::ParserPartial,
-        )];
-        packet.plan = empty_plan();
-        let mut obligation = claim_obligation(
-            PacketClaimObligationKindDto::Dispatch,
-            PacketObligationProofStatusDto::Reported,
-        );
-        obligation.requires_complete_discovery = true;
-        packet.plan.obligations.claim_obligations = vec![obligation];
-        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
-
-        apply_compiled_evidence(&mut packet, None);
-
-        assert_ne!(packet.disposition.kind, PacketDispositionKindDto::Supported);
+    fn whole_file_renderer_has_no_fifty_line_focus_limit() {
+        let source = "\n".repeat(80);
+        let rendered = complete_file_markdown(&source, 80, 1024)
+            .expect("all eighty numbered lines fit the larger bounded row");
+        assert_eq!(source_receipt_line_range(&rendered), Some((1, 80)));
+        assert!(rendered.len() <= 1024);
         assert!(matches!(
-            packet.disposition.kind,
-            PacketDispositionKindDto::DrillOnce | PacketDispositionKindDto::NotEstablished
+            complete_file_markdown("x\n", 1, 8),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
         ));
     }
 
     #[test]
-    fn source_range_support_stays_bound_to_its_retained_citation() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
-        let source_range = |id: &str, symbol_id: &str, snippet: &str| SupportUnitDto {
-            id: id.to_string(),
-            kind: SupportUnitKindDto::SourceRange,
-            summary: "source for Router.dispatch at src/router.rs:10".to_string(),
-            path: Some("src/router.rs".to_string()),
-            symbol_id: Some(symbol_id.to_string()),
-            start_line: Some(10),
+    fn file_admission_retains_only_complete_pinned_source_or_navigation() {
+        let project = tempfile::tempdir().expect("project");
+        let controller = AppController::new();
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let storage = Store::new_in_memory().expect("store");
+        let path = project.path().join("settings.rs");
+        let admission = PacketAdmissionReceiptV1 {
+            packet_ordinal: 0,
+            stable_identity: "path:settings.rs".into(),
+            score_version: "test".into(),
+            reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+            origin: PacketAdmissionOriginV1::Retrieval,
+        };
+        let mut file = FileInfo {
+            id: 1,
+            path: path.clone(),
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 2,
+            file_role: FileRole::Source,
+        };
+        let short = "const ENABLED: bool = true;\nconst LIMIT: usize = 2;\n";
+        std::fs::write(&path, short).expect("short source");
+        storage.insert_file(&file).expect("file");
+        let short_hash = format!("{:x}", Sha256::digest(short.as_bytes()));
+        storage
+            .update_file_metadata(&file, Some(&short_hash))
+            .expect("pinned source hash");
+        let whole = hydrate_admitted_file_source(&controller, &storage, &admission, &file)
+            .expect("complete short file source");
+        assert_eq!((whole.start_line, whole.end_line), (1, 2));
+        assert!(whole.source.contains("const LIMIT: usize = 2;"));
+
+        let many_short_lines = "\n".repeat(45);
+        file.line_count = 45;
+        std::fs::write(&path, &many_short_lines).expect("short multiline source");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!(
+                    "{:x}",
+                    Sha256::digest(many_short_lines.as_bytes())
+                )),
+            )
+            .expect("multiline source hash");
+        let whole = hydrate_admitted_file_source(&controller, &storage, &admission, &file)
+            .expect("every line fits the bounded source row");
+        assert_eq!((whole.start_line, whole.end_line), (1, 45));
+        assert!(whole.source.len() <= INTERIM_SOURCE_ROW_UPPER_BOUND);
+
+        let tiny_but_unrenderable = "\n".repeat(51);
+        file.line_count = 51;
+        std::fs::write(&path, &tiny_but_unrenderable).expect("raw bytes fit");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!(
+                    "{:x}",
+                    Sha256::digest(tiny_but_unrenderable.as_bytes())
+                )),
+            )
+            .expect("raw source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        ));
+
+        let long = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        file.line_count = 120;
+        std::fs::write(&path, &long).expect("long source");
+        let long_hash = format!("{:x}", Sha256::digest(long.as_bytes()));
+        storage
+            .update_file_metadata(&file, Some(&long_hash))
+            .expect("long source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        ));
+
+        std::fs::write(&path, "changed source\n").expect("drifted source");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+
+        let invalid_utf8 = b"\xff\n";
+        file.line_count = 1;
+        std::fs::write(&path, invalid_utf8).expect("invalid UTF-8 source");
+        storage
+            .update_file_metadata(&file, Some(&format!("{:x}", Sha256::digest(invalid_utf8))))
+            .expect("invalid UTF-8 source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+        storage
+            .update_file_metadata(&file, None)
+            .expect("missing source hash");
+        assert!(matches!(
+            hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn file_node_navigation_keeps_authenticated_path_without_source_text() {
+        let mut support = vec![SupportUnitDto {
+            id: "symbol:node:17".into(),
+            kind: SupportUnitKindDto::SymbolLocation,
+            summary: "Navigation only: no bounded source range for node:17".into(),
+            path: None,
+            symbol_id: Some("17".into()),
+            start_line: None,
             end_line: None,
-            snippet: Some(snippet.to_string()),
+            snippet: None,
             edge_kind: None,
             from_symbol: None,
             to_symbol: None,
             query: None,
-        };
-
-        let support = compile_support_units_with_source_ranges(
-            &packet.answer,
-            &[
-                source_range("source:retained", "Router.dispatch", "fn dispatch() {}"),
-                source_range("source:dropped", "Dropped.symbol", "fn dropped() {}"),
-                source_range("source:empty", "Router.dispatch", ""),
-            ],
-        );
-
-        assert_eq!(support.len(), 2);
-        assert_eq!(support[0].kind, SupportUnitKindDto::SymbolLocation);
-        assert_eq!(support[1].kind, SupportUnitKindDto::SourceRange);
-        assert_eq!(support[1].id, "source:retained");
-    }
-
-    #[test]
-    fn one_citation_is_not_automatically_supported_when_a_named_path_is_unread() {
-        let mut packet = test_packet("explain src/unread.rs", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation(
-            "OnlyHit",
-            "crates/codestory-runtime/src/agent/packet_budget.rs",
-        )];
-        packet.plan = PacketPlanDto {
-            probe_resolutions: vec![PacketProbeResolutionDto {
-                input_index: 0,
-                probe: PacketProbeDto::ExactPath {
-                    path: "src/unread.rs".to_string(),
-                },
-                status: PacketProbeResolutionStatusDto::ExactPath,
-                normalized_query: None,
-                path: Some("src/unread.rs".to_string()),
-                symbol_id: None,
-                candidates: Vec::new(),
-                rejection: None,
-            }],
-            ..empty_plan()
-        };
-
-        let (support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-        assert_eq!(support.len(), 1, "one citation still compiles as support");
-        assert_eq!(disposition.kind, PacketDispositionKindDto::DrillOnce);
-        let drill = disposition.drill.expect("drill plan");
-        assert_eq!(drill.remaining_rounds, 1);
-        assert!(
-            drill
-                .options
-                .iter()
-                .any(|option| option.path.as_deref() == Some("src/unread.rs")),
-            "{drill:?}"
-        );
-    }
-
-    #[test]
-    fn unresolved_named_path_after_drill_is_terminal_not_established() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation(
-            "OnlyHit",
-            "crates/codestory-runtime/src/agent/packet_budget.rs",
-        )];
-        packet.plan = PacketPlanDto {
-            probe_resolutions: vec![PacketProbeResolutionDto {
-                input_index: 0,
-                probe: PacketProbeDto::ExactPath {
-                    path: "src/unread.rs".to_string(),
-                },
-                status: PacketProbeResolutionStatusDto::ExactPath,
-                normalized_query: None,
-                path: Some("src/unread.rs".to_string()),
-                symbol_id: None,
-                candidates: Vec::new(),
-                rejection: None,
-            }],
-            ..empty_plan()
-        };
-        let request = AgentPacketRequestDto {
-            question: packet.question.clone(),
-            budget: Default::default(),
-            task_class: None,
-            probes: Vec::new(),
-            extra_probes: Vec::new(),
-            include_evidence: true,
-            latency_budget_ms: None,
-            parent_packet_id: Some(packet.packet_id.clone()),
-            option_ids: vec!["bounded_source_read:src%2Funread.rs".to_string()],
-            core_generation_id: None,
-            retrieval_generation: None,
-        };
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            Some(&request),
-        );
-        assert_ne!(disposition.kind, PacketDispositionKindDto::DrillOnce);
-        assert!(disposition.is_terminal());
-        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
-    }
-
-    #[test]
-    fn complete_zero_hit_is_not_established_not_a_search_loop() {
-        let mut packet = test_packet("no such symbol xyzzy", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations.clear();
-        packet.answer.retrieval_trace.packet_sidecar_diagnostics =
-            vec![codestory_contracts::api::PacketSidecarQueryDiagnosticDto {
-                query: "xyzzy".to_string(),
-                completion: PacketQueryCompletionDto::Completed,
-                retrieval_mode: "full".to_string(),
-                sidecar_query_ms: None,
-                candidate_resolution_ms: None,
-                total_elapsed_ms: None,
-                sidecar_stage_count: 1,
-                sidecar_stage_total_ms: None,
-                batch_query_wall_ms: None,
-                candidate_count: 0,
-                resolved_hit_count: 0,
-                unresolved_candidate_count: 0,
-                blocking_unresolved_candidate_count: 0,
-                semantic_stage_timeout_zero_hits: false,
-                semantic_abstained: false,
-                diagnostic: None,
-            }];
-
-        let (support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-        assert!(
-            support
-                .iter()
-                .any(|unit| unit.kind == SupportUnitKindDto::CompleteQueryNegative)
-        );
-        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
-    }
-
-    #[test]
-    fn retrieval_error_is_unavailable() {
-        let mut packet = test_packet("explain routing", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.retrieval_trace.steps = vec![AgentRetrievalStepDto {
-            kind: AgentRetrievalStepKindDto::Search,
-            status: AgentRetrievalStepStatusDto::Error,
-            duration_ms: 1,
-            input: Vec::new(),
-            output: Vec::new(),
-            message: Some("sidecar crashed".to_string()),
         }];
-
-        let (_support, disposition) = compile_packet_evidence(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            None,
-        );
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Unavailable);
+        let paths = HashMap::from([("node:17".into(), "src/large.rs".into())]);
+        attach_file_navigation_paths(&mut support, &paths);
+        assert_eq!(support[0].path.as_deref(), Some("src/large.rs"));
+        assert!(support[0].summary.starts_with("Navigation only:"));
+        assert!(support[0].snippet.is_none());
     }
 
     #[test]
-    fn budget_cannot_drop_drill_options_or_change_disposition() {
-        let mut packet = test_packet("explain src/unread.rs", 98_304);
-        packet.answer.freshness = Some(fresh_index_observation());
-        packet.answer.citations = vec![eligible_citation(
-            "OnlyHit",
-            "crates/codestory-runtime/src/agent/packet_budget.rs",
-        )];
-        packet.plan = PacketPlanDto {
-            probe_resolutions: vec![PacketProbeResolutionDto {
-                input_index: 0,
-                probe: PacketProbeDto::ExactPath {
-                    path: "src/unread.rs".to_string(),
+    fn packet_file_admissions_distinguish_verified_budget_from_source_drift() {
+        let project = tempfile::tempdir().expect("project");
+        let controller = AppController::new();
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let mut storage = Store::new_in_memory().expect("store");
+        let path = project.path().join("large.rs");
+        let source = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &source).expect("source");
+        let mut file = FileInfo {
+            id: 17,
+            path: path.clone(),
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 120,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).expect("file");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("pinned hash");
+        storage
+            .insert_nodes_batch(&[CoreNode {
+                id: CoreNodeId(17),
+                kind: CoreNodeKind::FILE,
+                serialized_name: "large.rs".into(),
+                file_node_id: Some(CoreNodeId(17)),
+                start_line: Some(1),
+                ..Default::default()
+            }])
+            .expect("file node");
+        let admissions = ["path:large.rs", "node:17"]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, stable_identity)| PacketAdmissionReceiptV1 {
+                packet_ordinal: ordinal as u32,
+                stable_identity: stable_identity.into(),
+                score_version: "test".into(),
+                reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            })
+            .collect::<Vec<_>>();
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("packet hydration");
+        assert_eq!(authenticated.len(), 2);
+        assert!(sources.is_empty());
+        assert_eq!(paths.get("node:17").map(String::as_str), Some("large.rs"));
+        assert_eq!(gaps.len(), 2);
+        assert!(
+            gaps.iter()
+                .all(|gap| matches!(gap.kind, PacketAdmissionGapKindV1::SourceBudgetExceeded))
+        );
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "test".into(),
+                core_generation_id: "pinned".into(),
+                retrieval_generation: None,
+            },
+            admissions: authenticated.into_iter().map(|item| item.receipt).collect(),
+            sources,
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: gaps,
+        };
+        let mut product = compile_repository_evidence(&input);
+        attach_file_navigation_paths(&mut product.support, &paths);
+        assert_eq!(product.support.len(), 2);
+        assert!(product.support.iter().all(|unit| {
+            unit.kind == SupportUnitKindDto::SymbolLocation
+                && unit.path.as_deref() == Some("large.rs")
+                && unit.snippet.is_none()
+                && unit.summary.starts_with("Navigation only:")
+        }));
+        assert_eq!(product.continuation.len(), 2);
+        assert!(
+            product.continuation.iter().all(|option| {
+                option.reason == PacketStructuralGapReasonV1::SourceBudgetExceeded
+            })
+        );
+
+        std::fs::write(&path, source.replace("line 1", "xxxx 1")).expect("drift");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("packet drift check");
+        assert!(authenticated.is_empty());
+        assert!(sources.is_empty());
+        assert!(paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+        assert!(
+            gaps.iter()
+                .all(|gap| matches!(gap.kind, PacketAdmissionGapKindV1::SourceUnavailable))
+        );
+
+        std::fs::write(&path, &source).expect("restore source");
+        storage
+            .update_file_metadata(&file, None)
+            .expect("remove pinned hash");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("missing hash check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+
+        file.complete = false;
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("incomplete file metadata");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("incomplete metadata check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+
+        let outside = tempfile::tempdir().expect("outside project");
+        file.complete = true;
+        file.path = outside.path().join("outside.rs");
+        std::fs::write(&file.path, &source).expect("outside source");
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+            )
+            .expect("mismatched file path");
+        let mut gaps = Vec::new();
+        let (authenticated, sources, paths) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps)
+                .expect("path containment check");
+        assert!(authenticated.is_empty() && sources.is_empty() && paths.is_empty());
+        assert_eq!(gaps.len(), 2);
+    }
+
+    #[test]
+    fn unknown_query_continuations_are_not_decoded() {
+        assert!(drill_options_from_ids(&["deadline_lost_candidate:diagnostic".into()]).is_empty());
+    }
+
+    #[test]
+    fn stable_symbol_continuation_round_trips_without_query_text() {
+        let original = DrillOptionDto::omitted_symbol("gap", "node-1");
+        let decoded = drill_options_from_ids(&[original.id]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].symbol_id.as_deref(), Some("node-1"));
+        assert!(decoded[0].structural_reason.is_some());
+    }
+
+    #[test]
+    fn uncertain_relation_is_not_compiler_evidence() {
+        assert_eq!(
+            relation_certainty(Some(ResolutionCertainty::Uncertain)),
+            PacketRelationCertaintyV1::Uncertain
+        );
+    }
+
+    #[test]
+    fn numeric_confidence_cannot_upgrade_missing_certainty() {
+        assert_eq!(relation_certainty(None), PacketRelationCertaintyV1::Unknown);
+    }
+
+    #[test]
+    fn missing_or_invalid_source_bounds_never_become_line_one_source() {
+        for (start_line, end_line) in [
+            (None, Some(3)),
+            (Some(3), None),
+            (Some(0), Some(3)),
+            (Some(4), Some(3)),
+        ] {
+            assert_eq!(valid_source_bounds(start_line, end_line), None);
+        }
+        assert_eq!(valid_source_bounds(Some(3), Some(4)), Some((3, 4)));
+    }
+
+    #[test]
+    fn public_symbol_identity_requires_a_node_in_the_pinned_core() {
+        let mut storage = Store::new_in_memory().expect("store");
+        assert!(
+            authenticated_node(&storage, "not-an-id")
+                .expect("invalid identities are rejected")
+                .is_none()
+        );
+        assert!(
+            authenticated_node(&storage, "-42")
+                .expect("missing identities are rejected")
+                .is_none()
+        );
+        storage
+            .insert_nodes_batch(&[CoreNode {
+                id: CoreNodeId(-42),
+                kind: CoreNodeKind::FUNCTION,
+                serialized_name: "crate::real".into(),
+                ..Default::default()
+            }])
+            .expect("insert authenticated node");
+        assert_eq!(
+            authenticated_node(&storage, "-42")
+                .expect("lookup")
+                .expect("authenticated node")
+                .id,
+            CoreNodeId(-42)
+        );
+    }
+
+    #[test]
+    fn path_admissions_participate_in_the_induced_relation_graph() {
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
                 },
-                status: PacketProbeResolutionStatusDto::ExactPath,
-                normalized_query: None,
-                path: Some("src/unread.rs".to_string()),
-                symbol_id: None,
-                candidates: Vec::new(),
-                rejection: None,
-            }],
-            ..empty_plan()
-        };
-        apply_compiled_evidence(&mut packet, None);
-        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::DrillOnce);
-        let option_ids = packet
-            .disposition
-            .drill
-            .as_ref()
-            .expect("drill plan")
-            .options
-            .iter()
-            .map(|option| option.id.clone())
-            .collect::<Vec<_>>();
-        assert!(!option_ids.is_empty());
-        crate::agent::packet_budget::enforce_packet_output_budget(
-            Path::new("/workspace/CodeStory"),
-            &mut packet,
-        );
-        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::DrillOnce);
-        let retained = packet
-            .disposition
-            .drill
-            .as_ref()
-            .expect("drill plan after budget")
-            .options
-            .iter()
-            .map(|option| option.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(retained, option_ids);
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/b.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(3),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert file nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::IMPORT,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(3),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert import edge");
+        let admissions = [
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 0,
+                    stable_identity: "path:src/a.rs".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(1),
+            },
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 1,
+                    stable_identity: "path:src/b.rs".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(2),
+            },
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 2,
+                    stable_identity: "node:3".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(3),
+            },
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].from_identity, "path:src/a.rs");
+        assert_eq!(relations[0].to_identity, "path:src/b.rs");
+        assert_eq!(relations[0].relation_kind, PacketRelationKindV1::Import);
+        assert_eq!(relations[1].from_identity, "path:src/a.rs");
+        assert_eq!(relations[1].to_identity, "node:3");
+        assert_eq!(relations[1].relation_kind, PacketRelationKindV1::Member);
     }
 
-    // -----------------------------------------------------------------------
-    // Stage 2: R5 reconciliation after compile
-    // -----------------------------------------------------------------------
-
-    /// Finalizes the mapper fixture so `mapper_config` is formula-proven
-    /// through its atom receipts (a certain TYPE_USAGE edge, the builder's
-    /// MEMBER-onto-METHOD edge, and a reread configuration source range).
-    fn finalized_mapper_proof_packet() -> AgentPacketDto {
-        let mut packet = crate::agent::packet_budget::tests::mapper_proof_packet();
-        codestory_agent::packet_obligations::finalize_packet_obligation_plan(
-            &packet.question.clone(),
-            packet.plan.task_class,
-            &mut packet.plan.obligations,
-            &packet.answer,
-            &packet.budget,
-            &packet.support.clone(),
-            &PacketProofEvidenceExtras::default(),
-        );
-        assert_eq!(
-            mapper_config_obligation(&packet).proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "fixture must start formula-proven"
-        );
-        packet
-    }
-
-    fn mapper_config_obligation(packet: &AgentPacketDto) -> &PacketClaimObligationDto {
-        packet
-            .plan
-            .obligations
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.id == "mapper_config")
-            .expect("mapper_config obligation")
-    }
-
-    /// R5 control: when every receipt survives compile, nothing is demoted
-    /// and the compiled disposition stands.
     #[test]
-    fn reconciliation_keeps_formula_proof_whose_receipts_survive_compile() {
-        let mut packet = finalized_mapper_proof_packet();
-
-        apply_compiled_evidence_with_proof_reconciliation(
-            &mut packet,
-            None,
-            &PacketProofEvidenceExtras::default(),
-        );
-
-        let obligation = mapper_config_obligation(&packet);
+    fn source_receipts_require_observed_numbered_lines() {
+        assert_eq!(source_receipt_line_range("source without a receipt"), None);
         assert_eq!(
-            obligation.proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "{obligation:?}"
+            source_receipt_line_range("```text\n>    7 | fn run() {}\n     8 | }\n```"),
+            Some((7, 8))
         );
-        assert!(
-            packet.support.iter().any(|unit| {
-                unit.kind == SupportUnitKindDto::SourceRange
-                    && unit.symbol_id.as_deref() == Some("MapperConfiguration")
-            }),
-            "the A2 receipt must survive compile for this control to be meaningful"
-        );
-    }
-
-    /// R5: a formula-proven obligation whose receipt is absent from the
-    /// compiled support is demoted fail-closed with the recorded reason, and
-    /// the disposition is recomputed on the post-demotion state — a fresh
-    /// compile of the returned packet yields the same disposition.
-    #[test]
-    fn reconciliation_demotes_formula_proof_and_recomputes_disposition() {
-        let mut packet = finalized_mapper_proof_packet();
-        // A budget-style loss between finalize and compile: the configuration
-        // citation is gone, so compile drops the A2 source-range receipt.
-        packet
-            .answer
-            .citations
-            .retain(|citation| citation.node_id.0 != "MapperConfiguration");
-
-        apply_compiled_evidence_with_proof_reconciliation(
-            &mut packet,
-            None,
-            &PacketProofEvidenceExtras::default(),
-        );
-
-        let obligation = mapper_config_obligation(&packet);
-        assert_ne!(
-            obligation.proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "missing receipts must demote fail-closed: {obligation:?}"
-        );
-        assert_eq!(
-            obligation.reason.as_deref(),
-            Some("flow_proof_receipts_missing_after_compile")
-        );
-        assert!(
-            !packet.support.iter().any(|unit| {
-                unit.kind == SupportUnitKindDto::SourceRange
-                    && unit.symbol_id.as_deref() == Some("MapperConfiguration")
-            }),
-            "compile must actually have dropped the receipt for this test to bite"
-        );
-        // Disposition and obligations agree at return: recompiling the
-        // post-demotion state reproduces the returned disposition exactly.
-        let (_support, recompiled) = compile_packet_evidence_with_source_ranges(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            &packet.support,
-            None,
-        );
-        assert_eq!(
-            packet.disposition, recompiled,
-            "packet.disposition must be the disposition of the post-demotion state"
-        );
-    }
-
-    /// Pins the property R5's single-recompile argument rests on: compiling
-    /// support is idempotent on its own output. If a future support-side
-    /// change breaks `compile(answer, S1) == S1` for `S1 = compile(answer,
-    /// S0)`, the one-pass reconciliation in
-    /// `apply_compiled_evidence_with_proof_reconciliation` would no longer be
-    /// provably sufficient — this test makes that break loud.
-    #[test]
-    fn compile_support_units_are_idempotent_on_their_own_output() {
-        let packet = finalized_mapper_proof_packet();
-
-        let first = compile_support_units_with_source_ranges(&packet.answer, &packet.support);
-        let second = compile_support_units_with_source_ranges(&packet.answer, &first);
-
-        assert!(
-            first
-                .iter()
-                .any(|unit| unit.kind == SupportUnitKindDto::SourceRange),
-            "the fixture must retain a SourceRange unit for the property to bite"
-        );
-        assert_eq!(
-            second, first,
-            "compiling support must be idempotent on its own output"
-        );
-    }
-
-    /// R2 visibility (landed together with the budget-cap protection
-    /// widening): retained TYPE_USAGE and USAGE atom receipts appear in the
-    /// scored typed-support payload, while kinds outside the allow-list stay
-    /// excluded.
-    #[test]
-    fn typed_support_allow_list_carries_type_usage_and_usage_edges() {
-        let mut seen = std::collections::BTreeSet::new();
-        let node = |id: &str| codestory_contracts::api::GraphNodeDto {
-            id: codestory_contracts::api::NodeId(id.to_string()),
-            label: id.to_string(),
-            kind: codestory_contracts::api::NodeKind::CLASS,
-            depth: 1,
-            label_policy: None,
-            badge_visible_members: None,
-            badge_total_members: None,
-            merged_symbol_examples: Vec::new(),
-            file_path: None,
-            qualified_name: None,
-            member_access: None,
-        };
-        let edge = |id: &str, kind: EdgeKind| codestory_contracts::api::GraphEdgeDto {
-            id: codestory_contracts::api::EdgeId(id.to_string()),
-            source: codestory_contracts::api::NodeId("builder".to_string()),
-            target: codestory_contracts::api::NodeId("config".to_string()),
-            kind,
-            confidence: None,
-            certainty: Some("certain".to_string()),
-            callsite_identity: None,
-            candidate_targets: Vec::new(),
-        };
-        let graph = GraphResponse {
-            center_id: codestory_contracts::api::NodeId("builder".to_string()),
-            nodes: vec![node("builder"), node("config")],
-            edges: vec![
-                edge("uses-config", EdgeKind::TYPE_USAGE),
-                edge("uses-var", EdgeKind::USAGE),
-                edge("overrides", EdgeKind::OVERRIDE),
-            ],
-            truncated: false,
-            omitted_edge_count: 0,
-            canonical_layout: None,
-        };
-        let units = typed_edge_support_units(&graph, &mut seen);
-        let kinds = units
-            .iter()
-            .filter_map(|unit| unit.edge_kind.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            ["TYPE_USAGE", "USAGE"],
-            "atom receipt kinds must be visible and OVERRIDE must stay excluded"
-        );
-        assert!(
-            units
-                .iter()
-                .all(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
-        );
-        assert_eq!(units[0].summary, "`builder` TYPE_USAGE `config`");
     }
 }

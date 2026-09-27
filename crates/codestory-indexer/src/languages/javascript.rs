@@ -42,11 +42,12 @@ use super::typescript::{
     collect_typescript_imported_type_bindings, typescript_property_belongs_to_owner,
 };
 use crate::{
-    CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualReceiverCallSpec,
-    ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey, ReceiverOwnerBinding,
-    collect_receiver_call_specs_in_callable, declaration_name, enclosing_node_with_kind,
-    javascript_binding_has_prior_write, js_like_callable_source_name,
-    js_ts_local_binding_visible_at_call, js_ts_visible_local_type_name, member_call_method_col,
+    CompiledLanguageRules, GraphNodeSpan, ImportedTypeBinding, LanguageRuleset,
+    ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
+    ReceiverCallSiteKey, ReceiverOwnerBinding, collect_receiver_call_specs_in_callable,
+    declaration_name, enclosing_node_with_kind, javascript_binding_has_prior_write,
+    js_like_callable_source_name, js_ts_local_binding_visible_at_call,
+    js_ts_visible_local_type_name, member_call_method_col,
     normalize_js_ts_private_receiver_surface, normalize_parameter_name,
     normalized_receiver_variable, receiver_call_belongs_to_callable, receiver_callsite_key,
     same_ts_span, trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
@@ -58,6 +59,45 @@ pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
 
 /// Callsite marker for a bare call whose exact local name is also a runtime import binding.
 pub(crate) const RUNTIME_IMPORT_CALLSITE_MARKER: &str = "syntax:js-runtime-import-call";
+
+/// A named expression's private binding has no unscoped lookup authority.
+pub(crate) const PRIVATE_NAME_CALLSITE_MARKER: &str = "syntax:js-private-name-call";
+
+pub(crate) fn private_name_call_spans(tree: &Tree, source: &str) -> HashSet<GraphNodeSpan> {
+    let mut spans = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |call| {
+        if call.kind() != "call_expression" {
+            return;
+        }
+        let Some(target) = call
+            .child_by_field_name("function")
+            .filter(|target| target.kind() == "identifier")
+        else {
+            return;
+        };
+        let Some(name) = trimmed_node_text(target, source) else {
+            return;
+        };
+        let mut ancestor = call.parent();
+        while let Some(scope) = ancestor {
+            if matches!(scope.kind(), "function_expression" | "generator_function")
+                && scope
+                    .child_by_field_name("name")
+                    .and_then(|binding| trimmed_node_text(binding, source))
+                    .as_deref()
+                    == Some(name.as_str())
+            {
+                // Nested callable bodies still close over this private name.
+                // Without a complete binding resolution, do not guess at a
+                // same-spelled outer declaration, parameter, or local shadow.
+                spans.insert(ts_node_graph_span(target));
+                break;
+            }
+            ancestor = scope.parent();
+        }
+    });
+    spans
+}
 
 const GRAPH_QUERY: &str = include_str!("../../rules/javascript.scm");
 

@@ -339,7 +339,9 @@ fn ruby_visible_local_receiver_owner(
         if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
             return;
         }
-        let owner_name = if node.kind() == "operator_assignment" {
+        let owner_name = if node.kind() == "operator_assignment"
+            || ruby_assignment_is_conditional(node, callable, source)
+        {
             None
         } else {
             node.child_by_field_name("right")
@@ -347,8 +349,65 @@ fn ruby_visible_local_receiver_owner(
         };
         visible_bindings.push((node.end_byte(), owner_name));
     });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
+    match visible_bindings.as_slice() {
+        [] => None,
+        [(_, owner)] => Some(owner.clone()),
+        _ => Some(None),
+    }
+}
+
+pub(crate) fn execution_child_is_conditional(
+    parent: TsNode<'_>,
+    child: TsNode<'_>,
+    source: &str,
+) -> bool {
+    matches!(
+        parent.kind(),
+        "if" | "unless"
+            | "elsif"
+            | "else"
+            | "case"
+            | "when"
+            | "while"
+            | "until"
+            | "for"
+            | "block"
+            | "do_block"
+            | "rescue"
+            | "ensure"
+            | "if_modifier"
+            | "unless_modifier"
+            | "while_modifier"
+            | "until_modifier"
+            | "rescue_modifier"
+            | "conditional"
+            | "case_match"
+            | "in_clause"
+    ) || (parent.kind() == "binary"
+        && parent
+            .child_by_field_name("operator")
+            .and_then(|operator| trimmed_node_text(operator, source))
+            .is_some_and(|operator| matches!(operator.as_str(), "&&" | "||" | "and" | "or"))
+        && parent
+            .child_by_field_name("right")
+            .is_some_and(|right| right.id() == child.id()))
+}
+
+fn ruby_assignment_is_conditional(
+    mut node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> bool {
+    while let Some(parent) = node.parent() {
+        if same_ts_span(parent, callable) {
+            break;
+        }
+        if execution_child_is_conditional(parent, node, source) {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 /// Receiver and member of one Ruby member call, read from the grammar.

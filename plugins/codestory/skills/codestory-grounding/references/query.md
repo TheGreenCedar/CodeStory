@@ -20,7 +20,7 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 | `filter(...)` | Filters current items | optional `kind`, `file`, and `depth` |
 | `limit(5)` | Truncates current items | positional integer, or `n: 5` |
 
-Unknown operation names, unknown named arguments, invalid node kinds, and malformed strings are rejected with a caret pointing at the bad query segment. `query` is not a SQL interface; use `search --query <term> --why` for raw discovery or the graph-query DSL examples below for pipelines.
+Unknown operation names, unknown named arguments, invalid node kinds, and malformed strings are rejected with a caret pointing at the bad query segment. `query` is not a SQL interface; use `search --query <term>` for raw discovery or the graph-query DSL examples below for pipelines.
 
 ## Examples
 

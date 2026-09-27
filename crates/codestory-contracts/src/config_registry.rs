@@ -57,6 +57,7 @@ pub const INDEX_LEGACY_EDGE_IDENTITY_ENV: &str = "CODESTORY_INDEX_LEGACY_EDGE_ID
 pub const INDEX_SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 pub const INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256_ENV: &str =
     "CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256";
+pub const INTERNAL_EMBED_INVOCATION_GROUP_ENV: &str = "CODESTORY_INTERNAL_EMBED_INVOCATION_GROUP";
 pub const LATEST_RELEASE_VERSION_ENV: &str = "CODESTORY_LATEST_RELEASE_VERSION";
 pub const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 pub const LOG_ENV: &str = "CODESTORY_LOG";
@@ -115,6 +116,10 @@ pub const SUMMARY_MODEL_ENV: &str = "CODESTORY_SUMMARY_MODEL";
 pub const SUMMARY_TIMEOUT_SECS_ENV: &str = "CODESTORY_SUMMARY_TIMEOUT_SECS";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 pub const TEST_EMBED_ALLOW_CPU_ENV: &str = "CODESTORY_TEST_EMBED_ALLOW_CPU";
+pub const TEST_CORE_PUBLICATION_ABORT_POINT_ENV: &str =
+    "CODESTORY_TEST_CORE_PUBLICATION_ABORT_POINT";
+pub const TEST_CORE_PUBLICATION_ABORT_SENTINEL_ENV: &str =
+    "CODESTORY_TEST_CORE_PUBLICATION_ABORT_SENTINEL";
 pub const TEST_PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 
 /// Value shape a setting accepts.
@@ -242,6 +247,7 @@ const RUNTIME_SEARCH_ENGINE: &str = "crates/codestory-runtime/src/search/engine.
 const RUNTIME_TRACE_EXPORT: &str = "crates/codestory-runtime/src/agent/trace_export.rs";
 const STORE_HELPERS: &str = "crates/codestory-store/src/storage_impl/helpers.rs";
 const STORE_IMPL: &str = "crates/codestory-store/src/storage_impl/mod.rs";
+const STORE_CORE_GENERATION: &str = "crates/codestory-store/src/core_generation.rs";
 
 const fn setting(
     name: &'static str,
@@ -416,6 +422,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Text,
         SettingAudience::Diagnostic,
         "Expected embedding-server executable digest the transport verifies before connecting.",
+    ),
+    setting(
+        INTERNAL_EMBED_INVOCATION_GROUP_ENV,
+        CLI_EMBEDDING_SERVER_TRANSPORT,
+        SettingKind::Boolean,
+        SettingAudience::Diagnostic,
+        "On macOS, exact value `1` keeps private qualification embedding servers in the caller's invocation group; other present values are rejected. Ignored on other platforms.",
     ),
     setting(
         LATEST_RELEASE_VERSION_ENV,
@@ -801,6 +814,20 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Boolean,
         SettingAudience::Diagnostic,
         "Builds the symbol full-text index (default on).",
+    ),
+    setting(
+        TEST_CORE_PUBLICATION_ABORT_POINT_ENV,
+        STORE_CORE_GENERATION,
+        SettingKind::Text,
+        SettingAudience::Testing,
+        "Named crash-injection point during immutable core publication (tests only).",
+    ),
+    setting(
+        TEST_CORE_PUBLICATION_ABORT_SENTINEL_ENV,
+        STORE_CORE_GENERATION,
+        SettingKind::Path,
+        SettingAudience::Testing,
+        "Sentinel path written before aborting an immutable core publication (tests only).",
     ),
     setting(
         TEST_EMBED_ALLOW_CPU_ENV,

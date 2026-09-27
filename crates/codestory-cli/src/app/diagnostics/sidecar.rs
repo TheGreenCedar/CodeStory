@@ -46,11 +46,13 @@ pub(in crate::app::diagnostics) fn readiness_sidecar_input(
 }
 
 pub(crate) fn doctor_sidecar_status(runtime: &RuntimeContext) -> RetrievalStatusOutput {
-    doctor_sidecar_status_from_observation(
+    let mut status = doctor_sidecar_status_from_observation(
         runtime
             .activation
             .retrieval_status(&runtime.project_root, &runtime.storage_path),
-    )
+    );
+    status.legacy_retirement = observe_legacy_retirement(runtime);
+    status
 }
 
 pub(in crate::app::diagnostics) fn doctor_sidecar_status_for_profile(
@@ -58,12 +60,32 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_for_profile(
     profile: codestory_runtime::RuntimeRetrievalProfile,
     run_id: Option<&str>,
 ) -> RetrievalStatusOutput {
-    doctor_sidecar_status_from_observation(runtime.activation.retrieval_status_for_profile(
-        &runtime.project_root,
-        &runtime.storage_path,
-        profile,
-        run_id,
-    ))
+    let mut status =
+        doctor_sidecar_status_from_observation(runtime.activation.retrieval_status_for_profile(
+            &runtime.project_root,
+            &runtime.storage_path,
+            profile,
+            run_id,
+        ));
+    status.legacy_retirement = observe_legacy_retirement(runtime);
+    status
+}
+
+fn observe_legacy_retirement(
+    runtime: &RuntimeContext,
+) -> Option<codestory_runtime::LegacyRetirementReport> {
+    match runtime
+        .activation
+        .observe_legacy_retirement(&runtime.storage_path)
+    {
+        Ok(report) if report.pending => Some(report),
+        Ok(_) => None,
+        Err(error) => Some(codestory_runtime::LegacyRetirementReport {
+            pending: true,
+            errors: vec![format!("legacy retirement observation failed: {error}")],
+            ..codestory_runtime::LegacyRetirementReport::default()
+        }),
+    }
 }
 
 fn doctor_sidecar_status_from_observation(
@@ -161,6 +183,7 @@ fn doctor_sidecar_status_from_report_with_lease(
         precise_semantic_import_reason,
         precise_semantic_import_revision,
         precise_semantic_import_producer,
+        legacy_retirement: None,
         ready_lease,
     }
 }
@@ -191,6 +214,7 @@ fn doctor_sidecar_status_error_with_lease(
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+        legacy_retirement: None,
         ready_lease,
     }
 }

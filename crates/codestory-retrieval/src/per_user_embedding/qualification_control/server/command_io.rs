@@ -359,8 +359,11 @@ pub(in crate::per_user_embedding) fn poll_server_qualification_command(
     )?;
     control.mark_command_processed(command_sha256);
     if crash {
-        transport.fail_stop("embedding_qualification_crash");
+        // Drain before fail-stop so the accept loop and endpoint release see
+        // the crash even if process termination is delayed on a host where
+        // CRT abort stalls. Fail-stop itself must still make the PID exit.
         state.draining.store(true, Ordering::Release);
+        transport.fail_stop("embedding_qualification_crash");
     }
     Ok(())
 }

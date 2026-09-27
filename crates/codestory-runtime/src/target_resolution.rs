@@ -137,6 +137,7 @@ pub(crate) struct ResolutionRank {
     collection_definition_path: u8,
     concrete_exact_anchor: u8,
     exact_display: u8,
+    dotted_owner_exact: u8,
     exact_terminal: u8,
     exact_leading: u8,
     exact_case_match: u8,
@@ -177,6 +178,7 @@ pub(crate) fn resolution_rank_with_project_root(
         collection_definition_path: collection_definition_path_bucket(query, hit),
         concrete_exact_anchor: concrete_exact_anchor_bucket(query, hit),
         exact_display: rank.exact_display,
+        dotted_owner_exact: u8::from(dotted_owner_method_match(query, hit)),
         exact_terminal: rank.exact_terminal,
         exact_leading: rank.exact_leading,
         exact_case_match: exact_case_match_bucket(query, hit),
@@ -210,6 +212,9 @@ pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> b
     if rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0 {
         return true;
     }
+    if dotted_owner_method_match(query, hit) {
+        return true;
+    }
     if inexact_query_prefix_match_bucket(query, hit) != 0 {
         return true;
     }
@@ -225,6 +230,22 @@ pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> b
     let terminal = crate::terminal_symbol_segment(&hit.display_name);
     let leading = crate::leading_symbol_segment(&hit.display_name);
     display.starts_with(&query) || terminal.starts_with(&query) || leading.starts_with(&query)
+}
+
+fn dotted_owner_method_match(query: &str, hit: &SearchHit) -> bool {
+    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let query = crate::normalize_symbol_query(query);
+    let Some((owner, method)) = query.split_once('.') else {
+        return false;
+    };
+    if owner.is_empty() || method.is_empty() || method.contains('.') {
+        return false;
+    }
+    crate::normalize_symbol_query(&hit.display_name)
+        .strip_suffix(&query)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 pub(crate) fn is_resolvable_graph_target(query: &str, hit: &SearchHit) -> bool {
@@ -922,7 +943,6 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
                 .unwrap_or(PacketEvidenceResolutionDto::Resolved),
         ),
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -1098,7 +1118,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -1259,7 +1278,7 @@ mod tests {
             hit.resolution_status,
             Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
         assert!(hit.resolvable, "the cited source range remains navigable");
         assert!(!is_graph_target_candidate(&hit));
         assert!(!is_resolvable_graph_target("demo", &hit));
@@ -1311,7 +1330,7 @@ mod tests {
             hit.resolution_status,
             Some(PacketEvidenceResolutionDto::SourceRangeOnly)
         );
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
         assert!(hit.resolvable, "the cited source range remains navigable");
         assert!(!is_graph_target_candidate(&hit));
         assert!(matches!(

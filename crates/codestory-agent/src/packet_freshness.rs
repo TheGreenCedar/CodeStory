@@ -1,4 +1,4 @@
-//! Typed freshness input to packet sufficiency (EV-7).
+//! Typed freshness input to packet evidence availability (EV-7).
 //!
 //! Serving and proving are separate questions. The runtime serving waiver
 //! (`index_freshness_admits_operation`) deliberately keeps a bounded-inventory repository usable:
@@ -8,9 +8,9 @@
 //!
 //! What the waiver never established is that the publication still matches the working tree. A
 //! packet assembled over an unobserved publication can cite a symbol that no longer exists, so
-//! reporting it `sufficient` is the false-safe answer #1200 exists to remove. This module carries
-//! that distinction as a type: freshness reaches sufficiency as `Fresh`, `Unknown { cause }`, or
-//! `Stale`, and anything but `Fresh` caps the verdict at `partial` with a typed gap.
+//! treating it as current would be a false-safe result. This module carries
+//! that distinction as a type: packet evidence sees `Fresh`, `Unknown { cause }`, or
+//! `Stale`, and anything but `Fresh` blocks availability with a typed gap.
 //!
 //! `Unknown` is the permanent floor beneath the filesystem observer (EV-7b): when the observer is
 //! unavailable, overflows, or is unsupported on the host, it degrades into a typed cause here
@@ -24,7 +24,7 @@ use codestory_contracts::api::{
 /// without parsing prose.
 pub const PACKET_FRESHNESS_GAP_PREFIX: &str = "freshness";
 
-/// Freshness as packet sufficiency must consume it.
+/// Packet availability must consume the freshness distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketFreshnessInput {
     /// The full planned inventory was compared and matched.
@@ -36,7 +36,7 @@ pub enum PacketFreshnessInput {
 }
 
 impl PacketFreshnessInput {
-    /// Read a freshness observation as a sufficiency input.
+    /// Read a freshness observation as an evidence-availability input.
     ///
     /// The absent observation is `Unknown`, not `Fresh`: on the production path `None` means the
     /// freshness call itself failed, and defaulting a failed check to "fresh" is precisely the
@@ -53,8 +53,8 @@ impl PacketFreshnessInput {
         }
     }
 
-    /// Whether this input forbids reporting broad evidence as sufficient.
-    pub fn caps_sufficiency(self) -> bool {
+    /// Whether this input forbids serving the packet as available evidence.
+    pub fn blocks_packet_availability(self) -> bool {
         !matches!(self, Self::Fresh)
     }
 
@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_inventory_is_unknown_and_caps_sufficiency() {
+    fn bounded_inventory_is_unknown_and_blocks_packet_availability() {
         let freshness = observation(
             IndexFreshnessStatusDto::NotChecked,
             Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
@@ -136,7 +136,7 @@ mod tests {
                 cause: FreshnessUnknownCauseDto::BoundedInventory
             }
         );
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(
             input
                 .gap()
@@ -155,7 +155,7 @@ mod tests {
                 cause: FreshnessUnknownCauseDto::ObservationUnavailable
             }
         );
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod tests {
         let input = PacketFreshnessInput::from_observation(Some(&freshness));
 
         assert_eq!(input, PacketFreshnessInput::Fresh);
-        assert!(!input.caps_sufficiency());
+        assert!(!input.blocks_packet_availability());
         assert_eq!(input.gap(), None);
         assert_eq!(
             FreshnessUnknownCauseDto::for_observation(Some(&freshness)),
@@ -186,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn stale_caps_sufficiency_but_is_not_reported_as_unknown() {
+    fn stale_blocks_packet_availability_but_is_not_reported_as_unknown() {
         let freshness = observation(IndexFreshnessStatusDto::Stale, None);
 
         let input = PacketFreshnessInput::from_observation(Some(&freshness));
 
         assert_eq!(input, PacketFreshnessInput::Stale);
-        assert!(input.caps_sufficiency());
+        assert!(input.blocks_packet_availability());
         assert!(
             input
                 .gap()

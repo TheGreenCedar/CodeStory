@@ -30,7 +30,12 @@ from .foundation import (
     require,
 )
 from .process_identity import ExactProcessExitWaiter
-from .subprocess_control import json_command, run
+from .subprocess_control import (
+    json_command,
+    quality_search_hit_matches,
+    resolve_quality_search_hits,
+    run,
+)
 
 SERVER_PRODUCER_LABEL = "the per-user embedding qualification server"
 _WORKER_LABEL = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -378,15 +383,12 @@ def run_quality_search(
         cwd=project,
         timeout=timeout,
     )
-    hits = payload.get("indexed_symbol_hits")
-    require(isinstance(hits, list), "qualification search omitted indexed symbol hits")
+    hits = resolve_quality_search_hits(payload)
     position = next(
         (
             index
             for index, hit in enumerate(hits)
-            if isinstance(hit, dict)
-            and isinstance(hit.get("display_name"), str)
-            and expected in hit["display_name"]
+            if quality_search_hit_matches(hit, expected)
         ),
         None,
     )

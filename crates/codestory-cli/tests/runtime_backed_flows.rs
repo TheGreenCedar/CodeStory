@@ -1,6 +1,7 @@
 use fs4::fs_std::FileExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -57,6 +58,197 @@ fn run_cli_with_cache(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std:
         .arg("--cache-dir")
         .arg(cache_dir);
     command.output().expect("run codestory-cli")
+}
+
+fn snapshot_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(path).expect("read cache snapshot directory") {
+            let entry = entry.expect("cache snapshot entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("cache snapshot path belongs to root")
+                    .to_path_buf();
+                files.insert(relative, fs::read(path).expect("read cache snapshot file"));
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn index_dry_run_binds_project_before_observational_plan() {
+    let workspace = broad_metadata_workspace();
+    let cache_dir = tempdir().expect("create dry-run cache");
+    let indexed = run_cli_with_cache(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        indexed.status.success(),
+        "fixture index failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&indexed.stderr),
+        String::from_utf8_lossy(&indexed.stdout)
+    );
+    let source_before = snapshot_file_bytes(workspace.path());
+    let cache_before = snapshot_file_bytes(cache_dir.path());
+
+    let dry_run = run_cli_with_cache(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "index",
+            "--refresh",
+            "auto",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "dry-run failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&dry_run.stderr),
+        String::from_utf8_lossy(&dry_run.stdout)
+    );
+    let output: Value = serde_json::from_slice(&dry_run.stdout).expect("parse dry-run output");
+    assert_eq!(output["requested_refresh"], "auto");
+    assert_eq!(output["effective_refresh"], "incremental");
+    assert!(output.get("compatibility_reason").is_none());
+    assert_eq!(output["dry_run"]["files_to_index"], 0);
+    assert_eq!(output["dry_run"]["files_to_remove"], 0);
+    assert_eq!(
+        Path::new(output["dry_run"]["root"].as_str().expect("dry-run root")),
+        fs::canonicalize(workspace.path()).expect("canonical workspace")
+    );
+    assert_eq!(
+        Path::new(
+            output["dry_run"]["storage_path"]
+                .as_str()
+                .expect("dry-run storage path")
+        ),
+        fs::canonicalize(cache_dir.path())
+            .expect("canonical cache")
+            .join("codestory.db")
+    );
+    assert_eq!(
+        snapshot_file_bytes(cache_dir.path()),
+        cache_before,
+        "dry-run must not change cache files or bytes"
+    );
+    assert_eq!(
+        snapshot_file_bytes(workspace.path()),
+        source_before,
+        "dry-run must not change source files or bytes"
+    );
+}
+
+#[test]
+fn index_full_dry_run_plans_empty_cache_without_writing() {
+    let workspace = broad_metadata_workspace();
+    let cache_dir = tempdir().expect("create full dry-run cache");
+    let source_before = snapshot_file_bytes(workspace.path());
+    let cache_before = snapshot_file_bytes(cache_dir.path());
+
+    let dry_run = run_cli_with_cache(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "index",
+            "--refresh",
+            "full",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "full dry-run failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&dry_run.stderr),
+        String::from_utf8_lossy(&dry_run.stdout)
+    );
+    let output: Value = serde_json::from_slice(&dry_run.stdout).expect("parse full dry-run output");
+    assert_eq!(output["requested_refresh"], "full");
+    assert_eq!(output["effective_refresh"], "full");
+    assert!(output.get("compatibility_reason").is_none());
+    assert_eq!(output["dry_run"]["files_to_index"], 1);
+    assert_eq!(output["dry_run"]["files_to_remove"], 0);
+    assert_eq!(
+        Path::new(output["dry_run"]["root"].as_str().expect("dry-run root")),
+        fs::canonicalize(workspace.path()).expect("canonical workspace")
+    );
+    assert_eq!(
+        Path::new(
+            output["dry_run"]["storage_path"]
+                .as_str()
+                .expect("dry-run storage path")
+        ),
+        fs::canonicalize(cache_dir.path())
+            .expect("canonical cache")
+            .join("codestory.db")
+    );
+    assert_eq!(snapshot_file_bytes(cache_dir.path()), cache_before);
+    assert_eq!(snapshot_file_bytes(workspace.path()), source_before);
+}
+
+#[test]
+fn index_auto_dry_run_reports_missing_core_without_writing() {
+    let workspace = broad_metadata_workspace();
+    let cache_dir = tempdir().expect("create auto dry-run cache");
+    let source_before = snapshot_file_bytes(workspace.path());
+    let cache_before = snapshot_file_bytes(cache_dir.path());
+
+    let dry_run = run_cli_with_cache(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "index",
+            "--refresh",
+            "auto",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "auto dry-run failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&dry_run.stderr),
+        String::from_utf8_lossy(&dry_run.stdout)
+    );
+    let output: Value = serde_json::from_slice(&dry_run.stdout).expect("parse auto dry-run output");
+    assert_eq!(output["requested_refresh"], "auto");
+    assert_eq!(output["effective_refresh"], "full");
+    assert_eq!(
+        output["compatibility_reason"],
+        "complete_core_publication_missing"
+    );
+    assert_eq!(output["dry_run"]["files_to_index"], 1);
+    assert_eq!(output["dry_run"]["files_to_remove"], 0);
+    assert_eq!(
+        Path::new(output["dry_run"]["root"].as_str().expect("dry-run root")),
+        fs::canonicalize(workspace.path()).expect("canonical workspace")
+    );
+    assert_eq!(
+        Path::new(
+            output["dry_run"]["storage_path"]
+                .as_str()
+                .expect("dry-run storage path")
+        ),
+        fs::canonicalize(cache_dir.path())
+            .expect("canonical cache")
+            .join("codestory.db")
+    );
+    assert_eq!(snapshot_file_bytes(cache_dir.path()), cache_before);
+    assert_eq!(snapshot_file_bytes(workspace.path()), source_before);
 }
 
 fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> PathBuf {

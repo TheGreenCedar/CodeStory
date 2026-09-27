@@ -1,5 +1,6 @@
 use super::resolution::{CoreAnchorCandidate, resolve_bookmark};
 use super::*;
+use crate::StorageError;
 use tempfile::TempDir;
 
 fn binding(root: &Path, token: &str) -> NativeRootBinding {
@@ -9,6 +10,38 @@ fn binding(root: &Path, token: &str) -> NativeRootBinding {
 fn open_store(dir: &TempDir, token: &str) -> AnnotationStore {
     let path = dir.path().join("annotations.sqlite3");
     AnnotationStore::open_for_write(&path, &binding(dir.path(), token)).expect("open sidecar")
+}
+
+#[test]
+fn rebind_batch_rolls_back_earlier_bookmarks_when_a_later_write_fails() {
+    let dir = tempfile::tempdir().expect("annotation directory");
+    let store = open_store(&dir, "root");
+    let category = store.create_category("Saved").expect("category");
+    let first = store
+        .create_bookmark(category.id, &BookmarkAnchorInput::default())
+        .expect("first bookmark");
+    let second = store
+        .create_bookmark(category.id, &BookmarkAnchorInput::default())
+        .expect("second bookmark");
+    let before = store.bookmarks(None).expect("original bookmarks");
+    store
+        .conn
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_second_rebind BEFORE UPDATE ON bookmark
+             WHEN NEW.uuid = '{}' BEGIN SELECT RAISE(ABORT, 'rebind fault'); END;",
+            second.uuid
+        ))
+        .expect("install scoped write fault");
+    let orphan = AnnotationResolution::Orphaned {
+        reason: OrphanReason::TargetDeleted,
+    };
+    store
+        .apply_resolutions(&[(first.uuid, orphan.clone()), (second.uuid, orphan)])
+        .expect_err("later write error aborts the batch");
+    assert_eq!(
+        store.bookmarks(None).expect("bookmarks after abort"),
+        before
+    );
 }
 
 fn legacy_snapshot() -> LegacyAnnotationSnapshot {
@@ -396,16 +429,20 @@ impl FakeCore {
 }
 
 impl CoreAnchorIndex for FakeCore {
-    fn current_generation(&self) -> Option<i64> {
-        self.generation
+    fn current_generation(&self) -> Result<Option<i64>, StorageError> {
+        Ok(self.generation)
     }
 
-    fn candidates_by_canonical_id(&self, canonical_id: &str) -> Vec<CoreAnchorCandidate> {
-        self.symbols
+    fn candidates_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        Ok(self
+            .symbols
             .iter()
             .filter(|candidate| candidate.canonical_id.as_deref() == Some(canonical_id))
             .cloned()
-            .collect()
+            .collect())
     }
 
     fn candidates_by_anchor_tuple(
@@ -413,8 +450,9 @@ impl CoreAnchorIndex for FakeCore {
         file_identity: &str,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
-        self.symbols
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        Ok(self
+            .symbols
             .iter()
             .filter(|candidate| {
                 candidate.file_identity.as_deref() == Some(file_identity)
@@ -422,22 +460,23 @@ impl CoreAnchorIndex for FakeCore {
                     && candidate.kind == Some(kind)
             })
             .cloned()
-            .collect()
+            .collect())
     }
 
     fn candidates_by_qualified_name(
         &self,
         qualified_name: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
-        self.symbols
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        Ok(self
+            .symbols
             .iter()
             .filter(|candidate| {
                 candidate.qualified_name.as_deref() == Some(qualified_name)
                     && candidate.kind == Some(kind)
             })
             .cloned()
-            .collect()
+            .collect())
     }
 
     fn candidates_by_normalized_signature(
@@ -445,8 +484,9 @@ impl CoreAnchorIndex for FakeCore {
         normalized_signature: &str,
         file_identity: &str,
         kind: i64,
-    ) -> Vec<CoreAnchorCandidate> {
-        self.symbols
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        Ok(self
+            .symbols
             .iter()
             .filter(|candidate| {
                 candidate.normalized_signature.as_deref() == Some(normalized_signature)
@@ -454,7 +494,7 @@ impl CoreAnchorIndex for FakeCore {
                     && candidate.kind == Some(kind)
             })
             .cloned()
-            .collect()
+            .collect())
     }
 }
 
@@ -551,7 +591,7 @@ fn a_position_shifting_edit_re_resolves_the_unchanged_anchor() {
     let bookmark = anchored_bookmark(&store, Some(4));
     let core = FakeCore::at_generation(5).with(candidate(99, "/repo/src/lib.rs", "alpha"));
 
-    let resolution = resolve_bookmark(&bookmark, &core);
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
 
     assert_eq!(resolution.node_id(), Some(99));
     assert_eq!(resolution.status(), ResolutionStatus::Bound);
@@ -570,7 +610,9 @@ fn a_bind_records_how_well_its_evidence_separated_the_symbol() {
         // The same name in another file: the name does not separate it either.
         .with(candidate(101, "/repo/src/other.rs", "alpha"));
 
-    let AnnotationResolution::Bound { evidence, .. } = resolve_bookmark(&bookmark, &crowded) else {
+    let AnnotationResolution::Bound { evidence, .. } =
+        resolve_bookmark(&bookmark, &crowded).expect("resolve bookmark")
+    else {
         panic!("the exact anchor tuple still binds");
     };
     assert_eq!(
@@ -589,7 +631,8 @@ fn a_bind_records_how_well_its_evidence_separated_the_symbol() {
             "sibling",
             OTHER_SIGNATURE,
         ));
-    let AnnotationResolution::Bound { evidence, .. } = resolve_bookmark(&bookmark, &uncrowded)
+    let AnnotationResolution::Bound { evidence, .. } =
+        resolve_bookmark(&bookmark, &uncrowded).expect("resolve bookmark")
     else {
         panic!("the exact anchor tuple still binds");
     };
@@ -605,7 +648,7 @@ fn an_ambiguous_match_never_guesses() {
         .with(candidate(99, "/repo/src/lib.rs", "alpha"))
         .with(candidate(100, "/repo/src/lib.rs", "alpha"));
 
-    let resolution = resolve_bookmark(&bookmark, &core);
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
 
     assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
     assert_eq!(
@@ -631,11 +674,11 @@ fn a_unique_rename_rebinds_only_with_adjacent_generation_evidence() {
         ));
 
     let adjacent = anchored_bookmark(&store, Some(4));
-    let resolution = resolve_bookmark(&adjacent, &core);
+    let resolution = resolve_bookmark(&adjacent, &core).expect("resolve bookmark");
     assert_eq!(resolution.node_id(), Some(99), "adjacent rename rebinds");
 
     let stale = anchored_bookmark(&store, Some(1));
-    let resolution = resolve_bookmark(&stale, &core);
+    let resolution = resolve_bookmark(&stale, &core).expect("resolve bookmark");
     assert_eq!(
         resolution.orphan_reason(),
         Some(OrphanReason::GenerationGap),
@@ -661,7 +704,7 @@ fn a_rename_is_never_inferred_from_evidence_that_already_matched_a_sibling() {
     );
     let core = FakeCore::at_generation(5).with(candidate(100, "/repo/src/lib.rs", "sibling"));
 
-    let resolution = resolve_bookmark(&bookmark, &core);
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
 
     assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
     assert_eq!(
@@ -687,7 +730,7 @@ fn a_rename_is_never_inferred_from_a_signature_with_no_body_behind_it() {
         OUTLINE_SIGNATURE,
     ));
 
-    let resolution = resolve_bookmark(&bookmark, &core);
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
 
     assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
     assert_eq!(
@@ -713,7 +756,12 @@ fn a_move_still_rebinds_from_a_signature_with_no_body_behind_it() {
         OUTLINE_SIGNATURE,
     ));
 
-    assert_eq!(resolve_bookmark(&bookmark, &core).node_id(), Some(99));
+    assert_eq!(
+        resolve_bookmark(&bookmark, &core)
+            .expect("resolve bookmark")
+            .node_id(),
+        Some(99)
+    );
 }
 
 #[test]
@@ -722,13 +770,20 @@ fn a_unique_move_rebinds_and_an_ambiguous_move_orphans() {
     let store = open_store(&dir, "unix:1:1");
     let bookmark = anchored_bookmark(&store, Some(4));
     let moved = FakeCore::at_generation(5).with(candidate(99, "/repo/src/moved.rs", "alpha"));
-    assert_eq!(resolve_bookmark(&bookmark, &moved).node_id(), Some(99));
+    assert_eq!(
+        resolve_bookmark(&bookmark, &moved)
+            .expect("resolve bookmark")
+            .node_id(),
+        Some(99)
+    );
 
     let ambiguous = FakeCore::at_generation(5)
         .with(candidate(99, "/repo/src/moved.rs", "alpha"))
         .with(candidate(100, "/repo/src/other.rs", "alpha"));
     assert_eq!(
-        resolve_bookmark(&bookmark, &ambiguous).orphan_reason(),
+        resolve_bookmark(&bookmark, &ambiguous)
+            .expect("resolve bookmark")
+            .orphan_reason(),
         Some(OrphanReason::AmbiguousMatch)
     );
 }
@@ -747,7 +802,7 @@ fn a_moved_name_whose_shape_disagrees_is_a_visible_signature_changed_orphan() {
         OTHER_SIGNATURE,
     ));
 
-    let resolution = resolve_bookmark(&bookmark, &core);
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
 
     assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
     assert_eq!(
@@ -771,7 +826,9 @@ fn a_move_is_never_inferred_from_a_name_that_already_named_two_symbols() {
     let core = FakeCore::at_generation(5).with(candidate(99, "/repo/src/other.rs", "alpha"));
 
     assert_eq!(
-        resolve_bookmark(&bookmark, &core).orphan_reason(),
+        resolve_bookmark(&bookmark, &core)
+            .expect("resolve bookmark")
+            .orphan_reason(),
         Some(OrphanReason::AmbiguousMatch),
         "a name that was never unique cannot prove where its symbol went"
     );
@@ -784,7 +841,7 @@ fn a_deleted_target_orphans_and_reappearance_rebinds() {
     let bookmark = anchored_bookmark(&store, Some(4));
     let core = FakeCore::at_generation(5);
 
-    let orphaned = resolve_bookmark(&bookmark, &core);
+    let orphaned = resolve_bookmark(&bookmark, &core).expect("resolve bookmark");
     assert_eq!(orphaned.orphan_reason(), Some(OrphanReason::TargetDeleted));
     store
         .apply_resolution(&bookmark.uuid, &orphaned)
@@ -802,7 +859,7 @@ fn a_deleted_target_orphans_and_reappearance_rebinds() {
     );
 
     let core = core.with(candidate(99, "/repo/src/lib.rs", "alpha"));
-    let rebound = resolve_bookmark(&stored, &core);
+    let rebound = resolve_bookmark(&stored, &core).expect("resolve bookmark");
     assert_eq!(rebound.node_id(), Some(99));
     store
         .apply_resolution(&stored.uuid, &rebound)
@@ -840,7 +897,12 @@ fn a_canonical_id_resolves_before_the_anchor_tuple() {
         })
         .with(candidate(99, "/repo/src/lib.rs", "alpha"));
 
-    assert_eq!(resolve_bookmark(&bookmark, &core).node_id(), Some(11));
+    assert_eq!(
+        resolve_bookmark(&bookmark, &core)
+            .expect("resolve bookmark")
+            .node_id(),
+        Some(11)
+    );
 }
 
 #[test]
@@ -853,7 +915,9 @@ fn an_anchorless_bookmark_is_an_unresolvable_orphan() {
         .expect("create bookmark");
 
     assert_eq!(
-        resolve_bookmark(&bookmark, &FakeCore::default()).orphan_reason(),
+        resolve_bookmark(&bookmark, &FakeCore::default())
+            .expect("resolve bookmark")
+            .orphan_reason(),
         Some(OrphanReason::UnresolvableAnchor)
     );
 }

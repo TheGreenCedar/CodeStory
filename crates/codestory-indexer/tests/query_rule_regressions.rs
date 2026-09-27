@@ -1,5 +1,6 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind};
+use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind, Occurrence};
+use codestory_contracts::proof_resolution::parse_canonical_callsite_identity;
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
 use std::collections::HashMap;
@@ -7,6 +8,13 @@ use std::fs;
 use tempfile::tempdir;
 
 fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    let (nodes, edges, _) = index_project_with_occurrences(files)?;
+    Ok((nodes, edges))
+}
+
+fn index_project_with_occurrences(
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<Occurrence>)> {
     let dir = tempdir()?;
     let root = dir.path();
     let mut files_to_index = Vec::with_capacity(files.len());
@@ -32,7 +40,362 @@ fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>
 
     let errors = storage.get_errors(None)?;
     anyhow::ensure!(errors.is_empty(), "indexing errors: {errors:?}");
-    Ok((storage.get_nodes()?, storage.get_edges()?))
+    Ok((
+        storage.get_nodes()?,
+        storage.get_edges()?,
+        storage.get_occurrences()?,
+    ))
+}
+
+#[test]
+fn script_private_callable_names_cannot_resolve_to_enclosing_definitions() -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for (private, directory) in [("quartz", "alpha"), ("opaque_731", "elsewhere")] {
+            for callable in ["function", "async function", "function*", "async function*"] {
+                for outer in [false, true] {
+                    for nested in [false, true] {
+                        let outer_source = if outer {
+                            format!("function {private}(x) {{ return 99; }}\n")
+                        } else {
+                            "// no outer declaration\n".into()
+                        };
+                        let invocation = format!("return {private}(x-1);");
+                        let body = if nested {
+                            format!("function child() {{ {invocation} }} return child();")
+                        } else {
+                            invocation
+                        };
+                        let source = format!(
+                            "{outer_source}const bound = {callable} {private}(x) {{\n {body}\n}};\nfunction outside() {{ return bound(2); }}\n"
+                        );
+                        let (nodes, edges) = index_project(&[(
+                            &format!("{directory}/fixture.{extension}"),
+                            &source,
+                        )])?;
+                        let calls = edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.kind == EdgeKind::CALL
+                                    && nodes.iter().any(|node| {
+                                        node.id == edge.target
+                                            && node.serialized_name == private
+                                            && node.start_line == Some(3)
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if calls.is_empty()
+                            || calls.iter().any(|edge| {
+                                edge.resolved_target.is_some() || !edge.candidate_targets.is_empty()
+                            })
+                        {
+                            failures.push(format!("{extension}/{callable}/outer={outer}/nested={nested}: private {private} escaped its scope: {calls:?}"));
+                        }
+                    }
+                }
+                let source = format!(
+                    "function {private}(x) {{ return x; }}\nconst bound = {callable}(x) {{\n return {private}(x);\n}};\nfunction outside() {{ return {private}(1); }}\n"
+                );
+                let (nodes, edges) =
+                    index_project(&[(&format!("{directory}/control.{extension}"), &source)])?;
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION
+                            && node.serialized_name == private
+                            && node.start_line == Some(1)
+                    })
+                    .expect("outer control");
+                assert!(
+                    edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+                        && edge.line == Some(3)
+                        && edge.resolved_target == Some(target.id)),
+                    "anonymous {extension}/{callable} keeps lexical outer lookup"
+                );
+                assert!(
+                    edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+                        && edge.line == Some(5)
+                        && edge.resolved_target == Some(target.id)),
+                    "outside {extension}/{callable} keeps lexical outer lookup"
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn script_private_call_scope_belongs_to_each_occurrence() -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for private in ["quartz", "opaque_731"] {
+            for callable in ["function", "async function", "function*", "async function*"] {
+                for outside_first in [false, true] {
+                    for nested in [false, true] {
+                        let calls = format!("return {private}(x-1) + {private}(x-2);");
+                        let body = if nested {
+                            format!("function child() {{ {calls} }} return child();")
+                        } else {
+                            calls
+                        };
+                        let binding =
+                            format!("const bound = {callable} {private}(x) {{ {body} }};");
+                        let ordinary = format!("{private}(77);");
+                        let line = if outside_first {
+                            format!(
+                                "/* λ */ function driver() {{ {ordinary} {binding} return bound; }}"
+                            )
+                        } else {
+                            format!(
+                                "/* λ */ function driver() {{ {binding} {ordinary} return bound; }}"
+                            )
+                        };
+                        let source = format!("function {private}(x) {{ return 99; }}\n{line}\n");
+                        let (nodes, edges, occurrences) = index_project_with_occurrences(&[(
+                            &format!("nested/fixture.{extension}"),
+                            &source,
+                        )])?;
+                        let outer = nodes
+                            .iter()
+                            .find(|node| {
+                                node.kind == NodeKind::FUNCTION
+                                    && node.serialized_name == private
+                                    && node.start_line == Some(1)
+                            })
+                            .expect("outer definition");
+                        let calls = edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.kind == EdgeKind::CALL
+                                    && edge.line == Some(2)
+                                    && nodes.iter().any(|node| {
+                                        node.id == edge.target && node.serialized_name == private
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        let unresolved = calls
+                            .iter()
+                            .filter(|edge| {
+                                edge.resolved_target.is_none() && edge.candidate_targets.is_empty()
+                            })
+                            .count();
+                        let resolved = calls
+                            .iter()
+                            .filter(|edge| edge.resolved_target == Some(outer.id))
+                            .count();
+                        if calls.len() != 3 || unresolved != 2 || resolved != 1 {
+                            failures.push(format!("{extension}/{callable}/{private}/outside_first={outside_first}/nested={nested}: {calls:?}"));
+                        }
+                        for (spelling, expected_owner, should_resolve) in [
+                            (
+                                format!("{private}(x-1)"),
+                                if nested { "child" } else { "bound" },
+                                false,
+                            ),
+                            (
+                                format!("{private}(x-2)"),
+                                if nested { "child" } else { "bound" },
+                                false,
+                            ),
+                            (format!("{private}(77)"), "driver", true),
+                        ] {
+                            let column =
+                                line.find(&spelling).expect("fixture occurrence") as u32 + 1;
+                            let matching = calls
+                                .iter()
+                                .filter(|edge| {
+                                    edge.callsite_identity
+                                        .as_deref()
+                                        .and_then(parse_canonical_callsite_identity)
+                                        .is_some_and(|identity| {
+                                            identity.line == 2
+                                                && identity.column_or_ordinal == column
+                                                && identity.raw_target == edge.target
+                                                && edge.file_node_id.is_some_and(|file| {
+                                                    file.0 == identity.file_id.0
+                                                })
+                                        })
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                matching.len(),
+                                1,
+                                "{extension}/{callable}/{private}/column{column}: {calls:#?}"
+                            );
+                            let edge = matching[0];
+                            assert!(
+                                occurrences
+                                    .iter()
+                                    .any(|occurrence| { occurrence.element_id == edge.target.0 }),
+                                "canonical raw target must retain its node occurrence"
+                            );
+                            let owner = nodes
+                                .iter()
+                                .find(|node| node.id == edge.effective_source())
+                                .expect("independent occurrence owner");
+                            assert!(
+                                matches_name(&owner.serialized_name, expected_owner),
+                                "column{column} belongs to {expected_owner}, got {owner:#?}"
+                            );
+                            if should_resolve {
+                                assert_eq!(
+                                    edge.resolved_target,
+                                    Some(outer.id),
+                                    "outside occurrence must select independently identified outer declaration"
+                                );
+                            } else {
+                                assert!(
+                                    edge.resolved_target.is_none()
+                                        && edge.candidate_targets.is_empty(),
+                                    "private occurrence must not inherit outside authority"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} occurrence failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn script_exact_callee_spans_do_not_invent_unrepresented_callers() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        for (source, absent, present, caller) in [
+            (
+                "function target() {}\nfunction driver() { opaque(() => target(1)); target(2); }\n",
+                "target(1)",
+                "target(2)",
+                "driver",
+            ),
+            (
+                "function target() {} target(3); function nearby() { target(4); }\n",
+                "target(3)",
+                "target(4)",
+                "nearby",
+            ),
+        ] {
+            let (nodes, edges, occurrences) =
+                index_project_with_occurrences(&[(&format!("neutral.{extension}"), source)])?;
+            let location = |needle: &str| {
+                let byte = source.find(needle).expect("unique call anchor");
+                let before = &source[..byte];
+                let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+                let column = byte - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+                (line, column as u32)
+            };
+            let calls_at = |(line, column)| {
+                edges
+                    .iter()
+                    .filter(move |edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge
+                                .callsite_identity
+                                .as_deref()
+                                .and_then(parse_canonical_callsite_identity)
+                                .is_some_and(|identity| {
+                                    identity.line == line
+                                        && identity.column_or_ordinal == column
+                                        && identity.raw_target == edge.target
+                                        && edge
+                                            .file_node_id
+                                            .is_some_and(|file| file.0 == identity.file_id.0)
+                                })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let absent_location = location(absent);
+            assert!(
+                occurrences.iter().any(|occurrence| {
+                    nodes.iter().any(|node| {
+                        node.id.0 == occurrence.element_id
+                            && node.kind == NodeKind::UNKNOWN
+                            && node.serialized_name == "target"
+                    })
+                }),
+                "{extension}: rejected syntax still has a raw callee node occurrence"
+            );
+            assert!(
+                calls_at(absent_location).is_empty(),
+                "{extension}: exact unrepresented/module syntax cannot borrow another owner"
+            );
+            let present_location = location(present);
+            let calls = calls_at(present_location);
+            assert_eq!(calls.len(), 1, "{extension}: represented call remains");
+            let edge = calls[0];
+            let owner = nodes
+                .iter()
+                .find(|node| node.id == edge.effective_source())
+                .expect("represented caller");
+            assert!(matches_name(&owner.serialized_name, caller));
+            let target = nodes
+                .iter()
+                .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "target")
+                .expect("independent target");
+            assert_eq!(edge.resolved_target, Some(target.id));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn script_exact_recursive_call_keeps_its_syntactic_owner() -> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx"] {
+        let source = "function recurse(x) { if (x > 0) return recurse(x-1); return 0; } function adjacent() { return recurse(2); }\n";
+        let (nodes, edges) = index_project(&[(&format!("neutral.{extension}"), source)])?;
+        let recurse = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "recurse")
+            .expect("recursive declaration");
+        for (needle, owner_name) in [("recurse(x-1)", "recurse"), ("recurse(2)", "adjacent")] {
+            let column = source.find(needle).expect("independent call anchor") as u32 + 1;
+            let calls = edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge
+                            .callsite_identity
+                            .as_deref()
+                            .and_then(parse_canonical_callsite_identity)
+                            .is_some_and(|identity| {
+                                identity.line == 1
+                                    && identity.column_or_ordinal == column
+                                    && identity.raw_target == edge.target
+                                    && edge
+                                        .file_node_id
+                                        .is_some_and(|file| file.0 == identity.file_id.0)
+                            })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{extension}: actual recursive/adjacent occurrence"
+            );
+            let edge = calls[0];
+            let owner = nodes
+                .iter()
+                .find(|node| node.id == edge.effective_source())
+                .expect("caller");
+            assert!(matches_name(&owner.serialized_name, owner_name));
+            assert_eq!(edge.resolved_source, Some(owner.id));
+            assert_eq!(edge.resolved_target, Some(recurse.id));
+        }
+    }
+    Ok(())
 }
 
 fn matches_name(actual: &str, wanted: &str) -> bool {

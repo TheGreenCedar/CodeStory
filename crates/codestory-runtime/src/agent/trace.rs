@@ -157,7 +157,6 @@ impl TraceRecorder {
             semantic_stage_timeout_zero_hits: 0,
             semantic_abstained_count: 0,
             annotations: self.annotations,
-            packet_claim_profile_telemetry: None,
             source_freshness_telemetry: None,
             steps: self.steps,
             packet_sidecar_diagnostics: Vec::new(),

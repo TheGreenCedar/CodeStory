@@ -9,7 +9,7 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { Transform, pipeline } = require('stream');
-const { TextDecoder } = require('util');
+const { TextDecoder, isDeepStrictEqual } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const zlib = require('zlib');
 const {
@@ -80,10 +80,15 @@ const managedCliProbeForceKillGraceMs = 1000;
 // plugin test suite pins the launcher copy to that recording. The launcher must
 // not depend on the catalog at run time: a packaging failure that loses the
 // catalog must not also lose the skew detector.
-const managedCliMcpProtocolVersion = '2024-11-05';
-const supportedMcpProtocolVersions = Object.freeze(['2024-11-05']);
-const publicationStampSchemaVersion = 2;
-const minimumCompatiblePublicationStampSchemaVersion = 2;
+const managedCliMcpProtocolVersion = '2025-11-25';
+const supportedMcpProtocolVersions = Object.freeze([
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
+const publicationStampSchemaVersion = 3;
+const minimumCompatiblePublicationStampSchemaVersion = 3;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
 const failOpenMaxFrameBytes = 1024 * 1024;
@@ -349,9 +354,7 @@ function readCursorLocalOverrides(root = pluginRoot, options = {}) {
     : env.PLUGIN_DATA;
   const dataDir = typeof explicitPluginData === 'string' && path.isAbsolute(explicitPluginData)
     ? explicitPluginData
-    : env[cursorDogfoodMarker] === '1'
-      ? inferredCursorPluginDataDir(root, options.home, { env })
-      : null;
+    : inferredCursorPluginDataDir(root, options.home, { env });
   if (!dataDir) return null;
   const overridePath = path.join(dataDir, cursorLocalOverrideFileName);
   try {
@@ -2227,24 +2230,33 @@ function isPlainObject(value) {
 // launcher answers `initialize` itself and suppresses the CLI's answer, so an
 // echoed revision here would be a false compatibility claim the host can never
 // see corrected.
-function negotiateMcpProtocolVersion(requested) {
+function negotiateMcpProtocolVersion(
+  requested,
+  discoveryContracts = canonicalMcpCatalog?.wireContract?.discoveryContracts,
+) {
   const asked = typeof requested === 'string' ? requested.trim() : '';
   if (!asked) {
+    const negotiated = managedCliMcpProtocolVersion;
     return {
       requested: null,
-      negotiated: managedCliMcpProtocolVersion,
+      negotiated,
       supported: [...supportedMcpProtocolVersions],
+      preferred: managedCliMcpProtocolVersion,
       status: 'defaulted',
       compatible: true,
+      discovery_contract_sha256: discoveryContracts?.[negotiated] ?? null,
     };
   }
   const agreed = supportedMcpProtocolVersions.includes(asked);
+  const negotiated = agreed ? asked : managedCliMcpProtocolVersion;
   return {
     requested: asked,
-    negotiated: agreed ? asked : managedCliMcpProtocolVersion,
+    negotiated,
     supported: [...supportedMcpProtocolVersions],
+    preferred: managedCliMcpProtocolVersion,
     status: agreed ? 'agreed' : 'unsupported_client_revision',
     compatible: agreed,
+    discovery_contract_sha256: discoveryContracts?.[negotiated] ?? null,
   };
 }
 
@@ -2327,6 +2339,40 @@ function runtimeWireContractSkew(response, negotiatedProtocolVersion) {
   return publicationStampSkew(result._meta?.codestory_publication);
 }
 
+function v3LauncherSession(requested, discoveryContracts) {
+  const asked = typeof requested === 'string' ? requested.trim() : '';
+  const negotiated = supportedMcpProtocolVersions.includes(asked)
+    ? asked
+    : managedCliMcpProtocolVersion;
+  const discoveryContractSha256 = discoveryContracts?.[negotiated];
+  if (!/^[0-9a-f]{64}$/u.test(String(discoveryContractSha256 || ''))) {
+    throw new Error('v3_discovery_contract_missing');
+  }
+  return Object.freeze({
+    requested: asked || null,
+    negotiated,
+    discoveryContractSha256,
+    publicationSchemaVersion: 3,
+  });
+}
+
+function v3RuntimeWireContractSkew(response, session) {
+  if (!isPlainObject(response)) return 'initialize_response_invalid';
+  if (response.error !== undefined) return 'initialize_rejected';
+  const result = response.result;
+  if (!isPlainObject(result)) return 'initialize_result_invalid';
+  if (result.protocolVersion !== session?.negotiated) return 'protocol_version_skew';
+  if (result._meta?.codestory_protocol?.discovery_contract_sha256
+      !== session.discoveryContractSha256) {
+    return 'discovery_contract_skew';
+  }
+  if (result._meta?.codestory_publication?.schema_version
+      !== session.publicationSchemaVersion) {
+    return 'publication_schema_skew';
+  }
+  return publicationStampSkew(result._meta.codestory_publication);
+}
+
 function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
   return new Promise((resolve, reject) => {
     const spawnChild = options.spawn || spawn;
@@ -2404,6 +2450,8 @@ function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
         response?.jsonrpc !== '2.0' || response?.id !== 'managed-cli-staging' ||
         !isPlainObject(response.result) ||
         response.result.protocolVersion !== managedCliMcpProtocolVersion ||
+        response.result._meta?.codestory_protocol?.discovery_contract_sha256
+          !== canonicalMcpCatalog?.wireContract?.discoveryContracts?.[managedCliMcpProtocolVersion] ||
         !isPlainObject(response.result.capabilities) ||
         !isPlainObject(response.result.serverInfo) ||
         typeof response.result.serverInfo.name !== 'string' || !response.result.serverInfo.name.trim() ||
@@ -2587,6 +2635,41 @@ function releaseManagedCliLock(lock) {
   }
 }
 
+function captureManagedCliTempRootIdentity(tempRoot) {
+  let metadata;
+  try {
+    metadata = fs.lstatSync(tempRoot, { bigint: true });
+  } catch (error) {
+    throw new Error(`managed_cli_temp_root_unreadable:${error.code || managedCliFailureCode(error)}`);
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error('managed_cli_temp_root_not_direct');
+  }
+  return { dev: metadata.dev, ino: metadata.ino };
+}
+
+function removeManagedCliTempRoot(tempRoot, identity, options = {}) {
+  let metadata;
+  try {
+    metadata = fs.lstatSync(tempRoot, { bigint: true });
+  } catch (error) {
+    if (error.code === 'ENOENT' && options.allowMissing === true) return;
+    throw new Error(`managed_cli_temp_root_unreadable:${error.code || managedCliFailureCode(error)}`);
+  }
+  if (
+    !identity ||
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    metadata.dev !== identity.dev ||
+    metadata.ino !== identity.ino
+  ) {
+    throw new Error('managed_cli_temp_root_identity_changed');
+  }
+  // This check rejects observed replacement; it cannot make a hostile same-UID filesystem race
+  // between lstat and removal impossible.
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+}
+
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
   const { target, asset, buildSource } = managedAssetIdentity(version);
@@ -2598,6 +2681,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
   if (lock.waited) warnings.push('managed_cli_publication:waiter');
   if (lock.reclaimed) warnings.push('managed_cli_publication:reclaimed_lock');
   let tempRoot = null;
+  let tempRootIdentity = null;
   let stagingDir = null;
   try {
     trimManagedCliQuarantines(root, version);
@@ -2609,13 +2693,13 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       warnings.push(`managed_cli_publication:reprovision:${existing.reason}`);
     }
     warnings.push('managed_cli_publication:publisher');
-    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
+    tempRoot = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
+    tempRootIdentity = captureManagedCliTempRootIdentity(tempRoot);
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
-    // Keep the completed archive on the same filesystem as its own partial so publication is a
-    // same-directory rename. The temp root frequently sits on a different mount from the managed
-    // root, and a cross-device rename fails after the whole transfer has already succeeded.
+    // Keep the completed archive beside its partial for atomic download publication and reuse the
+    // verified download-cache entry across provisioning attempts.
     let archivePath = path.join(tempRoot, asset);
     let archivePartialPath = `${archivePath}.part`;
     try {
@@ -2695,6 +2779,11 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     if (!staged.verified) {
       throw new Error(`managed_cli_staging_verification_failed:${staged.reason}`);
     }
+    if (tempRoot) {
+      removeManagedCliTempRoot(tempRoot, tempRootIdentity);
+      tempRoot = null;
+      tempRootIdentity = null;
+    }
     if (fs.existsSync(versionDir)) throw new Error('managed_cli_publish_target_reappeared');
     fs.renameSync(stagingDir, versionDir);
     stagingDir = null;
@@ -2702,9 +2791,14 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     managedCliDownloadProgress.stage = null;
     return resolveManifest(path.join(versionDir, 'manifest.json'));
   } finally {
-    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
-    if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true });
-    releaseManagedCliLock(lock);
+    try {
+      if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
+      if (tempRoot) {
+        removeManagedCliTempRoot(tempRoot, tempRootIdentity, { allowMissing: true });
+      }
+    } finally {
+      releaseManagedCliLock(lock);
+    }
   }
 }
 
@@ -3843,19 +3937,6 @@ function managedProvisioningOperation() {
   };
 }
 
-function managedProvisioningMessage() {
-  const progress = managedCliDownloadProgressReport();
-  if (!progress || progress.asset === 'SHA256SUMS.txt') {
-    return 'CodeStory is preparing: downloading the runtime. Retry the same tool shortly.';
-  }
-  const received = formatByteSize(progress.received_bytes);
-  const total = progress.total_bytes === null ? null : formatByteSize(progress.total_bytes);
-  const measure = total
-    ? `${progress.percent}% of ${total}`
-    : `${received} so far`;
-  return `CodeStory is preparing: downloading the runtime (${measure}). Retry the same tool shortly.`;
-}
-
 function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
   const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
@@ -3877,12 +3958,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       project: selection.project,
       state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
     };
-    if (tool === 'status' && selection.code === 'project_required') {
-      return {
-        content: [{ type: 'text', text: 'state: no_project\nresult: structured\n' }],
-        structuredContent,
-      };
-    }
     return {
       content: [{ type: 'text', text: structuredContent.message }],
       structuredContent,
@@ -3902,8 +3977,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
       current_operation: currentOperation,
       failure: preparing ? null : primaryFailure,
-      failure_context: !preparing && managedFailure ? managedCliProvisionFailure.context : null,
-      hint: !preparing && managedFailure ? managedCliProvisionFailure.hint : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: currentOperation ? currentOperation.retry_after_ms : null,
       diagnostics_uri: diagnosticsUri,
@@ -3918,17 +3991,24 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   // The top-level hint repeats the operation snapshot's so one preparing response never carries
   // two disagreeing delays.
   const provisioningOperation = preparing ? managedProvisioningOperation() : null;
-  const structuredContent = preparing ? {
-    code: 'codestory_preparing',
-    message: managedProvisioningMessage(),
-    tool,
-    project,
-    state: 'preparing',
-    retry_tool: tool,
-    retry_after_ms: provisioningOperation.retry_after_ms,
-    operation: provisioningOperation,
-    diagnostics_uri: diagnosticsUri,
-  } : {
+  if (preparing) {
+    const structuredContent = {
+      kind: 'preparing',
+      state: 'preparing',
+      retry_after_ms: provisioningOperation.retry_after_ms,
+      minimum_next: {
+        kind: 'retry_same_request',
+        after_ms: provisioningOperation.retry_after_ms,
+      },
+      operation: provisioningOperation,
+    };
+    return {
+      content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
+      structuredContent,
+      isError: false,
+    };
+  }
+  const structuredContent = {
     code: 'codestory_unavailable',
     message: failureHint
       ? `CodeStory is unavailable. ${failureHint} Meanwhile, continue with focused source inspection.`
@@ -3944,10 +4024,36 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     content: [{ type: 'text', text: structuredContent.message }],
     structuredContent,
   };
-  if (!preparing) {
-    result.isError = true;
-  }
+  result.isError = true;
   return result;
+}
+
+function revisionNativeFailOpenToolResult(revision, toolResult) {
+  const root = toolResult?.structuredContent;
+  const isError = toolResult?.isError === true || !isPlainObject(root);
+  const text = JSON.stringify(
+    isPlainObject(root)
+      ? root
+      : { code: 'codestory_unavailable', message: 'CodeStory is unavailable.' },
+  );
+  if (isError) {
+    return { content: [{ type: 'text', text }], isError: true };
+  }
+  if (revision === '2024-11-05' || revision === '2025-03-26') {
+    return { content: [{ type: 'text', text }], isError: false };
+  }
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: root,
+    isError: false,
+    _meta: {
+      'com.thegreencedar.codestory/protocolRevision': revision,
+      codestory_publication: {
+        schema_version: publicationStampSchemaVersion,
+        minimum_compatible_schema_version: minimumCompatiblePublicationStampSchemaVersion,
+      },
+    },
+  };
 }
 
 const shuttingDownHandoffs = new WeakSet();
@@ -4098,6 +4204,253 @@ function shutdownHandoffChild(child, options = {}) {
   child.once?.('close', clearTimers);
 }
 
+const failOpenMaxReportedViolations = 8;
+const failOpenValidatedSchemaKeywords = Object.freeze([
+  'additionalProperties',
+  'allOf',
+  'anyOf',
+  'const',
+  'default',
+  'description',
+  'enum',
+  'items',
+  'maxItems',
+  'maxLength',
+  'maximum',
+  'minItems',
+  'minLength',
+  'minimum',
+  'not',
+  'oneOf',
+  'properties',
+  'required',
+  'type',
+]);
+
+function publishedSchemaTypeName(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+  return typeof value;
+}
+
+function publishedSchemaTypeMatches(declared, value) {
+  const names = Array.isArray(declared) ? declared : [declared];
+  return names.some((name) => {
+    switch (name) {
+      case 'object': return isPlainObject(value);
+      case 'array': return Array.isArray(value);
+      case 'string': return typeof value === 'string';
+      case 'boolean': return typeof value === 'boolean';
+      case 'integer': return typeof value === 'number' && Number.isInteger(value);
+      case 'number': return typeof value === 'number' && Number.isFinite(value);
+      case 'null': return value === null;
+      default: return false;
+    }
+  });
+}
+
+function renderPublishedSchemaType(declared) {
+  return (Array.isArray(declared) ? declared : [declared]).join(' or ');
+}
+
+function renderPublishedSchemaLiteral(value) {
+  return typeof value === 'string' ? `\`${value}\`` : JSON.stringify(value);
+}
+
+function renderPublishedSchemaVariants(variants) {
+  return variants.map((variant) => {
+    const required = Array.isArray(variant?.required) ? variant.required : [];
+    return required.length > 0
+      ? required.map((name) => `\`${name}\``).join(' + ')
+      : 'the declared variant';
+  }).join(', ');
+}
+
+function publishedSchemaViolation(code, pointer, message) {
+  return { code, pointer, message };
+}
+
+function publishedSchemaAccepts(schema, value) {
+  return validatePublishedSchemaValue(schema, value, '').length === 0;
+}
+
+/**
+ * Interpret the closed JSON Schema subset emitted by generated-mcp-catalog.json.
+ * The selected tools/list profile is the request contract; this deliberately
+ * reads that schema instead of maintaining a second launcher argument grammar.
+ */
+function validatePublishedSchemaValue(schema, value, pointer = '/arguments') {
+  if (!isPlainObject(schema)) return [];
+  const violations = [];
+  const declaredType = schema.type;
+  if (declaredType !== undefined && !publishedSchemaTypeMatches(declaredType, value)) {
+    return [publishedSchemaViolation(
+      'invalid_type',
+      pointer,
+      `expected type ${renderPublishedSchemaType(declaredType)}, received ${publishedSchemaTypeName(value)}`,
+    )];
+  }
+  if (declaredType !== undefined && value === null) return violations;
+
+  if (Object.hasOwn(schema, 'const') && !isDeepStrictEqual(value, schema.const)) {
+    violations.push(publishedSchemaViolation(
+      'invalid_const_value',
+      pointer,
+      `expected ${renderPublishedSchemaLiteral(schema.const)}`,
+    ));
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => isDeepStrictEqual(value, allowed))) {
+    violations.push(publishedSchemaViolation(
+      'invalid_enum_value',
+      pointer,
+      `expected one of ${schema.enum.map(renderPublishedSchemaLiteral).join(', ')}`,
+    ));
+  }
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) {
+      violations.push(publishedSchemaViolation(
+        'below_minimum', pointer, `expected a value of at least ${schema.minimum}`,
+      ));
+    }
+    if (typeof schema.maximum === 'number' && value > schema.maximum) {
+      violations.push(publishedSchemaViolation(
+        'above_maximum', pointer, `expected a value of at most ${schema.maximum}`,
+      ));
+    }
+  }
+  if (typeof value === 'string') {
+    const length = Array.from(value).length;
+    if (Number.isSafeInteger(schema.minLength) && length < schema.minLength) {
+      violations.push(publishedSchemaViolation(
+        'below_min_length', pointer, `expected at least ${schema.minLength} character(s)`,
+      ));
+    }
+    if (Number.isSafeInteger(schema.maxLength) && length > schema.maxLength) {
+      violations.push(publishedSchemaViolation(
+        'above_max_length', pointer, `expected at most ${schema.maxLength} character(s)`,
+      ));
+    }
+  }
+  if (Array.isArray(value)) {
+    if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) {
+      violations.push(publishedSchemaViolation(
+        'below_min_items', pointer, `expected at least ${schema.minItems} item(s)`,
+      ));
+    }
+    if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) {
+      violations.push(publishedSchemaViolation(
+        'above_max_items', pointer, `expected at most ${schema.maxItems} item(s)`,
+      ));
+    }
+    if (isPlainObject(schema.items)) {
+      value.forEach((item, index) => {
+        violations.push(...validatePublishedSchemaValue(schema.items, item, `${pointer}/${index}`));
+      });
+    }
+  }
+  if (isPlainObject(value)) {
+    const properties = isPlainObject(schema.properties) ? schema.properties : {};
+    if (schema.additionalProperties === false) {
+      for (const name of Object.keys(value)) {
+        if (!Object.hasOwn(properties, name)) {
+          violations.push(publishedSchemaViolation(
+            'unknown_property',
+            `${pointer}/${name}`,
+            'property is not declared by the published tool schema',
+          ));
+        }
+      }
+    }
+    if (Array.isArray(schema.required)) {
+      for (const name of schema.required) {
+        if (typeof name === 'string' && !Object.hasOwn(value, name)) {
+          violations.push(publishedSchemaViolation(
+            'missing_required', `${pointer}/${name}`, 'required property is missing',
+          ));
+        }
+      }
+    }
+    for (const [name, member] of Object.entries(value)) {
+      if (isPlainObject(properties[name])) {
+        violations.push(...validatePublishedSchemaValue(
+          properties[name], member, `${pointer}/${name}`,
+        ));
+      }
+    }
+  }
+
+  if (Array.isArray(schema.anyOf)
+    && !schema.anyOf.some((variant) => publishedSchemaAccepts(variant, value))) {
+    violations.push(publishedSchemaViolation(
+      'unsatisfied_any_of',
+      pointer,
+      `expected at least one of ${renderPublishedSchemaVariants(schema.anyOf)}`,
+    ));
+  }
+  if (Array.isArray(schema.oneOf)) {
+    const matched = schema.oneOf.filter((variant) => publishedSchemaAccepts(variant, value)).length;
+    if (matched !== 1) {
+      violations.push(publishedSchemaViolation(
+        'invalid_selector',
+        pointer,
+        `expected exactly one of ${renderPublishedSchemaVariants(schema.oneOf)}, matched ${matched}`,
+      ));
+    }
+  }
+  if (Array.isArray(schema.allOf)) {
+    const combinedBudget = schema.allOf.length > 1
+      && schema.allOf.every((constraint) => Array.isArray(constraint?.not?.required));
+    if (combinedBudget) {
+      const failed = schema.allOf.find((constraint) => !publishedSchemaAccepts(constraint, value));
+      if (failed) {
+        const names = failed.not.required.map((name) => `\`${name}\``).join(' and ');
+        violations.push(publishedSchemaViolation(
+          names ? 'combined_item_limit' : 'unsatisfied_all_of',
+          pointer,
+          names
+            ? `${names} may hold at most ${schema.allOf.length} item(s) together`
+            : 'value violates a declared combined constraint',
+        ));
+      }
+    } else {
+      for (const constraint of schema.allOf) {
+        violations.push(...validatePublishedSchemaValue(constraint, value, pointer));
+      }
+    }
+  }
+  if (isPlainObject(schema.not) && publishedSchemaAccepts(schema.not, value)) {
+    violations.push(publishedSchemaViolation(
+      'forbidden_combination',
+      pointer,
+      'value matches a combination the tool schema forbids',
+    ));
+  }
+  return violations;
+}
+
+function validateFailOpenToolArguments(tool, argumentsValue) {
+  const value = argumentsValue === null || argumentsValue === undefined ? {} : argumentsValue;
+  return validatePublishedSchemaValue(tool.inputSchema, value, '/arguments')
+    .filter((violation) => !(violation.code === 'missing_required'
+      && violation.pointer === '/arguments/project'));
+}
+
+function failOpenInvalidParamsError(id, tool, violations) {
+  return jsonrpcError(
+    id,
+    -32602,
+    `invalid_params: tool \`${tool}\` rejected ${violations.length} argument violation(s) declared by tools/list`,
+    {
+      code: 'invalid_params',
+      tool,
+      violation_count: violations.length,
+      violations: violations.slice(0, failOpenMaxReportedViolations),
+      next_action: 'correct_arguments_from_tools_list',
+    },
+  );
+}
+
 function runFailOpenMcp(status, options = {}) {
   const baseCurrentStatus = () => (typeof status === 'function' ? status() : status);
   const catalog = Object.hasOwn(options, 'catalog') ? options.catalog : canonicalMcpCatalog;
@@ -4105,14 +4458,19 @@ function runFailOpenMcp(status, options = {}) {
   let tools;
   let resources;
   let resourceTemplates;
-  try {
-    tools = failOpenToolCatalog(catalog);
-    if (!Array.isArray(catalog.resources) || !Array.isArray(catalog.resourceTemplates)) {
+  const catalogProfile = (revision) => catalog?.revisionProfiles?.[revision] ?? catalog;
+  const selectCatalogProfile = (revision) => {
+    const profile = catalogProfile(revision);
+    tools = failOpenToolCatalog(profile);
+    if (!Array.isArray(profile?.resources) || !Array.isArray(profile?.resourceTemplates)) {
       throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
     }
-    resources = catalog.resources.filter(({ uri }) => uri === 'codestory://agent-guide');
-    resourceTemplates = catalog.resourceTemplates.filter(({ uriTemplate }) =>
+    resources = profile.resources.filter(({ uri }) => uri === 'codestory://agent-guide');
+    resourceTemplates = profile.resourceTemplates.filter(({ uriTemplate }) =>
       uriTemplate === 'codestory://status{?project}');
+  };
+  try {
+    selectCatalogProfile(managedCliMcpProtocolVersion);
   } catch (error) {
     catalogFailure = error;
     tools = emergencyStatusToolCatalog();
@@ -4128,9 +4486,11 @@ function runFailOpenMcp(status, options = {}) {
     return catalogFailure ? catalogFailureStatus(current, catalogFailure) : current;
   };
   let handoff = null;
-  let handoffWrite = null;
+  let handoffDispatch = null;
+  let handoffValidated = false;
   let initializeRequest = null;
   let negotiatedProtocol = null;
+  let v3Session = null;
   let initializedNotification = null;
   let runtimeReadyNotified = false;
   let stdinEnded = false;
@@ -4160,12 +4520,16 @@ function runFailOpenMcp(status, options = {}) {
       return null;
     }
     handoff = options.startRuntime(liveStatus);
+    const activeHandoff = handoff;
     handoffStderrObservation = null;
     handoffFailureHandled = false;
+    const ownsHandoff = () => handoff === activeHandoff && !handoffFailureHandled;
+    let initializeTimer = null;
     const failHandoff = (reasonCode, details = {}) => {
-      if (handoffFailureHandled) return;
+      if (!ownsHandoff()) return;
       handoffFailureHandled = true;
-      const failedHandoff = handoff;
+      clearTimeout(initializeTimer);
+      const failedHandoff = activeHandoff;
       const stderrObservation = renderRuntimeStderrTail(handoffStderrObservation);
       const failureDetails = {
         code: Number.isSafeInteger(details.code) ? details.code : null,
@@ -4185,7 +4549,7 @@ function runFailOpenMcp(status, options = {}) {
       };
       const detailedReason = runtimeFailureDetail(reasonCode, failureDetails);
       handoff = null;
-      handoffWrite = null;
+      handoffDispatch = null;
       shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
         process.exit(failureDetails.code || 1);
@@ -4205,12 +4569,12 @@ function runFailOpenMcp(status, options = {}) {
         ...failureDetails,
       });
     };
-    handoffWrite = (line) => {
+    const writeToChild = (line) => {
       try {
-        if (!handoff?.stdin || handoff.stdin.destroyed) {
+        if (!ownsHandoff() || !activeHandoff?.stdin || activeHandoff.stdin.destroyed) {
           throw Object.assign(new Error('child stdin is unavailable'), { code: 'EPIPE' });
         }
-        handoff.stdin.write(`${line}\n`, (error) => {
+        activeHandoff.stdin.write(`${line}\n`, (error) => {
           if (error) {
             failHandoff('runtime_stdio_child_stdin', {
               errorCode: error?.code,
@@ -4227,24 +4591,38 @@ function runFailOpenMcp(status, options = {}) {
         return false;
       }
     };
-    handoff.stdin?.on?.('error', (error) => {
+    handoffValidated = !initializeRequest;
+    const queuedLines = [];
+    let queuedBytes = 0;
+    handoffDispatch = (line) => {
+      if (!ownsHandoff()) return false;
+      if (handoffValidated) return writeToChild(line);
+      queuedBytes += Buffer.byteLength(line, 'utf8') + 1;
+      if (queuedBytes > failOpenMaxFrameBytes) {
+        failHandoff('runtime_stdio_child_stdin', { errorCode: 'handoff_queue_full' });
+        return false;
+      }
+      queuedLines.push(line);
+      return true;
+    };
+    activeHandoff.stdin?.on?.('error', (error) => {
       failHandoff('runtime_stdio_child_stdin', {
         errorCode: error?.code,
         stdinError: true,
       });
     });
-    if (handoff.stdout) {
+    if (activeHandoff.stdout) {
       let stdout = '';
-      let suppressInitialize = Boolean(initializeRequest);
-      handoff.stdout.setEncoding('utf8');
-      handoff.stdout.on('data', (chunk) => {
+      activeHandoff.stdout.setEncoding('utf8');
+      activeHandoff.stdout.on('data', (chunk) => {
         // A failed handoff stops relaying immediately. Chunks that arrive after
         // the failure carry results from a runtime the launcher already refused.
-        if (handoffFailureHandled) return;
+        if (!ownsHandoff()) return;
         stdout += chunk;
         const lines = stdout.split(/\r?\n/u);
         stdout = lines.pop() || '';
         for (const output of lines) {
+          if (!ownsHandoff()) return;
           if (!output) continue;
           let parsed = null;
           try {
@@ -4252,57 +4630,71 @@ function runFailOpenMcp(status, options = {}) {
           } catch {
             // Non-JSON output remains visible instead of hiding a runtime failure.
           }
-          if (suppressInitialize && parsed?.id === initializeRequest.id) {
-            suppressInitialize = false;
+          if (!handoffValidated) {
             // The host never sees this frame — the launcher already answered
             // `initialize`. That makes the launcher the only reader of the
             // runtime's own compatibility claim, and the only place a
             // `CODESTORY_CLI` override can be caught at session runtime.
-            const skew = runtimeWireContractSkew(
-              parsed,
-              negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
-            );
+            const skew = parsed?.id === initializeRequest.id
+              ? v3RuntimeWireContractSkew(parsed, v3Session)
+              : 'initialize_response_invalid';
             if (skew) {
               failHandoff('runtime_wire_contract_skew', { errorCode: skew });
               return;
             }
+            clearTimeout(initializeTimer);
+            handoffValidated = true;
+            for (const line of queuedLines) {
+              if (!ownsHandoff() || !writeToChild(line)) return;
+            }
+            queuedLines.length = 0;
+            queuedBytes = 0;
+            if (stdinEnded && ownsHandoff()) shutdownHandoffChild(activeHandoff, options);
             continue;
           }
-          if (parsed?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(parsed.id));
+          for (const reply of Array.isArray(parsed) ? parsed : [parsed]) {
+            if (reply?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(reply.id));
+          }
           process.stdout.write(`${output}\n`);
         }
       });
     }
-    if (handoff.stderr) {
-      handoff.stderr.setEncoding?.('utf8');
-      handoff.stderr.on('data', (chunk) => {
+    if (activeHandoff.stderr) {
+      activeHandoff.stderr.setEncoding?.('utf8');
+      activeHandoff.stderr.on('data', (chunk) => {
+        if (!ownsHandoff()) return;
         // Drain child stderr without retaining its free-form bytes. Only
         // saturating byte/chunk counts cross the diagnostic boundary.
         handoffStderrObservation = appendRuntimeStderrTail(handoffStderrObservation, chunk);
       });
     }
-    handoff.on('close', (code, signal) => {
-      if (signal || code) {
+    activeHandoff.on('close', (code, signal) => {
+      if (!ownsHandoff()) return;
+      if (signal || code || !handoffValidated) {
         failHandoff('runtime_stdio_child_exit', { code, signal });
         return;
       }
       process.exit(0);
     });
-    handoff.on('error', (error) => {
+    activeHandoff.on('error', (error) => {
       failHandoff('runtime_stdio_child_spawn', {
         errorCode: error?.code,
         spawnError: true,
       });
     });
     if (initializeRequest) {
-      if (handoffWrite(JSON.stringify(initializeRequest))) {
-        handoffWrite?.(JSON.stringify(initializedNotification || {
+      initializeTimer = setTimeout(() => {
+        failHandoff('runtime_stdio_child_exit', { errorCode: 'initialize_timeout' });
+      }, options.handoffInitializeTimeoutMs ?? 5000);
+      initializeTimer.unref?.();
+      if (writeToChild(JSON.stringify(initializeRequest))) {
+        writeToChild(JSON.stringify(initializedNotification || {
           jsonrpc: '2.0',
           method: 'notifications/initialized',
         }));
       }
     }
-    if (stdinEnded) handoff.stdin.end();
+    if (stdinEnded && handoffValidated && ownsHandoff()) shutdownHandoffChild(activeHandoff, options);
     return handoff;
   };
   // Fail-open serves the project-bound status template and static guide. Do
@@ -4315,38 +4707,53 @@ function runFailOpenMcp(status, options = {}) {
       diagnostics_uri_template: 'codestory://status{?project}',
     };
   };
-  const handleLine = (line) => {
-    if (!line.trim()) return;
-    let request;
-    try {
-      request = JSON.parse(line);
-    } catch {
-      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
-      return;
-    }
-    if (!request || typeof request !== 'object' || Array.isArray(request)) {
-      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
-      return;
-    }
+  const validJsonRpcId = (value) => value === null
+    || typeof value === 'string'
+    || (typeof value === 'number' && Number.isFinite(value));
+  const validateJsonRpcRequest = (request) => isPlainObject(request)
+    && Object.keys(request).every((field) => ['jsonrpc', 'id', 'method', 'params'].includes(field))
+    && request.jsonrpc === '2.0'
+    && typeof request.method === 'string'
+    && (!Object.hasOwn(request, 'id') || validJsonRpcId(request.id))
+    && (!Object.hasOwn(request, 'params')
+      || Array.isArray(request.params)
+      || isPlainObject(request.params));
+  const invalidRequest = (request) => jsonrpcError(
+    isPlainObject(request) && validJsonRpcId(request.id) ? request.id : null,
+    -32600,
+    'Invalid Request',
+  );
+  const handleRequest = (request, rawLine, allowHandoff = true) => {
+    if (!validateJsonRpcRequest(request)) return invalidRequest(request);
     if (request.method === 'notifications/initialized') {
       initializedNotification = request;
       notifyRuntimeReady();
-      return;
+      return null;
     }
     if (request.method === 'initialize' && request.id !== undefined) {
       initializeRequest = request;
     }
-    const delegated = request.method === 'initialize' ? null : maybeHandoff();
+    const delegated = allowHandoff && request.method !== 'initialize' ? maybeHandoff() : null;
     if (delegated) {
       if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
-      handoffWrite(line);
-      return;
+      handoffDispatch(rawLine);
+      return null;
     }
-    if (request.id === undefined) return;
+    if (request.id === undefined) return null;
     let response;
     if (request.method === 'initialize') {
       const liveStatus = currentStatus();
       negotiatedProtocol = negotiateMcpProtocolVersion(request.params?.protocolVersion);
+      try {
+        v3Session = v3LauncherSession(
+          request.params?.protocolVersion,
+          catalog?.wireContract?.discoveryContracts,
+        );
+        selectCatalogProfile(v3Session.negotiated);
+      } catch (error) {
+        response = jsonrpcError(request.id, -32603, safeFailureToken(error.message, 'discovery_contract_invalid'));
+        return response;
+      }
       response = jsonrpcResult(request.id, {
         protocolVersion: negotiatedProtocol.negotiated,
         capabilities: {
@@ -4404,17 +4811,61 @@ function runFailOpenMcp(status, options = {}) {
         response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
       }
     } else if (request.method === 'tools/call') {
-      const tool = request.params?.name;
-      response = tools.some((candidate) => candidate.name === tool)
-        ? jsonrpcResult(
+      const toolName = request.params?.name;
+      const tool = tools.find((candidate) => candidate.name === toolName);
+      const argumentsValue = request.params?.arguments ?? {};
+      if (!tool) {
+        response = jsonrpcError(request.id, -32602, `unknown tool: ${toolName || '<missing>'}`);
+      } else {
+        const violations = validateFailOpenToolArguments(tool, argumentsValue);
+        response = violations.length > 0
+          ? failOpenInvalidParamsError(request.id, toolName, violations)
+          : jsonrpcResult(
             request.id,
-            failOpenToolResult(tool, currentStatus(), request.params?.arguments ?? {}),
-          )
-        : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
+            revisionNativeFailOpenToolResult(
+              negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
+              failOpenToolResult(toolName, currentStatus(), argumentsValue),
+            ),
+          );
+      }
     } else {
       response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
     }
-    process.stdout.write(`${JSON.stringify(response)}\n`);
+    return response;
+  };
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let frame;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
+      return;
+    }
+    if (!Array.isArray(frame)) {
+      const response = handleRequest(frame, line);
+      if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+      return;
+    }
+    const revision = negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion;
+    if (frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
+      return;
+    }
+    const delegated = maybeHandoff();
+    if (delegated) {
+      for (const request of frame) {
+        if (validateJsonRpcRequest(request) && request.id !== undefined) {
+          delegatedRequestIds.add(JSON.stringify(request.id));
+        }
+      }
+      handoffDispatch(line);
+      return;
+    }
+    const responses = frame
+      .map((request) => handleRequest(request, JSON.stringify(request), false))
+      .filter(Boolean);
+    if (responses.length > 0) process.stdout.write(`${JSON.stringify(responses)}\n`);
   };
   let buffer = '';
   let bufferBytes = 0;
@@ -4459,7 +4910,7 @@ function runFailOpenMcp(status, options = {}) {
     buffer = '';
     bufferBytes = 0;
     stdinEnded = true;
-    shutdownHandoffChild(handoff, options);
+    if (handoffValidated) shutdownHandoffChild(handoff, options);
   });
   return { notifyRuntimeReady };
 }
@@ -4748,6 +5199,8 @@ if (require.main === module) {
       trimManagedCliDownloadCache,
       extractArchive,
       failOpenToolResult,
+      failOpenValidatedSchemaKeywords,
+      validatePublishedSchemaValue,
       failOpenToolCatalog,
       failOpenMaxFrameBytes,
       managedCliFailureCode,
@@ -4775,6 +5228,8 @@ if (require.main === module) {
       failOpenPublicationStamp,
       publicationStampSkew,
       runtimeWireContractSkew,
+      v3LauncherSession,
+      v3RuntimeWireContractSkew,
       supportedMcpProtocolVersions,
       managedCliMcpProtocolVersion,
       publicationStampSchemaVersion,

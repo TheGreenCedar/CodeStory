@@ -19,8 +19,8 @@ pub(crate) const EMBEDDING_VECTOR_SCHEMA_VERSION: u32 = 2;
 
 const CONTEXT_TOKENS: u32 = 4096;
 const MAX_INPUT_TOKENS: usize = 512;
-const BATCH_TOKENS: u32 = 1024;
-const MAX_BATCH_SEQUENCES: u32 = 6;
+const BATCH_TOKENS: u32 = 2048;
+const MAX_BATCH_SEQUENCES: u32 = 16;
 
 pub(crate) fn native_engine_config(allow_cpu: bool) -> Result<EmbeddingEngineConfig> {
     let capabilities = compiled_engine_capabilities();

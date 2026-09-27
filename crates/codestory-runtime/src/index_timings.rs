@@ -24,6 +24,8 @@ pub(super) struct IndexingRunSummary {
     /// The run proved the published core already satisfied the request and
     /// wrote nothing, so no runtime cache rebuild or republication is owed.
     pub(super) unchanged_publication: bool,
+    /// Exact repository-tracking input used by the publication plan.
+    pub(super) repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
 }
 
 pub(super) fn incremental_plan_probe_timings(
@@ -377,6 +379,11 @@ pub(super) fn database_snapshot_copy_timings(
         copy_ms: stats.copy_ms,
         source_bytes: stats.source_bytes,
         target_bytes: stats.target_bytes,
+        stage_strategy: Some(stats.stage_strategy.to_owned()),
+        fallback_reason: stats.fallback_reason.map(str::to_owned),
+        native_error_code: stats.native_error_code,
+        cloned_bytes: stats.cloned_bytes,
+        copied_bytes: stats.copied_bytes,
     }
 }
 
@@ -385,6 +392,7 @@ pub(super) fn core_promotion_timings(
 ) -> CorePromotionTimings {
     CorePromotionTimings {
         total_ms: stats.total_ms,
+        lock_wait_ms: stats.lock_wait_ms,
         lock_recovery_ms: stats.lock_recovery_ms,
         candidate_validation_ms: stats.candidate_validation_ms,
         previous_validation_ms: stats.previous_validation_ms,
@@ -396,11 +404,14 @@ pub(super) fn core_promotion_timings(
         staged_to_live_restore_ms: stats.staged_to_live_restore_ms,
         promoted_validation_ms: stats.promoted_validation_ms,
         committed_journal_ms: stats.committed_journal_ms,
+        generation_install_ms: stats.generation_install_ms,
+        pointer_publication_ms: stats.pointer_publication_ms,
         cleanup_ms: stats.cleanup_ms,
         unattributed_ms: stats.unattributed_ms,
         candidate_bytes: stats.candidate_bytes,
         previous_live_bytes: stats.previous_live_bytes,
         rollback_backup_bytes: stats.rollback_backup_bytes,
+        rollback_generation_bytes: stats.rollback_generation_bytes,
         promoted_validation: match stats.promoted_validation {
             codestory_store::PromotedValidation::ReusedCandidateReceipt => {
                 PromotedValidationDto::ReusedCandidateReceipt

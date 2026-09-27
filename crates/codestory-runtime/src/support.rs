@@ -511,6 +511,8 @@ pub(crate) struct FocusedSourceContext {
     pub(crate) path: String,
     pub(crate) line: u32,
     pub(crate) snippet: String,
+    pub(crate) truncated: bool,
+    pub(crate) evidence: codestory_contracts::api::FocusedSourceEvidenceDto,
 }
 
 #[cfg(test)]

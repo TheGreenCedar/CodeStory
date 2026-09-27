@@ -380,10 +380,16 @@
 }
 
 ;; Local bindings
+;;
+;; Closures (including `async ||` / `async move ||`) are owned by the lambda
+;; stanza above. The historical text predicate only excluded `|…|` and
+;; `move |…|`, so `async ||` let-bindings matched both stanzas and aborted
+;; graph execution with DuplicateVariable — the U09/U12 collector_failure
+;; class on meilisearch/surrealdb under frozen caps.
 (let_declaration
   pattern: (identifier) @name
   value: (_) @value
-  (#not-match? @value "^(move\\s+)?\\|"))
+  (#not-match? @value "^(async(\\s+move)?\\s+|move\\s+)?\\|"))
 {
   node @name.node
   attr (@name.node) kind = "VARIABLE"

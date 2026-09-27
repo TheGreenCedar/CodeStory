@@ -1,3 +1,6 @@
+;; java-type-visibility-v1: declaration-scoped visibility is projected by the
+;; Java extractor; this query revision invalidates parser/proof artifacts.
+
 (method_declaration
   name: (identifier) @name) @def
 {

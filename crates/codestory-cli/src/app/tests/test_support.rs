@@ -5,7 +5,7 @@ use codestory_contracts::api::{
     GraphEdgeDto, GraphNodeDto, IncrementalPlanProbeOutcomeDto, IncrementalPlanProbeTimings,
     IndexingPhaseTimings, NodeDetailsDto, NodeId, NodeKind, PacketBudgetDto, PacketBudgetLimitsDto,
     PacketBudgetModeDto, PacketBudgetUsageDto, PacketDispositionDto, PacketPlanDto,
-    PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketTaskClassDto, ProjectSummary,
+    PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, ProjectSummary,
     ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings, PromotedValidationDto,
     RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto,
     StorageStatsDto, SupportUnitDto, SupportUnitKindDto,
@@ -28,6 +28,7 @@ pub(super) fn sample_retrieval() -> RetrievalStateDto {
 
 pub(super) fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAnswerDto {
     AgentAnswerDto {
+        focused_source: None,
         source_coverage: Vec::new(),
         answer_id: "context-test".to_string(),
         prompt: "capped_bundle".to_string(),
@@ -51,7 +52,6 @@ pub(super) fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAn
             semantic_stage_timeout_zero_hits: 0,
             semantic_abstained_count: 0,
             annotations: Vec::new(),
-            packet_claim_profile_telemetry: None,
             source_freshness_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
@@ -76,19 +76,16 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
     AgentPacketDto {
         packet_id: "packet-task-brief".to_string(),
         question: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
-        task_class: Some(PacketTaskClassDto::EditPlanning),
         plan: PacketPlanDto {
-            task_class: PacketTaskClassDto::EditPlanning,
-            inferred_task_class: false,
             queries: vec![PacketPlanQueryDto {
                 query: "task brief packet surface".to_string(),
                 purpose: "find packet entry points".to_string(),
             }],
             probe_resolutions: Vec::new(),
-            obligations: Default::default(),
             trace: Vec::new(),
         },
         answer: AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-task-brief".to_string(),
             prompt: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
@@ -112,7 +109,6 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
@@ -194,7 +190,6 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
@@ -204,6 +199,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
             search_steps: 1,
             trail_steps: 0,
         },
+        answer_sufficiency: Default::default(),
     }
 }
 
@@ -230,7 +226,6 @@ pub(super) fn sample_task_brief_citation(
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
     }
@@ -275,6 +270,14 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             catalog_publication_ms: 30,
             unattributed_ms: 20,
         }),
+        incremental_core_wall: None,
+        incremental_coverage_validation_ms: None,
+        incremental_proof_projection_ms: None,
+        incremental_semantic_scope_ms: None,
+        incremental_semantic_projection_ms: None,
+        incremental_grounding_snapshot_ms: None,
+        incremental_publication_identity_ms: None,
+        incremental_search_generation_ms: None,
         source_prepare_ms: Some(41),
         projection_batch_wall_ms: Some(50),
         projection_batch_transactions: Some(2),
@@ -372,9 +375,11 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             copy_ms: 13,
             source_bytes: 1_024,
             target_bytes: 1_024,
+            ..DatabaseSnapshotCopyTimings::default()
         }),
         core_promotion: Some(CorePromotionTimings {
             total_ms: 89,
+            lock_wait_ms: 0,
             lock_recovery_ms: 1,
             candidate_validation_ms: 11,
             previous_validation_ms: 12,
@@ -386,11 +391,14 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             staged_to_live_restore_ms: 15,
             promoted_validation_ms: 10,
             committed_journal_ms: 2,
+            generation_install_ms: 5,
+            pointer_publication_ms: 2,
             cleanup_ms: 1,
             unattributed_ms: 1,
             candidate_bytes: 2_048,
             previous_live_bytes: Some(1_024),
             rollback_backup_bytes: Some(1_024),
+            rollback_generation_bytes: Some(1_024),
             promoted_validation: PromotedValidationDto::ReusedCandidateReceipt,
         }),
         incremental_plan_probe: Some(IncrementalPlanProbeTimings {
@@ -535,7 +543,6 @@ pub(super) fn test_search_hit_defaults() -> SearchHit {
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),

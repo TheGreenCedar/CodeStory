@@ -11,18 +11,15 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ArtifactCacheAccessTimings, ArtifactCachePolicyDto,
     GraphArtifactDto, GroundingOrientationConfidenceDto, GroundingOrientationUncertaintyDto,
-    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketClaimProfileTelemetryDto,
-    PacketClaimSourceDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
-    RetrievalAnnotationKindDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SearchHitOrigin, SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto,
-    SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto, SearchPlanChannelDto,
-    SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto,
-    TrailContextDto, TrailStoryDto,
+    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, RepoTextScanStatsDto, RetrievalAnnotationKindDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
-#[cfg(test)]
-use codestory_contracts::api::{PacketClaimProfileFireRateDto, PacketClaimSourceCountDto};
 use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
 use serde_json::Value;
@@ -286,9 +283,23 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     markdown
 }
 
+fn diagnostic_core_status_label(status: crate::args::DiagnosticCoreStatus) -> &'static str {
+    match status {
+        crate::args::DiagnosticCoreStatus::Unavailable => "unavailable",
+        crate::args::DiagnosticCoreStatus::UpgradeRequired => "upgrade_required",
+    }
+}
+
 pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Readiness");
+    if let Some(status) = output.core_status {
+        let _ = writeln!(
+            markdown,
+            "core_status: `{}`",
+            diagnostic_core_status_label(status)
+        );
+    }
     if let Some(refresh) = output.local_refresh.as_ref() {
         let _ = writeln!(
             markdown,
@@ -298,6 +309,13 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
         if let Some(reason) = refresh.reason.as_deref() {
             let _ = writeln!(markdown, "local_refresh_reason: {reason}");
         }
+    }
+    if let Some(legacy) = output.legacy_retirement.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "legacy_retirement_pending: {} standalone_bytes={} errors={:?}",
+            legacy.pending, legacy.legacy_bytes, legacy.errors
+        );
     }
     append_readiness_verdicts(&mut markdown, &output.verdicts);
     if !output.readiness_lanes.is_empty() {
@@ -389,7 +407,7 @@ fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
     }
 }
 
-fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+pub(crate) fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
     let _ = writeln!(
         markdown,
         "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
@@ -416,6 +434,23 @@ fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             wall.search_generation_ms,
             wall.catalog_publication_ms,
             wall.unattributed_ms,
+        );
+    }
+    if let Some(wall) = timings.incremental_core_wall.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "incremental_core_wall_ms: core_refresh={} discovery_and_scheduling={} stage_open={} parse_and_extraction={} core_staging_and_mutation={} candidate_sealing={} pointer_publication={} lock_wait={} process_and_ipc={} unattributed={} scheduled_paths={}",
+            wall.core_refresh_ms,
+            wall.discovery_and_scheduling_ms,
+            wall.stage_open_ms,
+            wall.parse_and_extraction_ms,
+            wall.core_staging_and_mutation_ms,
+            wall.candidate_sealing_ms,
+            wall.pointer_publication_ms,
+            wall.lock_wait_ms,
+            wall.process_and_ipc_ms,
+            wall.unattributed_ms,
+            wall.scheduled_paths.len(),
         );
     }
     append_index_cache_timings(markdown, timings);
@@ -592,40 +627,29 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
         );
     }
     if let Some(promotion) = timings.core_promotion.as_ref() {
-        let rollback_backup_copy_ms = promotion
-            .rollback_backup_copy_ms
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
-        let backup_validation_ms = promotion
-            .backup_validation_ms
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
         let previous_live_bytes = promotion
             .previous_live_bytes
             .map_or_else(|| "none".to_string(), |value| value.to_string());
-        let rollback_backup_bytes = promotion
-            .rollback_backup_bytes
+        let rollback_generation_bytes = promotion
+            .rollback_generation_bytes
             .map_or_else(|| "none".to_string(), |value| value.to_string());
         let _ = writeln!(
             markdown,
-            "core_promotion_ms: total={} lock_recovery={} candidate_validation={} previous_validation={} rollback_backup_copy={} backup_validation={} prepared_journal_write={} prepared_journal_file_sync={} prepared_journal_directory_sync={} staged_to_live_restore={} promoted_validation={} committed_journal={} cleanup={} unattributed={}",
+            "core_promotion_ms: total={} lock_wait={} legacy_recovery={} candidate_validation={} previous_pointer_resolution={} generation_install={} pointer_publication={} cleanup={} unattributed={}",
             promotion.total_ms,
+            promotion.lock_wait_ms,
             promotion.lock_recovery_ms,
             promotion.candidate_validation_ms,
             promotion.previous_validation_ms,
-            rollback_backup_copy_ms,
-            backup_validation_ms,
-            promotion.prepared_journal_write_ms,
-            promotion.prepared_journal_file_sync_ms,
-            promotion.prepared_journal_directory_sync_ms,
-            promotion.staged_to_live_restore_ms,
-            promotion.promoted_validation_ms,
-            promotion.committed_journal_ms,
+            promotion.generation_install_ms,
+            promotion.pointer_publication_ms,
             promotion.cleanup_ms,
             promotion.unattributed_ms,
         );
         let _ = writeln!(
             markdown,
-            "core_promotion_bytes: candidate={} previous_live={} rollback_backup={}",
-            promotion.candidate_bytes, previous_live_bytes, rollback_backup_bytes,
+            "core_promotion_bytes: candidate={} previous_live={} rollback_generation={}",
+            promotion.candidate_bytes, previous_live_bytes, rollback_generation_bytes,
         );
         let _ = writeln!(
             markdown,
@@ -1225,7 +1249,7 @@ fn search_operator_next_action(project_root: &Path, output: &SearchOutput) -> St
         );
     }
     format!(
-        "codestory-cli search --project {} --query {} --why",
+        "codestory-cli search --project {} --query {}",
         quoted_project_arg(project_root),
         quoted_cli_arg(&output.query)
     )
@@ -1983,7 +2007,7 @@ fn append_search_evidence_packet(
         } else {
             let _ = writeln!(
                 markdown,
-                "- `codestory-cli search --project {} --query {} --why`",
+                "- `codestory-cli search --project {} --query {}`",
                 quoted_project_arg(project_root),
                 quoted_cli_arg(&output.query)
             );
@@ -2016,9 +2040,6 @@ fn append_agent_evidence_packet(
         answer.retrieval_trace.total_latency_ms,
         answer.retrieval_trace.steps.len()
     );
-    if let Some(telemetry) = &answer.retrieval_trace.packet_claim_profile_telemetry {
-        let _ = writeln!(markdown, "- {}", claim_profile_telemetry_summary(telemetry));
-    }
     let checked_stages = answer
         .retrieval_trace
         .steps
@@ -2087,7 +2108,7 @@ fn append_agent_evidence_packet(
     } else {
         let _ = writeln!(
             markdown,
-            "- `codestory-cli search --project {} --query {} --why`",
+            "- `codestory-cli search --project {} --query {}`",
             quoted_project_arg(project_root),
             quoted_cli_arg(&answer.prompt.replace('\n', " "))
         );
@@ -2441,48 +2462,6 @@ fn citation_needs_untrusted_repo_label(citation: &AgentCitationDto) -> bool {
         )
 }
 
-/// Render claim-profile fire rates for the `what_was_checked` block.
-///
-/// This telemetry is always present on a packet, so it is reported as an observation about the
-/// retrieval run rather than as a trace annotation. Annotations are the evidence channel:
-/// `Gap`-kind entries downgrade confidence, so always-on telemetry never belongs there even as
-/// an `Observation`.
-fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -> String {
-    let source_claims = telemetry
-        .claim_sources
-        .iter()
-        .find(|entry| entry.source == PacketClaimSourceDto::SourceProfile)
-        .map(|entry| entry.claims)
-        .unwrap_or(0);
-    let mut summary = format!(
-        "claim profiles: contract_version={} fired={}/{} skipped_invalid={} pending={}/{} citations_considered={} source_profile_claims={}",
-        telemetry.contract_version,
-        telemetry.profiles_fired,
-        telemetry.registered_profiles,
-        telemetry.profiles_skipped_invalid,
-        telemetry.pending_profiles,
-        telemetry.pending_ratchet,
-        telemetry.citations_considered,
-        source_claims,
-    );
-    // The registry loads from checked-in data and fails closed, so a refusal answers from a
-    // smaller registry than the one this build ships. Reported only when it happened: a
-    // `rejected=0` on every packet is noise, and a silent refusal is the failure this exists for.
-    if telemetry.rejected_profiles > 0 {
-        summary.push_str(&format!(" rejected={}", telemetry.rejected_profiles));
-        if !telemetry.rejected_reasons.is_empty() {
-            summary.push_str(&format!(
-                " rejected_reasons={}",
-                telemetry.rejected_reasons.join(",")
-            ));
-        }
-    }
-    if let Some(error) = telemetry.registry_error.as_deref() {
-        summary.push_str(&format!(" registry_error={error}"));
-    }
-    summary
-}
-
 fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'static str {
     match reason {
         RetrievalFallbackReasonDto::DisabledByConfig => "disabled_by_config",
@@ -2619,7 +2598,7 @@ pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerD
 
 fn context_operator_next_action(answer: &AgentAnswerDto) -> &'static str {
     if answer.citations.is_empty() {
-        "Run search --why for a concrete symbol or file before answering."
+        "Run search for a concrete symbol or file before answering."
     } else if answer
         .retrieval_trace
         .steps
@@ -2704,6 +2683,13 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     );
     let _ = writeln!(markdown, "project: `{}`", output.project);
     let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
+    if let Some(status) = output.core_status {
+        let _ = writeln!(
+            markdown,
+            "core_status: `{}`",
+            diagnostic_core_status_label(status)
+        );
+    }
     let _ = writeln!(
         markdown,
         "stats: nodes={} edges={} files={} errors={}",
@@ -2721,6 +2707,13 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         output.sidecar_retrieval.embedding_device_state,
         output.sidecar_retrieval.embedding_cpu_allowed
     );
+    if let Some(legacy) = output.sidecar_retrieval.legacy_retirement.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "legacy_retirement_pending: {} standalone_bytes={} errors={:?}",
+            legacy.pending, legacy.legacy_bytes, legacy.errors
+        );
+    }
     let _ = writeln!(
         markdown,
         "readiness: local_navigation={} agent_packet_search={}",
@@ -3120,45 +3113,78 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
 }
 
 fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
-    let packet = &output.evidence_packet;
-    let _ = writeln!(
-        markdown,
-        "evidence_packet: id={} sufficiency={} citations={}",
-        packet.packet_id,
-        crate::packet_sufficiency_label(packet.disposition.kind),
-        packet.answer.citations.len()
-    );
-    let _ = writeln!(markdown, "- question: {}", packet.question);
-    if !packet.support.is_empty() {
-        let _ = writeln!(markdown, "- support:");
-        for unit in packet.support.iter().take(EVIDENCE_PREVIEW_LIMIT) {
-            let _ = writeln!(markdown, "  - {}", unit.summary);
-        }
-    }
-    if !packet.disposition.omission_receipts.is_empty() {
-        let _ = writeln!(markdown, "- gaps:");
-        for gap in packet
-            .disposition
-            .omission_receipts
-            .iter()
-            .take(EVIDENCE_PREVIEW_LIMIT)
-        {
-            let _ = writeln!(markdown, "  - {gap}");
-        }
-    }
-    if !packet.answer.citations.is_empty() {
-        let _ = writeln!(markdown, "- citations:");
-        for citation in packet.answer.citations.iter().take(EVIDENCE_PREVIEW_LIMIT) {
-            let path = citation.file_path.as_deref().unwrap_or("<no-file>");
-            let line = citation
-                .line
-                .map(|line| format!(":{line}"))
-                .unwrap_or_default();
+    match &output.evidence_packet {
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+            identity,
+            status,
+            evidence,
+            gaps,
+            ..
+        } => {
+            let availability = match status {
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Available => {
+                    "available"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::ContinuationAvailable => {
+                    "continuation_available"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::NoUsefulEvidence => {
+                    "no_useful_evidence"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Unavailable => {
+                    "unavailable"
+                }
+            };
             let _ = writeln!(
                 markdown,
-                "  - `{}` [{:?}] `{path}`{line} score={:.3}",
-                citation.display_name, citation.kind, citation.score
+                "evidence_packet: id={} availability={availability} evidence={}",
+                identity.packet_id.as_str(),
+                evidence.as_slice().len()
             );
+            if !evidence.as_slice().is_empty() {
+                let _ = writeln!(markdown, "- evidence:");
+                for row in evidence.as_slice().iter().take(EVIDENCE_PREVIEW_LIMIT) {
+                    let summary = row
+                        .summary
+                        .as_ref()
+                        .map_or("evidence row", |value| value.as_str());
+                    let path = row
+                        .path
+                        .as_ref()
+                        .map_or("<no-file>", |value| value.as_str());
+                    let _ = writeln!(markdown, "  - {summary} (`{path}`)");
+                }
+            }
+            if !gaps.as_slice().is_empty() {
+                let _ = writeln!(markdown, "- gaps:");
+                for gap in gaps.as_slice().iter().take(EVIDENCE_PREVIEW_LIMIT) {
+                    let message = gap
+                        .message
+                        .as_ref()
+                        .map_or("additional evidence required", |value| value.as_str());
+                    let _ = writeln!(markdown, "  - {message}");
+                }
+            }
+        }
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
+            identity,
+            gaps,
+            maximum_bytes,
+            required_complete_bytes,
+            ..
+        } => {
+            let _ = writeln!(
+                markdown,
+                "evidence_packet: id={} availability=unavailable budget={maximum_bytes} required={required_complete_bytes}",
+                identity.packet_id.as_str()
+            );
+            for gap in gaps.as_slice() {
+                let _ = writeln!(
+                    markdown,
+                    "- gap: output_budget_exceeded (`{}`)",
+                    gap.identity.gap_id.as_str()
+                );
+            }
         }
     }
 }
@@ -3644,12 +3670,14 @@ pub(crate) fn render_snippet_markdown(
         }
     }
     append_verification_targets(&mut markdown, "verification_targets", verification_targets);
-    let fence = snippet_fence(&context.snippet);
+    markdown = markdown.replace('\u{1b}', "\\x1b");
+    let display_snippet = context.snippet.replace('\u{1b}', "\\x1b");
+    let fence = snippet_fence(&display_snippet);
     let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
     let snippet = if colorize {
-        ansi_highlight_snippet(&context.path, &context.snippet)
+        ansi_highlight_snippet(&context.path, &display_snippet)
     } else {
-        context.snippet.clone()
+        display_snippet
     };
     let _ = writeln!(markdown, "{snippet}");
     let _ = writeln!(markdown, "{fence}");
@@ -4243,7 +4271,8 @@ mod tests {
                 total_ms: 9,
                 candidate_validation_ms: 2,
                 previous_validation_ms: 1,
-                staged_to_live_restore_ms: 3,
+                generation_install_ms: 3,
+                pointer_publication_ms: 1,
                 promoted_validation_ms: 2,
                 unattributed_ms: 1,
                 candidate_bytes: 4_096,
@@ -4255,10 +4284,13 @@ mod tests {
 
         append_index_phase_timings(&mut markdown, &timings);
 
-        assert!(markdown.contains("rollback_backup_copy=none backup_validation=none"));
         assert!(markdown.contains(
-            "core_promotion_bytes: candidate=4096 previous_live=none rollback_backup=none"
+            "core_promotion_ms: total=9 lock_wait=0 legacy_recovery=0 candidate_validation=2 previous_pointer_resolution=1 generation_install=3 pointer_publication=1 cleanup=0 unattributed=1"
         ));
+        assert!(markdown.contains(
+            "core_promotion_bytes: candidate=4096 previous_live=none rollback_generation=none"
+        ));
+        assert!(!markdown.contains("rollback_backup"));
         assert!(!markdown.contains("staged_snapshot_copy:"));
     }
 
@@ -4331,7 +4363,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -4414,6 +4445,7 @@ mod tests {
         DoctorOutput {
             project: "C:/repo".to_string(),
             storage_path: "C:/cache/codestory.db".to_string(),
+            core_status: None,
             indexed: true,
             stats: sample_storage_stats(),
             retrieval_mode: "full".to_string(),
@@ -4438,6 +4470,7 @@ mod tests {
                 precise_semantic_import_reason: None,
                 precise_semantic_import_revision: None,
                 precise_semantic_import_producer: None,
+                legacy_retirement: None,
                 ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
             },
             retrieval: None,
@@ -4962,7 +4995,6 @@ mod tests {
             evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
             resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: Some(false),
             source_excerpt: None,
         };
@@ -4985,6 +5017,7 @@ mod tests {
     #[test]
     fn context_markdown_contract_includes_evidence_packet_shape() {
         let answer = AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "build_packet".to_string(),
@@ -5014,7 +5047,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -5036,7 +5068,6 @@ mod tests {
                 annotations: vec![RetrievalAnnotationDto::observation(
                     "semantic retrieval ready",
                 )],
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -5084,54 +5115,9 @@ mod tests {
         );
     }
 
-    fn claim_profile_telemetry_fixture() -> PacketClaimProfileTelemetryDto {
-        PacketClaimProfileTelemetryDto {
-            contract_version: 2,
-            registered_profiles: 20,
-            contracted_profiles: 7,
-            pending_profiles: 13,
-            pending_ratchet: 13,
-            rejected_profiles: 0,
-            rejected_reasons: Vec::new(),
-            registry_error: None,
-            citations_considered: 3,
-            profiles_fired: 2,
-            // A healthy packet routinely reports skips: a profile whose runtime contract does
-            // not hold for a citation is skipped rather than fired.
-            profiles_skipped_invalid: 1,
-            profiles: vec![
-                PacketClaimProfileFireRateDto {
-                    profile_id: "shell-install-dispatch".to_string(),
-                    evaluated: 3,
-                    fired: 2,
-                    claims: 4,
-                    skipped_invalid: 0,
-                    skip_reason: None,
-                },
-                PacketClaimProfileFireRateDto {
-                    profile_id: "session-request-dispatch".to_string(),
-                    evaluated: 3,
-                    fired: 0,
-                    claims: 0,
-                    skipped_invalid: 1,
-                    skip_reason: Some("no_allowed_proof_roles".to_string()),
-                },
-            ],
-            claim_sources: vec![
-                PacketClaimSourceCountDto {
-                    source: PacketClaimSourceDto::SourceProfile,
-                    claims: 4,
-                },
-                PacketClaimSourceCountDto {
-                    source: PacketClaimSourceDto::RoleTemplate,
-                    claims: 1,
-                },
-            ],
-        }
-    }
-
     fn well_grounded_packet_answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-telemetry".to_string(),
             prompt: "Explain how the installer dispatches commands.".to_string(),
@@ -5167,7 +5153,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -5187,7 +5172,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -5201,63 +5185,6 @@ mod tests {
                 retrieval_shadow: None,
             },
         }
-    }
-
-    #[test]
-    fn claim_profile_telemetry_keeps_a_clean_packet_at_high_ready_confidence() {
-        // Regression: the always-on claim-profile counters were published as free-text
-        // `retrieval_trace.annotations`, which is the evidence-gap channel, so
-        // every packet reported the telemetry as an evidence gap and `agent_confidence` fell
-        // from high to medium (operator status ready -> review) universally. Telemetry now
-        // rides its own typed field and must not touch the gap channel.
-        let baseline = well_grounded_packet_answer();
-        let (baseline_confidence, _) = agent_confidence(&baseline);
-        assert_eq!(
-            baseline_confidence, "high",
-            "fixture must start from a clean high-confidence packet"
-        );
-
-        let mut answer = well_grounded_packet_answer();
-        answer.retrieval_trace.packet_claim_profile_telemetry =
-            Some(claim_profile_telemetry_fixture());
-
-        let (confidence, reasons) = agent_confidence(&answer);
-        assert_eq!(
-            confidence, "high",
-            "profile telemetry must not downgrade packet confidence: {reasons:?}"
-        );
-        assert_eq!(operator_status_from_confidence(confidence), "ready");
-        assert!(
-            agent_gap_notes(&answer).is_empty(),
-            "profile telemetry must not be reported as an evidence gap: {:?}",
-            agent_gap_notes(&answer)
-        );
-
-        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
-        assert!(
-            markdown.contains("status: ready"),
-            "telemetry-carrying packet must stay ready:\n{markdown}"
-        );
-        // Fire rates stay observable, but as an observation about the run rather than a gap.
-        assert!(
-            markdown.contains("claim profiles: contract_version=2 fired=2/20 skipped_invalid=1"),
-            "claim-profile fire rates must be reported under what_was_checked:\n{markdown}"
-        );
-        assert!(
-            !markdown.contains("rejected=") && !markdown.contains("registry_error="),
-            "a registry that loaded whole must not report a loader refusal:\n{markdown}"
-        );
-        assert_order(&markdown, "what_was_checked:", "gaps_uncertainty:");
-        let gaps_block = markdown
-            .split("gaps_uncertainty:")
-            .nth(1)
-            .expect("gaps block");
-        assert!(
-            !gaps_block.contains("claim profiles:")
-                && !gaps_block.contains("skipped_invalid")
-                && !gaps_block.contains("profiles_fired"),
-            "claim-profile telemetry must never appear as an evidence gap:\n{gaps_block}"
-        );
     }
 
     /// Every word the retired `is_gap_annotation` substring heuristic matched on.
@@ -5374,38 +5301,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_claim_profile_registry_is_visible_to_the_operator() {
-        // The registry loads from checked-in data and fails closed. A refusal answers from a
-        // smaller registry than this build ships, which is indistinguishable from "the profiles
-        // ran and stayed quiet" unless the refusal itself is printed.
-        let mut answer = well_grounded_packet_answer();
-        let mut telemetry = claim_profile_telemetry_fixture();
-        telemetry.rejected_profiles = 2;
-        telemetry.rejected_reasons = vec![
-            "unknown_profile_id".to_string(),
-            "missing_contract".to_string(),
-        ];
-        telemetry.registry_error = Some("schema_version_mismatch".to_string());
-        answer.retrieval_trace.packet_claim_profile_telemetry = Some(telemetry);
-
-        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
-        assert!(
-            markdown.contains(
-                "rejected=2 rejected_reasons=unknown_profile_id,missing_contract \
-                 registry_error=schema_version_mismatch"
-            ),
-            "a refused registry must be reported under what_was_checked:\n{markdown}"
-        );
-        // It is an observation about the run, not an evidence gap: routing it through the gap
-        // channel would downgrade confidence by substring match, which EV-6 established as wrong.
-        assert!(
-            agent_gap_notes(&answer).is_empty(),
-            "a loader refusal must not be published as an evidence annotation: {:?}",
-            agent_gap_notes(&answer)
-        );
-    }
-
-    #[test]
     fn search_why_markdown_contract_includes_evidence_packet_shape() {
         let output = crate::args::SearchOutput {
             query: "packet output".to_string(),
@@ -5458,11 +5353,11 @@ mod tests {
         );
         assert!(
             !markdown.contains("query_hints:"),
-            "search --why should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
+            "search should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
         );
         assert!(
             !markdown.contains("why:"),
-            "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
+            "search should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
         );
         assert!(
             markdown.contains("trust=untrusted_repo_evidence"),
@@ -5573,6 +5468,67 @@ mod tests {
         ] {
             assert_eq!(snippet_language(path), expected, "{path}");
         }
+    }
+
+    #[test]
+    fn snippet_markdown_escapes_source_escape_without_changing_plain_text() {
+        let original_snippet =
+            "-- café\nSELECT '\u{1b}[31mred\u{1b}[0m'; -- \u{1b}]0;owned\u{1b}\\".to_string();
+        let mut node = sample_node_details("terminal-fixture", "terminal_fixture");
+        node.display_name = "terminal\u{1b}[2Jfixture".to_string();
+        node.serialized_name = node.display_name.clone();
+        let context = SnippetContextDto {
+            node,
+            path: "C:/repo/db/\u{1b}]0;header\u{1b}\\terminal.sql".to_string(),
+            line: 1,
+            snippet: original_snippet.clone(),
+            scope: codestory_contracts::api::SnippetScopeDto::LineContext,
+            requested_context: 8,
+            snippet_truncated: false,
+            max_snippet_bytes: Some(512),
+            range_source: None,
+            fallback_reason: None,
+            truncation_guidance: None,
+        };
+        let serialized_before = serde_json::to_vec(&context).unwrap();
+
+        let markdown = render_snippet_markdown(
+            Path::new("C:/repo"),
+            &sample_resolved_target(),
+            &context,
+            false,
+            &[],
+        );
+
+        assert!(!markdown.contains('\u{1b}'), "{markdown:?}");
+        assert!(markdown.contains(r"SELECT '\x1b[31mred\x1b[0m';"));
+        assert!(markdown.contains("-- café"));
+        assert!(markdown.contains(r"terminal\x1b[2Jfixture"));
+        assert!(markdown.contains(r"\x1b]0;header\x1b/terminal.sql"));
+        assert_eq!(context.snippet, original_snippet);
+
+        let colorized = render_snippet_markdown(
+            Path::new("C:/repo"),
+            &sample_resolved_target(),
+            &context,
+            true,
+            &[],
+        );
+        assert!(colorized.contains("\u{1b}[32m"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}[31m"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}[2J"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}]0;owned"), "{colorized:?}");
+        assert!(!colorized.contains("\u{1b}]0;header"), "{colorized:?}");
+        assert!(colorized.contains(r"\x1b[31mred\x1b[0m"));
+        assert!(colorized.contains(r"\x1b]0;owned\x1b\"));
+
+        let serialized_after = serde_json::to_vec(&context).unwrap();
+        assert_eq!(serialized_after, serialized_before);
+        assert!(!serialized_after.contains(&0x1b));
+        let round_trip: SnippetContextDto = serde_json::from_slice(&serialized_after).unwrap();
+        assert_eq!(round_trip.snippet, context.snippet);
+        assert_eq!(round_trip.node.display_name, context.node.display_name);
+        assert_eq!(round_trip.path, context.path);
     }
 
     #[test]
@@ -5816,7 +5772,7 @@ mod tests {
             coverage_buckets: Vec::new(),
             notes: vec!["No fallback was needed.".to_string()],
             recommended_queries: vec![
-                "codestory-cli search --project C:/repo --query packet --why".to_string(),
+                "codestory-cli search --project C:/repo --query packet".to_string(),
             ],
         };
 
@@ -5921,6 +5877,7 @@ mod tests {
     #[test]
     fn context_markdown_surfaces_low_confidence_trace_gaps() {
         let answer = AgentAnswerDto {
+            focused_source: None,
             source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "weak_hit".to_string(),
@@ -5960,7 +5917,6 @@ mod tests {
                 evidence_producer: None,
                 resolution_status: None,
                 loss_reason: None,
-                coverage_role: None,
                 eligible_for_sufficiency: None,
                 source_excerpt: None,
             }],
@@ -5980,7 +5936,6 @@ mod tests {
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
                 annotations: vec![RetrievalAnnotationDto::gap("weak hits after fallback")],
-                packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
                 steps: vec![
                     AgentRetrievalStepDto {
@@ -6047,7 +6002,7 @@ mod tests {
                 stale_or_missing_anchor: false,
                 repo_text_fallback_reason: None,
                 recommended_next_action: Some(
-                    "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string(),
+                    "Run retrieval index to restore full sidecar mode, then rerun search with a shorter concrete symbol.".to_string(),
                 ),
                 orientation: None,
             }),

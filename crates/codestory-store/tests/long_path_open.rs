@@ -186,8 +186,11 @@ fn every_core_store_sqlite_open_routes_through_the_conversion_helper() {
     ];
     /// Any of these in the call's immediate neighborhood proves the filename
     /// was converted, or that no filename is involved at all.
-    const ACCEPTED: [&str; 4] = [
+    const ACCEPTED: [&str; 5] = [
         "sqlite_path::",
+        // PinnedCopySource holds the immutable image lease through ATTACH.
+        // The separate guard below proves both branches convert the path.
+        "source_path.attach_argument()",
         "open_in_memory",
         "DETACH DATABASE",
         // Opt out explicitly, next to the call, when a site genuinely does
@@ -225,5 +228,29 @@ fn every_core_store_sqlite_open_routes_through_the_conversion_helper() {
          their path with codestory_store::sqlite_path, so their -wal/-shm siblings will fail \
          past MAX_PATH on Windows:\n{}",
         unguarded.join("\n")
+    );
+}
+
+#[test]
+fn pinned_copy_source_attach_converts_both_image_and_legacy_paths() {
+    const SOURCE: &str = include_str!("../src/storage_impl/mod.rs");
+    let implementation = SOURCE
+        .split_once("impl PinnedCopySource {")
+        .expect("PinnedCopySource implementation")
+        .1
+        .split_once("impl std::ops::Deref for PinnedCopySource")
+        .expect("end of PinnedCopySource implementation")
+        .0;
+    let normalized = implementation
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains(
+            "fn attach_argument(&self) -> String { if self.immutable { \
+             sqlite_path::observational_uri(&self.path, true) } else { \
+             sqlite_path::attach_argument(&self.path) } }"
+        ),
+        "pinned immutable and legacy ATTACH sources must both use the SQLite path conversion helper"
     );
 }
