@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Project-scoped MCP calls now wait for managed preparation and return the requested result in the original call, with progress when the host supports it. A bounded deadline provides the same-tool arguments needed to resume; cancellation and preparation failures end the call directly.
-
 ## 0.17.6
 
 ### A rebuilt evidence engine for coding agents
@@ -27,6 +25,8 @@ Calls and imports survive both full indexing and parser-cache reuse. Go navigati
 Graph navigation can include test and benchmark callers through `caller_scope`; production callers remain the default. Affected-code results explain graph-backed relationships and suggest tests from the same package. File-scoped symbol lookup stays focused on the selected file even when the repository contains many declarations with the same name.
 
 ### Keep the map current without starting over
+
+Ask for code while CodeStory prepares the project: the original MCP call waits and returns the requested result, with progress when the host supports it. If preparation reaches its deadline, the response supplies the same-tool arguments needed to resume. Cancellation and preparation failures end the call directly.
 
 Incremental updates reuse unchanged work across supported filesystems, including those without database cloning. When cache space is short, CodeStory reports the required and available bytes before starting a full-size index stage. Indexes, parser caches and stored source provenance use compression and deduplication. Preparation reuses unchanged indexes and compatible embedding batches, and compatible retrieval artifacts can be prepared concurrently. Core-only search reads the existing symbol index without starting embeddings. Embedding-server startup on Apple Silicon reduces repeated setup work while retaining executable authentication.
 
