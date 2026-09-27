@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -67,6 +67,10 @@ const STDIO_TEXT_ITEM_LIMIT: usize = 8;
 const STDIO_TEXT_MAX_BYTES: usize = 4 * 1024;
 const STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+/// One MCP call may wait through several five-second activation slices. The
+/// deadline is fixed when that call begins and never renewed by a slice.
+const STDIO_PREPARATION_WAIT_BUDGET: Duration = Duration::from_secs(120);
+const STDIO_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -187,9 +191,67 @@ where
     let mut stdin_closed = false;
     let mut terminating_since: Option<Instant> = None;
     let mut terminate = std::pin::pin!(terminate);
+    let mut progress_tick = tokio::time::interval(STDIO_PREPARATION_PROGRESS_INTERVAL);
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending_progress: Option<PendingStdioProgress> = None;
+    let mut frame_reader = StdioFrameReader::default();
 
     loop {
         let drain_deadline = terminating_since.map(|since| since + drain_budget);
+        // A progress frame may be only partly written when the host stops
+        // reading. Retain its offset across select iterations so cancellation
+        // and shutdown remain observable without appending another JSON frame
+        // to an unfinished one.
+        if let Some(progress) = pending_progress.as_mut() {
+            if progress.written == 0
+                && active
+                    .as_ref()
+                    .is_some_and(|request| request.client_cancelled.load(Ordering::Acquire))
+            {
+                pending_progress = None;
+                continue;
+            }
+            if drain_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            let mut finished = false;
+            let timeout_at = tokio::time::Instant::from_std(
+                drain_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)),
+            );
+            tokio::select! {
+                step = async {
+                    if progress.written < progress.bytes.len() {
+                        let written = writer.write(&progress.bytes[progress.written..]).await?;
+                        if written == 0 {
+                            bail!("stdio progress writer returned zero bytes");
+                        }
+                        progress.written += written;
+                        Ok::<bool, anyhow::Error>(false)
+                    } else {
+                        writer.flush().await?;
+                        Ok(true)
+                    }
+                } => {
+                    finished = step?;
+                }
+                frame = frame_reader.read_frame(&mut reader), if !stdin_closed && drain_deadline.is_none() => {
+                    match frame? {
+                        Some(frame) => queued.admit(frame, active.as_ref()),
+                        None => stdin_closed = true,
+                    }
+                }
+                () = &mut terminate, if terminating_since.is_none() => {
+                    terminating_since = Some(Instant::now());
+                }
+                _ = tokio::time::sleep_until(timeout_at), if drain_deadline.is_some() => {
+                    break;
+                }
+            }
+            if finished {
+                pending_progress = None;
+            }
+            continue;
+        }
         // Responses the transport already owes leave the queue before anything
         // else runs, and they leave it from wherever they sit rather than only
         // from its front: a refusal queued behind a full batch of admitted
@@ -217,10 +279,16 @@ where
                 let line = message.line;
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let worker_cancelled = Arc::clone(&cancelled);
+                let progress = Arc::new(Mutex::new(None));
+                let progress_token = stdio_progress_token(&line);
+                request_session.preparation_progress = Some(Arc::clone(&progress));
                 active = Some(ActiveStdioRequest {
                     id: message.id,
                     cancelled,
                     client_cancelled: Arc::new(AtomicBool::new(false)),
+                    progress,
+                    progress_token,
+                    progress_sequence: 0,
                     task: tokio::task::spawn_blocking(move || {
                         let outcome = run_stdio_request(
                             &mut request_session,
@@ -237,7 +305,7 @@ where
                 break;
             }
             tokio::select! {
-                frame = read_stdio_frame(&mut reader) => {
+                frame = frame_reader.read_frame(&mut reader) => {
                     match frame? {
                         Some(frame) => queued.admit(frame, None),
                         None => stdin_closed = true,
@@ -263,7 +331,7 @@ where
 
         let active_request = active.as_mut().expect("active stdio request");
         tokio::select! {
-            frame = read_stdio_frame(&mut reader) => {
+            frame = frame_reader.read_frame(&mut reader) => {
                 match frame? {
                     Some(frame) => queued.admit(frame, Some(active_request)),
                     None => stdin_closed = true,
@@ -281,6 +349,44 @@ where
                         stdio_request_response(completed.1, active_request.id.as_ref())
                 {
                     write_stdio_response(&mut writer, &response).await?;
+                }
+            }
+            _ = progress_tick.tick(), if active_request.progress_token.is_some() => {
+                let snapshot = {
+                    active_request
+                        .progress
+                        .lock()
+                        .expect("stdio preparation progress mutex")
+                        .clone()
+                };
+                if !active_request.client_cancelled.load(Ordering::Acquire)
+                    && !active_request.task.is_finished()
+                    && let Some(snapshot) = snapshot
+                    && matches!(
+                        snapshot.state,
+                        codestory_runtime::ActivationState::Preparing
+                            | codestory_runtime::ActivationState::Updating
+                    )
+                {
+                    active_request.progress_sequence += 1;
+                    let token = active_request
+                        .progress_token
+                        .as_ref()
+                        .expect("progress tick requires a token");
+                    let mut bytes = serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": token,
+                                // MCP progress is a monotonically increasing
+                                // update count, not the stage's fixed 0..100
+                                // label or an estimated percentage.
+                                "progress": active_request.progress_sequence,
+                                "message": stdio_activation_stage_message(snapshot.stage),
+                            }
+                        }))?;
+                    bytes.push(b'\n');
+                    pending_progress = Some(PendingStdioProgress { bytes, written: 0 });
                 }
             }
         }
@@ -381,7 +487,15 @@ struct ActiveStdioRequest {
     /// raises `cancelled` without raising this one, because the client is still
     /// waiting and has to be told the server is stopping.
     client_cancelled: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<codestory_runtime::ActivationSnapshot>>>,
+    progress_token: Option<serde_json::Value>,
+    progress_sequence: u64,
     task: tokio::task::JoinHandle<(StdioServerSession, StdioRequestOutcome)>,
+}
+
+struct PendingStdioProgress {
+    bytes: Vec<u8>,
+    written: usize,
 }
 
 struct StdioQueuedMessage {
@@ -436,6 +550,7 @@ fn run_stdio_request(
     let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handler(session, line, cancelled)
     }));
+    session.preparation_progress = None;
     match executed {
         Ok(response) => StdioRequestOutcome::Completed(response),
         Err(_) => {
@@ -655,6 +770,72 @@ fn stdio_cancellation_target_id(line: &str) -> Option<serde_json::Value> {
     Some(target.clone())
 }
 
+/// MCP progress is correlated by the client's token, never by a project or
+/// the mutable active request id. Invalid or oversized tokens are ignored.
+fn stdio_progress_token(line: &str) -> Option<serde_json::Value> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    let token = message.pointer("/params/_meta/progressToken")?;
+    if (!token.is_string() && !token.is_i64() && !token.is_u64())
+        || stdio_json_retained_bytes(token) > STDIO_MAX_ECHOED_ID_BYTES
+    {
+        return None;
+    }
+    Some(token.clone())
+}
+
+/// Consume transport-only resume arguments before product argument parsing.
+/// The published activation-tool schemas admit the pair so an ordinary MCP
+/// caller can use the deadline result without access to JSON-RPC `_meta`.
+fn stdio_resume_arguments(
+    request: &mut serde_json::Value,
+) -> std::result::Result<Option<(String, u32)>, ApiError> {
+    let Some(arguments) = request
+        .pointer_mut("/params/arguments")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    let id = arguments.remove("resume_operation_id");
+    let attempt = arguments.remove("resume_operation_attempt");
+    match (id, attempt) {
+        (None, None) => Ok(None),
+        (Some(id), Some(attempt)) => {
+            let Some(id) = id.as_str() else {
+                return Err(ApiError::invalid_argument(
+                    "resume_operation_id must be an operation ID string",
+                ));
+            };
+            let Some(attempt) = attempt.as_u64().and_then(|value| u32::try_from(value).ok()) else {
+                return Err(ApiError::invalid_argument(
+                    "resume_operation_attempt must be a positive integer",
+                ));
+            };
+            if attempt == 0 {
+                return Err(ApiError::invalid_argument(
+                    "resume_operation_attempt must be a positive integer",
+                ));
+            }
+            Ok(Some((id.to_string(), attempt)))
+        }
+        _ => Err(ApiError::invalid_argument(
+            "preparation resume requires both operation ID and attempt",
+        )),
+    }
+}
+
+fn stdio_activation_stage_message(stage: codestory_runtime::ActivationStage) -> &'static str {
+    use codestory_runtime::ActivationStage;
+    match stage {
+        ActivationStage::Discovery => "CodeStory is checking project files",
+        ActivationStage::CoreFreshness => "CodeStory is updating the code index",
+        ActivationStage::SearchPreparation => "CodeStory is preparing search",
+        ActivationStage::DensePreparation => "CodeStory is preparing semantic search",
+        ActivationStage::Publication => "CodeStory is publishing the new index",
+        ActivationStage::Validation => "CodeStory is checking the completed index",
+        ActivationStage::Ready => "CodeStory is finishing preparation",
+    }
+}
+
 /// Wait for the in-flight request to finish and answer whoever is still owed.
 ///
 /// With no `deadline` (stdin closed on its own) the wait is unbounded: nothing
@@ -709,67 +890,77 @@ enum StdioFrame {
     TooLarge(usize),
 }
 
-async fn read_stdio_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<StdioFrame>> {
-    let mut line = Vec::new();
-    loop {
-        let (available_len, newline_index, at_eof) = {
-            let available = reader.fill_buf().await?;
-            (
-                available.len(),
-                available.iter().position(|byte| *byte == b'\n'),
-                available.is_empty(),
-            )
-        };
-        if at_eof {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(StdioFrame::Line(line)))
+/// Bytes consumed before a pending `fill_buf` must survive every cancelled
+/// select branch. The same applies while discarding an oversized frame tail.
+#[derive(Default)]
+struct StdioFrameReader {
+    line: Vec<u8>,
+    discarded: Option<usize>,
+}
+
+impl StdioFrameReader {
+    async fn read_frame<R: AsyncBufRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<StdioFrame>> {
+        loop {
+            let (available_len, newline_index) = {
+                let available = reader.fill_buf().await?;
+                (
+                    available.len(),
+                    available.iter().position(|byte| *byte == b'\n'),
+                )
             };
-        }
-        if let Some(index) = newline_index {
-            let bytes_to_newline = index + 1;
-            if line.len() + bytes_to_newline > STDIO_MAX_FRAME_BYTES {
-                reader.consume(bytes_to_newline);
-                return Ok(Some(StdioFrame::TooLarge(line.len() + bytes_to_newline)));
+            if let Some(discarded) = self.discarded {
+                if available_len == 0 {
+                    self.discarded = None;
+                    return Ok(Some(StdioFrame::TooLarge(discarded)));
+                }
+                let consumed = newline_index.map_or(available_len, |index| index + 1);
+                reader.consume(consumed);
+                let total = discarded.saturating_add(consumed);
+                if newline_index.is_some() {
+                    self.discarded = None;
+                    return Ok(Some(StdioFrame::TooLarge(total)));
+                }
+                self.discarded = Some(total);
+                continue;
+            }
+            if available_len == 0 {
+                return if self.line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(StdioFrame::Line(std::mem::take(&mut self.line))))
+                };
+            }
+            if let Some(index) = newline_index {
+                let consumed = index + 1;
+                let total = self.line.len() + consumed;
+                if total > STDIO_MAX_FRAME_BYTES {
+                    reader.consume(consumed);
+                    self.line.clear();
+                    return Ok(Some(StdioFrame::TooLarge(total)));
+                }
+                {
+                    let available = reader.fill_buf().await?;
+                    self.line.extend_from_slice(&available[..consumed]);
+                }
+                reader.consume(consumed);
+                return Ok(Some(StdioFrame::Line(std::mem::take(&mut self.line))));
+            }
+            if available_len > STDIO_MAX_FRAME_BYTES.saturating_sub(self.line.len()) {
+                let total = self.line.len() + available_len;
+                reader.consume(available_len);
+                self.line.clear();
+                self.discarded = Some(total);
+                continue;
             }
             {
                 let available = reader.fill_buf().await?;
-                line.extend_from_slice(&available[..bytes_to_newline]);
+                self.line.extend_from_slice(available);
             }
-            reader.consume(bytes_to_newline);
-            return Ok(Some(StdioFrame::Line(line)));
-        }
-        let remaining = STDIO_MAX_FRAME_BYTES.saturating_sub(line.len());
-        if available_len > remaining {
             reader.consume(available_len);
-            let tail_bytes = discard_stdio_frame_tail(reader).await?;
-            return Ok(Some(StdioFrame::TooLarge(
-                line.len() + available_len + tail_bytes,
-            )));
         }
-        {
-            let available = reader.fill_buf().await?;
-            line.extend_from_slice(available);
-        }
-        reader.consume(available_len);
-    }
-}
-
-async fn discard_stdio_frame_tail<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<usize> {
-    let mut discarded = 0;
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(discarded);
-        }
-        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
-            reader.consume(index + 1);
-            return Ok(discarded + index + 1);
-        }
-        let len = available.len();
-        reader.consume(len);
-        discarded += len;
     }
 }
 
@@ -1145,8 +1336,11 @@ struct StdioServerSession {
     tainted_project: Option<args::ProjectArgs>,
     protocol_v3: crate::stdio_v3::NativeSessionV3,
     diagnostics_v3: Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
+    preparation_progress: Option<Arc<Mutex<Option<codestory_runtime::ActivationSnapshot>>>>,
     #[cfg(test)]
     proof_fixture: bool,
+    #[cfg(test)]
+    preparation_wait_budget_for_test: Option<Duration>,
 }
 
 impl StdioServerSession {
@@ -1168,8 +1362,11 @@ impl StdioServerSession {
             diagnostics_v3: Arc::new(std::sync::Mutex::new(
                 crate::stdio_v3::DiagnosticsRegistryV3::new(),
             )),
+            preparation_progress: None,
             #[cfg(test)]
             proof_fixture: false,
+            #[cfg(test)]
+            preparation_wait_budget_for_test: None,
         }
     }
 
@@ -1495,6 +1692,7 @@ fn handle_stdio_request(
     request: &serde_json::Value,
     cancelled: &Arc<AtomicBool>,
 ) -> Option<serde_json::Value> {
+    let request_started = Instant::now();
     let mut request = request.clone();
     if !request.is_object() {
         return Some(stdio_jsonrpc_error(
@@ -1690,10 +1888,22 @@ fn handle_stdio_request(
                     format!("Unknown tool: {name}"),
                 ));
             }
+            let tool_name = name.to_string();
+            let resume_from_arguments = if stdio_tool_reads_publication(&tool_name) {
+                match stdio_resume_arguments(&mut request) {
+                    Ok(resume) => resume,
+                    Err(error) => {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            stdio_tool_call_error_v3(&stdio_api_error_value(error)),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             // Accept the server's own output vocabulary as input before anything reads
             // these arguments, so validation and the handler agree on one spelling.
-            // `name` borrows from `request`, so take an owned copy for the mutation.
-            let tool_name = name.to_string();
             if let Some(arguments) = request.pointer_mut("/params/arguments") {
                 crate::stdio_arguments::reconcile_argument_synonyms(&tool_name, arguments);
             }
@@ -1719,7 +1929,7 @@ fn handle_stdio_request(
                     ));
                 }
             };
-            let _packet_latency_scope = if name == "packet" {
+            let (_packet_latency_scope, preparation_budget) = if name == "packet" {
                 let latency_budget_ms = match stdio_packet_latency_budget(&request) {
                     Ok(latency_budget_ms) => latency_budget_ms,
                     Err(error) => {
@@ -1733,12 +1943,22 @@ fn handle_stdio_request(
                         ));
                     }
                 };
-                Some(codestory_runtime::enter_packet_latency_scope(
-                    latency_budget_ms,
-                ))
+                (
+                    Some(codestory_runtime::enter_packet_latency_scope(
+                        latency_budget_ms,
+                    )),
+                    Duration::from_millis(u64::from(latency_budget_ms.unwrap_or(18_000))),
+                )
             } else {
-                None
+                (None, STDIO_PREPARATION_WAIT_BUDGET)
             };
+            #[cfg(test)]
+            let preparation_budget = session
+                .preparation_wait_budget_for_test
+                .unwrap_or(preparation_budget);
+            let preparation_deadline = request_started
+                .checked_add(preparation_budget)
+                .unwrap_or(request_started);
             codestory_runtime::observe_packet_entry_phase(
                 codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
             );
@@ -1763,6 +1983,7 @@ fn handle_stdio_request(
             );
             let revision = session.protocol_v3.negotiated_revision();
             let diagnostics_registry = Arc::clone(&session.diagnostics_v3);
+            let preparation_progress = session.preparation_progress.clone();
             let (runtime, state) = session.active_project_mut();
             let public_operation = stdio_public_operation_name(name, &request);
             let observes_complete_core = stdio_tool_observes_complete_core(name, &request);
@@ -1779,28 +2000,198 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                // Exact proof and affected share complete-core admission: a warm
-                // complete publication stays observational, while cold/fenced
-                // state starts managed preparation and returns preparing+retry.
+                // Exact proof and affected share complete-core admission. Each
+                // wait below names the same operation; it cannot start a new
+                // attempt if the worker finishes between foreground slices.
+                let resume_id = request.pointer("/params/_meta/codestory_operation_id");
+                let resume_attempt = request.pointer("/params/_meta/codestory_operation_attempt");
+                let meta_operation_id = resume_id.and_then(serde_json::Value::as_str);
+                let meta_attempt = resume_attempt
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                if (resume_id.is_some() || resume_attempt.is_some())
+                    && (meta_operation_id.is_none() || meta_attempt.is_none())
+                {
+                    return Some(stdio_jsonrpc_success(
+                        id,
+                        stdio_tool_call_error_v3(&serde_json::json!({
+                            "code": "invalid_argument",
+                            "message": "Preparation resume requires an operation ID and attempt",
+                            "tool": name,
+                        })),
+                    ));
+                }
+                if let Some((argument_id, argument_attempt)) = resume_from_arguments.as_ref()
+                    && meta_operation_id.is_some()
+                    && (meta_operation_id != Some(argument_id.as_str())
+                        || meta_attempt != Some(*argument_attempt))
+                {
+                    return Some(stdio_jsonrpc_success(
+                        id,
+                        stdio_tool_call_error_v3(&serde_json::json!({
+                            "code": "invalid_argument",
+                            "message": "Preparation resume arguments and metadata disagree",
+                            "tool": name,
+                        })),
+                    ));
+                }
+                let resumed_operation_id = resume_from_arguments
+                    .as_ref()
+                    .map(|(id, _)| id.as_str())
+                    .or(meta_operation_id);
+                let resumed_attempt = resume_from_arguments
+                    .as_ref()
+                    .map(|(_, attempt)| *attempt)
+                    .or(meta_attempt);
+                if let Some(expected) = resumed_operation_id {
+                    let current = runtime.activation.snapshot();
+                    if expected.len() > 128
+                        || !expected
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                        || current
+                            .as_ref()
+                            .map(|snapshot| snapshot.operation_id.as_str())
+                            != Some(expected)
+                        || current.as_ref().map(|snapshot| snapshot.attempt) != resumed_attempt
+                    {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            stdio_tool_call_error_v3(&serde_json::json!({
+                                "code": "publication_changed",
+                                "message": "The requested preparation operation is no longer current for this project",
+                                "tool": name,
+                            })),
+                        ));
+                    }
+                    if let Some(snapshot) = current
+                        && !matches!(
+                            snapshot.state,
+                            codestory_runtime::ActivationState::Preparing
+                                | codestory_runtime::ActivationState::Updating
+                                | codestory_runtime::ActivationState::Ready
+                        )
+                    {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            stdio_tool_call_error_v3(&serde_json::json!({
+                                "code": snapshot.failure_code.unwrap_or_else(|| "project_unavailable".into()),
+                                "message": snapshot.failure.unwrap_or_else(|| "The preparation operation ended without the required capability".into()),
+                                "details": snapshot.failure_details,
+                                "tool": name,
+                            })),
+                        ));
+                    }
+                    if runtime.activation.snapshot().is_some_and(|snapshot| {
+                        snapshot.state == codestory_runtime::ActivationState::Ready
+                            && !snapshot.allows_operation(name)
+                    }) {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            stdio_tool_call_error_v3(&serde_json::json!({
+                                "code": "project_unavailable",
+                                "message": "The resumed preparation did not provide this tool's required capability",
+                                "tool": name,
+                            })),
+                        ));
+                    }
+                }
                 codestory_runtime::observe_packet_entry_phase(
                     codestory_runtime::PacketEntryObservationPhase::ActivationStarted,
                 );
-                let activation = if observes_complete_core {
-                    runtime.activation.ensure_complete_core_for_observation(
-                        &runtime.project_root,
-                        &runtime.storage_path,
-                        Arc::clone(cancelled),
-                    )
+                let goal = if observes_complete_core {
+                    codestory_runtime::ActivationGoal::CoreOnly
                 } else {
+                    codestory_runtime::ActivationGoal::Full
+                };
+                let first_slice = preparation_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(5));
+                let mut activation = if let (Some(expected), Some(attempt)) =
+                    (resumed_operation_id, resumed_attempt)
+                {
                     runtime
                         .activation
-                        .activate_project(
+                        .wait_for_existing_operation(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            (expected, attempt),
+                            cancelled.as_ref(),
+                            first_slice,
+                            goal,
+                        )
+                        .map(|_| ())
+                } else if observes_complete_core {
+                    runtime
+                        .activation
+                        .ensure_complete_core_for_observation_with_budget(
                             &runtime.project_root,
                             &runtime.storage_path,
                             Arc::clone(cancelled),
+                            first_slice,
+                        )
+                } else {
+                    runtime
+                        .activation
+                        .activate_project_with_foreground_budget(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            Arc::clone(cancelled),
+                            first_slice,
                         )
                         .map(|_| ())
                 };
+                let mut deadline_exceeded = false;
+                let mut waiting_operation_id = resumed_operation_id.map(str::to_string);
+                let mut waiting_attempt = resumed_attempt;
+                while activation
+                    .as_ref()
+                    .is_err_and(|error| error.code == "activation_preparing")
+                {
+                    let snapshot = runtime.activation.snapshot();
+                    let Some(snapshot) = snapshot else {
+                        break;
+                    };
+                    match stdio_retained_capability_for_wait(
+                        &snapshot,
+                        waiting_operation_id.as_deref(),
+                        waiting_attempt,
+                        name,
+                        observes_complete_core,
+                    ) {
+                        Err(error) => {
+                            activation = Err(error);
+                            break;
+                        }
+                        Ok(true) => break,
+                        Ok(false) => {}
+                    }
+                    waiting_operation_id = Some(snapshot.operation_id.clone());
+                    waiting_attempt = Some(snapshot.attempt);
+                    if let Some(progress) = preparation_progress.as_ref() {
+                        *progress.lock().expect("stdio preparation progress mutex") =
+                            Some(snapshot.clone());
+                    }
+                    let now = Instant::now();
+                    if now >= preparation_deadline {
+                        deadline_exceeded = true;
+                        break;
+                    }
+                    let budget = preparation_deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_secs(5));
+                    activation = runtime
+                        .activation
+                        .wait_for_existing_operation(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            (&snapshot.operation_id, snapshot.attempt),
+                            cancelled.as_ref(),
+                            budget,
+                            goal,
+                        )
+                        .map(|_| ());
+                }
                 codestory_runtime::observe_packet_entry_phase(
                     codestory_runtime::PacketEntryObservationPhase::ActivationReturned,
                 );
@@ -1818,14 +2209,14 @@ fn handle_stdio_request(
                         && operation
                             .as_ref()
                             .is_some_and(|snapshot| snapshot.allows_operation(name));
-                    if error.code == "cancelled" || !allowed {
-                        let preparing = matches!(
-                            error.code.as_str(),
-                            "activation_preparing"
-                                | "activation_retryable"
-                                | "cache_busy"
-                                | "publication_changed"
-                        );
+                    if matches!(error.code.as_str(), "cancelled" | "publication_changed")
+                        || !allowed
+                    {
+                        // Only the still-running operation reaches the bounded
+                        // resume envelope. A worker's retryable failure, lock
+                        // error, or publication drift is a real terminal
+                        // error for this request, not a new hot retry.
+                        let preparing = error.code == "activation_preparing" && deadline_exceeded;
                         let cause_code = error
                             .details
                             .as_deref()
@@ -1837,18 +2228,36 @@ fn handle_stdio_request(
                             &runtime.project_root,
                         );
                         let mut recommended_next_calls = Vec::new();
+                        let mut retry_arguments = request
+                            .pointer("/params/arguments")
+                            .and_then(serde_json::Value::as_object)
+                            .cloned()
+                            .map(serde_json::Value::Object)
+                            .unwrap_or_else(|| serde_json::json!({}));
                         if preparing {
+                            let arguments = retry_arguments
+                                .as_object_mut()
+                                .expect("validated tool arguments are an object");
+                            arguments.insert(
+                                "resume_operation_id".into(),
+                                serde_json::json!(waiting_operation_id),
+                            );
+                            arguments.insert(
+                                "resume_operation_attempt".into(),
+                                serde_json::json!(waiting_attempt),
+                            );
                             recommended_next_calls.push(serde_json::json!({
                                 "method": "tools/call",
                                 "tool": name,
-                                "arguments": request
-                                    .pointer("/params/arguments")
-                                    .cloned()
-                                    .unwrap_or_else(|| serde_json::json!({})),
+                                "arguments": retry_arguments,
                                 "after_ms": operation
                                     .as_ref()
                                     .and_then(|snapshot| snapshot.retry_after_ms)
                                     .unwrap_or(250),
+                                "_meta": {
+                                    "codestory_operation_id": waiting_operation_id,
+                                    "codestory_operation_attempt": waiting_attempt,
+                                },
                             }));
                         }
                         let error = serde_json::json!({
@@ -1874,6 +2283,9 @@ fn handle_stdio_request(
                             "retry_after_ms": operation
                                 .as_ref()
                                 .and_then(|snapshot| snapshot.retry_after_ms),
+                            "deadline_exceeded": deadline_exceeded,
+                            "resume_operation_id": waiting_operation_id,
+                            "resume_operation_attempt": waiting_attempt,
                             "operation": operation,
                             "next_action": if preparing {
                                 "retry_intended_tool"
@@ -1894,12 +2306,22 @@ fn handle_stdio_request(
                             let preparing = serde_json::json!({
                                 "kind": "preparing",
                                 "state": "preparing",
+                                "deadline_exceeded": true,
+                                "resume_operation_id": waiting_operation_id,
+                                "resume_operation_attempt": waiting_attempt,
                                 "retry_after_ms": retry_after_ms,
                                 // The caller need not re-plan: the same request,
                                 // unchanged, is the whole next action.
                                 "minimum_next": {
                                     "kind": "retry_same_request",
                                     "after_ms": retry_after_ms,
+                                    "operation_id": waiting_operation_id,
+                                    "operation_attempt": waiting_attempt,
+                                    "arguments": retry_arguments,
+                                    "request_meta": {
+                                        "codestory_operation_id": waiting_operation_id,
+                                        "codestory_operation_attempt": waiting_attempt,
+                                    },
                                 },
                                 "operation": operation
                                     .as_ref()
@@ -2808,6 +3230,27 @@ fn stdio_packet_tool_call_success(
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
     name != "status"
+}
+
+fn stdio_retained_capability_for_wait(
+    snapshot: &codestory_runtime::ActivationSnapshot,
+    operation_id: Option<&str>,
+    attempt: Option<u32>,
+    tool: &str,
+    observes_complete_core: bool,
+) -> Result<bool, ApiError> {
+    // Retained navigation may use a completed capability only from the
+    // operation this request joined. A replacement's ready capability cannot
+    // turn an exact resume into a different operation's response.
+    if operation_id.is_some_and(|expected| expected != snapshot.operation_id)
+        || attempt.is_some_and(|expected| expected != snapshot.attempt)
+    {
+        return Err(ApiError::new(
+            "publication_changed",
+            "the project preparation operation changed while the request was waiting",
+        ));
+    }
+    Ok(!observes_complete_core && snapshot.allows_operation(tool))
 }
 
 fn stdio_search_repo_text_mode(request: &serde_json::Value) -> SearchRepoTextMode {
@@ -9073,6 +9516,9 @@ mod tests {
             id: Some(json!("request-1")),
             cancelled: Arc::clone(&cancelled),
             client_cancelled: Arc::clone(&client_cancelled),
+            progress: Arc::new(Mutex::new(None)),
+            progress_token: None,
+            progress_sequence: 0,
             task: tokio::task::spawn_blocking(|| {
                 (
                     StdioServerSession::new(None),
@@ -9246,6 +9692,9 @@ mod tests {
             id: Some(json!("long-running")),
             cancelled: Arc::new(AtomicBool::new(false)),
             client_cancelled: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(None)),
+            progress_token: None,
+            progress_sequence: 0,
             task: tokio::task::spawn_blocking(move || {
                 while !worker_released.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
@@ -9883,6 +10332,875 @@ mod tests {
 
         assert_eq!(error.code, "cancelled");
         assert!(!runtime.storage_path.exists());
+    }
+
+    #[tokio::test]
+    async fn one_stdio_call_waits_past_foreground_preparation_and_returns_affected_evidence() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::create_dir(project.path().join("src")).expect("source directory");
+        std::fs::write(
+            project.path().join("src/lib.rs"),
+            "pub fn prepared_symbol() {}\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": "one-preparing-call",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "affected",
+                            "arguments": {
+                                "project": project.path(),
+                                "paths": ["src/lib.rs"]
+                            },
+                            "_meta": {"progressToken": "one-preparing-progress"}
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send one affected request");
+        let mut output = BufReader::new(client_output);
+        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        let mut before_release = Vec::new();
+        loop {
+            let mut line = String::new();
+            match tokio::time::timeout(Duration::from_millis(100), output.read_line(&mut line))
+                .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => before_release.push(
+                    serde_json::from_str::<serde_json::Value>(&line).expect("JSON-RPC frame"),
+                ),
+                Ok(Err(error)) => panic!("read pending response: {error}"),
+            }
+        }
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        let early_terminal = before_release
+            .iter()
+            .find(|frame| frame.get("id") == Some(&json!("one-preparing-call")));
+        assert!(
+            early_terminal.is_none(),
+            "the original call completed while preparation was still blocked: {before_release:?}"
+        );
+        let progress = before_release
+            .iter()
+            .filter(|frame| frame.get("method") == Some(&json!("notifications/progress")))
+            .collect::<Vec<_>>();
+        assert!(
+            !progress.is_empty(),
+            "no progress while pending: {before_release:?}"
+        );
+        for (index, frame) in progress.iter().enumerate() {
+            assert_eq!(
+                frame.pointer("/params/progressToken"),
+                Some(&json!("one-preparing-progress"))
+            );
+            assert_eq!(frame.pointer("/params/progress"), Some(&json!(index + 1)));
+            assert!(frame.pointer("/params/total").is_none());
+            let message = frame
+                .pointer("/params/message")
+                .and_then(serde_json::Value::as_str);
+            assert!(
+                message.is_some_and(
+                    |message| message.starts_with("CodeStory is ") && !message.contains('_')
+                ),
+                "progress must describe a user-readable stage: {frame}"
+            );
+        }
+
+        let final_response = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut line = String::new();
+                output.read_line(&mut line).await.expect("read response");
+                let frame: serde_json::Value = serde_json::from_str(&line).expect("JSON-RPC frame");
+                if frame.get("id") == Some(&json!("one-preparing-call")) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("one call resolves after preparation");
+        assert_eq!(
+            final_response.pointer("/result/structuredContent/changed_paths"),
+            Some(&json!(["src/lib.rs"])),
+            "{final_response}"
+        );
+        client_input.shutdown().await.expect("close request stream");
+        assert_eq!(
+            serving.await.expect("serve task").expect("serve request"),
+            StdioServeOutcome::StdinClosed
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[tokio::test]
+    async fn preparation_deadline_returns_exact_resume_without_a_progress_token() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(project.path().join("lib.rs"), "pub fn resume_anchor() {}\n")
+            .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session.preparation_wait_budget_for_test = Some(Duration::from_millis(120));
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        let affected = |id: &str, resume: Option<(&str, u32)>| {
+            let mut params = json!({
+                "name": "affected",
+                "arguments": {
+                    "project": project.path(),
+                    "paths": ["lib.rs"]
+                }
+            });
+            if let Some((operation_id, attempt)) = resume {
+                params["arguments"]["resume_operation_id"] = json!(operation_id);
+                params["arguments"]["resume_operation_attempt"] = json!(attempt);
+            }
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params})
+        };
+        let started = Instant::now();
+        client_input
+            .write_all(format!("{}\n", affected("deadline", None)).as_bytes())
+            .await
+            .expect("send original request");
+        let mut output = BufReader::new(client_output);
+        let first = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut line = String::new();
+            output
+                .read_line(&mut line)
+                .await
+                .expect("read deadline response");
+            serde_json::from_str::<serde_json::Value>(&line).expect("deadline JSON-RPC")
+        })
+        .await;
+        if first.is_err() {
+            activation.set_worker_start_gate_for_test(None);
+            let (released, changed) = worker_gate.as_ref();
+            *released.lock().expect("activation gate") = true;
+            changed.notify_all();
+        }
+        let first = first.unwrap_or_else(|_| {
+            panic!(
+                "bounded preparation deadline; snapshot={:?}",
+                activation.snapshot()
+            )
+        });
+        // A fresh five-second slice would violate this short test deadline.
+        assert!(started.elapsed() < Duration::from_secs(2), "{first}");
+        let deadline = &first["result"]["structuredContent"];
+        assert_eq!(first["id"], json!("deadline"));
+        assert_eq!(deadline["kind"], json!("preparing"), "{first}");
+        assert_eq!(deadline["deadline_exceeded"], json!(true));
+        let operation_id = deadline["resume_operation_id"]
+            .as_str()
+            .expect("operation identity")
+            .to_owned();
+        let attempt = deadline["resume_operation_attempt"]
+            .as_u64()
+            .expect("attempt") as u32;
+        let mut replacement = activation.snapshot().expect("held operation snapshot");
+        replacement.operation_id = format!("{}-replacement", operation_id);
+        replacement.attempt += 1;
+        replacement.capabilities.local_navigation =
+            codestory_runtime::ActivationCapabilityState::Ready;
+        replacement.capabilities.broad_search = codestory_runtime::ActivationCapabilityState::Ready;
+        assert!(replacement.allows_operation("ground"));
+        assert_eq!(
+            stdio_retained_capability_for_wait(
+                &replacement,
+                Some(&operation_id),
+                Some(attempt),
+                "ground",
+                false,
+            )
+            .expect_err("a replacement ready capability cannot admit an exact resume")
+            .code,
+            "publication_changed"
+        );
+        assert_eq!(
+            deadline.pointer("/minimum_next/request_meta/codestory_operation_id"),
+            Some(&json!(operation_id))
+        );
+        assert_eq!(
+            deadline.pointer("/minimum_next/request_meta/codestory_operation_attempt"),
+            Some(&json!(attempt))
+        );
+        assert_eq!(
+            deadline.pointer("/minimum_next/arguments/resume_operation_id"),
+            Some(&json!(operation_id))
+        );
+        assert_eq!(
+            deadline.pointer("/minimum_next/arguments/resume_operation_attempt"),
+            Some(&json!(attempt))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                let mut line = String::new();
+                output.read_line(&mut line).await
+            })
+            .await
+            .is_err(),
+            "a request without a progress token must emit no progress frame"
+        );
+
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if activation.snapshot().is_some_and(|snapshot| {
+                    snapshot.capabilities.local_navigation
+                        == codestory_runtime::ActivationCapabilityState::Ready
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shared activation finishes after the first request's deadline");
+        client_input
+            .write_all(
+                format!("{}\n", affected("resume", Some((&operation_id, attempt)))).as_bytes(),
+            )
+            .await
+            .expect("send exact resume");
+        let resumed = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut line = String::new();
+            output
+                .read_line(&mut line)
+                .await
+                .expect("read resumed result");
+            serde_json::from_str::<serde_json::Value>(&line).expect("resumed JSON-RPC")
+        })
+        .await
+        .expect("same operation converges");
+        assert_eq!(resumed["id"], json!("resume"), "{resumed}");
+        assert_eq!(
+            resumed.pointer("/result/structuredContent/changed_paths"),
+            Some(&json!(["lib.rs"])),
+            "{resumed}"
+        );
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    affected("stale", Some((&operation_id, attempt + 1)))
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send wrong attempt");
+        let mut line = String::new();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read stale refusal");
+        let stale: serde_json::Value = serde_json::from_str(&line).expect("stale JSON-RPC");
+        assert_eq!(stale["id"], json!("stale"));
+        assert_eq!(stale.pointer("/result/isError"), Some(&json!(true)));
+        let stale_body: serde_json::Value = serde_json::from_str(
+            stale["result"]["content"][0]["text"]
+                .as_str()
+                .expect("typed error text"),
+        )
+        .expect("typed error JSON");
+        assert_eq!(
+            stale_body.get("code"),
+            Some(&json!("publication_changed")),
+            "{stale}"
+        );
+        let mut conflicting = affected("conflict", Some((&operation_id, attempt)));
+        conflicting["params"]["_meta"] = json!({
+            "codestory_operation_id": operation_id,
+            "codestory_operation_attempt": attempt + 1,
+        });
+        client_input
+            .write_all(format!("{}\n", conflicting).as_bytes())
+            .await
+            .expect("send conflicting resume identities");
+        line.clear();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read conflict refusal");
+        let conflict: serde_json::Value = serde_json::from_str(&line).expect("conflict JSON-RPC");
+        let conflict_body: serde_json::Value = serde_json::from_str(
+            conflict["result"]["content"][0]["text"]
+                .as_str()
+                .expect("conflict text"),
+        )
+        .expect("typed conflict JSON");
+        assert_eq!(
+            conflict_body["code"],
+            json!("invalid_argument"),
+            "{conflict}"
+        );
+        client_input.shutdown().await.expect("close request stream");
+        assert_eq!(
+            serving.await.expect("serve task").expect("serve request"),
+            StdioServeOutcome::StdinClosed
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[test]
+    fn packet_preparation_spends_its_existing_latency_budget_before_execution() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(project.path().join("lib.rs"), "pub fn packet_wait() {}\n")
+            .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let started = Instant::now();
+        let response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc":"2.0","id":"packet-preparation-budget","method":"tools/call",
+                "params":{
+                    "name":"packet",
+                    "arguments":{
+                        "project":project.path(),
+                        "question":"Where is packet_wait?",
+                        "latency_budget_ms":1_000
+                    }
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("packet deadline response");
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a five-second activation slice renewed packet's one-second budget: {response}"
+        );
+        assert_eq!(
+            response.pointer("/result/structuredContent/kind"),
+            Some(&json!("preparing")),
+            "{response}"
+        );
+        assert_eq!(
+            response.pointer("/result/structuredContent/deadline_exceeded"),
+            Some(&json!(true))
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[tokio::test]
+    async fn blocked_progress_writer_still_observes_cancel_and_termination() {
+        use tokio::io::AsyncReadExt;
+
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn stalled_output() {}\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        // One byte of output capacity forces a partial progress frame. No
+        // reader drains it until after shutdown.
+        let (server_output, mut client_output) = tokio::io::duplex(1);
+        let terminate = Arc::new(AtomicBool::new(false));
+        let terminate_signal = Arc::clone(&terminate);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            async move {
+                while !terminate_signal.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            handle_stdio_message,
+            Duration::from_millis(300),
+        ));
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc":"2.0",
+                        "id":"blocked",
+                        "method":"tools/call",
+                        "params":{
+                            "name":"affected",
+                            "arguments":{"project":project.path(),"paths":["lib.rs"]},
+                            "_meta":{"progressToken":7}
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send request");
+        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc":"2.0",
+                        "method":"notifications/cancelled",
+                        "params":{"requestId":"blocked"}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("cancel blocked request");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        terminate.store(true, Ordering::Release);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("shutdown must not wait on a blocked progress write")
+            .expect("serve task")
+            .expect("bounded serve outcome");
+        assert_eq!(outcome, StdioServeOutcome::Terminated);
+        let mut written = Vec::new();
+        client_output
+            .read_to_end(&mut written)
+            .await
+            .expect("read written prefix");
+        assert!(
+            !written.contains(&b'\n'),
+            "a later terminal frame must not be appended after an unfinished progress frame"
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_tail_survives_a_cancelled_read_future() {
+        let (mut input, server_input) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(server_input);
+        let mut frames = StdioFrameReader {
+            line: vec![b'x'; STDIO_MAX_FRAME_BYTES],
+            discarded: None,
+        };
+        input.write_all(b"x").await.expect("exceed frame bound");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), frames.read_frame(&mut reader))
+                .await
+                .is_err(),
+            "the oversized frame has no newline yet"
+        );
+        assert_eq!(frames.discarded, Some(STDIO_MAX_FRAME_BYTES + 1));
+        input
+            .write_all(b"tail\n{\"jsonrpc\":\"2.0\",\"id\":1}\n")
+            .await
+            .expect("finish oversize tail and a valid frame");
+        match frames
+            .read_frame(&mut reader)
+            .await
+            .expect("oversized frame")
+        {
+            Some(StdioFrame::TooLarge(bytes)) => {
+                assert_eq!(bytes, STDIO_MAX_FRAME_BYTES + 1 + b"tail\n".len())
+            }
+            _ => panic!("oversized frame did not retain discard state"),
+        }
+        match frames
+            .read_frame(&mut reader)
+            .await
+            .expect("following frame")
+        {
+            Some(StdioFrame::Line(line)) => {
+                assert_eq!(line, b"{\"jsonrpc\":\"2.0\",\"id\":1}\n")
+            }
+            _ => panic!("following frame was lost after oversized tail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_call_keeps_shared_preparation_and_the_queue_usable() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(project.path().join("lib.rs"), "pub fn after_cancel() {}\n")
+            .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        let affected = |id: &str, token: bool| {
+            let mut params = json!({
+                "name":"affected",
+                "arguments":{"project":project.path(),"paths":["lib.rs"]}
+            });
+            if token {
+                params["_meta"] = json!({"progressToken":"cancelled-progress"});
+            }
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params})
+        };
+        let status = |id: &str| {
+            json!({
+                "jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"status","arguments":{"project":project.path()}}
+            })
+        };
+        let cancel = |id: &str| {
+            json!({
+                "jsonrpc":"2.0","method":"notifications/cancelled",
+                "params":{"requestId":id}
+            })
+        };
+        client_input
+            .write_all(format!("{}\n", affected("cancel-active", true)).as_bytes())
+            .await
+            .expect("send active request");
+        client_input
+            .write_all(
+                format!("{}\n{}\n", status("cancel-queued"), cancel("cancel-queued")).as_bytes(),
+            )
+            .await
+            .expect("queue and cancel another request");
+        let mut output = BufReader::new(client_output);
+        let first_progress = tokio::time::timeout(Duration::from_secs(9), async {
+            let mut line = String::new();
+            output.read_line(&mut line).await.expect("read progress");
+            serde_json::from_str::<serde_json::Value>(&line).expect("progress JSON-RPC")
+        })
+        .await
+        .expect("pending call sends progress");
+        assert_eq!(first_progress["method"], json!("notifications/progress"));
+        assert_eq!(
+            first_progress.pointer("/params/progressToken"),
+            Some(&json!("cancelled-progress"))
+        );
+        // A queued request and then a cancellation both cross a progress
+        // tick while only their prefixes have arrived. The frame reader must
+        // retain those consumed bytes across each cancelled read future.
+        let survivor_line = format!("{}\n", status("survivor"));
+        let split = survivor_line.len() / 2;
+        client_input
+            .write_all(&survivor_line.as_bytes()[..split])
+            .await
+            .expect("send queued request prefix");
+        let second_progress = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut line = String::new();
+            output
+                .read_line(&mut line)
+                .await
+                .expect("read second progress");
+            serde_json::from_str::<serde_json::Value>(&line).expect("second progress JSON-RPC")
+        })
+        .await;
+        client_input
+            .write_all(&survivor_line.as_bytes()[split..])
+            .await
+            .expect("finish queued request");
+        let cancel_line = format!("{}\n", cancel("cancel-active"));
+        let split = cancel_line.len() / 2;
+        client_input
+            .write_all(&cancel_line.as_bytes()[..split])
+            .await
+            .expect("send cancellation prefix");
+        let third_progress = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut line = String::new();
+            output
+                .read_line(&mut line)
+                .await
+                .expect("read third progress");
+            serde_json::from_str::<serde_json::Value>(&line).expect("third progress JSON-RPC")
+        })
+        .await;
+        client_input
+            .write_all(&cancel_line.as_bytes()[split..])
+            .await
+            .expect("finish cancellation");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        let second_progress = second_progress.expect("progress while request frame is split");
+        let third_progress = third_progress.expect("progress while cancellation frame is split");
+        for (index, frame) in [(2, second_progress), (3, third_progress)] {
+            assert_eq!(frame["method"], json!("notifications/progress"), "{frame}");
+            assert_eq!(frame["params"]["progress"], json!(index), "{frame}");
+        }
+        let survivor = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                output.read_line(&mut line).await.expect("read next frame");
+                let frame: serde_json::Value = serde_json::from_str(&line).expect("next JSON-RPC");
+                assert_ne!(frame["id"], json!("cancel-active"), "{frame}");
+                assert_ne!(frame["id"], json!("cancel-queued"), "{frame}");
+                assert_ne!(
+                    frame["method"],
+                    json!("notifications/progress"),
+                    "cancelled request emitted late progress: {frame}"
+                );
+                if frame["id"] == json!("survivor") {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("queue continues after cancellation");
+        assert_eq!(survivor["id"], json!("survivor"));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if activation.snapshot().is_some_and(|snapshot| {
+                    snapshot.capabilities.local_navigation
+                        == codestory_runtime::ActivationCapabilityState::Ready
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shared activation survives one waiter cancellation");
+        client_input
+            .write_all(format!("{}\n", affected("after-cancel", false)).as_bytes())
+            .await
+            .expect("send next evidence request");
+        let mut line = String::new();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read final evidence");
+        let evidence: serde_json::Value = serde_json::from_str(&line).expect("evidence JSON-RPC");
+        assert_eq!(evidence["id"], json!("after-cancel"), "{evidence}");
+        assert_eq!(
+            evidence.pointer("/result/structuredContent/changed_paths"),
+            Some(&json!(["lib.rs"])),
+            "{evidence}"
+        );
+        client_input.shutdown().await.expect("close request stream");
+        assert_eq!(
+            serving.await.expect("serve task").expect("serve request"),
+            StdioServeOutcome::StdinClosed
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[tokio::test]
+    async fn preparation_worker_failure_ends_the_original_call_with_a_causal_error() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn before_failure() {}\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc":"2.0","id":"failed-preparation","method":"tools/call",
+                        "params":{
+                            "name":"affected",
+                            "arguments":{"project":project.path(),"paths":["lib.rs"]},
+                            "_meta":{"progressToken":"failure-progress"}
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send request");
+        let mut output = BufReader::new(client_output);
+        let first = tokio::time::timeout(Duration::from_secs(9), async {
+            let mut line = String::new();
+            output.read_line(&mut line).await.expect("read progress");
+            serde_json::from_str::<serde_json::Value>(&line).expect("progress JSON-RPC")
+        })
+        .await
+        .expect("request remains pending through first slice");
+        assert_eq!(first["method"], json!("notifications/progress"));
+        // The selected root existed at admission. Removing it while the
+        // worker is held makes the worker, not argument parsing, fail.
+        std::fs::remove_dir_all(project.path()).expect("remove selected project");
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut line = String::new();
+                output
+                    .read_line(&mut line)
+                    .await
+                    .expect("read worker result");
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).expect("worker JSON-RPC");
+                if frame["id"] == json!("failed-preparation") {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("real worker failure ends original call");
+        assert_eq!(failed["result"]["isError"], json!(true), "{failed}");
+        let failure: serde_json::Value = serde_json::from_str(
+            failed["result"]["content"][0]["text"]
+                .as_str()
+                .expect("failure text"),
+        )
+        .expect("typed failure JSON");
+        assert_ne!(failure["code"], json!("codestory_preparing"), "{failed}");
+        assert_ne!(
+            failure["cause_code"],
+            json!("activation_preparing"),
+            "{failed}"
+        );
+        assert!(failure.get("operation").is_some(), "{failed}");
+        let terminal = activation.snapshot().expect("terminal worker snapshot");
+        assert_eq!(
+            failure["cause_code"],
+            json!(terminal.failure_code),
+            "{failed}"
+        );
+        assert_eq!(
+            failure["details"],
+            json!(terminal.failure_details),
+            "{failed}"
+        );
+        client_input.shutdown().await.expect("close request stream");
+        assert_eq!(
+            serving.await.expect("serve task").expect("serve request"),
+            StdioServeOutcome::StdinClosed
+        );
+        activation.cancel_and_wait();
     }
 
     #[test]

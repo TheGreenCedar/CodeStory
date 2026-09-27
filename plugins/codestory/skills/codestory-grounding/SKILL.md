@@ -161,9 +161,16 @@ not the repository. Do not repeatedly retry an unchanged failed selection.
 
 ## Preparation and failures
 
-Project-scoped tools own managed preparation. For `preparing` or `updating`,
-honor `retry_after_ms` and retry the same request when still needed. Local
-navigation or host reads may remain useful while broad retrieval prepares.
+Project-scoped tools own managed preparation. Keep the original tool call
+pending while CodeStory prepares its required capability; progress
+notifications describe the current stage when the host supplies a progress
+token. Ordinary calls wait up to two minutes. `packet` uses its existing
+`latency_budget_ms` instead (18 seconds by default), including any preparation
+time. If that deadline returns `kind: preparing`, retry the same tool with the
+`minimum_next.arguments` supplied in the result. Those arguments include the
+exact operation and attempt so a later call cannot silently start different
+work. A real unavailable result is terminal for that call. Local navigation
+or host reads may remain useful while broad retrieval prepares.
 Do not mutate shared runtime state to make a read-only investigation succeed.
 
 Use `status` or `codestory://status{?project}` to diagnose failed or stalled
