@@ -2152,19 +2152,19 @@ fn handle_stdio_request(
                     let Some(snapshot) = snapshot else {
                         break;
                     };
-                    match stdio_retained_capability_for_wait(
-                        &snapshot,
-                        waiting_operation_id.as_deref(),
-                        waiting_attempt,
-                        name,
-                        observes_complete_core,
-                    ) {
-                        Err(error) => {
-                            activation = Err(error);
-                            break;
-                        }
-                        Ok(true) => break,
-                        Ok(false) => {}
+                    if waiting_operation_id
+                        .as_deref()
+                        .is_some_and(|expected| expected != snapshot.operation_id)
+                        || waiting_attempt.is_some_and(|expected| expected != snapshot.attempt)
+                    {
+                        activation = Err(ApiError::new(
+                            "publication_changed",
+                            "the project preparation operation changed while the request was waiting",
+                        ));
+                        break;
+                    }
+                    if !observes_complete_core && snapshot.allows_operation(name) {
+                        break;
                     }
                     waiting_operation_id = Some(snapshot.operation_id.clone());
                     waiting_attempt = Some(snapshot.attempt);
@@ -3230,27 +3230,6 @@ fn stdio_packet_tool_call_success(
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
     name != "status"
-}
-
-fn stdio_retained_capability_for_wait(
-    snapshot: &codestory_runtime::ActivationSnapshot,
-    operation_id: Option<&str>,
-    attempt: Option<u32>,
-    tool: &str,
-    observes_complete_core: bool,
-) -> Result<bool, ApiError> {
-    // Retained navigation may use a completed capability only from the
-    // operation this request joined. A replacement's ready capability cannot
-    // turn an exact resume into a different operation's response.
-    if operation_id.is_some_and(|expected| expected != snapshot.operation_id)
-        || attempt.is_some_and(|expected| expected != snapshot.attempt)
-    {
-        return Err(ApiError::new(
-            "publication_changed",
-            "the project preparation operation changed while the request was waiting",
-        ));
-    }
-    Ok(!observes_complete_core && snapshot.allows_operation(tool))
 }
 
 fn stdio_search_repo_text_mode(request: &serde_json::Value) -> SearchRepoTextMode {
@@ -8172,6 +8151,26 @@ mod tests {
     use std::process::Command;
     use uuid::Uuid;
 
+    /// Release owned gated workers even when a transport assertion panics.
+    struct PreparationTestCleanup {
+        activation: codestory_runtime::ActivationService,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        restore_snapshot: Option<codestory_runtime::ActivationSnapshot>,
+    }
+
+    impl Drop for PreparationTestCleanup {
+        fn drop(&mut self) {
+            if let Some(snapshot) = self.restore_snapshot.take() {
+                self.activation.set_snapshot_for_test(Some(snapshot));
+            }
+            self.activation.set_worker_start_gate_for_test(None);
+            let (released, changed) = self.gate.as_ref();
+            *released.lock().expect("activation gate") = true;
+            changed.notify_all();
+            self.activation.cancel_and_wait();
+        }
+    }
+
     fn fixture_json_sha256(value: &serde_json::Value) -> String {
         format!(
             "{:x}",
@@ -10554,25 +10553,6 @@ mod tests {
         let attempt = deadline["resume_operation_attempt"]
             .as_u64()
             .expect("attempt") as u32;
-        let mut replacement = activation.snapshot().expect("held operation snapshot");
-        replacement.operation_id = format!("{}-replacement", operation_id);
-        replacement.attempt += 1;
-        replacement.capabilities.local_navigation =
-            codestory_runtime::ActivationCapabilityState::Ready;
-        replacement.capabilities.broad_search = codestory_runtime::ActivationCapabilityState::Ready;
-        assert!(replacement.allows_operation("ground"));
-        assert_eq!(
-            stdio_retained_capability_for_wait(
-                &replacement,
-                Some(&operation_id),
-                Some(attempt),
-                "ground",
-                false,
-            )
-            .expect_err("a replacement ready capability cannot admit an exact resume")
-            .code,
-            "publication_changed"
-        );
         assert_eq!(
             deadline.pointer("/minimum_next/request_meta/codestory_operation_id"),
             Some(&json!(operation_id))
@@ -10701,6 +10681,163 @@ mod tests {
         activation.cancel_and_wait();
     }
 
+    #[tokio::test]
+    async fn exact_resume_delivers_replacement_error_before_a_ready_capability() {
+        use tokio::io::AsyncReadExt;
+
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(project.path().join("lib.rs"), "pub fn exact_resume() {}\n")
+            .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let runtime = &session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime;
+        let activation = runtime.activation.clone();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let mut cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate,
+            restore_snapshot: None,
+        };
+        let first = activation
+            .activate_project_with_foreground_budget(
+                &runtime.project_root,
+                &runtime.storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+            )
+            .expect_err("held operation prepares");
+        assert_eq!(first.code, "activation_preparing");
+        let original = activation.snapshot().expect("original operation");
+        cleanup.restore_snapshot = Some(original.clone());
+
+        let (mut input, server_input) = tokio::io::duplex(4096);
+        let (server_output, output) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc":"2.0","id":"exact-replaced","method":"tools/call",
+                        "params": {
+                            "name":"ground",
+                            "arguments": {
+                                "project":project.path(),
+                                "resume_operation_id":original.operation_id,
+                                "resume_operation_attempt":original.attempt,
+                            },
+                            "_meta":{"progressToken":"exact-replacement-progress"},
+                        },
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send exact resume");
+        let mut output = BufReader::new(output);
+        let progress = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut line = String::new();
+            output
+                .read_line(&mut line)
+                .await
+                .expect("read joined progress");
+            serde_json::from_str::<serde_json::Value>(&line).expect("progress JSON-RPC")
+        })
+        .await
+        .expect("resumed request joined the held operation");
+        assert_eq!(
+            progress["method"],
+            json!("notifications/progress"),
+            "{progress}"
+        );
+        assert_eq!(
+            progress.pointer("/params/progressToken"),
+            Some(&json!("exact-replacement-progress"))
+        );
+
+        // The real request is now waiting on A. A replacement B advertises a
+        // ready local capability; that capability must not swallow A's error.
+        let mut replacement = original.clone();
+        replacement.operation_id.push_str("-replacement");
+        replacement.attempt += 1;
+        replacement.state = codestory_runtime::ActivationState::Ready;
+        replacement.capabilities.local_navigation =
+            codestory_runtime::ActivationCapabilityState::Ready;
+        replacement.capabilities.broad_search = codestory_runtime::ActivationCapabilityState::Ready;
+        assert!(replacement.allows_operation("ground"));
+        activation.set_snapshot_for_test(Some(replacement));
+        let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let mut line = String::new();
+                output
+                    .read_line(&mut line)
+                    .await
+                    .expect("read replacement refusal");
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).expect("response JSON-RPC");
+                if frame.get("id") == Some(&json!("exact-replaced")) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("replacement error ends the original request promptly");
+        assert_eq!(
+            terminal.pointer("/result/isError"),
+            Some(&json!(true)),
+            "{terminal}"
+        );
+        assert!(
+            terminal.pointer("/result/structuredContent").is_none(),
+            "{terminal}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(
+            terminal["result"]["content"][0]["text"]
+                .as_str()
+                .expect("typed refusal text"),
+        )
+        .unwrap_or_else(|error| {
+            panic!("typed replacement refusal expected: {error}; response={terminal}")
+        });
+        assert_eq!(
+            refusal["cause_code"],
+            json!("publication_changed"),
+            "{terminal}"
+        );
+        assert_eq!(refusal["state"], json!("unavailable"));
+        drop(cleanup);
+        input.shutdown().await.expect("close requests");
+        assert_eq!(
+            serving.await.expect("serve task").expect("serve outcome"),
+            StdioServeOutcome::StdinClosed
+        );
+        let mut remaining = String::new();
+        output
+            .read_to_string(&mut remaining)
+            .await
+            .expect("drain completed output");
+        assert!(
+            remaining.is_empty(),
+            "late or duplicate frame after terminal response: {remaining}"
+        );
+    }
+
     #[test]
     fn packet_preparation_spends_its_existing_latency_budget_before_execution() {
         let project = tempfile::tempdir().expect("project");
@@ -10763,6 +10900,39 @@ mod tests {
     async fn blocked_progress_writer_still_observes_cancel_and_termination() {
         use tokio::io::AsyncReadExt;
 
+        fn observe_real_response(
+            session: &mut StdioServerSession,
+            line: &str,
+            cancelled: &Arc<AtomicBool>,
+        ) -> Option<serde_json::Value> {
+            let response = handle_stdio_message(session, line, cancelled);
+            let request: serde_json::Value = serde_json::from_str(line).expect("test request");
+            if let Some(path) = request
+                .pointer("/params/_meta/test_response_observation")
+                .and_then(serde_json::Value::as_str)
+            {
+                let temporary = Path::new(path).with_extension("partial");
+                if let Err(error) = std::fs::write(
+                    &temporary,
+                    serde_json::to_vec(&response).expect("actual response"),
+                ) {
+                    // A failing assertion can already have dropped the
+                    // isolated fixture while this handler unwinds. It must
+                    // not manufacture a second panic during owned cleanup.
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        return response;
+                    }
+                    panic!("record actual handler result: {error}");
+                }
+                if let Err(error) = std::fs::rename(temporary, path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        panic!("publish complete response observation: {error}");
+                    }
+                }
+            }
+            response
+        }
+
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         std::fs::write(
@@ -10784,23 +10954,26 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
+        let response_observation = cache.path().join("cancelled-response.json");
 
         let (mut client_input, server_input) = tokio::io::duplex(4096);
         // One byte of output capacity forces a partial progress frame. No
-        // reader drains it until after shutdown.
+        // reader drains more than its first byte until after shutdown.
         let (server_output, mut client_output) = tokio::io::duplex(1);
-        let terminate = Arc::new(AtomicBool::new(false));
-        let terminate_signal = Arc::clone(&terminate);
+        let (mut terminate, mut terminated) = tokio::io::duplex(1);
         let serving = tokio::spawn(serve_stdio_requests(
             session,
             BufReader::new(server_input),
             server_output,
             async move {
-                while !terminate_signal.load(Ordering::Acquire) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                let _ = terminated.read_exact(&mut [0]).await;
             },
-            handle_stdio_message,
+            observe_real_response,
             Duration::from_millis(300),
         ));
         client_input
@@ -10814,7 +10987,10 @@ mod tests {
                         "params":{
                             "name":"affected",
                             "arguments":{"project":project.path(),"paths":["lib.rs"]},
-                            "_meta":{"progressToken":7}
+                            "_meta":{
+                                "progressToken":7,
+                                "test_response_observation":response_observation,
+                            }
                         }
                     })
                 )
@@ -10822,7 +10998,15 @@ mod tests {
             )
             .await
             .expect("send request");
-        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        let mut first_byte = [0];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client_output.read_exact(&mut first_byte),
+        )
+        .await
+        .expect("pending request begins a partial progress frame")
+        .expect("read first progress byte");
+        assert_eq!(first_byte, [b'{']);
         client_input
             .write_all(
                 format!(
@@ -10837,12 +11021,42 @@ mod tests {
             )
             .await
             .expect("cancel blocked request");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let actual_response = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match std::fs::read(&response_observation) {
+                    Ok(bytes) => break serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .expect("actual handler response JSON"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("read cancellation observation: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancellation must reach the real handler before output is drained or termination begins");
+        assert_eq!(actual_response["id"], json!("blocked"));
+        assert_eq!(
+            actual_response.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        let cancelled_response: serde_json::Value = serde_json::from_str(
+            actual_response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("actual cancellation text"),
+        )
+        .expect("actual cancellation JSON");
+        assert_eq!(
+            cancelled_response["code"],
+            json!("cancelled"),
+            "{actual_response}"
+        );
+        assert_eq!(cancelled_response["cause_code"], json!("cancelled"));
         activation.set_worker_start_gate_for_test(None);
         let (released, changed) = worker_gate.as_ref();
         *released.lock().expect("activation gate") = true;
         changed.notify_all();
-        terminate.store(true, Ordering::Release);
+        terminate.write_all(&[1]).await.expect("signal termination");
         let outcome = tokio::time::timeout(Duration::from_secs(2), serving)
             .await
             .expect("shutdown must not wait on a blocked progress write")
@@ -14088,45 +14302,28 @@ version = "0.11.20"
             "from symbol \"caller\"\n",
             "direct-call symbol \"callee\"\n",
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut converged = None;
-        for attempt in 0..40 {
-            let response = handle_stdio_message(
-                &mut session,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": format!("core-only-{attempt}"),
-                    "method": "tools/call",
-                    "params": {
-                        "name": "verify_indexed_direct_calls",
-                        "arguments": {
-                            "project": project.path().to_string_lossy(),
-                            "call_path": call_path,
-                        }
+        let response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "core-only",
+                "method": "tools/call",
+                "params": {
+                    "name": "verify_indexed_direct_calls",
+                    "arguments": {
+                        "project": project.path().to_string_lossy(),
+                        "call_path": call_path,
                     }
-                })
-                .to_string(),
-                &Arc::new(AtomicBool::new(false)),
-            )
-            .expect("verification response");
-            let content = response["result"]["structuredContent"].clone();
-            if content.get("code") == Some(&json!("codestory_preparing")) {
-                assert!(
-                    Instant::now() < deadline,
-                    "cold verification did not converge: {content}"
-                );
-                std::thread::sleep(Duration::from_millis(
-                    content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
-                ));
-                continue;
-            }
-            converged = Some(content);
-            break;
-        }
-        let converged = converged.expect("cold verification converged within the retry budget");
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("verification response");
+        let converged = &response["result"]["structuredContent"];
         assert_eq!(
             converged["domain"], "call-path/v1",
-            "cold verification must return a verification result: {converged}"
+            "cold verification must return a verification result in the original call: {response}"
         );
 
         assert_eq!(

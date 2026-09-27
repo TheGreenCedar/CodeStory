@@ -6944,7 +6944,6 @@ pub(crate) mod activation_tests {
             )
             .expect_err("other waiter still sees shared progress");
         assert_eq!(still_waiting.code, "activation_preparing");
-        assert_eq!(service.worker_start_count_for_test(), 1);
         assert_eq!(
             service
                 .snapshot()

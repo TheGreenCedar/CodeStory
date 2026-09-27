@@ -514,7 +514,7 @@ pub(crate) fn proof_tool_source_v3() -> Value {
 }
 
 fn proof_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
+    let mut schema = closed_object_schema_v3(vec![
         ("project", json!({"type":"string","minLength":1})),
         (
             "resume_operation_id",
@@ -530,7 +530,9 @@ fn proof_input_schema_v3() -> Value {
                 "description":PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3,
             }),
         ),
-    ])
+    ]);
+    schema["required"] = json!(["project", "call_path"]);
+    schema
 }
 
 fn title_v3(name: &str) -> String {
