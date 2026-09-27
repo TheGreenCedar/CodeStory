@@ -8978,6 +8978,49 @@ fn cancellation_during_legacy_retirement_receipt_cannot_commit_pointer() -> Resu
 }
 
 #[test]
+fn promotion_refuses_a_foreign_native_predecessor_with_an_existing_retirement_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir().expect("foreign predecessor fixture");
+    let live = root.path().join("codestory.db");
+    seed_schema31_promotion_file(&live, 1, "original.rs")?;
+    let layout = crate::CorePublicationLayout::from_storage_path(&live)?;
+    let first = layout.create_staging_database_path()?;
+    seed_promotion_file(&first, 2, "cancelled.rs")?;
+    let receipt_path = layout
+        .root()
+        .join(super::core_retention::LEGACY_RETIREMENT_RECEIPT_FILE);
+    Storage::promote_staged_snapshot_inner(&first, &live, None, &|| receipt_path.is_file())
+        .expect_err("cancel only after recording the original native identity");
+    assert!(layout.read_pointer()?.is_none());
+    let receipt_before = fs::read(&receipt_path)?;
+    let original = root.path().join("held-original.db");
+    fs::rename(&live, &original)?;
+    seed_schema31_promotion_file(&live, 3, "foreign.rs")?;
+    let foreign_before = durable_sqlite_state(&live);
+    let foreign_identity = super::core_retention::capture_legacy_identity(&live)?;
+    let candidate = layout.create_staging_database_path()?;
+    seed_promotion_file(&candidate, 4, "replacement.rs")?;
+
+    let error = Storage::promote_staged_snapshot(&candidate, &live)
+        .expect_err("an existing receipt must not be adopted for another native predecessor");
+    assert!(
+        error
+            .to_string()
+            .contains("Prior legacy retirement receipt names another native source"),
+        "the intended preparation mismatch must refuse: {error}"
+    );
+    assert_eq!(durable_sqlite_state(&live), foreign_before);
+    assert_eq!(
+        super::core_retention::capture_legacy_identity(&live)?,
+        foreign_identity
+    );
+    assert_eq!(fs::read(receipt_path)?, receipt_before);
+    assert!(layout.read_pointer()?.is_none());
+    assert!(original.is_file());
+    Ok(())
+}
+
+#[test]
 fn uncommitted_legacy_receipt_cannot_retire_source() -> Result<(), StorageError> {
     let root = tempfile::tempdir().expect("migration root");
     let live = root.path().join("codestory.db");

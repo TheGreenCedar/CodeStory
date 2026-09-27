@@ -98,6 +98,7 @@ pub const CORE_PUBLICATION_DIRECTORY: &str = "core";
 pub const CORE_GENERATIONS_DIRECTORY: &str = "generations";
 pub const CORE_STAGING_DIRECTORY: &str = "staging";
 pub const CORE_PUBLICATION_FILE: &str = "publication.json";
+pub const CORE_LEGACY_RETIREMENT_FILE: &str = "legacy-retirement.json";
 pub const CORE_RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
 pub const CORE_ACQUISITION_FILE: &str = "acquisition.lock";
 pub const CORE_LEASE_FILE: &str = ".codestory-core-lease.lock";
@@ -206,6 +207,7 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     files.push(annotations_migration_backup_path(storage_path));
     let core_root = core_publication_root(storage_path);
     files.push(core_root.join(CORE_PUBLICATION_FILE));
+    files.push(core_root.join(CORE_LEGACY_RETIREMENT_FILE));
     files.push(core_acquisition_lock_path(storage_path));
     files.extend(sqlite_file_with_sidecars(
         &core_root.join(CORE_RETRIEVAL_PUBLICATION_FILE),
@@ -397,6 +399,7 @@ mod tests {
             "/cache/local-refresh.lock",
             "/cache/local-refresh-state.guard",
             "/cache/core/publication.json",
+            "/cache/core/legacy-retirement.json",
             "/cache/core/retrieval-publication.sqlite3",
             "/cache/core/retrieval-publication.sqlite3-wal",
         ] {

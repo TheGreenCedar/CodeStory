@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const LEGACY_RETIREMENT_RECEIPT_FILE: &str = "legacy-retirement.json";
+pub use codestory_contracts::owned_artifacts::CORE_LEGACY_RETIREMENT_FILE as LEGACY_RETIREMENT_RECEIPT_FILE;
 const LEGACY_RETIREMENT_RECEIPT_VERSION: u32 = 1;
 const MAX_LEGACY_RETIREMENT_RECEIPT_BYTES: u64 = 4096;
 const LEGACY_SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
