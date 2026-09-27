@@ -1003,7 +1003,7 @@ mod tests {
             windows_clone_shape(4 * 1024 * 1024 * 1024 + 1, 4096).expect("large");
         assert_eq!(rounded, 4 * 1024 * 1024 * 1024 + 4096);
         assert_eq!(max_range, 2 * 1024 * 1024 * 1024);
-        assert_eq!((rounded + max_range - 1) / max_range, 3);
+        assert_eq!(rounded.div_ceil(max_range), 3);
         assert!(windows_clone_shape(u64::MAX, 4096).is_err());
     }
 }
