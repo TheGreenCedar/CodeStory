@@ -4457,8 +4457,7 @@ pub(crate) mod activation_tests {
         let preparation_before = service.preparation_counts_for_test();
         let status_error = service
             .retrieval_status(fixture.project.path(), &fixture.storage_path)
-            .err()
-            .expect("status must reject a missing pointer-selected generation");
+            .expect_err("status must reject a missing pointer-selected generation");
         assert!(
             status_error
                 .to_string()
@@ -4467,8 +4466,7 @@ pub(crate) mod activation_tests {
         );
         let doctor_error = service
             .retrieval_engine_diagnostics(fixture.project.path(), &fixture.storage_path)
-            .err()
-            .expect("doctor must reject a missing pointer-selected generation");
+            .expect_err("doctor must reject a missing pointer-selected generation");
         assert!(
             doctor_error
                 .to_string()
