@@ -2668,26 +2668,17 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let preparing = assert_tool_preparing(&response, json!(id));
-        assert!(preparing["retry_after_ms"].as_u64().is_some());
+        let unavailable = assert_tool_error(&response, json!(id));
         assert_eq!(
-            preparing
-                .as_object()
-                .expect("preparing result object")
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "kind",
-                "minimum_next",
-                "operation",
-                "retry_after_ms",
-                "state"
-            ]),
-            "preparing is a closed successful v3 result, not a legacy error envelope: {preparing}"
+            unavailable["code"],
+            json!("codestory_unavailable"),
+            "the original call must report the writer-lock failure: {unavailable}"
         );
+        assert_eq!(unavailable["cause_code"], json!("cache_busy"));
+        assert_eq!(unavailable["state"], json!("unavailable"));
+        assert_eq!(unavailable["operation"]["state"], json!("retryable"));
         operation_ids.push(
-            preparing["operation"]["operation_id"]
+            unavailable["operation"]["operation_id"]
                 .as_str()
                 .expect("project activation operation id")
                 .to_string(),
@@ -2697,17 +2688,6 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         operation_ids.iter().collect::<BTreeSet<_>>().len(),
         3,
         "each project needs an independent activation operation"
-    );
-
-    let retry = send_json(
-        &mut server,
-        packet_request("multi-packet-first-retry", projects[0].path()),
-    );
-    let retry_error = assert_tool_preparing(&retry, json!("multi-packet-first-retry"));
-    assert_eq!(
-        retry_error["operation"]["operation_id"],
-        json!(operation_ids[0]),
-        "retrying one project must not adopt another project's operation"
     );
 
     drop(writer_locks);

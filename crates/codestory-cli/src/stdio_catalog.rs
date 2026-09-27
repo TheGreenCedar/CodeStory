@@ -93,19 +93,38 @@ impl ToolSpec {
         let input = input_schema
             .as_object_mut()
             .expect("stdio tool input schema must be an object");
-        input
+        let properties = input
             .get_mut("properties")
             .and_then(Value::as_object_mut)
-            .expect("stdio tool properties must be an object")
-            .insert(
-                "project".to_string(),
-                SchemaProperty::string_required(
-                    "project",
-                    "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            .expect("stdio tool properties must be an object");
+        properties.insert(
+            "project".to_string(),
+            SchemaProperty::string_required(
+                "project",
+                "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            )
+            .with_min_length(1)
+            .to_json(),
+        );
+        if self.safety.activates_managed_state {
+            properties.insert(
+                "resume_operation_id".to_string(),
+                SchemaProperty::string(
+                    "resume_operation_id",
+                    "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                 )
-                .with_min_length(1)
+                .with_max_length(128)
                 .to_json(),
             );
+            properties.insert(
+                "resume_operation_attempt".to_string(),
+                SchemaProperty::integer(
+                    "resume_operation_attempt",
+                    "Optional exact attempt from a preparation deadline result.",
+                )
+                .to_json(),
+            );
+        }
         input
             .get_mut("required")
             .and_then(Value::as_array_mut)
@@ -925,6 +944,7 @@ static STDIO_RETRY_NEXT_CALL_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("tool", "Tool to retry."),
         SchemaProperty::object("arguments", "Original tool arguments."),
         SchemaProperty::integer("after_ms", "Delay before retry."),
+        SchemaProperty::object("_meta", "Exact preparation operation to resume."),
     ],
     &["method", "tool"],
 );
@@ -944,6 +964,20 @@ static STDIO_RETRY_ENVELOPE_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .nullable(),
         SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
+        SchemaProperty::boolean(
+            "deadline_exceeded",
+            "Whether the request wait deadline expired.",
+        ),
+        SchemaProperty::string(
+            "resume_operation_id",
+            "Exact preparation operation to resume.",
+        )
+        .nullable(),
+        SchemaProperty::integer(
+            "resume_operation_attempt",
+            "Exact preparation attempt to resume.",
+        )
+        .nullable(),
         SchemaProperty::object("operation", "Current managed preparation operation.").nullable(),
         SchemaProperty::string("next_action", "Direct next action for the caller."),
         SchemaProperty::array(
@@ -2985,6 +3019,9 @@ mod tests {
         "state",
         "retry_tool",
         "retry_after_ms",
+        "deadline_exceeded",
+        "resume_operation_id",
+        "resume_operation_attempt",
         "operation",
         "next_action",
         "recommended_next_calls",
@@ -3066,6 +3103,31 @@ mod tests {
             }],
             "diagnostics_uri": "codestory://status?project=%2Frepo"
         })
+    }
+
+    #[test]
+    fn activation_tools_advertise_callable_exact_preparation_resume_arguments() {
+        let catalog = tools_list_json();
+        for tool in catalog["result"]["tools"].as_array().expect("tools") {
+            let activates = tool.pointer("/safety/activatesProject") == Some(&json!(true));
+            let schema = &tool["inputSchema"];
+            let properties = schema["properties"]
+                .as_object()
+                .or_else(|| {
+                    schema
+                        .pointer("/allOf/0/properties")
+                        .and_then(Value::as_object)
+                })
+                .expect("published input properties");
+            for field in ["resume_operation_id", "resume_operation_attempt"] {
+                assert_eq!(
+                    properties.contains_key(field),
+                    activates,
+                    "{} {field} disagrees with activation scope",
+                    tool["name"]
+                );
+            }
+        }
     }
 
     #[test]

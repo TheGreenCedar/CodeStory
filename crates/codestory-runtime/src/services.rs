@@ -625,7 +625,7 @@ impl ActivationService {
 
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    fn set_worker_start_gate_for_test(&self, gate: Option<Arc<(Mutex<bool>, Condvar)>>) {
+    pub fn set_worker_start_gate_for_test(&self, gate: Option<Arc<(Mutex<bool>, Condvar)>>) {
         *self
             .coordinator
             .worker_start_gate
@@ -920,6 +920,49 @@ impl ActivationService {
         )
     }
 
+    /// Wait for the exact operation a request already joined. A transport may
+    /// keep its original call pending beyond one foreground slice without
+    /// starting a replacement attempt if the worker finishes between slices.
+    /// The request cancellation flag belongs to this waiter; it does not stop
+    /// the shared activation worker or another caller waiting on it.
+    pub fn wait_for_existing_operation(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        operation: (&str, u32),
+        cancelled: &AtomicBool,
+        foreground_budget: Duration,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
+        let (operation_id, attempt) = operation;
+        let target = self.target_for_request(project_root, storage_path);
+        if self.snapshot().as_ref().is_none_or(|snapshot| {
+            snapshot.operation_id != operation_id || snapshot.attempt != attempt
+        }) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the project preparation attempt changed while the request was waiting",
+            ));
+        }
+        let result = self.wait_for_activation(
+            &target,
+            operation_id,
+            true,
+            cancelled,
+            foreground_budget,
+            goal,
+        );
+        if self.snapshot().as_ref().is_none_or(|snapshot| {
+            snapshot.operation_id != operation_id || snapshot.attempt != attempt
+        }) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the project preparation attempt changed while the request was waiting",
+            ));
+        }
+        result
+    }
+
     /// Prepare only the complete core publication, for callers that read the
     /// core and nothing else.
     pub fn activate_core_only(
@@ -955,6 +998,21 @@ impl ActivationService {
         storage_path: &Path,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(), ApiError> {
+        self.ensure_complete_core_for_observation_with_budget(
+            project_root,
+            storage_path,
+            cancelled,
+            DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
+        )
+    }
+
+    pub fn ensure_complete_core_for_observation_with_budget(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+    ) -> Result<(), ApiError> {
         if cancelled.load(Ordering::Acquire) {
             return Err(ApiError::new(
                 "cancelled",
@@ -967,7 +1025,13 @@ impl ActivationService {
             CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
         }
 
-        match self.activate_core_only(project_root, storage_path, cancelled) {
+        match self.activate_with_goal(
+            project_root,
+            storage_path,
+            cancelled,
+            foreground_budget,
+            ActivationGoal::CoreOnly,
+        ) {
             Ok(_) => Ok(()),
             Err(error)
                 if error.code != "cancelled"
@@ -6826,6 +6890,104 @@ pub(crate) mod activation_tests {
         assert_eq!(after.operation_id, before.operation_id);
         assert_ne!(after.state, ActivationState::Cancelled);
         service.cancel_and_wait();
+    }
+
+    #[test]
+    fn exact_operation_waiters_share_core_preparation_without_sharing_cancellation() {
+        let project = tempfile::tempdir().expect("project");
+        let other_project = tempfile::tempdir().expect("other project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let other_storage = other_project.path().join("cache").join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn one_project() {}\n",
+        )
+        .expect("source file");
+        fs::write(
+            other_project.path().join("fixture.rs"),
+            "pub fn other_project() {}\n",
+        )
+        .expect("other source file");
+        let service = Runtime::new().activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let first = service
+            .activate_with_goal(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+                ActivationGoal::CoreOnly,
+            )
+            .expect_err("held core preparation returns progress");
+        assert_eq!(first.code, "activation_preparing");
+        let operation = service.snapshot().expect("first operation");
+        let cancelled = service
+            .wait_for_existing_operation(
+                project.path(),
+                &storage_path,
+                (&operation.operation_id, operation.attempt),
+                &AtomicBool::new(true),
+                Duration::ZERO,
+                ActivationGoal::CoreOnly,
+            )
+            .expect_err("one cancelled waiter stops");
+        assert_eq!(cancelled.code, "cancelled");
+        let still_waiting = service
+            .wait_for_existing_operation(
+                project.path(),
+                &storage_path,
+                (&operation.operation_id, operation.attempt),
+                &AtomicBool::new(false),
+                Duration::ZERO,
+                ActivationGoal::CoreOnly,
+            )
+            .expect_err("other waiter still sees shared progress");
+        assert_eq!(still_waiting.code, "activation_preparing");
+        assert_eq!(
+            service
+                .snapshot()
+                .expect("surviving operation")
+                .operation_id,
+            operation.operation_id
+        );
+
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        let ready = service
+            .wait_for_existing_operation(
+                project.path(),
+                &storage_path,
+                (&operation.operation_id, operation.attempt),
+                &AtomicBool::new(false),
+                Duration::from_secs(20),
+                ActivationGoal::CoreOnly,
+            )
+            .expect("surviving waiter receives the complete core");
+        assert_eq!(
+            ready.snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready
+        );
+        assert_eq!(service.worker_start_count_for_test(), 1);
+        let different_project = Runtime::new().activation_service();
+        let different = different_project
+            .activate_with_goal(
+                other_project.path(),
+                &other_storage,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(20),
+                ActivationGoal::CoreOnly,
+            )
+            .expect("other project's core is independent");
+        assert_ne!(
+            different.snapshot.operation_id, operation.operation_id,
+            "different projects have distinct operation identities"
+        );
+        assert_eq!(different_project.worker_start_count_for_test(), 1);
+        service.cancel_and_wait();
+        different_project.cancel_and_wait();
     }
 
     #[test]

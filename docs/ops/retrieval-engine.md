@@ -13,8 +13,8 @@ set, model, llama source, and producer. It records capability only; live
 accelerator execution still requires protected hardware evidence.
 
 This page is for maintainers collecting diagnostics or changing retrieval. The
-normal plugin contract is simpler: call the intended repository tool and retry
-that same tool while it reports `preparing`.
+normal plugin contract is simpler: call the intended repository tool and let
+that call wait through managed preparation.
 
 ## Runtime shape
 
@@ -88,16 +88,21 @@ Repository activation and engine initialization are separate:
    manifest.
 7. Packet/search readers pin one coherent core and retrieval publication.
 
-A cold request can return a bounded same-tool retry while these steps run. An
+A cold MCP request remains pending while these steps run, with progress when
+the caller supplies a progress token. The stdio wait has one fixed deadline:
+two minutes for ordinary calls, or the packet's existing latency budget
+(18 seconds by default). An
 existing complete publication remains readable during refresh. Concurrent
 publication identity drift returns `publication_changed` and permits one
 bounded whole-operation retry rather than mixing generations. Lock or refresh
 contention returns `cache_busy`.
 
-The bounded response is `codestory_preparing` with one stable operation ID, a
-non-null retry delay, and the attempted tool as `retry_tool`. Terminal
-`codestory_unavailable` is reserved for policy, protocol, or infrastructure
-conditions runtime cannot repair itself.
+If the request deadline expires while preparation still runs, the bounded
+`kind: preparing` result carries the operation ID, attempt, retry delay, and
+same-tool arguments needed to resume that exact attempt. A real preparation
+failure ends the original call with its causal error; it is not converted to a
+new retry. Terminal `codestory_unavailable` reports conditions the running
+operation did not repair.
 
 ## Readiness contract
 
@@ -172,7 +177,7 @@ accelerator authorization.
 
 | Failure | Product behavior | Maintainer action |
 | --- | --- | --- |
-| Engine still initializing | Same tool returns `preparing` with a retry delay | Let the owner finish; do not start another engine |
+| Engine still initializing | The original MCP call waits with progress; its deadline can return `preparing` with exact resume arguments | Let the owner finish; resume only after the stated deadline |
 | Unsupported or software adapter | Broad search returns unavailable; local map remains usable | Capture diagnostics and verify the packaged platform policy |
 | Queue full or soft deadline elapsed | Typed capacity state reports class, capacity, depth, opaque active phase, retry delay, and a useful retry condition | Retry the same product call after the named condition; do not run doctor or reindex |
 | Incompatible server is fully idle | The server closes admission and exits before the exact requesting CLI can win authority | Retry the same operation |

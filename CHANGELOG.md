@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Project-scoped MCP calls now wait for managed preparation and return the requested result in the original call, with progress when the host supports it. A bounded deadline provides the same-tool arguments needed to resume; cancellation and preparation failures end the call directly.
+
 ## 0.17.6
 
 ### A rebuilt evidence engine for coding agents

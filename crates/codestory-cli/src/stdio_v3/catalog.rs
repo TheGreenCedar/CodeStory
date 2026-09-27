@@ -449,10 +449,25 @@ fn unsigned_integer_schema_v3() -> Value {
 /// A preparing result states the smallest sufficient next action, so a caller
 /// never has to infer whether the request needs rewriting.
 fn preparing_minimum_next_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("kind", enum_schema_v3(&["retry_same_request"])),
-        ("after_ms", json!({"type":"integer","minimum":1})),
-    ])
+    // The installed launcher can report managed-CLI provisioning before a
+    // product activation operation exists. Exact resume fields are present
+    // only when the product's own request deadline has an operation to name.
+    json!({
+        "type":"object",
+        "properties":{
+            "kind": enum_schema_v3(&["retry_same_request"]),
+            "after_ms": {"type":"integer","minimum":1},
+            "operation_id": {"type":"string"},
+            "operation_attempt": unsigned_integer_schema_v3(),
+            "arguments": {"type":"object"},
+            "request_meta": closed_object_schema_v3(vec![
+                ("codestory_operation_id", json!({"type":"string"})),
+                ("codestory_operation_attempt", unsigned_integer_schema_v3()),
+            ]),
+        },
+        "required":["kind","after_ms"],
+        "additionalProperties":false,
+    })
 }
 
 fn successful_with_preparing_schema_v3(success: Value) -> Value {
@@ -470,6 +485,9 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
                 "properties": {
                     "kind": {"type":"string","enum":["preparing"]},
                     "state": {"type":"string","enum":["preparing"]},
+                    "deadline_exceeded": {"type":"boolean"},
+                    "resume_operation_id": {"type":"string"},
+                    "resume_operation_attempt": unsigned_integer_schema_v3(),
                     "retry_after_ms": {"type":"integer","minimum":1},
                     "minimum_next": preparing_minimum_next_schema_v3(),
                     "operation": {"type":"object"}
@@ -496,8 +514,13 @@ pub(crate) fn proof_tool_source_v3() -> Value {
 }
 
 fn proof_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
+    let mut schema = closed_object_schema_v3(vec![
         ("project", json!({"type":"string","minLength":1})),
+        (
+            "resume_operation_id",
+            json!({"type":"string","maxLength":128}),
+        ),
+        ("resume_operation_attempt", unsigned_integer_schema_v3()),
         (
             "call_path",
             json!({
@@ -507,7 +530,9 @@ fn proof_input_schema_v3() -> Value {
                 "description":PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3,
             }),
         ),
-    ])
+    ]);
+    schema["required"] = json!(["project", "call_path"]);
+    schema
 }
 
 fn title_v3(name: &str) -> String {
