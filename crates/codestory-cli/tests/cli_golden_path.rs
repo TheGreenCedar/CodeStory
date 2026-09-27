@@ -3091,7 +3091,13 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     );
     let storage_path = PathBuf::from(string_field(&index, &["storage_path"]));
     let search_dir = search_dir_for_storage(&storage_path);
-    let storage_before = fs::metadata(&storage_path)
+    let database_path = codestory_runtime::resolve_core_database_path(&storage_path)
+        .expect("resolve published core image");
+    let database_before = fs::read(&database_path).expect("published core bytes");
+    assert!(!database_before.is_empty());
+    let pointer_path = storage_path.parent().unwrap().join("core/publication.json");
+    let pointer_before = fs::read(&pointer_path).expect("publication pointer");
+    let storage_before = fs::metadata(&database_path)
         .expect("storage metadata before read")
         .modified()
         .expect("storage modified before read");
@@ -3099,6 +3105,12 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
         .expect("search dir metadata before read")
         .modified()
         .expect("search dir modified before read");
+
+    let search_payload_before = cache_file_snapshots(&search_dir);
+    assert!(
+        !search_payload_before.is_empty(),
+        "fixture must contain persisted search payloads"
+    );
 
     thread::sleep(Duration::from_millis(25));
     fs::write(
@@ -3130,7 +3142,7 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     );
     assert_stale_freshness_counts(&doctor, "doctor");
 
-    let storage_after = fs::metadata(&storage_path)
+    let storage_after = fs::metadata(&database_path)
         .expect("storage metadata after read")
         .modified()
         .expect("storage modified after read");
@@ -3141,6 +3153,18 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     assert_eq!(
         storage_before, storage_after,
         "read freshness checks should not mutate the SQLite cache"
+    );
+    assert_eq!(fs::read(&database_path).unwrap(), database_before);
+    assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before);
+    assert_eq!(
+        codestory_runtime::resolve_core_database_path(&storage_path).unwrap(),
+        database_path,
+        "observational reads must retain the same active image"
+    );
+    assert_eq!(
+        cache_file_snapshots(&search_dir),
+        search_payload_before,
+        "read freshness checks must preserve persisted search bytes and metadata"
     );
     assert_eq!(
         search_dir_before, search_dir_after,

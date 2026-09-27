@@ -5568,6 +5568,41 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
         }
     }
 
+    let retained_database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+    assert!(fs::metadata(&retained_database).unwrap().len() > 0);
+    let retained_artifacts = [
+        retained_database.clone(),
+        retained_database.with_extension("db-wal"),
+        retained_database.with_extension("db-shm"),
+        retained_database.with_extension("db-journal"),
+        storage_path.parent().unwrap().join("core/publication.json"),
+    ]
+    .map(|path| {
+        let bytes = fs::read(&path).ok();
+        (path, bytes)
+    });
+    // Writer migration is allowed here; ordinary readers still require the
+    // current schema and cannot serve this retained predecessor.
+    match codestory_store::CoreReadSession::pin(&storage_path) {
+        Ok(_) => panic!("immutable reader admitted a schema-29 predecessor"),
+        Err(error) => assert!(
+            error.to_string().contains(&format!(
+                "Immutable core generation requires schema version {}, found 29",
+                codestory_store::CURRENT_SCHEMA_VERSION
+            )),
+            "unexpected immutable reader refusal: {error}"
+        ),
+    }
+
+    for (path, before) in &retained_artifacts {
+        assert_eq!(
+            &fs::read(path).ok(),
+            before,
+            "immutable query refusal must preserve {}",
+            path.display()
+        );
+    }
+
     let outcome = controller
         .republish_semantic_projections_at_blocking(
             workspace.path().to_path_buf(),
@@ -9385,9 +9420,19 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
         "{\"missing_value\":",
     )
     .expect("write source that would fail a full parse");
-    let database_before = fs::read(&storage_path).expect("read incompatible database");
-    let wal_path = storage_path.with_extension("db-wal");
+    let database_path = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve hostile active generation");
+    assert!(fs::metadata(&database_path).unwrap().len() > 0);
+    let pointer_path = storage_path.parent().unwrap().join("core/publication.json");
+    let pointer_before = fs::read(&pointer_path).expect("published pointer before rejection");
+    let database_before = fs::read(&database_path).expect("read incompatible database");
+    let wal_path = database_path.with_extension("db-wal");
     let wal_before = fs::read(&wal_path).ok();
+    let other_sidecars_before = ["db-shm", "db-journal"].map(|extension| {
+        let path = database_path.with_extension(extension);
+        let bytes = fs::read(&path).ok();
+        (path, bytes)
+    });
 
     for error in [
         controller
@@ -9410,7 +9455,7 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
         );
     }
     assert_eq!(
-        fs::read(&storage_path).expect("read database after rejected requests"),
+        fs::read(&database_path).expect("read database after rejected requests"),
         database_before,
         "compatibility rejection must not mutate the live database"
     );
@@ -9419,14 +9464,35 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
         wal_before,
         "compatibility rejection must not mutate the live WAL"
     );
+    for (path, before) in &other_sidecars_before {
+        assert_eq!(
+            &fs::read(path).ok(),
+            before,
+            "compatibility checks must preserve physical sidecar {}",
+            path.display()
+        );
+    }
     assert_eq!(
         Store::database_index_publication(&storage_path)
             .expect("read preserved publication")
             .expect("preserved publication"),
         previous
     );
+    assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before);
+    assert_eq!(
+        codestory_store::resolve_core_database_path(&storage_path).unwrap(),
+        database_path,
+        "rejected requests must retain the same active image"
+    );
     assert!(!controller.state.lock().is_indexing);
     assert_no_staged_publication_artifacts(&storage_path);
+    assert!(
+        fs::read_dir(storage_path.parent().unwrap().join("core/staging"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "rejected compatibility checks must not leave a staged generation"
+    );
 
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
@@ -9469,9 +9535,19 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
             .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
             .expect("stamp supported pre-current schema");
     });
-    let database_before = fs::read(&storage_path).expect("read old-schema database");
-    let wal_path = storage_path.with_extension("db-wal");
+    let database_path = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve hostile active generation");
+    assert!(fs::metadata(&database_path).unwrap().len() > 0);
+    let pointer_path = storage_path.parent().unwrap().join("core/publication.json");
+    let pointer_before = fs::read(&pointer_path).expect("published pointer before rejection");
+    let database_before = fs::read(&database_path).expect("read old-schema database");
+    let wal_path = database_path.with_extension("db-wal");
     let wal_before = fs::read(&wal_path).ok();
+    let other_sidecars_before = ["db-shm", "db-journal"].map(|extension| {
+        let path = database_path.with_extension(extension);
+        let bytes = fs::read(&path).ok();
+        (path, bytes)
+    });
     let cache_path = storage_path.parent().expect("cache path");
     let cache_entries_before = {
         let mut entries = fs::read_dir(cache_path)
@@ -9510,7 +9586,7 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
         .expect("auto-selected full dry-run must inspect old schema without migrating it");
     assert_eq!(auto_effective_dry_run.refresh, IndexMode::Full);
     assert_eq!(
-        fs::read(&storage_path).expect("read database after rejected requests"),
+        fs::read(&database_path).expect("read database after rejected requests"),
         database_before,
         "old-schema compatibility checks must preserve database bytes"
     );
@@ -9519,6 +9595,14 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
         wal_before,
         "old-schema compatibility checks must preserve WAL bytes"
     );
+    for (path, before) in &other_sidecars_before {
+        assert_eq!(
+            &fs::read(path).ok(),
+            before,
+            "compatibility checks must preserve physical sidecar {}",
+            path.display()
+        );
+    }
     let cache_entries_after = {
         let mut entries = fs::read_dir(cache_path)
             .expect("list cache after compatibility checks")
@@ -9534,8 +9618,21 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
         entries
     };
     assert_eq!(cache_entries_after, cache_entries_before);
+    assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before);
+    assert_eq!(
+        codestory_store::resolve_core_database_path(&storage_path).unwrap(),
+        database_path,
+        "rejected requests must retain the same active image"
+    );
     assert!(!controller.state.lock().is_indexing);
     assert_no_staged_publication_artifacts(&storage_path);
+    assert!(
+        fs::read_dir(storage_path.parent().unwrap().join("core/staging"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "rejected compatibility checks must not leave a staged generation"
+    );
 
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)

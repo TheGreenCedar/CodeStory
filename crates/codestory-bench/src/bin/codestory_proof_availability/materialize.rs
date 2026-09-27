@@ -877,11 +877,21 @@ fn validate_operational_environment_with_identity(
         {
             bail!("proof_availability_operational_repository_binding_invalid")
         }
+        let resolved_database =
+            codestory_store::resolve_core_database_path(&repository.database_path)
+                .context("resolve published core generation for materialization digest check")?;
+        // The logical file can be retired after publication. Its existing
+        // parent and the selected physical image must both stay in this cache.
+        let database_parent = repository.database_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("proof_availability_operational_repository_path_invalid")
+        })?;
         if !workspace_path_lexical_identity(&repository.checkout_root.canonicalize()?)?
             .is_within(&workspace_identity)
             || !workspace_path_lexical_identity(&repository.project_root.canonicalize()?)?
                 .is_within(&workspace_identity)
-            || !workspace_path_lexical_identity(&repository.database_path.canonicalize()?)?
+            || !workspace_path_lexical_identity(&database_parent.canonicalize()?)?
+                .is_within(&cache_identity)
+            || !workspace_path_lexical_identity(&resolved_database.canonicalize()?)?
                 .is_within(&cache_identity)
         {
             bail!("proof_availability_operational_repository_path_invalid")
@@ -891,9 +901,6 @@ fn validate_operational_environment_with_identity(
             &repository.checkout_root,
             &repository.project_root,
         )?;
-        let resolved_database =
-            codestory_store::resolve_core_database_path(&repository.database_path)
-                .context("resolve published core generation for materialization digest check")?;
         if sha256(&fs::read(&resolved_database)?) != project.database_sha256 {
             bail!("proof_availability_database_mismatch")
         }
@@ -2756,6 +2763,10 @@ mod tests {
                 .all(|project| matches!(project.freshness, MaterializationFreshnessV1::Fresh))
         );
         for repository in &descriptor.repositories {
+            assert!(
+                !repository.database_path.exists(),
+                "a retired logical file must not be required for validation"
+            );
             let store =
                 codestory_store::Store::open_observational(&repository.database_path).unwrap();
             assert!(store.get_complete_index_publication().unwrap().is_some());
@@ -2847,6 +2858,38 @@ mod tests {
         let database =
             codestory_store::resolve_core_database_path(&descriptor.repositories[0].database_path)
                 .expect("resolve active generation for digest tamper");
+        #[cfg(unix)]
+        {
+            // Flat file aliases isolate the two confinement guards: one
+            // confined image with a foreign parent, then the reverse.
+            let outside = root.path().join("outside-cache");
+            fs::create_dir(&outside).unwrap();
+            let outside_image = outside.join("codestory.db");
+            fs::copy(&database, &outside_image).unwrap();
+            let foreign_parent_alias = outside.join("inside-image.db");
+            std::os::unix::fs::symlink(&database, &foreign_parent_alias).unwrap();
+            let inside_parent = descriptor.cache_root.join("flat-alias");
+            fs::create_dir(&inside_parent).unwrap();
+            let foreign_image_alias = inside_parent.join("codestory.db");
+            std::os::unix::fs::symlink(&outside_image, &foreign_image_alias).unwrap();
+            for alias in [foreign_parent_alias, foreign_image_alias] {
+                let mut aliased = descriptor.clone();
+                aliased.repositories[0].database_path = alias;
+                let error = validate_operational_environment_with_identity(
+                    &loaded,
+                    &aliased,
+                    &qualification,
+                    &registry,
+                )
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("operational_repository_path_invalid"),
+                    "unexpected alias refusal: {error:#}"
+                );
+            }
+        }
         codestory_store::make_file_owner_writable(&database)
             .expect("unlock immutable generation for digest tamper");
         let mut bytes = fs::read(&database).unwrap();

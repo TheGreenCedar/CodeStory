@@ -309,12 +309,8 @@ pub fn stage_sealed_file(
     stage_sealed_file_impl(source, destination, cancelled)
 }
 
-fn stage_sealed_file_impl(
-    source: &Path,
-    destination: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<SealedStageStats, StorageError> {
-    let started = Instant::now();
+/// Validate before any SQLite observation as well as before byte staging.
+pub(crate) fn validate_sealed_source(source: &Path) -> Result<fs::Metadata, StorageError> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|cause| io_error("inspect sealed source", source, cause))?;
     if !metadata.file_type().is_file() || !metadata.permissions().readonly() {
@@ -323,7 +319,7 @@ fn stage_sealed_file_impl(
             source.display()
         )));
     }
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = source_sidecar(source, suffix);
         match fs::symlink_metadata(&sidecar) {
             Ok(_) => {
@@ -336,6 +332,16 @@ fn stage_sealed_file_impl(
             Err(cause) => return Err(io_error("inspect sealed source sidecar", &sidecar, cause)),
         }
     }
+    Ok(metadata)
+}
+
+fn stage_sealed_file_impl(
+    source: &Path,
+    destination: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SealedStageStats, StorageError> {
+    let started = Instant::now();
+    let metadata = validate_sealed_source(source)?;
     if cancelled() {
         return Err(cancelled_error());
     }
@@ -947,11 +953,13 @@ mod tests {
         assert!(stage_sealed_file(&source, &destination, &|| false).is_err());
         assert_eq!(fs::read(&destination).expect("sentinel"), b"other owner");
         fs::remove_file(&destination).expect("remove sentinel");
-        let wal = source_sidecar(&source, "-wal");
-        fs::write(&wal, b"pending").expect("sidecar");
-        assert!(stage_sealed_file(&source, &destination, &|| false).is_err());
-        assert!(!destination.exists());
-        fs::remove_file(wal).expect("remove sidecar");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = source_sidecar(&source, suffix);
+            fs::write(&sidecar, b"pending").expect("sidecar");
+            assert!(stage_sealed_file(&source, &destination, &|| false).is_err());
+            assert!(!destination.exists());
+            fs::remove_file(sidecar).expect("remove sidecar");
+        }
         crate::core_generation::make_file_owner_writable(&source).expect("unseal source");
         assert!(stage_sealed_file(&source, &destination, &|| false).is_err());
         assert!(!destination.exists());

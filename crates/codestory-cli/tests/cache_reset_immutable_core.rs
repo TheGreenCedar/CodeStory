@@ -251,6 +251,10 @@ fn confirmed_reset_recovers_newer_immutable_core_and_preserves_annotations() {
     );
     let annotations = snapshot_annotations(&fixture.cache);
     let core = fs::read(&fixture.database).expect("old core");
+    let retirement_relative =
+        Path::new("core").join(codestory_contracts::owned_artifacts::CORE_LEGACY_RETIREMENT_FILE);
+    let retirement_before =
+        fs::read(fixture.cache.join(&retirement_relative)).expect("retained retirement receipt");
     let coordination = coordination_identities(&fixture.cache);
     let output = fixture.success(&[
         "cache",
@@ -261,6 +265,17 @@ fn confirmed_reset_recovers_newer_immutable_core_and_preserves_annotations() {
         "json",
     ]);
     assert_eq!(output["applied"], true);
+    assert!(
+        output["quarantined"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.as_str() == Some(retirement_relative.to_string_lossy().as_ref())
+            }),
+        "reset must quarantine its obsolete retirement identity: {output}"
+    );
+    assert!(!fixture.cache.join(&retirement_relative).exists());
     assert_eq!(
         snapshot_annotations(&fixture.cache),
         annotations,
@@ -302,6 +317,11 @@ fn confirmed_reset_recovers_newer_immutable_core_and_preserves_annotations() {
         core
     );
     assert!(quarantine.join("core/publication.json").is_file());
+    assert_eq!(
+        fs::read(quarantine.join(retirement_relative)).unwrap(),
+        retirement_before,
+        "reset must preserve the old retirement evidence in quarantine"
+    );
     for coordination in [
         "codestory.index-writer.lock",
         "codestory.db.promotion.lock",

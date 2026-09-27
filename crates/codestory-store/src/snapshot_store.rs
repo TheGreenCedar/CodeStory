@@ -273,14 +273,13 @@ impl StagedSnapshot {
 
     fn clone_live(live_path: &Path, cancelled: &dyn Fn() -> bool) -> Result<Self, StorageError> {
         let layout = CorePublicationLayout::from_storage_path(live_path)?;
-        let published = layout.read_pointer()?.is_some();
-        let pinned = if published {
-            Some(crate::CoreReadSession::pin(live_path)?)
-        } else {
-            None
-        };
+        // Writer staging may migrate a supported predecessor on the private
+        // copy. Pin its exact file and lease without applying query-reader
+        // schema admission to the source; the build and caller validate it.
+        let pinned = crate::storage_impl::pin_active_core(&layout)?;
+        let published = pinned.is_some();
         let source = if let Some(session) = pinned.as_ref() {
-            session.generation_path().to_path_buf()
+            session.path.clone()
         } else {
             layout.resolve_active_database()?.ok_or_else(|| {
                 StorageError::Other(format!(
@@ -289,6 +288,9 @@ impl StagedSnapshot {
                 ))
             })?
         };
+        if published {
+            crate::sealed_file_stage::validate_sealed_source(&source)?;
+        }
         let inherited_validations = if published {
             Store::open_immutable_generation(&source)
                 .ok()
@@ -1556,6 +1558,155 @@ mod tests {
             Some(original)
         );
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn clone_live_holds_the_selected_source_lease_through_copy() {
+        let root = tempfile::tempdir().expect("clone lease fixture");
+        let live = root.path().join("codestory.db");
+        let publish = |generation: u64| {
+            let mut stage = SnapshotStore::open_staged(&live).expect("new stage");
+            let publication = crate::IndexPublicationRecord {
+                generation,
+                generation_id: format!("generation-{generation}"),
+                run_id: format!("run-{generation}"),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: generation.try_into().unwrap(),
+            };
+            stage
+                .store_mut()
+                .insert_files_batch(&[crate::FileInfo {
+                    id: generation.try_into().unwrap(),
+                    path: PathBuf::from(format!("source-{generation}.rs")),
+                    language: "rust".into(),
+                    modification_time: generation.try_into().unwrap(),
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                }])
+                .unwrap();
+            stage
+                .store_mut()
+                .put_index_publication(&publication)
+                .unwrap();
+            publish_empty_source_policy(stage.store_mut(), &publication);
+            stage.publish(&live).expect("publish generation");
+        };
+        publish(1);
+        let source = crate::resolve_core_database_path(&live).unwrap();
+        let previous = Store::database_complete_index_publication(&live).unwrap();
+        let moved = std::cell::Cell::new(false);
+        let mut copied = crate::with_core_clone_disabled(|| {
+            SnapshotStore::clone_live_to_staged_with_cancel(&live, &|| {
+                if !moved.replace(true) {
+                    // Advance at the pre-copy cancellation boundary. The
+                    // selected source lease must already exclude cleanup.
+                    publish(2);
+                    publish(3);
+                    let report = crate::apply_core_retention(&live, &|| false, |_, _, _, _, _| {
+                        panic!("copy source was reclaimed while staging held it")
+                    })
+                    .unwrap();
+                    assert_eq!(report.deferred_pins, 1);
+                    assert_eq!(report.reclaimed_images, 0);
+                    assert!(source.is_file());
+                }
+                false
+            })
+            .expect("copy pinned source")
+        });
+        assert!(
+            moved.get(),
+            "copy must reach the production cancellation boundary"
+        );
+        assert_eq!(
+            copied.store_mut().get_complete_index_publication().unwrap(),
+            previous
+        );
+        assert_eq!(
+            copied.snapshot_copy.as_ref().unwrap().stage_strategy,
+            "copied"
+        );
+        let files = copied.store_mut().get_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("source-1.rs"));
+        assert_eq!(
+            Store::database_complete_index_publication(&live)
+                .unwrap()
+                .unwrap()
+                .generation,
+            3
+        );
+        copied.discard().unwrap();
+        let report = crate::apply_core_retention(&live, &|| false, |parent, id, _, _, _| {
+            assert_eq!(id, "generation-1");
+            let directory = parent.join(id);
+            crate::make_file_owner_writable(&source)?;
+            fs::remove_file(&source).expect("remove owned copy source");
+            fs::remove_file(directory.join(crate::storage_impl::CORE_LEASE_FILE))
+                .expect("remove owned source lease");
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            report.reclaimed_images, 1,
+            "copy must release the source lease on return"
+        );
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn clone_live_rejects_sqlite_sidecars_before_observation() {
+        let root = tempfile::tempdir().expect("sidecar fixture");
+        let live = root.path().join("codestory.db");
+        let mut initial = SnapshotStore::open_staged(&live).unwrap();
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "sidecar-source".into(),
+            run_id: "sidecar-run".into(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        initial
+            .store_mut()
+            .put_index_publication(&publication)
+            .unwrap();
+        publish_empty_source_policy(initial.store_mut(), &publication);
+        initial.publish(&live).unwrap();
+        let layout = crate::CorePublicationLayout::from_storage_path(&live).unwrap();
+        let source = crate::resolve_core_database_path(&live).unwrap();
+        let original = fs::read(&source).unwrap();
+        let pointer = layout.read_pointer().unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar_name = source.as_os_str().to_os_string();
+            sidecar_name.push(suffix);
+            let sidecar = PathBuf::from(sidecar_name);
+            fs::write(&sidecar, b"pending recovery evidence").unwrap();
+            let error = match SnapshotStore::clone_live_to_staged(&live) {
+                Ok(stage) => {
+                    stage.discard().unwrap();
+                    panic!("sidecar source was staged");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("sealed stage source has SQLite sidecar"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&source).unwrap(), original);
+            assert_eq!(fs::read(&sidecar).unwrap(), b"pending recovery evidence");
+            assert_eq!(layout.read_pointer().unwrap(), pointer);
+            assert!(
+                fs::read_dir(layout.staging_root())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            fs::remove_file(sidecar).unwrap();
+        }
     }
 
     #[test]
