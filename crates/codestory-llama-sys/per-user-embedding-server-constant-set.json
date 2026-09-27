@@ -1,7 +1,7 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 40,
+      "retry_after_ms": 41,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
@@ -43,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "3d8e5eb37c21577ddeb22885630885d6314772ef9437a30e941de8ec195f127f",
+    "calibration_freeze_digest": "0140d7b290f19edd8330f105753409517d311d815bfeb8e0fe175e5a2c7e79f7",
+    "input_constant_set_sha256": "79518ab625533cc29a845386e222f531b1eab9bca14f25247ba3591dcf3d0dbe",
+    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
+    "protocol_sha256": "69688d108bd571f9a3b3b68492991c13d676fc8f944b90718d196ea4d67b297f",
+    "run_artifact_sha256s": [
+      "cd7dac29a26171ac7b25b67813f4355a6aaf9f6c6a2ddedc47baf44a7a3d5015",
+      "d4366ac356f4521087f8fe832427737cd0016be8ad083dde91077e7f1df920eb",
+      "dc108c7cb3a3cc636b1971946266148d3615d857890c9ae579d74864f4a45357"
+    ],
+    "selected_at": "github-actions-run:36305490421:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "912dfa06b4f0288476062e73843a78b2eedd8aa4",
+    "selection_source_tree": "7f67e8bf989f01c3077aacfb3b2f25b8e1e96d55"
+  },
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
       "existing_owner_connect": 125,
@@ -66,5 +81,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
