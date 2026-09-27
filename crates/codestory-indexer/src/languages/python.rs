@@ -176,8 +176,11 @@ pub(crate) fn decorator_call_specs(tree: &Tree, source: &str) -> Vec<ManualEdgeS
 
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
-    let module_type_blockers = python_module_type_binding_blockers(tree.root_node(), source);
-    let imported_type_bindings = collect_python_imported_type_bindings(tree.root_node(), source);
+    let module_types = python_module_type_bindings(tree.root_node(), source);
+    let mut local_annotation_callsites = HashSet::new();
+    let mut imported_type_bindings =
+        collect_python_imported_type_bindings(tree.root_node(), source);
+    imported_type_bindings.retain(|local_name, _| !module_types.blockers.contains(local_name));
     let imported_module_bindings =
         collect_python_imported_module_bindings(tree.root_node(), source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
@@ -263,6 +266,25 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
                 spec.owner_module = Some(binding.module_name.clone());
             }
         }
+        // An explicit parameter annotation can name the unique local class
+        // that unconditionally shadows one earlier import. This is ordinary
+        // declaration navigation, not constructor or strict proof authority.
+        local_annotation_callsites.extend(
+            fallback_specs
+                .iter()
+                .filter(|spec| {
+                    callable
+                        .parent()
+                        .is_some_and(|parent| parent == tree.root_node())
+                        && !is_implicit_receiver(&spec.receiver_name)
+                        && spec.owner_module.is_none()
+                        && module_types
+                            .shadowing_annotation_owners
+                            .get(&spec.owner_name)
+                            .is_some_and(|class_end| *class_end <= callable.start_byte())
+                })
+                .map(receiver_callsite_key),
+        );
         edges.extend(fallback_specs);
     });
     // A capitalized call spelling is not type authority when another module
@@ -270,14 +292,21 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
     // their own local binding table; do not poison a remote owner merely
     // because an unrelated local callable has its exported simple name.
     edges.retain(|spec| {
-        spec.owner_module.is_some() || !module_type_blockers.contains(&spec.owner_name)
+        spec.owner_module.is_some()
+            || !module_types.blockers.contains(&spec.owner_name)
+            || local_annotation_callsites.contains(&receiver_callsite_key(spec))
     });
     edges
 }
 
-fn python_module_type_binding_blockers(root: TsNode<'_>, source: &str) -> HashSet<String> {
+struct PythonModuleTypeBindings {
+    blockers: HashSet<String>,
+    shadowing_annotation_owners: HashMap<String, usize>,
+}
+
+fn python_module_type_bindings(root: TsNode<'_>, source: &str) -> PythonModuleTypeBindings {
     let mut blockers = HashSet::new();
-    let mut type_bindings = HashMap::<String, usize>::new();
+    let mut type_bindings = HashMap::<String, Vec<TsNode<'_>>>::new();
     walk_tree_nodes(root, &mut |node| {
         if enclosing_node_with_kind(node, &["function_definition", "class_definition", "lambda"])
             .is_some()
@@ -287,12 +316,12 @@ fn python_module_type_binding_blockers(root: TsNode<'_>, source: &str) -> HashSe
         match node.kind() {
             "class_definition" => {
                 if let Some(name) = declaration_name(node, source) {
-                    *type_bindings.entry(name).or_default() += 1;
+                    type_bindings.entry(name).or_default().push(node);
                 }
             }
             "import_from_statement" => {
                 for name in python_from_import_local_binding_names(node, source) {
-                    *type_bindings.entry(name).or_default() += 1;
+                    type_bindings.entry(name).or_default().push(node);
                 }
             }
             "function_definition"
@@ -308,12 +337,26 @@ fn python_module_type_binding_blockers(root: TsNode<'_>, source: &str) -> HashSe
             _ => {}
         }
     });
-    blockers.extend(
-        type_bindings
-            .into_iter()
-            .filter_map(|(name, count)| (count > 1).then_some(name)),
-    );
-    blockers
+    let mut shadowing_annotation_owners = HashMap::new();
+    for (name, bindings) in type_bindings {
+        if let [import, class] = bindings.as_slice()
+            && import.kind() == "import_from_statement"
+            && class.kind() == "class_definition"
+            && import.parent().is_some_and(|parent| parent == root)
+            && class.parent().is_some_and(|parent| parent == root)
+            && import.end_byte() <= class.start_byte()
+            && !blockers.contains(&name)
+        {
+            shadowing_annotation_owners.insert(name.clone(), class.end_byte());
+        }
+        if bindings.len() > 1 {
+            blockers.insert(name);
+        }
+    }
+    PythonModuleTypeBindings {
+        blockers,
+        shadowing_annotation_owners,
+    }
 }
 
 /// Exact callsites whose receiver came from `with Owner() as alias`. The graph writer uses these

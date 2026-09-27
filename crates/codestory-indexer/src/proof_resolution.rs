@@ -247,7 +247,7 @@ fn ruby_php_resolution_work() -> usize {
 
 const ADAPTER_VERSION: &str = "reference-v17";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
-const PYTHON_ADAPTER_VERSION: &str = "reference-v19";
+const PYTHON_ADAPTER_VERSION: &str = "reference-v20";
 const RUST_ADAPTER_VERSION: &str = "reference-v20";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v19";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";

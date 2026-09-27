@@ -6185,7 +6185,7 @@ fn stale_python_namespace_and_mutation_cache_refuses_replay_and_reparses() -> an
                     && hostile.edge_id.is_none()
                     && hostile.evidence_chain.is_empty()
             );
-            assert_eq!(hostile.provenance.language_adapter_version, "reference-v19");
+            assert_eq!(hostile.provenance.language_adapter_version, "reference-v20");
             let safe = facts
                 .iter()
                 .find(|fact| {
@@ -6201,6 +6201,96 @@ fn stale_python_namespace_and_mutation_cache_refuses_replay_and_reparses() -> an
                 Some(safe_owner_line),
             )?;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_python_local_annotation_cache_refuses_v19_then_reparses_and_reuses() -> anyhow::Result<()>
+{
+    // Version-refusal control on the newly restored ordinary annotation path.
+    // This is current semantic payload with a modeled v19 identity, not output
+    // from an old binary; the causal baseline separately records the lost link.
+    let source = "from external import Worker\nclass Worker:\n    def target(self):\n        pass\ndef caller(worker: Worker):\n    worker.target()\n";
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let paths = index_files(project.path(), &mut store, &[("main.py", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let before = store.get_proof_resolution_facts()?;
+    let blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact = decode_index_artifact_json(&blob)?;
+    artifact["resolution_file"]["adapter_version"] = "reference-v19".into();
+    for call in artifact["call_resolution_inputs"].as_array_mut().unwrap() {
+        call["adapter_version"] = "reference-v19".into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("v19 annotation artifact must not replay under the new adapter");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    assert_eq!(store.get_proof_resolution_facts()?, before);
+    for (generation, expected_hits) in [(2, 0), (3, 1)] {
+        let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+            &mut store,
+            &RefreshInfo {
+                mode: BuildMode::Incremental,
+                files_to_index: paths.clone(),
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        assert_eq!(
+            result.artifact_cache_hits, expected_hits,
+            "annotation generation{generation}"
+        );
+        assert_eq!(fs::read_to_string(&paths[0])?, source);
+        let nodes = store.get_nodes()?;
+        let caller = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.start_line == Some(5))
+            .unwrap();
+        let member = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
+                    && node.start_line == Some(3)
+            })
+            .unwrap();
+        let calls = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(6))
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            panic!("annotation call census: {calls:#?}")
+        };
+        assert_eq!(call.effective_source(), caller.id);
+        assert_eq!(call.resolved_target, Some(member.id));
+        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+        store.validate_proof_resolution_publication(&publication(generation))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| fact.callsite.line == 6 && fact.callsite.raw_target == "target")
+            .unwrap();
+        assert_eq!(
+            fact.status,
+            ProofResolutionStatus::Unsupported,
+            "ordinary nominal annotation is not strict dispatch proof: {fact:#?}"
+        );
+        assert!(fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty());
+        assert_eq!(fact.provenance.language_adapter_version, "reference-v20");
     }
     Ok(())
 }
@@ -6685,7 +6775,7 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
             static_facts.iter().all(|fact| {
                 fact.status == ProofResolutionStatus::Exact
                     && fact.edge_id.is_some()
-                    && fact.provenance.language_adapter_version == "reference-v19"
+                    && fact.provenance.language_adapter_version == "reference-v20"
             }),
             "read-only getter poisoned {target}: {static_facts:#?}"
         );
@@ -15255,7 +15345,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "python")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v19")
+        Some("reference-v20")
     );
     for (language, expected) in [
         ("java", "reference-v4"),
@@ -17002,7 +17092,7 @@ fn stale_ordinary_receiver_artifacts_reparse_then_reuse() -> anyhow::Result<()> 
             9,
             11,
             "reference-v18",
-            "reference-v19",
+            "reference-v20",
         ),
     ] {
         let project = tempfile::tempdir()?;

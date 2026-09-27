@@ -1273,6 +1273,98 @@ class Notifier:
         "notifier.py",
     );
 
+    // Ordinary local annotation navigation needs one unconditional class
+    // after its one earlier import, with no other binding of that name.
+    let local_class = "class Notifier:\n    def notify_event(self):\n        pass\n";
+    let imported = "from notifier import Notifier\n";
+    let annotated_call = "def run(notifier: Notifier):\n    notifier.notify_event()\n";
+    for (name, source) in [
+        (
+            "reversed import",
+            format!("{local_class}{imported}{annotated_call}"),
+        ),
+        (
+            "later import",
+            format!("{local_class}{annotated_call}{imported}"),
+        ),
+        (
+            "later class",
+            format!("{imported}{annotated_call}{local_class}"),
+        ),
+        (
+            "duplicate import",
+            format!("{imported}{imported}{local_class}{annotated_call}"),
+        ),
+        (
+            "duplicate class",
+            format!("{imported}{local_class}{local_class}{annotated_call}"),
+        ),
+        (
+            "conditional class",
+            format!(
+                "{imported}if flag:\n    class Notifier:\n        def notify_event(self):\n            pass\n{annotated_call}"
+            ),
+        ),
+        (
+            "conditional import",
+            format!("if flag:\n    from notifier import Notifier\n{local_class}{annotated_call}"),
+        ),
+        (
+            "function collision",
+            format!("{imported}def Notifier():\n    return None\n{local_class}{annotated_call}"),
+        ),
+        (
+            "earlier value write",
+            format!("{imported}Notifier = replacement\n{local_class}{annotated_call}"),
+        ),
+        (
+            "later value write",
+            format!("{imported}{local_class}{annotated_call}Notifier = replacement\n"),
+        ),
+        (
+            "decorated class",
+            format!("{imported}@replace\n{local_class}{annotated_call}"),
+        ),
+        (
+            "nested lexical parameter",
+            format!(
+                "{imported}{local_class}def outer(Notifier):\n    def run(notifier: Notifier):\n        notifier.notify_event()\n"
+            ),
+        ),
+        (
+            "nested lexical value",
+            format!(
+                "{imported}{local_class}def outer():\n    Notifier = replacement\n    def run(notifier: Notifier):\n        notifier.notify_event()\n"
+            ),
+        ),
+    ] {
+        let (nodes, edges) =
+            index_files(&[("notifier.py", notifier_source), ("workflow.py", &source)])?;
+        assert_no_resolved_call_to_method_owner(
+            name,
+            &nodes,
+            &edges,
+            "run",
+            "Notifier",
+            "notify_event",
+        );
+    }
+    let constructor_source = format!(
+        "{imported}{local_class}def construct():\n    notifier = Notifier()\n    notifier.notify_event()\n"
+    );
+    let (constructor_nodes, constructor_edges) = index_files(&[
+        ("notifier.py", notifier_source),
+        ("workflow.py", &constructor_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "local annotation authority does not restore guessed constructor binding",
+        &constructor_nodes,
+        &constructor_edges,
+        "construct",
+        "Notifier",
+        "notify_event",
+    );
+
     let (assignment_shadow_nodes, assignment_shadow_edges) = index_files(&[
         ("notifier.py", notifier_source),
         ("workflow.py", assignment_shadow_import_source),
@@ -8568,6 +8660,13 @@ fn test_javascript_property_assigned_functions_preserve_receiver_and_import_boun
 const send = require('wire-send');
 
 const app = {};
+app.handleDirect = function handleDirect(req, res) {
+    return this.router.handle(req, res);
+};
+app.useDirect = function useDirect(path) {
+    const router = this.router;
+    return router.use(path);
+};
 app.handle = function handle(req, res) {
     return [req].map(() => this.router.handle(req, res));
 };
@@ -8677,7 +8776,9 @@ res.sendFile = function sendFile(path) {
 };
 "#;
 
-    let (nodes, edges) = index_single_file("server.js", source)?;
+    let project = tempdir()?;
+    let (nodes, edges, occurrences) =
+        index_files_at_root_with_occurrences(project.path(), &[("server.js", source)])?;
     assert_resolved_call_to_method_owner(
         "javascript property-assigned this receiver",
         &nodes,
@@ -8696,6 +8797,46 @@ res.sendFile = function sendFile(path) {
     );
 
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    for (anchor, callee) in [
+        (
+            "return [req].map(() => this.router.handle(req, res));",
+            "handle",
+        ),
+        ("return router.use(path);\n    });", "use"),
+        ("return [path].map(() => router.use(path));", "use"),
+    ] {
+        let byte = source.find(anchor).expect("unique anonymous call anchor")
+            + anchor.find(callee).expect("callee within anchor");
+        let before = &source[..byte];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+        let column = (byte - before.rfind('\n').map_or(0, |newline| newline + 1) + 1) as u32;
+        assert!(
+            occurrences.iter().any(|occurrence| {
+                occurrence.location.start_line == line
+                    && occurrence.location.end_line == line
+                    && occurrence.location.start_col == column
+                    && occurrence.location.end_col == column + callee.len() as u32
+                    && node_by_id
+                        .get(&NodeId(occurrence.element_id))
+                        .is_some_and(|node| {
+                            node.kind == NodeKind::UNKNOWN && node.serialized_name == callee
+                        })
+            }),
+            "anonymous {callee} must retain its exact raw callee occurrence at {line}:{column}"
+        );
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .all(|edge| {
+                    edge.line != Some(line)
+                        || node_by_id
+                            .get(&edge.target)
+                            .is_none_or(|target| target.serialized_name != callee)
+                }),
+            "anonymous {callee} at {line}:{column} must not borrow any represented CALL owner"
+        );
+    }
     let external_router_call = edges.iter().find(|edge| {
         if edge.kind != EdgeKind::CALL {
             return false;
@@ -8706,12 +8847,12 @@ res.sendFile = function sendFile(path) {
         let Some(target) = node_by_id.get(&edge.target) else {
             return false;
         };
-        is_matching_name(&source.serialized_name, "app.handle")
+        is_matching_name(&source.serialized_name, "app.handleDirect")
             && is_matching_name(&target.serialized_name, "handle")
     });
     let external_router_call = external_router_call.unwrap_or_else(|| {
         panic!(
-            "expected exact app.handle external callsite. Calls: {:?}",
+            "expected exact app.handleDirect external callsite. Calls: {:?}",
             describe_call_edges(&edges, &nodes)
         )
     });
@@ -8736,8 +8877,8 @@ res.sendFile = function sendFile(path) {
         .collect::<Vec<_>>();
     assert_eq!(
         alias_edges.len(),
-        8,
-        "only lexical `this.router` and its exact local alias may carry app.router provenance: {:?}",
+        7,
+        "only represented lexical `this.router` and its exact local alias may carry app.router provenance: {:?}",
         describe_call_edges(&edges, &nodes)
     );
     assert!(
@@ -8754,7 +8895,7 @@ res.sendFile = function sendFile(path) {
         .find(|edge| {
             node_by_id
                 .get(&edge.source)
-                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use"))
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.useDirect"))
                 && node_by_id
                     .get(&edge.target)
                     .is_some_and(|target| is_matching_name(&target.serialized_name, "use"))
@@ -8764,17 +8905,8 @@ res.sendFile = function sendFile(path) {
     assert!(
         node_by_id
             .get(&alias_use.source)
-            .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use")),
+            .is_some_and(|source| is_matching_name(&source.serialized_name, "app.useDirect")),
         "alias provenance should stay attached to the owning property-assigned callable: {:?}",
-        describe_call_edges(&edges, &nodes)
-    );
-    assert!(
-        alias_edges.iter().any(|edge| {
-            node_by_id
-                .get(&edge.source)
-                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.arrowAlias"))
-        }),
-        "a nested arrow must retain the exact lexical router alias: {:?}",
         describe_call_edges(&edges, &nodes)
     );
     assert!(
