@@ -10924,10 +10924,10 @@ mod tests {
                     }
                     panic!("record actual handler result: {error}");
                 }
-                if let Err(error) = std::fs::rename(temporary, path) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        panic!("publish complete response observation: {error}");
-                    }
+                if let Err(error) = std::fs::rename(temporary, path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    panic!("publish complete response observation: {error}");
                 }
             }
             response
