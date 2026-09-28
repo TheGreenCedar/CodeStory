@@ -1156,7 +1156,13 @@ fn shared_file_provenance_round_trips_with_fewer_pages_than_denormalized_facts()
              CREATE INDEX idx_proof_resolution_file
                ON proof_resolution_fact(file_id);
              CREATE INDEX idx_proof_resolution_caller_target
-               ON proof_resolution_fact(caller_node_id, target_node_id, status);",
+               ON proof_resolution_fact(caller_node_id, target_node_id, status);
+             CREATE INDEX idx_proof_resolution_target
+               ON proof_resolution_fact(target_node_id);
+             CREATE INDEX idx_proof_resolution_raw_target
+               ON proof_resolution_fact(raw_edge_target_id);
+             CREATE INDEX idx_proof_resolution_edge
+               ON proof_resolution_fact(edge_id);",
         )
         .expect("create exact legacy proof schema");
     {
