@@ -510,6 +510,10 @@ pub use agent::packet_batch::{
     PacketEntryObservationPhase, PacketLatencyScopeGuard, enter_packet_latency_scope,
     observe_packet_entry_phase,
 };
+pub use call_path_kernel::PROOF_DOMAIN;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use controller_indexing::set_mid_indexing_test_hook;
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
@@ -523,8 +527,9 @@ pub use services::{
     ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
     ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
-    IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error, search_operation_name, set_activation_fail_stop_hook,
+    HistoricalServedReason, IndexService, OperationFreshness, OperationReadClass, ProjectService,
+    PublicOperation, PublicOperationService, SearchService, TrailService, embedding_api_error,
+    operation_read_class, search_operation_name, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,

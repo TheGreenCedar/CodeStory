@@ -628,25 +628,49 @@ fn publication_env_nonempty(name: &str) -> Option<String> {
 }
 
 /// Build the canonical publication/contract stamp shared by CLI JSON, HTTP, and stdio.
+///
+/// `freshness` is the runtime's own admission decision for the operation that
+/// produced the response, never a status-cache guess: `Historical` exactly
+/// when the runtime admitted the read from a retained publication during a
+/// refresh. `served_from` derives from it.
 pub(crate) fn codestory_publication_meta(
     core_publication: Option<serde_json::Value>,
     retrieval_publication: Option<serde_json::Value>,
     operation_id: Option<&str>,
     attempt: Option<u32>,
-    refreshing: bool,
+    freshness: Option<codestory_runtime::OperationFreshness>,
 ) -> serde_json::Value {
     let served_from = if core_publication.is_none() && retrieval_publication.is_none() {
         "contract_only"
-    } else if refreshing {
+    } else if matches!(
+        freshness,
+        Some(codestory_runtime::OperationFreshness::Historical(_))
+    ) {
         "last_complete_publication"
     } else {
         "complete_publication"
+    };
+    let served_generation = core_publication
+        .as_ref()
+        .and_then(|publication| publication.pointer("/generation_id"))
+        .cloned();
+    let freshness = match freshness {
+        Some(codestory_runtime::OperationFreshness::Historical(reason)) => serde_json::json!({
+            "state": "historical",
+            "reason": reason,
+            "served_generation": served_generation,
+        }),
+        _ => serde_json::json!({
+            "state": "fresh",
+            "served_generation": served_generation,
+        }),
     };
     serde_json::json!({
         "schema_version": CODESTORY_PUBLICATION_META_SCHEMA_VERSION,
         "minimum_compatible_schema_version":
             CODESTORY_PUBLICATION_META_MINIMUM_COMPATIBLE_SCHEMA_VERSION,
         "served_from": served_from,
+        "freshness": freshness,
         "publication": core_publication,
         "core_publication": core_publication,
         "retrieval_publication": retrieval_publication,
@@ -697,7 +721,7 @@ pub(crate) fn public_operation_json_value<T, V: Serialize>(
                 retrieval_publication,
                 Some(&operation.operation_id),
                 Some(operation.attempt),
-                false,
+                Some(operation.freshness),
             ),
         );
     Ok(value)
@@ -713,6 +737,7 @@ pub(crate) fn map_public_operation<T, U>(
         retrieval_publication: operation.retrieval_publication,
         operation_id: operation.operation_id,
         attempt: operation.attempt,
+        freshness: operation.freshness,
     }
 }
 
@@ -1381,6 +1406,7 @@ mod tests {
             retrieval_publication: None,
             operation_id: "public-7".to_string(),
             attempt: 2,
+            freshness: codestory_runtime::OperationFreshness::Fresh,
         };
         let response = serde_json::json!({
             "result": "ok",
@@ -1406,7 +1432,7 @@ mod tests {
         // must see the bump rather than a self-referential comparison.
         assert_eq!(
             value.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&serde_json::json!(3))
+            Some(&serde_json::json!(4))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),

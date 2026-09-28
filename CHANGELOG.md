@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Snippet and source reads for an indexed symbol now verify file bytes against the indexed content hash and refuse stale or missing source with a typed error instead of returning mismatched text.
+- During a refresh, source-backed reads wait for the fresh index while graph-only answers may come from the retained publication; results served that way are labelled `historical` under `_meta.codestory_publication.freshness`.
 
 ## 0.17.6
 

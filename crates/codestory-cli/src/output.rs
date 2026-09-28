@@ -4308,6 +4308,7 @@ mod tests {
             retrieval_publication: None,
             operation_id: "public-1".to_string(),
             attempt: 1,
+            freshness: codestory_runtime::OperationFreshness::Fresh,
         };
 
         emit_public_operation(OutputFormat::Markdown, operation(), Some(&markdown_path))
@@ -4337,6 +4338,7 @@ mod tests {
                 retrieval_publication: None,
                 operation_id: "public-2".to_string(),
                 attempt: 1,
+                freshness: codestory_runtime::OperationFreshness::Fresh,
             },
             Some(&graph_path),
         )

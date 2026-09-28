@@ -173,6 +173,14 @@ work. A real unavailable result is terminal for that call. Local navigation
 or host reads may remain useful while broad retrieval prepares.
 Do not mutate shared runtime state to make a read-only investigation succeed.
 
+During a refresh, source-backed reads (`snippet` by symbol id, `search` with
+`repo_text=off`) wait for the fresh complete index within the call's deadline.
+Pure graph answers (`ground`, `files`, symbol/trail navigation) may instead
+come from the retained publication; when they do, the response marks
+`_meta.codestory_publication.freshness.state` as `historical` with a
+runtime-derived `reason`, so cite it as pre-refresh evidence rather than
+current source.
+
 Use `status` or `codestory://status{?project}` to diagnose failed or stalled
 requests. Discover the intended method if tools are hidden. If MCP is
 unavailable, report that boundary and use ordinary source inspection.

@@ -27,7 +27,7 @@ pub(in crate::app) fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     let operation = if cmd.target.query.is_some() {
         "graph_assisted"
     } else {
-        "graph"
+        "source_snippet"
     };
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()

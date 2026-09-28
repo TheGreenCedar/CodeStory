@@ -1008,7 +1008,7 @@ impl AppController {
         &self,
         budget: GroundingBudgetDto,
     ) -> Result<GroundingSnapshotDto, ApiError> {
-        self.ensure_consistent_read_state("Grounding")?;
+        self.ensure_graph_only_read_state("Grounding")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
         if matches!(budget, GroundingBudgetDto::Max)

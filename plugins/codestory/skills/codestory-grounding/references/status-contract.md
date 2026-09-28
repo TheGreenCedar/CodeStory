@@ -44,6 +44,16 @@ it as `after_ms`.
 part of the call. Once a complete publication exists, local graph tools keep
 using it during refresh and never read a half-published generation.
 
+Tool results carry `_meta.codestory_publication.freshness` describing what the
+runtime actually served: `state` is `fresh` when the answer came from the
+current source, and `historical` when a graph-only tool answered from the
+retained publication while a refresh was still running or after a failed
+replacement. The `reason` and `served_generation` fields name why and which
+generation. Source-backed reads (`snippet` by symbol id, `search` with
+`repo_text=off`) never return historical bytes: they wait for the fresh
+complete index inside the call's deadline and return `preparing` if it cannot
+converge.
+
 ## Diagnostic status
 
 `codestory://status{?project}` is an observational diagnostic resource

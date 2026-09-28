@@ -388,7 +388,21 @@ impl ReadOnlyBrowserService {
         node_id: NodeId,
         context: usize,
     ) -> Result<SnippetContextDto, ApiError> {
-        self.run_public("graph", || {
+        self.run_public("source_snippet", || {
+            self.controller.snippet_context(node_id.clone(), context)
+        })
+    }
+
+    /// The MCP `resources/read` surface is observational: it pins the
+    /// committed publication without activating or waiting, so source drift
+    /// surfaces as the read's own typed error (`source_stale`) rather than an
+    /// admission refusal.
+    pub fn snippet_context_observational(
+        &self,
+        node_id: NodeId,
+        context: usize,
+    ) -> Result<SnippetContextDto, ApiError> {
+        self.run_observational("source_snippet", || {
             self.controller.snippet_context(node_id.clone(), context)
         })
     }
@@ -398,7 +412,7 @@ impl ReadOnlyBrowserService {
         node_id: NodeId,
         context: usize,
     ) -> Result<SnippetContextDto, ApiError> {
-        self.run_public("graph", || {
+        self.run_public("source_snippet", || {
             self.controller
                 .snippet_function_body_context(node_id.clone(), context)
         })
