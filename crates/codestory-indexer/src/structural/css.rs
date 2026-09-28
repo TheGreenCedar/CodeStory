@@ -927,6 +927,15 @@ mod tests {
         assert!(kinds.contains(&NodeKind::CONSTANT));
         assert!(kinds.contains(&NodeKind::VARIABLE));
         assert!(storage.edges.iter().any(|e| e.kind == EdgeKind::MEMBER));
+        // `.btn` alone supplies a CONSTANT; pin each named selector family so
+        // dropping id collection cannot hide behind the class node.
+        for canonical in ["css:class:btn", "css:id:app", "css:var:--primary"] {
+            assert!(
+                find_node(&storage, canonical).is_some(),
+                "expected `{canonical}` to be minted: {:?}",
+                storage.nodes
+            );
+        }
     }
 
     #[test]

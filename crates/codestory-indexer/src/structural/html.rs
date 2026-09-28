@@ -422,11 +422,31 @@ mod tests {
                 .any(|n| n.canonical_id.as_deref() == Some("html:id:app"))
         );
         assert!(storage.edges.iter().any(|e| e.kind == EdgeKind::USAGE));
+        // `css:class:layout` is minted twice through different paths: the class
+        // attribute's USAGE linkage and the embedded `<style>` block's selector
+        // rule. The style-minted node anchors at the style line; without
+        // `collect_css_entities` only the attribute-minted line would exist.
+        let style_line = html
+            .lines()
+            .position(|line| line.contains("<style>"))
+            .map(|index| index as u32 + 1)
+            .expect("fixture carries a style block");
+        let layout_nodes = storage
+            .nodes
+            .iter()
+            .filter(|n| n.canonical_id.as_deref() == Some("css:class:layout"))
+            .collect::<Vec<_>>();
         assert!(
-            storage
-                .nodes
+            layout_nodes.len() >= 2,
+            "the class attribute and the embedded style rule must each mint `css:class:layout`: {:?}",
+            storage.nodes
+        );
+        assert!(
+            layout_nodes
                 .iter()
-                .any(|n| n.canonical_id.as_deref() == Some("css:class:layout"))
+                .any(|n| n.start_line == Some(style_line)),
+            "the style-block selector must anchor `css:class:layout` at line {style_line}: {:?}",
+            layout_nodes
         );
     }
 

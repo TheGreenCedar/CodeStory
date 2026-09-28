@@ -385,6 +385,26 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
     let nodes = storage.get_nodes()?;
     assert!(nodes.iter().any(|node| node.serialized_name == "run"));
 
+    // The cache-hit run must still carry real artifact output: an empty cached
+    // extraction would keep the hit telemetry green while dropping calls.
+    let edges = storage.get_edges()?;
+    assert!(
+        edges
+            .iter()
+            .any(|edge| { edge.kind == EdgeKind::CALL && edge.resolved_target.is_some() }),
+        "cache-hit run must persist resolved CALL edges (run -> helper)"
+    );
+    let run_node = nodes
+        .iter()
+        .find(|node| node.serialized_name == "run")
+        .expect("run node");
+    assert!(
+        !storage
+            .get_occurrences_for_element(run_node.id.0)?
+            .is_empty(),
+        "cache-hit run must persist occurrence output for `run`"
+    );
+
     Ok(())
 }
 
@@ -801,7 +821,14 @@ fn test_index_artifact_cache_copies_across_compatible_roots() -> anyhow::Result<
                 .contains(source_root_text.as_ref())
         );
     }
-    for edge in target_storage.get_edges()? {
+    let target_edges = target_storage.get_edges()?;
+    // A copied artifact that dropped CALL/occurrence output would leave this
+    // loop empty and pass vacuously; require the calls first.
+    assert!(
+        target_edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
+        "copied artifact cache must reproduce CALL edges in the target root"
+    );
+    for edge in &target_edges {
         if edge.kind == EdgeKind::CALL {
             let identity = edge
                 .callsite_identity
@@ -1431,8 +1458,28 @@ fn process(t: MyType) {
     assert!(nodes.iter().any(|n| n.serialized_name == "MyType"));
     assert!(nodes.iter().any(|n| n.serialized_name == "process"));
 
-    // Should have edges (TYPE_USAGE or similar)
-    assert!(edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
+    // The cross-file contract: the `use types::MyType` import in main.rs must
+    // resolve to the MyType struct node declared in types.rs — an unresolved
+    // or self-referential import must fail.
+    let my_type = nodes
+        .iter()
+        .find(|n| n.serialized_name == "MyType" && n.kind == NodeKind::STRUCT)
+        .expect("MyType struct node");
+    let my_type_file = my_type
+        .file_node_id
+        .and_then(|id| nodes.iter().find(|n| n.id == id))
+        .map(|n| n.serialized_name.clone())
+        .expect("MyType must belong to a file node");
+    assert!(
+        my_type_file.ends_with("types.rs"),
+        "MyType struct must be declared in types.rs, got {my_type_file}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| { e.kind == EdgeKind::IMPORT && e.resolved_target == Some(my_type.id) }),
+        "expected IMPORT edge resolved to the types.rs MyType node"
+    );
 
     Ok(())
 }

@@ -10913,6 +10913,21 @@ function Widget({ response, body }: { response: Response; body: string }) {
             Some("dispatch"),
             "the member expression target must not inherit the bare import marker"
         );
+        // Both callsites resolve to a `dispatch` target by name; the bare
+        // import call is the only line whose statement starts with `dispatch`.
+        // Pinning the marked edge's line proves the member call never inherits
+        // the marker — swapping marker ownership would still name `dispatch`.
+        let bare_line = source
+            .lines()
+            .position(|line| line.trim_start().starts_with("dispatch("))
+            .map(|index| index as u32 + 1)
+            .expect("the fixture carries a bare dispatch callsite");
+        assert_eq!(
+            marked[0].line,
+            Some(bare_line),
+            "the runtime-import marker must sit on the bare call, not the member call: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
     }
     Ok(())
 }
@@ -12744,13 +12759,20 @@ export function Widget(): JSX.Element {
         "WidgetWorkflow",
         "decorate",
     );
-    assert_resolved_call_to_method_owner(
+    // The fixture carries two `workflow.run` callsites — the statement and the
+    // JSX expression. A count assertion is required: an existential check
+    // stays green when the JSX call is dropped.
+    assert_resolved_call_count_to_method_owner_in_file(
         "tsx constructor receiver",
         &nodes,
         &edges,
-        "Widget",
-        "WidgetWorkflow",
-        "run",
+        ResolvedCallCountInFile {
+            caller_name: "Widget",
+            owner_name: "WidgetWorkflow",
+            method_name: "run",
+            file_suffix: "widget.tsx",
+            expected_count: 2,
+        },
     );
 
     Ok(())
@@ -18478,28 +18500,6 @@ func run(notifier: Any) {
 }
 
 #[test]
-fn test_java_annotation_usage_span_tracks_terminal_identifier() -> anyhow::Result<()> {
-    let source = "@Deprecated\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-
-    let deprecated_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Deprecated"))
-        .ok_or_else(|| anyhow::anyhow!("expected Deprecated annotation usage node"))?;
-
-    assert_eq!(
-        snippet_for_node(source, deprecated_target),
-        Some("Deprecated"),
-        "expected Java annotation usage placeholder to cover only the annotation token"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn test_rust_impl_expr_span_tracks_terminal_identifier() -> anyhow::Result<()> {
     let source = "impl crate::api::Worker<T> {\n    fn run(&self) {}\n}\n";
     let (nodes, _edges) = index_single_file("main.rs", source)?;
@@ -18519,48 +18519,30 @@ fn test_rust_impl_expr_span_tracks_terminal_identifier() -> anyhow::Result<()> {
 
 #[test]
 fn test_java_annotation_usage_placeholder_span_tracks_terminal_identifier() -> anyhow::Result<()> {
-    let source = "@Marker\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    // The Marker/Deprecated/Logged spellings all traverse the same
+    // `marker_annotation` grammar path; the consolidated sweep keeps the
+    // spelling variants while asserting the terminal-identifier span and the
+    // exact line-1 placement the weaker duplicates lacked.
+    for annotation in ["Marker", "Deprecated", "Logged"] {
+        let source = format!("@{annotation}\nclass Example {{}}\n");
+        let (nodes, edges) = index_single_file("Main.java", &source)?;
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
 
-    let marker_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Marker"))
-        .ok_or_else(|| anyhow::anyhow!("expected Marker annotation placeholder node"))?;
+        let annotation_target = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
+            .filter_map(|edge| node_by_id.get(&edge.target).copied())
+            .find(|node| is_matching_name(&node.serialized_name, annotation))
+            .ok_or_else(|| anyhow::anyhow!("expected {annotation} annotation placeholder node"))?;
 
-    assert_eq!(marker_target.start_line, Some(1));
-    assert_eq!(marker_target.end_line, Some(1));
-    assert_eq!(
-        snippet_for_node(source, marker_target),
-        Some("Marker"),
-        "expected Java annotation placeholder to cover only the annotation token"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_java_annotation_usage_placeholder_span_tracks_annotation_token() -> anyhow::Result<()> {
-    let source = "@Logged\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-
-    let logged_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Logged"))
-        .ok_or_else(|| anyhow::anyhow!("expected Logged annotation node"))?;
-
-    assert_eq!(logged_target.start_line, Some(1));
-    assert_eq!(logged_target.end_line, Some(1));
-    assert_eq!(
-        snippet_for_node(source, logged_target),
-        Some("Logged"),
-        "expected Java annotation usage placeholder to cover only the annotation token"
-    );
+        assert_eq!(annotation_target.start_line, Some(1));
+        assert_eq!(annotation_target.end_line, Some(1));
+        assert_eq!(
+            snippet_for_node(&source, annotation_target),
+            Some(annotation),
+            "expected Java annotation placeholder to cover only the annotation token"
+        );
+    }
 
     Ok(())
 }
@@ -20818,21 +20800,31 @@ func ImplicitDeclaredPackage() { declared.NewWorker().Finish() }
         ),
     ])?;
     assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "FabricatedImport", "Finish");
-    assert_resolved_call_to_method_owner(
+    // Three same-named `Worker` declarations exist across worker/, other/, and
+    // oddpath/; the target file must be pinned, not just the owner name.
+    assert_resolved_call_count_to_method_owner_in_file(
         "return-import-ast",
         &nodes,
         &edges,
-        "ActualImport",
-        "Worker",
-        "Finish",
+        ResolvedCallCountInFile {
+            caller_name: "ActualImport",
+            owner_name: "Worker",
+            method_name: "Finish",
+            file_suffix: "worker/worker.go",
+            expected_count: 1,
+        },
     );
-    assert_resolved_call_to_method_owner(
+    assert_resolved_call_count_to_method_owner_in_file(
         "return-import-implicit-package-clause",
         &nodes,
         &edges,
-        "ImplicitDeclaredPackage",
-        "Worker",
-        "Finish",
+        ResolvedCallCountInFile {
+            caller_name: "ImplicitDeclaredPackage",
+            owner_name: "Worker",
+            method_name: "Finish",
+            file_suffix: "oddpath/worker.go",
+            expected_count: 1,
+        },
     );
     Ok(())
 }
@@ -21687,7 +21679,11 @@ func Closure() { chosen := local{}; func() { chosen.Target() }() }
 fn test_go_module_control_change_reindexes_callers_and_clears_old_resolution() -> anyhow::Result<()>
 {
     let dir = tempdir()?;
-    let root = dir.path();
+    // Workspace plans report canonical paths; on macOS `tempdir()` returns the
+    // lexical `/var/...` spelling of the canonical `/private/var/...` inode, so
+    // every `root.join(...)` comparison below must use the canonical path.
+    let canonical_root = dir.path().canonicalize()?;
+    let root = canonical_root.as_path();
     fs::create_dir_all(root.join("selected"))?;
     fs::write(root.join(".gitignore"), "go.mod\n")?;
     fs::write(root.join("go.mod"), "module example.com/project\n")?;
