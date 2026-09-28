@@ -7453,7 +7453,8 @@ impl Storage {
     }
 
     pub fn discard_staged_snapshot(staged_path: &Path) -> Result<(), StorageError> {
-        cleanup_sqlite_sidecars(staged_path)
+        cleanup_sqlite_sidecars(staged_path)?;
+        crate::core_generation::remove_empty_staging_directory(staged_path)
     }
 
     fn init(&self, _mode: StorageOpenMode) -> Result<(), StorageError> {

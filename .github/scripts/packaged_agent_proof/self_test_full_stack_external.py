@@ -161,20 +161,89 @@ def _publication_fault_hostile(
     external_package, external_contracts = _external_contracts(fixture)
     publication_path = publication.path
     publication_payload = publication.payload
-    hostile_publication = json.loads(json.dumps(publication_payload))
-    hostile_publication["assertions"] = {"lost_publication_lease_blocks_commit": True}
-    write_json(publication_path, hostile_publication)
-    try:
-        verify_publication_fault_raw_evidence(
-            publication_path,
-            source=manifest["source"],
-            package=external_package,
-            contracts=external_contracts,
-        )
-    except ProofFailure:
-        pass
-    else:
-        raise ProofFailure("self-declared publication assertions were accepted")
+
+    def expect_rejected(label: str, mutate) -> None:
+        hostile = json.loads(json.dumps(publication_payload))
+        mutate(hostile)
+        write_json(publication_path, hostile)
+        try:
+            verify_publication_fault_raw_evidence(
+                publication_path,
+                source=manifest["source"],
+                package=external_package,
+                contracts=external_contracts,
+            )
+        except ProofFailure:
+            return
+        raise ProofFailure(f"hostile publication evidence was accepted: {label}")
+
+    expect_rejected(
+        "self-declared assertions",
+        lambda payload: payload.__setitem__(
+            "assertions", {"lost_publication_lease_blocks_commit": True}
+        ),
+    )
+    # Lease: a revalidation that succeeded must not certify a blocked commit.
+    expect_rejected(
+        "lease revalidation reported as held",
+        lambda payload: payload["publication_hook_events"][2].__setitem__(
+            "status", "succeeded"
+        ),
+    )
+    # Fence: a committed manifest must not certify a blocked publication.
+    expect_rejected(
+        "manifest commit reported as committed",
+        lambda payload: payload["publication_hook_events"][3].__setitem__(
+            "status", "committed"
+        ),
+    )
+    # Fence: the lease event cannot be silently dropped from the sequence.
+    expect_rejected(
+        "missing lease revalidation event",
+        lambda payload: payload["publication_hook_events"].pop(2),
+    )
+    # Fence: hook clocks cannot move backwards within the commit.
+    expect_rejected(
+        "non-monotonic hook clock",
+        lambda payload: payload["publication_hook_events"][3]["clock"].__setitem__(
+            "elapsed_ns", 0
+        ),
+    )
+    # The candidate must have failed; a successful commit is not a blocked one.
+    expect_rejected(
+        "candidate commit succeeded",
+        lambda payload: payload["candidate_observation"].__setitem__("exit_code", 0),
+    )
+    # Product preservation: post-fault reads must pin the previous publication.
+    expect_rejected(
+        "ordinary observation used a different publication",
+        lambda payload: payload["ordinary_product_observations"][1].__setitem__(
+            "publication_identity_sha256",
+            hashlib.sha256(b"new-publication").hexdigest(),
+        ),
+    )
+    # Product preservation: an ordinary product call failing after the fault
+    # proves the previous publication did not stay usable.
+    expect_rejected(
+        "ordinary search failed after the fault",
+        lambda payload: payload["ordinary_product_observations"][1].__setitem__(
+            "exit_code", 1
+        ),
+    )
+    # The replacement must be a different server instance, not the crashed one.
+    expect_rejected(
+        "server was not actually replaced",
+        lambda payload: payload["server_observations"][1].update(
+            {
+                "server_instance_id": payload["server_observations"][0][
+                    "server_instance_id"
+                ],
+                "process_start_id": payload["server_observations"][0][
+                    "process_start_id"
+                ],
+            }
+        ),
+    )
     write_json(publication_path, publication_payload)
 
 
