@@ -2500,6 +2500,7 @@ fn aggregate_symbol_matches_prioritizes_direct_matches() {
 
 #[test]
 fn indexed_files_reports_incomplete_reason_counts() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("temp dir");
     let storage_path = temp.path().join("cache").join("codestory.db");
     std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
@@ -2559,7 +2560,7 @@ fn indexed_files_reports_incomplete_reason_counts() {
             .expect("publish complete core identity");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
         .expect("open project");
@@ -4578,6 +4579,7 @@ fn special_collector_growth_after_planning_cannot_publish() {
 
 #[test]
 fn partial_discovery_keeps_oversized_candidates_blocking_and_publishes_nothing() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::create_dir_all(workspace.path().join("src")).expect("source directory");
     fs::write(
@@ -4591,7 +4593,7 @@ fn partial_discovery_keeps_oversized_candidates_blocking_and_publishes_nothing()
     )
     .expect("partial workspace manifest");
     let storage_path = workspace.path().join(".cache/codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -8264,9 +8266,10 @@ fn full_index_rebuilds_semantic_docs_when_source_text_changes() {
 
 #[test]
 fn finalize_indexing_without_runtime_refresh_propagates_rebuild_failure() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(
@@ -8329,10 +8332,11 @@ fn persisted_empty_indexing_run_summary(storage_path: &Path) -> IndexingRunSumma
 
 #[test]
 fn successful_index_refresh_clears_indexing_state() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let storage_path = temp.path().join("codestory.db");
     drop(Storage::open(&storage_path).expect("seed storage"));
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     {
         let mut state = controller.state.lock();
@@ -8350,6 +8354,7 @@ fn successful_index_refresh_clears_indexing_state() {
 
 #[test]
 fn async_incremental_finishes_cache_boundary_before_clearing_marker() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -8357,7 +8362,7 @@ fn async_incremental_finishes_cache_boundary_before_clearing_marker() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -8410,9 +8415,10 @@ fn async_incremental_finishes_cache_boundary_before_clearing_marker() {
 
 #[test]
 fn empty_full_refresh_reports_adaptive_chunk_config() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
         .expect("open project");
@@ -8436,6 +8442,7 @@ fn empty_full_refresh_reports_adaptive_chunk_config() {
 
 #[test]
 fn full_and_incremental_publications_advance_one_durable_generation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let assert_promotion_reconciles = |promotion: &CorePromotionTimings| {
         let named_ms = promotion
             .lock_wait_ms
@@ -8465,7 +8472,7 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     )
     .expect("write initial source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -8779,13 +8786,14 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
 
 #[test]
 fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let markdown_path = workspace.path().join("guide.md");
     let json_path = workspace.path().join("config.json");
     fs::write(&markdown_path, "# Stable\n").expect("write markdown");
     fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n").expect("write JSON");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9014,6 +9022,7 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
 
 #[test]
 fn full_refresh_retains_malformed_source_separately_from_controlled_exclusions() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let fixture = workspace
         .path()
@@ -9022,7 +9031,7 @@ fn full_refresh_retains_malformed_source_separately_from_controlled_exclusions()
     fs::write(workspace.path().join("lib.rs"), "pub fn ready() {}\n").expect("write parser source");
     fs::write(&fixture, "jobs: [\n").expect("write controlled invalid fixture");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9059,6 +9068,7 @@ fn full_refresh_retains_malformed_source_separately_from_controlled_exclusions()
 
 #[test]
 fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     for scenario in ["unreadable", "partial-discovery"] {
         let workspace = tempdir().expect("workspace dir");
         let source_root = workspace.path().join("src");
@@ -9069,7 +9079,7 @@ fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
         fs::write(&manifest_path, r#"{"members":["src"]}"#)
             .expect("write complete workspace manifest");
         let storage_path = workspace.path().join(".cache/codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -9123,11 +9133,12 @@ fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
 
 #[test]
 fn staged_structural_cache_write_failure_preserves_nonempty_live_generation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let css_path = workspace.path().join("styles.css");
     fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
     let storage_path = workspace.path().join(".cache/codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9174,6 +9185,7 @@ fn staged_structural_cache_write_failure_preserves_nonempty_live_generation() {
 
 #[test]
 fn incremental_cache_read_faults_recollect_in_staged_candidate_and_preserve_live_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     for (family, cache_table) in [
         ("parser", "index_artifact_cache"),
         ("structural", "structural_text_artifact_cache"),
@@ -9186,7 +9198,7 @@ fn incremental_cache_read_faults_recollect_in_staged_candidate_and_preserve_live
         fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n")
             .expect("write structural source");
         let storage_path = workspace.path().join(".cache/codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -9318,6 +9330,7 @@ fn incremental_cache_read_faults_recollect_in_staged_candidate_and_preserve_live
 
 #[test]
 fn structural_publication_survives_cancellation_and_promotion_rollback_boundaries() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     for (boundary, action, mode) in [
         (
             PublicationTestBoundary::SearchBuild,
@@ -9341,7 +9354,7 @@ fn structural_publication_survives_cancellation_and_promotion_rollback_boundarie
         fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
         fs::write(&rust_path, "pub fn baseline() -> i32 { 1 }\n").expect("write parser source");
         let storage_path = workspace.path().join(".cache/codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -9389,6 +9402,7 @@ fn structural_publication_survives_cancellation_and_promotion_rollback_boundarie
 
 #[test]
 fn explicit_incremental_rejects_incompatible_structural_publication_before_source_reads() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("Cargo.toml"),
@@ -9396,7 +9410,7 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
     )
     .expect("write manifest");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9512,6 +9526,7 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
 
 #[test]
 fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -9519,7 +9534,7 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9672,6 +9687,7 @@ fn full_refresh_required_command_quotes_shell_metacharacters() {
 
 #[test]
 fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -9679,7 +9695,7 @@ fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9734,10 +9750,11 @@ fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
 
 #[test]
 fn full_refresh_rejects_a_nonempty_proof_overlay_before_graph_mutation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(workspace.path().join("lib.rs"), "pub fn value() {}\n").expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9781,12 +9798,13 @@ fn full_refresh_rejects_a_nonempty_proof_overlay_before_graph_mutation() {
 
 #[test]
 fn full_refresh_semantic_endpoint_index_failure_preserves_live_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9833,12 +9851,13 @@ fn full_refresh_semantic_endpoint_index_failure_preserves_live_publication() {
 
 #[test]
 fn full_refresh_post_summary_index_failure_preserves_live_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -9888,6 +9907,7 @@ fn full_refresh_post_summary_index_failure_preserves_live_publication() {
 
 #[test]
 fn incremental_publication_ignores_changed_files_without_graph_collectors() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -9903,7 +9923,7 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
     let collectorless = workspace.path().join("styles.scss");
     fs::write(&collectorless, ".initial { color: red; }\n").expect("write collectorless file");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10003,10 +10023,11 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
 
 #[test]
 fn incomplete_legacy_run_is_not_a_servable_complete_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(workspace.path().join("lib.rs"), "pub fn value() {}\n").expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10039,6 +10060,7 @@ fn incomplete_legacy_run_is_not_a_servable_complete_publication() {
 
 #[test]
 fn legacy_schema_18_incomplete_marker_requires_explicit_full_recovery() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -10046,7 +10068,7 @@ fn legacy_schema_18_incomplete_marker_requires_explicit_full_recovery() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10108,9 +10130,10 @@ fn legacy_schema_18_incomplete_marker_requires_explicit_full_recovery() {
 
 #[test]
 fn successful_index_reopen_failure_does_not_leave_indexing_stuck() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let storage_path = temp.path().join("missing").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     {
         let mut state = controller.state.lock();
@@ -10137,7 +10160,8 @@ fn successful_index_reopen_failure_does_not_leave_indexing_stuck() {
 
 #[test]
 fn blocking_index_without_open_project_does_not_leave_indexing_stuck() {
-    let controller = AppController::new();
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     let error = controller
         .run_indexing_blocking(IndexMode::Full)
@@ -10219,13 +10243,14 @@ fn incremental_failure_message(boundary: IncrementalFailureBoundary) -> &'static
 }
 
 fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let old_path = workspace.path().join("old.rs");
     let new_path = workspace.path().join("new.rs");
     fs::write(&old_path, "pub fn old_value() -> i32 { 1 }\n").expect("write old source");
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10412,6 +10437,7 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
 
 struct EmptyPlanShortCircuitFixture {
     _workspace: tempfile::TempDir,
+    _process_cache: tempfile::TempDir,
     controller: AppController,
     storage_path: PathBuf,
     source_path: PathBuf,
@@ -10420,11 +10446,12 @@ struct EmptyPlanShortCircuitFixture {
 }
 
 fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10447,6 +10474,7 @@ fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
     );
     EmptyPlanShortCircuitFixture {
         _workspace: workspace,
+        _process_cache: process_cache,
         controller,
         storage_path,
         source_path,
@@ -10457,6 +10485,7 @@ fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
 
 #[cfg(unix)]
 fn publish_source_alias_incremental_baseline() -> EmptyPlanShortCircuitFixture {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     use std::os::unix::fs::symlink;
 
     let workspace = tempdir().expect("workspace dir");
@@ -10485,7 +10514,7 @@ fn publish_source_alias_incremental_baseline() -> EmptyPlanShortCircuitFixture {
     .expect("write alias manifest");
 
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -10516,6 +10545,7 @@ fn publish_source_alias_incremental_baseline() -> EmptyPlanShortCircuitFixture {
     );
     EmptyPlanShortCircuitFixture {
         _workspace: workspace,
+        _process_cache: process_cache,
         controller,
         storage_path,
         source_path,
@@ -10847,8 +10877,9 @@ fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
         changed_policy.byte_cap,
         SourceIndexPolicy::default().byte_cap
     );
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let controller = AppController::new_with_source_index_policy(
-        codestory_retrieval::SidecarRuntimeConfig::local(),
+        crate::test_sidecar_runtime_with_cache_root(process_cache.path()),
         changed_policy,
     );
     controller
@@ -11287,8 +11318,9 @@ fn assert_publication_transition_fault_is_atomic(
     boundary: PublicationTestBoundary,
     action: PublicationTestAction,
 ) {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let source_path = workspace_root.join("lib.rs");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace_root.to_path_buf(),
@@ -11408,7 +11440,7 @@ fn assert_publication_transition_fault_is_atomic(
         }
     }
 
-    let restarted = AppController::new();
+    let restarted = AppController::new_with_owned_cache_root(process_cache.path());
     let summary = restarted
         .open_project_summary_with_storage_path(
             workspace_root.to_path_buf(),
@@ -11470,13 +11502,14 @@ fn assert_publication_transition_fault_is_atomic(
 }
 
 fn assert_publication_transition_matrix(mode: IndexMode) {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let (baseline, baseline_search_generations) = {
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -11540,12 +11573,13 @@ fn assert_publication_transition_matrix(mode: IndexMode) {
 
 #[test]
 fn runtime_service_shared_cancellation_stops_full_refresh_before_core_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -11591,12 +11625,13 @@ fn assert_symbol_index_failure_preserves_previous_complete_publication(
     fault: search::engine::SymbolIndexTestFault,
     expected_error: &str,
 ) {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -11653,6 +11688,7 @@ fn symbol_index_commit_failure_preserves_previous_complete_publication() {
 
 #[test]
 fn cancelled_full_refresh_preserves_previous_verified_exclusion_manifest() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let ordinary = workspace.path().join("lib.rs");
     let oversized = workspace.path().join("generated.rs");
@@ -11660,7 +11696,7 @@ fn cancelled_full_refresh_preserves_previous_verified_exclusion_manifest() {
     fs::write(&oversized, "pub fn generated() {}\n").expect("write generated source");
     make_source_exceed_default_index_byte_cap(&oversized, "baseline exclusion");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -11723,13 +11759,14 @@ fn cancelled_full_refresh_preserves_previous_verified_exclusion_manifest() {
 
 #[test]
 fn full_recovery_marker_completion_fault_preserves_fenced_live_generation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
     fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
         .expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let baseline = {
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -11766,7 +11803,7 @@ fn full_recovery_marker_completion_fault_preserves_fenced_live_generation() {
         });
         fs::write(&source_path, "pub fn new_generation() -> i32 { 2 }\n")
             .expect("write recovery source");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -11806,7 +11843,7 @@ fn full_recovery_marker_completion_fault_preserves_fenced_live_generation() {
         drop(storage);
         assert_no_staged_publication_artifacts(&storage_path);
 
-        let restarted = AppController::new();
+        let restarted = AppController::new_with_owned_cache_root(process_cache.path());
         restarted
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -11841,6 +11878,7 @@ fn incremental_publication_transitions_fail_or_cancel_atomically() {
 
 #[test]
 fn index_writer_lock_reports_cache_busy_and_releases_after_drop() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -11848,7 +11886,7 @@ fn index_writer_lock_reports_cache_busy_and_releases_after_drop() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -11919,6 +11957,7 @@ fn first_incremental_requires_full_before_cancellation_or_storage_creation() {
 
 #[test]
 fn cancelled_incremental_preserves_live_generation_and_retries_incrementally() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     for index in 0..64 {
         fs::write(
@@ -11930,7 +11969,7 @@ fn cancelled_incremental_preserves_live_generation_and_retries_incrementally() {
         .expect("write source");
     }
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -12061,9 +12100,10 @@ fn cancelled_incremental_preserves_live_generation_and_retries_incrementally() {
 
 #[test]
 fn cancelled_blocking_index_is_user_visible_and_clears_indexing_state() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
         .expect("open project summary");
@@ -12082,9 +12122,10 @@ fn cancelled_blocking_index_is_user_visible_and_clears_indexing_state() {
 
 #[test]
 fn full_refresh_publishes_both_grounding_snapshot_tiers() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     let assert_ready = |phase: &str| {
         let storage = Storage::open(&storage_path).expect("reopen storage");
         assert!(
@@ -12165,8 +12206,9 @@ fn progress_forwarder_relays_progress_and_status_events() {
 
 #[test]
 fn write_file_text_writes_inside_project_root() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12187,8 +12229,9 @@ fn write_file_text_writes_inside_project_root() {
 
 #[test]
 fn write_file_text_rejects_paths_outside_project_root() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12207,6 +12250,7 @@ fn write_file_text_rejects_paths_outside_project_root() {
 
 #[test]
 fn list_root_symbols_deduplicates_repeated_entries() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -12236,7 +12280,7 @@ fn list_root_symbols_deduplicates_repeated_entries() {
             .expect("insert root nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12257,6 +12301,7 @@ fn list_root_symbols_deduplicates_repeated_entries() {
 
 #[test]
 fn graph_neighborhood_member_includes_owner_inheritance_edges() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -12304,7 +12349,7 @@ fn graph_neighborhood_member_includes_owner_inheritance_edges() {
             .expect("insert edges");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12333,6 +12378,7 @@ fn graph_neighborhood_member_includes_owner_inheritance_edges() {
 
 #[test]
 fn graph_trail_includes_canonical_layout() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -12380,7 +12426,7 @@ fn graph_trail_includes_canonical_layout() {
             .expect("insert edges");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12413,6 +12459,7 @@ fn graph_trail_includes_canonical_layout() {
 
 #[test]
 fn graph_direct_references_returns_filtered_direct_incoming_edges() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -12498,7 +12545,7 @@ fn graph_direct_references_returns_filtered_direct_incoming_edges() {
             .expect("insert edges");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12540,6 +12587,7 @@ fn graph_direct_references_returns_filtered_direct_incoming_edges() {
 
 #[test]
 fn high_fanout_graph_trail_reports_truncation_at_max_nodes() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -12571,7 +12619,7 @@ fn high_fanout_graph_trail_reports_truncation_at_max_nodes() {
         storage.insert_edges_batch(&edges).expect("insert edges");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12602,8 +12650,9 @@ fn high_fanout_graph_trail_reports_truncation_at_max_nodes() {
 
 #[test]
 fn update_bookmark_category_returns_not_found_when_missing() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -12624,6 +12673,7 @@ fn update_bookmark_category_returns_not_found_when_missing() {
 
 struct AnnotationProject {
     _workspace: TempDir,
+    _process_cache: TempDir,
     root: PathBuf,
     source_path: PathBuf,
     storage_path: PathBuf,
@@ -12632,17 +12682,19 @@ struct AnnotationProject {
 
 impl AnnotationProject {
     fn open(source: &str) -> Self {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let workspace = tempdir().expect("workspace dir");
         let root = workspace.path().to_path_buf();
         let source_path = root.join("lib.rs");
         fs::write(&source_path, source).expect("write source");
         let storage_path = root.join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(root.clone(), storage_path.clone())
             .expect("open annotation project");
         Self {
             _workspace: workspace,
+            _process_cache: process_cache,
             root,
             source_path,
             storage_path,
@@ -12750,6 +12802,7 @@ impl AnnotationProject {
 
 #[test]
 fn relative_root_incremental_failure_never_hides_a_committed_core() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let cwd = std::env::current_dir().expect("test working directory");
     let workspace = tempfile::Builder::new()
         .prefix(".relative-incremental-")
@@ -12788,7 +12841,7 @@ fn relative_root_incremental_failure_never_hides_a_committed_core() {
     )
     .expect("explicit source manifest");
     let storage_path = absolute_root.join(".cache").join("codestory.db");
-    let absolute_controller = AppController::new();
+    let absolute_controller = AppController::new_with_owned_cache_root(process_cache.path());
     absolute_controller
         .open_project_summary_with_storage_path(absolute_root.clone(), storage_path.clone())
         .expect("open absolute baseline project");
@@ -12809,7 +12862,7 @@ fn relative_root_incremental_failure_never_hides_a_committed_core() {
         "// source-only edit\npub fn alpha() -> i32 { 1 }\n",
     )
     .expect("edit one existing source");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(root, storage_path.clone())
         .expect("reopen complete core through relative project root");
@@ -12835,7 +12888,7 @@ fn relative_root_incremental_failure_never_hides_a_committed_core() {
         }
     }
 
-    let absolute_retry = AppController::new();
+    let absolute_retry = AppController::new_with_owned_cache_root(process_cache.path());
     absolute_retry
         .open_project_summary_with_storage_path(absolute_root, storage_path.clone())
         .expect("reopen absolute project for retry");
@@ -12855,6 +12908,7 @@ fn dot_root_source_only_incremental_reports_committed_core_and_runtime_state() {
     const CHILD_MARKER: &str = "CODESTORY_B1_DOT_ROOT_CHILD";
     if std::env::var_os(CHILD_MARKER).is_none() {
         let workspace = tempdir().expect("isolated child working directory");
+        let process_cache = tempdir().expect("owned runtime cache root");
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -12862,6 +12916,7 @@ fn dot_root_source_only_incremental_reports_committed_core_and_runtime_state() {
                 "--nocapture",
             ])
             .env(CHILD_MARKER, "1")
+            .env("CODESTORY_CACHE_ROOT", process_cache.path())
             .current_dir(workspace.path())
             .output()
             .expect("run child in the project's working directory");
@@ -13479,6 +13534,7 @@ fn a_full_refresh_rescues_legacy_annotations_before_it_replaces_core() {
 
 #[test]
 fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_cow() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace");
     let root = workspace.path().join("project");
     fs::create_dir(&root).expect("project root");
@@ -13488,7 +13544,7 @@ fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_c
     )
     .expect("source with a call edge");
     let storage_path = workspace.path().join("cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(root.clone(), storage_path.clone())
         .expect("open seed project");
@@ -13589,7 +13645,7 @@ fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_c
     fs::rename(&legacy_path, &storage_path).expect("install schema-31 disk fixture");
     assert!(layout.read_pointer().expect("pointer read").is_none());
 
-    let upgraded = AppController::new();
+    let upgraded = AppController::new_with_owned_cache_root(process_cache.path());
     upgraded
         .bind_project_paths_for_refresh(root, storage_path.clone())
         .expect("bind legacy project without opening it");
@@ -13606,7 +13662,10 @@ fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_c
         pointer.rollback.is_some(),
         "complete legacy predecessor stays rollback eligible"
     );
-    assert_eq!(Storage::database_schema_version(&storage_path).unwrap(), 35);
+    assert_eq!(
+        Storage::database_schema_version(&storage_path).unwrap(),
+        codestory_store::CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(
         upgraded.list_bookmarks(None).expect("migrated annotations")[0]
             .comment
@@ -13637,12 +13696,13 @@ fn schema31_disk_upgrade_keeps_annotations_and_publishes_complete_core_without_c
 
 #[test]
 fn full_refresh_replaces_interrupted_standalone_core_with_retained_publication_and_annotation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace");
     let root = workspace.path().join("project");
     fs::create_dir(&root).expect("project root");
     fs::write(root.join("lib.rs"), "pub fn alpha() -> i32 { 1 }\n").expect("source");
     let storage_path = workspace.path().join("cache").join("codestory.db");
-    let seed = AppController::new();
+    let seed = AppController::new_with_owned_cache_root(process_cache.path());
     seed.open_project_summary_with_storage_path(root.clone(), storage_path.clone())
         .expect("open seed project");
     seed.run_indexing_blocking(IndexMode::Full)
@@ -13689,7 +13749,7 @@ fn full_refresh_replaces_interrupted_standalone_core_with_retained_publication_a
         "annotation rescue is still required before replacement"
     );
 
-    let recovered = AppController::new();
+    let recovered = AppController::new_with_owned_cache_root(process_cache.path());
     recovered
         .bind_project_paths_for_refresh(root, storage_path.clone())
         .expect("bind interrupted project");

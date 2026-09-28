@@ -76,7 +76,11 @@ impl ActivationService {
         project_root: &Path,
         storage_path: &Path,
     ) -> anyhow::Result<SidecarInventoryReport> {
-        codestory_retrieval::sidecar_inventory_with_storage(project_root, storage_path)
+        codestory_retrieval::sidecar_inventory_with_storage(
+            project_root,
+            storage_path,
+            self.controller.runtime_config.as_ref(),
+        )
     }
 
     /// Apply the retrieval owner's bounded generation-retention plan.
@@ -85,8 +89,11 @@ impl ActivationService {
         project_root: &Path,
         storage_path: &Path,
     ) -> anyhow::Result<SidecarGcReport> {
-        let report =
-            codestory_retrieval::sidecar_gc_apply_with_storage(project_root, storage_path)?;
+        let report = codestory_retrieval::sidecar_gc_apply_with_storage(
+            project_root,
+            storage_path,
+            self.controller.runtime_config.as_ref(),
+        )?;
         apply_core_gc_for_runtime(
             self.controller.runtime_config.as_ref(),
             storage_path,
@@ -451,17 +458,23 @@ mod tests {
             assert_eq!(facade_refusal.code(), direct_refusal.code());
             assert_eq!(facade_refusal.to_string(), direct_refusal.to_string());
 
-            let direct_inventory =
-                codestory_retrieval::sidecar_inventory_with_storage(project.path(), &storage_path)
-                    .expect("direct inventory");
+            let direct_inventory = codestory_retrieval::sidecar_inventory_with_storage(
+                project.path(),
+                &storage_path,
+                &raw,
+            )
+            .expect("direct inventory");
             let facade_inventory = facade
                 .retrieval_inventory(project.path(), &storage_path)
                 .expect("facade inventory");
             assert_eq!(facade_inventory, direct_inventory);
 
-            let direct_gc =
-                codestory_retrieval::sidecar_gc_apply_with_storage(project.path(), &storage_path)
-                    .expect("direct gc");
+            let direct_gc = codestory_retrieval::sidecar_gc_apply_with_storage(
+                project.path(),
+                &storage_path,
+                &raw,
+            )
+            .expect("direct gc");
             let facade_gc = facade
                 .apply_retrieval_gc(project.path(), &storage_path)
                 .expect("facade gc");

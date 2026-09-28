@@ -4416,6 +4416,7 @@ pub(crate) mod activation_tests {
 
     fn complete_core_without_retrieval_pointer_fixture()
     -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let storage_path = cache.path().join("codestory.db");
@@ -4425,7 +4426,7 @@ pub(crate) mod activation_tests {
         )
         .expect("write retained-core fixture");
 
-        let seeding_runtime = Runtime::new();
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -6840,10 +6841,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn activation_target_reobserves_same_root_remote_change_and_no_remote_reinit() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         initialize_identifiable_git_project(project.path());
         let storage = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let remote_a = ActivationTarget::new(project.path(), &storage);
         let snapshot = ActivationSnapshot {
             operation_id: "activation-logical-target-fixture".into(),
@@ -6969,9 +6972,10 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn pre_cancelled_activation_does_not_start_shared_work() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let cancelled = Arc::new(AtomicBool::new(true));
 
         let error = runtime
@@ -6986,6 +6990,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn foreground_budget_returns_progress_while_one_shared_activation_continues() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(
@@ -6993,7 +6998,8 @@ pub(crate) mod activation_tests {
             "pub fn foreground_activation_fixture() {}\n",
         )
         .expect("write fixture");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
         service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
@@ -7053,6 +7059,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn a_full_request_waits_for_an_in_flight_core_only_run_then_pursues_full() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(
@@ -7060,7 +7067,8 @@ pub(crate) mod activation_tests {
             "pub fn core_only_upgrade_fixture() {}\n",
         )
         .expect("write fixture");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
         service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
@@ -7151,7 +7159,9 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn bounded_cancel_returns_on_a_running_activation_it_cannot_stop() {
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = service
@@ -7204,7 +7214,9 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn bounded_cancel_reads_through_a_poisoned_coordinator() {
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = service
@@ -7237,10 +7249,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn serial_retries_keep_one_activation_identity_after_terminal_failure() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
 
         let first = service
             .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
@@ -7266,10 +7280,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn disk_space_refusal_keeps_typed_snapshot_without_starting_a_hot_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing_project = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         service.set_terminal_disk_space_for_test(&missing_project, &storage_path, 80_000_000, 0);
         let before = service.snapshot().expect("terminal disk snapshot");
         for _ in 0..2 {
@@ -7315,6 +7331,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn cancelling_a_waiter_does_not_cancel_or_replace_shared_activation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(
@@ -7322,7 +7339,8 @@ pub(crate) mod activation_tests {
             "pub fn shared_activation_fixture() {}\n",
         )
         .expect("write fixture");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
         service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
@@ -7499,10 +7517,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn panicking_activation_worker_finishes_waiters_and_allows_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let target = ActivationTarget::new(&missing, &storage_path);
         let operation_id = "activation-panic-fixture".to_string();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7726,10 +7746,11 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn activation_error_is_unavailable_instead_of_ready() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()
@@ -8002,9 +8023,11 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn activation_state_is_not_reused_across_project_targets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project_a = tempfile::tempdir().expect("project a");
         let project_b = tempfile::tempdir().expect("project b");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let hold_until_started = |service: &ActivationService| {
             let deadline = Instant::now() + Duration::from_secs(10);
             while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
@@ -8154,9 +8177,10 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn observational_summary_does_not_create_storage_parent() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cold-cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let summary = runtime
             .project_service()
@@ -8172,7 +8196,8 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn cancelled_public_operation_never_enters_response_builder() {
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let cancelled = Arc::new(AtomicBool::new(true));
         let mut entered = false;
 
@@ -8353,11 +8378,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn observational_admission_propagates_corrupt_storage_instead_of_treating_it_as_cold() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::create_dir_all(storage_path.parent().expect("cache parent")).expect("create cache");
         fs::write(&storage_path, b"not a sqlite database").expect("write corrupt storage");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()
@@ -8378,9 +8404,10 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn pre_cancelled_observational_admission_does_not_create_cold_storage() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()

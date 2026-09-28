@@ -1,4 +1,4 @@
-use crate::config::{SidecarRuntimeConfig, user_cache_root};
+use crate::config::SidecarRuntimeConfig;
 use crate::generation::{
     manifest_has_current_sidecar_contract, manifest_unavailable_reason_for_runtime,
 };
@@ -32,15 +32,15 @@ pub struct SidecarGcReport {
 pub fn sidecar_inventory_with_storage(
     project_root: &Path,
     storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<SidecarInventoryReport> {
-    let cache_root = user_cache_root();
     Ok(SidecarInventoryReport {
         dry_run: true,
-        cache_root: cache_root.display().to_string(),
+        cache_root: runtime.cache_root.display().to_string(),
         generation_retention: Some(generation_retention_plan_for_storage(
             project_root,
             storage_path,
-            &cache_root,
+            runtime,
         )?),
     })
 }
@@ -48,20 +48,19 @@ pub fn sidecar_inventory_with_storage(
 pub fn sidecar_gc_apply_with_storage(
     project_root: &Path,
     storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<SidecarGcReport> {
-    let cache_root = user_cache_root();
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    let global_gc_state_file = global_generation_gc_state_file(&runtime);
+    let global_gc_state_file = global_generation_gc_state_file(runtime);
     let _global_gc_lock =
         GenerationRetentionLock::acquire(&global_gc_state_file, GLOBAL_GENERATION_GC_LOCK_SCOPE)
             .context("coordinate retrieval cleanup with generation publication")?;
     Ok(SidecarGcReport {
         dry_run: false,
-        cache_root: cache_root.display().to_string(),
+        cache_root: runtime.cache_root.display().to_string(),
         generation_retention: Some(apply_generation_retention_for_storage(
             project_root,
             storage_path,
-            &cache_root,
+            runtime,
         )?),
     })
 }
@@ -69,15 +68,14 @@ pub fn sidecar_gc_apply_with_storage(
 fn generation_retention_plan_for_storage(
     project_root: &Path,
     storage_path: &Path,
-    cache_root: &Path,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<GenerationRetentionPlan> {
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
-    let (_lock, unrooted_state) = inventory_retention_view(&runtime, &project_id)?;
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
+    let (_lock, unrooted_state) = inventory_retention_view(runtime, &project_id)?;
     Ok(build_generation_retention_plan(
         storage_path,
-        cache_root,
-        &runtime,
+        &runtime.cache_root,
+        runtime,
         &project_id,
         unrooted_state,
     ))
@@ -102,16 +100,15 @@ fn inventory_retention_view(
 fn apply_generation_retention_for_storage(
     project_root: &Path,
     storage_path: &Path,
-    cache_root: &Path,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<GenerationRetentionApplyReport> {
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
     let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
         .context("lock retrieval generation retention apply")?;
     let plan = build_generation_retention_plan(
         storage_path,
-        cache_root,
-        &runtime,
+        &runtime.cache_root,
+        runtime,
         &project_id,
         GenerationRetentionState::Reclaimable,
     );
@@ -308,7 +305,8 @@ mod tests {
 
         let before = snapshot_tree(cache.path());
         let report = with_test_cache_root(cache.path(), || {
-            sidecar_inventory_with_storage(project.path(), &active_storage)
+            let runtime = SidecarRuntimeConfig::for_project_auto(project.path());
+            sidecar_inventory_with_storage(project.path(), &active_storage, &runtime)
                 .expect("dry-run inventory")
         });
         let after = snapshot_tree(cache.path());
@@ -350,7 +348,8 @@ mod tests {
         let retention_dir = cache.path().join("retention");
 
         with_test_cache_root(cache.path(), || {
-            sidecar_inventory_with_storage(project.path(), &active_storage)
+            let runtime = SidecarRuntimeConfig::for_project_auto(project.path());
+            sidecar_inventory_with_storage(project.path(), &active_storage, &runtime)
                 .expect("dry-run inventory")
         });
 

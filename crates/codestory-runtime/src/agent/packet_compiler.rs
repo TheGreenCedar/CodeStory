@@ -920,6 +920,7 @@ mod tests {
 
     #[test]
     fn frozen_public_packet_keeps_only_admitted_sources_and_induced_relations() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use crate::agent::packet_candidate::PacketAdmissionDecision;
         use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
@@ -1073,7 +1074,7 @@ mod tests {
         assert_eq!(storage.get_edges().unwrap().len(), 56);
         drop(storage);
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         {
             let mut state = controller.state.lock();
             state.project_root = Some(project.path().to_path_buf());
@@ -1326,8 +1327,9 @@ mod tests {
 
     #[test]
     fn file_admission_retains_only_complete_pinned_source_or_navigation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller.state.lock().project_root = Some(project.path().to_path_buf());
         let storage = Store::new_in_memory().expect("store");
         let path = project.path().join("settings.rs");
@@ -1458,8 +1460,9 @@ mod tests {
 
     #[test]
     fn packet_file_admissions_distinguish_verified_budget_from_source_drift() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller.state.lock().project_root = Some(project.path().to_path_buf());
         let mut storage = Store::new_in_memory().expect("store");
         let path = project.path().join("large.rs");

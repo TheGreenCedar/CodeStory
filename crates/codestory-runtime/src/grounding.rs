@@ -2552,6 +2552,7 @@ mod tests {
 
     #[test]
     fn large_member_rich_mixed_project_diversifies_entrypoints_into_architecture_breadth() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let project_root = temp.path().join("target/acceptance/project");
         let db_path = temp.path().join("cache/codestory.db");
@@ -2855,7 +2856,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(project_root, db_path)
             .expect("open project");
@@ -3107,6 +3108,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_represents_all_files() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3148,7 +3150,7 @@ mod tests {
             .expect("insert second");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3165,6 +3167,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_publishes_structural_text_metadata_without_graph_claims() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3193,7 +3196,7 @@ mod tests {
                 .expect("insert verified manifest projection");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3223,6 +3226,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_preserves_openapi_endpoint_source_identity() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3248,7 +3252,7 @@ mod tests {
             .expect("insert OpenAPI endpoint node");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3278,6 +3282,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_uses_symbol_range_when_available() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3308,7 +3313,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3329,6 +3334,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_keeps_single_line_rust_body() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3358,7 +3364,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3381,6 +3387,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_uses_brace_balanced_fallback_when_range_is_missing() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3418,7 +3425,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3447,6 +3454,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_reports_line_context_fallback_when_body_is_unavailable() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3477,7 +3485,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3508,6 +3516,7 @@ mod tests {
         start_line: u32,
         end_line: Option<u32>,
     ) -> (tempfile::TempDir, AppController, PathBuf) {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3532,7 +3541,7 @@ mod tests {
             )
             .expect("insert function");
         }
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3622,6 +3631,7 @@ mod tests {
     /// must not deny a byte-identical target.
     #[test]
     fn snippet_context_succeeds_when_only_an_unrelated_file_changes() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3668,7 +3678,7 @@ mod tests {
             )
             .expect("insert other");
         }
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3801,6 +3811,7 @@ mod tests {
 
     #[test]
     fn declaration_only_range_is_not_reported_as_a_function_body() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3831,7 +3842,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3856,6 +3867,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_caps_detailed_files_and_adds_coverage_buckets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3883,7 +3895,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3907,6 +3919,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_deprioritizes_import_like_root_symbols() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3956,7 +3969,7 @@ mod tests {
                 .expect("insert nodes");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3975,6 +3988,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_prefers_production_and_diversifies_fixture_roots() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4097,7 +4111,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4204,6 +4218,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_ranks_cross_language_architecture_and_reports_orientation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4370,7 +4385,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4444,6 +4459,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_reports_weak_orientation_without_entrypoint_evidence() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4469,7 +4485,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4493,6 +4509,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_keeps_diversified_fixture_fallback_without_production_roots() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4530,7 +4547,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4565,6 +4582,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_represented_symbols_is_monotonic_across_budgets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4655,7 +4673,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4694,6 +4712,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_batches_member_counts_line_fallbacks_and_edge_digests() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4771,7 +4790,7 @@ mod tests {
                 .expect("insert occurrences");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4792,6 +4811,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_uses_materialized_snapshot_after_summary_open() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4859,7 +4879,7 @@ mod tests {
             );
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project summary");
@@ -4881,6 +4901,7 @@ mod tests {
 
     #[test]
     fn balanced_grounding_falls_back_to_live_detail_queries_when_detail_tier_is_dirty() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4976,7 +4997,7 @@ mod tests {
             );
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
             .expect("open project summary");
@@ -5005,6 +5026,7 @@ mod tests {
 
     #[test]
     fn max_grounding_does_not_mutate_an_incomplete_publication() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -5073,7 +5095,7 @@ mod tests {
                 .expect("refresh summary snapshots");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
             .expect("open project summary");

@@ -3589,7 +3589,7 @@ fn retain_published_generations(
     marker_error: Option<String>,
 ) -> (GenerationRetentionPlan, GenerationRetentionApplyReport) {
     let mut protection = scan_retention_protection(
-        &crate::config::user_cache_root(),
+        &context.runtime.cache_root,
         Some(storage_path),
         &context.layout.state_file,
     );
@@ -5899,6 +5899,81 @@ mod tests {
                     && error.contains("owned sidecar root")),
             "missing explicit postcommit cleanup diagnostic: {:?}",
             report.errors
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn postcommit_retention_scans_the_runtime_cache_root_not_the_ambient_process_root() {
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let sentinel = TempDir::new().expect("sentinel ambient cache root");
+        // A foreign store the retention scan cannot observe. If the scan ran
+        // against the ambient process root this entry would mark protection
+        // evidence incomplete and suppress pruning of the owned root.
+        let foreign = sentinel.path().join("foreign-project");
+        fs::create_dir_all(&foreign).expect("create foreign project cache dir");
+        fs::write(foreign.join("codestory.db"), b"not a sqlite store")
+            .expect("poison the ambient cache root");
+
+        let project_id = sidecar_project_id_for_runtime(fixture.project.path(), &fixture.runtime)
+            .expect("fixture project identity");
+        // Pin an active generation under the owned root so the plan has a
+        // nonempty protected set: only ambient interference could suppress
+        // pruning below.
+        let active = crate::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
+        let marker = GenerationRetentionMarker::next(
+            "retention-root-isolation-workspace",
+            fixture.project.path(),
+            active,
+            None,
+            1,
+        )
+        .expect("build retention marker");
+        write_retention_marker(&fixture.runtime.layout.state_file, &marker)
+            .expect("pin the active generation under the owned root");
+
+        let stale_dir = fixture
+            .runtime
+            .layout
+            .lexical_data_dir
+            .join("shards")
+            .join(format!("{project_id}-{}", "b".repeat(16)));
+        fs::create_dir_all(&stale_dir).expect("create stale generation dir");
+        fs::write(stale_dir.join("shard.bin"), b"stale").expect("write stale shard bytes");
+
+        let (plan, report) = crate::config::with_test_cache_root(sentinel.path(), || {
+            retain_published_generations(
+                &fixture.storage_path,
+                &GenerationRetentionContext {
+                    runtime: &fixture.runtime,
+                    layout: &fixture.runtime.layout,
+                    workspace_id: "retention-root-isolation-workspace",
+                    previous_manifest: None,
+                    embedding_device: &crate::embeddings::embedding_device_readiness_for_runtime(
+                        &fixture.runtime,
+                    ),
+                    embedding_residency:
+                        crate::embeddings::acquire_product_embedding_residency_for_runtime(
+                            &fixture.runtime,
+                        )
+                        .expect("acquire test residency"),
+                    pinned_core_publication: fixture.publication.clone(),
+                    graph_equivalent_predecessor: None,
+                },
+                &project_id,
+                None,
+            )
+        });
+
+        assert!(
+            !plan.pruning_suppressed && !report.pruning_suppressed,
+            "ambient cache contents must not suppress pruning of the runtime root: {:?}",
+            plan.errors
+        );
+        assert!(
+            !stale_dir.exists(),
+            "the unprotected generation under the owned root must be reclaimed"
         );
     }
 

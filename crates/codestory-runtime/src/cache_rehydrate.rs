@@ -604,8 +604,20 @@ fn publish_rehydrated_database(
             .context("begin rehydrate publish transaction")?
             .commit_rehydrate(logical_target)
             .context("publish rehydrated generation and swap the publication pointer")?;
+        // GC must observe the cache that was just rehydrated, not the ambient
+        // process root: `target_cache_dir` may be a `--cache-dir` override.
+        let target_cache_root = logical_target
+            .parent()
+            .context("resolve rehydrate target cache root")?;
         let retrieval_runtime =
-            codestory_retrieval::SidecarRuntimeConfig::for_project_auto(target_project);
+            codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_process_defaults(
+                target_project,
+                &codestory_retrieval::SidecarProcessDefaults::new(
+                    target_cache_root.to_path_buf(),
+                    codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+                ),
+                &codestory_retrieval::SidecarRuntimeOverrides::default(),
+            );
         crate::activation_retrieval::apply_core_gc_after_publication(
             &retrieval_runtime,
             logical_target,
@@ -963,6 +975,7 @@ mod tests {
 
     #[test]
     fn rehydrate_atomically_carries_only_core_inventory_and_policy_exclusions() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -980,12 +993,14 @@ mod tests {
         fs::write(source_sidecar_dir.join("vectors.bin"), b"source-only")
             .expect("seed source-only sidecar");
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1183,6 +1198,7 @@ mod tests {
 
     #[test]
     fn rehydrate_dry_run_does_not_create_target_cache_metadata() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1194,12 +1210,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: true,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: true,
+            })
         })
         .expect("rehydrate dry run");
 
@@ -1220,6 +1238,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_when_git_tree_differs() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1238,12 +1257,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1254,6 +1275,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_when_target_worktree_is_dirty() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1267,12 +1289,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1287,6 +1311,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_when_target_metadata_reports_issues() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1310,12 +1335,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1331,6 +1358,7 @@ mod tests {
 
     #[test]
     fn rehydrate_reuses_when_a_tracked_source_is_repo_ignored_but_restored() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1352,12 +1380,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: true,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: true,
+            })
         })
         .expect("rehydrate");
 
@@ -1406,6 +1436,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_when_source_cache_is_stale() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let scenarios = [
             StaleSourceChange::Modify,
             StaleSourceChange::Add,
@@ -1424,12 +1455,14 @@ mod tests {
             apply_stale_source_change(source_project.path(), scenario);
             apply_stale_source_change(target_project.path(), scenario);
 
-            let output = rehydrate_cache(CacheRehydrateRequest {
-                source_project: source_project.path(),
-                source_cache_dir: source_cache.path(),
-                target_project: target_project.path(),
-                target_cache_dir: target_cache.path(),
-                dry_run: false,
+            let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+                rehydrate_cache(CacheRehydrateRequest {
+                    source_project: source_project.path(),
+                    source_cache_dir: source_cache.path(),
+                    target_project: target_project.path(),
+                    target_cache_dir: target_cache.path(),
+                    dry_run: false,
+                })
             })
             .expect("rehydrate");
 
@@ -1447,6 +1480,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_incomplete_source_cache() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1464,12 +1498,14 @@ mod tests {
             )
             .expect("seed schema-compatible incomplete marker");
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1486,6 +1522,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_while_source_index_writer_is_active() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let source_project = tempdir().expect("source project");
         let target_project = tempdir().expect("target project");
         let source_cache = tempdir().expect("source cache");
@@ -1494,12 +1531,14 @@ mod tests {
         drop(Store::open(&source_db).expect("seed source cache"));
         let _guard = crate::IndexWriterGuard::try_acquire(&source_db).expect("source writer lock");
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1515,6 +1554,7 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_while_target_index_writer_is_active() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let source_project = tempdir().expect("source project");
         let target_project = tempdir().expect("target project");
         let source_cache = tempdir().expect("source cache");
@@ -1524,12 +1564,14 @@ mod tests {
         drop(Store::open(&source_db).expect("seed source cache"));
         let _guard = crate::IndexWriterGuard::try_acquire(&target_db).expect("target writer lock");
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1545,18 +1587,21 @@ mod tests {
 
     #[test]
     fn rehydrate_skips_when_target_cache_is_inside_source_cache() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempdir().expect("project");
         let source_cache = tempdir().expect("source cache");
         let target_cache_path = source_cache.path().join("nested-target");
         fs::write(project.path().join("src.rs"), "pub fn run() {}\n").expect("write source");
         seed_cache(&source_cache.path().join("codestory.db"), project.path());
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1573,6 +1618,7 @@ mod tests {
 
     #[test]
     fn compact_rehydrate_publishes_zero_freelist_database() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1585,12 +1631,14 @@ mod tests {
         let source_db = source_cache.path().join("codestory.db");
         seed_cache(&source_db, source_project.path());
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 
@@ -1622,6 +1670,7 @@ mod tests {
 
     #[test]
     fn compact_rehydrate_reports_insufficient_space_before_stage_copy() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1635,12 +1684,14 @@ mod tests {
         seed_cache(&source_db, source_project.path());
 
         let output = codestory_store::with_available_filesystem_bytes_override(0, || {
-            rehydrate_cache(CacheRehydrateRequest {
-                source_project: source_project.path(),
-                source_cache_dir: source_cache.path(),
-                target_project: target_project.path(),
-                target_cache_dir: &target_cache_path,
-                dry_run: false,
+            codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+                rehydrate_cache(CacheRehydrateRequest {
+                    source_project: source_project.path(),
+                    source_cache_dir: source_cache.path(),
+                    target_project: target_project.path(),
+                    target_cache_dir: &target_cache_path,
+                    dry_run: false,
+                })
             })
         })
         .expect("rehydrate");
@@ -1677,6 +1728,7 @@ mod tests {
 
     #[test]
     fn absent_target_insufficient_space_does_not_create_lock_and_can_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1688,12 +1740,14 @@ mod tests {
         assert!(!target_cache_path.exists(), "target starts absent");
 
         let refused = codestory_store::with_available_filesystem_bytes_override(0, || {
-            rehydrate_cache(CacheRehydrateRequest {
-                source_project: source_project.path(),
-                source_cache_dir: source_cache.path(),
-                target_project: target_project.path(),
-                target_cache_dir: &target_cache_path,
-                dry_run: false,
+            codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+                rehydrate_cache(CacheRehydrateRequest {
+                    source_project: source_project.path(),
+                    source_cache_dir: source_cache.path(),
+                    target_project: target_project.path(),
+                    target_cache_dir: &target_cache_path,
+                    dry_run: false,
+                })
             })
         })
         .expect("insufficient-space result");
@@ -1705,12 +1759,14 @@ mod tests {
             "preflight refusal must leave the target directory and writer lock absent"
         );
 
-        let retried = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let retried = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("retry after capacity returns");
         assert_eq!(retried.status, "rehydrated");
@@ -1719,6 +1775,7 @@ mod tests {
 
     #[test]
     fn absent_target_capacity_drop_under_lock_refuses_before_stage() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1730,12 +1787,14 @@ mod tests {
         let source_hash = Sha256::digest(fs::read(&source_db).expect("read source before attempt"));
         AFTER_TARGET_WRITER_GUARD_AVAILABLE_BYTES.with(|bytes| bytes.set(Some(0)));
 
-        let refused = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let refused = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("capacity drop result");
         assert_eq!(refused.status, "insufficient_space");
@@ -1755,12 +1814,14 @@ mod tests {
             "the failed target attempt must not alter its source"
         );
 
-        let retried = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let retried = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("retry after capacity returns");
         assert_eq!(retried.status, "rehydrated");
@@ -1768,6 +1829,7 @@ mod tests {
 
     #[test]
     fn rehydrate_refuses_nonempty_target_without_replacing_its_file() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1780,12 +1842,14 @@ mod tests {
             source_project.path(),
         );
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: target_cache.path(),
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
         })
         .expect("nonempty target refusal");
         assert_eq!(output.status, "skipped");
@@ -1802,6 +1866,7 @@ mod tests {
 
     #[test]
     fn rehydrate_pins_the_source_generation_after_writer_guard() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -1919,12 +1984,14 @@ mod tests {
             }));
         });
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate after source publication swap");
         assert_eq!(output.status, "rehydrated");
@@ -1988,6 +2055,7 @@ mod tests {
     /// and copy must measure the generation `CorePublicationLayout` selects.
     #[test]
     fn rehydrate_copies_the_published_generation_not_a_leftover_legacy_file() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -2007,12 +2075,14 @@ mod tests {
             .expect("publish the seeded image as a generation");
         fs::write(&logical_source, b"stale-leftover").expect("leave a wrong leftover file");
 
-        let output = rehydrate_cache(CacheRehydrateRequest {
-            source_project: source_project.path(),
-            source_cache_dir: source_cache.path(),
-            target_project: target_project.path(),
-            target_cache_dir: &target_cache_path,
-            dry_run: false,
+        let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
+            rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: &target_cache_path,
+                dry_run: false,
+            })
         })
         .expect("rehydrate");
 

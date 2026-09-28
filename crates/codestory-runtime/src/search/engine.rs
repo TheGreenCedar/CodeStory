@@ -1896,9 +1896,33 @@ mod tests {
     }
 
     #[test]
+    /// `SearchEngine::new` reads `SYMBOL_FULL_TEXT_INDEX` during construction,
+    /// so the flag must be true for the whole process: the parent re-executes
+    /// this test in a child with the variable set, leaving the parent's
+    /// environment untouched.
     fn symbol_full_text_index_can_be_disabled_for_projection_only_search() -> Result<()> {
-        let _lock = crate::process_env_test_lock();
-        let _guard = EnvGuard::set(SYMBOL_FULL_TEXT_INDEX_ENV, "false");
+        const CHILD_MARKER: &str = "CODESTORY_SEARCH_NO_FULL_TEXT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "search::engine::tests::symbol_full_text_index_can_be_disabled_for_projection_only_search",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(SYMBOL_FULL_TEXT_INDEX_ENV, "false")
+            .output()
+            .expect("run child with full-text indexing disabled");
+            assert!(
+                output.status.success(),
+                "child stdout:\n{}\nchild stderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
         let mut engine = SearchEngine::new(None)?;
 
         engine.index_nodes(vec![
