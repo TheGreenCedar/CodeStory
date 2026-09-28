@@ -811,11 +811,15 @@ fn go_package_dependency_ids(
         }
     }
     count_store_replay_work(1);
-    context
+    let dependency_ids = context
         .go_dependency_ids_by_package
         .get(source_identity)
-        .cloned()
-        .ok_or_else(|| proof_error("Go authenticated package closure is missing"))
+        .ok_or_else(|| proof_error("Go authenticated package closure is missing"))?;
+    // The caller receives an owned closure, so materializing it is necessary
+    // output-sized work: count every copied member so replay measurements see
+    // the per-lookup package-member copy.
+    count_store_replay_work(dependency_ids.len());
+    Ok(dependency_ids.clone())
 }
 
 fn stored_go_package_dependency_ids(
@@ -1996,6 +2000,12 @@ mod go_replay_complexity_tests {
         store_replay_work()
     }
 
+    /// Necessary output cost: every lookup materializes an owned
+    /// package-membership set sized by the file count.
+    fn measured_package_output_cost(file_count: usize, lookup_count: usize) -> usize {
+        file_count * lookup_count
+    }
+
     #[test]
     fn package_file_preparation_and_fact_replay_are_independently_linear() {
         let baseline = measured_package_replay_work(32, 32);
@@ -2003,17 +2013,31 @@ mod go_replay_complexity_tests {
         let more_facts = measured_package_replay_work(32, 64);
         let combined = measured_package_replay_work(64, 64);
         assert!(baseline > 0, "Go store replay work was not counted");
+        // The owned-closure copy is required output: it must be measured, and
+        // it must be exactly the file_count * lookup_count term.
         assert!(
-            more_files <= baseline * 2 + 64,
-            "Go store file preparation grew superlinearly: {baseline} -> {more_files}"
+            baseline >= measured_package_output_cost(32, 32),
+            "Go replay measurement omits the owned-closure copy: {baseline}"
+        );
+        // Everything beyond necessary output must stay independently linear.
+        let residual = |work: usize, files: usize, lookups: usize| {
+            work - measured_package_output_cost(files, lookups)
+        };
+        let baseline_residual = residual(baseline, 32, 32);
+        let more_files_residual = residual(more_files, 64, 32);
+        let more_facts_residual = residual(more_facts, 32, 64);
+        let combined_residual = residual(combined, 64, 64);
+        assert!(
+            more_files_residual <= baseline_residual * 2 + 64,
+            "Go store file preparation grew superlinearly: {baseline_residual} -> {more_files_residual}"
         );
         assert!(
-            more_facts <= baseline * 2 + 64,
-            "Go store fact replay grew superlinearly: {baseline} -> {more_facts}"
+            more_facts_residual <= baseline_residual * 2 + 64,
+            "Go store fact replay grew superlinearly: {baseline_residual} -> {more_facts_residual}"
         );
         assert!(
-            combined <= baseline * 2 + 128,
-            "combined Go store replay grew superlinearly: {baseline} -> {combined}"
+            combined_residual <= baseline_residual * 2 + 128,
+            "combined Go store replay grew superlinearly: {baseline_residual} -> {combined_residual}"
         );
     }
 
@@ -2341,26 +2365,47 @@ mod ruby_php_replay_complexity_tests {
         store_replay_work()
     }
 
+    /// Necessary output cost: each fact replay materializes a dependency list
+    /// sized by the domain's file count, and `append` counts each member.
+    fn measured_domain_output_cost(file_count: usize, fact_count: usize) -> usize {
+        file_count * fact_count
+    }
+
     #[test]
     fn ruby_php_file_domain_and_fact_replay_work_is_independently_linear() {
         for language in ["ruby", "php"] {
             let baseline = measured_domain_replay_work(language, 32, 32, false);
             let more_files = measured_domain_replay_work(language, 64, 32, false);
             let more_facts = measured_domain_replay_work(language, 32, 64, false);
-            let combined = measured_domain_replay_work(language, 64, 32, false);
+            let combined = measured_domain_replay_work(language, 64, 64, false);
             let hostile = measured_domain_replay_work(language, 64, 32, true);
             assert!(baseline > 0, "{language} replay work was not counted");
+            // The dependency-list materialization is required output: it must
+            // be measured, and it is exactly the file_count * fact_count term.
             assert!(
-                more_files <= baseline * 2 + 128,
-                "{language} file preparation grew superlinearly: {baseline} -> {more_files}"
+                baseline >= measured_domain_output_cost(32, 32),
+                "{language} replay measurement omits dependency-list output: {baseline}"
+            );
+            // Everything beyond necessary output must stay independently
+            // linear; the combined row exercises the (64,64) interaction.
+            let residual = |work: usize, files: usize, facts: usize| {
+                work - measured_domain_output_cost(files, facts)
+            };
+            let baseline_residual = residual(baseline, 32, 32);
+            let more_files_residual = residual(more_files, 64, 32);
+            let more_facts_residual = residual(more_facts, 32, 64);
+            let combined_residual = residual(combined, 64, 64);
+            assert!(
+                more_files_residual <= baseline_residual * 2 + 128,
+                "{language} file preparation grew superlinearly: {baseline_residual} -> {more_files_residual}"
             );
             assert!(
-                more_facts <= baseline * 2 + 128,
-                "{language} fact replay grew superlinearly: {baseline} -> {more_facts}"
+                more_facts_residual <= baseline_residual * 2 + 128,
+                "{language} fact replay grew superlinearly: {baseline_residual} -> {more_facts_residual}"
             );
             assert!(
-                combined <= baseline * 2 + 256,
-                "{language} combined replay grew superlinearly: {baseline} -> {combined}"
+                combined_residual <= baseline_residual * 2 + 256,
+                "{language} combined replay grew superlinearly: {baseline_residual} -> {combined_residual}"
             );
             assert!(
                 hostile <= more_files + 128,

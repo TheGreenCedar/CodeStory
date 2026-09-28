@@ -223,6 +223,21 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_historical_float32_embedding_blob_bytes() {
+        // Historical persisted layout: raw little-endian IEEE-754 f32 with no
+        // header. These literals are independent of the current encoder, so a
+        // coordinated encode/decode change cannot keep this test green.
+        let historical: &[u8] = &[
+            0x00, 0x00, 0x80, 0x3e, // 0.25
+            0x00, 0x00, 0x00, 0xbf, // -0.5
+            0x00, 0x00, 0x40, 0x3f, // 0.75
+            0xcd, 0xcc, 0x4c, 0xc0, // -3.2
+        ];
+        let decoded = decode_embedding_blob(historical).expect("decode historical f32 blob");
+        assert_eq!(decoded, vec![0.25_f32, -0.5, 0.75, -3.2]);
+    }
+
+    #[test]
     fn test_int8_embedding_blob_is_compact_and_normalized() {
         let values = [0.6, -0.8, 0.0];
 

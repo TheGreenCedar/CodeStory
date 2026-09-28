@@ -1346,28 +1346,64 @@ mod tests {
         assert_eq!(report.reclaimed_images, 0);
     }
 
+    /// A generation directory reclamation can actually act on: a readable
+    /// SQLite image whose complete publication identity matches the directory
+    /// name, plus its lease marker.
+    fn seed_reclaimable_generation(
+        layout: &CorePublicationLayout,
+        generation_id: &str,
+    ) -> Result<(), StorageError> {
+        let directory = layout.generation_directory(generation_id)?;
+        fs::create_dir_all(&directory).expect("generation directory");
+        {
+            let storage = crate::Store::open(directory.join(CORE_DATABASE_FILE))?;
+            storage.put_index_publication(&crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: generation_id.to_owned(),
+                run_id: format!("run-{generation_id}"),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })?;
+        }
+        fs::write(directory.join(CORE_LEASE_FILE), b"").expect("lease marker");
+        Ok(())
+    }
+
     #[test]
     fn late_enumeration_failure_removes_no_previously_seen_candidate() {
         let (_cache, logical, layout) = published_lock_fixture();
         for id in ["obsolete-one", "obsolete-two"] {
-            let directory = layout.generation_directory(id).expect("generation");
-            fs::create_dir_all(&directory).expect("obsolete directory");
-            fs::write(directory.join(CORE_DATABASE_FILE), b"unchanged").expect("old image");
-            fs::write(directory.join(CORE_LEASE_FILE), b"").expect("old lease");
+            seed_reclaimable_generation(&layout, id).expect("reclaimable generation");
         }
-        // The directory has multiple entries. Fail after one has been read,
-        // before candidate validation/removal can use a partial scan.
-        fail_enumeration_after(1);
+        // Three entries (active plus two reclaimable). Fail on the third entry
+        // so at least one real candidate has been discovered before the error:
+        // a regression that deletes during enumeration would remove it.
+        fail_enumeration_after(2);
         let error = apply_core_retention(&logical, &|| false, |_, _, _, _, _| {
             panic!("an incomplete root scan cannot authorize any removal")
         })
         .expect_err("late enumeration failure must fail the pass");
         assert!(error.to_string().contains("injected late"));
         for id in ["obsolete-one", "obsolete-two"] {
-            assert_eq!(
-                fs::read(layout.generation_database_path(id).unwrap()).unwrap(),
-                b"unchanged"
+            let database = layout.generation_database_path(id).expect("generation db");
+            assert!(
+                database.is_file(),
+                "{id} was removed before the scan completed"
             );
         }
+
+        // No-fault control: the seeded candidates are genuinely reclaimable,
+        // so a clean pass must observe and remove both.
+        let mut removed = Vec::new();
+        let report = apply_core_retention(&logical, &|| false, |root, generation, _, _, _| {
+            removed.push(generation.to_owned());
+            fs::remove_dir_all(root.join(generation))
+                .map_err(|error| StorageError::Other(format!("remove {generation}: {error}")))?;
+            Ok(true)
+        })
+        .expect("clean retention pass");
+        removed.sort();
+        assert_eq!(removed, ["obsolete-one", "obsolete-two"]);
+        assert_eq!(report.reclaimed_images, 2);
     }
 }

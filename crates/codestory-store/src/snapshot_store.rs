@@ -1589,28 +1589,71 @@ mod tests {
         let temp = fresh_temp_root("clone-live-cow-disabled");
         let live_path = temp.join("live.sqlite");
         {
-            let mut live = Store::open(&live_path).expect("open live");
-            live.insert_files_batch(&[crate::FileInfo {
-                id: 1,
-                path: PathBuf::from("old.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 1,
-                file_role: crate::FileRole::Source,
-            }])
-            .expect("seed live file");
+            // Publish a real generation so clone_live enters the sealed-copy
+            // path where with_core_clone_disabled actually gates the strategy.
+            let mut stage = SnapshotStore::open_staged(&live_path).expect("open source stage");
+            let publication = crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "generation-1".into(),
+                run_id: "run-1".into(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            stage
+                .store_mut()
+                .insert_files_batch(&[crate::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("old.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                }])
+                .expect("seed live file");
+            stage
+                .store_mut()
+                .put_index_publication(&publication)
+                .expect("source publication");
+            publish_empty_source_policy(stage.store_mut(), &publication);
+            stage
+                .publish(&live_path)
+                .expect("publish source generation");
         }
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let source = layout
+            .resolve_active_database()
+            .expect("resolve source")
+            .expect("published source exists");
+        let source_bytes = fs::read(&source).expect("read source image");
 
         let mut staged = crate::with_core_clone_disabled(|| {
             SnapshotStore::clone_live_to_staged(&live_path)
                 .expect("unsupported native clone uses the production copy path")
         });
         assert_ne!(staged.path(), live_path);
+        let copy = staged
+            .snapshot_copy
+            .as_ref()
+            .expect("sealed copy produced stats");
+        assert_eq!(
+            copy.stage_strategy, "copied",
+            "disabled native clone must take the sealed-copy path"
+        );
+        assert!(
+            copy.fallback_reason.is_some(),
+            "the copy must record why the native clone was not used"
+        );
+        assert_eq!(copy.copied_bytes, source_bytes.len() as u64);
         assert_eq!(
             staged.store_mut().get_files().expect("staged files")[0].path,
             PathBuf::from("old.rs")
+        );
+        assert_eq!(
+            fs::read(&source).expect("read source after copy"),
+            source_bytes,
+            "the copy must not mutate the sealed source image"
         );
         staged.discard().expect("discard copied stage");
 

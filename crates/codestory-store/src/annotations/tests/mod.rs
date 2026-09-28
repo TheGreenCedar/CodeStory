@@ -106,6 +106,19 @@ fn observational_open_never_materializes_the_sidecar() {
     );
 }
 
+fn durable_tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(dir)
+        .expect("read annotation directory")
+        .map(|entry| {
+            let entry = entry.expect("directory entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).expect("read durable file"),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn observational_open_rejects_a_newer_sidecar_schema() {
     let dir = TempDir::new().expect("temp dir");
@@ -121,11 +134,59 @@ fn observational_open_rejects_a_newer_sidecar_schema() {
             .expect("stamp newer schema");
     }
 
+    // Closed database: the rejection must not alter durable bytes.
+    let before = durable_tree(dir.path());
     let error = AnnotationStore::open_observational(&path).expect_err("newer schema fails closed");
     assert!(
         matches!(error, AnnotationError::UnsupportedSchema { found, .. } if found == ANNOTATION_SCHEMA_VERSION + 1),
         "unexpected error: {error}"
     );
+    let after = durable_tree(dir.path());
+    let wal = after.get("annotations.sqlite3-wal");
+    assert_eq!(
+        after.get("annotations.sqlite3"),
+        before.get("annotations.sqlite3"),
+        "the rejected observational open changed the durable database image"
+    );
+    assert!(
+        wal.is_none_or(|bytes| bytes.is_empty()),
+        "the rejected observational open journaled frames into the WAL"
+    );
+}
+
+#[test]
+fn observational_open_does_not_mutate_pending_recovery_state() {
+    // Pending-recovery fixture: keep the writer connection alive so the
+    // committed schema rows stay in the -wal sidecar while the observational
+    // path runs against the un-checkpointed database.
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("annotations.sqlite3");
+    let pending = open_store(&dir, "unix:2:1");
+    let wal_path = dir.path().join("annotations.sqlite3-wal");
+    assert!(wal_path.is_file(), "fixture must retain a populated WAL");
+    let before = durable_tree(dir.path());
+
+    let observed = AnnotationStore::open_observational(&path)
+        .expect("observational open")
+        .expect("current-schema sidecar is observable");
+    assert_eq!(
+        observed.schema_version().expect("observed schema version"),
+        ANNOTATION_SCHEMA_VERSION
+    );
+    drop(observed);
+
+    let after = durable_tree(dir.path());
+    assert_eq!(
+        after.get("annotations.sqlite3"),
+        before.get("annotations.sqlite3"),
+        "observation changed the durable database image"
+    );
+    assert_eq!(
+        after.get("annotations.sqlite3-wal"),
+        before.get("annotations.sqlite3-wal"),
+        "observation appended to or truncated the pending WAL"
+    );
+    drop(pending);
 }
 
 #[test]
@@ -393,12 +454,25 @@ fn export_and_import_round_trip_preserves_annotations() {
 
     let imported = target.bookmarks(None).expect("bookmarks");
     assert_eq!(imported.len(), 1);
+    // Every durable anchor field supplied by the fixture must survive the
+    // round trip; each is fallback evidence for later rebinding.
     assert_eq!(
         imported[0].canonical_id.as_deref(),
         Some("codestory:symbol:alpha")
     );
+    assert_eq!(
+        imported[0].file_identity.as_deref(),
+        Some("/repo/src/lib.rs")
+    );
+    assert_eq!(imported[0].qualified_name.as_deref(), Some("alpha"));
+    assert_eq!(imported[0].kind, Some(3));
+    assert_eq!(imported[0].normalized_signature.as_deref(), Some("111"));
+    assert_eq!(imported[0].start_line, Some(10));
     assert_eq!(imported[0].comment.as_deref(), Some("note"));
-    assert_eq!(target.categories().expect("categories").len(), 1);
+    let categories = target.categories().expect("categories");
+    assert_eq!(categories.len(), 1);
+    assert_eq!(imported[0].category_id, categories[0].id);
+    assert_eq!(categories[0].name, "Favorites");
 }
 
 /// One workspace's worth of anchor candidates.
