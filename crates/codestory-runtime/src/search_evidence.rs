@@ -168,28 +168,60 @@ fn bounded_source_window_at_line(content: &str, line: u32) -> Option<String> {
     Some(lines[start..end].join("\n"))
 }
 
+/// Why a registered file could not be served as verified source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifiedFileError {
+    /// The file exists and is readable, but its bytes no longer hash to the
+    /// indexed SHA-256. The index is stale for this file.
+    Stale,
+    /// Missing, unreadable, non-UTF-8, escaping project containment, or no
+    /// indexed content hash is recorded.
+    Unavailable,
+}
+
+/// Read a registered file from disk only when its bytes still hash to the
+/// indexed SHA-256. The file is read exactly once; callers distinguish
+/// `Stale` (source changed since indexing) from `Unavailable` (missing,
+/// unreadable, or out of bounds) instead of receiving mismatched text.
+pub(crate) fn verified_file_checked(
+    storage: &Store,
+    project_root: Option<&Path>,
+    file: &FileInfo,
+) -> Result<VerifiedSourceFile, VerifiedFileError> {
+    let expected_hash = storage
+        .get_file_content_hash(file.id)
+        .ok()
+        .flatten()
+        .ok_or(VerifiedFileError::Unavailable)?;
+    let path = resolve_path(project_root, &file.path);
+    let read_path = match project_root {
+        Some(root) => {
+            contained_existing_read_path(root, &path).map_err(|_| VerifiedFileError::Unavailable)?
+        }
+        None => path.clone(),
+    };
+    #[cfg(test)]
+    VERIFIED_SOURCE_READS.with(|count| count.set(count.get() + 1));
+    let bytes = std::fs::read(read_path).map_err(|_| VerifiedFileError::Unavailable)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err(VerifiedFileError::Stale);
+    }
+    Ok(VerifiedSourceFile {
+        path,
+        content: String::from_utf8(bytes).map_err(|_| VerifiedFileError::Unavailable)?,
+        content_sha256: expected_hash,
+    })
+}
+
+/// Read a registered file from disk only when its bytes still hash to the
+/// indexed SHA-256. Missing, unreadable, or stale files return `None` so the
+/// caller can surface a `source_unavailable` error instead of mismatched text.
 pub(crate) fn verified_file(
     storage: &Store,
     project_root: Option<&Path>,
     file: &FileInfo,
 ) -> Option<VerifiedSourceFile> {
-    let expected_hash = storage.get_file_content_hash(file.id).ok().flatten()?;
-    let path = resolve_path(project_root, &file.path);
-    let read_path = match project_root {
-        Some(root) => contained_existing_read_path(root, &path).ok()?,
-        None => path.clone(),
-    };
-    #[cfg(test)]
-    VERIFIED_SOURCE_READS.with(|count| count.set(count.get() + 1));
-    let bytes = std::fs::read(read_path).ok()?;
-    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
-        return None;
-    }
-    Some(VerifiedSourceFile {
-        path,
-        content: String::from_utf8(bytes).ok()?,
-        content_sha256: expected_hash,
-    })
+    verified_file_checked(storage, project_root, file).ok()
 }
 
 fn contained_existing_read_path(project_root: &Path, path: &Path) -> std::io::Result<PathBuf> {

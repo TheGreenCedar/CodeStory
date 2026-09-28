@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Snippet and source reads for an indexed symbol now verify file bytes against the indexed content hash and refuse stale or missing source with a typed error instead of returning mismatched text.
+
 ## 0.17.6
 
 ### A rebuilt evidence engine for coding agents

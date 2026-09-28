@@ -4,11 +4,11 @@
 //! [`PacketCompilationInputV1`]. Selection itself lives in
 //! `codestory-agent` and cannot see the question.
 
+use crate::AppController;
 use crate::agent::packet_candidate::PacketProofSession;
 use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_scoring::packet_display_path;
-use crate::{AppController, BoundedSnippetRangeOptions};
 use codestory_agent::evidence_compiler::{
     RepositoryDerivedCompilationV1, compile_repository_evidence,
 };
@@ -343,19 +343,21 @@ fn hydrate_admitted_node_source(
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
-    let (_, bounded) = controller
-        .bounded_file_snippet_range(
-            &file.path.to_string_lossy(),
-            BoundedSnippetRangeOptions {
-                focus_line: start_line,
-                start_line,
-                end_line,
-                context_lines: 0,
-                max_bytes: source_byte_cap(admission),
-                truncation_suffix: COMPILER_SOURCE_TRUNCATION_SUFFIX,
-            },
-        )
+    let project_root = controller
+        .require_project_root()
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let source = crate::search_evidence::verified_file_checked(storage, Some(&project_root), &file)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let bounded = crate::snippets::bounded_markdown_snippet_range_from_text(
+        &source.content,
+        start_line,
+        start_line,
+        end_line,
+        0,
+        source_byte_cap(admission),
+        COMPILER_SOURCE_TRUNCATION_SUFFIX,
+    )
+    .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
     hydrated_source(
         admission,
         &file.path.to_string_lossy(),
