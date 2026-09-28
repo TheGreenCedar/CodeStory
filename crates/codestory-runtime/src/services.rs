@@ -5953,7 +5953,8 @@ pub(crate) mod activation_tests {
         fs::write(linked.join("build/X.java"), "class X {}\n").expect("excluded source");
 
         let storage_path = parent.path().join("cache/codestory.db");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(linked.clone(), storage_path.clone())
@@ -5991,6 +5992,14 @@ pub(crate) mod activation_tests {
         assert!(
             !service.ready_lease_source_observer_unchanged(Some(&recorded)),
             "the runtime lease probe must reject state A after the linked index moves to B"
+        );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
         );
     }
 
@@ -6274,7 +6283,8 @@ pub(crate) mod activation_tests {
     fn full_activation_admits_complete_core_with_physically_missing_retrieval_pointer() {
         let (project, _cache, storage_path, retrieval_pointer) =
             complete_core_without_retrieval_pointer_fixture();
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6303,13 +6313,28 @@ pub(crate) mod activation_tests {
             !retrieval_pointer.exists(),
             "activation planning must not materialize a retrieval pointer"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a seam-stopped activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "activation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
     fn missing_retrieval_pointer_remains_an_observational_error() {
         let (project, _cache, storage_path, retrieval_pointer) =
             complete_core_without_retrieval_pointer_fixture();
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_core_read_only_with_storage_path(
@@ -6334,6 +6359,20 @@ pub(crate) mod activation_tests {
             !retrieval_pointer.exists(),
             "ordinary observation must not materialize a retrieval pointer"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "an observational read must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "observation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
@@ -6342,7 +6381,8 @@ pub(crate) mod activation_tests {
             complete_core_without_retrieval_pointer_fixture();
         let corrupt = b"not a retrieval publication database";
         fs::write(&retrieval_pointer, corrupt).expect("write corrupt retrieval pointer");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6374,6 +6414,20 @@ pub(crate) mod activation_tests {
             corrupt,
             "failed activation must not repair or replace corrupt pointer bytes"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a refused activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "a refused activation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[cfg(unix)]
@@ -6393,7 +6447,8 @@ pub(crate) mod activation_tests {
             fs::symlink_metadata(&retrieval_pointer).is_ok(),
             "nofollow metadata must still observe the hostile pointer entry"
         );
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6423,6 +6478,20 @@ pub(crate) mod activation_tests {
         assert!(
             fs::symlink_metadata(&retrieval_pointer).is_ok(),
             "failed activation must leave the dangling pointer entry unchanged"
+        );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a refused activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "a refused activation must use the injected cache root, not ambient process defaults"
         );
     }
 
@@ -6648,6 +6717,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
         let service = Runtime::new().activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
         let first = service
             .activate_project_with_foreground_budget(
@@ -6658,6 +6729,15 @@ pub(crate) mod activation_tests {
             )
             .expect_err("zero foreground budget must return typed progress");
         assert_eq!(first.code, "activation_preparing");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "exactly one shared activation worker must be in flight"
+        );
         let first_snapshot = service.snapshot().expect("running snapshot");
         assert!(matches!(
             first_snapshot.state,
@@ -6677,7 +6757,18 @@ pub(crate) mod activation_tests {
         let joined_snapshot = service.snapshot().expect("joined snapshot");
         assert_eq!(joined_snapshot.operation_id, first_snapshot.operation_id);
         assert_eq!(joined_snapshot.attempt, 1);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "a joining caller must not spawn a second worker"
+        );
 
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
         let terminal = service.snapshot().expect("terminal snapshot");
         assert_ne!(terminal.state, ActivationState::Ready);
@@ -6857,6 +6948,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
         let service = Runtime::new().activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
         let first = service
             .activate_project_with_foreground_budget(
@@ -6867,6 +6960,15 @@ pub(crate) mod activation_tests {
             )
             .expect_err("zero foreground budget must return shared progress");
         assert_eq!(first.code, "activation_preparing");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "one shared activation worker must be in flight before the waiter is cancelled"
+        );
         let before = service.snapshot().expect("shared activation snapshot");
 
         let target = ActivationTarget::new(project.path(), &storage_path);
@@ -6887,6 +6989,17 @@ pub(crate) mod activation_tests {
 
         assert_eq!(after.operation_id, before.operation_id);
         assert_ne!(after.state, ActivationState::Cancelled);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "a cancelled waiter must not cancel or replace the shared worker"
+        );
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
     }
 
@@ -6906,7 +7019,9 @@ pub(crate) mod activation_tests {
             "pub fn other_project() {}\n",
         )
         .expect("other source file");
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let service = runtime.activation_service();
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
         service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
         let first = service
@@ -6969,7 +7084,8 @@ pub(crate) mod activation_tests {
             ActivationCapabilityState::Ready
         );
         assert_eq!(service.worker_start_count_for_test(), 1);
-        let different_project = Runtime::new().activation_service();
+        let different_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let different_project = different_runtime.activation_service();
         let different = different_project
             .activate_with_goal(
                 other_project.path(),
@@ -6986,6 +7102,24 @@ pub(crate) mod activation_tests {
         assert_eq!(different_project.worker_start_count_for_test(), 1);
         service.cancel_and_wait();
         different_project.cancel_and_wait();
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "activation must use the injected cache root, not ambient process defaults"
+        );
+        assert_eq!(
+            different_runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "the second runtime must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
@@ -7074,7 +7208,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7095,7 +7230,7 @@ pub(crate) mod activation_tests {
             r#"{"members":["src","missing"]}"#,
         )
         .expect("write incomplete synthetic workspace");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         assert_eq!(
             runtime
                 .activation_service()
@@ -7204,6 +7339,14 @@ pub(crate) mod activation_tests {
             .public_operation_service()
             .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
             .expect("ground admits the exact post-publication retained core");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
@@ -7238,7 +7381,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7257,7 +7401,7 @@ pub(crate) mod activation_tests {
             .expect("search generation path");
         fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let error = runtime
             .activation_service()
             .activate_project(
@@ -7290,6 +7434,14 @@ pub(crate) mod activation_tests {
             .project_service()
             .open_project_with_storage_path(project.path().to_path_buf(), storage_path)
             .expect("the strict reader must admit the repaired generation");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[cfg(unix)]
@@ -7328,7 +7480,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write project manifest");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7355,7 +7508,7 @@ pub(crate) mod activation_tests {
             .expect("search generation path");
         fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let error = runtime
             .activation_service()
             .activate_project(
@@ -7392,6 +7545,14 @@ pub(crate) mod activation_tests {
             read_search_generation_completion(&previous_search, &previous.generation_id).is_some(),
             "activation must publish search completion for the unchanged core generation"
         );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
@@ -7405,7 +7566,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7425,7 +7587,7 @@ pub(crate) mod activation_tests {
         fs::remove_dir_all(previous_search).expect("remove completed search generation");
         mutate_active_generation_sql(&storage_path, "DELETE FROM dense_anchor_publication;");
 
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .activation_service()
             .activate_project(
@@ -7453,6 +7615,14 @@ pub(crate) mod activation_tests {
         storage
             .validate_dense_anchor_publication(&current)
             .expect("incremental migration must republish dense anchors");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
@@ -7460,7 +7630,15 @@ pub(crate) mod activation_tests {
         let project_a = tempfile::tempdir().expect("project a");
         let project_b = tempfile::tempdir().expect("project b");
         let service = Runtime::new().activation_service();
+        let hold_until_started = |service: &ActivationService| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+        };
 
+        let worker_gate_a = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate_a)));
         service
             .activate_project_with_foreground_budget(
                 project_a.path(),
@@ -7469,9 +7647,23 @@ pub(crate) mod activation_tests {
                 Duration::ZERO,
             )
             .expect_err("project a should continue outside the foreground budget");
+        hold_until_started(&service);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "project a activation must hold one in-flight worker"
+        );
         let first = service.snapshot().expect("first state");
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate_a.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
 
+        let worker_gate_b = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate_b)));
         service
             .activate_project_with_foreground_budget(
                 project_b.path(),
@@ -7480,7 +7672,22 @@ pub(crate) mod activation_tests {
                 Duration::ZERO,
             )
             .expect_err("project b should continue outside the foreground budget");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            2,
+            "project b must start a distinct second worker"
+        );
         let second = service.snapshot().expect("second state");
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate_b.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
 
         assert_ne!(first.operation_id, second.operation_id);
@@ -7507,7 +7714,10 @@ pub(crate) mod activation_tests {
         let caches = (0..3)
             .map(|_| tempfile::tempdir().expect("cache"))
             .collect::<Vec<_>>();
-        let runtimes = (0..3).map(|_| Runtime::new()).collect::<Vec<_>>();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtimes = (0..3)
+            .map(|_| crate::test_runtime_with_owned_cache_root(process_cache.path()))
+            .collect::<Vec<_>>();
         let barrier = Arc::new(std::sync::Barrier::new(3));
 
         let workers = (0..3)
@@ -7558,6 +7768,13 @@ pub(crate) mod activation_tests {
             );
             runtime.activation_service().cancel_and_wait();
         }
+        for runtime in &runtimes {
+            assert_eq!(
+                runtime.test_owned_cache_root(),
+                process_cache.path(),
+                "a cancelled activation must use the injected cache root, not ambient process defaults"
+            );
+        }
     }
 
     #[test]
@@ -7602,7 +7819,8 @@ pub(crate) mod activation_tests {
         let storage_path = project.path().join("cache").join("codestory.db");
         let source = project.path().join("fixture.rs");
         fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7647,6 +7865,14 @@ pub(crate) mod activation_tests {
             runtime.activation_service().snapshot().is_none(),
             "existing complete state must not start managed activation"
         );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
@@ -7655,7 +7881,8 @@ pub(crate) mod activation_tests {
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(project.path().join("fixture.rs"), "pub fn fixture() {}\n")
             .expect("write fixture");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7700,6 +7927,14 @@ pub(crate) mod activation_tests {
             "managed core recovery must clear the durable incomplete fence"
         );
         runtime.activation_service().cancel_and_wait();
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]

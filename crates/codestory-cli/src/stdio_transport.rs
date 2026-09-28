@@ -10357,6 +10357,11 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
 
         let (mut client_input, server_input) = tokio::io::duplex(4096);
         let (server_output, client_output) = tokio::io::duplex(4096);
@@ -10488,6 +10493,11 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
 
         let (mut client_input, server_input) = tokio::io::duplex(4096);
         let (server_output, client_output) = tokio::io::duplex(4096);
@@ -10858,6 +10868,11 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
         let started = Instant::now();
         let response = handle_stdio_message(
             &mut session,
@@ -11137,6 +11152,11 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
         let (mut client_input, server_input) = tokio::io::duplex(4096);
         let (server_output, client_output) = tokio::io::duplex(4096);
         let serving = tokio::spawn(serve_stdio_requests(
@@ -11325,6 +11345,11 @@ mod tests {
             .clone();
         let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
         let (mut client_input, server_input) = tokio::io::duplex(4096);
         let (server_output, client_output) = tokio::io::duplex(4096);
         let serving = tokio::spawn(serve_stdio_requests(
@@ -14375,7 +14400,7 @@ version = "0.11.20"
                 )
                 .expect("tool response");
                 let content = &response["result"]["structuredContent"];
-                if content.get("code") == Some(&json!("codestory_preparing")) {
+                if content.get("kind").and_then(serde_json::Value::as_str) == Some("preparing") {
                     assert!(
                         Instant::now() < deadline,
                         "broad call did not become ready: {content}"
@@ -14580,7 +14605,7 @@ version = "0.11.20"
                 )
                 .expect("packet response");
                 let content = &response["result"]["structuredContent"];
-                if content.get("code") == Some(&json!("codestory_preparing")) {
+                if content.get("kind").and_then(serde_json::Value::as_str) == Some("preparing") {
                     assert!(
                         Instant::now() < deadline,
                         "packet fixture did not become ready: {content}"
@@ -14589,6 +14614,11 @@ version = "0.11.20"
                         content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
                     ));
                     continue;
+                }
+                if response.pointer("/result/isError") == Some(&json!(true)) {
+                    panic!(
+                        "packet fixture must converge instead of becoming unavailable: {response}"
+                    );
                 }
                 return response;
             }

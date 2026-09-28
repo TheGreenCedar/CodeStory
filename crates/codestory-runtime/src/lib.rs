@@ -475,6 +475,36 @@ pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRun
         &codestory_retrieval::SidecarRuntimeOverrides::default(),
     )
 }
+
+/// Runtime whose process-owned defaults carry `cache_root` instead of the
+/// ambient process cache. The caller owns the directory and must keep it
+/// alive until every activation worker the runtime spawned has quiesced.
+#[cfg(test)]
+pub(crate) fn test_runtime_with_owned_cache_root(cache_root: &std::path::Path) -> Runtime {
+    let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+    );
+    Runtime::new_with_config(
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            codestory_retrieval::SidecarProfile::Local,
+            None,
+            &process_defaults,
+            &codestory_retrieval::SidecarRuntimeOverrides::default(),
+        ),
+    )
+}
+
+impl Runtime {
+    /// The cache root captured in this runtime's immutable process defaults.
+    /// Tests assert it equals their owned directory so a regression back to
+    /// ambient process defaults is observable without relying on writes.
+    #[cfg(test)]
+    pub(crate) fn test_owned_cache_root(&self) -> &std::path::Path {
+        &self.controller.runtime_config.cache_root
+    }
+}
 #[doc(hidden)]
 pub use agent::packet_batch::{
     PacketEntryObservationPhase, PacketLatencyScopeGuard, enter_packet_latency_scope,

@@ -1181,12 +1181,6 @@ fn tool_result_code(response: &Value) -> Option<String> {
     if response.pointer("/result/structuredContent/kind") == Some(&json!("preparing")) {
         return Some("codestory_preparing".to_string());
     }
-    if let Some(code) = response
-        .pointer("/result/structuredContent/code")
-        .and_then(Value::as_str)
-    {
-        return Some(code.to_string());
-    }
     response
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
@@ -6058,12 +6052,19 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
-    let old_generation = json_resource_content(
+    let warmup_content = json_resource_content(
         assert_success_envelope(&warmup_status, json!("warmup-generation")),
         "codestory://status",
-    )["index_publication"]["generation"]
+    );
+    let old_generation = warmup_content["index_publication"]["generation"]
         .as_u64()
         .expect("old complete generation");
+    let writer_lock_path = PathBuf::from(
+        warmup_content["storage_path"]
+            .as_str()
+            .expect("status storage_path"),
+    )
+    .with_extension("index-writer.lock");
     let mut writer_client = spawn_stdio_server(&fixture);
     initialize_stdio_server(&mut writer_client, "writer-initialize");
     thread::sleep(Duration::from_millis(25));
@@ -6092,40 +6093,65 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         (writer_client, response)
     });
 
-    let lock_path = fixture.cache_dir.path().join("local-refresh.lock");
-    let lock_deadline = Instant::now() + Duration::from_secs(10);
-    while !lock_path.exists() {
-        if writer.is_finished() {
-            break;
+    // Owner-scoped barrier: probe the real index-writer lock the refresh run
+    // holds end to end. A failed try-lock proves the writer is inside the
+    // publication boundary; a reader request answered in that window proves
+    // reads were admitted while the writer still held it. Releasing a
+    // successful probe immediately is safe because the production acquire
+    // retries within its spawn-ghost budget.
+    let writer_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&writer_lock_path)
+        .expect("open index-writer lock");
+    let mut admitted_during_writer_hold = false;
+    let lock_deadline = Instant::now() + Duration::from_secs(120);
+    while !admitted_during_writer_hold {
+        if writer_lock_file
+            .try_lock_exclusive()
+            .expect("probe index-writer lock")
+        {
+            writer_lock_file.unlock().expect("release probed lock");
+            assert!(
+                !writer.is_finished(),
+                "writer finished without ever holding the index-writer lock"
+            );
+        } else {
+            let concurrent_ground = send_json(
+                &mut reader_client,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "reader-ground-during-lock",
+                    "method": "resources/read",
+                    "params": {
+                        "uri": "codestory://grounding",
+                        "project": fixture.workspace.path()
+                    }
+                }),
+            );
+            let concurrent_ground = json_resource_content(
+                assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
+                "codestory://grounding",
+            );
+            assert!(
+                concurrent_ground["stats"]["file_count"]
+                    .as_u64()
+                    .is_some_and(|count| count == 5 || count == 101),
+                "concurrent resource read observed neither complete file set: {concurrent_ground}"
+            );
+            admitted_during_writer_hold = true;
         }
         assert!(
             Instant::now() < lock_deadline,
-            "writer did not acquire the local refresh lock"
+            "writer never held the index-writer lock while a reader ran"
         );
         thread::sleep(Duration::from_millis(10));
     }
-
-    let concurrent_ground = send_json(
-        &mut reader_client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "reader-ground-during-lock",
-            "method": "resources/read",
-            "params": {
-                "uri": "codestory://grounding",
-                "project": fixture.workspace.path()
-            }
-        }),
-    );
-    let concurrent_ground = json_resource_content(
-        assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
-        "codestory://grounding",
-    );
     assert!(
-        concurrent_ground["stats"]["file_count"]
-            .as_u64()
-            .is_some_and(|count| count == 5 || count == 101),
-        "concurrent resource read observed neither complete file set: {concurrent_ground}"
+        admitted_during_writer_hold,
+        "no reader request was admitted while the writer held the publication boundary"
     );
 
     // Workspace-wide default-concurrency runs can heavily contend with the
@@ -6468,10 +6494,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     );
     assert!(
         matches!(
-            search_error.pointer("/code").and_then(Value::as_str),
+            tool_result_code(&search_response).as_deref(),
             Some("codestory_preparing" | "codestory_unavailable")
         ),
-        "broad search should use the normal readiness response after local graph refresh: {search_response}"
+        "broad search should use the normal readiness response after local graph refresh: {search_error}"
     );
 }
 
