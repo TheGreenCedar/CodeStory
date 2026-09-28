@@ -1911,6 +1911,37 @@ fn transient_incomplete_schema_fence_requires_marker() -> Result<(), StorageErro
 }
 
 #[test]
+fn interrupted_incremental_run_regains_proof_fk_indexes_without_clearing_fence()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("incomplete-incremental-proof-fk-indexes");
+    {
+        let storage = Storage::open(&path)?;
+        storage
+            .conn
+            .execute_batch("DROP INDEX idx_proof_resolution_target")?;
+        storage.begin_incremental_run()?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(
+        Storage::database_schema_version(&path)?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(storage.has_incomplete_incremental_run()?);
+    assert!(sqlite_index_exists(
+        &storage,
+        "idx_proof_resolution_target"
+    )?);
+    storage.finish_incremental_run()?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
 fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Result<(), StorageError>
 {
     let path = unique_temp_db_path("interrupted-v19-manifest-migration");
@@ -11381,6 +11412,495 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
     assert_eq!(remaining_states[0].node_id, caller_in_a.id);
     assert_eq!(summary.affected_caller_file_ids, vec![file_a_id]);
 
+    Ok(())
+}
+
+/// File ids for the proof-FK deletion fixture: one removable file and one
+/// unrelated survivor that owns the bulk proof-fact rows.
+const PROOF_FK_REMOVED_FILE: i64 = 7_001;
+const PROOF_FK_SURVIVOR_FILE: i64 = 8_001;
+const PROOF_FK_SURVIVOR_CALLER: i64 = 80_001;
+const PROOF_FK_SURVIVOR_PLACEHOLDER: i64 = 80_002;
+const PROOF_FK_SURVIVOR_EDGE: i64 = 90_001;
+const PROOF_FK_SURVIVOR_PROVENANCE: i64 = 81;
+const PROOF_FK_REMOVED_PROVENANCE: i64 = 71;
+
+fn insert_proof_fact(
+    storage: &Storage,
+    ordinal: i64,
+    file_id: i64,
+    provenance_id: i64,
+    status: &str,
+    caller_node_id: i64,
+    edge_id: Option<i64>,
+    raw_edge_target_id: Option<i64>,
+    target_node_id: Option<i64>,
+) -> Result<(), StorageError> {
+    let (reason, callsite, domain_complete): (&str, Option<&str>, i64) = match status {
+        "exact" => ("exact_resolution", Some("callsite"), 1),
+        "ambiguous" => ("multiple_bindings", None, 1),
+        "unsupported" => ("unsupported_construct", None, 0),
+        _ => ("missing_binding", None, 1),
+    };
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1,
+            'identifier', 'callee', ?9, ?10, ?11, ?12,
+            '[]', ?13, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?14)",
+        params![
+            format!("{ordinal:064x}"),
+            edge_id,
+            raw_edge_target_id,
+            callsite,
+            file_id,
+            provenance_id,
+            1_000 + ordinal * 2,
+            1_001 + ordinal * 2,
+            caller_node_id,
+            target_node_id,
+            status,
+            reason,
+            domain_complete,
+            format!("{:064x}", ordinal + 1),
+        ],
+    )?;
+    Ok(())
+}
+
+/// One removable file with `removed_nodes` function nodes and `removed_edges`
+/// call edges, plus an unrelated survivor file owning `surviving_facts` proof
+/// facts (mixed exact/ambiguous/missing_binding statuses), a raw call edge
+/// resolved into the removed file, and three facts whose edge/target/raw-target
+/// columns point into the removed file so every proof_resolution_fact foreign
+/// key a node or edge delete validates is exercised. The caller must keep
+/// `removed_nodes >= 2` and `removed_edges >= 1`.
+fn proof_fk_deletion_fixture(
+    removed_nodes: i64,
+    removed_edges: i64,
+    surviving_facts: i64,
+) -> Result<Storage, StorageError> {
+    assert!(removed_nodes >= 2 && removed_edges >= 1);
+    let mut storage = Storage::new_in_memory()?;
+    for (id, path) in [
+        (PROOF_FK_REMOVED_FILE, "src/removed.rs"),
+        (PROOF_FK_SURVIVOR_FILE, "src/survivor.rs"),
+    ] {
+        storage.insert_file(&FileInfo {
+            id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 100,
+            file_role: FileRole::Source,
+        })?;
+    }
+
+    let mut nodes = vec![
+        Node {
+            id: NodeId(PROOF_FK_REMOVED_FILE),
+            kind: NodeKind::FILE,
+            serialized_name: "src/removed.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_FILE),
+            kind: NodeKind::FILE,
+            serialized_name: "src/survivor.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_CALLER),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "survivor_caller".to_string(),
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "survivor_placeholder".to_string(),
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        },
+    ];
+    for index in 0..removed_nodes {
+        nodes.push(Node {
+            id: NodeId(70_001 + index),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("removed_{index}"),
+            file_node_id: Some(NodeId(PROOF_FK_REMOVED_FILE)),
+            ..Default::default()
+        });
+    }
+    storage.insert_nodes_batch(&nodes)?;
+
+    // One dedicated survivor edge per exact fact: the partial unique index
+    // idx_proof_resolution_exact_edge admits one exact fact per edge_id.
+    let exact_fact_edges = surviving_facts / 5 + 2;
+    let mut edges = vec![Edge {
+        id: EdgeId(PROOF_FK_SURVIVOR_EDGE),
+        source: NodeId(PROOF_FK_SURVIVOR_CALLER),
+        target: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+        kind: EdgeKind::CALL,
+        file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+        resolved_target: Some(NodeId(70_001)),
+        confidence: Some(0.9),
+        certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+        candidate_targets: vec![NodeId(70_001)],
+        ..Default::default()
+    }];
+    for index in 0..exact_fact_edges {
+        edges.push(Edge {
+            id: EdgeId(91_000 + index),
+            source: NodeId(PROOF_FK_SURVIVOR_CALLER),
+            target: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        });
+    }
+    for index in 0..removed_edges {
+        edges.push(Edge {
+            id: EdgeId(60_001 + index),
+            source: NodeId(70_001 + index % removed_nodes),
+            target: NodeId(70_001 + (index + 1) % removed_nodes),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(PROOF_FK_REMOVED_FILE)),
+            ..Default::default()
+        });
+    }
+    storage.insert_edges_batch(&edges)?;
+
+    for (provenance_id, file_id, sha) in [
+        (
+            PROOF_FK_REMOVED_PROVENANCE,
+            PROOF_FK_REMOVED_FILE,
+            "7".repeat(64),
+        ),
+        (
+            PROOF_FK_SURVIVOR_PROVENANCE,
+            PROOF_FK_SURVIVOR_FILE,
+            "8".repeat(64),
+        ),
+    ] {
+        storage.conn.execute(
+            "INSERT INTO proof_resolution_provenance (
+                provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+             ) VALUES (?1, ?2, ?3, 'test-parser', '[]')",
+            params![provenance_id, file_id, sha],
+        )?;
+    }
+
+    // Facts owned by the removed file.
+    for ordinal in 1..=3_i64 {
+        insert_proof_fact(
+            &storage,
+            ordinal,
+            PROOF_FK_REMOVED_FILE,
+            PROOF_FK_REMOVED_PROVENANCE,
+            "missing_binding",
+            70_001,
+            None,
+            None,
+            None,
+        )?;
+    }
+    // Bulk survivor facts: every fifth is exact and holds a dedicated edge;
+    // non-exact rows carry no resolved keys.
+    let non_exact_statuses = [
+        "ambiguous",
+        "unsupported",
+        "missing_binding",
+        "incomplete_domain",
+    ];
+    let mut exact_edge = 0_i64;
+    for index in 0..surviving_facts {
+        let (status, edge_id, raw_target, target) = if index % 5 == 0 {
+            let edge_id = 91_000 + exact_edge;
+            exact_edge += 1;
+            (
+                "exact",
+                Some(edge_id),
+                Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+                Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            )
+        } else {
+            (non_exact_statuses[(index % 4) as usize], None, None, None)
+        };
+        insert_proof_fact(
+            &storage,
+            10_000 + index,
+            PROOF_FK_SURVIVOR_FILE,
+            PROOF_FK_SURVIVOR_PROVENANCE,
+            status,
+            PROOF_FK_SURVIVOR_CALLER,
+            edge_id,
+            raw_target,
+            target,
+        )?;
+    }
+    // Three survivor-owned facts pointing into the removed file through each
+    // FK column; the explicit cleanup must delete them before the node and
+    // edge deletes run. Each holds a distinct edge for the exact-status
+    // uniqueness constraint.
+    insert_proof_fact(
+        &storage,
+        50_001,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(PROOF_FK_SURVIVOR_EDGE),
+        Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+        Some(70_001),
+    )?;
+    insert_proof_fact(
+        &storage,
+        50_002,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(91_000 + exact_edge),
+        Some(70_002),
+        Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+    )?;
+    insert_proof_fact(
+        &storage,
+        50_003,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(60_001),
+        Some(70_001),
+        Some(70_001),
+    )?;
+
+    Ok(storage)
+}
+
+/// Count VM steps (progress callbacks at interval 1) around a
+/// delete_file_projection call on a fresh fixture. The statement-level
+/// counters cannot be reached without restructuring the production delete, so
+/// this measures the whole cleanup transaction; the FK-lookup plans are
+/// pinned separately by EXPLAIN in the sibling test.
+fn measure_proof_fk_deletion_vm_steps(
+    surviving_facts: i64,
+    drop_target_index: bool,
+) -> Result<(u64, FileProjectionRemovalSummary), StorageError> {
+    let mut storage = proof_fk_deletion_fixture(12, 6, surviving_facts)?;
+    if drop_target_index {
+        storage
+            .conn
+            .execute_batch("DROP INDEX idx_proof_resolution_target")?;
+    }
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&steps);
+    storage.conn.progress_handler(
+        1,
+        Some(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    )?;
+    let summary = storage.delete_file_projection(PROOF_FK_REMOVED_FILE)?;
+    storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+    Ok((steps.load(std::sync::atomic::Ordering::Relaxed), summary))
+}
+
+#[test]
+fn delete_file_projection_proof_fk_lookups_use_leading_indexes() -> Result<(), StorageError> {
+    let storage = proof_fk_deletion_fixture(4, 2, 60)?;
+    for (index, predicate) in [
+        ("idx_proof_resolution_target", "target_node_id = 0"),
+        ("idx_proof_resolution_raw_target", "raw_edge_target_id = 0"),
+        ("idx_proof_resolution_edge", "edge_id = 0"),
+    ] {
+        assert!(sqlite_index_exists(&storage, index)?);
+        let mut statement = storage.conn.prepare(&format!(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM proof_resolution_fact WHERE {predicate}"
+        ))?;
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH proof_resolution_fact") && line.contains(index)),
+            "{predicate} lookup did not use {index}: {plan:?}"
+        );
+    }
+    // The partial exact-status index stays unique but can never serve the
+    // unconditional foreign-key child check on edge_id.
+    assert!(sqlite_index_exists(
+        &storage,
+        "idx_proof_resolution_exact_edge"
+    )?);
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_cost_is_independent_of_surviving_proof_facts() -> Result<(), StorageError>
+{
+    const SMALL_FACTS: i64 = 200;
+    const LARGE_FACTS: i64 = 2_000;
+    let (small_steps, small_summary) = measure_proof_fk_deletion_vm_steps(SMALL_FACTS, false)?;
+    let (large_steps, large_summary) = measure_proof_fk_deletion_vm_steps(LARGE_FACTS, false)?;
+    assert_eq!(small_summary.removed_node_count, 13);
+    assert_eq!(small_summary.removed_edge_count, 6);
+    assert_eq!(large_summary.removed_node_count, 13);
+    assert_eq!(large_summary.removed_edge_count, 6);
+    // Scaling the retained fact table tenfold must not scale deletion work:
+    // every foreign-key child probe is an index seek, not a scan.
+    assert!(
+        large_steps < small_steps.saturating_mul(4),
+        "deletion VM steps scaled with surviving facts: \
+         {SMALL_FACTS} facts -> {small_steps} steps, {LARGE_FACTS} facts -> {large_steps} steps"
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_without_target_index_rescans_surviving_facts() -> Result<(), StorageError>
+{
+    const SMALL_FACTS: i64 = 200;
+    const LARGE_FACTS: i64 = 2_000;
+    let (small_steps, _) = measure_proof_fk_deletion_vm_steps(SMALL_FACTS, true)?;
+    let (large_steps, _) = measure_proof_fk_deletion_vm_steps(LARGE_FACTS, true)?;
+    // With idx_proof_resolution_target dropped, every deleted node rescans
+    // the retained fact table, so deletion work tracks the fact count.
+    assert!(
+        large_steps > small_steps.saturating_mul(4),
+        "missing target index did not rescale deletion work: \
+         {SMALL_FACTS} facts -> {small_steps} steps, {LARGE_FACTS} facts -> {large_steps} steps"
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_removes_removed_facts_and_preserves_survivors() -> Result<(), StorageError>
+{
+    const SURVIVING_FACTS: i64 = 30;
+    let mut storage = proof_fk_deletion_fixture(12, 6, SURVIVING_FACTS)?;
+
+    let summary = storage.delete_file_projection(PROOF_FK_REMOVED_FILE)?;
+    assert_eq!(summary.removed_node_count, 13);
+    assert_eq!(summary.removed_edge_count, 6);
+    assert_eq!(
+        summary.affected_caller_file_ids,
+        vec![PROOF_FK_SURVIVOR_FILE]
+    );
+
+    // Removed file's nodes, edges, facts and provenance are gone.
+    assert!(storage.get_node(NodeId(PROOF_FK_REMOVED_FILE))?.is_none());
+    assert!(storage.get_node(NodeId(70_001))?.is_none());
+    let removed_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact WHERE file_id = ?1",
+        params![PROOF_FK_REMOVED_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(removed_facts, 0);
+    let removed_provenance: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_provenance WHERE file_id = ?1",
+        params![PROOF_FK_REMOVED_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(removed_provenance, 0);
+
+    // Survivor facts survive; the three that pointed into the removed file
+    // were cleaned before the node and edge deletes.
+    let surviving_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact WHERE file_id = ?1",
+        params![PROOF_FK_SURVIVOR_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(surviving_facts, SURVIVING_FACTS);
+    let dangling_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact
+         WHERE target_node_id = 70001 OR raw_edge_target_id = 70002 OR edge_id = 60001",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(dangling_facts, 0);
+    let survivor_provenance: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_provenance WHERE file_id = ?1",
+        params![PROOF_FK_SURVIVOR_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(survivor_provenance, 1);
+
+    // The cross-file edge row stays; its resolved pointer into the removed
+    // file is cleared.
+    let resolved_target: Option<i64> = storage.conn.query_row(
+        "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+        params![PROOF_FK_SURVIVOR_EDGE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(resolved_target, None);
+
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_rolls_back_when_cleanup_fails() -> Result<(), StorageError> {
+    let mut storage = proof_fk_deletion_fixture(4, 2, 20)?;
+    let fact_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get(0)
+            })?;
+    let node_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))?;
+    let edge_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge", [], |row| row.get(0))?;
+
+    // Fail mid-cleanup: proof facts have already been deleted in the same
+    // transaction when the edge delete aborts, so a partial commit would leak
+    // fact loss.
+    storage.conn.execute_batch(
+        "CREATE TRIGGER fail_edge_cleanup
+         BEFORE DELETE ON edge BEGIN
+             SELECT RAISE(ABORT, 'injected cleanup failure');
+         END;",
+    )?;
+    assert!(
+        storage
+            .delete_file_projection(PROOF_FK_REMOVED_FILE)
+            .is_err()
+    );
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER fail_edge_cleanup")?;
+
+    let fact_count_after: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get(0)
+            })?;
+    let node_count_after: i64 = storage
+        .conn
+        .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))?;
+    let edge_count_after: i64 = storage
+        .conn
+        .query_row("SELECT COUNT(*) FROM edge", [], |row| row.get(0))?;
+    assert_eq!(fact_count_after, fact_count_before);
+    assert_eq!(node_count_after, node_count_before);
+    assert_eq!(edge_count_after, edge_count_before);
     Ok(())
 }
 

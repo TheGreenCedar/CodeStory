@@ -85,7 +85,8 @@ pub(crate) struct SealedCoreCandidateReceipt {
 const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
 const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
-const SCHEMA_VERSION: u32 = ATTACHED_COMMENT_SCHEMA_VERSION;
+const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
+const SCHEMA_VERSION: u32 = PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
