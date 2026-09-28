@@ -2590,7 +2590,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
         })
         .and_then(|symbol| symbol["id"].as_str())
         .unwrap_or_else(|| panic!("first project should expose first_only: {first_ground:#}"));
-    let first_symbol = assert_tool_success(
+    assert_tool_success(
         &send_json(
             &mut server,
             json!({
@@ -2604,8 +2604,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             }),
         ),
         json!("multi-first-symbol"),
-    )
-    .clone();
+    );
     let wrong_project_uri = format!(
         "codestory://symbol/{}?project={}",
         strict_resource_component(first_node_id),
