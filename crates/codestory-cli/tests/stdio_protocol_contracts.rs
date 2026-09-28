@@ -4077,6 +4077,120 @@ fn snippet_tool_exact_id_navigates_structural_evidence_but_query_stays_typed() {
     );
 }
 
+/// A symbol-identified snippet read must never serve bytes that fail the
+/// indexed content hash. Mutating the bound file after indexing makes both
+/// the `snippet` tool and the `codestory://snippet/` resource answer with the
+/// typed `source_stale` code instead of mismatched text.
+#[test]
+fn snippet_id_reads_return_source_stale_when_indexed_bytes_change() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stale-snippet",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "balanced"}}
+        }),
+    );
+    let grounding = assert_tool_success(&ground_response, json!("ground-stale-snippet"));
+    let node_id = grounding["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            grounding["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("tiny-stdio-contract-fixture @ "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("grounding should expose the Cargo package: {grounding:#}"))
+        .to_string();
+
+    let manifest_path = fixture.workspace.path().join("Cargo.toml");
+    let manifest_original = fs::read_to_string(&manifest_path).expect("read manifest");
+    let manifest_mutated =
+        manifest_original.replace("tiny-stdio-contract-fixture", "tiny-stdio-contract-staledx");
+    assert_eq!(manifest_original.len(), manifest_mutated.len());
+    let modified = fs::metadata(&manifest_path)
+        .expect("manifest metadata")
+        .modified()
+        .expect("manifest mtime");
+    fs::write(&manifest_path, manifest_mutated).expect("mutate indexed manifest");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&manifest_path)
+        .expect("open manifest")
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .expect("restore manifest mtime");
+
+    // The snippet resource is an observational read: it pins the publication
+    // that activation already produced instead of refreshing first, so the
+    // drifted bytes reach the hash check and surface the typed stale code.
+    let resource_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-stale-resource",
+            "method": "resources/read",
+            "params": {
+                "uri": format!("codestory://snippet/{node_id}"),
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let resource_error = assert_error_envelope(&resource_response, json!("snippet-stale-resource"));
+    assert!(
+        resource_error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("source_stale")),
+        "the snippet resource must surface the typed stale-source code: {resource_error:#}"
+    );
+    assert!(
+        !resource_error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("staledx")),
+        "the stale-source error must not carry bytes the index never saw: {resource_error:#}"
+    );
+
+    let tool_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-stale-tool",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": node_id}}
+        }),
+    );
+    // The snippet tool runs managed activation first: the drift is detected,
+    // the index republishes, and the pinned id from the previous generation no
+    // longer resolves. That is still a typed refusal -- the wire must never
+    // carry the mutated bytes under the old identity.
+    let tool_error = assert_tool_error(&tool_response, json!("snippet-stale-tool"));
+    assert!(
+        matches!(
+            tool_error["code"].as_str(),
+            Some("source_stale" | "not_found" | "project_unavailable")
+        ),
+        "snippet tool must refuse stale source with a typed code: {tool_error:#}"
+    );
+    assert!(
+        !serde_json::to_string(&tool_error)
+            .expect("serialize tool error")
+            .contains("staledx"),
+        "the refusal must not carry bytes the index never saw: {tool_error:#}"
+    );
+}
+
 #[test]
 fn files_tool_lists_indexed_files_without_sidecars() {
     let fixture = indexed_fixture();
