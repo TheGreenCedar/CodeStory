@@ -14,12 +14,13 @@ use super::{
     finalize_staged_semantic_docs, flush_pending_dense_anchor_inputs, fs,
     hybrid_search_config_for_request, hybrid_test_env, insert_semantic_fixture_nodes,
     llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
-    normalized_hybrid_weights, pending_semantic_doc_for_test, persisted_search_generation_names,
-    primary_source_retention_threshold, process_env_test_lock, project_identity_v3,
-    prune_search_generations, rebuild_search_state_from_storage, search_generation_completion_path,
-    search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
-    semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
-    test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    mutate_published_core, normalized_hybrid_weights, pending_semantic_doc_for_test,
+    persisted_search_generation_names, primary_source_retention_threshold, process_env_test_lock,
+    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
+    search_generation_completion_path, search_index_generation_root,
+    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
+    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
+    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
 use codestory_contracts::bounded_locks::{self, FileLockKind};
@@ -2228,7 +2229,6 @@ fn persisted_search_generations_do_not_overwrite_a_racing_reader() {
 }
 
 #[test]
-#[ignore = "staged core promotion requires rebound proof-resolution identity"]
 fn catalog_waiting_loader_reopens_core_and_search_as_one_generation() {
     let _env = hybrid_test_env();
     let temp = tempdir().expect("create temp dir");
@@ -2791,8 +2791,8 @@ fn hybrid_search_config_skips_exact_symbol_escalation_for_mixed_nl() {
 }
 
 #[test]
-#[ignore = "live published cores are immutable generations; incomplete-run fences belong on staged candidates"]
 fn staged_recovery_search_failure_preserves_the_marked_live_database() {
+    const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
@@ -2811,10 +2811,22 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("initial full index");
-    Storage::open(&storage_path)
-        .expect("open storage")
-        .begin_incremental_run()
-        .expect("simulate interrupted incremental");
+    // An interrupted incremental leaves its durable fence on the published
+    // core: the marker row plus the incomplete-run schema sentinel. Live
+    // generation files are immutable to ordinary opens, so the fence goes in
+    // through the same sealed-generation replacement the recovery code meets.
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(&format!(
+                "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+                 VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET
+                    started_at_epoch_ms = excluded.started_at_epoch_ms;
+                 PRAGMA user_version = {INCOMPLETE_INCREMENTAL_SCHEMA_VERSION};"
+            ))
+            .expect("plant the durable incomplete-run fence");
+    });
 
     let search_path = search_index_generation_root(&storage_path);
     if search_path.is_dir() {
@@ -2830,42 +2842,22 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         error.message.contains("search"),
         "unexpected error: {error:?}"
     );
-    let storage = Storage::open(&storage_path).expect("open replacement database");
+    assert_no_staged_publication_artifacts(&storage_path);
+    // The fence stamps the live generation with the incomplete-run sentinel
+    // version, which read-only opens refuse by contract; inspect it through
+    // the static promotion readers instead of Storage::open.
     assert!(
-        storage
-            .has_incomplete_incremental_run()
-            .expect("replacement marker")
+        Storage::database_has_incomplete_incremental_run(&storage_path)
+            .expect("replacement marker"),
+        "pre-publication failure must preserve the durable incomplete-run fence"
     );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_summary()
-            .expect("live summary readiness"),
-        "pre-publication failure must preserve the live summary snapshot"
-    );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_detail()
-            .expect("live detail readiness"),
-        "pre-publication failure must preserve the live detail snapshot"
-    );
-    storage
-        .get_connection()
-        .execute(
-            "UPDATE incomplete_index_run
-             SET started_at_epoch_ms = started_at_epoch_ms
-             WHERE id = 1",
-            [],
-        )
-        .expect("retain the fence in committed WAL state");
     let fenced_schema =
         Storage::database_schema_version(&storage_path).expect("replacement schema");
-    assert_ne!(fenced_schema, codestory_store::CURRENT_SCHEMA_VERSION);
-    let wal_path = storage_path.with_extension("db-wal");
-    assert!(wal_path.is_file(), "fenced fixture must retain WAL state");
-    let database_before = fs::read(&storage_path).expect("read fenced database before freshness");
-    let wal_before = fs::read(&wal_path).expect("read fenced WAL before freshness");
+    assert_eq!(fenced_schema, INCOMPLETE_INCREMENTAL_SCHEMA_VERSION);
+    let live_database = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve fenced live generation");
+    let live_wal = live_database.with_extension("db-wal");
+    let database_before = fs::read(&live_database).expect("read fenced database before freshness");
 
     let cached = controller
         .index_freshness()
@@ -2889,39 +2881,37 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         assert!(freshness.samples.is_empty());
     }
     assert_eq!(
-        fs::read(&storage_path).expect("read fenced database after freshness"),
+        fs::read(&live_database).expect("read fenced database after freshness"),
         database_before
     );
-    assert_eq!(
-        fs::read(&wal_path).expect("read fenced WAL after freshness"),
-        wal_before
+    assert!(
+        !live_wal.exists(),
+        "read-only freshness must not leave WAL state on the fenced generation"
     );
     assert_eq!(
         Storage::database_schema_version(&storage_path).expect("schema after freshness"),
         fenced_schema
     );
     assert!(
-        storage
-            .has_incomplete_incremental_run()
+        Storage::database_has_incomplete_incremental_run(&storage_path)
             .expect("marker after freshness"),
         "freshness observation must preserve the durable fence"
     );
 
-    drop(storage);
     fs::remove_file(&search_path).expect("remove search rebuild blocker");
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("successful full recovery");
+    assert_no_staged_publication_artifacts(&storage_path);
     assert_eq!(
         Storage::database_schema_version(&storage_path).expect("recovered schema"),
         codestory_store::CURRENT_SCHEMA_VERSION
     );
-    let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
     assert!(
-        !readable
-            .has_incomplete_incremental_run()
+        !Storage::database_has_incomplete_incremental_run(&storage_path)
             .expect("read recovered marker")
     );
+    let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
     assert!(
         readable
             .get_complete_index_publication()

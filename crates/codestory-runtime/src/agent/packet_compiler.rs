@@ -1620,17 +1620,130 @@ mod tests {
         assert!(decoded[0].structural_reason.is_some());
     }
 
+    fn test_admission(
+        packet_ordinal: u32,
+        stable_identity: &str,
+        node_id: i64,
+    ) -> AuthenticatedPacketAdmissionV1 {
+        AuthenticatedPacketAdmissionV1 {
+            receipt: PacketAdmissionReceiptV1 {
+                packet_ordinal,
+                stable_identity: stable_identity.into(),
+                score_version: "test".into(),
+                reserved_source_bytes: 1,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            },
+            core_node_id: CoreNodeId(node_id),
+        }
+    }
+
     #[test]
     fn uncertain_relation_is_not_compiler_evidence() {
         assert_eq!(
             relation_certainty(Some(ResolutionCertainty::Uncertain)),
             PacketRelationCertaintyV1::Uncertain
         );
+
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::CALL,
+                    certainty: Some(ResolutionCertainty::Uncertain),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert edges");
+        let admissions = [
+            test_admission(0, "path:src/a.rs", 1),
+            test_admission(1, "node:2", 2),
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_id, "10");
+        assert_eq!(relations[0].certainty, PacketRelationCertaintyV1::Certain);
     }
 
     #[test]
     fn numeric_confidence_cannot_upgrade_missing_certainty() {
         assert_eq!(relation_certainty(None), PacketRelationCertaintyV1::Unknown);
+
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::CALL,
+                    confidence: Some(0.99),
+                    certainty: None,
+                    ..Default::default()
+                },
+            ])
+            .expect("insert edges");
+        let admissions = [
+            test_admission(0, "path:src/a.rs", 1),
+            test_admission(1, "node:2", 2),
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_id, "10");
     }
 
     #[test]

@@ -11211,15 +11211,49 @@ fn structural_live_identity(storage_path: &Path) -> StructuralLiveIdentity {
     }
 }
 
+/// Assert the operation left no staged core candidates owned by this process.
+///
+/// Current candidates live in `stage-<pid>-<uuid>` directories under
+/// `CorePublicationLayout::staging_root`, not as `.staged.` siblings of the
+/// database. Enumeration failures are fatal rather than filtered, and
+/// candidates owned by other processes are preserved — this assertion only
+/// covers staging directories this process could have created.
 pub(crate) fn assert_no_staged_publication_artifacts(storage_path: &Path) {
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+        .expect("resolve core publication layout");
+    let staging_root = layout.staging_root();
+    let owned_prefix = format!("stage-{}-", std::process::id());
+    let mut debris = Vec::new();
+    if staging_root.is_dir() {
+        for entry in fs::read_dir(&staging_root).expect("list core staging root") {
+            let name = entry
+                .expect("enumerate staged core candidate")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if name.starts_with(&owned_prefix) {
+                debris.push(name);
+            }
+        }
+    }
+    assert!(debris.is_empty(), "staged publication debris: {debris:?}");
+
     let parent = storage_path.parent().expect("storage parent");
-    let staged = fs::read_dir(parent)
-        .expect("list storage parent")
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name.contains(".staged."))
-        .collect::<Vec<_>>();
-    assert!(staged.is_empty(), "staged publication debris: {staged:?}");
+    let mut legacy = Vec::new();
+    for entry in fs::read_dir(parent).expect("list storage parent") {
+        let name = entry
+            .expect("enumerate storage parent")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if name.contains(".staged.") {
+            legacy.push(name);
+        }
+    }
+    assert!(
+        legacy.is_empty(),
+        "legacy staged publication debris: {legacy:?}"
+    );
 }
 
 /// Apply a hostile fixture write to the published core.
