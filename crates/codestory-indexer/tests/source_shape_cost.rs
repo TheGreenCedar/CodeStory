@@ -12,6 +12,7 @@
 //! it — while the quadratic it guards against, which ran to tens of seconds at
 //! this size, cannot pass.
 
+use codestory_contracts::graph::EdgeKind;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,10 @@ fn one_giant_function_costs_about_what_many_small_ones_do() {
     assert!(
         !result.nodes.is_empty(),
         "the fixture must actually project nodes, or this guard measures nothing"
+    );
+    assert!(
+        result.edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
+        "the fixture's `base.get()` receiver calls must project CALL edges, or this          guard measures nothing"
     );
     assert!(
         elapsed < BUDGET,
