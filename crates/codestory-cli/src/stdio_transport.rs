@@ -6132,10 +6132,7 @@ fn stdio_typed_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> s
     // that text so message-only readers see the same words; the typed code and
     // details now ride alongside it in the object.
     if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "message".to_string(),
-            serde_json::json!(error.to_string()),
-        );
+        object.insert("message".to_string(), serde_json::json!(error.to_string()));
     }
     value
 }
