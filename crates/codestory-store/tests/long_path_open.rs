@@ -231,26 +231,124 @@ fn every_core_store_sqlite_open_routes_through_the_conversion_helper() {
     );
 }
 
+/// Both `PinnedCopySource` ATTACH branches must convert their path:
+/// a published generation attaches through the immutable observational URI
+/// (no `-wal`/`-shm` may appear beside the sealed image), while a legacy
+/// fixed-path source attaches through the plain converted path argument.
+/// Behavior-level proof exercises each branch instead of asserting on the
+/// private implementation body.
 #[test]
 fn pinned_copy_source_attach_converts_both_image_and_legacy_paths() {
-    const SOURCE: &str = include_str!("../src/storage_impl/mod.rs");
-    let implementation = SOURCE
-        .split_once("impl PinnedCopySource {")
-        .expect("PinnedCopySource implementation")
-        .1
-        .split_once("impl std::ops::Deref for PinnedCopySource")
-        .expect("end of PinnedCopySource implementation")
-        .0;
-    let normalized = implementation
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        normalized.contains(
-            "fn attach_argument(&self) -> String { if self.immutable { \
-             sqlite_path::observational_uri(&self.path, true) } else { \
-             sqlite_path::attach_argument(&self.path) } }"
-        ),
-        "pinned immutable and legacy ATTACH sources must both use the SQLite path conversion helper"
+    let cached_file = Path::new("src/cached.rs");
+
+    // Legacy branch: a fixed-path source with no publication pointer.
+    let root = tempfile::tempdir().expect("temporary store root");
+    let legacy_source = root.path().join("legacy.db");
+    let source = Store::open(&legacy_source).expect("open legacy source");
+    source
+        .upsert_index_artifact_cache_batch(&[IndexArtifactCacheWrite {
+            path: cached_file,
+            cache_key: "legacy-key",
+            artifact_blob: b"legacy-artifact",
+        }])
+        .expect("seed legacy artifact");
+    drop(source);
+
+    let legacy_target = root.path().join("legacy-target.db");
+    let mut target = Store::open(&legacy_target).expect("open legacy target");
+    assert_eq!(
+        target
+            .copy_index_artifact_cache_from(&legacy_source)
+            .expect("attach a legacy fixed-path source"),
+        1
+    );
+    assert_eq!(
+        target
+            .get_index_artifact_cache(cached_file, "legacy-key")
+            .expect("read the legacy copy"),
+        Some(b"legacy-artifact".to_vec())
+    );
+    drop(target);
+
+    // Published branch: a sealed generation pins the copy source, so the
+    // attach must use the immutable observational URI — proven by the source
+    // image gaining no WAL/SHM siblings during the read.
+    let published_root = tempfile::tempdir().expect("published store root");
+    let live_path = published_root.path().join("codestory.db");
+    let mut stage =
+        codestory_store::SnapshotStore::open_staged(&live_path).expect("open staged source");
+    stage
+        .store_mut()
+        .upsert_index_artifact_cache_batch(&[IndexArtifactCacheWrite {
+            path: cached_file,
+            cache_key: "published-key",
+            artifact_blob: b"published-artifact",
+        }])
+        .expect("seed published artifact");
+    let publication = codestory_store::IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-1".to_owned(),
+        run_id: "run-1".to_owned(),
+        mode: codestory_store::IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    stage
+        .store_mut()
+        .put_index_publication(&publication)
+        .expect("source publication");
+    stage
+        .store_mut()
+        .publish_structural_text_unit_generation(&publication)
+        .expect("source structural identity");
+    stage
+        .store_mut()
+        .publish_source_policy_exclusion_generation(
+            &publication,
+            "test-project",
+            "test-workspace",
+            codestory_store::SourcePolicyExclusionPolicyIdentity::new(
+                codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION,
+                codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            ),
+            &[],
+        )
+        .expect("source policy identity");
+    stage
+        .publish(&live_path)
+        .expect("publish source generation");
+
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(&live_path)
+        .expect("publication layout");
+    let sealed_source = layout
+        .resolve_active_database()
+        .expect("resolve published source")
+        .expect("published generation exists");
+    assert_ne!(sealed_source, live_path);
+
+    // The target must sit in a different directory: `CorePublicationLayout`
+    // roots at `<parent>/core`, so a sibling path would resolve the source's
+    // pointer and open read-only.
+    let target_dir = published_root.path().join("target");
+    std::fs::create_dir(&target_dir).expect("target directory");
+    let published_target = target_dir.join("published-target.db");
+    let mut target = Store::open(&published_target).expect("open published target");
+    assert_eq!(
+        target
+            .copy_index_artifact_cache_from(&live_path)
+            .expect("attach the pinned published image"),
+        1
+    );
+    assert_eq!(
+        target
+            .get_index_artifact_cache(cached_file, "published-key")
+            .expect("read the published copy"),
+        Some(b"published-artifact".to_vec())
+    );
+    drop(target);
+    assert_eq!(
+        sibling(&sealed_source, "-wal").exists() || sibling(&sealed_source, "-shm").exists(),
+        false,
+        "attaching a sealed generation must not materialize lock siblings"
     );
 }
