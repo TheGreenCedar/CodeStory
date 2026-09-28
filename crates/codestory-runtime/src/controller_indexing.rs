@@ -51,7 +51,7 @@ use codestory_store::{
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) struct ActivationIndexingEvidence {
     pub(crate) phase_timings: IndexingPhaseTimings,
@@ -95,6 +95,43 @@ fn run_mid_indexing_test_hook(storage_path: &Path) {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_mid_indexing_test_hook(_storage_path: &Path) {}
+
+/// Extension for the spawned-process writer-hold marker: while
+/// `<storage>.index-writer-hold` exists, a run that already owns the writer
+/// lock parks before doing any work.
+const INDEX_WRITER_HOLD_EXTENSION: &str = "index-writer-hold";
+
+/// Spawned-process tests park a real refresh mid-flight by creating the
+/// `<storage>.index-writer-hold` marker: the run that already owns the writer
+/// lock waits here — still holding it — until the file disappears. Both the
+/// explicit token and the ambient activation cancellation stop the wait, and
+/// a bounded deadline keeps a forgotten marker from wedging indexing.
+fn wait_out_index_writer_hold_marker(
+    storage_path: &Path,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), ApiError> {
+    let marker = storage_path.with_extension(INDEX_WRITER_HOLD_EXTENSION);
+    if !marker.exists() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while marker.exists() {
+        if cancel_token.is_some_and(|token| token.is_cancelled())
+            || codestory_contracts::bounded_locks::thread_cancellation()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(ApiError::new(
+                "cancelled",
+                "indexing cancelled while holding the writer lock on a hold marker",
+            ));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
 
 impl AppController {
     fn core_project_summary_from_storage(
@@ -592,6 +629,7 @@ impl AppController {
             cancel_token,
             None,
             None,
+            None,
         )
         .map(|completion| completion.phase_timings)
     }
@@ -603,6 +641,7 @@ impl AppController {
         cancel_token: Option<&CancellationToken>,
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        preacquired_writer: Option<IndexWriterGuard>,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -632,14 +671,24 @@ impl AppController {
             s.index_freshness_cache = None;
         }
 
-        let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.state.lock().is_indexing = false;
-                return Err(error);
-            }
+        let _writer_guard = match preacquired_writer {
+            // A peer-waited activation hands in the writer it already holds;
+            // every other caller contends here and keeps the single-failure
+            // `cache_busy` answer.
+            Some(guard) => guard,
+            None => match IndexWriterGuard::try_acquire(&storage_path) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    self.state.lock().is_indexing = false;
+                    return Err(error);
+                }
+            },
         };
         run_mid_indexing_test_hook(&storage_path);
+        if let Err(error) = wait_out_index_writer_hold_marker(&storage_path, cancel_token) {
+            self.state.lock().is_indexing = false;
+            return Err(error);
+        }
 
         // A refresh can install a database that never carried the legacy
         // annotation tables, so annotations move to the sidecar before the run
@@ -851,7 +900,18 @@ impl AppController {
             .storage_path
             .clone()
             .ok_or_else(no_project_error)?;
-        let _writer_guard = IndexWriterGuard::try_acquire(&storage_path)?;
+        // Activation owns this acquisition, so peer contention waits on the
+        // publication boundary rather than failing `cache_busy`: the ambient
+        // activation cancellation reaches the bounded wait, and the
+        // publication revalidation below already re-checks whatever the peer
+        // committed first.
+        let _writer_guard = IndexWriterGuard::acquire_after_peer(
+            &storage_path,
+            codestory_contracts::bounded_locks::LockDeadline::after(
+                codestory_contracts::bounded_locks::PUBLICATION_LOCK_WAIT,
+            ),
+            None,
+        )?;
         if cancel_token.is_cancelled() {
             return Err(indexing_cancelled_error());
         }
@@ -1031,12 +1091,16 @@ impl AppController {
     /// core facts that the staged publication already validated. Activation
     /// uses this receipt instead of rebuilding a broad project summary and
     /// revalidating the same derived publications before retrieval can start.
+    /// `writer_guard` is the index-writer lock the activation already holds —
+    /// either acquired uncontended or taken over from a peer after a bounded
+    /// wait — so the publication it plans against cannot change underneath it.
     pub(crate) fn run_indexing_blocking_with_cancel_for_activation(
         &self,
         mode: IndexMode,
         cancel_token: &CancellationToken,
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        writer_guard: IndexWriterGuard,
     ) -> Result<ActivationIndexingEvidence, ApiError> {
         let completion = self.run_indexing_blocking_inner_with_probe(
             mode,
@@ -1044,6 +1108,7 @@ impl AppController {
             Some(cancel_token),
             precomputed_probe,
             failed_refresh_diagnostics,
+            Some(writer_guard),
         )?;
         let storage_path = self.require_storage_path()?;
         let storage = Store::open_read_only(&storage_path).map_err(|error| {

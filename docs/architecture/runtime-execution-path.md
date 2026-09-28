@@ -65,6 +65,16 @@ drift against it rather than waiting or falling back. `resources/read` stays
 observational — it never activates or waits, so a `codestory://snippet/` read
 against drifted bytes reports `source_stale` from the pinned generation.
 
+The writer lock coordinates refreshes across processes. An activation that
+finds the index-writer lock held by another session reports stage
+`waiting_for_peer_writer` and waits — bounded and cancellable — for the peer to
+release it. On release it re-opens committed storage and re-plans: if the peer
+published a satisfying core, the waiter adopts it without a second write;
+otherwise it performs exactly one refresh under the lock it now holds. If the
+peer died without publishing, the OS releases the lock and the waiter does the
+work itself. The previous complete publication stays readable throughout, and
+graph-only answers from it carry freshness reason `peer_writer`.
+
 ## Core indexing
 
 An explicit `index` request delegates to runtime, which asks

@@ -17,7 +17,10 @@ across repositories.
 
 `current_operation` is the runtime-owned activation snapshot. When present it
 contains one stable `operation_id`, monotonic `revision`, `stage`, `attempt`,
-and `progress`, plus retry delay and failure. Concurrent and serial retries for
+and `progress`, plus retry delay and failure. A `stage` of
+`waiting_for_peer_writer` means this runtime is waiting for another session's
+indexing run to release the writer lock; keep waiting rather than starting
+repair. Concurrent and serial retries for
 the same native project/configuration key join that operation; they do not
 start another refresh or repair flow. A `retained` local-navigation capability
 names the exact complete core publication still usable for observational local

@@ -827,6 +827,9 @@ fn stdio_activation_stage_message(stage: codestory_runtime::ActivationStage) -> 
     use codestory_runtime::ActivationStage;
     match stage {
         ActivationStage::Discovery => "CodeStory is checking project files",
+        ActivationStage::WaitingForPeerWriter => {
+            "CodeStory is waiting for another session to finish indexing"
+        }
         ActivationStage::CoreFreshness => "CodeStory is updating the code index",
         ActivationStage::SearchPreparation => "CodeStory is preparing search",
         ActivationStage::DensePreparation => "CodeStory is preparing semantic search",

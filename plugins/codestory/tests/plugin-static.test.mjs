@@ -197,7 +197,7 @@ test("launcher wire contract matches the generated catalog read from the real CL
     preferredMcpProtocolVersion: launcherTest.managedCliMcpProtocolVersion,
     discoveryContracts: generatedCatalog.wireContract.discoveryContracts,
   });
-  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 3);
+  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 4);
   assert.deepEqual(
     catalog.wireContract.supportedMcpProtocolVersions,
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
@@ -305,9 +305,9 @@ test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => 
     requested: "2025-06-18",
     negotiated: "2025-06-18",
     discoveryContractSha256: contracts["2025-06-18"],
-    publicationSchemaVersion: 3,
+    publicationSchemaVersion: 4,
   });
-  const response = (revision, digest, schemaVersion = 3) => ({
+  const response = (revision, digest, schemaVersion = 4) => ({
     jsonrpc: "2.0",
     id: "initialize",
     result: {
@@ -341,13 +341,13 @@ test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => 
   );
   assert.equal(
     launcherTest.v3RuntimeWireContractSkew(
-      response(session.negotiated, session.discoveryContractSha256, 4),
+      response(session.negotiated, session.discoveryContractSha256, 3),
       session,
     ),
     "publication_schema_skew",
   );
   const tooNewMinimum = response(session.negotiated, session.discoveryContractSha256);
-  tooNewMinimum.result._meta.codestory_publication.minimum_compatible_schema_version = 4;
+  tooNewMinimum.result._meta.codestory_publication.minimum_compatible_schema_version = 5;
   assert.equal(
     launcherTest.v3RuntimeWireContractSkew(tooNewMinimum, session),
     "publication_stamp_producer_too_new",
@@ -518,7 +518,7 @@ test("handoff waits for child validation and retires answered legacy batch IDs",
           "process.stdin.setEncoding('utf8');",
           "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
           "if(Array.isArray(frame)){seen.push('batch');record('received');process.stdout.write(JSON.stringify([{jsonrpc:'2.0',id:'A',result:{ok:'A'}},{jsonrpc:'2.0',id:'B',result:{ok:'B'}}])+'\\n',()=>setTimeout(()=>process.exit(17),30));continue;}",
-          "if(frame.method==='initialize'){seen.push('initialize');setTimeout(()=>{record('before-validation');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:process.env.TEST_REVISION,_meta:{codestory_protocol:{discovery_contract_sha256:process.env.TEST_DIGEST},codestory_publication:{schema_version:3,minimum_compatible_schema_version:3}}}})+'\\n');},100);continue;}",
+          "if(frame.method==='initialize'){seen.push('initialize');setTimeout(()=>{record('before-validation');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:process.env.TEST_REVISION,_meta:{codestory_protocol:{discovery_contract_sha256:process.env.TEST_DIGEST},codestory_publication:{schema_version:4,minimum_compatible_schema_version:3}}}})+'\\n');},100);continue;}",
           "if(frame.method==='notifications/initialized'){seen.push('initialized');continue;}",
           "seen.push(String(frame.id));record('received');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{ok:frame.id}})+'\\n');",
           "}});",
@@ -623,7 +623,7 @@ test("late events from a refused child cannot affect the retry handoff", () => {
       protocolVersion: revision,
       _meta: {
         codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
-        codestory_publication: { schema_version: 3, minimum_compatible_schema_version: 3 },
+        codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 3 },
       },
     },
   };
@@ -1361,7 +1361,7 @@ async function waitForPath(pathname, timeoutMs = 10000) {
 async function writeFakeCli(cliPath) {
   const script = [
     "const fs=require('fs');const args=process.argv.slice(1);",
-    `if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest())}},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'3'),minimum_compatible_schema_version:3}}}})+'\\n',()=>process.exit(0))})}`,
+    `if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest())}},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'4'),minimum_compatible_schema_version:3}}}})+'\\n',()=>process.exit(0))})}`,
     "else if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}",
     "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
   ].join("");
@@ -1389,7 +1389,7 @@ async function writeLifecycleCli(cliPath) {
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
-    `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'3'),minimum_compatible_schema_version:3}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
+    `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'4'),minimum_compatible_schema_version:3}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
   ].join("");
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
@@ -2990,9 +2990,9 @@ test("managed cli staging refuses to stage a runtime whose publication stamp it 
     [{ schema_version: 0 }, "publication_stamp_legacy_v0"],
     [{ schema_version: "3" }, "publication_stamp_malformed"],
     [{ schema_version: 1 }, "publication_stamp_producer_too_old"],
-    [{ schema_version: 4 }, "publication_stamp_producer_too_new"],
+    [{ schema_version: 5 }, "publication_stamp_producer_too_new"],
     [
-      { schema_version: 3, minimum_compatible_schema_version: 4 },
+      { schema_version: 4, minimum_compatible_schema_version: 5 },
       "publication_stamp_producer_too_new",
     ],
   ];
@@ -4187,7 +4187,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
         "      if (!line.trim()) continue;",
         "      const request = JSON.parse(line);",
       "      if (request.method === 'initialize') {",
-      `        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || ${JSON.stringify(preferredRevision)}, serverInfo: { name: 'codestory', version: '1' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '3'), minimum_compatible_schema_version: 3 } } } }) + '\\n');`,
+      `        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || ${JSON.stringify(preferredRevision)}, serverInfo: { name: 'codestory', version: '1' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '4'), minimum_compatible_schema_version: 3 } } } }) + '\\n');`,
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
       "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
@@ -4658,7 +4658,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
       "the packaged handshake must carry _meta.codestory_publication, not only _meta.codestory_protocol",
     );
     assert.deepEqual(stamp, {
-      schema_version: 3,
+      schema_version: 4,
       minimum_compatible_schema_version: 3,
       served_from: "contract_only",
       publication: null,
@@ -4699,7 +4699,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
 
     const stamp = failOpenResult._meta?.codestory_publication;
     assert.ok(stamp, "the fail-open handshake must carry the stamp too");
-    assert.equal(stamp.schema_version, 3);
+    assert.equal(stamp.schema_version, 4);
     assert.equal(stamp.minimum_compatible_schema_version, 3);
     assert.equal(stamp.served_from, "contract_only");
     assert.equal(launcherTest.publicationStampSkew(stamp), null);
@@ -4760,7 +4760,7 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
         `            protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2025-03-26',`,
         "            capabilities: {},",
         "            serverInfo: { name: 'codestory', version },",
-        `            _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '3'), minimum_compatible_schema_version: 3 } },`,
+        `            _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '4'), minimum_compatible_schema_version: 3 } },`,
         "          },",
         "        }));",
         "      } else if (request.method === 'tools/list') {",
@@ -4879,7 +4879,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
         "    if (!line.trim()) continue;",
         "    const request = JSON.parse(line);",
         "    if (request.method === 'initialize') {",
-        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 3, minimum_compatible_schema_version: 4 } } } }) + '\\n');`,
+        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 5 } } } }) + '\\n');`,
         "    } else if (request.method === 'tools/call') {",
         // Answer in a later chunk so the reply lands after the launcher has
         // already refused this runtime: the relay must stay shut, not just

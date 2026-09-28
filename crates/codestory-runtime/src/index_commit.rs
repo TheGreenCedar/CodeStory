@@ -12,7 +12,7 @@ use crate::{
     current_epoch_ms, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
 };
 use codestory_contracts::api::{ApiError, IndexPublicationDto, IndexPublicationModeDto};
-use codestory_contracts::bounded_locks;
+use codestory_contracts::bounded_locks::{self, FileLockError, FileLockKind};
 use codestory_indexer::CancellationToken;
 use codestory_store::{
     IndexPublicationMode, IndexPublicationRecord, StagedSnapshot, StagedSnapshotPublishStats,
@@ -21,6 +21,7 @@ use codestory_workspace::{
     OversizedSourceExclusionCandidate, SourceIndexPolicy, WorkspaceManifest,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -63,7 +64,7 @@ pub(super) struct IndexWriterGuard {
 }
 
 impl IndexWriterGuard {
-    pub(super) fn try_acquire(storage_path: &Path) -> Result<Self, ApiError> {
+    fn open_lock_file(storage_path: &Path) -> Result<(std::fs::File, PathBuf), ApiError> {
         let path = storage_path
             .with_extension(codestory_contracts::owned_artifacts::INDEX_WRITER_LOCK_EXTENSION);
         if let Some(parent) = path
@@ -89,6 +90,11 @@ impl IndexWriterGuard {
                     path.display()
                 ))
             })?;
+        Ok((file, path))
+    }
+
+    pub(super) fn try_acquire(storage_path: &Path) -> Result<Self, ApiError> {
+        let (file, path) = Self::open_lock_file(storage_path)?;
         if !codestory_workspace::locking::try_lock_exclusive_outliving_spawn_ghosts(&file).map_err(
             |error| {
                 ApiError::internal(format!(
@@ -106,6 +112,40 @@ impl IndexWriterGuard {
             ));
         }
         Ok(Self { file, path })
+    }
+
+    /// Wait out a peer process that owns the writer lock, then hold it
+    /// ourselves. The wait is bounded by `deadline`, observes `cancel`
+    /// between poll slices, and takes an exclusive acquisition because the
+    /// caller intends to write if the peer's publication did not already
+    /// cover the work. Only this process's own acquisition is ever released:
+    /// another process's lock file is never deleted or unlocked.
+    pub(super) fn acquire_after_peer(
+        storage_path: &Path,
+        deadline: bounded_locks::LockDeadline,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self, ApiError> {
+        let (file, path) = Self::open_lock_file(storage_path)?;
+        match bounded_locks::acquire_with_deadline(&file, FileLockKind::Exclusive, deadline, cancel)
+        {
+            Ok(()) => Ok(Self { file, path }),
+            Err(FileLockError::Cancelled { .. }) => Err(ApiError::new(
+                "cancelled",
+                "activation cancelled while waiting for a peer process's index writer lock",
+            )),
+            Err(FileLockError::Timeout { waited, .. }) => Err(ApiError::new(
+                "cache_busy",
+                format!(
+                    "A peer process held the index writer lock at {} for the whole {} ms wait budget.",
+                    path.display(),
+                    waited.as_millis()
+                ),
+            )),
+            Err(FileLockError::Unavailable { source, .. }) => Err(ApiError::internal(format!(
+                "Failed to wait on index writer lock {}: {source}",
+                path.display()
+            ))),
+        }
     }
 }
 
