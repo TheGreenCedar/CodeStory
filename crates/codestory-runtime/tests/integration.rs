@@ -13,6 +13,24 @@ fn should_run_repo_scale_test() -> bool {
     )
 }
 
+/// Controller whose process-owned defaults carry `cache_root` instead of the
+/// ambient process cache. The caller owns the directory and must keep it
+/// alive until every worker the controller spawned has quiesced.
+fn owned_cache_controller(process_cache: &std::path::Path) -> AppController {
+    AppController::new_with_config(
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            codestory_retrieval::SidecarProfile::Local,
+            None,
+            &codestory_retrieval::SidecarProcessDefaults::new(
+                process_cache.to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+            ),
+            &codestory_retrieval::SidecarRuntimeOverrides::default(),
+        ),
+    )
+}
+
 #[test]
 fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
     // This test exercises CLI -> runtime -> project/storage -> indexer lifecycle without being a benchmark.
@@ -33,7 +51,8 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
     }
     fs::write(src_dir.join("main.rs"), code)?;
 
-    let controller = AppController::new();
+    let process_cache = tempdir()?;
+    let controller = owned_cache_controller(process_cache.path());
     let storage_path = root.join(".cache").join("codestory.db");
 
     // 1. Open project
@@ -149,7 +168,8 @@ fn test_repo_scale_call_resolution() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let controller = AppController::new();
+    let process_cache = tempdir()?;
+    let controller = owned_cache_controller(process_cache.path());
     let cache_dir = tempdir()?;
     let storage_path = cache_dir.path().join("codestory.db");
 
@@ -259,7 +279,8 @@ fn incremental_publication_immutable_generation_measurement() -> anyhow::Result<
     let copied = copy_measurement_project(&repo_root, &project_root);
     let storage_path = scratch.path().join("cache").join("codestory.db");
 
-    let controller = AppController::new();
+    let process_cache = tempdir()?;
+    let controller = owned_cache_controller(process_cache.path());
     controller
         .open_project_with_storage_path(project_root.clone(), storage_path.clone())
         .expect("open measurement project");

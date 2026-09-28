@@ -1039,7 +1039,8 @@ mod tests {
 
     #[test]
     fn unresolved_exact_probe_keeps_its_packet_wide_reservation_charged() {
-        let controller = AppController::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         let session = Rc::new(PacketProofSession::new());
         let _guard = install_packet_proof_session(Rc::clone(&session));
 

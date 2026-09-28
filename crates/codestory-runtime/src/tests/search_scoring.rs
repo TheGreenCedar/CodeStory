@@ -279,6 +279,7 @@ fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
 
 #[test]
 fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let route_canonical_id = format!(
         "route_endpoint:{}",
         serde_json::json!({
@@ -386,7 +387,7 @@ fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
         );
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     for (route_id, expected_handler) in [
         (CoreNodeId(101), NodeId("105".to_string())),
         (CoreNodeId(102), NodeId("106".to_string())),
@@ -787,6 +788,7 @@ fn persisted_search_build_streams_multiple_pages_through_one_writer() {
 
 #[test]
 fn search_requires_full_sidecars_for_exact_type_queries() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -834,7 +836,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
         .expect("open project");
@@ -896,6 +898,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 
 #[test]
 fn dotted_owner_method_query_resolves_with_file_constraint() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     use crate::{TargetResolution, TargetSelection};
 
     let temp = tempdir().expect("create temp dir");
@@ -976,7 +979,7 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
             .expect("insert symbols");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
         .expect("open project");
@@ -1097,12 +1100,14 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
 #[test]
 fn core_exact_search_is_invariant_to_absolute_project_root() {
     struct Fixture {
+        _process_cache: tempfile::TempDir,
         controller: AppController,
         storage_path: PathBuf,
         source_path: PathBuf,
     }
 
     fn fixture(root: &Path) -> Fixture {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let source_path = root.join("src").join("module-entry.ts");
         fs::create_dir_all(source_path.parent().expect("source parent"))
             .expect("create source directory");
@@ -1211,11 +1216,12 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                 .expect("insert canonical file identities");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(root.to_path_buf(), storage_path.clone())
             .expect("open project");
         Fixture {
+            _process_cache: process_cache,
             controller,
             storage_path,
             source_path,
@@ -1464,6 +1470,7 @@ fn repo_explanation_search_requires_full_sidecar_retrieval() {
 
 #[test]
 fn search_rejects_natural_language_queries_without_full_sidecars() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -1493,7 +1500,7 @@ fn search_rejects_natural_language_queries_without_full_sidecars() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -1612,9 +1619,10 @@ fn broad_search_plan_loads_symbols_after_summary_only_open() {
 
 #[test]
 fn open_project_summary_preserves_search_state_for_the_same_complete_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
@@ -1779,9 +1787,10 @@ fn activation_search_preparation_preserves_resident_state_for_retrieval_only_rep
 
 #[test]
 fn open_project_summary_clears_state_bound_to_another_core_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
@@ -1829,9 +1838,10 @@ fn open_project_summary_clears_state_bound_to_another_core_publication() {
 
 #[test]
 fn run_indexing_without_runtime_refresh_keeps_search_uninitialized() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
@@ -2783,6 +2793,7 @@ fn hybrid_search_config_skips_exact_symbol_escalation_for_mixed_nl() {
 #[test]
 #[ignore = "live published cores are immutable generations; incomplete-run fences belong on staged candidates"]
 fn staged_recovery_search_failure_preserves_the_marked_live_database() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -2790,7 +2801,7 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -2921,7 +2932,8 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
 
 #[test]
 fn search_rejects_reads_while_indexing_is_active() {
-    let controller = AppController::new();
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     {
         let mut state = controller.state.lock();
         state.is_indexing = true;
@@ -2938,15 +2950,20 @@ fn search_rejects_reads_while_indexing_is_active() {
         })
         .expect_err("search should be blocked while indexing");
 
-    assert_eq!(error.code, "invalid_argument");
-    assert!(error.message.contains("indexing is in progress"));
+    assert_eq!(error.code, "activation_preparing");
+    assert!(
+        error.message.contains("indexing is in progress"),
+        "preparing refusal must name the in-progress indexing: {}",
+        error.message
+    );
 }
 
 #[test]
 fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)

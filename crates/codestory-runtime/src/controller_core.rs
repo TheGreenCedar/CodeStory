@@ -45,6 +45,14 @@ impl AppController {
         ))
     }
 
+    /// Controller whose process-owned defaults carry `cache_root` instead of
+    /// the ambient process cache. The caller owns the directory and must keep
+    /// it alive until every worker the controller spawned has quiesced.
+    #[cfg(test)]
+    pub(crate) fn new_with_owned_cache_root(cache_root: &Path) -> Self {
+        Self::new_with_config(crate::test_sidecar_runtime_with_cache_root(cache_root))
+    }
+
     pub(crate) fn new_with_process_config(config: RuntimeProcessConfig) -> Self {
         Self::new_with_source_index_policy(config.sidecar.into_inner(), config.source_index_policy)
     }

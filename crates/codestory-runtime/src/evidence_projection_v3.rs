@@ -1061,15 +1061,17 @@ mod tests {
     fn indexed_search_fixture() -> (
         tempfile::TempDir,
         tempfile::TempDir,
+        tempfile::TempDir,
         crate::AppController,
         crate::services::PublicOperationService,
     ) {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("isolated cache");
         let source = project.path().join("src/layout.css");
         fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
         fs::write(&source, "/* REPO_TEXT_TOKEN */\nbody { color: red; }\n").expect("source");
-        let controller = crate::AppController::new();
+        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 project.path().to_path_buf(),
@@ -1080,7 +1082,7 @@ mod tests {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("complete core index");
         let service = crate::services::PublicOperationService::new(controller.clone());
-        (project, state, controller, service)
+        (project, state, process_cache, controller, service)
     }
 
     fn core_search_request(query: &str) -> SearchRequest {
@@ -1096,7 +1098,7 @@ mod tests {
 
     #[test]
     fn search_projection_keeps_real_repo_text_only_match() {
-        let (project, _state, controller, service) = indexed_search_fixture();
+        let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let projected = service
             .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
                 let mut results =
@@ -1132,7 +1134,7 @@ mod tests {
 
     #[test]
     fn search_projection_keeps_parentless_core_file_match() {
-        let (_project, _state, controller, service) = indexed_search_fixture();
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let projected = service
             .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
                 let results = controller.search_results(core_search_request("layout.css"))?;
@@ -1167,7 +1169,7 @@ mod tests {
 
     #[test]
     fn search_projection_deduplicates_mixed_hits_and_accounts_for_missing_or_bounded_rows() {
-        let (_project, _state, controller, service) = indexed_search_fixture();
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let results = service
             .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
                 controller.search_results(core_search_request("layout.css"))
@@ -1241,7 +1243,7 @@ mod tests {
 
     #[test]
     fn file_search_path_comes_from_pinned_file_identity() {
-        let (_project, state, controller, _service) = indexed_search_fixture();
+        let (_project, state, _process_cache, controller, _service) = indexed_search_fixture();
         let file_hit = controller
             .search_results(core_search_request("layout.css"))
             .expect("core search")
@@ -2485,11 +2487,12 @@ mod tests {
 
     #[test]
     fn context_projection_keeps_the_resolved_target_with_or_without_citations() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let source = project.path().join("resolved.rs");
         fs::write(&source, "pub fn resolved_target() {}\n").expect("source");
         let storage = project.path().join("codestory.db");
-        let controller = crate::AppController::new();
+        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(project.path().to_path_buf(), storage)
             .expect("open project");
@@ -2569,11 +2572,12 @@ mod tests {
 
     #[test]
     fn context_projection_preserves_path_only_unresolved_uncertainty() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let source = project.path().join("unresolved.rs");
         fs::write(&source, "pub fn unresolved_target() {}\n").expect("source");
         let storage = project.path().join("codestory.db");
-        let controller = crate::AppController::new();
+        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(project.path().to_path_buf(), storage)
             .expect("open project");

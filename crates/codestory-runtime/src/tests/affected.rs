@@ -1186,10 +1186,11 @@ fn affected_follow_ups_are_deduplicated_and_empty_for_complete_input() {
 
 #[test]
 fn affected_not_checked_svg_has_no_doctor_or_index_follow_up() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempdir().expect("project");
     fs::write(project.path().join("desk.svg"), "<svg/>\n").expect("write SVG");
     Storage::open(project.path().join("codestory.db")).expect("create empty storage");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: project.path().to_string_lossy().to_string(),
@@ -1215,6 +1216,7 @@ fn affected_not_checked_svg_has_no_doctor_or_index_follow_up() {
 
 #[test]
 fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempdir().expect("project");
     let source_dir = project.path().join("src");
     fs::create_dir(&source_dir).expect("create source directory");
@@ -1282,7 +1284,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
             ])
             .expect("insert fixture nodes");
     }
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: project.path().to_string_lossy().to_string(),
@@ -1309,6 +1311,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
 
 #[test]
 fn affected_rename_and_copy_classify_current_path_while_previous_identity_only_seeds_graph() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempdir().expect("project");
     let source_dir = project.path().join("src");
     fs::create_dir_all(&source_dir).expect("create source directory");
@@ -1356,7 +1359,7 @@ fn affected_rename_and_copy_classify_current_path_while_previous_identity_only_s
             ])
             .expect("insert previous graph");
     }
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: project.path().to_string_lossy().to_string(),
@@ -2046,6 +2049,7 @@ fn route_handler_comparator_is_total_across_every_candidate_permutation() {
 
 #[test]
 fn affected_graph_cycle_terminates_and_result_caps_are_enforced() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempdir().expect("project");
     let source_dir = project.path().join("src");
     fs::create_dir_all(&source_dir).expect("create source directory");
@@ -2120,7 +2124,7 @@ fn affected_graph_cycle_terminates_and_result_caps_are_enforced() {
         storage.insert_edges_batch(&edges).expect("insert edges");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: project.path().to_string_lossy().to_string(),
@@ -2357,6 +2361,7 @@ fn dedicated_openapi_coverage_requires_authenticated_file_owned_projection_evide
 
 #[test]
 fn incremental_openapi_structural_transitions_replace_file_owned_projection_atomically() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     fn endpoint_ids(storage: &Storage) -> HashSet<String> {
         storage
             .get_nodes()
@@ -2375,7 +2380,7 @@ fn incremental_openapi_structural_transitions_replace_file_owned_projection_atom
     )
     .expect("write baseline OpenAPI source");
     let storage_path = workspace.path().join(".cache/codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),

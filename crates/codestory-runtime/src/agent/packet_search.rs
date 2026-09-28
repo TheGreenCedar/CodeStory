@@ -272,8 +272,9 @@ mod tests {
 
     #[test]
     fn packet_batch_preserves_publication_changed_for_operation_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let error = packet_batch_error(
-            &AppController::new(),
+            &AppController::new_with_owned_cache_root(process_cache.path()),
             ApiError::new("publication_changed", "generation drift"),
             "packet batch",
         );
@@ -284,8 +285,9 @@ mod tests {
 
     #[test]
     fn packet_batch_preserves_public_cancellation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let error = packet_batch_error(
-            &AppController::new(),
+            &AppController::new_with_owned_cache_root(process_cache.path()),
             ApiError::new("cancelled", "request cancelled"),
             "packet batch",
         );
@@ -296,8 +298,9 @@ mod tests {
 
     #[test]
     fn packet_batch_preserves_embedding_capacity_without_reindex_advice() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let error = packet_batch_error(
-            &AppController::new(),
+            &AppController::new_with_owned_cache_root(process_cache.path()),
             ApiError::embedding_capacity(
                 "embedding connection admission is full",
                 codestory_contracts::api::EmbeddingCapacityPressureDto {
@@ -337,40 +340,38 @@ mod tests {
         );
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn cleared(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: test-only env cleanup under the shared process env lock.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: restores the process-local env var captured by this guard.
-            unsafe {
-                if let Some(previous) = self.previous.take() {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
+    /// `CODESTORY_RETRIEVAL` is read at call time, so the absence must be true
+    /// for the whole process: the parent re-executes this test in a child with
+    /// the variable removed, leaving the parent's environment untouched.
     #[test]
     fn packet_fused_batch_fails_closed_without_sidecar_primary() {
-        let _lock = crate::process_env_test_lock();
-        let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
-        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        const CHILD_MARKER: &str = "CODESTORY_PACKET_SEARCH_NO_RETRIEVAL_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "agent::packet_search::tests::packet_fused_batch_fails_closed_without_sidecar_primary",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("CODESTORY_RETRIEVAL")
+            .output()
+            .expect("run child without CODESTORY_RETRIEVAL");
+            assert!(
+                output.status.success(),
+                "child stdout:\n{}\nchild stderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let controller = AppController::new_with_config(
+            crate::test_sidecar_runtime_with_cache_root(process_cache.path()),
+        );
 
         let error = controller
             .search_packet_fused_batch(&[("run_exec_session".to_string(), 5)], None)
