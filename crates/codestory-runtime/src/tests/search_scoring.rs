@@ -2260,11 +2260,12 @@ fn catalog_waiting_loader_reopens_core_and_search_as_one_generation() {
     let catalog_guard =
         SearchGenerationCatalogGuard::acquire(&storage_path).expect("hold catalog for publish");
     let loader_path = storage_path.clone();
+    let loader_root = temp.path().to_path_buf();
     let (started_tx, started_rx) = unbounded();
     let loader = std::thread::spawn(move || {
         let mut stale_storage = stale_storage;
         started_tx.send(()).expect("announce loader");
-        load_persisted_search_state(&mut stale_storage, &loader_path)
+        load_persisted_search_state(&mut stale_storage, &loader_root, &loader_path)
             .expect("load post-publication generation")
     });
     started_rx.recv().expect("loader started");
@@ -2391,7 +2392,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
         .expect("publish core generation");
     let expected_path = search_index_path_for_publication(&storage_path, Some(&publication))
         .expect("expected path");
-    let missing_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let missing_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must not rebuild a missing search generation"),
     };
@@ -2414,7 +2416,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
     )
     .expect("write mismatched completion marker");
 
-    let mismatch_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let mismatch_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must reject a count-mismatched search generation"),
     };
@@ -2426,7 +2429,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
     fs::write(&expected_path, b"corrupt search generation")
         .expect("write corrupt generation artifact");
 
-    let corrupt_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let corrupt_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must not rebuild a corrupt search generation"),
     };

@@ -279,6 +279,9 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     }
     append_readiness_verdicts(&mut markdown, &output.readiness);
     append_index_summary_generation(&mut markdown, output);
+    for warning in &output.warnings {
+        let _ = writeln!(markdown, "warning: {warning}");
+    }
     append_next_commands(&mut markdown, &output.next_commands);
     markdown
 }
@@ -2761,6 +2764,27 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
             compact_doctor_check_message(check)
         );
     }
+    if !output.stale_cached_cores.is_empty() {
+        let _ = writeln!(markdown, "stale_cached_cores:");
+        for core in &output.stale_cached_cores {
+            match (core.project_root.as_ref(), core.next_action.as_ref()) {
+                (Some(root), Some(action)) => {
+                    let _ = writeln!(
+                        markdown,
+                        "- `{}` schema={} required={} next: `{action}`",
+                        root, core.found_schema, core.required_schema
+                    );
+                }
+                _ => {
+                    let _ = writeln!(
+                        markdown,
+                        "- `{}` schema={} required={}",
+                        core.cache_dir, core.found_schema, core.required_schema
+                    );
+                }
+            }
+        }
+    }
     let _ = writeln!(markdown, "environment:");
     for item in &output.environment {
         let _ = writeln!(
@@ -4481,6 +4505,7 @@ mod tests {
             readiness_lanes: std::collections::BTreeMap::new(),
             checks: Vec::new(),
             next_commands: Vec::new(),
+            stale_cached_cores: Vec::new(),
             environment: Vec::new(),
         }
     }

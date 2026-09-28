@@ -1281,3 +1281,42 @@ enum Tone {
     assert!(has_node_with_kind(&nodes, NodeKind::ENUM, "Tone"));
     Ok(())
 }
+
+#[test]
+#[cfg(unix)]
+fn test_trailing_space_extension_indexes_without_abort() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let migrations = root.join("migrations");
+    fs::create_dir(&migrations)?;
+    let odd_path = migrations.join("x.sql ");
+    let normal_path = root.join("ok.sql");
+    fs::write(&odd_path, "CREATE TABLE x (id INTEGER);\n")?;
+    fs::write(&normal_path, "CREATE TABLE u (id INTEGER);\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let refresh_info = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![odd_path, normal_path],
+        files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
+    };
+
+    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+
+    let nodes = storage.get_nodes()?;
+    assert!(
+        nodes.iter().any(|node| node.serialized_name == "public.u"),
+        "the normal sql file must still index"
+    );
+    // `x.sql ` is admitted by the trimming extension lookup, so dispatch must
+    // route it through the same normalization: the file indexes as SQL rather
+    // than degrading to a tolerated coverage gap.
+    assert!(
+        nodes.iter().any(|node| node.serialized_name == "public.x"),
+        "the whitespace-extension file must index as SQL, got: {nodes:?}"
+    );
+    Ok(())
+}

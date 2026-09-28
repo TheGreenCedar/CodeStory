@@ -2063,12 +2063,24 @@ function managedCliVersionProbeFailure(probeOrReason, expectedVersion) {
   return kind === 'version_probe_mismatch' ? kind : null;
 }
 
+// Containment rejections raised while verifying a staged or installed managed
+// CLI are fixed launcher tokens, safe to preserve in the surfaced code so the
+// hint can name the actual cause instead of the generic staging label.
+const managedCliVerificationContainmentReasons = new Set([
+  'manifest_path_unsafe',
+  'manifest_path_escape',
+]);
+
 function managedCliFailureCode(error) {
   const message = String(error?.message || error || 'unknown_failure');
   const code = safeFailureToken(message, 'unknown_failure');
   if (code !== 'managed_cli_staging_verification_failed') return code;
   const probeFailure = managedCliVersionProbeFailure(message.slice(code.length + 1));
-  return probeFailure ? `${code}:${probeFailure}` : code;
+  if (probeFailure) return `${code}:${probeFailure}`;
+  const reason = safeFailureToken(message.slice(code.length + 1), null);
+  return reason && managedCliVerificationContainmentReasons.has(reason)
+    ? `${code}:${reason}`
+    : code;
 }
 
 // The machine-readable failure code is deliberately reduced to a single safe token, which left the
@@ -2119,6 +2131,15 @@ function managedCliDownloadHint(context, code) {
   if (code === 'archive_checksum_mismatch') {
     return 'The runtime archive failed checksum verification and was discarded. ' +
       'Retry the tool to download it again.';
+  }
+  if (code === 'managed_cli_staging_verification_failed:manifest_path_escape' ||
+    code === 'managed_cli_staging_verification_failed:manifest_path_unsafe') {
+    return 'The managed runtime path resolves outside its own version directory, ' +
+      'which the containment check rejects. If you linked the executable out, ' +
+      'replace the link with a hard link or a real copy — a symlink escape is ' +
+      'refused — and never point a host directly into the revision-hashed ' +
+      'plugin cache. To bypass managed provisioning entirely, install ' +
+      'codestory-cli yourself and point CODESTORY_CLI at it.';
   }
   if (!context) return null;
   const resumeNote = context.resumable_bytes > 0

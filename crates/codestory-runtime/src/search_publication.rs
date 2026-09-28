@@ -541,18 +541,25 @@ pub(super) struct LoadedSearchState {
 #[cfg(test)]
 pub(super) fn load_persisted_search_state(
     storage: &mut Storage,
+    project_root: &Path,
     storage_path: &Path,
 ) -> Result<LoadedSearchState, ApiError> {
-    load_persisted_search_state_for_runtime(storage, storage_path, &test_sidecar_runtime_from_env())
+    load_persisted_search_state_for_runtime(
+        storage,
+        project_root,
+        storage_path,
+        &test_sidecar_runtime_from_env(),
+    )
 }
 
 pub(super) fn load_persisted_search_state_for_runtime(
     storage: &mut Storage,
+    project_root: &Path,
     storage_path: &Path,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<LoadedSearchState, ApiError> {
     let _catalog_guard = SearchGenerationCatalogGuard::acquire(storage_path)?;
-    *storage = open_storage_for_read(storage_path)?;
+    *storage = open_storage_for_read(project_root, storage_path)?;
     let publication = storage.get_complete_index_publication().map_err(|error| {
         ApiError::internal(format!(
             "Failed to read complete search publication identity: {error}"

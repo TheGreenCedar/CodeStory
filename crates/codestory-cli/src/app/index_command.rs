@@ -143,6 +143,13 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         &sidecar_retrieval,
     );
     let next_commands = readiness::compatibility_next_commands(&readiness);
+    let warnings = opened
+        .summary
+        .freshness
+        .as_ref()
+        .and_then(readiness::bounded_inventory_freshness_warning)
+        .into_iter()
+        .collect();
     let output = IndexOutput {
         project: &opened.summary.root,
         storage_path: &storage_path,
@@ -152,6 +159,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
         summary_generation: summary_generation.as_ref(),
+        warnings,
         readiness,
         next_commands,
     };
@@ -299,7 +307,10 @@ mod tests {
         let published_mode = || {
             observer
                 .project
-                .complete_index_publication_at(std::path::Path::new(storage_path))
+                .complete_index_publication_at(
+                    &observer.project_root,
+                    std::path::Path::new(storage_path),
+                )
                 .expect("read command publication")
                 .expect("complete command publication")
                 .mode

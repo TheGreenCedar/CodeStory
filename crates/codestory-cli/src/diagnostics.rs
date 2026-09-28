@@ -106,6 +106,99 @@ pub(crate) fn record_command_failure(error: &anyhow::Error) {
     let _ = process_diagnostics().write_record(record);
 }
 
+/// A support bundle is the user-facing triage artifact: the command's own
+/// report plus every diagnostics record this process cache root already holds.
+/// The records carry only what was safe at capture time (panic site
+/// file:line:column, payload sizes, event classes), so bundling them adds no
+/// new disclosure and there is no unredacted mode.
+const SUPPORT_BUNDLE_SCHEMA_VERSION: u32 = 1;
+const SUPPORT_BUNDLE_MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(crate) fn write_support_bundle(path: &Path, report: &Value) -> Result<()> {
+    let sink = process_diagnostics();
+    let (diagnostics, diagnostics_truncated) = collect_diagnostic_records(&sink);
+    let bundle = json!({
+        "schema_version": SUPPORT_BUNDLE_SCHEMA_VERSION,
+        "generated_at_unix_ms": unix_timestamp_ms(),
+        "correlation_id": sink.correlation_id.clone(),
+        "report": report,
+        "diagnostics": diagnostics,
+        "diagnostics_truncated": diagnostics_truncated,
+    });
+    let mut encoded = serde_json::to_vec_pretty(&bundle).context("encode support bundle")?;
+    encoded.push(b'\n');
+    refuse_symlink(path)?;
+    let mut file = open_private_truncated_file(path)
+        .with_context(|| format!("write support bundle {}", path.display()))?;
+    file.write_all(&encoded)
+        .with_context(|| format!("write support bundle {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync support bundle {}", path.display()))?;
+    Ok(())
+}
+
+/// Read the records the sink already persisted. Reading must stay
+/// observational: a missing or unreadable log contributes nothing, and the
+/// reader never creates the diagnostics directory or touches the record lock.
+fn collect_diagnostic_records(sink: &DiagnosticSink) -> (Vec<Value>, bool) {
+    let mut records = Vec::new();
+    let mut bytes: u64 = 0;
+    let mut truncated = false;
+    let mut read_file = |path: &Path, records: &mut Vec<Value>| {
+        let Ok(content) = fs::read(path) else {
+            return;
+        };
+        for line in content.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if bytes.saturating_add(line.len() as u64) > SUPPORT_BUNDLE_MAX_DIAGNOSTIC_BYTES {
+                truncated = true;
+                return;
+            }
+            match serde_json::from_slice::<Value>(line) {
+                Ok(record) => {
+                    bytes += line.len() as u64;
+                    records.push(record);
+                }
+                Err(_) => {
+                    records.push(json!({
+                        "event": "unparseable_diagnostic_record",
+                        "bytes": line.len(),
+                    }));
+                }
+            }
+        }
+    };
+    let directory = sink.diagnostics_dir();
+    read_file(&directory.join(LOG_FILE), &mut records);
+    for index in 1..=RETAINED_LOGS {
+        read_file(
+            &rotated_path(&directory.join(LOG_FILE), index),
+            &mut records,
+        );
+    }
+    for namespace in ["emergency-", "fail-stop-"] {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut candidates = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(namespace))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        for candidate in candidates {
+            read_file(&candidate, &mut records);
+        }
+    }
+    (records, truncated)
+}
+
 fn command_failure_record(error: &anyhow::Error) -> Value {
     let chain_count = error.chain().take(MAX_ERROR_CHAIN_COUNT + 1).count();
     json!({

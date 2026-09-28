@@ -1143,7 +1143,8 @@ fn is_cache_busy_text(text: &str) -> bool {
 }
 
 fn api_error_is_schema_too_new(error: &ApiError) -> bool {
-    is_schema_too_new_text(&format!("{} {}", error.code, error.message))
+    error.code == "core_schema_too_new"
+        || is_schema_too_new_text(&format!("{} {}", error.code, error.message))
 }
 
 fn is_schema_too_new_text(text: &str) -> bool {
@@ -1911,7 +1912,7 @@ mod tests {
             .value;
         let current_generation = publisher
             .project
-            .complete_index_publication_at(&publisher.storage_path)
+            .complete_index_publication_at(&publisher.project_root, &publisher.storage_path)
             .expect("read current publication")
             .expect("current publication")
             .generation;
@@ -1976,7 +1977,7 @@ mod tests {
             .expect("observational response should retry one core replacement");
         let current_generation = publisher
             .project
-            .complete_index_publication_at(&publisher.storage_path)
+            .complete_index_publication_at(&publisher.project_root, &publisher.storage_path)
             .expect("read current publication")
             .expect("current publication")
             .generation;
@@ -2072,7 +2073,7 @@ mod tests {
         );
         let generation_a = reader
             .project
-            .complete_index_publication_at(&reader.storage_path)
+            .complete_index_publication_at(&reader.project_root, &reader.storage_path)
             .expect("read generation A")
             .expect("generation A exists");
 

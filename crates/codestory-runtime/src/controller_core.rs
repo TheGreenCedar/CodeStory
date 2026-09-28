@@ -169,7 +169,8 @@ impl AppController {
             return Ok(ReadStorage::Pinned(storage));
         }
         let storage_path = self.require_storage_path()?;
-        open_existing_storage_for_read(&storage_path).map(ReadStorage::Owned)
+        let root = self.require_project_root()?;
+        open_existing_storage_for_read(&root, &storage_path).map(ReadStorage::Owned)
     }
 
     pub(crate) fn open_storage_for_freshness(&self) -> Result<ReadStorage, ApiError> {
@@ -183,12 +184,15 @@ impl AppController {
             return Ok(ReadStorage::Pinned(storage));
         }
         let storage_path = self.require_storage_path()?;
+        let root = self.require_project_root()?;
         Storage::open_freshness_observational(&storage_path)
             .map(ReadStorage::Owned)
             .map_err(|error| {
-                ApiError::internal(format!(
-                    "Failed to open storage for freshness observation: {error}"
-                ))
+                crate::index_incremental::core_schema_observation_error(
+                    &root,
+                    "Failed to open storage for freshness observation",
+                    error,
+                )
             })
     }
 
@@ -222,7 +226,8 @@ impl AppController {
             return build(&publication);
         }
         let storage_path = self.require_storage_path()?;
-        let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
+        let root = self.require_project_root()?;
+        let storage = Rc::new(open_existing_storage_for_read(&root, &storage_path)?);
         self.prepare_armed_proof_publication_validation()?;
         let installed_storage = Rc::clone(&storage);
         let snapshot = storage.read_snapshot().map_err(|error| {
@@ -537,11 +542,13 @@ impl AppController {
             }
         }
 
+        let root = self.require_project_root()?;
         let mut attempts = 0;
         let loaded = loop {
-            let mut storage = open_storage_for_read(&storage_path)?;
+            let mut storage = open_storage_for_read(&root, &storage_path)?;
             match load_persisted_search_state_for_runtime(
                 &mut storage,
+                &root,
                 &storage_path,
                 &self.runtime_config,
             ) {

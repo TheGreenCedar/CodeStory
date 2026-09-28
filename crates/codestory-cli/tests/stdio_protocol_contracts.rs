@@ -2209,6 +2209,124 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     assert_allowed_surface(&refreshed, "ground", true, "local_navigation", "ready");
 }
 
+/// A 0.17.6-era cache carries schema 35 under this binary's schema 36. The
+/// observational status surface must return the typed upgrade refusal with the
+/// managed refresh command — never `internal` — and the activation-owned
+/// `ground` call must rebuild instead of failing.
+#[test]
+fn stdio_status_reports_stale_core_schema_and_ground_rebuilds() {
+    let fixture = indexed_fixture();
+    let database = test_support::set_active_core_schema_version(fixture.cache_dir.path(), 35);
+    let stale_bytes = fs::read(&database).expect("read downgraded generation");
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-stale-schema");
+
+    let status = send_json(
+        &mut server,
+        stdio_status_request("status-stale", fixture.workspace.path()),
+    );
+    let status_text = status
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or_else(|| status["result"].clone());
+    let code = status_text["code"].as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        code, "core_schema_upgrade_required",
+        "status on a stale core must be typed, not internal: {status}"
+    );
+    let command = status_text["next_commands"]
+        .as_array()
+        .or_else(|| {
+            status_text
+                .pointer("/details/next_commands")
+                .and_then(Value::as_array)
+        })
+        .and_then(|commands| {
+            commands
+                .iter()
+                .find(|command| {
+                    command
+                        .as_str()
+                        .is_some_and(|text| text.contains("index --project"))
+                })
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("status must name the managed refresh: {status}"));
+    assert!(
+        command
+            .as_str()
+            .is_some_and(|text| text.contains("--refresh full")),
+        "refresh command must be a full refresh: {command}"
+    );
+    assert_eq!(
+        fs::read(&database).expect("reread stale generation"),
+        stale_bytes,
+        "an observational status read must not mutate the stale generation"
+    );
+
+    let resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-resource-stale",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let resource_error = assert_error_envelope(&resource, json!("status-resource-stale"));
+    assert_eq!(
+        resource_error["data"]["code"],
+        json!("core_schema_upgrade_required"),
+        "resources/read status must surface the typed schema refusal: {resource}"
+    );
+    assert!(
+        resource_error["data"]["details"]["next_commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| {
+                command.as_str().is_some_and(|text| {
+                    text.contains("index --project") && text.contains("--refresh full")
+                })
+            })),
+        "resources/read must carry the managed refresh command: {resource_error}"
+    );
+
+    // The activation-owned call treats the stale core as cold: it rebuilds into
+    // a new generation and converges (or reports exact retry state), never an
+    // internal failure.
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stale",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    match tool_result_code(&ground).as_deref() {
+        Some("codestory_preparing") => {
+            assert_tool_preparing(&ground, json!("ground-stale"));
+        }
+        Some(code) => panic!("ground on a stale core must rebuild, not fail: {code}"),
+        None => {
+            let grounding = assert_tool_success(&ground, json!("ground-stale"));
+            assert!(
+                grounding["stats"]["file_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "rebuilt ground call should return a repository map: {ground}"
+            );
+        }
+    }
+    if database.exists() {
+        assert_eq!(
+            fs::read(&database).expect("reread old generation"),
+            stale_bytes,
+            "rebuild must leave the previous generation image intact"
+        );
+    }
+}
+
 #[test]
 fn notification_messages_do_not_produce_responses() {
     let fixture = indexed_fixture();

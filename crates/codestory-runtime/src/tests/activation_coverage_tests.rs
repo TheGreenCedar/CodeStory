@@ -517,7 +517,7 @@ fn cancelled_activation_search_repair_exposes_no_completed_generation() {
         "cancelled repair must not expose a completed generation"
     );
     let mut reader = Storage::open(&storage_path).expect("open strict reader storage");
-    let reader_error = match load_persisted_search_state(&mut reader, &storage_path) {
+    let reader_error = match load_persisted_search_state(&mut reader, temp.path(), &storage_path) {
         Err(error) => error,
         Ok(_) => panic!("reader must remain fail-closed after cancelled repair"),
     };

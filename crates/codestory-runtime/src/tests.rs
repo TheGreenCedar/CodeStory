@@ -8051,7 +8051,7 @@ fn persisted_loader_reuses_generation_built_by_indexing_finisher() {
         crate::search::engine::SYMBOL_FULL_TEXT_INDEX_ENV,
         "false",
     ));
-    let loaded = load_persisted_search_state(&mut storage, &storage_path)
+    let loaded = load_persisted_search_state(&mut storage, temp.path(), &storage_path)
         .expect("reader loads completed search generation");
     env.pop();
 
