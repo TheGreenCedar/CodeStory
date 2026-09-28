@@ -151,11 +151,26 @@ pub fn project_public_transport_budget_result(
         "disposition": {
             "kind": "unknown",
             "contract_digest": contract_digest,
-            "gaps": [{"kind":"output_budget_exceeded"}]
+            "gaps": output_budget_gaps(object.get("disposition")),
         },
         "cap_bytes": COMPACT_PROOF_MAX_BYTES,
         "required_complete_size": required_transport_size
     }))
+}
+
+/// The causal gaps the internal disposition already carries, kept in their
+/// canonical order, terminated by the output-budget marker. Causal gaps stay
+/// visible through the transport envelope: a caller whose proof exhausted its
+/// kernel search budget must not be told only that the answer did not fit.
+fn output_budget_gaps(disposition: Option<&Value>) -> Vec<Value> {
+    let mut gaps = disposition
+        .and_then(|disposition| disposition.get("gaps"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    gaps.retain(|gap| gap.get("kind").and_then(Value::as_str) != Some("output_budget_exceeded"));
+    gaps.push(json!({ "kind": "output_budget_exceeded" }));
+    gaps
 }
 
 fn apply_public_compact_budget(root: Value) -> Result<PublicCallPathResultDto, String> {
@@ -168,26 +183,37 @@ fn apply_public_compact_budget(root: Value) -> Result<PublicCallPathResultDto, S
         .as_object()
         .ok_or_else(|| "proof projection root must be an object".to_owned())?;
     let contract_digest = object.get("contract_digest").cloned().unwrap_or(json!(""));
-    let compact = json!({
-        "kind": "budget_exceeded",
-        "schema_version": object.get("schema_version").cloned().unwrap_or(json!(1)),
-        "domain": PUBLIC_CALL_PATH_DOMAIN,
-        "translation_status": object.get("translation_status").cloned().unwrap_or(json!(CONTRACT_INTERPRETATION)),
-        "graph_disposition": "unknown",
-        "runtime_execution_proven": false,
-        "guard_version": object.get("guard_version").cloned().unwrap_or(json!(codestory_contracts::call_path::CLAUSE_GUARD_VERSION)),
-        "source_text_sha256": object.get("source_text_sha256").cloned().unwrap_or(json!("")),
-        "contract_digest": contract_digest.clone(),
-        "core_publication": object.get("core_publication").cloned().unwrap_or(json!({})),
-        "provenance": { "availability": "unavailable" },
-        "disposition": {
-            "kind": "unknown",
-            "contract_digest": contract_digest,
-            "gaps": [{"kind": "output_budget_exceeded"}]
-        },
-        "cap_bytes": COMPACT_PROOF_MAX_BYTES,
-        "required_complete_size": serialized.len(),
-    });
+    let envelope = |gaps: Vec<Value>| {
+        json!({
+            "kind": "budget_exceeded",
+            "schema_version": object.get("schema_version").cloned().unwrap_or(json!(1)),
+            "domain": PUBLIC_CALL_PATH_DOMAIN,
+            "translation_status": object.get("translation_status").cloned().unwrap_or(json!(CONTRACT_INTERPRETATION)),
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
+            "guard_version": object.get("guard_version").cloned().unwrap_or(json!(codestory_contracts::call_path::CLAUSE_GUARD_VERSION)),
+            "source_text_sha256": object.get("source_text_sha256").cloned().unwrap_or(json!("")),
+            "contract_digest": contract_digest.clone(),
+            "core_publication": object.get("core_publication").cloned().unwrap_or(json!({})),
+            "provenance": { "availability": "unavailable" },
+            "disposition": {
+                "kind": "unknown",
+                "contract_digest": contract_digest,
+                "gaps": gaps,
+            },
+            "cap_bytes": COMPACT_PROOF_MAX_BYTES,
+            "required_complete_size": serialized.len(),
+        })
+    };
+    let compact = envelope(output_budget_gaps(object.get("disposition")));
+    let compact_bytes = serde_json::to_vec(&compact)
+        .map_err(|error| format!("serialize public verification budget envelope: {error}"))?;
+    let compact = if compact_bytes.len() > COMPACT_PROOF_MAX_BYTES {
+        // Rare pathological case: the causal gap list alone overflows the cap.
+        envelope(vec![json!({ "kind": "output_budget_exceeded" })])
+    } else {
+        compact
+    };
     let compact_bytes = serde_json::to_vec(&compact)
         .map_err(|error| format!("serialize public verification budget envelope: {error}"))?;
     if compact_bytes.len() > COMPACT_PROOF_MAX_BYTES {
@@ -338,7 +364,9 @@ pub fn proof_domain() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObservedIntegratedProjectedCallPathResult, run_observed_call_path_public_operation,
+        ObservedIntegratedProjectedCallPathResult, PublicCallPathResultDto,
+        apply_public_compact_budget, project_public_transport_budget_result,
+        run_observed_call_path_public_operation,
     };
     use std::cell::Cell;
     use std::fs;
@@ -558,5 +586,87 @@ mod tests {
         )
         .expect_err("the helper must own the public-operation freshness fence");
         assert_eq!(stale.code, "project_unavailable");
+    }
+
+    fn causal_gaps() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"kind":"direct_call_missing","step_index":5}),
+            serde_json::json!({"kind":"kernel_search_budget_exceeded"}),
+        ]
+    }
+
+    #[test]
+    fn oversized_result_envelope_preserves_canonical_causal_gaps() {
+        let root = serde_json::json!({
+            "kind": "complete",
+            "schema_version": 1,
+            "domain": "call-path/v1",
+            "contract_interpretation": "host_supplied",
+            "guard_version": "clause_guard_v1",
+            "source_text_sha256": "a".repeat(64),
+            "contract_digest": "b".repeat(64),
+            "core_publication": {},
+            "disposition": {
+                "kind": "unknown",
+                "contract_digest": "b".repeat(64),
+                "gaps": causal_gaps(),
+            },
+            "padding": "x".repeat(6_000),
+        });
+        let bounded = apply_public_compact_budget(root).expect("budget envelope");
+        let gaps = bounded.as_value()["disposition"]["gaps"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            gaps,
+            &vec![
+                serde_json::json!({"kind":"direct_call_missing","step_index":5}),
+                serde_json::json!({"kind":"kernel_search_budget_exceeded"}),
+                serde_json::json!({"kind":"output_budget_exceeded"}),
+            ],
+            "the causal gaps must survive the output-budget envelope in order"
+        );
+        assert_eq!(bounded.as_value()["kind"], "budget_exceeded");
+    }
+
+    #[test]
+    fn transport_budget_envelope_preserves_canonical_causal_gaps() {
+        let complete = PublicCallPathResultDto::try_from_projected_value(serde_json::json!({
+            "kind": "complete",
+            "schema_version": 1,
+            "domain": "call-path/v1",
+            "translation_status": "host_supplied",
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
+            "guard_version": "clause_guard_v1",
+            "source_text_sha256": "a".repeat(64),
+            "contract_digest": "b".repeat(64),
+            "core_publication": {},
+            "provenance": {"availability":"unavailable"},
+            "identities": {},
+            "spec": {},
+            "clauses": [],
+            "steps": [],
+            "receipts": [],
+            "disposition": {
+                "kind": "unknown",
+                "contract_digest": "b".repeat(64),
+                "gaps": causal_gaps(),
+            },
+        }))
+        .expect("complete public result");
+        let bounded =
+            project_public_transport_budget_result(&complete, 9_000).expect("transport envelope");
+        let gaps = bounded.as_value()["disposition"]["gaps"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            gaps,
+            &vec![
+                serde_json::json!({"kind":"direct_call_missing","step_index":5}),
+                serde_json::json!({"kind":"kernel_search_budget_exceeded"}),
+                serde_json::json!({"kind":"output_budget_exceeded"}),
+            ]
+        );
     }
 }
