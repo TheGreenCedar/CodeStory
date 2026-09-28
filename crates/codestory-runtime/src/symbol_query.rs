@@ -193,19 +193,6 @@ pub fn symbol_name_match_rank(query: &str, display_name: &str) -> SymbolNameMatc
     best_symbol_name_match(query, display_name).0
 }
 
-/// Natural-language prompt with embedded symbol-like tokens (not a standalone symbol query).
-#[cfg(test)]
-pub(crate) fn mixed_natural_language_query(query: &str) -> bool {
-    let trimmed = query.trim();
-    if trimmed.is_empty() || looks_like_standalone_symbol_query(trimmed) {
-        return false;
-    }
-    if !trimmed.contains(char::is_whitespace) {
-        return false;
-    }
-    !exact_symbol_query_terms(query).is_empty()
-}
-
 fn trim_symbol_candidate(value: &str) -> &str {
     value.trim().trim_matches(|ch: char| {
         !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '?' | '!' | '~'))
@@ -1755,15 +1742,6 @@ mod tests {
         });
 
         assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&exact.node_id));
-    }
-
-    #[test]
-    fn mixed_natural_language_query_requires_whitespace_and_embedded_symbol() {
-        assert!(mixed_natural_language_query(
-            "how ExtensionHostManager starts"
-        ));
-        assert!(!mixed_natural_language_query("ExtensionHostManager"));
-        assert!(!mixed_natural_language_query("explain the architecture"));
     }
 
     #[test]

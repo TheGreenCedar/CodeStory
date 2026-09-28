@@ -171,7 +171,6 @@ mod semantic_projection;
 mod semantic_republish;
 mod snippets;
 #[cfg(test)]
-mod source_coverage;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]
 pub mod v3_evidence_qualification_support;
@@ -211,8 +210,8 @@ use index_freshness::{
 };
 #[cfg(test)]
 use index_freshness::{
-    EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, arm_after_index_freshness_fence_test_hook,
-    index_freshness_from_storage, indexable_source_path, not_checked_index_freshness,
+    arm_after_index_freshness_fence_test_hook, index_freshness_from_storage, indexable_source_path,
+    not_checked_index_freshness,
 };
 #[cfg(test)]
 use publication::{
@@ -228,12 +227,10 @@ use route_coverage::compare_optional_confidence_desc;
 use route_coverage::route_endpoint_adjusted_search_score;
 #[cfg(test)]
 use search_publication::{
-    SearchGenerationCompletion, llm_doc_embed_batch_size, load_persisted_search_state,
-    search_generation_completion_path, search_index_generation_root, search_index_storage_path,
+    SearchGenerationCompletion, load_persisted_search_state, search_generation_completion_path,
+    search_index_generation_root, search_index_storage_path,
 };
 use search_publication::{load_canonical_search_symbols, retrieval_state_from_storage_for_runtime};
-#[cfg(test)]
-use search_scoring::HybridSearchInstrumentation;
 pub(crate) use search_scoring::HybridSearchScoredHit;
 use search_state_cache::*;
 pub use semantic_projection::SemanticProjectionRepublishOutcome;
@@ -357,16 +354,13 @@ use semantic_projection::{
     SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV,
     SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_STREAM_PENDING_DOCS_ENV,
     SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, SYMBOL_SEARCH_DOC_PROVENANCE, SemanticDocAliasMode,
-    SemanticDocGraphContext, SemanticDocScope, build_component_report_docs,
-    build_llm_symbol_doc_text, build_search_state, build_semantic_file_text_cache_with_limits,
-    dense_anchor_is_central, dense_anchor_reason_for_node, finalize_staged_semantic_docs,
-    flush_pending_dense_anchor_inputs, llm_indexable_kind, llm_indexable_kind_for_scope,
-    llm_indexable_kinds_for_scope, llm_symbol_doc_hash, semantic_doc_alias_mode_from_env,
-    semantic_doc_alias_mode_from_value, semantic_doc_max_tokens_from_env,
-    semantic_doc_scope_from_env, semantic_doc_scope_from_value, semantic_doc_shape_contract,
-    semantic_doc_text_budget_cost, semantic_stream_sort_window_batches_from_env,
-    sort_pending_dense_anchor_inputs, stream_pending_llm_symbol_docs_from_env,
-    truncate_semantic_doc_text_to_token_budget,
+    SemanticDocGraphContext, SemanticDocScope, SemanticRuntimePolicy, build_search_state,
+    build_semantic_file_text_cache_with_limits, dense_anchor_is_central,
+    dense_anchor_reason_for_node, flush_pending_dense_anchor_inputs, llm_indexable_kind,
+    llm_indexable_kind_for_scope, llm_indexable_kinds_for_scope, llm_symbol_doc_hash,
+    semantic_doc_alias_mode_from_value, semantic_doc_scope_from_value,
+    semantic_doc_shape_contract_for_runtime, semantic_doc_text_budget_cost,
+    sort_pending_dense_anchor_inputs,
 };
 pub(crate) use snippets::{
     BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
@@ -561,8 +555,6 @@ pub(crate) use support::{
     source_freshness_telemetry_for_operation,
 };
 #[cfg(test)]
-pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};
-#[cfg(test)]
 use symbol_query::compare_search_hits;
 pub use symbol_query::{
     RetrievalFileRole, SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment,
@@ -574,8 +566,6 @@ pub(crate) use symbol_query::{
     compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_term,
     looks_like_standalone_symbol_query, query_mentions_non_primary_source,
 };
-#[cfg(test)]
-pub(crate) use symbol_query::{is_non_primary_source_hit, mixed_natural_language_query};
 
 type Storage = Store;
 type GraphNodeId = codestory_contracts::graph::NodeId;
@@ -723,9 +713,6 @@ struct AppState {
     observed_core_publication: Option<IndexPublicationDto>,
     is_indexing: bool,
     index_freshness_cache: Option<CachedIndexFreshness>,
-    #[cfg(test)]
-    #[allow(dead_code)]
-    last_hybrid_instrumentation: Option<HybridSearchInstrumentation>,
 }
 
 fn publish_search_engine(

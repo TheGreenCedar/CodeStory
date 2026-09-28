@@ -1,45 +1,39 @@
 use super::{
-    AccessKind, AgentHybridWeightsDto, ApiError, AppController, AppEventPayload,
-    BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, CancellationToken,
-    DEFAULT_SOURCE_FILE_BYTE_CAP, DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
-    DENSE_CENTRAL_SCORE_THRESHOLD, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-    DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason, FileInfo, GraphRequest,
-    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HybridSearchConfig, IndexFreshnessStatusDto,
-    IndexPublicationRecord, IndexWriterGuard, IndexedFileRoleDto, IndexingPhaseTimings,
-    LEGACY_OVERSIZED_SOURCE_POLICY_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,
+    AccessKind, ApiError, AppController, AppEventPayload, BUILD_EDGE_SEED_BATCH_SIZE,
+    CURRENT_SCHEMA_VERSION, CancellationToken, DEFAULT_SOURCE_FILE_BYTE_CAP,
+    DENSE_CENTRAL_RELATIONSHIP_THRESHOLD, DENSE_CENTRAL_SCORE_THRESHOLD, DIRECT_SNIPPET_MAX_BYTES,
+    DIRECT_SNIPPET_TRUNCATION_SUFFIX, DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason,
+    FileInfo, GraphRequest, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV,
+    IndexFreshnessStatusDto, IndexPublicationRecord, IndexWriterGuard, IndexedFileRoleDto,
+    IndexingPhaseTimings, LEGACY_OVERSIZED_SOURCE_POLICY_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,
     LLM_SYMBOL_DOC_SCHEMA_VERSION, NodeId, OVERSIZED_SOURCE_POLICY_VERSION, PUBLICATION_TEST_FAULT,
     PendingLlmSymbolDoc, PublicationTestAction, PublicationTestBoundary, RefreshExecutionPlan,
     RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalIndexManifest, RetrievalModeDto,
-    RetrievalStateDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
-    SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE,
-    SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
-    SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCompletion, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
-    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
-    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
-    SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
-    WorkspaceManifest, apply_hybrid_limits, arm_full_refresh_staged_store_hook,
-    arm_incremental_staged_store_hook, arm_postcommit_before_annotation_rebind_hook,
-    arm_postcommit_cache_refresh_error, arm_publication_test_fault,
-    arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
-    arm_source_policy_before_revalidate_hook, build_component_report_docs,
-    build_llm_symbol_doc_text, build_persisted_search_state_from_canonical_symbols,
-    build_search_state, build_semantic_file_text_cache_with_limits, clamp_usize_to_u32,
-    compare_search_hits, current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
-    extract_symbol_search_terms, file_text_match_line, finalize_staged_semantic_docs,
-    flush_pending_dense_anchor_inputs, graph_edge_dto, index_freshness_from_storage,
-    llm_doc_embed_batch_size, llm_indexable_kind, llm_indexable_kind_for_scope,
+    SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV,
+    SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_STREAM_PENDING_DOCS_ENV,
+    SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine,
+    SearchGenerationCompletion, SearchHit, SearchHitOrigin, SearchPlanChannelDto,
+    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SearchSymbolProjection,
+    SemanticDocAliasMode, SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
+    SemanticRuntimePolicy, SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, Store,
+    SymbolSearchDoc, TrailConfigDto, WorkspaceManifest, aggregate_symbol_matches,
+    arm_full_refresh_staged_store_hook, arm_incremental_staged_store_hook,
+    arm_postcommit_before_annotation_rebind_hook, arm_postcommit_cache_refresh_error,
+    arm_publication_test_fault, arm_semantic_projection_before_revalidate_hook,
+    arm_source_policy_after_plan_hook, arm_source_policy_before_revalidate_hook,
+    build_persisted_search_state_from_canonical_symbols, build_search_state,
+    build_semantic_file_text_cache_with_limits, clamp_usize_to_u32, compare_search_hits,
+    current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
+    extract_symbol_search_terms, file_text_match_line, flush_pending_dense_anchor_inputs,
+    graph_edge_dto, index_freshness_from_storage, llm_indexable_kind, llm_indexable_kind_for_scope,
     llm_indexable_kinds_for_scope, llm_symbol_doc_hash, load_persisted_search_state,
-    mixed_natural_language_query, node_display_name, normalized_hybrid_weights,
-    process_env_test_lock, publish_search_engine, query_has_symbol_or_literal_signal,
-    rebuild_search_state_from_storage, search_generation_completion_path,
-    search_index_generation_root, search_index_storage_path, semantic_doc_alias_mode_from_env,
-    semantic_doc_alias_mode_from_value, semantic_doc_max_tokens_from_env,
-    semantic_doc_scope_from_env, semantic_doc_scope_from_value, semantic_doc_shape_contract,
-    semantic_doc_text_budget_cost, semantic_stream_sort_window_batches_from_env,
-    should_expand_symbol_query, sort_pending_dense_anchor_inputs,
-    stream_pending_llm_symbol_docs_from_env, terminal_symbol_segment,
-    test_sidecar_runtime_from_env, truncate_semantic_doc_text_to_token_budget,
+    node_display_name, process_env_test_lock, publish_search_engine,
+    query_has_symbol_or_literal_signal, rebuild_search_state_from_storage,
+    search_generation_completion_path, search_index_generation_root, search_index_storage_path,
+    semantic_doc_alias_mode_from_value, semantic_doc_scope_from_value,
+    semantic_doc_shape_contract_for_runtime, semantic_doc_text_budget_cost,
+    should_expand_symbol_query, sort_pending_dense_anchor_inputs, terminal_symbol_segment,
+    test_sidecar_runtime_from_env,
 };
 use crate::affected::tests::{EnvGuard, assert_mandatory_retrieval_unavailable};
 use crate::graph_dto::AppGraphFeatureFlags;
@@ -55,7 +49,6 @@ use crate::repo_text::{
 };
 use crate::route_coverage::framework_route_coverage_matrix;
 use crate::search;
-use crate::search::lexical::exact_symbol_merged_lexical_queries;
 use crate::search_intent::indexed_file_matches_language_filter;
 use crate::search_intent::{
     SearchIntentFilter, annotate_search_hit_match_quality, apply_search_intent_filters,
@@ -73,10 +66,7 @@ use crate::search_publication::{
     search_index_path_for_publication, write_search_generation_completion,
 };
 use crate::search_scoring::{
-    HybridHitsContext, dedupe_inexact_search_hits_by_display_key, exact_symbol_lexical_fast_path,
-    exact_symbol_merged_lexical_hybrid_hits, hybrid_hits_for_retrieval_state,
-    hybrid_search_config_for_request, merge_search_hits_by_node_id,
-    primary_source_retention_threshold, should_pretruncate_primary_source_window,
+    dedupe_inexact_search_hits_by_display_key, merge_search_hits_by_node_id,
 };
 use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::attached_comment_for_symbol;
@@ -401,11 +391,18 @@ fn graph_edge_dto_defaults_structural_member_certainty() {
 }
 
 #[test]
-fn llm_doc_embed_batch_size_uses_throughput_default() {
+fn semantic_policy_uses_the_captured_embed_batch_size_not_ambient_env() {
     let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
+    let _env = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "7");
 
-    assert_eq!(llm_doc_embed_batch_size(), 1024);
+    let mut runtime = test_sidecar_runtime_from_env();
+    runtime.retrieval.llm_doc_embed_batch_size = 1_280;
+
+    let policy = SemanticRuntimePolicy::from_runtime(&runtime, DEFAULT_SOURCE_FILE_BYTE_CAP);
+    assert_eq!(
+        policy.anchor_batch_size, 1_280,
+        "semantic publication must size doc batches from the runtime captured at construction"
+    );
 }
 
 #[test]
@@ -513,42 +510,27 @@ fn framework_route_coverage_matrix_lists_coverage_evidence_and_known_gaps() {
 }
 
 #[test]
-fn llm_doc_embed_batch_size_allows_wider_managed_batches() {
+fn semantic_policy_uses_the_captured_stream_sort_window_not_ambient_env() {
     let _lock = process_env_test_lock();
-    let _env = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "1024");
-
-    assert_eq!(llm_doc_embed_batch_size(), 1024);
-}
-
-#[test]
-fn stream_pending_llm_symbol_docs_defaults_to_enabled() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(SEMANTIC_STREAM_PENDING_DOCS_ENV);
-    assert!(stream_pending_llm_symbol_docs_from_env());
-
-    let _env = EnvGuard::set(SEMANTIC_STREAM_PENDING_DOCS_ENV, "false");
-    assert!(!stream_pending_llm_symbol_docs_from_env());
-}
-
-#[test]
-fn semantic_stream_sort_window_defaults_to_one_batch() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV);
-    assert_eq!(semantic_stream_sort_window_batches_from_env(), 1);
-
     let _env = EnvGuard::set(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, "1");
-    assert_eq!(semantic_stream_sort_window_batches_from_env(), 1);
 
-    let _env = EnvGuard::set(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, "999");
-    assert_eq!(semantic_stream_sort_window_batches_from_env(), 16);
+    let mut runtime = test_sidecar_runtime_from_env();
+    runtime.retrieval.llm_doc_embed_batch_size = 300;
+    runtime.retrieval.stream_sort_window_batches = 4;
+
+    let policy = SemanticRuntimePolicy::from_runtime(&runtime, DEFAULT_SOURCE_FILE_BYTE_CAP);
+    assert_eq!(policy.anchor_batch_size, 300);
+    assert_eq!(
+        policy.stream_sort_window_size,
+        300 * 4,
+        "the sort window is batch-size times the captured window-batches setting"
+    );
 }
 
 #[test]
 fn semantic_doc_scope_defaults_to_durable_symbols_and_all_scope_is_opt_in() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV);
     assert_eq!(
-        semantic_doc_scope_from_env(),
+        semantic_doc_scope_from_value(""),
         SemanticDocScope::DurableSymbols
     );
     assert_eq!(
@@ -609,10 +591,8 @@ fn semantic_doc_scope_defaults_to_durable_symbols_and_all_scope_is_opt_in() {
 
 #[test]
 fn semantic_doc_alias_mode_defaults_to_alias_variant() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV);
     assert_eq!(
-        semantic_doc_alias_mode_from_env(),
+        semantic_doc_alias_mode_from_value(""),
         SemanticDocAliasMode::AliasVariant
     );
     assert_eq!(
@@ -630,30 +610,38 @@ fn semantic_doc_alias_mode_defaults_to_alias_variant() {
 }
 
 #[test]
-fn semantic_doc_token_budget_defaults_to_safe_window() {
+fn semantic_policy_uses_the_captured_doc_token_budget_not_ambient_env() {
     let _lock = process_env_test_lock();
-    let _env = EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV);
+    let _env = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "8192");
 
+    let mut runtime = test_sidecar_runtime_from_env();
+    runtime.retrieval.semantic_doc_max_tokens = 128;
+
+    let policy = SemanticRuntimePolicy::from_runtime(&runtime, DEFAULT_SOURCE_FILE_BYTE_CAP);
     assert_eq!(
-        semantic_doc_max_tokens_from_env(),
-        SEMANTIC_DOC_DEFAULT_MAX_TOKENS
+        policy.max_tokens, 128,
+        "the doc token budget comes from the captured runtime, not the ambient variable"
     );
-    assert!(semantic_doc_shape_contract().contains("max_tokens=128"));
+    assert!(
+        semantic_doc_shape_contract_for_runtime(&runtime).contains("max_tokens=128"),
+        "the shape contract must describe the captured budget"
+    );
 }
 
 #[test]
-fn semantic_doc_token_budget_matches_the_owning_module_at_the_clamp_floor() {
+fn semantic_policy_honours_the_owner_clamp_floor_in_the_captured_runtime() {
     let _lock = process_env_test_lock();
     // The setting is declared to codestory-retrieval/src/config.rs, which
-    // clamps a below-floor request up to 16. The runtime used to read the
-    // variable itself and reject a zero back to the 128-token default, so the
-    // same environment described a 16-token budget to publication planning and
-    // a 128-token budget to the projection that wrote the docs.
+    // clamps a below-floor request up to 16. A runtime captured under that
+    // environment must keep the clamped value through projection, even when
+    // the ambient variable later changes.
     let _env = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "0");
+    let runtime = test_sidecar_runtime_from_env();
+    let _env2 = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "4096");
 
-    let owner = codestory_retrieval::retrieval_runtime_config_from_process_env();
-    assert_eq!(owner.semantic_doc_max_tokens, 16);
-    assert_eq!(semantic_doc_max_tokens_from_env(), 16);
+    let policy = SemanticRuntimePolicy::from_runtime(&runtime, DEFAULT_SOURCE_FILE_BYTE_CAP);
+    assert_eq!(policy.max_tokens, 16);
+    assert!(semantic_doc_shape_contract_for_runtime(&runtime).contains("max_tokens=16"));
 }
 
 #[test]
@@ -694,6 +682,24 @@ fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymb
         doc_hash: llm_symbol_doc_hash(doc_text),
         dense_reason: DenseAnchorReason::PublicApi,
     }
+}
+
+pub(super) fn finalize_semantic_docs_for_test(
+    storage: &mut Storage,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<SemanticProjectionStats, ApiError> {
+    crate::semantic_projection::finalize_staged_semantic_docs_for_runtime(
+        storage,
+        None,
+        None,
+        "core:test-publication",
+        cancel_token,
+        runtime,
+        crate::semantic_projection::SemanticProjectionDocumentSource::SourceFiles {
+            max_file_bytes: SourceIndexPolicy::default().byte_cap,
+        },
+    )
 }
 
 fn semantic_policy_node(id: i64, kind: NodeKind, name: &str, file_id: i64) -> Node {
@@ -1458,8 +1464,14 @@ fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
     context
         .edge_digests
         .insert(node.id, vec!["CALL=9".to_string()]);
-    let reports =
-        build_component_report_docs(&context, &[&node], &std::collections::HashMap::new(), 123);
+    let reports = build_component_report_docs_with_policy(
+        &context,
+        &[&node],
+        &std::collections::HashMap::new(),
+        123,
+        SemanticDocAliasMode::AliasVariant,
+        SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
+    );
 
     assert_eq!(reports.len(), 1);
     let report = &reports[0];
@@ -1595,11 +1607,13 @@ fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
         context.file_read_path_for_node(&function_node),
         Some("C:/work/nvm/nvm.sh")
     );
-    let reports = build_component_report_docs(
+    let reports = build_component_report_docs_with_policy(
         &context,
         &semantic_nodes,
         &std::collections::HashMap::new(),
         123,
+        SemanticDocAliasMode::AliasVariant,
+        SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
     );
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].symbol_doc.file_path.as_deref(), Some("nvm.sh"));
@@ -2055,6 +2069,8 @@ fn semantic_doc_text_for_test(
     qualified_name: Option<&str>,
     file_path: &str,
     kind: NodeKind,
+    alias_mode: SemanticDocAliasMode,
+    max_tokens: usize,
 ) -> String {
     let node = Node {
         id: CoreNodeId(10),
@@ -2067,20 +2083,19 @@ fn semantic_doc_text_for_test(
     };
     let graph_context = SemanticDocGraphContext::default();
     let file_text_cache = HashMap::new();
-    build_llm_symbol_doc_text(
+    build_llm_symbol_doc_text_with_policy(
         &graph_context,
         &node,
         display_name,
         Some(file_path),
         &file_text_cache,
+        alias_mode,
+        max_tokens,
     )
 }
 
 #[test]
 fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
     let cases = [
         (
             "rust",
@@ -2141,8 +2156,14 @@ fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() 
     ];
 
     for (language, file_path, display_name, qualified_name, terminal_alias, full_alias) in cases {
-        let doc =
-            semantic_doc_text_for_test(display_name, qualified_name, file_path, NodeKind::FUNCTION);
+        let doc = semantic_doc_text_for_test(
+            display_name,
+            qualified_name,
+            file_path,
+            NodeKind::FUNCTION,
+            SemanticDocAliasMode::CurrentAlias,
+            512,
+        );
         assert!(
             doc.contains(&format!("language: {language}")),
             "doc should include language for {file_path}:\n{doc}"
@@ -2160,14 +2181,13 @@ fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() 
 
 #[test]
 fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
     let doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::CurrentAlias,
+        512,
     );
 
     assert!(
@@ -2192,9 +2212,6 @@ fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
 
 #[test]
 fn semantic_doc_text_reserves_signature_and_body_before_comments_without_fragments() {
-    let _lock = process_env_test_lock();
-    let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
     let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
     let oversized_comment = "OVERSIZED_COMMENT_TOKEN".repeat(24);
     let file_text = format!(
@@ -2217,12 +2234,14 @@ export class SourceGroupCxxCdb {{
     let mut file_text_cache = HashMap::new();
     file_text_cache.insert(file_path.to_string(), Some(file_text));
 
-    let doc = build_llm_symbol_doc_text(
+    let doc = build_llm_symbol_doc_text_with_policy(
         &SemanticDocGraphContext::default(),
         &node,
         "SourceGroupCxxCdb",
         Some(file_path),
         &file_text_cache,
+        SemanticDocAliasMode::AliasVariant,
+        SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
     );
 
     let signature = doc
@@ -2244,14 +2263,13 @@ export class SourceGroupCxxCdb {{
 
 #[test]
 fn semantic_doc_text_token_budget_respects_configured_limit() {
-    let _lock = process_env_test_lock();
-    let _alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "48");
     let doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::CurrentAlias,
+        48,
     );
 
     assert!(
@@ -2273,27 +2291,41 @@ fn semantic_doc_text_token_budget_respects_configured_limit() {
 }
 
 #[test]
-fn semantic_doc_text_token_budget_charges_long_identifiers() {
-    let doc = concat!(
-        "semantic_doc_version: 1\n",
-        "symbol: AppController::openProjectWithStoragePath\n",
-        "path_aliases: crates codestory runtime src lib rs app controller open project ",
-        "storage path AppControllerOpenProjectWithStoragePathRepeatedRepeated\n",
+fn semantic_doc_builder_holds_long_identifiers_inside_the_token_budget() {
+    let hostile = "AppControllerOpenProjectWithStoragePathRepeatedRepeatedRepeatedRepeatedSuffix";
+    let mut node = semantic_policy_node(10, NodeKind::FUNCTION, "build_doc", 1);
+    node.qualified_name = Some(format!("pkg::session::{hostile}"));
+    let context = semantic_policy_context("crates/codestory-runtime/src/lib.rs", &node);
+
+    let doc = build_llm_symbol_doc_text_with_policy(
+        &context,
+        &node,
+        "build_doc",
+        Some("crates/codestory-runtime/src/lib.rs"),
+        &HashMap::new(),
+        SemanticDocAliasMode::CurrentAlias,
+        48,
     );
-    let truncated = truncate_semantic_doc_text_to_token_budget(doc, 36);
 
     assert!(
-        semantic_doc_text_budget_cost(&truncated) <= 36,
-        "budgeted semantic doc should stay under the conservative token proxy:\n{truncated}"
+        semantic_doc_text_budget_cost(&doc) <= 48,
+        "the live builder must hold the doc inside the conservative token proxy:\n{doc}"
     );
     assert!(
-        truncated.split_whitespace().count() < doc.split_whitespace().count(),
-        "long identifier-heavy docs should be truncated earlier than whitespace counts alone"
+        doc.starts_with("semantic_doc_version:"),
+        "the live builder must keep the leading version field:\n{doc}"
     );
     assert!(
-        truncated.contains("symbol: AppController::openProjectWithStoragePath"),
-        "budgeted semantic doc should retain leading symbol identity:\n{truncated}"
+        !doc.contains(hostile) || doc.split_whitespace().any(|token| token.contains(hostile)),
+        "unexpected identifier duplication:\n{doc}"
     );
+    if !doc.contains(hostile) {
+        assert!(
+            !doc.split_whitespace()
+                .any(|token| hostile.starts_with(token) && token.len() >= 12),
+            "a hostile identifier must be dropped whole, never split mid-token:\n{doc}"
+        );
+    }
 }
 
 fn copy_tictactoe_workspace() -> tempfile::TempDir {
@@ -2445,9 +2477,6 @@ fn search_plan_test_hit(
 
 #[test]
 fn repo_explanation_overview_replacement_is_generic_only() {
-    assert!(AppController::is_repo_explanation_search_query(
-        "Explain how this repo fits together"
-    ));
     assert!(!query_has_symbol_or_literal_signal(
         "Explain how this repo fits together"
     ));
@@ -4769,8 +4798,12 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("a parser-partial file must not block publication");
 
-    let observations =
-        crate::source_coverage::observe_source_coverage(&controller, &["job-store.ts".to_string()]);
+    let storage = Storage::open(&storage_path).expect("open storage");
+    let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["job-store.ts".to_string()],
+    );
     assert_eq!(observations.len(), 1);
     assert_eq!(
         observations[0].status,
@@ -4819,6 +4852,8 @@ fn coverage_observation_matches_an_exclusion_by_path_identity() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
 
+    let storage = Storage::open(&storage_path).expect("open storage");
+
     // Every spelling a citation might carry for the same file must resolve to
     // the one exclusion row.
     for spelling in [
@@ -4830,8 +4865,9 @@ fn coverage_observation_matches_an_exclusion_by_path_identity() {
             std::path::MAIN_SEPARATOR
         ),
     ] {
-        let observations = crate::source_coverage::observe_source_coverage(
+        let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
             &controller,
+            &storage,
             std::slice::from_ref(&spelling),
         );
         assert_eq!(observations.len(), 1, "{spelling}: {observations:?}");
@@ -4840,41 +4876,37 @@ fn coverage_observation_matches_an_exclusion_by_path_identity() {
             codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
             "spelling {spelling} must resolve to the exclusion row: {observations:?}"
         );
-        assert_eq!(
-            observations[0].byte_cap,
-            Some(codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP),
-            "the observation must carry the cap that refused the file"
-        );
     }
 
-    // And two spellings of one file are one file: the packet must not ship the
-    // same gap twice. This is why the dedup compares path identity rather than
-    // strings, like everything else here.
-    let duplicated = crate::source_coverage::observe_source_coverage(
+    // Two identical display spellings of one file are one gap: the packet must
+    // not ship the same exclusion twice.
+    let duplicated = crate::agent::packet_compiler::observe_admitted_source_coverage(
         &controller,
-        &[
-            "docs/api.json".to_string(),
-            structural.to_string_lossy().to_string(),
-        ],
+        &storage,
+        &["docs/api.json".to_string(), "docs/api.json".to_string()],
     );
     assert_eq!(
         duplicated.len(),
         1,
-        "two spellings of one file must dedup: {duplicated:?}"
+        "two identical display spellings of one file must dedup: {duplicated:?}"
     );
 
     // Distinct files still get one observation each — the map-not-filter
     // contract, which the dedup must not quietly break.
-    let distinct = crate::source_coverage::observe_source_coverage(
+    let distinct = crate::agent::packet_compiler::observe_admitted_source_coverage(
         &controller,
-        &["docs/api.json".to_string(), "game.kt".to_string()],
+        &storage,
+        &["docs/api.json".to_string(), "rust_tictactoe.rs".to_string()],
     );
     assert_eq!(distinct.len(), 2, "{distinct:?}");
 
     // A file the index did cover must not be reported as excluded, or the cap
     // would fire on every packet in the repository.
-    let covered =
-        crate::source_coverage::observe_source_coverage(&controller, &["game.kt".to_string()]);
+    let covered = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["rust_tictactoe.rs".to_string()],
+    );
     assert_eq!(covered.len(), 1);
     assert_eq!(
         covered[0].status,
@@ -7252,8 +7284,9 @@ fn staged_semantic_finalization_repairs_mixed_dense_anchor_contracts() {
     insert_semantic_fixture_nodes(&mut storage, &file_path);
 
     let _env = hybrid_test_env();
-    let initial_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
-        .expect("initial finalization");
+    let initial_stats =
+        finalize_semantic_docs_for_test(&mut storage, None, &test_sidecar_runtime_from_env())
+            .expect("initial finalization");
     assert!(initial_stats.docs_pending > 0);
     assert_eq!(initial_stats.docs_embedded, 0);
     let seeded_docs = storage
@@ -7277,8 +7310,9 @@ fn staged_semantic_finalization_repairs_mixed_dense_anchor_contracts() {
         )
         .expect("mark one dense anchor contract as stale");
 
-    let repair_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
-        .expect("mixed dense anchor contract should force finalization");
+    let repair_stats =
+        finalize_semantic_docs_for_test(&mut storage, None, &test_sidecar_runtime_from_env())
+            .expect("mixed dense anchor contract should force finalization");
     assert!(repair_stats.docs_pending > 0);
     assert_eq!(repair_stats.docs_embedded, 0);
 
@@ -7370,8 +7404,9 @@ fn staged_full_semantic_projection_streams_bounded_node_pages() {
         .expect("insert shared endpoint edges");
 
     let _env = hybrid_test_env();
-    let stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
-        .expect("stream semantic projection");
+    let stats =
+        finalize_semantic_docs_for_test(&mut storage, None, &test_sidecar_runtime_from_env())
+            .expect("stream semantic projection");
 
     assert_eq!(stats.node_load_rows, 4_097);
     assert_eq!(stats.selected_nodes, 4_097);
@@ -7390,8 +7425,9 @@ fn staged_full_semantic_projection_streams_bounded_node_pages() {
         4_097
     );
 
-    let _scope = EnvGuard::set(SEMANTIC_DOC_SCOPE_ENV, "all");
-    let all_scope_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
+    let mut all_scope_runtime = test_sidecar_runtime_from_env();
+    all_scope_runtime.retrieval.semantic_doc_scope = "all".to_string();
+    let all_scope_stats = finalize_semantic_docs_for_test(&mut storage, None, &all_scope_runtime)
         .expect("repeat all-symbol stream");
     assert_eq!(all_scope_stats.node_load_rows, 4_098);
     assert_eq!(all_scope_stats.selected_nodes, 4_097);
@@ -7624,7 +7660,6 @@ fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_repor
     const STALE_NODE_ID: CoreNodeId = CoreNodeId(900_000);
 
     let _env = hybrid_test_env();
-    let _tokens = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "8192");
     let temp = tempdir().expect("create temp dir");
     let mut files = Vec::new();
     let mut file_nodes = Vec::new();
@@ -7779,9 +7814,11 @@ fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_repor
     let mut streamed = Storage::open_build(&streamed_path).expect("open staged store");
     seed(&mut legacy);
     seed(&mut streamed);
-    let legacy_stats = finalize_staged_semantic_docs(&mut legacy, None, None, None)
+    let mut runtime = test_sidecar_runtime_from_env();
+    runtime.retrieval.semantic_doc_max_tokens = 8_192;
+    let legacy_stats = finalize_semantic_docs_for_test(&mut legacy, None, &runtime)
         .expect("build legacy semantic projection");
-    let streamed_stats = finalize_staged_semantic_docs(&mut streamed, None, None, None)
+    let streamed_stats = finalize_semantic_docs_for_test(&mut streamed, None, &runtime)
         .expect("build streamed semantic projection");
 
     let normalize_symbol_docs = |storage: &Storage| {
@@ -7970,204 +8007,7 @@ fn embedded_exact_symbol_terms_count_and_annotate_exact_hits() {
 }
 
 #[test]
-fn exact_symbol_queries_skip_primary_source_pretruncate() {
-    assert!(
-        !should_pretruncate_primary_source_window("StorageAccess", true, 250, 10),
-        "exact symbol queries need final exact-symbol sorting before truncation"
-    );
-    assert!(should_pretruncate_primary_source_window(
-        "how search ranking works",
-        true,
-        250,
-        10
-    ));
-    assert!(!should_pretruncate_primary_source_window(
-        "how search ranking works",
-        false,
-        250,
-        10
-    ));
-}
-
-#[test]
-fn exact_symbol_fast_path_is_conservative() {
-    let req = |query: &str,
-               hybrid_weights: Option<AgentHybridWeightsDto>,
-               hybrid_limits: Option<SearchHybridLimitsDto>| SearchRequest {
-        query: query.to_string(),
-        repo_text: SearchRepoTextMode::Off,
-        limit_per_source: 10,
-        expand_search_plan: false,
-        hybrid_weights,
-        hybrid_limits,
-    };
-
-    assert!(exact_symbol_lexical_fast_path(
-        &req("Workbench", None, None),
-        None
-    ));
-    assert!(exact_symbol_lexical_fast_path(
-        &req("Subcommand::Exec", None, None),
-        None
-    ));
-    assert!(exact_symbol_lexical_fast_path(
-        &req("check_winner", None, None),
-        None
-    ));
-    assert!(!exact_symbol_lexical_fast_path(
-        &req("authorization", None, None),
-        None
-    ));
-    assert!(!exact_symbol_lexical_fast_path(
-        &req("how ExtensionService starts", None, None),
-        None
-    ));
-    assert!(!exact_symbol_lexical_fast_path(
-        &req(
-            "Workbench",
-            None,
-            Some(SearchHybridLimitsDto {
-                lexical: None,
-                semantic: Some(20),
-            }),
-        ),
-        None
-    ));
-
-    let weights = AgentHybridWeightsDto {
-        lexical: Some(0.25),
-        semantic: Some(0.75),
-        graph: None,
-    };
-    assert!(!exact_symbol_lexical_fast_path(
-        &req("Workbench", Some(weights.clone()), None),
-        Some(&weights)
-    ));
-}
-
-#[test]
-fn exact_symbol_merged_lexical_queries_dedupe_exact_anchor_scan() {
-    assert_eq!(
-        exact_symbol_merged_lexical_queries("Workbench"),
-        vec!["Workbench".to_string()]
-    );
-    assert_eq!(
-        exact_symbol_merged_lexical_queries("Subcommand::Exec"),
-        vec!["Subcommand::Exec".to_string(), "Exec".to_string()]
-    );
-    assert_eq!(
-        exact_symbol_merged_lexical_queries("how ExtensionHostManager starts"),
-        vec!["how ExtensionHostManager starts".to_string()]
-    );
-}
-
-#[test]
-fn exact_symbol_fast_path_returns_lexical_hits_without_semantic_fallback() {
-    let mut engine = SearchEngine::new(None).expect("search engine");
-    engine
-        .index_nodes(vec![(CoreNodeId(1), "Workbench".to_string())])
-        .expect("index nodes");
-    let req = SearchRequest {
-        query: "Workbench".to_string(),
-        repo_text: SearchRepoTextMode::Off,
-        limit_per_source: 10,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
-    };
-    let storage_retrieval = RetrievalStateDto {
-        mode: RetrievalModeDto::Hybrid,
-        hybrid_configured: true,
-        semantic_ready: true,
-        semantic_mode: SemanticModeDto::Enabled,
-        semantic_doc_count: 170_000,
-        embedding_model: Some("test-model".to_string()),
-        current_embedding: None,
-        stored_embedding: None,
-        fallback_reason: None,
-        fallback_message: None,
-    };
-    let graph_boosts = HashMap::new();
-    let mut retrieval = storage_retrieval.clone();
-    let use_exact_symbol_lexical_fast_path = exact_symbol_lexical_fast_path(&req, None);
-
-    let hits = hybrid_hits_for_retrieval_state(
-        &mut engine,
-        HybridHitsContext {
-            req: &req,
-            graph_boosts: &graph_boosts,
-            requested_max_results: 10,
-            request_weights: None,
-            prefer_primary_sources: true,
-            storage_retrieval: &storage_retrieval,
-            use_exact_symbol_lexical_fast_path,
-        },
-        &mut retrieval,
-    );
-
-    assert!(use_exact_symbol_lexical_fast_path);
-    assert_eq!(hits.first().map(|hit| hit.node_id), Some(CoreNodeId(1)));
-    assert_eq!(hits[0].semantic_score, 0.0);
-    assert_eq!(retrieval.fallback_reason, None);
-    assert_eq!(retrieval.fallback_message, None);
-}
-
-#[test]
-fn zero_semantic_request_weights_use_lexical_hits_without_semantic_fallback() {
-    let mut engine = SearchEngine::new(None).expect("search engine");
-    engine
-        .index_nodes(vec![(CoreNodeId(1), "ExtensionHostManager".to_string())])
-        .expect("index nodes");
-    let req = SearchRequest {
-        query: "ExtensionHostManager".to_string(),
-        repo_text: SearchRepoTextMode::Off,
-        limit_per_source: 10,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
-    };
-    let storage_retrieval = RetrievalStateDto {
-        mode: RetrievalModeDto::Hybrid,
-        hybrid_configured: true,
-        semantic_ready: true,
-        semantic_mode: SemanticModeDto::Enabled,
-        semantic_doc_count: 170_000,
-        embedding_model: Some("test-model".to_string()),
-        current_embedding: None,
-        stored_embedding: None,
-        fallback_reason: None,
-        fallback_message: None,
-    };
-    let graph_boosts = HashMap::new();
-    let mut retrieval = storage_retrieval.clone();
-    let request_weights = AgentHybridWeightsDto {
-        lexical: Some(1.0),
-        semantic: Some(0.0),
-        graph: Some(0.0),
-    };
-
-    let hits = hybrid_hits_for_retrieval_state(
-        &mut engine,
-        HybridHitsContext {
-            req: &req,
-            graph_boosts: &graph_boosts,
-            requested_max_results: 10,
-            request_weights: Some(request_weights),
-            prefer_primary_sources: true,
-            storage_retrieval: &storage_retrieval,
-            use_exact_symbol_lexical_fast_path: false,
-        },
-        &mut retrieval,
-    );
-
-    assert_eq!(hits.first().map(|hit| hit.node_id), Some(CoreNodeId(1)));
-    assert_eq!(hits[0].semantic_score, 0.0);
-    assert_eq!(retrieval.fallback_reason, None);
-    assert_eq!(retrieval.fallback_message, None);
-}
-
-#[test]
-fn exact_symbol_merged_lexical_hits_include_terminal_symbol_matches() {
+fn expanded_symbol_search_keeps_terminal_matches_and_uniqueness() {
     let mut engine = SearchEngine::new(None).expect("search engine");
     engine
         .index_nodes(vec![
@@ -8180,21 +8020,23 @@ fn exact_symbol_merged_lexical_hits_include_terminal_symbol_matches() {
         ])
         .expect("index nodes");
 
-    let hits = exact_symbol_merged_lexical_hybrid_hits(
-        &engine,
-        "exec_events::ThreadEvent",
-        &HashMap::new(),
-    );
-    let ids = hits.iter().map(|hit| hit.node_id).collect::<Vec<_>>();
+    let query = "exec_events::ThreadEvent";
+    let direct = engine.search_symbol_with_scores(query);
+    let mut expanded = Vec::new();
+    for term in extract_symbol_search_terms(query) {
+        expanded.extend(engine.search_symbol_with_scores(&term));
+    }
+    let merged = aggregate_symbol_matches(direct, expanded);
+    let ids: Vec<_> = merged.iter().map(|(id, _)| *id).collect();
 
     assert!(
         ids.contains(&CoreNodeId(2)),
-        "terminal exact symbol should be admitted beside qualified aliases: {ids:?}"
+        "the terminal segment must admit the exact terminal symbol beside qualified aliases: {ids:?}"
     );
     assert_eq!(
         ids.iter().filter(|id| **id == CoreNodeId(2)).count(),
         1,
-        "exact-symbol merging should preserve node uniqueness: {ids:?}"
+        "symbol merging should preserve node uniqueness: {ids:?}"
     );
 }
 

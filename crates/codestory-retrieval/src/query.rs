@@ -2961,6 +2961,7 @@ mod tests {
         )
         .expect("write");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         {
             let mut storage = Store::open(&storage_path).expect("open db");
@@ -3040,19 +3041,23 @@ mod tests {
                 }])
                 .expect("semantic doc");
         }
-        if let Err(error) = finalize_index(project.path(), &storage_path) {
+        if let Err(error) = crate::config::with_test_cache_root(cache_root.path(), || {
+            finalize_index(project.path(), &storage_path)
+        }) {
             eprintln!(
                 "skipping live retrieval query fixture because sidecar indexing failed: {error:#}"
             );
             return;
         }
 
-        let result = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "extension",
-            budget_ms: Some(500),
-            cancelled: None,
+        let result = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "extension",
+                budget_ms: Some(500),
+                cancelled: None,
+            })
         })
         .expect("query");
 
@@ -3064,6 +3069,7 @@ mod tests {
     fn query_rejects_legacy_manifest_before_sidecar_access() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let project_id = crate::index::project_id_for_root(project.path());
         {
@@ -3096,12 +3102,14 @@ mod tests {
                 .expect("manifest");
         }
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "ExtensionHostManager",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "ExtensionHostManager",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("legacy manifests must fail closed");
 
@@ -3112,6 +3120,7 @@ mod tests {
     fn query_rejects_manifest_with_stale_projection_count() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let project_id = crate::index::project_id_for_root(project.path());
         {
@@ -3121,12 +3130,14 @@ mod tests {
                 .expect("manifest");
         }
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "ExtensionHostManager",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "ExtensionHostManager",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("stale manifests must fail closed");
 
@@ -3137,6 +3148,7 @@ mod tests {
     fn query_rejects_manifest_when_indexed_file_changes_or_is_removed() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let source_path = project.path().join("src").join("lib.rs");
         std::fs::create_dir_all(source_path.parent().expect("source parent"))
@@ -3169,12 +3181,14 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(&source_path, "pub fn indexed() -> usize { 1 }\n").expect("mutate source");
-        let changed_error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "indexed",
-            budget_ms: Some(100),
-            cancelled: None,
+        let changed_error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "indexed",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("changed indexed file must fail closed");
         assert!(
@@ -3184,12 +3198,14 @@ mod tests {
         );
 
         std::fs::remove_file(&source_path).expect("remove source");
-        let removed_error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "indexed",
-            budget_ms: Some(100),
-            cancelled: None,
+        let removed_error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "indexed",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("removed indexed file must fail closed");
         assert!(
@@ -3203,6 +3219,7 @@ mod tests {
     fn query_rejects_manifest_when_new_indexable_file_is_added() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let source_path = project.path().join("src").join("lib.rs");
         std::fs::create_dir_all(source_path.parent().expect("source parent"))
@@ -3238,12 +3255,14 @@ mod tests {
         )
         .expect("write new source");
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "newly_added",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "newly_added",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("new indexable file must fail closed");
 

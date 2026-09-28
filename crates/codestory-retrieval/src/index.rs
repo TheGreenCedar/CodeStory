@@ -5382,13 +5382,16 @@ mod tests {
         let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
         let storage_dir = TempDir::new().expect("storage dir");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         {
             let storage = Store::open(&storage_path).expect("open empty db");
             drop(storage);
         }
-        let error = finalize_index(project.path(), &storage_path)
-            .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            finalize_index(project.path(), &storage_path)
+        })
+        .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
         let message = format!("{error:#}");
         assert!(
             message.contains("mandatory")
