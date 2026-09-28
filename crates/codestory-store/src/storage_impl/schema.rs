@@ -544,6 +544,20 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
 
+// Child-key-leading indexes for every proof_resolution_fact foreign key a
+// file-projection deletion validates. They belong to the load-time set — not
+// the deferred secondary set — because an incremental stage cloned from an
+// older publication runs graph cleanup before deferred index creation, and
+// without them every deleted node/edge rescans the retained fact table.
+const PROOF_RESOLUTION_FK_INDEX_STATEMENTS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_target
+     ON proof_resolution_fact(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_raw_target
+     ON proof_resolution_fact(raw_edge_target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_edge
+     ON proof_resolution_fact(edge_id)",
+];
+
 const NODE_CANONICAL_SUFFIX_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_node_canonical_suffix
      ON node(COALESCE(substr(CAST(canonical_id AS BLOB), -32), X''))";
 
@@ -587,7 +601,17 @@ pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
 }
 
 pub(super) fn create_load_indexes(conn: &Connection) -> Result<(), StorageError> {
-    for statement in LOAD_TIME_INDEX_STATEMENTS {
+    for statement in LOAD_TIME_INDEX_STATEMENTS
+        .iter()
+        .chain(PROOF_RESOLUTION_FK_INDEX_STATEMENTS)
+    {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+fn create_proof_resolution_fk_indexes(conn: &Connection) -> Result<(), StorageError> {
+    for statement in PROOF_RESOLUTION_FK_INDEX_STATEMENTS {
         conn.execute(statement, [])?;
     }
     Ok(())
@@ -835,6 +859,15 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
     {
         migrate_v35_attached_comment_evidence(&storage.conn)?;
+    }
+    if stored_version < PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        // Unconditional in both build and live modes: an incremental stage
+        // cloned from an index-less predecessor deletes graph rows before
+        // deferred index creation, so the proof-fact FK child indexes must
+        // exist at open.
+        create_proof_resolution_fk_indexes(&storage.conn)?;
     }
     create_indexes(&storage.conn, index_mode)?;
 

@@ -132,6 +132,15 @@ string and suffix collisions. Live migration replaces the indexes and advances
 the schema version in one transaction, while staged builds use the existing
 deferred-index fence.
 
+Schema v36 adds child-key-leading indexes on the `proof_resolution_fact`
+foreign keys a file-projection deletion validates (`target_node_id`,
+`raw_edge_target_id`, `edge_id`). They belong to the load-time index set, not
+the deferred secondary set: an incremental stage cloned from a publication
+that predates them runs graph cleanup before deferred index creation, and
+without them every deleted node and edge rescans the retained fact table. The
+partial unique `idx_proof_resolution_exact_edge` index stays, but a partial
+index can never serve the unconditional foreign-key child check.
+
 The projection transaction also replaces file-scoped errors and marks
 grounding summary/detail plus resolution-support state dirty. Those writes do
 not follow the graph commit as independent autocommits. Store telemetry counts
