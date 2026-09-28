@@ -151,10 +151,7 @@ pub(super) fn full_refresh_required_error(
     reason: impl AsRef<str>,
 ) -> ApiError {
     let project = root.to_string_lossy().to_string();
-    let next_command = format!(
-        "codestory-cli index --project {} --refresh full",
-        quote_refresh_command_argument(&project)
-    );
+    let next_command = full_refresh_command(root);
     ApiError::with_details(
         FULL_REFRESH_REQUIRED_ERROR_CODE,
         format!(
@@ -185,6 +182,193 @@ fn quote_refresh_command_argument(value: &str) -> String {
 #[cfg(not(windows))]
 fn quote_refresh_command_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The exact refresh command a stale-schema surface must name.
+pub(super) fn full_refresh_command(root: &Path) -> String {
+    format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_refresh_command_argument(&root.to_string_lossy())
+    )
+}
+
+/// The typed stale-schema failure for observational surfaces. `status`,
+/// `doctor`, and `resources/read` report this instead of `internal`, carrying
+/// the rebuild command an operator or host can act on.
+pub(super) fn core_schema_upgrade_required_error(
+    root: &Path,
+    found: u32,
+    required: u32,
+) -> ApiError {
+    core_schema_recovery_error(
+        root,
+        "core_schema_upgrade_required",
+        format!("Core cache schema {found} requires a full index to upgrade to schema {required}"),
+    )
+}
+
+/// The typed refusal when the cached core was written by a newer binary than
+/// the one reading it. Migrations are forward-only, so the recovery is the
+/// derived-cache quarantine sequence, not a bare refresh. The message keeps
+/// the "unsupported database schema version" wording the CLI's downgrade
+/// guidance matches on.
+pub(super) fn core_schema_too_new_error(root: &Path, found: u32, required: u32) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let quoted = quote_refresh_command_argument(&project);
+    let reset_dry_run =
+        format!("codestory-cli cache reset --project {quoted} --derived-only --dry-run");
+    let reset_confirm =
+        format!("codestory-cli cache reset --project {quoted} --derived-only --confirm");
+    let rebuild = full_refresh_command(root);
+    let doctor = format!("codestory-cli doctor --project {quoted} --format markdown");
+    ApiError::with_details(
+        "core_schema_too_new",
+        format!(
+            "Unsupported database schema version {found} (max supported: {required}); the cache was written by a newer CodeStory"
+        ),
+        ApiErrorDetails {
+            cause_code: Some("core_schema_too_new".to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![
+                reset_dry_run.clone(),
+                reset_confirm.clone(),
+                rebuild.clone(),
+            ],
+            minimum_next: vec![reset_dry_run, reset_confirm, rebuild],
+            full_repair: vec![doctor],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            disk_space: None,
+            coverage_gaps: Vec::new(),
+        },
+    )
+}
+
+fn core_schema_recovery_error(root: &Path, code: &str, message: String) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let next_command = full_refresh_command(root);
+    ApiError::with_details(
+        code,
+        message,
+        ApiErrorDetails {
+            cause_code: Some(code.to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![next_command.clone()],
+            minimum_next: vec![next_command.clone()],
+            full_repair: vec![next_command],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            disk_space: None,
+            coverage_gaps: Vec::new(),
+        },
+    )
+}
+
+/// Map a store open refusal on an observational read into the compatibility
+/// contract: a typed schema mismatch is stale, fenced, or forward-incompatible
+/// state a full refresh rebuilds, never an internal failure.
+pub(super) fn core_schema_observation_error(
+    root: &Path,
+    context: &str,
+    error: codestory_store::StorageError,
+) -> ApiError {
+    match error {
+        codestory_store::StorageError::SchemaVersionMismatch { found, .. }
+            if found == codestory_store::INCOMPLETE_INCREMENTAL_SCHEMA_VERSION =>
+        {
+            full_refresh_required_error(
+                root,
+                "incomplete_incremental_run",
+                format!("incomplete_incremental_run:schema={found}"),
+            )
+        }
+        codestory_store::StorageError::SchemaVersionMismatch {
+            found, required, ..
+        } if found > required => core_schema_too_new_error(root, found, required),
+        codestory_store::StorageError::SchemaVersionMismatch {
+            found, required, ..
+        } => core_schema_upgrade_required_error(root, found, required),
+        other => ApiError::internal(format!("{context}: {other}")),
+    }
+}
+
+/// A project cache under the process cache root whose durable core schema is
+/// not the one this binary serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleCachedCore {
+    /// The per-project cache directory (`<cache_root>/<workspace-id>`).
+    pub cache_dir: PathBuf,
+    /// The project root recovered from the cache's indexed source paths, when
+    /// the core is readable enough to derive one.
+    pub project_root: Option<PathBuf>,
+    /// The durable schema version observed in the core.
+    pub found_schema: u32,
+    /// The schema version this binary serves.
+    pub required_schema: u32,
+}
+
+/// Enumerate cached projects whose core schema is not current. This is an
+/// observational read of the cache root: caches are opened through the
+/// non-mutating schema reader only, so nothing is migrated, recovered, or
+/// opened read-write. Caches that cannot be observed (mid-promotion, owned by
+/// another product, missing an image) are skipped rather than reported.
+/// `exclude_cache_dir` removes the caller's own project cache, which
+/// observational commands already report directly.
+pub fn observe_stale_cached_cores(
+    process_cache_root: &Path,
+    exclude_cache_dir: &Path,
+) -> Vec<StaleCachedCore> {
+    let mut stale = Vec::new();
+    let excluded = std::fs::canonicalize(exclude_cache_dir)
+        .unwrap_or_else(|_| exclude_cache_dir.to_path_buf());
+    let Ok(entries) = std::fs::read_dir(process_cache_root) else {
+        return stale;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone()) == excluded {
+            continue;
+        }
+        let storage_path = dir.join(codestory_store::CORE_DATABASE_FILE);
+        if !dir.join(codestory_store::CORE_DIRECTORY).is_dir() && !storage_path.is_file() {
+            continue;
+        }
+        let Ok(found_schema) = Store::database_schema_version_observational(&storage_path) else {
+            continue;
+        };
+        if found_schema == CURRENT_SCHEMA_VERSION {
+            continue;
+        }
+        let project_root = Store::database_indexed_source_root_observational(&storage_path)
+            .ok()
+            .flatten();
+        stale.push(StaleCachedCore {
+            cache_dir: dir,
+            project_root,
+            found_schema,
+            required_schema: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    stale.sort_by(|a, b| a.cache_dir.cmp(&b.cache_dir));
+    stale
+}
+
+/// Map a store open refusal into the compatibility contract: a typed schema
+/// mismatch is stale, fenced, or forward-incompatible state, never an internal
+/// failure.
+pub(super) fn schema_observation_error(
+    root: &Path,
+    context: &str,
+    error: codestory_store::StorageError,
+) -> ApiError {
+    core_schema_observation_error(root, context, error)
 }
 
 pub(super) fn ensure_incremental_refresh_compatible(
@@ -226,9 +410,11 @@ pub(super) fn ensure_incremental_refresh_compatible(
         return Err(full_refresh_required_error(root, reason_code, reason));
     }
     let storage = Store::open_freshness_observational(storage_path).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to inspect incremental refresh compatibility: {error}"
-        ))
+        schema_observation_error(
+            root,
+            "Failed to inspect incremental refresh compatibility",
+            error,
+        )
     })?;
     if storage.has_incomplete_incremental_run().map_err(|error| {
         ApiError::internal(format!(

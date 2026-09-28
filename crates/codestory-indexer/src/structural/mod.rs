@@ -450,9 +450,11 @@ fn validate_yaml_syntax(source: &str) -> Result<(), StructuralCollectionError> {
 }
 
 fn structural_extension(path: &Path) -> Option<String> {
+    // Admission normalizes through the shared contracts helper; dispatch must
+    // agree or an admitted path has no producer.
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
+        .map(codestory_contracts::language_support::normalize_extension)
 }
 
 fn file_modification_time(path: &Path) -> i64 {

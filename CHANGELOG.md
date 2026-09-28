@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Indexing a file whose extension carries trailing whitespace no longer panics; the file is indexed under its real extension.
+- Markdown failure output now shows the same cause chain and recovery command that JSON output already carried, and `codestory-cli doctor --support-bundle <file>` writes a local redacted bundle (panic site, payload sizes, command-failure causes) for support reports.
+- A project index built by an older CodeStory release is reported as a schema upgrade requirement with an explicit recovery command — `codestory-cli index --project <root> --refresh full` — and the next product call rebuilds it into a fresh generation without touching the old one. `doctor` also lists other cached projects whose cores need the same upgrade.
+- Repositories past the 25,000-file freshness-scan bound now surface a warning in `index` output and a `warn` check in `doctor`, instead of silently reporting the inventory as merely unchecked.
+- The user guide documents connecting arbitrary MCP hosts, including the `CODESTORY_CLI` override, and the managed-CLI containment failure now explains how to fix it.
 - Snippet and source reads for an indexed symbol now verify file bytes against the indexed content hash and refuse stale or missing source with a typed error instead of returning mismatched text.
 - During a refresh, source-backed reads wait for the fresh index while graph-only answers may come from the retained publication; results served that way are labelled `historical` under `_meta.codestory_publication.freshness`.
 - When another CodeStory session is already refreshing the same project, a second session now waits for it to finish and adopts its publication instead of failing with a busy error.

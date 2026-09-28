@@ -4436,7 +4436,9 @@ fn handle_stdio_tool_call(
     match name {
         "status" => read_stdio_status_resource_cached(runtime, state)
             .map(|status| serde_json::json!({"result": compact_stdio_status(runtime, &status)}))
-            .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+            .unwrap_or_else(
+                |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
+            ),
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
         "ground" => handle_stdio_ground(runtime, request),
@@ -6105,8 +6107,8 @@ fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection 
 /// boundary without a typed cause; `architecture_contracts` forbids adding new
 /// stringified paths beside it.
 fn stdio_typed_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> serde_json::Value {
-    if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
-        return serde_json::to_value(build_ambiguous_target_error_output(
+    let mut value = if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+        serde_json::to_value(build_ambiguous_target_error_output(
             &runtime.project_root,
             ambiguous,
         ))
@@ -6117,14 +6119,25 @@ fn stdio_typed_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> s
                 "ambiguous_target",
                 ambiguous.to_string(),
             ))
-        });
+        })
+    } else if let Some(api_error) = crate::runtime::api_error_in_chain(error) {
+        stdio_api_error_value(api_error.clone())
+    } else {
+        stdio_api_error_value(codestory_contracts::api::ApiError::internal(
+            error.to_string(),
+        ))
+    };
+    // The legacy `{"error": string}` shape surfaced the rendered message
+    // (code prefix plus recovery commands) as the JSON-RPC message text. Keep
+    // that text so message-only readers see the same words; the typed code and
+    // details now ride alongside it in the object.
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "message".to_string(),
+            serde_json::json!(error.to_string()),
+        );
     }
-    if let Some(api_error) = crate::runtime::api_error_in_chain(error) {
-        return stdio_api_error_value(api_error.clone());
-    }
-    stdio_api_error_value(codestory_contracts::api::ApiError::internal(
-        error.to_string(),
-    ))
+    value
 }
 
 fn read_stdio_resource(
@@ -6145,7 +6158,9 @@ fn read_stdio_resource(
     };
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(|error| {
+            serde_json::json!({"error": stdio_typed_error_value(runtime, &error)})
+        })
 }
 
 fn read_stdio_static_resource(resource: &ParsedStdioResource) -> serde_json::Value {
@@ -6240,7 +6255,7 @@ fn read_stdio_status_resource_base_cached(
     for attempt in 1..=STDIO_STATUS_PUBLICATION_ATTEMPTS {
         let publication_before = runtime
             .project
-            .complete_index_publication_at(&runtime.storage_path)
+            .complete_index_publication_at(&runtime.project_root, &runtime.storage_path)
             .map_err(map_api_error)?;
         let mut value = read_stdio_status_resource_uncached(runtime, state)?;
         completed_refresh = completed_refresh.or_else(|| {
@@ -6253,7 +6268,7 @@ fn read_stdio_status_resource_base_cached(
         });
         let publication_after = runtime
             .project
-            .complete_index_publication_at(&runtime.storage_path)
+            .complete_index_publication_at(&runtime.project_root, &runtime.storage_path)
             .map_err(map_api_error)?;
         let cache_key = stdio_status_cache_key_with_publication(
             runtime,
@@ -6466,7 +6481,7 @@ fn read_stdio_status_resource_uncached(
 fn stdio_complete_publication_fingerprint(runtime: &RuntimeContext) -> String {
     match runtime
         .project
-        .complete_index_publication_at(&runtime.storage_path)
+        .complete_index_publication_at(&runtime.project_root, &runtime.storage_path)
     {
         Ok(publication) => stdio_publication_fingerprint(publication.as_ref()),
         Err(error) => format!("error:{error:?}"),

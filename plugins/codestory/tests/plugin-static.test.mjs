@@ -7760,6 +7760,37 @@ test("download failure hints stay structured and actionable", () => {
   assert.equal(launcherTest.managedCliDownloadHint(null, "managed_cli_probe_failed"), null);
 });
 
+test("manifest path escape keeps its subreason and gets an actionable hint", () => {
+  // The containment check stays, but the surfaced code must carry the real
+  // cause so the hint can say what to fix instead of the bare staging label.
+  const escaped = new Error("managed_cli_staging_verification_failed:manifest_path_escape");
+  const escapedCode = launcherTest.managedCliFailureCode(escaped);
+  assert.equal(escapedCode, "managed_cli_staging_verification_failed:manifest_path_escape");
+
+  const hint = launcherTest.managedCliDownloadHint(null, escapedCode);
+  assert.match(hint, /hard link or a real copy/u);
+  assert.match(hint, /symlink/u);
+  assert.match(hint, /revision-hashed/u);
+  assert.match(hint, /CODESTORY_CLI/u);
+
+  // Unknown subreasons still collapse to the generic staging label.
+  const unknown = new Error("managed_cli_staging_verification_failed:unexpected_detail");
+  assert.equal(
+    launcherTest.managedCliFailureCode(unknown),
+    "managed_cli_staging_verification_failed",
+  );
+
+  // The staged-verification failure propagates through the provision failure
+  // record, so preparing responses expose the preserved code and the hint.
+  const warnings = [];
+  const warning = launcherTest.recordManagedCliProvisionFailure(warnings, escaped);
+  assert.equal(
+    warning,
+    "managed_cli_provision_failed:managed_cli_staging_verification_failed:manifest_path_escape",
+  );
+  assert.match(launcherTest.managedCliProvisionFailure.hint, /hard link or a real copy/u);
+});
+
 test("mcp launcher keeps managed provision failures primary", async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));

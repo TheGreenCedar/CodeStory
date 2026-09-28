@@ -89,7 +89,10 @@ const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
 const SCHEMA_VERSION: u32 = PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
-const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
+/// The `user_version` sentinel stamped while an incremental index run is
+/// incomplete. Read surfaces must distinguish the fence from a real
+/// forward-incompatible schema even though it sorts above `SCHEMA_VERSION`.
+pub const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
 /// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
@@ -2603,10 +2606,34 @@ pub enum StorageError {
     },
     #[error("Resolution support snapshot exceeds the current SQLite value limit")]
     ResolutionSupportSnapshotTooBig,
+    /// A read-only or observational open refused a publication whose durable
+    /// `user_version` is not the schema this binary serves. `found`/`required`
+    /// keep the refusal typed so callers can route stale cores into managed
+    /// preparation instead of reporting a string match.
+    #[error("{surface} requires schema version {required}, found {found}")]
+    SchemaVersionMismatch {
+        surface: &'static str,
+        required: u32,
+        found: u32,
+    },
     #[error("Invalid enum value: {0}")]
     EnumConversion(#[from] EnumConversionError),
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// The typed refusal for a `PRAGMA user_version` that is not `SCHEMA_VERSION`.
+/// `found`/`required` keep the refusal typed so callers can route a stale core
+/// into managed preparation instead of matching on message text. A publication
+/// written by a newer binary reaches the same variant — a full refresh rebuilds
+/// either direction — while mutable writer opens keep their long-standing
+/// "unsupported" contract for the forward-incompatible case.
+fn schema_version_mismatch_error(surface: &'static str, version: u32) -> StorageError {
+    StorageError::SchemaVersionMismatch {
+        surface,
+        required: SCHEMA_VERSION,
+        found: version,
+    }
 }
 
 /// One reusable parser artifact to persist in the index artifact cache.
@@ -5107,9 +5134,7 @@ impl Storage {
                     "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
                 )));
             }
-            return Err(StorageError::Other(format!(
-                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error("Read-only storage", version));
         }
         Ok(Self {
             conn,
@@ -5166,9 +5191,10 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Immutable core generation requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error(
+                "Immutable core generation",
+                version,
+            ));
         }
         Ok(Self {
             conn,
@@ -5213,6 +5239,53 @@ impl Storage {
     pub fn database_schema_version_observational(path: &Path) -> Result<u32, StorageError> {
         let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
         storage.schema_version()
+    }
+
+    /// The deepest directory containing every indexed source path, observed
+    /// without mutating or migrating the database. `None` when the core has no
+    /// file rows, the `file` table predates the path column, or no common
+    /// directory prefix exists. Diagnostics use it to name the project a stale
+    /// cache belongs to.
+    pub fn database_indexed_source_root_observational(
+        path: &Path,
+    ) -> Result<Option<PathBuf>, StorageError> {
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
+        let has_file_table: Option<i64> = storage
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if has_file_table.is_none() {
+            return Ok(None);
+        }
+        let bounds = storage
+            .conn
+            .query_row("SELECT MIN(path), MAX(path) FROM file", [], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        let Some((Some(low), Some(high))) = bounds else {
+            return Ok(None);
+        };
+        let common_len = low
+            .chars()
+            .zip(high.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum::<usize>();
+        let prefix = &low[..common_len];
+        let cut = prefix.rfind(|c| c == '/' || c == '\\').unwrap_or(0);
+        let root = &prefix[..cut];
+        if root.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PathBuf::from(root)))
     }
 
     fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
@@ -5305,9 +5378,10 @@ impl Storage {
         let version = version.max(0) as u32;
         match policy {
             NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
-                )));
+                return Err(schema_version_mismatch_error(
+                    "Observational storage",
+                    version,
+                ));
             }
             NonmutatingOpenPolicy::FreshnessFence
                 if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
@@ -5320,14 +5394,13 @@ impl Storage {
             NonmutatingOpenPolicy::FreshnessFence
                 if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => {}
             NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
-                )));
+                return Err(schema_version_mismatch_error(
+                    "Freshness observation",
+                    version,
+                ));
             }
             NonmutatingOpenPolicy::ProofValidation if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Proof validation requires schema version {SCHEMA_VERSION}, found {version}"
-                )));
+                return Err(schema_version_mismatch_error("Proof validation", version));
             }
             NonmutatingOpenPolicy::SchemaVersion => {}
             _ => {}
@@ -5619,9 +5692,10 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Artifact-cache reader requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error(
+                "Artifact-cache reader",
+                version,
+            ));
         }
         Ok(Some(IndexArtifactCacheReader { conn }))
     }

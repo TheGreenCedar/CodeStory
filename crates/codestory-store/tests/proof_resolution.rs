@@ -1508,10 +1508,7 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
     let second_fact = repeated_exact_fact(1);
     let second_facts = vec![expected_fact.clone(), second_fact.clone()];
     let second_receipt = store
-        .replace_proof_resolution_projection(
-            &second_publication,
-            &projection(second_facts.clone()),
-        )
+        .replace_proof_resolution_projection(&second_publication, &projection(second_facts.clone()))
         .expect("a distinct publication replaces the projection");
 
     store
@@ -1534,10 +1531,7 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
         published_at_epoch_ms: 789,
     };
     let error = store
-        .replace_proof_resolution_projection(
-            &third_publication,
-            &projection(second_facts.clone()),
-        )
+        .replace_proof_resolution_projection(&third_publication, &projection(second_facts.clone()))
         .expect_err("the injected shared provenance write must fail");
     assert!(
         error
@@ -1546,10 +1540,7 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
         "the reached failure must be the injected trigger, got: {error}"
     );
 
-    assert_eq!(
-        store.get_proof_resolution_facts().unwrap(),
-        second_facts
-    );
+    assert_eq!(store.get_proof_resolution_facts().unwrap(), second_facts);
     assert_eq!(
         store.get_proof_resolution_publication().unwrap(),
         Some(second_receipt)

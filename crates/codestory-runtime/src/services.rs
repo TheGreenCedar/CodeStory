@@ -557,6 +557,11 @@ enum CompleteCoreAdmission {
     Complete,
     Cold,
     Fenced,
+    /// The core exists but its durable schema is not the one this binary
+    /// serves. Activation rebuilds into a new generation, so callers that own
+    /// activation treat this like a cold read; non-activating callers surface
+    /// the typed failure.
+    StaleSchema(ApiError),
     Corrupt(ApiError),
 }
 
@@ -1045,7 +1050,9 @@ impl ActivationService {
         match self.classify_complete_core_admission(project_root, storage_path) {
             CompleteCoreAdmission::Complete => return Ok(()),
             CompleteCoreAdmission::Corrupt(error) => return Err(error),
-            CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
+            CompleteCoreAdmission::Cold
+            | CompleteCoreAdmission::Fenced
+            | CompleteCoreAdmission::StaleSchema(_) => {}
         }
 
         match self.activate_with_goal(
@@ -1087,7 +1094,9 @@ impl ActivationService {
         }
         match self.classify_complete_core_admission(project_root, storage_path) {
             CompleteCoreAdmission::Complete => Ok(()),
-            CompleteCoreAdmission::Corrupt(error) => Err(error),
+            CompleteCoreAdmission::Corrupt(error) | CompleteCoreAdmission::StaleSchema(error) => {
+                Err(error)
+            }
             CompleteCoreAdmission::Cold => Err(ApiError::new(
                 "proof_semantic_projection_unavailable",
                 "no complete exact-proof core publication is available",
@@ -1115,6 +1124,17 @@ impl ActivationService {
         }
         let freshness = match Store::open_freshness_observational(storage_path) {
             Ok(storage) => storage,
+            Err(codestory_store::StorageError::SchemaVersionMismatch {
+                found, required, ..
+            }) => {
+                return CompleteCoreAdmission::StaleSchema(
+                    crate::index_incremental::core_schema_upgrade_required_error(
+                        project_root,
+                        found,
+                        required,
+                    ),
+                );
+            }
             Err(error) => {
                 return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
                     "Failed to inspect storage admission state: {error}"
@@ -1138,6 +1158,9 @@ impl ActivationService {
         ) {
             Ok(Some(summary)) if summary.publication.is_some() => CompleteCoreAdmission::Complete,
             Ok(_) => CompleteCoreAdmission::Cold,
+            Err(error) if error.code == "core_schema_upgrade_required" => {
+                CompleteCoreAdmission::StaleSchema(error)
+            }
             Err(error) => CompleteCoreAdmission::Corrupt(error),
         }
     }
@@ -3606,9 +3629,11 @@ impl ProjectService {
 
     pub fn complete_index_publication_at(
         &self,
+        project_root: &std::path::Path,
         storage_path: &std::path::Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        self.controller.complete_index_publication_at(storage_path)
+        self.controller
+            .complete_index_publication_at(project_root, storage_path)
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
@@ -8236,7 +8261,7 @@ pub(crate) mod activation_tests {
             .expect("publish complete core");
         let before = runtime
             .project_service()
-            .complete_index_publication_at(&storage_path)
+            .complete_index_publication_at(project.path(), &storage_path)
             .expect("read publication")
             .expect("complete publication");
 
@@ -8312,6 +8337,104 @@ pub(crate) mod activation_tests {
             .expect_err("a source-backed read must never serve the retained core");
         assert_eq!(source.code, "project_unavailable");
         assert!(!entered_source_response);
+    }
+
+    /// A core published by the previous release (schema 35 under the current
+    /// 36) must read as a typed stale-schema failure on observational paths and
+    /// rebuild into a new immutable generation on activation-owned paths.
+    #[test]
+    fn stale_core_schema_observation_is_typed_and_activation_rebuilds() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
+        fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let generation_db = codestory_store::resolve_core_database_path(&storage_path)
+            .expect("resolve active immutable generation");
+
+        // Downgrade the sealed image to the previous release's durable schema
+        // (0.17.6 wrote user_version 35; this binary serves 36).
+        mutate_active_generation_sql(&storage_path, "PRAGMA user_version = 35;");
+        let generation_before = fs::read(&generation_db).expect("read sealed generation");
+
+        // Observational admission surfaces the typed failure and the exact
+        // managed-refresh command; it must not activate or mutate the core.
+        let error = runtime
+            .activation_service()
+            .bind_existing_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("a stale core must refuse observational admission");
+        assert_eq!(error.code, "core_schema_upgrade_required", "{error:?}");
+        let next_commands = error
+            .details
+            .as_deref()
+            .map(|details| details.next_commands.clone())
+            .unwrap_or_default();
+        let refresh = next_commands
+            .iter()
+            .find(|command| command.contains("codestory-cli index --project"))
+            .unwrap_or_else(|| {
+                panic!("stale-schema error must name the refresh command: {error:?}")
+            });
+        assert!(
+            refresh.contains("--refresh full")
+                && refresh.contains(&*project.path().to_string_lossy()),
+            "refresh command must target this project: {refresh}"
+        );
+        assert_eq!(
+            fs::read(&generation_db).expect("reread sealed generation"),
+            generation_before,
+            "observing a stale core must not mutate the sealed generation"
+        );
+        assert!(
+            runtime.activation_service().snapshot().is_none(),
+            "observational admission must not start managed activation"
+        );
+
+        // The activation-owned call treats the stale core like cold state and
+        // publishes a replacement generation, leaving the old image intact.
+        runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("activation rebuilds a stale core");
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("inspect rebuilt project")
+            .expect("rebuilt project summary");
+        assert!(
+            summary.publication.is_some(),
+            "rebuilt publication: {summary:?}"
+        );
+        assert_eq!(
+            fs::read(&generation_db).expect("reread old generation"),
+            generation_before,
+            "rebuild must preserve the previous generation as an immutable rollback"
+        );
     }
 
     #[test]

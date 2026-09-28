@@ -216,6 +216,14 @@ impl AppController {
             )));
         }
         let session = CoreReadSession::pin(&storage_path).map_err(|error| {
+            if let codestory_store::StorageError::SchemaVersionMismatch {
+                found, required, ..
+            } = error
+            {
+                return crate::index_incremental::core_schema_upgrade_required_error(
+                    &root, found, required,
+                );
+            }
             ApiError::new(
                 "project_unavailable",
                 format!("no complete core publication is available: {error}"),
@@ -256,6 +264,7 @@ impl AppController {
 
     pub fn complete_index_publication_at(
         &self,
+        project_root: &Path,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
         if !codestory_store::core_database_exists(storage_path).map_err(|error| {
@@ -269,6 +278,18 @@ impl AppController {
             .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
+                if let codestory_store::StorageError::SchemaVersionMismatch {
+                    found,
+                    required,
+                    ..
+                } = error
+                {
+                    return crate::index_incremental::core_schema_upgrade_required_error(
+                        project_root,
+                        found,
+                        required,
+                    );
+                }
                 ApiError::internal(format!(
                     "Failed to observe complete index publication: {error}"
                 ))
@@ -292,13 +313,15 @@ impl AppController {
         {
             let storage =
                 Storage::open_freshness_observational(&storage_path).map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to open fenced storage for project summary: {error}"
-                    ))
+                    crate::index_incremental::core_schema_observation_error(
+                        &root,
+                        "Failed to open fenced storage for project summary",
+                        error,
+                    )
                 })?;
             self.project_summary_from_storage(&root, &storage_path, &storage)?
         } else {
-            let storage = open_storage_for_read(&storage_path)?;
+            let storage = open_storage_for_read(&root, &storage_path)?;
             let snapshot = storage.read_snapshot().map_err(|error| {
                 ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
             })?;
@@ -350,9 +373,10 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let mut storage = open_storage_for_read(&storage_path)?;
+        let mut storage = open_storage_for_read(&root, &storage_path)?;
         let loaded = load_persisted_search_state_for_runtime(
             &mut storage,
+            &root,
             &storage_path,
             &self.runtime_config,
         )?;
@@ -489,14 +513,23 @@ impl AppController {
                 ))
             })?;
         if schema_version < CURRENT_SCHEMA_VERSION {
-            return Err(ApiError::new(
-                "core_schema_upgrade_required",
-                format!(
-                    "Core cache schema {schema_version} requires a full index to upgrade to schema {CURRENT_SCHEMA_VERSION}"
+            return Err(
+                crate::index_incremental::core_schema_upgrade_required_error(
+                    &root,
+                    schema_version,
+                    CURRENT_SCHEMA_VERSION,
                 ),
-            ));
+            );
         }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
+            if let codestory_store::StorageError::SchemaVersionMismatch {
+                found, required, ..
+            } = error
+            {
+                return crate::index_incremental::core_schema_upgrade_required_error(
+                    &root, found, required,
+                );
+            }
             ApiError::internal(format!("Failed to open storage observationally: {error}"))
         })?;
         let snapshot = storage.read_snapshot().map_err(|error| {
@@ -1393,9 +1426,11 @@ impl AppController {
                 } else {
                     let store =
                         Store::open_freshness_observational(&storage_path).map_err(|error| {
-                            ApiError::internal(format!(
-                                "Failed to inspect dry-run storage without mutation: {error}"
-                            ))
+                            crate::index_incremental::schema_observation_error(
+                                &root,
+                                "Failed to inspect dry-run storage without mutation",
+                                error,
+                            )
                         })?;
                     workspace_refresh_inputs(&store)?
                 }

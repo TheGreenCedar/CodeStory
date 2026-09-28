@@ -667,6 +667,12 @@ pub(crate) struct DoctorCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Also write a support bundle to this file: the doctor report plus this process's redacted diagnostics records. The parent directory must already exist."
+    )]
+    pub(crate) support_bundle: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1672,6 +1678,8 @@ pub(crate) struct IndexOutput<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) summary_generation: Option<&'a SummaryGenerationDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) next_commands: Vec<String>,
@@ -2526,7 +2534,22 @@ pub(crate) struct DoctorOutput {
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) stale_cached_cores: Vec<DoctorStaleCachedCore>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
+}
+
+/// Another project cache under the process cache root whose core schema this
+/// binary cannot serve until it is re-indexed.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DoctorStaleCachedCore {
+    pub(crate) cache_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project_root: Option<String>,
+    pub(crate) found_schema: u32,
+    pub(crate) required_schema: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_action: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codestory_contracts::bounded_locks::{
     self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
 };
@@ -558,7 +558,13 @@ fn acquire_local_refresh_state_guard(cache_root: &Path) -> Result<LocalRefreshSt
         FileLockKind::Exclusive,
         LockDeadline::after(DEFAULT_LOCK_WAIT),
         None,
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "acquire exclusive local refresh state guard {}",
+            path.display()
+        )
+    })?;
     anyhow::ensure!(
         locked_guard_path_matches(&file, &path),
         "local refresh state guard was replaced at {}",

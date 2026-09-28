@@ -343,7 +343,7 @@ pub fn retrieval_state_from_manifest_storage_for_test(
             &process_defaults,
             &overrides,
         );
-    let storage = open_storage_for_read(storage_path)?;
+    let storage = open_storage_for_read(project_root, storage_path)?;
     search_publication::retrieval_state_from_storage_for_runtime(&storage, project_root, &runtime)
 }
 #[cfg(test)]
@@ -516,6 +516,7 @@ pub use call_path_kernel::PROOF_DOMAIN;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use controller_indexing::set_mid_indexing_test_hook;
+pub use index_incremental::{StaleCachedCore, observe_stale_cached_cores};
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,

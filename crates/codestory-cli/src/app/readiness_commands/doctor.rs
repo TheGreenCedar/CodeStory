@@ -12,7 +12,7 @@ use crate::args::{
 use crate::display::quote_command_path;
 use crate::output::{emit, render_doctor_markdown, render_ready_markdown};
 use crate::runtime::{RuntimeContext, api_error_in_chain};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codestory_contracts::api::{
     ProjectSummary, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
 };
@@ -39,7 +39,10 @@ fn observe_core(runtime: &RuntimeContext) -> Result<ObservedCore> {
             let Some(api_error) = api_error_in_chain(&error) else {
                 return Err(error);
             };
-            if api_error.code != "core_schema_upgrade_required" {
+            if !matches!(
+                api_error.code.as_str(),
+                "core_schema_upgrade_required" | "core_schema_too_new"
+            ) {
                 return Err(error);
             }
             Ok(ObservedCore {
@@ -106,11 +109,17 @@ fn mark_unavailable_doctor(
 pub(in crate::app) fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "doctor")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    preflight_output_file(cmd.support_bundle.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let observed = observe_core(&runtime)?;
     let mut output = build_doctor_output(&runtime, &observed.summary);
     if let (Some(status), Some(reason)) = (observed.status, observed.reason.as_deref()) {
         mark_unavailable_doctor(&runtime, &mut output, status, reason);
+    }
+    if let Some(path) = cmd.support_bundle.as_deref() {
+        let report =
+            serde_json::to_value(&output).context("serialize doctor report for support bundle")?;
+        crate::diagnostics::write_support_bundle(path, &report)?;
     }
     let markdown = render_doctor_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
