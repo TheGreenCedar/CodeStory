@@ -917,9 +917,9 @@ mod tests {
                 rusqlite::Connection::open(&generation_path).expect("open sealed generation");
             connection
                 .execute_batch(
-                    "DROP INDEX idx_proof_resolution_target;
-                     DROP INDEX idx_proof_resolution_raw_target;
-                     DROP INDEX idx_proof_resolution_edge;
+                    "DROP INDEX IF EXISTS idx_proof_resolution_target;
+                     DROP INDEX IF EXISTS idx_proof_resolution_raw_target;
+                     DROP INDEX IF EXISTS idx_proof_resolution_edge;
                      PRAGMA user_version = 35;",
                 )
                 .expect("downgrade sealed generation");
