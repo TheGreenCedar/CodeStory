@@ -198,7 +198,7 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&json!(3))
+            Some(&json!(4))
         );
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
@@ -1930,7 +1930,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(3)),
+        Some(&json!(4)),
         "the session-start stamp publishes the evidence-only v3 response schema: {agreed}"
     );
     assert_eq!(
@@ -2033,7 +2033,7 @@ fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
     let result = assert_success_envelope(&response, json!("ground-stamp"));
     assert_eq!(
         result.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(3)),
+        Some(&json!(4)),
         "a served payload must name the schema its vocabulary belongs to: {response}"
     );
     assert_eq!(
@@ -2554,6 +2554,42 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
         );
     }
 
+    // Query-resolution is retrieval-class; ground is graph-only and lists
+    // first_only with its stable id for the id-based symbol call below.
+    let first_ground = assert_tool_success(
+        &send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "multi-first-ground",
+                "method": "tools/call",
+                "params": {
+                    "name": "ground",
+                    "arguments": {"project": first.path(), "budget": "strict"}
+                }
+            }),
+        ),
+        json!("multi-first-ground"),
+    )
+    .clone();
+    let first_node_id = first_ground["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            first_ground["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("first_only"))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("first project should expose first_only: {first_ground:#}"));
     let first_symbol = assert_tool_success(
         &send_json(
             &mut server,
@@ -2563,18 +2599,13 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
                 "method": "tools/call",
                 "params": {
                     "name": "symbol",
-                    "arguments": {"project": first.path(), "query": "first_only"}
+                    "arguments": {"project": first.path(), "id": first_node_id}
                 }
             }),
         ),
         json!("multi-first-symbol"),
     )
     .clone();
-    let first_node_id = first_symbol
-        .pointer("/node/id")
-        .or_else(|| first_symbol.pointer("/resolution/resolved/node_id"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("first project should resolve first_only: {first_symbol}"));
     let wrong_project_uri = format!(
         "codestory://symbol/{}?project={}",
         strict_resource_component(first_node_id),
@@ -4069,18 +4100,24 @@ fn snippet_tool_exact_id_navigates_structural_evidence_but_query_stays_typed() {
         }),
     );
     let error = assert_tool_error(&query_response, json!("snippet-structural-query"));
+    // A query snippet is a retrieval-class read: where managed retrieval is
+    // unavailable the refusal is the typed availability envelope; where it is
+    // available the resolver still reports a typed no-match. Either way the
+    // wire carries a typed refusal, never an untyped error or stale bytes.
     assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("No symbol matched query")),
-        "stdio query snippet should retain typed graph filtering: {error:#}"
+        error["code"].as_str() == Some("codestory_unavailable")
+            || error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No symbol matched query")),
+        "stdio query snippet should retain typed refusal: {error:#}"
     );
 }
 
 /// A symbol-identified snippet read must never serve bytes that fail the
-/// indexed content hash. Mutating the bound file after indexing makes both
-/// the `snippet` tool and the `codestory://snippet/` resource answer with the
-/// typed `source_stale` code instead of mismatched text.
+/// indexed content hash. Mutating the bound file after indexing makes the
+/// observational `codestory://snippet/` resource answer with the typed
+/// `source_stale` code, while the `snippet` tool waits for the managed
+/// refresh and then reports the stale id as `not_found`.
 #[test]
 fn snippet_id_reads_return_source_stale_when_indexed_bytes_change() {
     let fixture = indexed_fixture();
@@ -4171,17 +4208,16 @@ fn snippet_id_reads_return_source_stale_when_indexed_bytes_change() {
             "params": {"name": "snippet", "arguments": {"id": node_id}}
         }),
     );
-    // The snippet tool runs managed activation first: the drift is detected,
-    // the index republishes, and the pinned id from the previous generation no
-    // longer resolves. That is still a typed refusal -- the wire must never
-    // carry the mutated bytes under the old identity.
+    // The snippet tool is a source-backed read: managed activation detects
+    // the drift, waits for the refresh, and republishes. The pinned id from
+    // the previous generation then no longer resolves, so the exact refusal
+    // is `not_found` -- and the wire still never carries the mutated bytes
+    // under the old identity.
     let tool_error = assert_tool_error(&tool_response, json!("snippet-stale-tool"));
-    assert!(
-        matches!(
-            tool_error["code"].as_str(),
-            Some("source_stale" | "not_found" | "project_unavailable")
-        ),
-        "snippet tool must refuse stale source with a typed code: {tool_error:#}"
+    assert_eq!(
+        tool_error["code"].as_str(),
+        Some("not_found"),
+        "snippet tool waits for the refresh, so the stale id resolves to nothing: {tool_error:#}"
     );
     assert!(
         !serde_json::to_string(&tool_error)
@@ -6102,13 +6138,48 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
             .expect("ground serving generation");
     assert!(served_generation >= generation);
 
+    // A query-resolved symbol call is retrieval-class; the root-symbol
+    // resource is graph-only and hands back the stable id instead.
+    let pre_symbols_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-root-symbols-lookup",
+            "method": "resources/read",
+            "params": {
+                "uri": "codestory://symbols/root",
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let pre_symbols = json_resource_content(
+        assert_success_envelope(
+            &pre_symbols_response,
+            json!("concurrent-root-symbols-lookup"),
+        ),
+        "codestory://symbols/root",
+    );
+    let app_controller_id = pre_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|symbol| {
+            symbol["display_name"] == json!("AppController")
+                || symbol["label"] == json!("AppController")
+                || symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("AppController "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("root symbols should expose AppController: {pre_symbols}"))
+        .to_string();
     let symbol_response = send_json(
         &mut ground_client,
         json!({
             "jsonrpc": "2.0",
             "id": "concurrent-symbol",
             "method": "tools/call",
-            "params": {"name": "symbol", "arguments": {"query": "AppController"}}
+            "params": {"name": "symbol", "arguments": {"id": app_controller_id}}
         }),
     );
     let symbol = assert_tool_success(&symbol_response, json!("concurrent-symbol"));
@@ -6487,28 +6558,29 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         "ground should serve refreshed graph stats after mutation; before={node_count_before}, after={node_count_after}, snapshot={ground_after}"
     );
 
-    let symbol_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "tool-refresh-symbol",
-            "method": "tools/call",
-            "params": {
-                "name": "symbol",
-                "arguments": {"query": "stdio_tool_added_after_mutation"}
-            }
-        }),
-    );
-    let symbol = assert_tool_success(&symbol_response, json!("tool-refresh-symbol"));
-    let node_id = symbol
-        .pointer("/node/id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            symbol
-                .pointer("/resolution/resolved/node_id")
-                .and_then(Value::as_str)
+    // Query-resolution is retrieval-class and unavailable without broad
+    // retrieval; the refreshed ground response already lists the new symbol
+    // with its stable id, which is the graph-only way to select it.
+    let node_id = ground_after["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            ground_after["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("stdio_tool_added_after_mutation"))
         })
-        .unwrap_or_else(|| panic!("symbol should resolve the post-mutation function: {symbol}"))
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| {
+            panic!("refreshed ground should expose the post-mutation function: {ground_after:#}")
+        })
         .to_string();
 
     for (tool, id) in [
@@ -7503,29 +7575,40 @@ fn mcp_graph_caller_scope_hides_stored_test_call_until_explicitly_included() {
     let mut server = spawn_stdio_server(&fixture);
     initialize_stdio_server(&mut server, "init-scope");
 
-    let test_entry = call_graph_tool(
+    // Query-resolution is retrieval-class; ground is graph-only and lists the
+    // fixture functions with their stable ids.
+    let grounding = call_graph_tool(
         &mut server,
-        "symbol-test-entry",
-        "symbol",
+        "scope-ground",
+        "ground",
         json!({
             "project": fixture.workspace.path(),
-            "query": "test_entry"
+            "budget": "strict"
         }),
     );
-    let test_id = test_entry["node"]["id"]
-        .as_str()
-        .expect("test_entry id")
-        .to_string();
-    let leaf = call_graph_tool(
-        &mut server,
-        "symbol-leaf",
-        "symbol",
-        json!({
-            "project": fixture.workspace.path(),
-            "query": "leaf"
-        }),
-    );
-    let leaf_id = leaf["node"]["id"].as_str().expect("leaf id").to_string();
+    let scope_symbol_id = |name: &str| {
+        grounding["root_symbols"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                grounding["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+            )
+            .find(|symbol| {
+                symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with(name))
+            })
+            .and_then(|symbol| symbol["id"].as_str())
+            .unwrap_or_else(|| panic!("ground should expose {name}: {grounding:#}"))
+            .to_string()
+    };
+    let test_id = scope_symbol_id("test_entry");
+    let leaf_id = scope_symbol_id("leaf");
 
     for (name, extra) in [
         (

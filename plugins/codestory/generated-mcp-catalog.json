@@ -1,6 +1,6 @@
 {
   "wireContract": {
-    "publicationStampSchemaVersion": 3,
+    "publicationStampSchemaVersion": 4,
     "minimumCompatiblePublicationStampSchemaVersion": 3,
     "supportedMcpProtocolVersions": [
       "2024-11-05",

@@ -65,6 +65,37 @@ struct IndexingCompletion {
     repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static MID_INDEXING_TEST_HOOK: std::sync::RwLock<
+    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+> = std::sync::RwLock::new(None);
+
+/// Run `hook` while an indexing worker owns the writer lock with
+/// `is_indexing` set, so a test can hold a refresh genuinely in flight while
+/// reads pin the retained publication. The hook sees the storage path so a
+/// shared test binary only parks the run it armed for.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_mid_indexing_test_hook(hook: Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>) {
+    *MID_INDEXING_TEST_HOOK
+        .write()
+        .expect("mid-indexing test hook lock") = hook;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_mid_indexing_test_hook(storage_path: &Path) {
+    let hook = MID_INDEXING_TEST_HOOK
+        .read()
+        .expect("mid-indexing test hook lock")
+        .clone();
+    if let Some(hook) = hook {
+        hook(storage_path);
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_mid_indexing_test_hook(_storage_path: &Path) {}
+
 impl AppController {
     fn core_project_summary_from_storage(
         &self,
@@ -608,6 +639,7 @@ impl AppController {
                 return Err(error);
             }
         };
+        run_mid_indexing_test_hook(&storage_path);
 
         // A refresh can install a database that never carried the legacy
         // annotation tables, so annotations move to the sidecar before the run
@@ -1481,7 +1513,7 @@ impl AppController {
     }
 
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
-        self.ensure_consistent_read_state("Files")?;
+        self.ensure_graph_only_read_state("Files")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
         indexed_files_from_storage(&root, &storage, &self.source_index_policy, req)

@@ -1718,7 +1718,7 @@ fn handle_stdio_request(
             );
             let mut result = session.protocol_v3.initialize_result();
             result["_meta"]["codestory_publication"] =
-                crate::runtime::codestory_publication_meta(None, None, None, None, false);
+                crate::runtime::codestory_publication_meta(None, None, None, None, None);
             return Some(stdio_jsonrpc_success(id, result));
         }
         "tools/list" => serde_json::json!({
@@ -2084,7 +2084,7 @@ fn handle_stdio_request(
                     }
                     if runtime.activation.snapshot().is_some_and(|snapshot| {
                         snapshot.state == codestory_runtime::ActivationState::Ready
-                            && !snapshot.allows_operation(name)
+                            && !snapshot.allows_operation(public_operation)
                     }) {
                         return Some(stdio_jsonrpc_success(
                             id,
@@ -2099,9 +2099,21 @@ fn handle_stdio_request(
                 codestory_runtime::observe_packet_entry_phase(
                     codestory_runtime::PacketEntryObservationPhase::ActivationStarted,
                 );
-                let goal = if observes_complete_core {
+                // PinnedObserver and source-backed reads need only the
+                // complete core, never the retrieval sidecars. A CoreOnly run
+                // stops at the core publication; allows_operation still
+                // requires a fresh Ready core for them, so Retained no longer
+                // admits.
+                let goal = if matches!(public_operation, "exact_search" | "source_snippet")
+                    || codestory_runtime::operation_read_class(public_operation)
+                        == codestory_runtime::OperationReadClass::PinnedObserver
+                {
                     codestory_runtime::ActivationGoal::CoreOnly
                 } else {
+                    // Retrieval-class operations (`packet`, `search`,
+                    // `context`, `drill`, `resolution`, `graph_assisted`) need
+                    // managed retrieval preparation, and allows_operation
+                    // requires `broad_search` Ready for them.
                     codestory_runtime::ActivationGoal::Full
                 };
                 let first_slice = preparation_deadline
@@ -2133,11 +2145,12 @@ fn handle_stdio_request(
                 } else {
                     runtime
                         .activation
-                        .activate_project_with_foreground_budget(
+                        .activate_project_with_foreground_budget_and_goal(
                             &runtime.project_root,
                             &runtime.storage_path,
                             Arc::clone(cancelled),
                             first_slice,
+                            goal,
                         )
                         .map(|_| ())
                 };
@@ -2163,7 +2176,11 @@ fn handle_stdio_request(
                         ));
                         break;
                     }
-                    if !observes_complete_core && snapshot.allows_operation(name) {
+                    // Only a graph-only read may leave the wait early on a
+                    // Retained snapshot: its answer is labelled historical.
+                    // SourceBacked and PinnedObserver keep waiting because
+                    // allows_operation requires a fresh Ready core for them.
+                    if !observes_complete_core && snapshot.allows_operation(public_operation) {
                         break;
                     }
                     waiting_operation_id = Some(snapshot.operation_id.clone());
@@ -2208,7 +2225,7 @@ fn handle_stdio_request(
                     let allowed = !observes_complete_core
                         && operation
                             .as_ref()
-                            .is_some_and(|snapshot| snapshot.allows_operation(name));
+                            .is_some_and(|snapshot| snapshot.allows_operation(public_operation));
                     if matches!(error.code.as_str(), "cancelled" | "publication_changed")
                         || !allowed
                     {
@@ -2471,6 +2488,7 @@ fn handle_stdio_request(
                             }),
                             Some(&operation.operation_id),
                             Some(operation.attempt),
+                            Some(operation.freshness),
                         ));
                         execution
                     }
@@ -2488,6 +2506,7 @@ fn handle_stdio_request(
                             state,
                             None,
                             stdio_response_retrieval_publication(&execution.response),
+                            None,
                             None,
                             None,
                         ));
@@ -3243,15 +3262,33 @@ fn stdio_search_repo_text_mode(request: &serde_json::Value) -> SearchRepoTextMod
     }
 }
 
+fn stdio_tool_read_class(
+    name: &str,
+    request: &serde_json::Value,
+) -> codestory_runtime::OperationReadClass {
+    codestory_runtime::operation_read_class(stdio_public_operation_name(name, request))
+}
+
 fn stdio_tool_observes_complete_core(name: &str, request: &serde_json::Value) -> bool {
-    name == "affected"
-        || crate::prove_call_path::is_proof_tool_name(name)
-        || (name == "search" && stdio_search_repo_text_mode(request) == SearchRepoTextMode::Off)
+    stdio_tool_read_class(name, request) == codestory_runtime::OperationReadClass::PinnedObserver
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
     if name == "search" {
         codestory_runtime::search_operation_name(stdio_search_repo_text_mode(request))
+    } else if name == "snippet" {
+        // An id-selected snippet serves verified source bytes, so it is a
+        // source-backed read that waits for a fresh complete core. A snippet
+        // requested by query text is a graph-assisted selection instead.
+        if request
+            .pointer("/params/arguments/query")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|query| !query.trim().is_empty())
+        {
+            "graph_assisted"
+        } else {
+            "source_snippet"
+        }
     } else if matches!(
         name,
         "symbol"
@@ -3264,7 +3301,6 @@ fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -
             | "query_subgraph"
             | "definition"
             | "references"
-            | "snippet"
     ) {
         if request
             .pointer("/params/arguments/query")
@@ -3275,6 +3311,11 @@ fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -
         } else {
             "graph"
         }
+    } else if crate::prove_call_path::is_proof_tool_name(name) {
+        // Proof tools keep their own observed-operation internals; the
+        // admission loop only needs the pinned-observer class, so they share
+        // one runtime-visible operation name.
+        codestory_runtime::PROOF_DOMAIN
     } else {
         name
     }
@@ -3286,7 +3327,11 @@ fn stdio_served_publication_meta(
     retrieval_publication: Option<&serde_json::Value>,
     operation_id: Option<&str>,
     attempt: Option<u32>,
+    freshness: Option<codestory_runtime::OperationFreshness>,
 ) -> serde_json::Value {
+    // `freshness`/`served_from` come from the runtime's admission decision on
+    // the PublicOperation, not this status cache. The cache still feeds the
+    // `refresh` block, which is diagnostic detail about the live refresh only.
     let status = state.status_cache.as_ref().map(|cached| &cached.value);
     let refreshing = status
         .and_then(|status| status.pointer("/local_refresh/state"))
@@ -3299,7 +3344,7 @@ fn stdio_served_publication_meta(
         retrieval_publication.cloned(),
         operation_id,
         attempt,
-        refreshing,
+        freshness,
     );
     if refreshing {
         meta["refresh"] = serde_json::json!({
@@ -4055,7 +4100,7 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
                 None,
                 None,
                 None,
-                false,
+                None,
             ),
             "codestory_protocol": negotiation,
         }
@@ -8126,7 +8171,7 @@ fn read_stdio_template_resource(
             .map_err(map_api_error),
         StdioResource::Snippet(node_id) => runtime
             .browser
-            .snippet_context(node_id.clone(), 4)
+            .snippet_context_observational(node_id.clone(), 4)
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         StdioResource::Trail(node_id) => runtime
@@ -8494,9 +8539,20 @@ mod tests {
         let ordinary = json!({
             "params": {"arguments": {"query": "RenamedAnchor", "repo_text": "auto"}}
         });
-        assert!(stdio_tool_observes_complete_core("search", &exact));
+        assert!(!stdio_tool_observes_complete_core("search", &exact));
         assert!(!stdio_tool_observes_complete_core("search", &ordinary));
         assert!(!stdio_tool_observes_complete_core("search", &json!({})));
+        // repo_text=off is a source-backed read: it waits for a fresh
+        // complete core through a CoreOnly activation instead of binding a
+        // retained one.
+        assert_eq!(
+            stdio_tool_read_class("search", &exact),
+            codestory_runtime::OperationReadClass::SourceBacked
+        );
+        assert_eq!(
+            stdio_tool_read_class("search", &ordinary),
+            codestory_runtime::OperationReadClass::Retrieval
+        );
         assert_eq!(
             stdio_public_operation_name("search", &exact),
             "exact_search"
@@ -9352,7 +9408,15 @@ mod tests {
                 "graph_assisted",
                 "{tool} query resolution must keep one retrieval pin through response assembly"
             );
-            assert_eq!(stdio_public_operation_name(tool, &id), "graph");
+            assert_eq!(
+                stdio_public_operation_name(tool, &id),
+                if tool == "snippet" {
+                    "source_snippet"
+                } else {
+                    "graph"
+                },
+                "{tool} id selection keeps its read-class operation name"
+            );
         }
         assert_eq!(
             stdio_public_operation_name(
@@ -12790,6 +12854,7 @@ version = "0.11.20"
             Some(&retrieval),
             Some("public-2"),
             Some(1),
+            None,
         );
         let response = stdio_jsonrpc_tool_call_from_legacy(json!(1), bound, meta, "search");
 
@@ -12807,7 +12872,7 @@ version = "0.11.20"
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(3))
+            Some(&json!(4))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/contract_runtime/cli_version"),
@@ -12830,6 +12895,7 @@ version = "0.11.20"
             None,
             Some("public-1"),
             Some(1),
+            None,
         );
         let response = stdio_jsonrpc_tool_call_from_legacy(
             json!(1),
@@ -12844,6 +12910,7 @@ version = "0.11.20"
                 retrieval_publication: None,
                 operation_id: "public-1".to_string(),
                 attempt: 1,
+                freshness: codestory_runtime::OperationFreshness::Fresh,
             },
             &payload,
         )
@@ -12854,7 +12921,7 @@ version = "0.11.20"
         // an older schema.
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(3))
+            Some(&json!(4))
         );
         assert_eq!(
             response
@@ -12960,7 +13027,7 @@ version = "0.11.20"
         // The launcher reads this stamp out of the frame it suppresses, so it
         // must be the same contract-only stamp every other adapter publishes.
         let stamp = &agreed["_meta"]["codestory_publication"];
-        assert_eq!(stamp["schema_version"], json!(3));
+        assert_eq!(stamp["schema_version"], json!(4));
         assert_eq!(stamp["minimum_compatible_schema_version"], json!(3));
         assert_eq!(stamp["served_from"], json!("contract_only"));
         assert_eq!(
@@ -12969,7 +13036,7 @@ version = "0.11.20"
         );
         assert_eq!(
             stamp,
-            &crate::runtime::codestory_publication_meta(None, None, None, None, false),
+            &crate::runtime::codestory_publication_meta(None, None, None, None, None),
             "initialize must not invent a second stamp shape"
         );
     }
@@ -15592,6 +15659,696 @@ version = "0.11.20"
             shm_shape(),
             shm_before,
             "status materialized or resized the SHM wal-index"
+        );
+    }
+    /// Parks the indexing worker while `is_indexing` is set and the writer
+    /// lock is held, so a read runs against a refresh that is genuinely in
+    /// flight instead of one parked before it started.
+    struct MidIndexingHold {
+        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl MidIndexingHold {
+        fn arm(storage_path: &Path) -> Self {
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let expected = storage_path.to_path_buf();
+            let hook_gate = Arc::clone(&gate);
+            codestory_runtime::set_mid_indexing_test_hook(Some(Arc::new(move |path: &Path| {
+                if path == expected.as_path() {
+                    let (released, changed) = &*hook_gate;
+                    let mut released = released.lock().expect("mid-index gate");
+                    while !*released {
+                        released = changed.wait(released).expect("mid-index gate");
+                    }
+                }
+            })));
+            Self { gate }
+        }
+    }
+
+    impl Drop for MidIndexingHold {
+        fn drop(&mut self) {
+            let (released, changed) = &*self.gate;
+            *released.lock().expect("mid-index gate") = true;
+            changed.notify_all();
+            codestory_runtime::set_mid_indexing_test_hook(None);
+        }
+    }
+
+    struct LiveStdioFixture {
+        _project: tempfile::TempDir,
+        _cache: tempfile::TempDir,
+        project_root: PathBuf,
+        storage_path: PathBuf,
+        activation: codestory_runtime::ActivationService,
+        input: tokio::io::DuplexStream,
+        output: BufReader<tokio::io::DuplexStream>,
+        serving: tokio::task::JoinHandle<Result<StdioServeOutcome>>,
+    }
+
+    impl LiveStdioFixture {
+        async fn send_call(&mut self, id: &str, name: &str, arguments: serde_json::Value) {
+            self.input
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "tools/call",
+                            "params": {"name": name, "arguments": arguments}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("send tools/call");
+        }
+
+        async fn read_response(&mut self, id: &str, timeout: Duration) -> serde_json::Value {
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let mut line = String::new();
+                    self.output
+                        .read_line(&mut line)
+                        .await
+                        .expect("read response line");
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&line).expect("response JSON-RPC frame");
+                    if frame.get("id") == Some(&json!(id)) {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("response for {id} never arrived"))
+        }
+
+        /// Drain any frames for `id` that arrive inside `window`; the caller
+        /// asserts none arrived, proving the call stayed pending.
+        async fn collect_frames_for(
+            &mut self,
+            id: &str,
+            window: Duration,
+        ) -> Vec<serde_json::Value> {
+            let deadline = Instant::now() + window;
+            let mut frames = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return frames;
+                }
+                let mut line = String::new();
+                match tokio::time::timeout(remaining, self.output.read_line(&mut line)).await {
+                    Ok(Ok(0)) | Err(_) => return frames,
+                    Ok(Ok(_)) => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&line).expect("response JSON-RPC frame");
+                        if frame.get("id") == Some(&json!(id)) {
+                            frames.push(frame);
+                        }
+                    }
+                    Ok(Err(error)) => panic!("read pending response: {error}"),
+                }
+            }
+        }
+    }
+
+    async fn live_stdio_fixture(files: &[(&str, &str)]) -> LiveStdioFixture {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        for (name, contents) in files {
+            let path = project.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("source directory");
+            }
+            std::fs::write(path, contents).expect("write source file");
+        }
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let (activation, storage_path) = {
+            let runtime = &session
+                .active_project
+                .as_ref()
+                .expect("selected project")
+                .runtime;
+            (runtime.activation.clone(), runtime.storage_path.clone())
+        };
+        let (client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(8192);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        LiveStdioFixture {
+            project_root: project.path().to_path_buf(),
+            _project: project,
+            _cache: cache,
+            storage_path,
+            activation,
+            input: client_input,
+            output: BufReader::new(client_output),
+            serving,
+        }
+    }
+
+    /// Warm the project to a complete publication and return the grounding
+    /// payload with a symbol id for `name`.
+    async fn warm_fixture_and_symbol_id(
+        fixture: &mut LiveStdioFixture,
+        symbol_name: &str,
+    ) -> serde_json::Value {
+        fixture
+            .send_call(
+                "warm-ground",
+                "ground",
+                json!({"project": fixture.project_root, "budget": "balanced"}),
+            )
+            .await;
+        let ground = fixture
+            .read_response("warm-ground", Duration::from_secs(60))
+            .await;
+        let result = &ground["result"]["structuredContent"];
+        assert!(result.is_object(), "warm-up ground must converge: {ground}");
+        let node_id = result["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["symbols"].as_array().into_iter().flatten())
+            .chain(result["root_symbols"].as_array().into_iter().flatten())
+            .find(|symbol| {
+                symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with(&format!("{symbol_name} @ ")))
+            })
+            .and_then(|symbol| symbol["id"].as_str())
+            .unwrap_or_else(|| panic!("warm-up ground must expose {symbol_name}: {result}"))
+            .to_string();
+        assert_eq!(
+            ground.pointer("/result/_meta/codestory_publication/freshness/state"),
+            Some(&json!("fresh")),
+            "a warm read with no refresh in flight reports fresh: {ground}"
+        );
+        json!({"ground": result.clone(), "node_id": node_id})
+    }
+
+    #[tokio::test]
+    async fn graph_only_reads_serve_retained_publication_as_historical_during_refresh() {
+        let mut fixture =
+            live_stdio_fixture(&[("lib.rs", "pub fn admitted_anchor() -> u32 { 1 }\n")]).await;
+        warm_fixture_and_symbol_id(&mut fixture, "admitted_anchor").await;
+
+        std::fs::write(
+            fixture.project_root.join("lib.rs"),
+            "pub fn admitted_anchor() -> u32 { 2 }\npub fn added_after() {}\n",
+        )
+        .expect("mutate indexed source");
+        // The refresh worker parks while it owns the writer lock with
+        // `is_indexing` set: reads that reach the controller observe a refresh
+        // that is genuinely in flight, not one parked before indexing.
+        let _hold = MidIndexingHold::arm(&fixture.storage_path);
+
+        fixture
+            .send_call(
+                "refresh-ground",
+                "ground",
+                json!({"project": fixture.project_root, "budget": "balanced"}),
+            )
+            .await;
+        let ground = fixture
+            .read_response("refresh-ground", Duration::from_secs(30))
+            .await;
+        let result = &ground["result"]["structuredContent"];
+        assert!(result.is_object(), "ground must serve, not fail: {ground}");
+        let meta = &ground["result"]["_meta"]["codestory_publication"];
+        assert_eq!(
+            meta["freshness"]["state"],
+            json!("historical"),
+            "a graph-only read during refresh answers from the retained publication: {ground}"
+        );
+        assert_eq!(
+            meta["freshness"]["reason"],
+            json!("refresh_in_progress"),
+            "{ground}"
+        );
+        assert_eq!(
+            meta["served_from"],
+            json!("last_complete_publication"),
+            "{ground}"
+        );
+        let wire = serde_json::to_string(&ground).expect("serialize ground");
+        assert!(
+            !wire.contains("invalid_argument") && !wire.contains("activation_preparing"),
+            "graph-only reads must not fail as a bad argument while indexing runs: {wire}"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_backed_snippet_waits_for_the_fresh_core_during_refresh() {
+        let mut fixture =
+            live_stdio_fixture(&[("lib.rs", "pub fn source_anchor() -> u32 { 1 }\n")]).await;
+        let warm = warm_fixture_and_symbol_id(&mut fixture, "source_anchor").await;
+        let node_id = warm["node_id"].as_str().expect("symbol id").to_string();
+        let retained_generation = warm["ground"]["_meta"]
+            .get("codestory_publication")
+            .cloned();
+        std::fs::write(
+            fixture.project_root.join("lib.rs"),
+            "pub fn source_anchor() -> u32 { 2 }\npub fn appended_marker() {}\n",
+        )
+        .expect("mutate indexed source");
+        let _hold = MidIndexingHold::arm(&fixture.storage_path);
+
+        fixture
+            .send_call(
+                "held-snippet",
+                "snippet",
+                json!({"project": fixture.project_root, "id": node_id}),
+            )
+            .await;
+        let pending = fixture
+            .collect_frames_for("held-snippet", Duration::from_secs(6))
+            .await;
+        assert!(
+            pending.is_empty(),
+            "a source-backed read must wait for the fresh core, not answer from retained: {pending:?}"
+        );
+
+        drop(_hold);
+        let response = fixture
+            .read_response("held-snippet", Duration::from_secs(60))
+            .await;
+        let snippet = &response["result"]["structuredContent"];
+        assert!(
+            snippet["snippet"].as_str().is_some(),
+            "snippet must serve after the refresh completes: {response}"
+        );
+        let meta = &response["result"]["_meta"]["codestory_publication"];
+        assert_eq!(
+            meta["freshness"]["state"],
+            json!("fresh"),
+            "the waited answer comes from the fresh publication: {response}"
+        );
+        assert_eq!(
+            meta["served_from"],
+            json!("complete_publication"),
+            "{response}"
+        );
+        let _ = retained_generation;
+    }
+
+    #[tokio::test]
+    async fn source_backed_deadline_returns_activation_preparing_with_exact_resume() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn resume_source_anchor() -> u32 { 1 }\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session.preparation_wait_budget_for_test = Some(Duration::from_millis(120));
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let (activation, _storage_path) = {
+            let runtime = &session
+                .active_project
+                .as_ref()
+                .expect("selected project")
+                .runtime;
+            (runtime.activation.clone(), runtime.storage_path.clone())
+        };
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(8192);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": "deadline-snippet",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "snippet",
+                            "arguments": {
+                                "project": project.path(),
+                                "id": "any-node"
+                            }
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send snippet request");
+        let mut output = BufReader::new(client_output);
+        let first = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut line = String::new();
+                output
+                    .read_line(&mut line)
+                    .await
+                    .expect("read deadline response");
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).expect("deadline JSON-RPC");
+                if frame.get("id") == Some(&json!("deadline-snippet")) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("bounded preparation deadline response");
+        let deadline = &first["result"]["structuredContent"];
+        assert_eq!(deadline["kind"], json!("preparing"), "{first}");
+        assert_eq!(deadline["deadline_exceeded"], json!(true), "{first}");
+        let snapshot = activation.snapshot().expect("running activation");
+        assert_eq!(
+            deadline["resume_operation_id"].as_str(),
+            Some(snapshot.operation_id.as_str()),
+            "resume must name the exact running operation: {first}"
+        );
+        assert_eq!(
+            deadline["resume_operation_attempt"].as_u64(),
+            Some(u64::from(snapshot.attempt)),
+            "{first}"
+        );
+        drop(serving);
+    }
+
+    #[tokio::test]
+    async fn exact_search_and_packet_wait_for_the_fresh_publication() {
+        let mut fixture =
+            live_stdio_fixture(&[("lib.rs", "pub fn exact_anchor() -> u32 { 1 }\n")]).await;
+        warm_fixture_and_symbol_id(&mut fixture, "exact_anchor").await;
+        std::fs::write(
+            fixture.project_root.join("lib.rs"),
+            "pub fn exact_anchor() -> u32 { 2 }\npub fn second_marker() {}\n",
+        )
+        .expect("mutate indexed source");
+        let _hold = MidIndexingHold::arm(&fixture.storage_path);
+
+        fixture
+            .send_call(
+                "held-exact",
+                "search",
+                json!({
+                    "project": fixture.project_root,
+                    "query": "second_marker",
+                    "repo_text": "off"
+                }),
+            )
+            .await;
+        let pending = fixture
+            .collect_frames_for("held-exact", Duration::from_secs(6))
+            .await;
+        assert!(
+            pending.is_empty(),
+            "exact search must wait for the fresh core: {pending:?}"
+        );
+        drop(_hold);
+        let response = fixture
+            .read_response("held-exact", Duration::from_secs(60))
+            .await;
+        let wire = serde_json::to_string(&response).expect("serialize exact response");
+        assert!(
+            wire.contains("second_marker"),
+            "exact search must observe the refreshed source: {wire}"
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/freshness/state"),
+            Some(&json!("fresh")),
+            "{response}"
+        );
+
+        std::fs::write(
+            fixture.project_root.join("lib.rs"),
+            "pub fn exact_anchor() -> u32 { 3 }\npub fn third_marker() {}\n",
+        )
+        .expect("mutate indexed source again");
+        let _hold = MidIndexingHold::arm(&fixture.storage_path);
+        fixture
+            .send_call(
+                "held-packet",
+                "packet",
+                json!({
+                    "project": fixture.project_root,
+                    "question": "what does third_marker do"
+                }),
+            )
+            .await;
+        let pending = fixture
+            .collect_frames_for("held-packet", Duration::from_secs(6))
+            .await;
+        assert!(
+            pending.is_empty(),
+            "packet must spend its wait on the refresh instead of answering early: {pending:?}"
+        );
+        drop(_hold);
+        let response = fixture
+            .read_response("held-packet", Duration::from_secs(60))
+            .await;
+        let is_error = response.pointer("/result/isError") == Some(&json!(true))
+            || response.pointer("/error").is_some();
+        assert!(
+            is_error || response["result"]["structuredContent"].is_object(),
+            "packet may only answer with a fresh publication or a typed refusal: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_observers_report_drift_while_a_refresh_waits() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn observed_anchor() -> u32 { 1 }\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(8192);
+        let serving = tokio::spawn(serve_stdio_requests(
+            session,
+            BufReader::new(server_input),
+            server_output,
+            std::future::pending::<()>(),
+            handle_stdio_message,
+            STDIO_TERMINATION_DRAIN_BUDGET,
+        ));
+        let mut output = BufReader::new(client_output);
+        // Warm the project to a complete publication.
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":"warm","method":"tools/call",
+                        "params":{"name":"ground","arguments":{"project":project.path(),"budget":"balanced"}}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send warm-up");
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(60), output.read_line(&mut line))
+                .await
+                .expect("warm-up response")
+                .expect("warm-up line");
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("warm JSON");
+            if frame.get("id") == Some(&json!("warm")) {
+                assert!(frame["result"]["structuredContent"].is_object(), "{frame}");
+                break;
+            }
+        }
+
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn observed_anchor() -> u32 { 2 }\n",
+        )
+        .expect("mutate indexed source");
+        // Park the refresh before its worker starts: the operation is in
+        // flight and the core is retained, but the controller is not yet
+        // mid-index, which is exactly the window a pinned observer must still
+        // answer in.
+        let worker_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&worker_gate),
+            restore_snapshot: None,
+        };
+
+        // Trigger the refresh with a graph call that returns historically,
+        // then ask the pinned observer while the worker is still parked.
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":"trigger","method":"tools/call",
+                        "params":{"name":"ground","arguments":{"project":project.path(),"budget":"balanced"}}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send refresh trigger");
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(30), output.read_line(&mut line))
+                .await
+                .expect("trigger response")
+                .expect("trigger line");
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("trigger JSON");
+            if frame.get("id") == Some(&json!("trigger")) {
+                assert_eq!(
+                    frame.pointer("/result/_meta/codestory_publication/freshness/state"),
+                    Some(&json!("historical")),
+                    "the trigger read itself serves historically: {frame}"
+                );
+                break;
+            }
+        }
+        assert!(
+            activation.snapshot().is_some_and(|snapshot| matches!(
+                snapshot.state,
+                codestory_runtime::ActivationState::Preparing
+                    | codestory_runtime::ActivationState::Updating
+            )),
+            "the refresh must still be in flight for the pinned-observer assertion"
+        );
+
+        client_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":"affected-mid-refresh","method":"tools/call",
+                        "params":{"name":"affected","arguments":{"project":project.path(),"paths":["lib.rs"]}}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send affected during refresh");
+        let affected = loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(15), output.read_line(&mut line))
+                .await
+                .expect("affected response while refresh parked")
+                .expect("affected line");
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("affected JSON");
+            if frame.get("id") == Some(&json!("affected-mid-refresh")) {
+                break frame;
+            }
+        };
+        let result = &affected["result"]["structuredContent"];
+        assert!(
+            result.is_object(),
+            "affected must still answer from the pinned core: {affected}"
+        );
+        assert!(
+            result["uncovered_inputs"]
+                .as_array()
+                .is_some_and(|inputs| inputs.iter().any(|input| {
+                    input["path"] == "lib.rs" && input["classification"] == "stale_index"
+                })),
+            "affected must report the drift against the pinned publication, not refresh it away: {affected}"
+        );
+        drop(serving);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_serves_historical_graph_and_refuses_source_reads() {
+        let mut fixture =
+            live_stdio_fixture(&[("lib.rs", "pub fn failing_anchor() -> u32 { 1 }\n")]).await;
+        let warm = warm_fixture_and_symbol_id(&mut fixture, "failing_anchor").await;
+        let node_id = warm["node_id"].as_str().expect("symbol id").to_string();
+
+        // An incomplete member inventory fences the replacement: the refresh
+        // fails closed and the previous publication stays retained.
+        std::fs::write(
+            fixture.project_root.join("codestory_workspace.json"),
+            r#"{"members":["missing"]}"#,
+        )
+        .expect("fence the replacement");
+
+        fixture
+            .send_call(
+                "failed-ground",
+                "ground",
+                json!({"project": fixture.project_root, "budget": "balanced"}),
+            )
+            .await;
+        let ground = fixture
+            .read_response("failed-ground", Duration::from_secs(60))
+            .await;
+        let meta = &ground["result"]["_meta"]["codestory_publication"];
+        assert_eq!(
+            meta["freshness"]["state"],
+            json!("historical"),
+            "a graph-only read after a failed replacement stays on the retained publication: {ground}"
+        );
+        assert_eq!(
+            meta["freshness"]["reason"],
+            json!("replacement_failed"),
+            "{ground}"
+        );
+
+        fixture
+            .send_call(
+                "failed-snippet",
+                "snippet",
+                json!({"project": fixture.project_root, "id": node_id}),
+            )
+            .await;
+        let response = fixture
+            .read_response("failed-snippet", Duration::from_secs(60))
+            .await;
+        let wire = serde_json::to_string(&response).expect("serialize snippet response");
+        assert!(
+            response.pointer("/result/isError") == Some(&json!(true))
+                || response
+                    .pointer("/result/structuredContent/error")
+                    .is_some()
+                || wire.contains("source_discovery_incomplete")
+                || wire.contains("project_unavailable"),
+            "a source-backed read must surface the causal refresh failure, not retained bytes: {wire}"
+        );
+        assert!(
+            !wire.contains("\"snippet\":"),
+            "no retained snippet body may be served: {wire}"
         );
     }
 }

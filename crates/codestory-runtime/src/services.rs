@@ -316,13 +316,32 @@ pub struct ActivationSnapshot {
 
 impl ActivationSnapshot {
     pub fn allows_operation(&self, operation: &str) -> bool {
-        if operation_requires_retrieval(operation) {
-            self.capabilities.broad_search == ActivationCapabilityState::Ready
-        } else {
-            matches!(
+        match operation_read_class(operation) {
+            OperationReadClass::Retrieval => {
+                self.capabilities.broad_search == ActivationCapabilityState::Ready
+            }
+            OperationReadClass::GraphOnly => matches!(
                 self.capabilities.local_navigation,
                 ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
-            )
+            ),
+            // Source-backed reads require a fresh complete core: a retained
+            // publication never admits them, and neither does a core that is
+            // still current only because its refresh is still running --
+            // `Ready` under a `Preparing`/`Updating` snapshot describes the
+            // pre-refresh generation, so the caller keeps waiting for the
+            // operation to finish (or fails with its causal error).
+            OperationReadClass::SourceBacked => {
+                self.capabilities.local_navigation == ActivationCapabilityState::Ready
+                    && !matches!(
+                        self.state,
+                        ActivationState::Preparing | ActivationState::Updating
+                    )
+            }
+            // Pinned observers read the committed publication deliberately;
+            // they bind it even while a refresh is in flight.
+            OperationReadClass::PinnedObserver => {
+                self.capabilities.local_navigation == ActivationCapabilityState::Ready
+            }
         }
     }
 }
@@ -1181,6 +1200,26 @@ impl ActivationService {
             request_cancelled,
             foreground_budget,
             ActivationGoal::Full,
+        )
+    }
+
+    /// Activate or join activation with an explicit goal inside one foreground
+    /// slice. Source-backed callers pass `CoreOnly`: they need the fresh core,
+    /// never the retrieval sidecars.
+    pub fn activate_project_with_foreground_budget_and_goal(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            request_cancelled,
+            foreground_budget,
+            goal,
         )
     }
 
@@ -2223,11 +2262,51 @@ pub fn search_operation_name(repo_text: SearchRepoTextMode) -> &'static str {
     }
 }
 
+/// How a public operation relates to the pinned core publication.
+///
+/// Every public operation is one of four read classes; the class decides what
+/// activation capability the operation waits for and whether a retained
+/// publication may answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationReadClass {
+    /// Pure graph reads. They may answer from a retained complete publication
+    /// while a refresh runs; the answer is labelled historical.
+    GraphOnly,
+    /// Reads that serve source bytes or freshness-bound core truth. They wait
+    /// for a fresh complete core and never fall back to a retained one.
+    SourceBacked,
+    /// Complete-core observers such as `affected` and the proof tool. They pin
+    /// one complete publication and report drift instead of blocking.
+    PinnedObserver,
+    /// Full-retrieval operations; unchanged readiness contract.
+    Retrieval,
+}
+
+/// The read class of one public operation name.
+///
+/// Operation names here are the runtime-visible names: `stdio` maps tool
+/// identities to these names before admission (`snippet` without a query
+/// becomes `source_snippet`), and `browser.rs` names each call directly.
+/// Anything not listed is a pure graph read.
+pub fn operation_read_class(operation: &str) -> OperationReadClass {
+    match operation {
+        // Retrieval readiness admits only operations whose results execute
+        // through the retrieval sidecars (`packet`, hybrid `search`, `context`,
+        // `drill`) or resolve evidence against a pinned retrieval generation
+        // (`resolution`, `graph_assisted`).
+        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted" => {
+            OperationReadClass::Retrieval
+        }
+        "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
+        "affected" | crate::call_path_kernel::PROOF_DOMAIN => OperationReadClass::PinnedObserver,
+        _ => OperationReadClass::GraphOnly,
+    }
+}
+
+/// Whether execution pins the retrieval publication: exactly the operations
+/// whose admission also requires `broad_search` readiness.
 fn operation_requires_retrieval(operation: &str) -> bool {
-    matches!(
-        operation,
-        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted"
-    )
+    operation_read_class(operation) == OperationReadClass::Retrieval
 }
 
 /// Whether a freshness observation permits serving an operation from the current publication.
@@ -2518,6 +2597,29 @@ pub struct ActivationOperation {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Why a public operation answered from a retained publication instead of a
+/// fresh one. Serialized into `codestory_publication.freshness` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalServedReason {
+    /// A refresh activation was in flight when the read was admitted.
+    RefreshInProgress,
+    /// The refresh could not publish because a peer process holds the writer.
+    PeerWriter,
+    /// A replacement publication failed and the previous generation was kept.
+    ReplacementFailed,
+    /// Source drift was observed with no clearer cause in the snapshot.
+    StaleSource,
+}
+
+/// Whether a public operation's result came from the fresh current source or
+/// from a retained publication a refresh is still replacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationFreshness {
+    Fresh,
+    Historical(HistoricalServedReason),
+}
+
 #[derive(Debug, Clone)]
 pub struct PublicOperation<T> {
     pub value: T,
@@ -2525,6 +2627,9 @@ pub struct PublicOperation<T> {
     pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub operation_id: String,
     pub attempt: u32,
+    /// `Historical` exactly when the freshness gate admitted this operation
+    /// from a retained publication; the adapter stamps it on the wire.
+    pub freshness: OperationFreshness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2572,25 +2677,48 @@ impl PublicOperationService {
         )
     }
 
-    fn retained_core_allows(&self, operation: &str, publication: &IndexPublicationRecord) -> bool {
-        !operation_requires_retrieval(operation)
-            && self.activation.as_ref().is_some_and(|activation| {
-                let Some(project_root) = self.controller.require_project_root().ok() else {
-                    return false;
-                };
-                let Some(storage_path) = self.controller.require_storage_path().ok() else {
-                    return false;
-                };
-                activation
-                    .snapshot_for_target(&project_root, &storage_path)
-                    .is_some_and(|snapshot| {
-                        matches!(
-                            snapshot.capabilities.local_navigation,
-                            ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
-                        ) && snapshot.retained_core_publication.as_ref()
-                            == Some(&crate::index_publication_dto(publication.clone()))
-                    })
-            })
+    /// Whether the operation may answer from a retained complete publication,
+    /// and why. Only `GraphOnly` operations have a retained escape; every
+    /// other class fails the freshness gate so a source-backed read can never
+    /// silently serve pre-refresh bytes. The reason is recorded for the
+    /// `historical` freshness metadata the adapter stamps on the result.
+    fn retained_core_admission(
+        &self,
+        operation: &str,
+        publication: &IndexPublicationRecord,
+    ) -> Option<HistoricalServedReason> {
+        if operation_read_class(operation) != OperationReadClass::GraphOnly {
+            return None;
+        }
+        let snapshot = self.activation.as_ref().and_then(|activation| {
+            let project_root = self.controller.require_project_root().ok()?;
+            let storage_path = self.controller.require_storage_path().ok()?;
+            activation.snapshot_for_target(&project_root, &storage_path)
+        })?;
+        if !matches!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+        ) || snapshot.retained_core_publication.as_ref()
+            != Some(&crate::index_publication_dto(publication.clone()))
+        {
+            return None;
+        }
+        let reason = if snapshot.failure_code.as_deref() == Some("cache_busy") {
+            HistoricalServedReason::PeerWriter
+        } else if matches!(
+            snapshot.state,
+            ActivationState::Preparing | ActivationState::Updating
+        ) {
+            HistoricalServedReason::RefreshInProgress
+        } else if matches!(
+            snapshot.state,
+            ActivationState::Retryable | ActivationState::Unavailable
+        ) {
+            HistoricalServedReason::ReplacementFailed
+        } else {
+            HistoricalServedReason::StaleSource
+        };
+        Some(reason)
     }
 
     fn ensure_packet_latency_remaining(
@@ -2773,6 +2901,7 @@ impl PublicOperationService {
             let mut complete_core_span = crate::agent::packet_batch::observe_packet_operation_span(
                 crate::agent::packet_batch::PacketOperationObservationSpan::CompleteCoreSnapshot,
             );
+            let mut historical_reason = None;
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let mut freshness_span =
                     crate::agent::packet_batch::observe_packet_operation_span(
@@ -2802,11 +2931,14 @@ impl PublicOperationService {
                 let freshness = freshness?;
                 if !index_freshness_admits_operation(&freshness) {
                     codestory_workspace::invalidate_lease_memoized_values();
-                    if !self.retained_core_allows(operation, publication) {
-                        return Err(ApiError::new(
-                            "project_unavailable",
-                            index_freshness_block_message(operation, &freshness),
-                        ));
+                    match self.retained_core_admission(operation, publication) {
+                        Some(reason) => historical_reason = Some(reason),
+                        None => {
+                            return Err(ApiError::new(
+                                "project_unavailable",
+                                index_freshness_block_message(operation, &freshness),
+                            ));
+                        }
                     }
                 }
                 let mut run = || {
@@ -2864,11 +2996,14 @@ impl PublicOperationService {
                     let after = after?;
                     if !index_freshness_admits_operation(&after) {
                         codestory_workspace::invalidate_lease_memoized_values();
-                        if !self.retained_core_allows(operation, publication) {
-                            return Err(ApiError::new(
-                                "publication_changed",
-                                format!("source inputs changed while running {operation}"),
-                            ));
+                        match self.retained_core_admission(operation, publication) {
+                            Some(reason) => historical_reason = Some(reason),
+                            None => {
+                                return Err(ApiError::new(
+                                    "publication_changed",
+                                    format!("source inputs changed while running {operation}"),
+                                ));
+                            }
                         }
                     }
                     Ok(value)
@@ -2916,6 +3051,10 @@ impl PublicOperationService {
                         retrieval_publication,
                         operation_id,
                         attempt,
+                        freshness: match historical_reason {
+                            Some(reason) => OperationFreshness::Historical(reason),
+                            None => OperationFreshness::Fresh,
+                        },
                     });
                 }
                 Err(error)
@@ -2988,12 +3127,17 @@ impl PublicOperationService {
             });
             match result {
                 Ok((value, core_publication, retrieval_publication)) => {
+                    // Observational reads pin the committed complete
+                    // publication directly; they never take the retained
+                    // admission escape, so they are always `Fresh` here even
+                    // while a refresh is running.
                     return Ok(PublicOperation {
                         value,
                         core_publication: Some(core_publication),
                         retrieval_publication,
                         operation_id,
                         attempt,
+                        freshness: OperationFreshness::Fresh,
                     });
                 }
                 Err(error) if attempt == 1 && error.code == "publication_changed" => continue,
@@ -7817,7 +7961,9 @@ pub(crate) mod activation_tests {
     fn observational_admission_preserves_an_existing_stale_complete_publication() {
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let source = project.path().join("fixture.rs");
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
         fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
@@ -7873,6 +8019,43 @@ pub(crate) mod activation_tests {
                 .is_file(),
             "core publication must route its retention lock through the owned process cache"
         );
+
+        // With a failed replacement retaining the stale generation, only
+        // graph-only reads may answer from it; a source-backed read must be
+        // refused instead of serving pre-refresh bytes.
+        fs::write(
+            project.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("fence the replacement with an incomplete workspace");
+        let error = runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("incomplete replacement inventory must fail closed");
+        assert_eq!(error.code, "source_discovery_incomplete");
+        let graph = runtime
+            .public_operation_service()
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("graph-only reads may answer from the retained core");
+        assert_eq!(
+            graph.freshness,
+            OperationFreshness::Historical(HistoricalServedReason::ReplacementFailed),
+            "the retained answer must be labelled historical: {graph:?}"
+        );
+        let mut entered_source_response = false;
+        let source = runtime
+            .public_operation_service()
+            .run_with_cancel("source_snippet", Arc::new(AtomicBool::new(false)), || {
+                entered_source_response = true;
+                Ok(())
+            })
+            .expect_err("a source-backed read must never serve the retained core");
+        assert_eq!(source.code, "project_unavailable");
+        assert!(!entered_source_response);
     }
 
     #[test]
@@ -8305,6 +8488,39 @@ pub(crate) mod activation_tests {
         assert!(snapshot.allows_operation("ground"));
         assert!(!snapshot.allows_operation("packet"));
         assert_ne!(snapshot.state, ActivationState::Ready);
+    }
+
+    #[test]
+    fn read_class_admission_keeps_retrieval_distinct_from_source_backed() {
+        // A fresh complete core with broad retrieval unavailable: source-backed
+        // and graph-only reads are admitted, while retrieval-class operations
+        // keep waiting on `broad_search` instead of being admitted on the core
+        // alone and then failing at the retrieval pin.
+        let snapshot = ActivationSnapshot {
+            operation_id: "read-class-fixture".into(),
+            revision: 1,
+            state: ActivationState::Ready,
+            stage: ActivationStage::Ready,
+            progress: activation_stage_progress(ActivationStage::Ready),
+            attempt: 1,
+            retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: None,
+            failure: None,
+            failure_details: None,
+            retained_core_publication: None,
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Ready,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        };
+        assert!(snapshot.allows_operation("source_snippet"));
+        assert!(snapshot.allows_operation("exact_search"));
+        assert!(snapshot.allows_operation("ground"));
+        assert!(!snapshot.allows_operation("graph_assisted"));
+        assert!(!snapshot.allows_operation("resolution"));
+        assert!(!snapshot.allows_operation("packet"));
     }
 }
 

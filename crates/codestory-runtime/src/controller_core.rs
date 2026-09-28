@@ -17,7 +17,8 @@ use crate::{
     SourceObserverState, Storage, clear_search_engine, publish_search_engine,
 };
 use codestory_contracts::api::{
-    ApiError, AppEventPayload, IndexFreshnessDto, ProjectSummary, RetrievalStateDto,
+    ApiError, ApiErrorDetails, AppEventPayload, IndexFreshnessDto, ProjectSummary,
+    RetrievalStateDto,
 };
 use codestory_store::{IndexPublicationRecord, Store};
 use codestory_workspace::SourceIndexPolicy;
@@ -454,13 +455,48 @@ impl AppController {
         self.canonical_symbol_names.lock().clear();
     }
 
+    /// Guard for reads that consult controller state indexing mutates.
+    /// Source-backed and pinned observers reach this only when indexing starts
+    /// mid-operation, so the refusal is typed as preparation, not a bad
+    /// argument; adapters already wait before dispatching.
     pub(crate) fn ensure_consistent_read_state(&self, operation: &str) -> Result<(), ApiError> {
         if self.state.lock().is_indexing {
-            return Err(ApiError::invalid_argument(format!(
-                "{operation} is unavailable while indexing is in progress. Retry after indexing completes."
-            )));
+            return Err(ApiError::with_details(
+                "activation_preparing",
+                format!(
+                    "{operation} is unavailable while indexing is in progress. Retry after indexing completes."
+                ),
+                ApiErrorDetails::cause("indexing_in_progress"),
+            ));
         }
         Ok(())
+    }
+
+    /// Guard for pure graph reads (`ground`, `files`). They only read the
+    /// published generation's storage, which is immutable and stays readable
+    /// while a refresh stages its replacement, so a pinned complete
+    /// publication may serve them even while `is_indexing` is set. Without a
+    /// pin or a durable complete publication the call is typed preparation.
+    pub(crate) fn ensure_graph_only_read_state(&self, operation: &str) -> Result<(), ApiError> {
+        if !self.state.lock().is_indexing || self.active_core_publication().is_some() {
+            return Ok(());
+        }
+        let storage_path = self.require_storage_path()?;
+        if Store::database_complete_index_publication(&storage_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read complete index publication: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(ApiError::with_details(
+            "activation_preparing",
+            format!("{operation} is unavailable until the first index publication completes."),
+            ApiErrorDetails::cause("indexing_in_progress"),
+        ))
     }
 
     pub(crate) fn ensure_search_state(&self) -> Result<(), ApiError> {
