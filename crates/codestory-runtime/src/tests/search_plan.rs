@@ -747,7 +747,12 @@ fn orientation_query_ranks_entry_evidence_above_leaf_aliases_when_both_exist() {
         hit_evidence(
             EntryEvidence::None,
             false,
-            CallDegrees::default(),
+            // The leaf's graph reach deliberately exceeds the root's, so only
+            // the missing entry evidence can keep it behind.
+            CallDegrees {
+                production_in_calls: 0,
+                out_calls: 6,
+            },
             1,
             "ts:src",
         ),
