@@ -2,7 +2,7 @@ use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind};
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use tempfile::tempdir;
 
@@ -951,6 +951,20 @@ fn test_fidelity_lab_graph_shape_and_semantics() -> anyhow::Result<()> {
             describe_call_edges(&edges, &nodes)
         );
 
+        // Resolved CALL targets must be real nodes in this fixture, not
+        // dangling ids — folded in from the deleted integrity-only test.
+        let node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
+        for edge in call_edges.iter() {
+            if let Some(resolved_id) = edge.resolved_target {
+                assert!(
+                    node_ids.contains(&resolved_id),
+                    "Case `{}`: resolved CALL points to missing node id {:?}",
+                    case.language,
+                    resolved_id
+                );
+            }
+        }
+
         let resolved_calls = call_edges
             .iter()
             .filter(|edge| edge.resolved_target.is_some())
@@ -1166,28 +1180,6 @@ fn caller(flag: bool) -> bool {
 
     Ok(())
 }
-
-#[test]
-fn test_fidelity_lab_resolved_targets_point_to_existing_nodes() -> anyhow::Result<()> {
-    for case in fidelity_cases() {
-        let (nodes, edges) = index_single_file(case.filename, case.source)?;
-        let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
-
-        for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
-            if let Some(resolved_id) = edge.resolved_target {
-                assert!(
-                    node_by_id.contains_key(&resolved_id),
-                    "Case `{}`: resolved CALL points to missing node id {:?}",
-                    case.language,
-                    resolved_id
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[test]
 fn test_nested_call_attribution_follows_enclosing_callable() -> anyhow::Result<()> {
     for (filename, source, caller, callee) in [

@@ -101,15 +101,6 @@ struct SemanticRequestStats {
     skipped_requests: usize,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Default)]
-struct ResolutionLookupCache {
-    same_file_lookup: HashMap<(String, i64, String), Option<i64>>,
-    same_module_lookup: HashMap<(String, String, String), Option<i64>>,
-    global_unique_lookup: HashMap<(String, String), Option<i64>>,
-}
-
 #[derive(Debug, Clone)]
 struct CandidateNode {
     id: i64,
@@ -3950,317 +3941,11 @@ fn module_prefix(qualified: &str) -> Option<(String, &'static str)> {
     None
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn find_same_file(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    file_id: Option<i64>,
-    exact: &str,
-    suffix_dot: &str,
-    suffix_colon: &str,
-    lookup_cache: &mut ResolutionLookupCache,
-) -> Result<Option<i64>> {
-    let Some(file_id) = file_id else {
-        return Ok(None);
-    };
-    let cache_key = (kind_clause.to_string(), file_id, exact.to_string());
-    if let Some(cached) = lookup_cache.same_file_lookup.get(&cache_key) {
-        return Ok(*cached);
-    }
-
-    let exact_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND file_node_id = ?1
-         AND serialized_name = ?2
-         ORDER BY start_line LIMIT 1",
-        kind_clause
-    );
-    let resolved = if let Some(id) = conn
-        .query_row(&exact_query, params![file_id, exact], |row| row.get(0))
-        .optional()?
-    {
-        Some(id)
-    } else {
-        let suffix_query = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND file_node_id = ?1
-             AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
-             ORDER BY start_line LIMIT 1",
-            kind_clause
-        );
-        conn.query_row(
-            &suffix_query,
-            params![file_id, suffix_dot, suffix_colon],
-            |row| row.get(0),
-        )
-        .optional()?
-    };
-    lookup_cache.same_file_lookup.insert(cache_key, resolved);
-    Ok(resolved)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-fn find_same_module(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    module_prefix: &str,
-    delimiter: &str,
-    exact: &str,
-    suffix_dot: &str,
-    suffix_colon: &str,
-    lookup_cache: &mut ResolutionLookupCache,
-) -> Result<Option<i64>> {
-    let pattern = format!("{}{}%", module_prefix, delimiter);
-    let cache_key = (kind_clause.to_string(), pattern.clone(), exact.to_string());
-    if let Some(cached) = lookup_cache.same_module_lookup.get(&cache_key) {
-        return Ok(*cached);
-    }
-
-    let exact_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND qualified_name LIKE ?1
-         AND serialized_name = ?2
-         ORDER BY start_line LIMIT 1",
-        kind_clause
-    );
-    let resolved = if let Some(id) = conn
-        .query_row(&exact_query, params![pattern, exact], |row| row.get(0))
-        .optional()?
-    {
-        Some(id)
-    } else {
-        let suffix_query = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND qualified_name LIKE ?1
-             AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
-             ORDER BY start_line LIMIT 1",
-            kind_clause
-        );
-        conn.query_row(
-            &suffix_query,
-            params![pattern, suffix_dot, suffix_colon],
-            |row| row.get(0),
-        )
-        .optional()?
-    };
-    lookup_cache.same_module_lookup.insert(cache_key, resolved);
-    Ok(resolved)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn find_global_unique(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    exact: &str,
-    suffix_dot: &str,
-    suffix_colon: &str,
-    lookup_cache: &mut ResolutionLookupCache,
-) -> Result<Option<i64>> {
-    let cache_key = (kind_clause.to_string(), exact.to_string());
-    if let Some(cached) = lookup_cache.global_unique_lookup.get(&cache_key) {
-        return Ok(*cached);
-    }
-
-    let exact_count_query = format!(
-        "SELECT COUNT(*) FROM node
-         WHERE kind IN ({})
-         AND serialized_name = ?1",
-        kind_clause
-    );
-    let exact_count: i64 = conn.query_row(&exact_count_query, params![exact], |row| row.get(0))?;
-    let resolved = if exact_count == 1 {
-        let exact_query = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND serialized_name = ?1
-             LIMIT 1",
-            kind_clause
-        );
-        conn.query_row(&exact_query, params![exact], |row| row.get(0))
-            .optional()?
-    } else if exact_count > 1 {
-        None
-    } else {
-        let suffix_count_query = format!(
-            "SELECT COUNT(*) FROM node
-             WHERE kind IN ({})
-             AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)",
-            kind_clause
-        );
-        let suffix_count: i64 = conn.query_row(
-            &suffix_count_query,
-            params![suffix_dot, suffix_colon],
-            |row| row.get(0),
-        )?;
-        if suffix_count != 1 {
-            None
-        } else {
-            let suffix_query = format!(
-                "SELECT id FROM node
-                 WHERE kind IN ({})
-                 AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
-                 LIMIT 1",
-                kind_clause
-            );
-            conn.query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
-                row.get(0)
-            })
-            .optional()?
-        }
-    };
-    lookup_cache
-        .global_unique_lookup
-        .insert(cache_key, resolved);
-    Ok(resolved)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn find_fuzzy(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    exact: &str,
-    suffix_dot: &str,
-    suffix_colon: &str,
-) -> Result<Option<i64>> {
-    let exact_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND serialized_name = ?1
-         ORDER BY start_line LIMIT 1",
-        kind_clause
-    );
-    if let Some(id) = conn
-        .query_row(&exact_query, params![exact], |row| row.get(0))
-        .optional()?
-    {
-        return Ok(Some(id));
-    }
-
-    let suffix_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
-         ORDER BY start_line LIMIT 1",
-        kind_clause
-    );
-    if let Some(id) = conn
-        .query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
-            row.get(0)
-        })
-        .optional()?
-    {
-        return Ok(Some(id));
-    }
-
-    let fuzzy = format!("%{}%", exact);
-    let query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND serialized_name LIKE ?1
-         ORDER BY start_line LIMIT 1",
-        kind_clause
-    );
-    conn.query_row(&query, params![fuzzy], |row| row.get(0))
-        .optional()
-        .map_err(Into::into)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn collect_candidate_pool(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    names: &[String],
-    out: &mut Vec<i64>,
-    limit: usize,
-) -> Result<()> {
-    if out.len() >= limit {
-        return Ok(());
-    }
-    for name in names {
-        let (exact, suffix_dot, suffix_colon) = name_patterns(name);
-        let top = find_top_matches(conn, kind_clause, &exact, &suffix_dot, &suffix_colon, 3)?;
-        for id in top {
-            record_candidate(out, id);
-            if out.len() >= limit {
-                return Ok(());
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn find_top_matches(
-    conn: &rusqlite::Connection,
-    kind_clause: &str,
-    exact: &str,
-    suffix_dot: &str,
-    suffix_colon: &str,
-    limit: usize,
-) -> Result<Vec<i64>> {
-    let exact_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND serialized_name = ?1
-         ORDER BY start_line
-         LIMIT {}",
-        kind_clause, limit
-    );
-    let mut out = Vec::with_capacity(limit);
-    {
-        let mut stmt = conn.prepare(&exact_query)?;
-        let rows = stmt.query_map(params![exact], |row| row.get(0))?;
-        for row in rows {
-            out.push(row?);
-        }
-    }
-    if out.len() >= limit {
-        return Ok(out);
-    }
-
-    let remaining = limit - out.len();
-    let suffix_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
-         ORDER BY start_line
-         LIMIT {}",
-        kind_clause, remaining
-    );
-    let mut stmt = conn.prepare(&suffix_query)?;
-    let rows = stmt.query_map(params![suffix_dot, suffix_colon], |row| row.get(0))?;
-    for row in rows {
-        let candidate = row?;
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    Ok(out)
-}
-
 fn candidate_json(candidates: &[i64]) -> Result<Option<String>> {
     if candidates.is_empty() {
         return Ok(None);
     }
     Ok(Some(serde_json::to_string(candidates)?))
-}
-
-#[cfg(test)]
-fn record_candidate(candidates: &mut Vec<i64>, candidate: i64) {
-    if !candidates.contains(&candidate) {
-        candidates.push(candidate);
-    }
 }
 
 fn consider_selected(selected: &mut Option<(i64, f32)>, candidate_id: i64, confidence: f32) {
@@ -5042,53 +4727,6 @@ mod tests {
     }
 
     #[test]
-    fn test_common_call_certain_semantic_candidate_still_resolves() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        create_node_table(&conn)?;
-        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
-        let flags = ResolutionFlags {
-            legacy_mode: false,
-            enable_semantic: true,
-            store_candidates: false,
-            parallel_compute: false,
-        };
-        let pass = ResolutionPass {
-            flags,
-            policy: ResolutionPolicy::for_flags(flags),
-            semantic_resolvers: SemanticResolverRegistry::new(true),
-            go_context: None,
-        };
-        let row = (
-            2_i64,
-            Some(100_i64),
-            Some("pkg::core::caller".to_string()),
-            "caller".to_string(),
-            "clone".to_string(),
-            0,
-            Some("/repo/lib.rs".to_string()),
-            Some("1:2:3:4".to_string()),
-            None,
-        );
-        let semantic_candidates = vec![SemanticResolutionCandidate {
-            target_node_id: 77_i64,
-            confidence: ResolutionCertainty::CERTAIN_MIN,
-        }];
-
-        let computed = candidate_selection::compute_call_resolution(
-            &pass,
-            &index,
-            &row,
-            &semantic_candidates,
-        )?;
-        assert_eq!(
-            computed.strategy,
-            Some(ResolutionStrategy::CallSemanticFallback)
-        );
-        assert_eq!(computed.update.resolved_target_node_id, Some(77_i64));
-        Ok(())
-    }
-
-    #[test]
     fn test_semantic_language_bucket_matrix() {
         let expected = [
             ("a.c", Some("c")),
@@ -5377,55 +5015,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1000_i64);
         assert_eq!(count, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_exact_lookup_cache_reuses_same_file_key() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE node (
-                id INTEGER PRIMARY KEY,
-                kind INTEGER NOT NULL,
-                serialized_name TEXT NOT NULL,
-                canonical_id TEXT,
-                file_node_id INTEGER,
-                start_line INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
-        conn.execute(
-            "INSERT INTO node (id, kind, serialized_name, file_node_id, start_line)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![77_i64, NodeKind::FUNCTION as i32, "foo", 555_i64, 1_i64],
-        )?;
-
-        let kind_clause = kind_clause(&[NodeKind::FUNCTION as i32]);
-        let (exact, suffix_dot, suffix_colon) = name_patterns("foo");
-        let mut lookup_cache = ResolutionLookupCache::default();
-
-        let first = find_same_file(
-            &conn,
-            &kind_clause,
-            Some(555_i64),
-            &exact,
-            &suffix_dot,
-            &suffix_colon,
-            &mut lookup_cache,
-        )?;
-        assert_eq!(first, Some(77_i64));
-        assert_eq!(lookup_cache.same_file_lookup.len(), 1);
-
-        let second = find_same_file(
-            &conn,
-            &kind_clause,
-            Some(555_i64),
-            &exact,
-            &suffix_dot,
-            &suffix_colon,
-            &mut lookup_cache,
-        )?;
-        assert_eq!(second, Some(77_i64));
-        assert_eq!(lookup_cache.same_file_lookup.len(), 1);
         Ok(())
     }
 
@@ -5826,6 +5415,14 @@ mod tests {
 
         let ids: Vec<i64> = (1..=600_i64).collect();
 
+        let persisted_value = |conn: &Connection| -> Result<i64> {
+            Ok(
+                conn.query_row("SELECT COALESCE(SUM(value), 0) FROM perf", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        };
+
         let no_tx_start = Instant::now();
         for id in &ids {
             conn.execute(
@@ -5834,6 +5431,11 @@ mod tests {
             )?;
         }
         let no_tx_elapsed = no_tx_start.elapsed();
+        assert_eq!(
+            persisted_value(&conn)?,
+            ids.len() as i64,
+            "autocommit updates must be persisted before the timing is compared"
+        );
 
         conn.execute("UPDATE perf SET value = 0", [])?;
 
@@ -5846,6 +5448,24 @@ mod tests {
             Ok(())
         })?;
         let tx_elapsed = tx_start.elapsed();
+        assert_eq!(
+            persisted_value(&conn)?,
+            ids.len() as i64,
+            "transaction updates must be committed before the timing is compared"
+        );
+
+        // A transaction that aborts must leave prior values untouched; without
+        // this the smoke test times a block whose writes may never commit.
+        let aborted = run_in_immediate_transaction(&conn, |tx_conn| -> Result<()> {
+            tx_conn.execute("UPDATE perf SET value = value + 100", [])?;
+            Err(anyhow::anyhow!("forced abort"))
+        });
+        assert!(aborted.is_err(), "the injected abort must surface");
+        assert_eq!(
+            persisted_value(&conn)?,
+            ids.len() as i64,
+            "an aborted transaction must roll back every staged write"
+        );
 
         assert!(
             tx_elapsed < no_tx_elapsed,

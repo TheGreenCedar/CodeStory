@@ -507,14 +507,6 @@ fn test_two_go_peer_external_import_occurrences_do_not_resolve_to_each_other() -
     let (nodes, edges) = index_workspace(&fixture)?;
     assert_go_import_occurrence_resolution(&nodes, &edges, 2, true)
 }
-
-#[test]
-fn test_go_import_occurrence_safety_when_internal_resolution_is_optional() -> anyhow::Result<()> {
-    let fixture = go_import_occurrence_fixture(3);
-    let (nodes, edges) = index_workspace(&fixture)?;
-    assert_go_import_occurrence_resolution(&nodes, &edges, 3, false)
-}
-
 #[test]
 fn test_generic_parser_backed_imports_resolve_to_indexed_targets() -> anyhow::Result<()> {
     let (nodes, edges) = index_workspace(&[

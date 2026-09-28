@@ -143,6 +143,22 @@ mod tests {
         assert!(blanked.contains("let x = 1;"));
         assert!(blanked.as_bytes()[0] == b' ');
         assert!(blanked.as_bytes()[4] == b' ');
+        // The line boundaries themselves must survive: blanking newline or CR
+        // bytes to spaces would keep length and still pass the above.
+        let source_line_bytes = source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n' || byte == b'\r').then_some(index))
+            .collect::<Vec<_>>();
+        let blanked_line_bytes = blanked
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n' || byte == b'\r').then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blanked_line_bytes, source_line_bytes,
+            "blanking must preserve every line-boundary byte position"
+        );
     }
 
     #[test]

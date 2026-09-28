@@ -17411,6 +17411,9 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.file_id, new_file);
         assert_eq!(file.top_level_declarations[0].declaration, new_method);
         assert_eq!(file.inherent_methods[0].declaration, new_method);
+        // `owner` is populated on the input but was previously never asserted —
+        // a rebase that left the stale old owner id would pass everything above.
+        assert_eq!(file.inherent_methods[0].owner, Some(new_owner));
         assert_eq!(file.classes[0].declaration, new_owner);
         assert_eq!(file.classes[0].methods[0].declaration, new_method);
         assert_eq!(file.direct_exports[0].declaration, new_owner);

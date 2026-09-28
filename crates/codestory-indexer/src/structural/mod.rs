@@ -1541,6 +1541,10 @@ mod tests {
         }
         let first = index_structural_file(&first_path).expect("index first markdown");
         let second = index_structural_file(&second_path).expect("index second markdown");
+        assert!(
+            !first.structural_text_units.is_empty() && !second.structural_text_units.is_empty(),
+            "an empty unit set would make the identity comparison vacuous"
+        );
         let mut first_content = first
             .structural_text_units
             .iter()
@@ -1612,6 +1616,10 @@ mod tests {
 
             let first = index_structural_file(&first_path).expect("index first fixture");
             let second = index_structural_file(&second_path).expect("index second fixture");
+            assert!(
+                !first.structural_text_units.is_empty() && !second.structural_text_units.is_empty(),
+                "{label}: an empty unit set would make the identity comparison vacuous"
+            );
             let mut first_content = first
                 .structural_text_units
                 .iter()

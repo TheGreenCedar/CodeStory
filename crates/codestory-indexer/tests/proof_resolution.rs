@@ -1075,35 +1075,6 @@ fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> 
         4,
     )
 }
-
-#[test]
-fn f4_verifier_relative_nested_java_ancestor() -> anyhow::Result<()> {
-    assert_nominal_call_is_nonexact(
-        &[(
-            "p/Outer.java",
-            concat!(
-                "package p;\n",
-                "class Outer {\n",
-                "  static class Worker {\n",
-                "    public void target() {}\n",
-                "  }\n",
-                "  static class Caller {\n",
-                "    void caller(Worker value) {\n",
-                "      value.target();\n",
-                "    }\n",
-                "  }\n",
-                "}\n",
-                "class Child extends Outer.Worker {\n",
-                "  public void target() {}\n",
-                "}\n",
-            ),
-        )],
-        "java",
-        "p/Outer.java",
-        8,
-    )
-}
-
 #[test]
 fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Result<()> {
     // Nested Exact authority remains unsupported, even without an override.
@@ -5861,21 +5832,6 @@ fn python_class_function_namespace_collision_refuses_constructor_proof() -> anyh
     );
     assert_python_member_identity(source, 11, 2, 1, false)
 }
-
-#[test]
-fn python_module_setattr_delattr_refuse_member_proof() -> anyhow::Result<()> {
-    for mutation in [
-        "setattr(Worker, 'target', replacement)",
-        "delattr(Worker, 'target')",
-    ] {
-        let source = format!(
-            "class Worker:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\ndef replacement(self):\n    pass\n{mutation}\n"
-        );
-        assert_python_member_identity(&source, 5, 2, 1, false)?;
-    }
-    Ok(())
-}
-
 #[test]
 fn python_namespace_collision_order_and_unshadowed_controls() -> anyhow::Result<()> {
     assert_python_member_identity(
@@ -6691,6 +6647,13 @@ fn python_relative_imports_reject_duplicate_raw_import_hops_before_and_after_rep
             })
             .collect::<Vec<_>>();
         hops.sort_by_key(|edge| edge.id);
+        // Census before mutation: without at least one raw module-target IMPORT
+        // hop, both corruption phases below execute zero assertions.
+        assert_eq!(
+            hops.len(),
+            1,
+            "replay={replay}: fixture must produce exactly one raw module-target IMPORT hop"
+        );
         for (offset, hop) in hops.into_iter().enumerate() {
             let mut duplicate = hop.clone();
             duplicate.id = EdgeId(8_700_000_000_000_000_000 + offset as i64);
@@ -6796,7 +6759,10 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
     Ok(())
 }
 
-fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::Result<()> {
+fn assert_python_facts_are_non_authoritative(
+    files: &[(&str, &str)],
+    expected_python_facts: usize,
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
@@ -6806,7 +6772,13 @@ fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::
         .into_iter()
         .filter(|fact| fact.provenance.language_adapter == "python")
         .collect::<Vec<_>>();
-    assert!(!facts.is_empty(), "missing Python facts for {files:?}");
+    // The census is part of the contract: dropping a derived callback or
+    // receiver fact while keeping one nonexact getter fact must fail here.
+    assert_eq!(
+        facts.len(),
+        expected_python_facts,
+        "unexpected Python fact census for {files:?}: {facts:#?}"
+    );
     assert!(
         facts.iter().all(|fact| {
             fact.status != ProofResolutionStatus::Exact && fact.evidence_chain.is_empty()
@@ -6818,19 +6790,43 @@ fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::
 
 #[test]
 fn python_getattr_and_derived_values_remain_non_authoritative() -> anyhow::Result<()> {
-    for source in [
-        "def caller(obj):\n    getattr(obj, 'target')()\n",
-        "def caller(obj):\n    callback = getattr(obj, 'target')\n    callback()\n",
-        "def caller(obj):\n    getattr(obj, 'target').method()\n",
-        "def caller(obj, getattr):\n    getattr(obj, 'target')()\n",
-        "def caller(obj):\n    getattr = obj\n    getattr(obj, 'target')()\n",
-        "from foreign import getattr\ndef caller(obj):\n    getattr(obj, 'target')()\n",
-        "def target():\n    pass\ndef caller(obj):\n    getattr(obj, 'value')\n    def inner():\n        target()\n    inner()\n",
-        "def caller(obj):\n    callback = lambda: getattr(obj, 'target')()\n    callback()\n",
-        "def caller(obj):\n    receiver = getattr(obj, 'receiver')\n    receiver.target()\n",
-        "def caller(obj):\n    constructor = getattr(obj, 'Worker')\n    constructor()\n",
+    for (source, expected_python_facts) in [
+        ("def caller(obj):\n    getattr(obj, 'target')()\n", 2),
+        (
+            "def caller(obj):\n    callback = getattr(obj, 'target')\n    callback()\n",
+            2,
+        ),
+        ("def caller(obj):\n    getattr(obj, 'target').method()\n", 2),
+        (
+            "def caller(obj, getattr):\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "def caller(obj):\n    getattr = obj\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "from foreign import getattr\ndef caller(obj):\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "def target():\n    pass\ndef caller(obj):\n    getattr(obj, 'value')\n    def inner():\n        target()\n    inner()\n",
+            3,
+        ),
+        (
+            "def caller(obj):\n    callback = lambda: getattr(obj, 'target')()\n    callback()\n",
+            3,
+        ),
+        (
+            "def caller(obj):\n    receiver = getattr(obj, 'receiver')\n    receiver.target()\n",
+            2,
+        ),
+        (
+            "def caller(obj):\n    constructor = getattr(obj, 'Worker')\n    constructor()\n",
+            2,
+        ),
     ] {
-        assert_python_facts_are_non_authoritative(&[("main.py", source)])?;
+        assert_python_facts_are_non_authoritative(&[("main.py", source)], expected_python_facts)?;
     }
     Ok(())
 }

@@ -20834,6 +20834,10 @@ mod ruby_php_complexity_tests {
             ("php", php_receiver_work(128), php_receiver_work(256)),
         ] {
             assert!(
+                small > 0,
+                "{language} work was not counted; a disabled counter makes the bound vacuous"
+            );
+            assert!(
                 large <= small.saturating_mul(2).saturating_add(32),
                 "{language} work grew superlinearly: 1x={small}, 2x={large}"
             );

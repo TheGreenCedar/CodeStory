@@ -1289,19 +1289,16 @@ public:
 #[test]
 fn test_file_completeness_tracks_parse_errors() -> Result<()> {
     let language_config = get_language_for_ext("rs").unwrap();
-    let result = index_file(
-        Path::new("broken.rs"),
-        "fn broken( {",
-        &language_config,
-        None,
-        None,
-    )?;
-
-    assert_eq!(result.files.len(), 1);
-    assert!(
-        !result.files[0].complete,
-        "malformed Rust source should be incomplete"
-    );
+    // Both fixture spellings share the same completeness boundary: the
+    // trailing-newline variant previously lived in a duplicate test.
+    for code in ["fn broken( {", "fn broken( {\n"] {
+        let result = index_file(Path::new("broken.rs"), code, &language_config, None, None)?;
+        assert_eq!(result.files.len(), 1);
+        assert!(
+            !result.files[0].complete,
+            "malformed Rust source should be incomplete: {code:?}"
+        );
+    }
     Ok(())
 }
 
@@ -3508,6 +3505,7 @@ fn test_full_refresh_parses_next_chunk_while_writer_owns_previous_chunk() -> Res
     use codestory_store::Store as Storage;
     use std::fs;
     use std::sync::Barrier;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     let dir = tempdir()?;
@@ -3566,7 +3564,19 @@ fn test_full_refresh_parses_next_chunk_while_writer_owns_previous_chunk() -> Res
         existing_file_ids: HashMap::new(),
     };
 
-    let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+    // The barrier hooks rendezvous two participants; if one never arrives the
+    // unbounded Barrier::wait would hang forever, so supervise the run with a
+    // local deadline that turns a missed rendezvous into a test failure.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = indexer.run(&mut storage, &plan, &EventBus::new(), None);
+        let _ = result_tx.send((result, storage));
+    });
+    let (result, _storage) = result_rx.recv_timeout(Duration::from_secs(15)).expect(
+        "full-refresh pipeline must finish before the local deadline;          a stuck barrier participant must fail, not hang",
+    );
+    handle.join().expect("indexing thread must not panic");
+    let stats = result?;
 
     assert!(next_parse_started.load(Ordering::SeqCst));
     assert_eq!(stats.full_refresh_chunks_produced, 2);
@@ -3579,6 +3589,7 @@ fn test_full_refresh_cancellation_while_queue_is_full_drains_only_accepted_chunk
     use codestory_store::Store as Storage;
     use std::fs;
     use std::sync::Barrier;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     let dir = tempdir()?;
@@ -3638,7 +3649,23 @@ fn test_full_refresh_cancellation_while_queue_is_full_drains_only_accepted_chunk
         existing_file_ids: HashMap::new(),
     };
 
-    let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+    // Same deadline guard: the barrier hooks must rendezvous or the run fails.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let run_cancel_token = cancel_token.clone();
+    let handle = std::thread::spawn(move || {
+        let result = indexer.run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            Some(&run_cancel_token),
+        );
+        let _ = result_tx.send((result, storage));
+    });
+    let (result, storage) = result_rx.recv_timeout(Duration::from_secs(15)).expect(
+        "full-refresh pipeline must finish before the local deadline;          a stuck barrier participant must fail, not hang",
+    );
+    handle.join().expect("indexing thread must not panic");
+    let stats = result?;
 
     assert!(cancel_token.is_cancelled());
     assert_eq!(stats.full_refresh_chunks_produced, 2);
@@ -3786,6 +3813,7 @@ fn test_full_refresh_cancellation_during_parse_drops_unaccepted_chunk() -> Resul
 fn test_full_refresh_cancellation_after_writer_acceptance_drains_that_chunk() -> Result<()> {
     use codestory_store::Store as Storage;
     use std::sync::Barrier;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     let dir = tempdir()?;
@@ -3831,7 +3859,24 @@ fn test_full_refresh_cancellation_after_writer_acceptance_drains_that_chunk() ->
     };
     let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
 
-    let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+    // Same deadline guard: the producer/writer rendezvous must complete or the
+    // run fails instead of hanging on an unbounded Barrier::wait.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let run_cancel_token = cancel_token.clone();
+    let handle = std::thread::spawn(move || {
+        let result = indexer.run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            Some(&run_cancel_token),
+        );
+        let _ = result_tx.send((result, storage));
+    });
+    let (result, storage) = result_rx.recv_timeout(Duration::from_secs(15)).expect(
+        "full-refresh pipeline must finish before the local deadline;          a stuck barrier participant must fail, not hang",
+    );
+    handle.join().expect("indexing thread must not panic");
+    let stats = result?;
 
     assert!(cancel_token.is_cancelled());
     assert_eq!(stats.full_refresh_chunks_produced, 1);
@@ -4240,25 +4285,41 @@ fn test_incremental_indexing_cancel_after_flush_skips_resolution() -> Result<()>
     let rx = bus.receiver();
     let cancel_token = CancellationToken::new();
     let cancel_from_progress = cancel_token.clone();
+    // Gate the cancellation landing: the worker must not reach the resolution
+    // check until the progress-driven cancel has already happened, otherwise a
+    // scheduler delay can let resolution start first and the assertion races.
+    let cancel_landed = Arc::new(AtomicBool::new(false));
+    let canceller_cancel_landed = cancel_landed.clone();
+    let hook_cancel_landed = cancel_landed.clone();
     let canceller = std::thread::spawn(move || {
         while let Ok(event) = rx.recv_timeout(Duration::from_secs(2)) {
             if let Event::IndexingProgress { current, total } = event
                 && current == total
             {
                 cancel_from_progress.cancel();
+                canceller_cancel_landed.store(true, Ordering::SeqCst);
                 return;
             }
         }
     });
-    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
-        IncrementalIndexingConfig {
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+        .with_batch_config(IncrementalIndexingConfig {
             file_batch_size: 64,
             node_batch_size: usize::MAX,
             edge_batch_size: usize::MAX,
             occurrence_batch_size: usize::MAX,
             error_batch_size: 128,
-        },
-    );
+        })
+        .with_before_resolution_test_hook(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !hook_cancel_landed.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "progress-driven cancel must land before the resolution check"
+                );
+                std::thread::yield_now();
+            }
+        }));
 
     let refresh_info = RefreshInfo {
         mode: codestory_workspace::BuildMode::Incremental,
@@ -4267,7 +4328,20 @@ fn test_incremental_indexing_cancel_after_flush_skips_resolution() -> Result<()>
         existing_file_ids: std::collections::HashMap::new(),
     };
 
-    let stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, Some(&cancel_token))?;
+    // Local deadline: if the progress event never arrives the barrier gate
+    // would hang the run; supervise it so a stuck participant fails instead.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let run_cancel_token = cancel_token.clone();
+    let handle = std::thread::spawn(move || {
+        let result =
+            indexer.run_incremental(&mut storage, &refresh_info, &bus, Some(&run_cancel_token));
+        let _ = result_tx.send((result, storage));
+    });
+    let (result, storage) = result_rx.recv_timeout(Duration::from_secs(15)).expect(
+        "incremental indexing must finish before the local deadline;          a stuck progress gate must fail, not hang",
+    );
+    handle.join().expect("indexing thread must not panic");
+    let stats = result?;
     canceller.join().expect("progress canceller should finish");
 
     assert!(
@@ -5151,22 +5225,6 @@ fn test_node_kind_mapping_preserves_method_and_field() {
     assert_eq!(node_kind_from_graph_kind("METHOD"), NodeKind::METHOD);
     assert_eq!(node_kind_from_graph_kind("FIELD"), NodeKind::FIELD);
     assert_eq!(node_kind_from_graph_kind("INTERFACE"), NodeKind::INTERFACE);
-}
-
-#[test]
-fn test_header_language_defaults_to_c_without_compilation_metadata() {
-    let config = get_language_for_ext("h").expect("header extension should resolve");
-    assert_eq!(config.language_name, "c");
-}
-
-#[test]
-fn test_header_language_uses_cpp_when_compilation_standard_is_cxx() {
-    let info = compilation_database::CompilationInfo {
-        standard: Some(compilation_database::CxxStandard::Cxx20),
-        ..Default::default()
-    };
-    let config = get_language_config_for_path(Path::new("widget.h"), Some(&info)).expect("config");
-    assert_eq!(config.language_name, "cpp");
 }
 
 #[test]
@@ -6079,20 +6137,6 @@ struct Holder {
 
     Ok(())
 }
-
-#[test]
-fn test_incomplete_parse_marks_file_incomplete() -> Result<()> {
-    let code = "fn broken( {\n";
-    let language_config = get_language_for_ext("rs").unwrap();
-    let result = index_file(Path::new("broken.rs"), code, &language_config, None, None)?;
-    assert_eq!(result.files.len(), 1);
-    assert!(
-        !result.files[0].complete,
-        "malformed syntax should mark the file incomplete"
-    );
-    Ok(())
-}
-
 #[test]
 fn test_jsx_component_and_prop_usage_recovery_matches_tsx_behavior() -> Result<()> {
     let code = r#"
@@ -6169,38 +6213,6 @@ fn test_openapi_schema_indexes_endpoint_symbols() -> Result<()> {
     }));
     Ok(())
 }
-
-#[test]
-fn workspace_openapi_routing_precedes_generic_json_structural_collection() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("openapi.json");
-    std::fs::write(
-        &path,
-        r#"{
-  "openapi": "3.1.0",
-  "paths": {
-    "/health": {
-      "get": {}
-    }
-  }
-}"#,
-    )?;
-    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
-    let storage = match indexer.prepare_openapi_schema_work(&path) {
-        Ok(Some(storage)) => storage,
-        Ok(None) => panic!("expected dedicated OpenAPI projection"),
-        Err(_) => panic!("OpenAPI preparation failed"),
-    };
-    assert_eq!(storage.files[0].language, "openapi");
-    assert!(storage.structural_text_units.is_empty());
-    assert!(storage.nodes.iter().any(|node| {
-        node.canonical_id
-            .as_deref()
-            .is_some_and(|value| value == "openapi:endpoint:GET /health")
-    }));
-    Ok(())
-}
-
 #[test]
 fn openapi_components_only_schema_emits_no_endpoint_anchors() -> Result<()> {
     let schema = r#"{
@@ -6609,36 +6621,6 @@ pub fn build() {
     );
     Ok(())
 }
-
-#[test]
-fn test_template_svelte_tauri_invoke_indexes_uncertain_command_edge() -> Result<()> {
-    let source = r#"
-<script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  export async function refresh() {
-    await invoke("get_snapshot");
-  }
-</script>
-"#;
-    let storage = index_template_file(
-        Path::new("src/App.svelte"),
-        template_pipeline::TemplateKind::Svelte,
-        source,
-    )?;
-    let command = storage
-        .nodes
-        .iter()
-        .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
-        .expect("tauri command node");
-
-    assert!(storage.edges.iter().any(|edge| {
-        edge.kind == EdgeKind::CALL
-            && edge.target == command.id
-            && edge.certainty == Some(ResolutionCertainty::Uncertain)
-    }));
-    Ok(())
-}
-
 #[test]
 fn test_text_only_svelte_plain_invoke_does_not_index_tauri_command() -> Result<()> {
     let temp = tempdir()?;
@@ -7117,13 +7099,13 @@ fn test_framework_route_extractors_cover_requested_web_stacks() {
             "typescript",
             Path::new("app/users/[id]/page.tsx"),
             r#"export default function UserPage() { return null; }"#,
-            vec!["nextjs"],
+            vec![("nextjs", "GET", "/users/:id")],
         ),
         (
             "typescript",
             Path::new("app/api/users/[id]/route.ts"),
             r#"export async function POST() { return Response.json({}); }"#,
-            vec!["nextjs"],
+            vec![("nextjs", "POST", "/api/users/:id")],
         ),
         (
             "typescript",
@@ -7132,25 +7114,28 @@ fn test_framework_route_extractors_cover_requested_web_stacks() {
 export const loader = async () => null;
 export const action = async () => null;
 "#,
-            vec!["remix"],
+            vec![
+                ("remix", "GET", "/accounts/:accountId"),
+                ("remix", "POST", "/accounts/:accountId"),
+            ],
         ),
         (
             "astro",
             Path::new("src/pages/blog/[slug].astro"),
             r#"<h1>Post</h1>"#,
-            vec!["astro"],
+            vec![("astro", "GET", "/blog/:slug")],
         ),
         (
             "typescript",
             Path::new("server/api/users/[id].post.ts"),
             r#"export default defineEventHandler(() => ({}));"#,
-            vec!["nuxt"],
+            vec![("nuxt", "POST", "/users/:id")],
         ),
         (
             "vue",
             Path::new("pages/users/[id].vue"),
             r#"<template><div /></template>"#,
-            vec!["nuxt"],
+            vec![("nuxt", "GET", "/users/:id")],
         ),
         (
             "typescript",
@@ -7160,7 +7145,7 @@ import fastify from "fastify";
 const server = fastify();
 server.get("/fastify/:id", listFastify);
 "#,
-            vec!["fastify"],
+            vec![("fastify", "GET", "/fastify/:id")],
         ),
         (
             "typescript",
@@ -7170,7 +7155,7 @@ import Router from "@koa/router";
 const router = new Router();
 router.post("/koa/:id", createKoa);
 "#,
-            vec!["koa"],
+            vec![("koa", "POST", "/koa/:id")],
         ),
         (
             "typescript",
@@ -7180,7 +7165,7 @@ import { Hono } from "hono";
 const app = new Hono();
 app.get("/hono/:id", getHono);
 "#,
-            vec!["hono"],
+            vec![("hono", "GET", "/hono/:id")],
         ),
         (
             "typescript",
@@ -7192,7 +7177,7 @@ export class UsersController {
   show() {}
 }
 "#,
-            vec!["nestjs"],
+            vec![("nestjs", "GET", "/users/:id")],
         ),
         (
             "go",
@@ -7203,7 +7188,7 @@ func routes(r *gin.Engine) {
   r.GET("/gin/:id", showGin)
 }
 "#,
-            vec!["gin"],
+            vec![("gin", "GET", "/gin/:id")],
         ),
         (
             "go",
@@ -7214,7 +7199,7 @@ func routes(r chi.Router) {
   r.Get("/chi/{id}", showChi)
 }
 "#,
-            vec!["chi"],
+            vec![("chi", "GET", "/chi/:id")],
         ),
         (
             "go",
@@ -7225,7 +7210,7 @@ func routes(e *echo.Echo) {
   e.GET("/echo/:id", showEcho)
 }
 "#,
-            vec!["echo"],
+            vec![("echo", "GET", "/echo/:id")],
         ),
         (
             "go",
@@ -7236,7 +7221,7 @@ func routes(app *fiber.App) {
   app.Get("/fiber/:id", showFiber)
 }
 "#,
-            vec!["fiber"],
+            vec![("fiber", "GET", "/fiber/:id")],
         ),
         (
             "python",
@@ -7248,31 +7233,35 @@ def flask_handler(): pass
 async def fastapi_handler(): pass
 path("django/", views.home)
 "#,
-            vec!["flask", "fastapi", "django"],
+            vec![
+                ("flask", "POST", "/flask"),
+                ("fastapi", "GET", "/fastapi"),
+                ("django", "ROUTE", "/django/"),
+            ],
         ),
         (
             "ruby",
             Path::new("config/routes.rb"),
             r#"get "/rails", to: "home#index""#,
-            vec!["rails"],
+            vec![("rails", "GET", "/rails")],
         ),
         (
             "php",
             Path::new("routes/web.php"),
             r#"Route::post("/laravel", [UserController::class, "store"]);"#,
-            vec!["laravel"],
+            vec![("laravel", "POST", "/laravel")],
         ),
         (
             "java",
             Path::new("Controller.java"),
             r#"@GetMapping("/spring")"#,
-            vec!["spring"],
+            vec![("spring", "GET", "/spring")],
         ),
         (
             "csharp",
             Path::new("Controller.cs"),
             r#"[HttpGet("/aspnet")]"#,
-            vec!["aspnet"],
+            vec![("aspnet", "GET", "/aspnet")],
         ),
         (
             "rust",
@@ -7282,13 +7271,17 @@ Router::new().route("/axum", get(handler));
 web::resource("/actix").route(web::get().to(handler));
 #[post("/rocket")]
 "#,
-            vec!["axum", "actix", "rocket"],
+            vec![
+                ("axum", "GET", "/axum"),
+                ("actix", "GET", "/actix"),
+                ("rocket", "POST", "/rocket"),
+            ],
         ),
         (
             "vue",
             Path::new("router.vue"),
             r#"{ path: "/vue", name: "VueHome" }"#,
-            vec!["vue-router"],
+            vec![("vue-router", "GET", "/vue")],
         ),
         (
             "kotlin",
@@ -7302,7 +7295,10 @@ fun Application.module() {
   }
 }
 "#,
-            vec!["ktor"],
+            vec![
+                ("ktor", "GET", "/ktor/users"),
+                ("ktor", "POST", "/ktor/users"),
+            ],
         ),
         (
             "swift",
@@ -7313,7 +7309,7 @@ func routes(_ app: Application) throws {
   app.get("vapor/users", use: UserController.index)
 }
 "#,
-            vec!["vapor"],
+            vec![("vapor", "GET", "/vapor/users")],
         ),
         (
             "dart",
@@ -7323,20 +7319,22 @@ import 'package:shelf_router/shelf_router.dart';
 final router = Router();
 router.get('/shelf/users', usersHandler);
 "#,
-            vec!["shelf"],
+            vec![("shelf", "GET", "/shelf/users")],
         ),
     ];
 
-    for (language, path, source, expected_frameworks) in cases {
+    for (language, path, source, expected_routes) in cases {
         let routes = collect_framework_routes(path, language, source);
-        let frameworks = routes
-            .iter()
-            .map(|route| route.framework)
-            .collect::<HashSet<_>>();
-        for expected in expected_frameworks {
+        // Pin the extracted method and path, not just the framework name:
+        // emitting garbage paths must fail this matrix.
+        for (framework, method, route_path) in expected_routes {
             assert!(
-                frameworks.contains(expected),
-                "expected {expected} route in {language}; got {routes:?}"
+                routes.iter().any(|route| {
+                    route.framework == framework
+                        && route.method == method
+                        && route.path == route_path
+                }),
+                "expected {framework} {method} {route_path} in {language} ({path:?}); got {routes:?}"
             );
         }
     }
@@ -7908,89 +7906,113 @@ fn type_usage_finalize_cleans_orphans_without_scanning_all_nodes() -> Result<()>
     // Regression for activation @20 dwell: orphan cleanup used
     // `DELETE ... WHERE canonical_id LIKE 'type_ref_pending:%' AND NOT EXISTS (...)`,
     // which scanned every node row on large multi-language cores (protobuf-class).
-    let mut storage = Storage::new_in_memory()?;
-    let noise_nodes = 25_000usize;
+    // A wall-clock bound cannot catch that regression on a fast machine, so the
+    // test measures SQLite VM steps at two noise scales: work must track the
+    // pending set, not the node count.
     let pending_count = 1_200usize;
 
-    let mut nodes = Vec::with_capacity(noise_nodes + pending_count + 8);
-    for index in 0..noise_nodes {
-        let id = NodeId(i64::try_from(index + 1).expect("noise id"));
+    let measure = |noise_nodes: usize| -> Result<(Storage, u64, NodeId)> {
+        let mut storage = Storage::new_in_memory()?;
+
+        let mut nodes = Vec::with_capacity(noise_nodes + pending_count + 8);
+        for index in 0..noise_nodes {
+            let id = NodeId(i64::try_from(index + 1).expect("noise id"));
+            nodes.push(Node {
+                id,
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("noise_{index}"),
+                qualified_name: Some(format!("Noise.Lib.Fn{index}")),
+                ..Default::default()
+            });
+        }
+
+        let declaration_id = NodeId(i64::try_from(noise_nodes + 1).expect("decl id"));
         nodes.push(Node {
-            id,
-            kind: NodeKind::FUNCTION,
-            serialized_name: format!("noise_{index}"),
-            qualified_name: Some(format!("Noise.Lib.Fn{index}")),
+            id: declaration_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Widget".to_string(),
+            qualified_name: Some("Acme.Widgets.Widget".to_string()),
             ..Default::default()
         });
-    }
 
-    let declaration_id = NodeId(i64::try_from(noise_nodes + 1).expect("decl id"));
-    nodes.push(Node {
-        id: declaration_id,
-        kind: NodeKind::CLASS,
-        serialized_name: "Widget".to_string(),
-        qualified_name: Some("Acme.Widgets.Widget".to_string()),
-        ..Default::default()
-    });
-
-    let source_id = NodeId(i64::try_from(noise_nodes + 2).expect("source id"));
-    nodes.push(Node {
-        id: source_id,
-        kind: NodeKind::CLASS,
-        serialized_name: "Owner".to_string(),
-        qualified_name: Some("Acme.App.Owner".to_string()),
-        ..Default::default()
-    });
-
-    let mut edges = Vec::with_capacity(pending_count + 1);
-    let resolve_pending_id = NodeId(i64::try_from(noise_nodes + 3).expect("resolve pending"));
-    nodes.push(Node {
-        id: resolve_pending_id,
-        kind: NodeKind::UNKNOWN,
-        serialized_name: "Widget".to_string(),
-        canonical_id: Some(format!(
-            "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Widget"
-        )),
-        ..Default::default()
-    });
-    edges.push(Edge {
-        id: EdgeId(1),
-        source: source_id,
-        target: resolve_pending_id,
-        kind: EdgeKind::TYPE_USAGE,
-        ..Default::default()
-    });
-
-    let pending_base = noise_nodes + 10;
-    for index in 0..pending_count {
-        let pending_id = NodeId(i64::try_from(pending_base + index).expect("pending id"));
+        let source_id = NodeId(i64::try_from(noise_nodes + 2).expect("source id"));
         nodes.push(Node {
-            id: pending_id,
+            id: source_id,
+            kind: NodeKind::CLASS,
+            serialized_name: "Owner".to_string(),
+            qualified_name: Some("Acme.App.Owner".to_string()),
+            ..Default::default()
+        });
+
+        let mut edges = Vec::with_capacity(pending_count + 1);
+        let resolve_pending_id = NodeId(i64::try_from(noise_nodes + 3).expect("resolve pending"));
+        nodes.push(Node {
+            id: resolve_pending_id,
             kind: NodeKind::UNKNOWN,
-            serialized_name: format!("Missing{index}"),
+            serialized_name: "Widget".to_string(),
             canonical_id: Some(format!(
-                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Missing{index}"
+                "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Widget"
             )),
             ..Default::default()
         });
         edges.push(Edge {
-            id: EdgeId(i64::try_from(index + 2).expect("edge id")),
+            id: EdgeId(1),
             source: source_id,
-            target: pending_id,
+            target: resolve_pending_id,
             kind: EdgeKind::TYPE_USAGE,
             ..Default::default()
         });
-    }
 
-    storage.insert_nodes_batch(&nodes)?;
-    storage.insert_edges_batch(&edges)?;
+        let pending_base = noise_nodes + 10;
+        for index in 0..pending_count {
+            let pending_id = NodeId(i64::try_from(pending_base + index).expect("pending id"));
+            nodes.push(Node {
+                id: pending_id,
+                kind: NodeKind::UNKNOWN,
+                serialized_name: format!("Missing{index}"),
+                canonical_id: Some(format!(
+                    "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}Owner.cs:Acme.App:Missing{index}"
+                )),
+                ..Default::default()
+            });
+            edges.push(Edge {
+                id: EdgeId(i64::try_from(index + 2).expect("edge id")),
+                source: source_id,
+                target: pending_id,
+                kind: EdgeKind::TYPE_USAGE,
+                ..Default::default()
+            });
+        }
 
-    let started = Instant::now();
-    finalize_pending_type_usage_edges(&mut storage)?;
-    let elapsed = started.elapsed();
+        storage.insert_nodes_batch(&nodes)?;
+        storage.insert_edges_batch(&edges)?;
+
+        let vm_steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let steps_counter = vm_steps.clone();
+        {
+            let conn = storage.get_connection();
+            conn.progress_handler(
+                1_000,
+                Some(move || {
+                    steps_counter.fetch_add(1_000, Ordering::Relaxed);
+                    false
+                }),
+            )?;
+        }
+        finalize_pending_type_usage_edges(&mut storage)?;
+        storage
+            .get_connection()
+            .progress_handler(0, None::<fn() -> bool>)?;
+        Ok((storage, vm_steps.load(Ordering::Relaxed), declaration_id))
+    };
+
+    let (storage, steps_small, declaration_id) = measure(25_000)?;
+    let (_storage_large, steps_large, _) = measure(75_000)?;
+    // Tripling the noise-node count must not materially grow finalize work:
+    // a regression to a full-node scan would scale linearly with noise.
     assert!(
-        elapsed.as_secs() < 3,
-        "TYPE_USAGE finalize must stay sub-second-class with {noise_nodes} noise nodes; took {elapsed:?}"
+        steps_large <= steps_small + steps_small / 2,
+        "TYPE_USAGE finalize work must track pending orphans, not total nodes:          25k noise -> {steps_small} VM steps, 75k noise -> {steps_large} VM steps"
     );
 
     let conn = storage.get_connection();

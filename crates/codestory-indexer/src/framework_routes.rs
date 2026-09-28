@@ -2069,7 +2069,37 @@ app.head("/string-only", documented);
         );
 
         assert_eq!((parser_tp, parser_fp, parser_fn), (4, 0, 0));
-        assert!(lexical_fp > 0 || lexical_fn > 0);
+        // Pin the lexical scanner's exact defect sets, not just "some defect":
+        // a repaired line scanner must be observed changing these rows, and
+        // skipping the defect branch can no longer satisfy `> 0` vacuously.
+        let lexical_extra = lexical
+            .difference(&expected)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let lexical_missing = expected
+            .difference(&lexical)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            lexical_extra,
+            [
+                ("DELETE".to_string(), "/nested-path".to_string()),
+                ("GET".to_string(), "/prefix".to_string()),
+                ("GET".to_string(), "/unowned".to_string()),
+                ("HEAD".to_string(), "/string-only".to_string()),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            lexical_missing,
+            [
+                ("POST".to_string(), "/multiline".to_string()),
+                ("PUT".to_string(), "/static-template".to_string()),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
         assert!(parser_routes.iter().all(|route| {
             route.extraction_provenance == "tree_sitter_query"
                 && route.claim_tier == "parser_backed"
@@ -2522,7 +2552,40 @@ const example = `api.head("/string-only", documented);`;
         );
 
         assert_eq!((parser_tp, parser_fp, parser_fn), (5, 0, 0));
-        assert!(lexical_fp > 0 || lexical_fn > 0);
+        // Pin the lexical scanner's exact defect sets (see the express row).
+        let lexical_extra = lexical
+            .difference(&expected)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let lexical_missing = expected
+            .difference(&lexical)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            lexical_extra,
+            [
+                ("/DYNAMIC-METHOD".to_string(), "/dynamic-method".to_string()),
+                ("GET".to_string(), "/array-method".to_string()),
+                ("GET".to_string(), "/duplicate-method".to_string()),
+                ("GET".to_string(), "/missing-handler".to_string()),
+                ("GET".to_string(), "/spread".to_string()),
+                ("GET".to_string(), "/unrelated".to_string()),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            lexical_missing,
+            [
+                ("DELETE".to_string(), "/object".to_string()),
+                ("GET".to_string(), "/simple".to_string()),
+                ("PATCH".to_string(), "/wrapped".to_string()),
+                ("POST".to_string(), "/multiline".to_string()),
+                ("PUT".to_string(), "/static-template".to_string()),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
         assert!(parser_routes.iter().all(|route| {
             route.extraction_provenance == "tree_sitter_query"
                 && route.claim_tier == "parser_backed"
