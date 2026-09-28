@@ -2000,7 +2000,11 @@ mod complexity_tests {
             .expect("Go grammar must load");
         let tree = parser.parse(&source, None).expect("Go source must parse");
         reset_go_navigation_resolution_work();
-        let _ = receiver_call_specs(&tree, &source);
+        let specs = receiver_call_specs(&tree, &source);
+        assert!(
+            specs.len() >= call_count,
+            "each receiver call must produce a spec, or the work bound is vacuous"
+        );
         go_navigation_resolution_work()
     }
 
