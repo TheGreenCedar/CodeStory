@@ -42,6 +42,7 @@ mod tests {
     fn adapter_binding_rewrites_the_deeper_packet_command_only() {
         let mut packet = super::super::packet_budget::tests::test_packet("trace routing", 98_304);
         packet.budget.requested = PacketBudgetModeDto::Compact;
+        let disposition_before = packet.disposition.clone();
         bind_packet_follow_up_program(
             Path::new("/tmp/project with space"),
             &mut packet,
@@ -56,7 +57,7 @@ mod tests {
                     .starts_with("'/opt/CodeStory Managed/bin/codestory-cli' packet"))
         );
         assert_eq!(
-            packet.disposition.kind, packet.disposition.kind,
+            packet.disposition, disposition_before,
             "adapter binding must not reclassify disposition"
         );
     }

@@ -966,12 +966,32 @@ mod tests {
         assert_eq!(evidence.as_slice().len(), 1);
         assert!(gaps.as_slice().is_empty());
         assert_eq!(record, before, "projection must not mutate the record");
-        assert!(
-            !serde_json::to_string(&projection)
-                .expect("serialize projection")
-                .contains(question),
-            "raw question must stay out of the packet projection"
-        );
+        let serialized = serde_json::to_value(&projection).expect("serialize projection");
+        assert_no_json_string_contains(&serialized, question);
+    }
+
+    fn assert_no_json_string_contains(value: &serde_json::Value, needle: &str) {
+        match value {
+            serde_json::Value::String(text) => assert!(
+                !text.contains(needle),
+                "raw question leaked into a projection string value"
+            ),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_json_string_contains(item, needle);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    assert!(
+                        !key.contains(needle),
+                        "raw question leaked into a projection field name"
+                    );
+                    assert_no_json_string_contains(item, needle);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
@@ -1407,36 +1427,44 @@ mod tests {
                 maximum_bytes,
                 required_complete_bytes,
                 ..
-            } = projection
+            } = &projection
             else {
                 panic!("cap plus one must discard the complete projection");
             };
-            assert_eq!(status, EvidenceAvailabilityV3Dto::Unavailable);
-            assert_eq!(diagnostics, diagnostics_capability_fixture());
-            assert_eq!(maximum_bytes, PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64);
+            assert_eq!(status, &EvidenceAvailabilityV3Dto::Unavailable);
+            assert_eq!(diagnostics, &diagnostics_capability_fixture());
+            assert_eq!(*maximum_bytes, PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64);
             assert_eq!(
-                required_complete_bytes,
+                *required_complete_bytes,
                 (PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1) as u64
             );
-            let serialized = serde_json::to_value(PacketProjectionV3Dto::BudgetExceeded {
-                schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
-                identity: packet_identity(&record),
-                publication: publication(&record),
-                status,
-                retrieval: record.retrieval().clone(),
-                diagnostics,
-                gaps: packet_budget_exceeded_gaps_v3(),
-                maximum_bytes,
-                required_complete_bytes,
-                answer_sufficiency: Default::default(),
-            })
-            .unwrap();
+            let serialized =
+                serde_json::to_value(&projection).expect("serialize returned fallback projection");
             let gaps = serialized["gaps"].as_array().expect("typed budget gap");
             assert_eq!(gaps.len(), 1, "fallback must carry exactly one gap");
             assert_eq!(gaps[0]["kind"], "output_budget_exceeded");
             assert_eq!(
                 gaps[0]["identity"]["gap_id"],
                 "packet-output-budget-exceeded"
+            );
+            assert_eq!(
+                serialized["schema_version"], PACKET_PROJECTION_V3_SCHEMA_VERSION,
+                "fallback must keep the projection schema version"
+            );
+            assert_eq!(
+                serialized["identity"],
+                serde_json::to_value(packet_identity(&record)).unwrap(),
+                "fallback must preserve the record request identity"
+            );
+            assert_eq!(
+                serialized["publication"],
+                serde_json::to_value(publication(&record)).unwrap(),
+                "fallback must preserve the record publication identity"
+            );
+            assert_eq!(
+                serialized["retrieval"],
+                serde_json::to_value(record.retrieval()).unwrap(),
+                "fallback must preserve the record retrieval descriptor"
             );
             for absent in ["evidence", "continuation", "summary"] {
                 assert!(serialized.get(absent).is_none(), "fallback leaked {absent}");

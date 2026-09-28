@@ -724,17 +724,20 @@ fn order_by_orientation(
 #[test]
 fn orientation_query_ranks_entry_evidence_above_leaf_aliases_when_both_exist() {
     let query = "explain how the subsystems connect end to end";
+    // Names and paths are deliberately adverse: the leaf alias sorts first on
+    // every non-evidence key, so only orientation evidence can rank the
+    // topological root ahead of it.
     let mut hits = vec![
         orientation_hit(
             "alias",
-            "zqLeafAlias",
+            "aaLeafAlias",
             "src/alias.ts",
             SearchHitOrigin::IndexedSymbol,
         ),
         orientation_hit(
             "entry",
-            "aaBootQuell",
-            "src/boot.ts",
+            "zqBootQuell",
+            "src/zboot.ts",
             SearchHitOrigin::IndexedSymbol,
         ),
     ];
@@ -744,7 +747,12 @@ fn orientation_query_ranks_entry_evidence_above_leaf_aliases_when_both_exist() {
         hit_evidence(
             EntryEvidence::None,
             false,
-            CallDegrees::default(),
+            // The leaf's graph reach deliberately exceeds the root's, so only
+            // the missing entry evidence can keep it behind.
+            CallDegrees {
+                production_in_calls: 0,
+                out_calls: 6,
+            },
             1,
             "ts:src",
         ),
@@ -765,7 +773,7 @@ fn orientation_query_ranks_entry_evidence_above_leaf_aliases_when_both_exist() {
 
     assert_eq!(
         order_by_orientation(query, &mut hits, Some(&evidence)),
-        ["aaBootQuell", "zqLeafAlias"]
+        ["zqBootQuell", "aaLeafAlias"]
     );
 }
 

@@ -1138,7 +1138,7 @@ mod tests {
             AgentRetrievalStepDto {
                 kind: AgentRetrievalStepKindDto::Search,
                 status: AgentRetrievalStepStatusDto::Skipped,
-                duration_ms: 0,
+                duration_ms: 500,
                 input: Vec::new(),
                 output: Vec::new(),
                 message: Some("budget exhausted".to_string()),

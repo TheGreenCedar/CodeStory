@@ -1375,10 +1375,55 @@ mod tests {
 
         let source_cache = tempdir().expect("source cache");
         let target_cache = tempdir().expect("target cache");
-        seed_cache(
-            &source_cache.path().join("codestory.db"),
-            source_project.path(),
-        );
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+        // The ignored-but-tracked file must be part of the seeded inventory
+        // too, or a stale-inventory refusal can masquerade as success.
+        {
+            let ignored = source_project.path().join("ignored.rs");
+            let ignored_text = ignored.to_string_lossy().to_string();
+            let ignored_mtime = fs::metadata(&ignored)
+                .expect("ignored source metadata")
+                .modified()
+                .expect("ignored source modified")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("ignored source mtime since epoch")
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            let mut storage = Store::open(&source_db).expect("reopen seeded cache");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: NodeId(4),
+                        kind: NodeKind::FILE,
+                        serialized_name: ignored_text.clone(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: NodeId(5),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: format!("{ignored_text}::hidden"),
+                        qualified_name: Some(format!("{ignored_text}::hidden")),
+                        file_node_id: Some(NodeId(4)),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("ignored nodes");
+            storage
+                .insert_file(&codestory_store::FileInfo {
+                    id: 2,
+                    path: ignored,
+                    language: "rust".into(),
+                    modification_time: ignored_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("ignored file inventory");
+        }
 
         let output = codestory_retrieval::with_test_cache_root(process_cache.path(), || {
             rehydrate_cache(CacheRehydrateRequest {
@@ -1391,6 +1436,11 @@ mod tests {
         })
         .expect("rehydrate");
 
+        assert_eq!(
+            output.status, "would_rehydrate",
+            "a restored tracked source must rehydrate cleanly: {output:?}"
+        );
+        assert!(!output.copied, "a dry run must not copy the cache");
         assert!(
             !output
                 .reason

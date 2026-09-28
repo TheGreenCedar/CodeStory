@@ -912,7 +912,13 @@ impl PacketLatencyBudget {
     }
 
     pub(crate) fn remaining_for_handoff(self) -> Option<u32> {
-        let remaining_ms = self.target_ms.saturating_sub(self.elapsed_ms());
+        self.remaining_for_handoff_at(Instant::now())
+    }
+
+    fn remaining_for_handoff_at(&self, now: Instant) -> Option<u32> {
+        let remaining_ms = self
+            .target_ms
+            .saturating_sub(now.saturating_duration_since(self.started_at).as_millis());
         (remaining_ms >= MIN_PACKET_HANDOFF_MS).then(|| clamp_u128_to_u32(remaining_ms))
     }
 
@@ -932,40 +938,44 @@ mod packet_latency_budget_tests {
 
     #[test]
     fn packet_budget_handoff_charges_elapsed_work_and_refuses_an_exhausted_floor() {
+        let started_at = Instant::now();
+
         let partially_spent = PacketLatencyBudget {
-            started_at: Instant::now()
-                .checked_sub(Duration::from_millis(700))
-                .expect("backdate packet start"),
+            started_at,
             target_ms: 2_000,
         };
-        let remaining = partially_spent
-            .remaining_for_handoff()
-            .expect("partially spent packet allowance");
-        assert!(
-            (1_250..=1_300).contains(&remaining),
-            "descriptor elapsed time must reduce the downstream allowance: {remaining}"
+        assert_eq!(
+            partially_spent.remaining_for_handoff_at(started_at + Duration::from_millis(700)),
+            Some(1_300),
+            "descriptor elapsed time must reduce the downstream allowance"
+        );
+
+        let at_floor = PacketLatencyBudget {
+            started_at,
+            target_ms: 2_000,
+        };
+        assert_eq!(
+            at_floor.remaining_for_handoff_at(started_at + Duration::from_millis(1_000)),
+            Some(1_000),
+            "a remainder exactly at the handoff floor must still be granted"
         );
 
         let below_retrieval_minimum = PacketLatencyBudget {
-            started_at: Instant::now()
-                .checked_sub(Duration::from_millis(700))
-                .expect("backdate sub-minimum packet start"),
+            started_at,
             target_ms: 1_000,
         };
         assert_eq!(
-            below_retrieval_minimum.remaining_for_handoff(),
+            below_retrieval_minimum.remaining_for_handoff_at(started_at + Duration::from_millis(1)),
             None,
             "a sub-minimum remainder must stop before downstream retrieval instead of granting a fresh 1000 ms phase"
         );
 
         let exhausted = PacketLatencyBudget {
-            started_at: Instant::now()
-                .checked_sub(Duration::from_millis(1_001))
-                .expect("backdate exhausted packet start"),
+            started_at,
             target_ms: 1_000,
         };
         assert_eq!(
-            exhausted.remaining_for_handoff(),
+            exhausted.remaining_for_handoff_at(started_at + Duration::from_millis(1_000)),
             None,
             "an exhausted packet must stop before a downstream stage instead of renewing the 1000 ms floor"
         );
