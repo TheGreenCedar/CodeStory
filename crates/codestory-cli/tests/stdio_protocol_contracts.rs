@@ -2673,6 +2673,9 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         })
         .collect::<Vec<_>>();
     let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    // A peer holding the writer lock is a wait, not a failure: each project's
+    // activation parks at the peer-writer stage and the short latency budget
+    // returns a resumable preparing envelope naming that operation.
     let packet_request = |id: &str, project: &Path| {
         json!({
             "jsonrpc": "2.0",
@@ -2682,7 +2685,8 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
                 "name": "packet",
                 "arguments": {
                     "project": project,
-                    "question": "How does AppController open a project?"
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 1000
                 }
             }
         })
@@ -2692,17 +2696,16 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let unavailable = assert_tool_error(&response, json!(id));
+        let preparing = assert_tool_preparing(&response, json!(id));
         assert_eq!(
-            unavailable["code"],
-            json!("codestory_unavailable"),
-            "the original call must report the writer-lock failure: {unavailable}"
+            preparing["operation"]["stage"],
+            json!("waiting_for_peer_writer"),
+            "the call must be parked on the peer's writer lock: {preparing}"
         );
-        assert_eq!(unavailable["cause_code"], json!("cache_busy"));
-        assert_eq!(unavailable["state"], json!("unavailable"));
-        assert_eq!(unavailable["operation"]["state"], json!("retryable"));
+        assert!(preparing["resume_operation_id"].is_string());
+        assert!(preparing["resume_operation_attempt"].is_u64());
         operation_ids.push(
-            unavailable["operation"]["operation_id"]
+            preparing["operation"]["operation_id"]
                 .as_str()
                 .expect("project activation operation id")
                 .to_string(),
@@ -6415,6 +6418,846 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
 
     let (_writer_client, writer_status) = writer.join().expect("join writer status client");
     assert_tool_success(&writer_status, json!("writer-start-refresh"));
+}
+
+/// Shared-cache two-process fixtures below pin the cross-process peer-writer
+/// contract: while one process holds the index-writer lock mid-refresh, a
+/// second process's activation waits on the publication boundary instead of
+/// failing `cache_busy`, then adopts whatever the peer published.
+
+/// `<storage>.index-writer.hold` marker companion to the lock path: the file
+/// holds a refresh parked mid-flight while it exists (see
+/// `wait_out_index_writer_hold_marker`).
+fn stdio_writer_paths(storage_path: &str) -> (PathBuf, PathBuf) {
+    let storage = PathBuf::from(storage_path);
+    (
+        storage.with_extension("index-writer.lock"),
+        storage.with_extension("index-writer-hold"),
+    )
+}
+
+/// Spawn `index --refresh incremental` as a child process. With the
+/// writer-hold marker armed it parks mid-refresh still holding the
+/// index-writer lock, so tests control exactly when the peer publishes.
+fn spawn_peer_index_refresh(fixture: &StdioFixture) -> Child {
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("incremental")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(fixture.workspace.path())
+        .arg("--cache-dir")
+        .arg(fixture.cache_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    allow_explicit_cpu_embeddings(&mut command);
+    command.spawn().expect("spawn peer index refresh")
+}
+
+/// Wait until some other process holds the index-writer lock: a failed probe
+/// proves ownership sits elsewhere.
+fn wait_for_peer_held_writer(writer_lock_path: &Path, context: &str) {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(writer_lock_path)
+        .expect("open index-writer lock");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if !file.try_lock_exclusive().expect("probe index-writer lock") {
+            return;
+        }
+        file.unlock().expect("release probed lock");
+        assert!(Instant::now() < deadline, "{context}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Write `request` without consuming a response: interleaved
+/// `notifications/progress` frames are read separately by the caller.
+fn write_stdio_request(server: &mut StdioServer, request: &Value) {
+    writeln!(server.stdin, "{request}").expect("write request line");
+    server.stdin.flush().expect("flush request line");
+}
+
+/// Send `request` on a background thread and stream every frame — progress
+/// notifications included — through the channel. The frame matching the
+/// request `id` is the response and ends the stream.
+fn stream_stdio_request(
+    mut server: StdioServer,
+    request: Value,
+) -> (
+    std::sync::mpsc::Receiver<Value>,
+    thread::JoinHandle<StdioServer>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = request.get("id").cloned();
+    let handle = thread::spawn(move || {
+        write_stdio_request(&mut server, &request);
+        loop {
+            let frame = read_json(&mut server);
+            let is_response = frame.get("id") == id.as_ref();
+            let _ = tx.send(frame);
+            if is_response {
+                break;
+            }
+        }
+        server
+    });
+    (rx, handle)
+}
+
+/// Drain `rx` until the response frame for `id` arrives, returning it along
+/// with every notification frame observed before it.
+fn wait_for_streamed_response(
+    rx: &std::sync::mpsc::Receiver<Value>,
+    id: &str,
+    deadline: Duration,
+) -> (Value, Vec<Value>) {
+    let started = Instant::now();
+    let mut notifications = Vec::new();
+    loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        assert!(
+            !remaining.is_zero(),
+            "response for {id} did not arrive within {deadline:?}"
+        );
+        match rx.recv_timeout(remaining) {
+            Ok(frame) if frame.get("id") == Some(&json!(id)) => {
+                return (frame, notifications);
+            }
+            Ok(frame) => notifications.push(frame),
+            Err(_) => panic!("response for {id} did not arrive within {deadline:?}"),
+        }
+    }
+}
+
+/// A request armed with a progress token must surface the peer-wait stage
+/// message while the activation is parked on the peer's writer lock.
+fn wait_for_peer_wait_progress(rx: &std::sync::mpsc::Receiver<Value>, id: &str) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let frame = rx
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|_| panic!("no frames observed for {id} while waiting for the peer"));
+        if frame.get("id") == Some(&json!(id)) {
+            panic!("request {id} answered before reaching the peer-writer wait: {frame}");
+        }
+        let is_wait_stage = frame.get("method") == Some(&json!("notifications/progress"))
+            && frame.pointer("/params/message").and_then(Value::as_str)
+                == Some("CodeStory is waiting for another session to finish indexing");
+        seen.push(frame);
+        if is_wait_stage {
+            return seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "request {id} never reported the peer-writer wait stage: {seen:?}"
+        );
+    }
+}
+
+/// Collect the fixture's storage path, current generation, and one stable
+/// symbol id from a warm reader process before any drift.
+fn warmup_reader_state(fixture: &StdioFixture) -> (StdioServer, String, u64, String) {
+    let mut reader = spawn_stdio_server(fixture);
+    let warmup_status = send_json(
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-warmup-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&warmup_status, json!("peer-warmup-status")),
+        "codestory://status",
+    );
+    let storage_path = status["storage_path"]
+        .as_str()
+        .expect("status storage_path")
+        .to_string();
+    let old_generation = status["index_publication"]["generation"]
+        .as_u64()
+        .expect("warm complete generation");
+    let symbols_response = send_json(
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-warmup-symbols",
+            "method": "resources/read",
+            "params": {
+                "uri": "codestory://symbols/root",
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let root_symbols = json_resource_content(
+        assert_success_envelope(&symbols_response, json!("peer-warmup-symbols")),
+        "codestory://symbols/root",
+    );
+    let symbol_id = root_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|symbol| {
+            symbol["display_name"] == json!("AppController")
+                || symbol["label"] == json!("AppController")
+                || symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("AppController "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("root symbols should expose AppController: {root_symbols}"))
+        .to_string();
+    (reader, storage_path, old_generation, symbol_id)
+}
+
+/// The current complete generation as a fresh observational status read sees
+/// it, so the test counts publications from shared storage.
+fn observed_generation(reader: &mut StdioServer, fixture: &StdioFixture, id: &str) -> u64 {
+    let response = send_json(
+        reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&response, json!(id)),
+        "codestory://status",
+    );
+    status["index_publication"]["generation"]
+        .as_u64()
+        .expect("observed complete generation")
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_wait_adopts_the_peer_publication() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_adopted.rs"),
+        "pub fn peer_adopted() -> usize { 7 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let snippet_server = spawn_stdio_server(&fixture);
+    let packet_server = spawn_stdio_server(&fixture);
+    let (snippet_rx, snippet_thread) = stream_stdio_request(
+        snippet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-wait-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-snippet-progress"}
+            }
+        }),
+    );
+    let (packet_rx, packet_thread) = stream_stdio_request(
+        packet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-wait-packet",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 60000
+                },
+                "_meta": {"progressToken": "peer-packet-progress"}
+            }
+        }),
+    );
+
+    // Both calls must be parked inside the peer-writer wait — progress
+    // reporting proves the stage — with no response on the wire while the
+    // peer still holds the writer.
+    wait_for_peer_wait_progress(&snippet_rx, "peer-wait-snippet");
+    wait_for_peer_wait_progress(&packet_rx, "peer-wait-packet");
+    thread::sleep(Duration::from_millis(500));
+    for (rx, id) in [
+        (&snippet_rx, "peer-wait-snippet"),
+        (&packet_rx, "peer-wait-packet"),
+    ] {
+        while let Ok(frame) = rx.try_recv() {
+            assert_ne!(
+                frame.get("id"),
+                Some(&json!(id)),
+                "request {id} answered while the peer still held the writer: {frame}"
+            );
+        }
+    }
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "peer refresh failed
+stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&peer_output.stdout),
+        String::from_utf8_lossy(&peer_output.stderr)
+    );
+
+    let (snippet_response, _) =
+        wait_for_streamed_response(&snippet_rx, "peer-wait-snippet", Duration::from_secs(120));
+    let (packet_response, _) =
+        wait_for_streamed_response(&packet_rx, "peer-wait-packet", Duration::from_secs(120));
+    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    let _packet_server = packet_thread.join().expect("join packet request");
+
+    // Exactly one new complete generation exists — the peer's — and both
+    // waiters answer from it rather than publishing again.
+    let published = observed_generation(&mut reader, &fixture, "peer-adopted-generation");
+    assert_eq!(
+        published,
+        old_generation + 1,
+        "exactly one publication must occur: the peer's"
+    );
+    assert_tool_success(&snippet_response, json!("peer-wait-snippet"));
+    let snippet_result = assert_success_envelope(&snippet_response, json!("peer-wait-snippet"));
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published),
+        "the waiting snippet must answer from the peer's publication"
+    );
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("fresh")
+    );
+    let packet_result = assert_success_envelope(&packet_response, json!("peer-wait-packet"));
+    if packet_result.get("isError").and_then(Value::as_bool) == Some(true) {
+        // This build carries no embedded embedding model, so a full
+        // activation can wait on the peer, adopt its publication, and still
+        // terminate at dense preparation. The wire answer must be that typed
+        // limitation — never a lock-contention refusal — and the observed
+        // operation proves the peer's publication was already in place.
+        let error = assert_tool_error(&packet_response, json!("peer-wait-packet"));
+        assert_eq!(
+            error["cause_code"],
+            json!("native_model_not_embedded"),
+            "the waited packet must not fail on writer contention: {error}"
+        );
+        assert_eq!(
+            error["operation"]["retained_core_publication"]["generation"],
+            json!(published),
+            "the packet activation must have adopted the peer's publication"
+        );
+    } else {
+        assert_tool_success(&packet_response, json!("peer-wait-packet"));
+        assert_eq!(
+            packet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+            json!(published)
+        );
+        assert_eq!(
+            packet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+            json!("fresh")
+        );
+    }
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_wait_returns_resumable_preparing() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, _symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_resume.rs"),
+        "pub fn peer_resume() -> usize { 8 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    // A bounded packet latency budget expires while the peer still holds the
+    // writer: the caller gets a resumable preparing envelope plus progress.
+    // The budget must span the first activation slice plus one progress tick
+    // so the join-wait loop reports the parked stage before returning.
+    // send_json reads only one line, so progress frames are drained until the
+    // matching response id arrives.
+    let mut packet_server = spawn_stdio_server(&fixture);
+    write_stdio_request(
+        &mut packet_server,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-deadline-packet",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 10000
+                },
+                "_meta": {"progressToken": "peer-deadline-progress"}
+            }
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut notifications = Vec::new();
+    let preparing_response = loop {
+        let frame = read_json(&mut packet_server);
+        assert!(
+            Instant::now() < deadline,
+            "the packet call never returned its preparing envelope"
+        );
+        if frame.get("id") == Some(&json!("peer-deadline-packet")) {
+            break frame;
+        }
+        notifications.push(frame);
+    };
+    let preparing = assert_success_envelope(&preparing_response, json!("peer-deadline-packet"));
+    let structured = preparing["structuredContent"].clone();
+    assert_eq!(
+        structured["kind"],
+        json!("preparing"),
+        "the expired call must return the resumable preparing envelope: {preparing_response}"
+    );
+    assert_eq!(structured["state"], json!("preparing"));
+    assert_eq!(structured["deadline_exceeded"], json!(true));
+    assert!(
+        structured["resume_operation_id"].is_string()
+            && structured["resume_operation_attempt"].is_u64(),
+        "the preparing envelope must carry callable resume identity: {structured}"
+    );
+    assert!(
+        notifications.iter().any(|frame| {
+            frame.get("method") == Some(&json!("notifications/progress"))
+                && frame.pointer("/params/progressToken") == Some(&json!("peer-deadline-progress"))
+        }),
+        "a progress-token request must emit progress while waiting on the peer: {notifications:?}"
+    );
+    // The timed-out request left its activation running in the background;
+    // it is still parked on the peer's writer lock.
+    assert_eq!(
+        structured["operation"]["stage"],
+        json!("waiting_for_peer_writer"),
+        "the preparing envelope must describe the peer-writer wait: {structured}"
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "peer refresh failed
+stderr:
+{}",
+        String::from_utf8_lossy(&peer_output.stderr)
+    );
+    let published = observed_generation(&mut reader, &fixture, "peer-resume-generation");
+    assert_eq!(published, old_generation + 1);
+
+    // Resume on the same connection with the envelope's exact minimum_next
+    // arguments: the still-running shared activation adopts the peer's
+    // publication, finishes, and the resumed call answers from it. The
+    // replayed latency budget is short, so another preparing envelope is a
+    // legal intermediate answer.
+    let resume_arguments = structured["minimum_next"]["arguments"].clone();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut resume_attempt = 0usize;
+    loop {
+        resume_attempt += 1;
+        let resume_response = send_json(
+            &mut packet_server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("peer-deadline-resume-{resume_attempt}"),
+                "method": "tools/call",
+                "params": {"name": "packet", "arguments": resume_arguments}
+            }),
+        );
+        let resume_result = assert_success_envelope(
+            &resume_response,
+            json!(format!("peer-deadline-resume-{resume_attempt}")),
+        );
+        if resume_result["structuredContent"]["kind"] == json!("preparing") {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed call never converged after the peer published"
+            );
+            continue;
+        }
+        if resume_result.get("isError").and_then(Value::as_bool) == Some(true) {
+            // A build without the embedded embedding model waits, adopts the
+            // peer's core, then ends at dense preparation. The wire answer is
+            // that typed limitation — never a contention error or an unknown
+            // operation.
+            let error = assert_tool_error(
+                &resume_response,
+                json!(format!("peer-deadline-resume-{resume_attempt}")),
+            );
+            let cause = error["cause_code"]
+                .as_str()
+                .or_else(|| error["details"]["cause_code"].as_str());
+            assert_eq!(
+                cause,
+                Some("native_model_not_embedded"),
+                "the resumed call must not fail on writer contention: {error}"
+            );
+            break;
+        }
+        assert_tool_success(&resume_response, json!("peer-deadline-resume"));
+        assert_eq!(
+            resume_result["_meta"]["codestory_publication"]["publication"]["generation"],
+            json!(published),
+            "the resumed call must answer from the peer's publication: {resume_response}"
+        );
+        assert_eq!(
+            resume_result["_meta"]["codestory_publication"]["freshness"]["state"],
+            json!("fresh")
+        );
+        break;
+    }
+}
+
+#[test]
+fn two_stdio_processes_cancelling_a_peer_waiter_leaves_everything_running() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_cancel.rs"),
+        "pub fn peer_cancel() -> usize { 9 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    // Park the waiter's snippet on the peer's writer lock; the progress
+    // frames prove which stage the request reached.
+    let mut waiter = spawn_stdio_server(&fixture);
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-cancel-progress"}
+            }
+        }),
+    );
+    let progress_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = read_json(&mut waiter);
+        assert_ne!(
+            frame.get("id"),
+            Some(&json!("peer-cancel-snippet")),
+            "the waiting request must not answer before cancellation: {frame}"
+        );
+        if frame.pointer("/params/message").and_then(Value::as_str)
+            == Some("CodeStory is waiting for another session to finish indexing")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < progress_deadline,
+            "the waiter never reached the peer-writer stage"
+        );
+    }
+
+    // Cancelling the request frees the worker promptly without touching the
+    // shared activation it joined.
+    let cancel_sent = Instant::now();
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "peer-cancel-snippet"}
+        }),
+    );
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_cancelled_response = false;
+    let status_response = loop {
+        let frame = read_json(&mut waiter);
+        assert!(
+            Instant::now() < status_deadline,
+            "the cancelled request never released the connection"
+        );
+        if frame.get("id") == Some(&json!("peer-cancel-snippet")) {
+            saw_cancelled_response = true;
+        }
+        if frame.get("id") == Some(&json!("peer-cancel-status")) {
+            break frame;
+        }
+    };
+    assert!(
+        !saw_cancelled_response,
+        "a client-cancelled request id is owed no response"
+    );
+    assert!(
+        cancel_sent.elapsed() < Duration::from_secs(30),
+        "the cancelled request must release the worker promptly"
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&status_response, json!("peer-cancel-status")),
+        "codestory://status",
+    );
+    let assert_still_waiting = |status: &Value| {
+        let operation = &status["current_operation"];
+        assert_eq!(
+            operation["stage"],
+            json!("waiting_for_peer_writer"),
+            "cancelling the request must not cancel the shared activation: {status}"
+        );
+        assert!(
+            matches!(
+                operation["state"].as_str(),
+                Some("preparing" | "updating" | "working_locally")
+            ),
+            "the shared activation must still be running for other callers: {status}"
+        );
+    };
+    assert_still_waiting(&status);
+
+    // The cancelled waiter must not have killed the shared activation: after
+    // a settle window it is still parked on the peer's writer lock.
+    std::thread::sleep(Duration::from_secs(2));
+    let settled_status_response = send_json(
+        &mut waiter,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-status-settled",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let settled_status = json_resource_content(
+        assert_success_envelope(
+            &settled_status_response,
+            json!("peer-cancel-status-settled"),
+        ),
+        "codestory://status",
+    );
+    assert_still_waiting(&settled_status);
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "the peer refresh must publish normally despite the cancelled waiter"
+    );
+    let published = observed_generation(&mut reader, &fixture, "peer-cancel-generation");
+    assert_eq!(published, old_generation + 1);
+
+    let retry_response = send_json(
+        &mut waiter,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-retry",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": symbol_id}}
+        }),
+    );
+    let retried = assert_tool_success(&retry_response, json!("peer-cancel-retry"));
+    let retry_result = assert_success_envelope(&retry_response, json!("peer-cancel-retry"));
+    assert_eq!(
+        retry_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published),
+        "a later call must answer from the peer publication: {retried:?}"
+    );
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_death_lets_the_waiter_publish() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_dead.rs"),
+        "pub fn peer_dead() -> usize { 10 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let mut peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let snippet_server = spawn_stdio_server(&fixture);
+    let (snippet_rx, snippet_thread) = stream_stdio_request(
+        snippet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-death-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-death-progress"}
+            }
+        }),
+    );
+    wait_for_peer_wait_progress(&snippet_rx, "peer-death-snippet");
+
+    // Kill the owner without publishing: the OS releases the writer lock and
+    // the parked waiter takes over — where the still-armed marker parks it
+    // again, mid-refresh, holding the lock this time.
+    peer.kill().expect("kill the peer writer");
+    let _ = peer.wait().expect("reap the peer writer");
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the waiter never took over the index-writer lock after the peer died",
+    );
+
+    // The previous publication stays readable while the waiter owns the
+    // writer: a graph-only read is answered from it and labelled historical.
+    let mut graph_only = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut graph_only,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-death-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("peer-death-ground"));
+    assert!(ground["stats"]["file_count"].as_u64().is_some());
+    let ground_result = assert_success_envelope(&ground_response, json!("peer-death-ground"));
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(old_generation),
+        "the retained publication must stay readable while the waiter writes"
+    );
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("historical")
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked waiter");
+    let (snippet_response, _) =
+        wait_for_streamed_response(&snippet_rx, "peer-death-snippet", Duration::from_secs(120));
+    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    assert_tool_success(&snippet_response, json!("peer-death-snippet"));
+    let snippet_result = assert_success_envelope(&snippet_response, json!("peer-death-snippet"));
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("fresh")
+    );
+
+    // The dead peer published nothing; the waiter's own refresh is the only
+    // new complete generation.
+    let published = observed_generation(&mut reader, &fixture, "peer-death-generation");
+    assert_eq!(
+        published,
+        old_generation + 1,
+        "the waiter performs exactly one refresh after the peer dies"
+    );
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published)
+    );
+}
+
+#[test]
+fn two_stdio_processes_graph_only_read_during_peer_refresh_is_historical() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, _symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_historical.rs"),
+        "pub fn peer_historical() -> usize { 11 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let mut graph_only = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut graph_only,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-historical-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("peer-historical-ground"));
+    assert!(ground["stats"]["file_count"].as_u64().is_some());
+    let ground_result = assert_success_envelope(&ground_response, json!("peer-historical-ground"));
+    let publication_meta = &ground_result["_meta"]["codestory_publication"];
+    assert_eq!(
+        publication_meta["freshness"]["state"],
+        json!("historical"),
+        "the graph-only read must be labelled historical while a peer writes"
+    );
+    assert_eq!(
+        publication_meta["freshness"]["reason"],
+        json!("peer_writer"),
+        "the peer-writer wait stage must identify the retained answer: {publication_meta}"
+    );
+    assert_eq!(
+        publication_meta["publication"]["generation"],
+        json!(old_generation),
+        "the historical answer must come from the retained publication"
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(peer_output.status.success());
+    assert_eq!(
+        observed_generation(&mut reader, &fixture, "peer-historical-generation"),
+        old_generation + 1
+    );
 }
 
 #[test]

@@ -244,6 +244,9 @@ pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> 
 #[serde(rename_all = "snake_case")]
 pub enum ActivationStage {
     Discovery,
+    /// The refresh found the index writer lock held by another process and
+    /// is inside its bounded, cancellable wait for the handoff.
+    WaitingForPeerWriter,
     CoreFreshness,
     SearchPreparation,
     DensePreparation,
@@ -255,6 +258,7 @@ pub enum ActivationStage {
 fn activation_stage_progress(stage: ActivationStage) -> u8 {
     match stage {
         ActivationStage::Discovery => 0,
+        ActivationStage::WaitingForPeerWriter => 10,
         ActivationStage::CoreFreshness => 20,
         ActivationStage::SearchPreparation => 40,
         ActivationStage::DensePreparation => 60,
@@ -1257,7 +1261,17 @@ impl ActivationService {
                         ));
                     }
                     if !state.goal.satisfies(goal) {
-                        return Err(narrower_activation_in_flight());
+                        // A narrower-goal run is in flight: wait it out inside
+                        // the caller's budget, then re-drive so this request
+                        // pursues its own goal instead of inheriting a
+                        // core-only verdict.
+                        self.wait_out_narrower_activation(
+                            state,
+                            &target,
+                            request_cancelled.as_ref(),
+                            foreground_budget,
+                        )?;
+                        continue;
                     }
                     let operation_id = state
                         .current
@@ -1326,7 +1340,17 @@ impl ActivationService {
                         ));
                     }
                     if !state.goal.satisfies(goal) {
-                        return Err(narrower_activation_in_flight());
+                        // A narrower-goal run is in flight: wait it out inside
+                        // the caller's budget, then re-drive so this request
+                        // pursues its own goal instead of inheriting a
+                        // core-only verdict.
+                        self.wait_out_narrower_activation(
+                            state,
+                            &target,
+                            request_cancelled.as_ref(),
+                            foreground_budget,
+                        )?;
+                        continue;
                     }
                     let operation_id = state
                         .current
@@ -1402,7 +1426,17 @@ impl ActivationService {
                     ));
                 }
                 if !state.goal.satisfies(goal) {
-                    return Err(narrower_activation_in_flight());
+                    // A narrower-goal run is in flight: wait it out inside
+                    // the caller's budget, then re-drive so this request
+                    // pursues its own goal instead of inheriting a core-only
+                    // verdict.
+                    self.wait_out_narrower_activation(
+                        state,
+                        &target,
+                        request_cancelled.as_ref(),
+                        foreground_budget,
+                    )?;
+                    continue;
                 }
                 let operation_id = state
                     .current
@@ -1874,88 +1908,144 @@ impl ActivationService {
         // legacy flat cache can migrate it in place and hide the need to
         // rebuild parser artifacts. Recovery binds paths without opening the
         // predecessor; the full refresh stages and publishes its replacement.
-        let summary = match self
-            .controller
-            .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
-        {
-            Ok(()) => {
-                let layout =
-                    codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
-                        .map_err(|error| {
-                            ApiError::internal(format!(
-                                "Failed to resolve core publication layout for activation: {error}"
-                            ))
-                        })?;
-                let has_generation_pointer =
-                    layout.read_pointer().is_ok_and(|pointer| pointer.is_some());
-                let retrieval_pointer_is_absent = matches!(
-                    std::fs::symlink_metadata(layout.retrieval_publication_path()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                );
-                let summary = if has_generation_pointer && retrieval_pointer_is_absent {
-                    // A complete core may legitimately predate its first retrieval
-                    // publication. Full activation owns advancing that state, but
-                    // the ordinary summary remains a strict observational read.
-                    self.controller.open_core_read_only_with_storage_path(
-                        project_root.clone(),
-                        storage_path.clone(),
-                    )?
-                } else {
-                    self.controller.open_project_summary_with_storage_path(
-                        project_root.clone(),
-                        storage_path.clone(),
-                    )?
-                };
-                Some(summary)
-            }
-            Err(error)
-                if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
-            {
-                self.controller
-                    .bind_project_paths_for_refresh(project_root.clone(), storage_path.clone())?;
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        let has_complete_core = summary
-            .as_ref()
-            .is_some_and(|summary| summary.publication.is_some() && summary.stats.node_count > 0);
-        let mut precomputed_core_probe = has_complete_core
-            .then(|| self.controller.probe_incremental_plan_for_activation())
-            .transpose()?;
-        let complete_incremental_source_inventory = precomputed_core_probe
-            .as_ref()
-            .is_some_and(|probe| probe.has_complete_source_inventory());
-        // The incremental probe reports a missing search generation only after
-        // proving a complete inventory, an empty source plan, and a current
-        // complete core contract. Repair that derived generation against the
-        // exact immutable core. Source aliases still prevent an unsealed
-        // short-circuit and take the full retrieval freshness path below.
-        let search_repair_only = has_complete_core
-            && precomputed_core_probe.as_ref().is_some_and(|probe| {
-                probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
-                    && probe.files_to_index == 0
-                    && probe.files_to_remove == 0
-                    && probe.publication.as_ref().is_some_and(|publication| {
-                        let publication =
-                            crate::index_commit::index_publication_dto(publication.clone());
-                        summary
-                            .as_ref()
-                            .and_then(|summary| summary.publication.as_ref())
-                            == Some(&publication)
-                    })
-            });
-        let preflight_ms =
-            u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        operation.set_stage(ActivationStage::CoreFreshness);
+        // The writer lock alone orders writers, including ones in other
+        // processes. A plan observed before holding it is stale by
+        // definition, so the observe/probe/write sequence repeats: after a
+        // peer releases the lock, freshly-opened storage decides whether the
+        // peer's publication already covers the work (adopt it) or a write
+        // is still required (exactly one attempt, under the held lock).
+        let mut held_writer: Option<crate::index_commit::IndexWriterGuard> = None;
         let core_refresh_started = Instant::now();
         let mut refreshed_core = None;
-        let core_stale = !has_complete_core
-            || precomputed_core_probe
+        let (
+            summary,
+            has_complete_core,
+            complete_incremental_source_inventory,
+            search_repair_only,
+            precomputed_core_probe,
+            preflight_ms,
+        ) = 'core_plan: loop {
+            // Inspect compatibility before opening the live database: opening a
+            // legacy flat cache can migrate it in place and hide the need to
+            // rebuild parser artifacts. Recovery binds paths without opening the
+            // predecessor; the full refresh stages and publishes its replacement.
+            let summary = match self
+                .controller
+                .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
+            {
+                Ok(()) => {
+                    let layout = codestory_store::CorePublicationLayout::from_storage_path(
+                        &storage_path,
+                    )
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to resolve core publication layout for activation: {error}"
+                        ))
+                    })?;
+                    let has_generation_pointer =
+                        layout.read_pointer().is_ok_and(|pointer| pointer.is_some());
+                    let retrieval_pointer_is_absent = matches!(
+                        std::fs::symlink_metadata(layout.retrieval_publication_path()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    );
+                    let summary = if has_generation_pointer && retrieval_pointer_is_absent {
+                        // A complete core may legitimately predate its first retrieval
+                        // publication. Full activation owns advancing that state, but
+                        // the ordinary summary remains a strict observational read.
+                        self.controller.open_core_read_only_with_storage_path(
+                            project_root.clone(),
+                            storage_path.clone(),
+                        )?
+                    } else {
+                        self.controller.open_project_summary_with_storage_path(
+                            project_root.clone(),
+                            storage_path.clone(),
+                        )?
+                    };
+                    Some(summary)
+                }
+                Err(error)
+                    if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
+                {
+                    self.controller.bind_project_paths_for_refresh(
+                        project_root.clone(),
+                        storage_path.clone(),
+                    )?;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let has_complete_core = summary.as_ref().is_some_and(|summary| {
+                summary.publication.is_some() && summary.stats.node_count > 0
+            });
+            let mut precomputed_core_probe = has_complete_core
+                .then(|| self.controller.probe_incremental_plan_for_activation())
+                .transpose()?;
+            let complete_incremental_source_inventory = precomputed_core_probe
                 .as_ref()
-                .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
-        if core_stale {
+                .is_some_and(|probe| probe.has_complete_source_inventory());
+            // The incremental probe reports a missing search generation only after
+            // proving a complete inventory, an empty source plan, and a current
+            // complete core contract. Repair that derived generation against the
+            // exact immutable core. Source aliases still prevent an unsealed
+            // short-circuit and take the full retrieval freshness path below.
+            let search_repair_only = has_complete_core
+                && precomputed_core_probe.as_ref().is_some_and(|probe| {
+                    probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
+                        && probe.files_to_index == 0
+                        && probe.files_to_remove == 0
+                        && probe.publication.as_ref().is_some_and(|publication| {
+                            let publication =
+                                crate::index_commit::index_publication_dto(publication.clone());
+                            summary
+                                .as_ref()
+                                .and_then(|summary| summary.publication.as_ref())
+                                == Some(&publication)
+                        })
+                });
+            let preflight_ms =
+                u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let core_stale = !has_complete_core
+                || precomputed_core_probe
+                    .as_ref()
+                    .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
+            if !core_stale {
+                operation.set_stage(ActivationStage::CoreFreshness);
+                break 'core_plan (
+                    summary,
+                    has_complete_core,
+                    complete_incremental_source_inventory,
+                    search_repair_only,
+                    precomputed_core_probe,
+                    preflight_ms,
+                );
+            }
+            let writer_guard = match held_writer.take() {
+                Some(guard) => guard,
+                None => match crate::index_commit::IndexWriterGuard::try_acquire(&storage_path) {
+                    Ok(guard) => guard,
+                    Err(error) if error.code == "cache_busy" => {
+                        // A peer process is publishing for this cache. Wait
+                        // out its writer lock — bounded, cancellable through
+                        // the activation flag, in slices no longer than the
+                        // bounded-lock poll step — then re-plan under the lock
+                        // this process now holds.
+                        operation.set_stage(ActivationStage::WaitingForPeerWriter);
+                        held_writer =
+                            Some(crate::index_commit::IndexWriterGuard::acquire_after_peer(
+                                &storage_path,
+                                codestory_contracts::bounded_locks::LockDeadline::after(
+                                    codestory_contracts::bounded_locks::PUBLICATION_LOCK_WAIT,
+                                ),
+                                Some(operation.cancelled.as_ref()),
+                            )?);
+                        continue 'core_plan;
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            operation.set_stage(ActivationStage::CoreFreshness);
             let mode = if !has_complete_core {
                 IndexMode::Full
             } else {
@@ -1988,6 +2078,7 @@ impl ActivationService {
                         .then(|| precomputed_core_probe.take())
                         .flatten(),
                     failed_refresh_diagnostics.as_ref(),
+                    writer_guard,
                 );
             let evidence = match evidence_result {
                 Ok(evidence) => evidence,
@@ -2012,7 +2103,19 @@ impl ActivationService {
                 evidence.stats,
                 evidence.repository_tracking_digest,
             ));
-        }
+            break 'core_plan (
+                summary,
+                has_complete_core,
+                complete_incremental_source_inventory,
+                search_repair_only,
+                precomputed_core_probe,
+                preflight_ms,
+            );
+        };
+        // Adopted peer publications and completed writes alike stop holding
+        // the writer here: retrieval preparation re-acquires it under the
+        // ordinary single-attempt `cache_busy` contract.
+        drop(held_writer);
         let local_ready = match refreshed_core.as_ref() {
             Some((_, stats, _)) => stats.node_count > 0 && stats.fatal_error_count == 0,
             None => summary.as_ref().is_some_and(|summary| {
@@ -2374,13 +2477,43 @@ fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
     snapshot.allows_operation("packet")
 }
 
-/// A full request cannot borrow a core-only run's completion, because that run
-/// stops before retrieval. Retrying starts the full activation instead.
-fn narrower_activation_in_flight() -> ApiError {
-    ApiError::new(
-        "activation_retryable",
-        "a core-only activation is already running for this project; retry to start full activation",
-    )
+impl ActivationService {
+    /// Wait out a running activation whose goal cannot satisfy this request
+    /// (a `CoreOnly` run ahead of a `Full` caller), then let the caller
+    /// re-drive through `activate_with_goal` so the requester's own goal
+    /// owns the outcome. The running goal frames the wait's admit check so
+    /// the narrower run's completion never reports broad readiness. Only a
+    /// spent caller budget or an explicit cancel propagates; the narrower
+    /// run's own verdicts are superseded by the new attempt.
+    fn wait_out_narrower_activation(
+        &self,
+        running: std::sync::MutexGuard<'_, ActivationCoordinatorState>,
+        target: &ActivationTarget,
+        request_cancelled: &AtomicBool,
+        foreground_budget: Duration,
+    ) -> Result<(), ApiError> {
+        let running_goal = running.goal;
+        let operation_id = running
+            .current
+            .as_ref()
+            .expect("running activation has a snapshot")
+            .operation_id
+            .clone();
+        drop(running);
+        match self.wait_for_activation(
+            target,
+            &operation_id,
+            true,
+            request_cancelled,
+            foreground_budget,
+            running_goal,
+        ) {
+            Err(error) if matches!(error.code.as_str(), "cancelled" | "activation_preparing") => {
+                Err(error)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
@@ -2703,7 +2836,7 @@ impl PublicOperationService {
         {
             return None;
         }
-        let reason = if snapshot.failure_code.as_deref() == Some("cache_busy") {
+        let reason = if snapshot.stage == ActivationStage::WaitingForPeerWriter {
             HistoricalServedReason::PeerWriter
         } else if matches!(
             snapshot.state,
@@ -6916,6 +7049,104 @@ pub(crate) mod activation_tests {
         service.cancel_and_wait();
         let terminal = service.snapshot().expect("terminal snapshot");
         assert_ne!(terminal.state, ActivationState::Ready);
+    }
+
+    #[test]
+    fn a_full_request_waits_for_an_in_flight_core_only_run_then_pursues_full() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn core_only_upgrade_fixture() {}\n",
+        )
+        .expect("write fixture");
+        let service = Runtime::new().activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+
+        let core_only_service = service.clone();
+        let core_only_root = project.path().to_path_buf();
+        let core_only_storage = storage_path.clone();
+        let core_only = std::thread::spawn(move || {
+            core_only_service.activate_core_only(
+                &core_only_root,
+                &core_only_storage,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(service.worker_start_count_for_test(), 1);
+
+        // The narrower run is in flight: a full caller waits inside its
+        // foreground budget rather than failing as activation_retryable.
+        let upgrade = service
+            .activate_project_with_foreground_budget_and_goal(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+                ActivationGoal::Full,
+            )
+            .expect_err("a parked core-only run cannot satisfy a full request");
+        assert_eq!(
+            upgrade.code, "activation_preparing",
+            "a full caller waits on the narrower run instead of a retryable refusal: {upgrade:?}"
+        );
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "waiting on the narrower run must not spawn a second worker"
+        );
+
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
+        let _ = core_only.join().expect("join core-only activation caller");
+
+        // Once the narrower run ends, a full caller drives its own activation
+        // attempt: the completed core-only snapshot stays `Updating` with no
+        // broad readiness, so the full goal can neither join it nor borrow its
+        // verdict. Poll the call itself until the attempt advances; every
+        // interim answer must be `activation_preparing`, never
+        // `activation_retryable`.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let second = service.activate_project_with_foreground_budget_and_goal(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+                ActivationGoal::Full,
+            );
+            match second {
+                Err(error) => assert_eq!(
+                    error.code, "activation_preparing",
+                    "the full request must wait or start, never refuse: {error:?}"
+                ),
+                Ok(run) => assert_eq!(
+                    run.snapshot.capabilities.broad_search,
+                    ActivationCapabilityState::Ready,
+                    "a full request can only succeed with broad readiness: {:?}",
+                    run.snapshot
+                ),
+            }
+            let snapshot = service.snapshot().expect("activation snapshot");
+            if snapshot.attempt > 1 && service.worker_start_count_for_test() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the core-only run ended but no full attempt started"
+            );
+            std::thread::yield_now();
+        }
+        service.cancel_and_wait();
     }
 
     #[test]

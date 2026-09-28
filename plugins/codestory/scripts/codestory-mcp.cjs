@@ -87,7 +87,7 @@ const supportedMcpProtocolVersions = Object.freeze([
   '2025-06-18',
   '2025-11-25',
 ]);
-const publicationStampSchemaVersion = 3;
+const publicationStampSchemaVersion = 4;
 const minimumCompatiblePublicationStampSchemaVersion = 3;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
@@ -2352,7 +2352,7 @@ function v3LauncherSession(requested, discoveryContracts) {
     requested: asked || null,
     negotiated,
     discoveryContractSha256,
-    publicationSchemaVersion: 3,
+    publicationSchemaVersion: publicationStampSchemaVersion,
   });
 }
 
