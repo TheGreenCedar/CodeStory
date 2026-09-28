@@ -654,9 +654,15 @@ mod tests {
             SymbolWorkflowMode::Impact,
             true,
         );
-        assert!(commands.iter().all(|command| {
-            !command.contains(" callers ") && !command.contains(" test-map ")
-                || command.contains("--include-tests")
-        }));
+        for named in [" callers ", " test-map "] {
+            let command = commands
+                .iter()
+                .find(|command| command.contains(named))
+                .unwrap_or_else(|| panic!("expected a{named}command in {commands:?}"));
+            assert!(
+                command.contains("--include-tests"),
+                "the{named}command must keep the widened test scope: {command}"
+            );
+        }
     }
 }

@@ -4174,6 +4174,62 @@ mod tests {
         }
     }
 
+    /// Moved from tests/retrieval_primary_rejection.rs: phantom-only results
+    /// must hit the runtime's typed refusal path, and a real file must reach
+    /// the ordinary resolution path instead.
+    #[test]
+    fn phantom_only_candidates_are_detected() {
+        let phantoms = vec![
+            CandidateHit::with_source(
+                "lexical:handler",
+                Some("handler".into()),
+                0.5,
+                CandidateSource::Lexical,
+            ),
+            CandidateHit::with_source(
+                "semantic:handler",
+                Some("handler".into()),
+                0.55,
+                CandidateSource::Semantic,
+            ),
+        ];
+        assert!(codestory_retrieval::phantom_sidecar_candidates_only(
+            &phantoms
+        ));
+
+        let node_names = HashMap::new();
+        for phantom in &phantoms {
+            assert_eq!(
+                candidate_resolution_label(None, None, &node_names, phantom),
+                "phantom_hit",
+                "phantom candidates must be refused before any path or storage work"
+            );
+        }
+        let ordered = ordered_sidecar_candidates(&phantoms, |_| {
+            panic!("phantom hits must be filtered before path resolution")
+        });
+        assert!(ordered.is_empty());
+
+        // Real-file control: an existing source file is not a phantom, reaches
+        // path resolution, and then proceeds into node lookup.
+        let temp = tempfile::tempdir().expect("project root");
+        let source = temp.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("src parent")).expect("mkdir src");
+        std::fs::write(&source, "fn lib() {}\n").expect("write source");
+        let real = CandidateHit::lexical_stub("src/lib.rs", 0.9);
+        assert!(!codestory_retrieval::phantom_sidecar_candidates_only(&[
+            real.clone()
+        ]));
+
+        let storage = Store::new_in_memory().expect("storage");
+        assert_eq!(
+            candidate_resolution_label(Some(temp.path()), Some(&storage), &node_names, &real),
+            "node_unresolved",
+            "a real resolvable file must reach node lookup, not the phantom refusal"
+        );
+        assert_eq!(ordered_sidecar_candidates(&[real], |_| true).len(), 1);
+    }
+
     #[test]
     fn symbol_candidate_skips_unknown_callsite_and_resolves_definition() {
         use codestory_contracts::graph::{Occurrence, OccurrenceKind, SourceLocation};

@@ -588,8 +588,27 @@ mod tests {
     #[test]
     fn a_missing_or_wrong_version_line_is_a_syntax_error() {
         assert!(parse_call_path_document("").is_err());
-        assert!(parse_call_path_document("from symbol \"A\"\ndirect-call symbol \"B\"\n").is_err());
-        assert!(parse_call_path_document("call-path/v2\nfrom symbol \"A\"\n").is_err());
+        // A headerless document loses its first content line to header
+        // parsing, so this arm still errs even without a version comparison.
+        assert!(
+            parse_call_path_document("from symbol \"crate::A\"\ndirect-call symbol \"crate::B\"\n")
+                .is_err()
+        );
+        // The wrong-version arm must fail on the version comparison alone:
+        // the body is an otherwise-complete valid contract.
+        assert!(
+            parse_call_path_document(
+                "call-path/v2\nfrom symbol \"crate::A\"\ndirect-call symbol \"crate::B\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_call_path_document(
+                "call-path/v1\nfrom symbol \"crate::A\"\ndirect-call symbol \"crate::B\"\n"
+            )
+            .is_ok(),
+            "the same body under the current version must parse"
+        );
     }
 
     #[test]

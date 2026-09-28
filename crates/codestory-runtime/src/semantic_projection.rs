@@ -1708,55 +1708,90 @@ mod bounded_file_text_cache_tests {
 
     #[test]
     fn semantic_cache_reuses_available_text_and_falls_back_for_missing_entries() {
-        let file_paths = HashMap::from([
-            ("late.rs".to_string(), "late-source".to_string()),
-            ("cached.rs".to_string(), "cached-source".to_string()),
-            ("missing.rs".to_string(), "missing-source".to_string()),
-        ]);
+        // Exercise the production reuse owner with real disk text: the cached
+        // Some entry must win over the changed disk contents, the cached None
+        // entry must fall back to a fresh disk read, and a file missing from
+        // disk must fall back to None.
+        let temp = tempfile::tempdir().expect("project dir");
+        let cached_path = temp.path().join("cached.rs");
+        let late_path = temp.path().join("late.rs");
+        let missing_path = temp.path().join("missing.rs");
+        std::fs::write(&cached_path, "changed body").expect("write cached.rs");
+        std::fs::write(&late_path, "late body").expect("write late.rs");
+
+        let semantic_node = |id: i64, file_id: i64| GraphNode {
+            id: codestory_contracts::graph::NodeId(id),
+            file_node_id: Some(codestory_contracts::graph::NodeId(file_id)),
+            ..Default::default()
+        };
+        let nodes = [
+            semantic_node(101, 11),
+            semantic_node(102, 12),
+            semantic_node(103, 13),
+        ];
+        let graph_context = SemanticDocGraphContext {
+            file_paths: HashMap::from([
+                (
+                    codestory_contracts::graph::NodeId(11),
+                    "cached.rs".to_string(),
+                ),
+                (
+                    codestory_contracts::graph::NodeId(12),
+                    "late.rs".to_string(),
+                ),
+                (
+                    codestory_contracts::graph::NodeId(13),
+                    "missing.rs".to_string(),
+                ),
+            ]),
+            file_read_paths: HashMap::from([
+                (
+                    codestory_contracts::graph::NodeId(11),
+                    cached_path.to_string_lossy().to_string(),
+                ),
+                (
+                    codestory_contracts::graph::NodeId(12),
+                    late_path.to_string_lossy().to_string(),
+                ),
+                (
+                    codestory_contracts::graph::NodeId(13),
+                    missing_path.to_string_lossy().to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
         let mut reusable_cache = HashMap::from([
             ("cached.rs".to_string(), Some("cached body".to_string())),
             ("late.rs".to_string(), None),
         ]);
-        let mut disk_reads = Vec::new();
 
-        let (cache, _) = build_semantic_file_text_cache_from_paths_with_limits_and_reader(
-            &file_paths,
+        let semantic_nodes = nodes.iter().collect::<Vec<_>>();
+        let cache = build_semantic_file_text_cache_with_reuse(
+            &graph_context,
+            &semantic_nodes,
             64,
-            64,
-            |display_path, read_path, read_limit| {
-                if let Some(Some(contents)) = reusable_cache.remove(display_path) {
-                    return crate::support::read_text_limited(
-                        std::io::Cursor::new(contents.into_bytes()),
-                        read_limit,
-                    );
-                }
-                disk_reads.push(read_path.to_string());
-                let contents = match read_path {
-                    "late-source" => "late body",
-                    "missing-source" => "missing body",
-                    "cached-source" => panic!("cached text must not be read from disk again"),
-                    _ => panic!("unexpected read path: {read_path}"),
-                };
-                crate::support::read_text_limited(
-                    std::io::Cursor::new(contents.as_bytes()),
-                    read_limit,
-                )
-            },
+            &mut reusable_cache,
         );
 
         assert_eq!(
             cache.get("cached.rs").and_then(Option::as_deref),
-            Some("cached body")
+            Some("cached body"),
+            "the cached text must win over the changed disk contents"
         );
         assert_eq!(
             cache.get("late.rs").and_then(Option::as_deref),
-            Some("late body")
+            Some("late body"),
+            "a cached None entry must fall back to a fresh disk read"
         );
         assert_eq!(
-            cache.get("missing.rs").and_then(Option::as_deref),
-            Some("missing body")
+            cache.get("missing.rs"),
+            Some(&None),
+            "a missing disk file must fall back to None"
         );
-        assert_eq!(disk_reads, ["late-source", "missing-source"]);
+        assert!(
+            reusable_cache.is_empty(),
+            "the reuse owner must consume the consulted cache entries"
+        );
     }
 }
 

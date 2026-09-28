@@ -13,12 +13,11 @@ use super::{
     flush_pending_dense_anchor_inputs, fs, hybrid_test_env, insert_semantic_fixture_nodes,
     llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
     mutate_published_core, pending_semantic_doc_for_test, persisted_search_generation_names,
-    process_env_test_lock,
-    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
-    search_generation_completion_path, search_index_generation_root,
-    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
-    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
-    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    process_env_test_lock, project_identity_v3, prune_search_generations,
+    rebuild_search_state_from_storage, search_generation_completion_path,
+    search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
+    semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
+    test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
 use codestory_contracts::bounded_locks::{self, FileLockKind};

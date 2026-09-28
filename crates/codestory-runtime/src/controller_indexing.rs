@@ -1517,7 +1517,7 @@ impl AppController {
     /// exists the live database is read-only and the rows can only be installed
     /// by republishing a new generation. An unpublished cache still takes the
     /// direct write.
-    fn persist_symbol_summaries(
+    pub(crate) fn persist_symbol_summaries(
         &self,
         storage_path: &Path,
         summaries: Vec<SymbolSummaryRecord>,

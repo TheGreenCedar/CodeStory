@@ -75,6 +75,32 @@ fn search_intent_filters_hits_by_kind_path_name_and_language() {
             codestory_contracts::api::NodeKind::FUNCTION,
             "src/routes.rs",
         ),
+        // Each of these violates exactly one filter, so disabling any single
+        // filter check must let exactly one extra hit through.
+        hit(
+            "kind-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::STRUCT,
+            "src/routes.ts",
+        ),
+        hit(
+            "name-only",
+            "getUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "src/routes.ts",
+        ),
+        hit(
+            "path-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "lib/users.ts",
+        ),
+        hit(
+            "language-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "src/routes.ts.md",
+        ),
     ];
 
     apply_search_intent_filters(

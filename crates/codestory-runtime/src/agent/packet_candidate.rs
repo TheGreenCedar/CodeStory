@@ -1096,13 +1096,18 @@ mod tests {
 
     #[test]
     fn citation_and_graph_keep_exact_packet_candidate_provenance() {
+        for hostile_eligibility in [Some(true), Some(false)] {
+            let mut hit = packet_hit("edge-1");
+            hit.hit.eligible_for_sufficiency = hostile_eligibility;
+            let citation = hit.citation(true);
+            assert_eq!(
+                citation.eligible_for_sufficiency, None,
+                "packet citations carry retrieval provenance, never answer-sufficiency authority"
+            );
+        }
         let hit = packet_hit("edge-1");
         let citation = hit.citation(true);
         assert_eq!(citation.evidence_edge_ids, [EdgeId("edge-1".into())]);
-        assert_eq!(
-            citation.eligible_for_sufficiency, None,
-            "packet citations carry retrieval provenance, never answer-sufficiency authority"
-        );
         assert!(hit.has_proof_call_provenance());
 
         let mut answer = answer();

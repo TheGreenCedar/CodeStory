@@ -2252,6 +2252,9 @@ mod tests {
             display_name: name.to_string(),
             file_path: Some(root.join("src/service.ts")),
         };
+        // Adverse fixture: the leaf's name sorts first on every earlier key
+        // (lexical order, no helper-name hints), so only the call topology can
+        // keep the referenced subsystem root ahead of it.
         let degrees = [
             (
                 CoreNodeId(1),
@@ -2263,8 +2266,8 @@ mod tests {
             (
                 CoreNodeId(2),
                 CallDegrees {
-                    production_in_calls: 0,
-                    out_calls: 0,
+                    production_in_calls: 4,
+                    out_calls: 1,
                 },
             ),
         ]
@@ -2272,7 +2275,7 @@ mod tests {
         .collect::<HashMap<_, _>>();
 
         let ordered = diversify_grounding_root_records(
-            vec![record(2, "zzHelperAlias"), record(1, "aaSubsystemRoot")],
+            vec![record(1, "zzSubstrateRoot"), record(2, "aaaDispatchLeaf")],
             root,
             &roles,
             &HashMap::new(),
@@ -2284,7 +2287,7 @@ mod tests {
                 .iter()
                 .map(|record| record.display_name.as_str())
                 .collect::<Vec<_>>(),
-            ["aaSubsystemRoot", "zzHelperAlias"]
+            ["zzSubstrateRoot", "aaaDispatchLeaf"]
         );
     }
 
@@ -3957,9 +3960,12 @@ mod tests {
                         start_line: Some(1),
                         ..Default::default()
                     },
+                    // Same kind as the import-like module and a later line, so
+                    // kind precedence and position cannot decide this; only
+                    // the import demotion keeps Widget ahead.
                     Node {
                         id: CoreNodeId(102),
-                        kind: NodeKind::CLASS,
+                        kind: NodeKind::MODULE,
                         serialized_name: "Widget".to_string(),
                         file_node_id: Some(CoreNodeId(11)),
                         start_line: Some(2),
@@ -4688,6 +4694,29 @@ mod tests {
             .grounding_snapshot(GroundingBudgetDto::Max)
             .expect("max snapshot");
 
+        // Fixture truth is independent of the returned shape: 24 files with 5
+        // symbols each were seeded, and every file and symbol must be
+        // represented either as a digest or inside a coverage bucket.
+        for snapshot in [&strict, &balanced, &max] {
+            assert_eq!(snapshot.coverage.total_files, 24);
+            assert_eq!(snapshot.coverage.represented_files, 24);
+            assert_eq!(snapshot.coverage.total_symbols, 120);
+            assert!(snapshot.coverage.represented_symbols > 0);
+        }
+
+        assert_eq!(strict.files.len(), 8, "strict budget detail cap");
+        assert!(
+            strict
+                .files
+                .iter()
+                .all(|file| file.symbol_count == 5 && file.represented_symbol_count > 0),
+            "strict digests must carry the fixture's per-file symbol counts"
+        );
+        assert!(
+            !strict.coverage_buckets.is_empty(),
+            "strict budget must bucket the undetailed files"
+        );
+
         assert!(strict.coverage.represented_symbols <= balanced.coverage.represented_symbols);
         assert!(balanced.coverage.represented_symbols <= max.coverage.represented_symbols);
         assert!(strict.files.len() <= balanced.files.len());
@@ -4707,6 +4736,11 @@ mod tests {
                         .sum::<u32>(),
                 );
             assert_eq!(snapshot.coverage.represented_symbols, surfaced_symbols);
+            for bucket in &snapshot.coverage_buckets {
+                assert!(!bucket.label.is_empty(), "bucket must carry an identity");
+                assert!(bucket.file_count > 0);
+                assert!(bucket.symbol_count > 0);
+            }
         }
     }
 
@@ -4879,6 +4913,20 @@ mod tests {
             );
         }
 
+        // Diverge the live node table from the materialized snapshot without
+        // refreshing: a read path that bypasses the snapshot would surface the
+        // live-only name instead of the materialized one.
+        {
+            let storage = Storage::open(&db_path).expect("reopen for live divergence");
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET serialized_name = 'live_only_helper' WHERE id = 102",
+                    [],
+                )
+                .expect("diverge live node table");
+        }
+
         let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path)
@@ -4896,6 +4944,20 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.label.starts_with("Controller")),
             "expected materialized root symbol to be surfaced"
+        );
+        assert!(
+            snapshot
+                .root_symbols
+                .iter()
+                .any(|symbol| symbol.label.starts_with("helper")),
+            "materialized snapshot must serve the pre-divergence label"
+        );
+        assert!(
+            !snapshot
+                .root_symbols
+                .iter()
+                .any(|symbol| symbol.label.contains("live_only_helper")),
+            "summary-open grounding must not read the divergent live node table"
         );
     }
 

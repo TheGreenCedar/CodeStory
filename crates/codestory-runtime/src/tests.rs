@@ -2051,10 +2051,10 @@ fn attached_comment_window_and_proxy_cap_truncate_the_tail() {
 #[test]
 fn dense_anchor_inputs_are_sorted_deterministically_before_publication() {
     let mut docs = vec![
-        pending_semantic_doc_for_test(1, &"x".repeat(900)),
-        pending_semantic_doc_for_test(2, "tiny"),
         pending_semantic_doc_for_test(3, &"m".repeat(880)),
+        pending_semantic_doc_for_test(1, &"x".repeat(900)),
         pending_semantic_doc_for_test(4, "small"),
+        pending_semantic_doc_for_test(2, "tiny"),
     ];
     sort_pending_dense_anchor_inputs(&mut docs);
 
@@ -2521,8 +2521,10 @@ String::new()
 
 #[test]
 fn aggregate_symbol_matches_prioritizes_direct_matches() {
+    // The expanded-only competitor (95) outscores the direct candidate's own
+    // expanded row (50), so only the direct-match boost can keep node 7 first.
     let direct = vec![(CoreNodeId(7), 2.0)];
-    let expanded = vec![(CoreNodeId(7), 99.0), (CoreNodeId(8), 95.0)];
+    let expanded = vec![(CoreNodeId(7), 50.0), (CoreNodeId(8), 95.0)];
     let merged = crate::support::aggregate_symbol_matches(direct, expanded);
     assert_eq!(merged.first().map(|(id, _)| *id), Some(CoreNodeId(7)));
 }
@@ -3622,7 +3624,20 @@ fn degraded_or_mismatched_manifest_does_not_report_hybrid_ready() {
     let mut storage = Storage::open(&storage_path).expect("open storage");
     let runtime = test_sidecar_runtime_from_env();
 
-    let mut degraded = published_full_retrieval_manifest(&project_root);
+    // Baseline: the same seeded store with an unmodified manifest reports
+    // hybrid ready, so each arm below flips exactly one declared condition.
+    let healthy = publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("healthy retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Hybrid);
+    assert!(state.semantic_ready);
+    assert_eq!(state.fallback_reason, None);
+
+    let mut degraded = healthy.clone();
     degraded.degraded_modes_json = r#"["embedded_vector_index_unavailable"]"#.to_string();
     storage
         .upsert_retrieval_index_manifest(&degraded)
@@ -3640,7 +3655,7 @@ fn degraded_or_mismatched_manifest_does_not_report_hybrid_ready() {
         Some(RetrievalFallbackReasonDto::DegradedRuntime)
     );
 
-    let mut mismatched = published_full_retrieval_manifest(&project_root);
+    let mut mismatched = healthy.clone();
     mismatched.embedding_backend = Some("legacy-backend".to_string());
     storage
         .upsert_retrieval_index_manifest(&mismatched)
@@ -6274,22 +6289,16 @@ fn symbol_summaries_persist_into_a_published_immutable_core() {
         "a published core must refuse a direct symbol-summary write"
     );
 
-    let staged_record = record.clone();
-    let outcome = controller
-        .republish_core_with_staged_mutation_blocking(
-            workspace.path().to_path_buf(),
-            storage_path.clone(),
-            &move |store: &mut Storage| {
-                store
-                    .upsert_symbol_summaries_batch(std::slice::from_ref(&staged_record))
-                    .map_err(|error| {
-                        codestory_contracts::api::ApiError::internal(error.to_string())
-                    })
-            },
-        )
-        .expect("republish the core with the generated summaries");
+    // The real persistence entry point must therefore route through a staged
+    // republish rather than the direct write.
+    controller
+        .persist_symbol_summaries(&storage_path, vec![record])
+        .expect("persist summaries through the published-core route");
 
-    assert_eq!(outcome.publication.generation, baseline.generation + 1);
+    let republished = Storage::database_complete_index_publication(&storage_path)
+        .expect("read republished publication")
+        .expect("republished publication");
+    assert_eq!(republished.generation, baseline.generation + 1);
     let stored: String = Storage::open(&storage_path)
         .expect("open republished core")
         .get_connection()
@@ -7011,8 +7020,11 @@ fn incremental_refresh_rebuilds_touched_file_semantic_docs_only() {
         .expect("full index");
     let before_docs = Storage::open(&storage_path)
         .expect("reopen storage before incremental")
-        .get_all_llm_symbol_docs()
-        .expect("semantic docs before incremental");
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("symbol docs before incremental")
+        .into_iter()
+        .map(|doc| (doc.node_id, doc))
+        .collect::<HashMap<_, _>>();
     let before_reports = Storage::open(&storage_path)
         .expect("reopen reports before incremental")
         .get_symbol_search_docs_batch_after(None, 10_000)
@@ -7057,6 +7069,48 @@ fn incremental_refresh_rebuilds_touched_file_semantic_docs_only() {
         docs.iter()
             .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
         "incremental symbol docs should include the new symbol"
+    );
+    let mut untouched_docs = 0usize;
+    for doc in &docs {
+        // Component reports aggregate the whole repository, so a real symbol
+        // addition legitimately changes them; the untouched contract covers
+        // per-file symbol docs only.
+        if doc.display_name.starts_with("component_report:") {
+            continue;
+        }
+        let touched_file = doc
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("rust_tictactoe.rs"));
+        if touched_file {
+            continue;
+        }
+        let before = before_docs.get(&doc.node_id).unwrap_or_else(|| {
+            panic!(
+                "symbol doc {:?} outside the touched file was dropped or renumbered",
+                doc.display_name
+            )
+        });
+        untouched_docs += 1;
+        assert_eq!(
+            (
+                doc.doc_hash.as_str(),
+                doc.doc_text.as_str(),
+                doc.doc_version
+            ),
+            (
+                before.doc_hash.as_str(),
+                before.doc_text.as_str(),
+                before.doc_version
+            ),
+            "incremental indexing must leave {:?} (file {:?}) payload untouched",
+            doc.display_name,
+            doc.file_path
+        );
+    }
+    assert!(
+        untouched_docs > 0,
+        "fixture must produce symbol docs outside the touched file"
     );
     assert!(
         docs.iter().any(|doc| {
@@ -7247,9 +7301,26 @@ fn symbol_context_by_id_does_not_mutate_persisted_semantic_docs() {
         .expect("index without runtime refresh");
 
     let storage = Storage::open(&storage_path).expect("reopen storage");
-    let before = storage
-        .get_llm_symbol_doc_stats()
-        .expect("semantic doc stats before");
+    let before_docs = storage
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("symbol docs before read")
+        .into_iter()
+        .map(|doc| {
+            (
+                doc.node_id,
+                doc.doc_hash,
+                doc.doc_text,
+                doc.doc_version,
+                doc.updated_at_epoch_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let before_anchors = storage
+        .get_dense_anchor_inputs_batch_after(None, 10_000)
+        .expect("dense anchors before read")
+        .into_iter()
+        .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+        .collect::<Vec<_>>();
     let symbol_id = storage
         .get_nodes()
         .expect("load nodes")
@@ -7269,11 +7340,34 @@ fn symbol_context_by_id_does_not_mutate_persisted_semantic_docs() {
     assert!(context.node.display_name.contains("check_winner"));
 
     let storage = Storage::open(&storage_path).expect("reopen storage after read");
-    let after = storage
-        .get_llm_symbol_doc_stats()
-        .expect("semantic doc stats after");
-    assert_eq!(after.doc_count, before.doc_count);
-    assert_eq!(after.embedding_model, before.embedding_model);
+    let after_docs = storage
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("symbol docs after read")
+        .into_iter()
+        .map(|doc| {
+            (
+                doc.node_id,
+                doc.doc_hash,
+                doc.doc_text,
+                doc.doc_version,
+                doc.updated_at_epoch_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let after_anchors = storage
+        .get_dense_anchor_inputs_batch_after(None, 10_000)
+        .expect("dense anchors after read")
+        .into_iter()
+        .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_docs, before_docs,
+        "a symbol_context read must not mutate persisted symbol docs"
+    );
+    assert_eq!(
+        after_anchors, before_anchors,
+        "a symbol_context read must not mutate persisted dense anchors"
+    );
 }
 
 #[test]
