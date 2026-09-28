@@ -533,7 +533,7 @@ fn source_receipt_line_range(markdown: &str) -> Option<(u32, u32)> {
     start.zip(end)
 }
 
-fn observe_admitted_source_coverage(
+pub(crate) fn observe_admitted_source_coverage(
     controller: &AppController,
     storage: &Store,
     paths: &[String],
@@ -560,6 +560,26 @@ fn observe_one_admitted_source_coverage(
     project_root: &Path,
     path: &str,
 ) -> Result<SourceCoverageObservationDto, codestory_store::StorageError> {
+    // Policy exclusions carry no `file` row (excluded sources are never
+    // registered as parser-backed coverage), so the exclusion table is
+    // consulted on the normalized relative spelling before the file lookup.
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        let relative_path = codestory_workspace::workspace_relative_path(project_root, &candidate)
+            .unwrap_or_else(|| candidate.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if storage.has_source_policy_exclusion_path(&relative_path)? {
+            return Ok(SourceCoverageObservationDto {
+                path: path.to_string(),
+                status: SourceCoverageStatusDto::PolicyExcluded,
+                reason: None,
+                not_established_cause: None,
+                observed_size: None,
+                byte_cap: None,
+            });
+        }
+    }
+
     let mut file = None;
     for candidate in admitted_file_lookup_paths(project_root, path) {
         if let Some(found) = storage.get_file_by_path(&candidate)? {
@@ -570,20 +590,6 @@ fn observe_one_admitted_source_coverage(
     let Some(file) = file else {
         return Ok(source_coverage_not_established(path));
     };
-    let relative_path = codestory_workspace::workspace_relative_path(project_root, &file.path)
-        .unwrap_or_else(|| file.path.clone())
-        .to_string_lossy()
-        .replace('\\', "/");
-    if storage.has_source_policy_exclusion_path(&relative_path)? {
-        return Ok(SourceCoverageObservationDto {
-            path: path.to_string(),
-            status: SourceCoverageStatusDto::PolicyExcluded,
-            reason: None,
-            not_established_cause: None,
-            observed_size: None,
-            byte_cap: None,
-        });
-    }
 
     let verified_source = storage.get_file_content_hash(file.id)?.is_some();
     let structural_projection = if file.language == "openapi" {

@@ -1,7 +1,7 @@
 use super::{
     Path, SearchHit, SearchIntentFilter, apply_search_intent_filters, extract_symbol_search_terms,
-    indexed_file_matches_language_filter, language_filter_matches_path,
-    mixed_natural_language_query, parse_search_intent_query, should_expand_symbol_query,
+    indexed_file_matches_language_filter, language_filter_matches_path, parse_search_intent_query,
+    should_expand_symbol_query,
 };
 
 #[test]
@@ -161,13 +161,4 @@ fn should_expand_symbol_query_for_sentence_prompts() {
         "How does the language parsing work in this repo?",
         5
     ));
-}
-
-#[test]
-fn mixed_natural_language_query_detects_embedded_symbol_prompts() {
-    assert!(mixed_natural_language_query(
-        "how ExtensionHostManager starts"
-    ));
-    assert!(!mixed_natural_language_query("Workbench"));
-    assert!(!mixed_natural_language_query("Subcommand::Exec"));
 }

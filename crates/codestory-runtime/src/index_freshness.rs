@@ -19,8 +19,6 @@ const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
 const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
-#[cfg(test)]
-pub(super) const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
 #[cfg(test)]
 thread_local! {

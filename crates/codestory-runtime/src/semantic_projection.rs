@@ -11,8 +11,6 @@ use super::{
     semantic_symbol_aliases, semantic_symbol_role_aliases,
 };
 #[cfg(test)]
-use super::{embedding_profile_contract_from_env, test_sidecar_runtime_from_env};
-#[cfg(test)]
 use crate::publication::{PublicationTestBoundary, publication_test_checkpoint};
 #[cfg(test)]
 use crate::search;
@@ -497,18 +495,6 @@ impl SemanticDocAliasMode {
     }
 }
 
-#[cfg(test)]
-pub(super) fn semantic_doc_shape_contract() -> String {
-    let max_tokens = semantic_doc_max_tokens_from_env();
-    format!(
-        "semantic_doc_version={};scope={};alias_mode={};max_tokens={}",
-        LLM_SYMBOL_DOC_SCHEMA_VERSION,
-        semantic_doc_scope_from_env().as_str(),
-        semantic_doc_alias_mode_from_env().as_str(),
-        max_tokens
-    )
-}
-
 pub(super) fn semantic_doc_shape_contract_for_runtime(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> String {
@@ -519,21 +505,6 @@ pub(super) fn semantic_doc_shape_contract_for_runtime(
         semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode).as_str(),
         runtime.retrieval.semantic_doc_max_tokens,
     )
-}
-
-#[cfg(test)]
-pub(super) fn current_embedding_contract_from_env() -> Option<EmbeddingProfileContractDto> {
-    let doc_shape = semantic_doc_shape_contract();
-    embedding_profile_contract_from_env()
-        .ok()
-        .map(|contract| EmbeddingProfileContractDto {
-            profile: contract.profile,
-            backend: contract.backend,
-            model_id: contract.model_id,
-            cache_key: contract.cache_key,
-            dimension: contract.dimension,
-            doc_shape,
-        })
 }
 
 pub(super) fn current_embedding_contract_for_runtime(
@@ -577,35 +548,11 @@ pub(super) fn semantic_doc_stats_match_contract(
         && stats.semantic_policy_version.as_deref() == Some(SEMANTIC_POLICY_VERSION)
 }
 
-/// The retrieval-owned semantic settings for this process.
-///
-/// Every `*_from_env` accessor below goes through here. The settings are
-/// declared to `codestory-retrieval/src/config.rs`, which reads and clamps
-/// them; the runtime interprets the resulting *values*, never the variables. A
-/// second parse here is how a clamp drifts: this file used to reject
-/// `CODESTORY_SEMANTIC_DOC_MAX_TOKENS=0` back to the default while the owner
-/// clamped it to the floor of 16, so the same environment described two
-/// different token budgets depending on which code asked.
-#[cfg(test)]
-fn retrieval_settings() -> codestory_retrieval::RetrievalRuntimeConfig {
-    codestory_retrieval::retrieval_runtime_config_from_process_env()
-}
-
-#[cfg(test)]
-pub(super) fn semantic_doc_scope_from_env() -> SemanticDocScope {
-    semantic_doc_scope_from_value(&retrieval_settings().semantic_doc_scope)
-}
-
 pub(super) fn semantic_doc_scope_from_value(value: &str) -> SemanticDocScope {
     match value.trim().to_ascii_lowercase().as_str() {
         "all" | "full" | "all-symbols" | "all_symbols" => SemanticDocScope::AllSymbols,
         _ => SemanticDocScope::DurableSymbols,
     }
-}
-
-#[cfg(test)]
-pub(super) fn semantic_doc_alias_mode_from_env() -> SemanticDocAliasMode {
-    semantic_doc_alias_mode_from_value(&retrieval_settings().semantic_doc_alias_mode)
 }
 
 pub(super) fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAliasMode {
@@ -618,21 +565,6 @@ pub(super) fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAlia
         | "compact-alias" => SemanticDocAliasMode::AliasVariant,
         _ => SemanticDocAliasMode::AliasVariant,
     }
-}
-
-#[cfg(test)]
-pub(super) fn semantic_doc_max_tokens_from_env() -> usize {
-    retrieval_settings().semantic_doc_max_tokens
-}
-
-#[cfg(test)]
-pub(super) fn stream_pending_llm_symbol_docs_from_env() -> bool {
-    retrieval_settings().stream_pending_docs
-}
-
-#[cfg(test)]
-pub(super) fn semantic_stream_sort_window_batches_from_env() -> usize {
-    retrieval_settings().stream_sort_window_batches
 }
 
 pub(super) fn llm_indexable_kind_for_scope(
@@ -715,7 +647,7 @@ pub(super) fn llm_indexable_kinds_for_scope(
 
 #[cfg(test)]
 pub(super) fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
-    llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
+    llm_indexable_kind_for_scope(kind, SemanticDocScope::DurableSymbols)
 }
 
 pub(super) fn normalize_semantic_store_path(path: &Path) -> String {
@@ -1373,7 +1305,7 @@ impl SemanticDocGraphContext {
             storage,
             semantic_nodes,
             all_nodes,
-            semantic_doc_scope_from_env(),
+            SemanticDocScope::DurableSymbols,
             file_paths,
             file_read_paths,
         )
@@ -1915,42 +1847,6 @@ pub(super) fn semantic_doc_text_budget_cost(doc_text: &str) -> usize {
         .sum()
 }
 
-#[cfg(test)]
-pub(super) fn truncate_semantic_doc_text_to_token_budget(
-    doc_text: &str,
-    max_tokens: usize,
-) -> String {
-    let mut remaining = max_tokens;
-    let mut out = String::new();
-
-    'lines: for line in doc_text.lines() {
-        if remaining == 0 {
-            break;
-        }
-        let mut selected = Vec::new();
-        for token in line.split_whitespace() {
-            let cost = semantic_doc_budget_cost(token);
-            if cost > remaining {
-                break 'lines;
-            }
-            selected.push(token);
-            remaining -= cost;
-        }
-        if selected.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&selected.join(" "));
-    }
-
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
-}
-
 fn compact_semantic_doc_fragment(lines: impl IntoIterator<Item = String>, budget: usize) -> String {
     if budget == 0 {
         return String::new();
@@ -2179,25 +2075,6 @@ pub(super) fn symbol_excerpt(
     (signature, comments, body)
 }
 
-#[cfg(test)]
-pub(super) fn build_llm_symbol_doc_text(
-    graph_context: &SemanticDocGraphContext,
-    node: &GraphNode,
-    display_name: &str,
-    file_path: Option<&str>,
-    file_text_cache: &HashMap<String, Option<String>>,
-) -> String {
-    build_llm_symbol_doc_text_with_policy(
-        graph_context,
-        node,
-        display_name,
-        file_path,
-        file_text_cache,
-        semantic_doc_alias_mode_from_env(),
-        semantic_doc_max_tokens_from_env(),
-    )
-}
-
 pub(super) fn build_llm_symbol_doc_text_with_policy(
     graph_context: &SemanticDocGraphContext,
     node: &GraphNode,
@@ -2339,7 +2216,7 @@ pub(super) struct BuiltLlmSymbolDoc {
 
 #[cfg(test)]
 pub(super) fn llm_symbol_doc_hash(doc_text: &str) -> String {
-    llm_symbol_doc_hash_with_alias(doc_text, semantic_doc_alias_mode_from_env())
+    llm_symbol_doc_hash_with_alias(doc_text, SemanticDocAliasMode::AliasVariant)
 }
 
 pub(super) fn llm_symbol_doc_hash_with_alias(
@@ -3057,23 +2934,6 @@ pub(super) fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
             .is_some_and(|canonical_id| canonical_id.starts_with("codestory:component_report:"))
 }
 
-#[cfg(test)]
-pub(super) fn build_component_report_docs(
-    graph_context: &SemanticDocGraphContext,
-    semantic_nodes: &[&GraphNode],
-    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
-    updated_at_epoch_ms: i64,
-) -> Vec<BuiltLlmSymbolDoc> {
-    build_component_report_docs_with_policy(
-        graph_context,
-        semantic_nodes,
-        existing_docs,
-        updated_at_epoch_ms,
-        semantic_doc_alias_mode_from_env(),
-        semantic_doc_max_tokens_from_env(),
-    )
-}
-
 #[derive(Debug)]
 pub(super) struct ComponentReportNode {
     node: GraphNode,
@@ -3681,18 +3541,18 @@ pub(super) fn publish_component_report_docs(
 }
 
 #[derive(Clone, Copy)]
-struct SemanticRuntimePolicy {
+pub(super) struct SemanticRuntimePolicy {
     updated_at_epoch_ms: i64,
-    anchor_batch_size: usize,
-    alias_mode: SemanticDocAliasMode,
-    max_tokens: usize,
-    stream_sort_window_size: usize,
-    scope: SemanticDocScope,
+    pub(super) anchor_batch_size: usize,
+    pub(super) alias_mode: SemanticDocAliasMode,
+    pub(super) max_tokens: usize,
+    pub(super) stream_sort_window_size: usize,
+    pub(super) scope: SemanticDocScope,
     max_file_bytes: u64,
 }
 
 impl SemanticRuntimePolicy {
-    fn from_runtime(
+    pub(super) fn from_runtime(
         runtime: &codestory_retrieval::SidecarRuntimeConfig,
         max_file_bytes: u64,
     ) -> Self {
@@ -4821,26 +4681,6 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
     )?;
     prune_incremental_semantic_docs(storage, None, &output, cancel_token, &mut stats)?;
     Ok(stats)
-}
-
-#[cfg(test)]
-pub(super) fn finalize_staged_semantic_docs(
-    storage: &mut Storage,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-    component_report_refresh: Option<&ComponentReportRefreshScope>,
-    cancel_token: Option<&CancellationToken>,
-) -> Result<SemanticProjectionStats, ApiError> {
-    finalize_staged_semantic_docs_for_runtime(
-        storage,
-        llm_refresh_file_scope,
-        component_report_refresh,
-        "core:test-publication",
-        cancel_token,
-        &test_sidecar_runtime_from_env(),
-        SemanticProjectionDocumentSource::SourceFiles {
-            max_file_bytes: SourceIndexPolicy::default().byte_cap,
-        },
-    )
 }
 
 pub(super) fn finalize_staged_semantic_docs_for_runtime(

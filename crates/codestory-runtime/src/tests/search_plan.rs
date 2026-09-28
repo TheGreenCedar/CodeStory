@@ -930,66 +930,6 @@ fn ordering_reduces_to_the_lexical_comparator_when_graph_evidence_is_absent() {
 }
 
 #[test]
-fn smaller_limit_results_are_an_exact_prefix_of_larger_limit_results_for_one_candidate_set() {
-    let query = "explain how the subsystems connect end to end";
-    let candidates = vec![
-        orientation_hit("a", "zqOne", "src/a.ts", SearchHitOrigin::IndexedSymbol),
-        orientation_hit("b", "zqOne", "src/b.ts", SearchHitOrigin::IndexedSymbol),
-        orientation_hit("c", "zqTwo", "src/b.ts", SearchHitOrigin::IndexedSymbol),
-        orientation_hit("d", "zqThree", "src/c.ts", SearchHitOrigin::IndexedSymbol),
-    ];
-    let mut evidence = OrientationEvidence::default();
-    for (index, hit) in candidates.iter().enumerate() {
-        evidence.insert(
-            hit.node_id.clone(),
-            hit_evidence(
-                EntryEvidence::None,
-                false,
-                CallDegrees {
-                    production_in_calls: index as u32,
-                    out_calls: 0,
-                },
-                1,
-                hit.file_path.as_deref().unwrap_or_default(),
-            ),
-        );
-    }
-
-    // Re-run the whole ordering pipeline per limit rather than slicing one
-    // result, so a stage that consulted the limit would break the prefix.
-    let run = |limit: usize| {
-        let mut hits = candidates.clone();
-        hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(None, query, left, right, Some(&evidence))
-        });
-        let mut ordered = diversify_root_order(
-            hits,
-            |_| false,
-            |hit| {
-                (
-                    hit.file_path.clone().unwrap_or_default(),
-                    hit.display_name.clone(),
-                )
-            },
-        );
-        ordered.truncate(limit);
-        ordered
-            .into_iter()
-            .map(|hit| hit.node_id.0)
-            .collect::<Vec<_>>()
-    };
-
-    let full = run(candidates.len());
-    for smaller in 0..=candidates.len() {
-        assert_eq!(
-            run(smaller),
-            full[..smaller],
-            "the order changed with the limit at {smaller}"
-        );
-    }
-}
-
-#[test]
 fn a_candidate_the_graph_window_did_not_reach_still_ranks_on_its_own_structure() {
     let query = "explain how the subsystems connect end to end";
     let shallow = orientation_hit(

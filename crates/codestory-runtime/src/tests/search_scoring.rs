@@ -1,51 +1,48 @@
 use super::{
-    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind,
-    EnvGuard, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
-    IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
-    OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
-    ResolutionCertainty, RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV,
-    SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine, SearchGenerationCatalogGuard,
-    SearchGenerationCompletion, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation, Storage,
-    apply_hybrid_limits, arm_publication_test_fault, assert_mandatory_retrieval_unavailable,
-    assert_no_staged_publication_artifacts, build_persisted_search_state_from_canonical_symbols,
-    build_search_state, compare_search_hits, copy_tictactoe_workspace, current_epoch_ms,
-    dedupe_inexact_search_hits_by_display_key, default_source_policy_identity,
-    finalize_staged_semantic_docs, flush_pending_dense_anchor_inputs, fs,
-    hybrid_search_config_for_request, hybrid_test_env, insert_semantic_fixture_nodes,
+    AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind, EnvGuard,
+    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexFreshnessStatusDto, IndexMode,
+    Node, NodeId, NodeKind, Occurrence, OccurrenceKind, OpenProjectRequest, Path, PathBuf,
+    PublicationTestAction, PublicationTestBoundary, ResolutionCertainty, RetrievalModeDto,
+    SearchEngine, SearchGenerationCatalogGuard, SearchGenerationCompletion, SearchHit,
+    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
+    SemanticProjectionStats, SnapshotStore, SourceLocation, Storage, arm_publication_test_fault,
+    assert_mandatory_retrieval_unavailable, assert_no_staged_publication_artifacts,
+    build_persisted_search_state_from_canonical_symbols, build_search_state, compare_search_hits,
+    copy_tictactoe_workspace, current_epoch_ms, dedupe_inexact_search_hits_by_display_key,
+    default_source_policy_identity, finalize_semantic_docs_for_test,
+    flush_pending_dense_anchor_inputs, fs, hybrid_test_env, insert_semantic_fixture_nodes,
     llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
-    normalized_hybrid_weights, pending_semantic_doc_for_test, persisted_search_generation_names,
-    primary_source_retention_threshold, process_env_test_lock, project_identity_v3,
-    prune_search_generations, rebuild_search_state_from_storage, search_generation_completion_path,
-    search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
-    semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
-    test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    pending_semantic_doc_for_test, persisted_search_generation_names, process_env_test_lock,
+    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
+    search_generation_completion_path, search_index_generation_root,
+    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
+    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
+    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
 use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
 fn semantic_doc_text_alias_modes_are_switchable_for_research() {
-    let _lock = process_env_test_lock();
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
-    let no_alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "no_alias");
     let no_alias_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::NoAlias,
+        512,
     );
     let no_alias_hash = llm_symbol_doc_hash(&no_alias_doc);
     assert!(!no_alias_doc.contains("terminal_alias:"));
     assert!(!no_alias_doc.contains("path_aliases:"));
-    drop(no_alias);
 
-    let variant = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "alias_variant");
     let variant_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::AliasVariant,
+        512,
     );
     let variant_hash = llm_symbol_doc_hash(&variant_doc);
     assert!(variant_doc.contains("terminal_alias: open project with storage path"));
@@ -54,19 +51,18 @@ fn semantic_doc_text_alias_modes_are_switchable_for_research() {
     assert!(!variant_doc.contains("name_aliases:"));
     assert!(!variant_doc.contains("path_aliases:"));
     assert_ne!(no_alias_hash, variant_hash);
-    drop(variant);
 
-    let current = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
     let current_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::CurrentAlias,
+        512,
     );
     assert!(current_doc.contains("name_aliases:"));
     assert!(current_doc.contains("path_aliases:"));
     assert_ne!(variant_hash, llm_symbol_doc_hash(&current_doc));
-    drop(current);
 }
 
 #[test]
@@ -2076,7 +2072,8 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
             "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         ))
         .expect("publish identity");
-    finalize_staged_semantic_docs(&mut storage, None, None, None).expect("finalize semantic rows");
+    finalize_semantic_docs_for_test(&mut storage, None, &test_sidecar_runtime_from_env())
+        .expect("finalize semantic rows");
     let before_legacy = storage
         .get_all_llm_symbol_docs()
         .expect("legacy semantic rows before cache load");
@@ -2116,7 +2113,6 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
     let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
         .expect("hydrate cache without semantic persistence");
 
-    assert!(!result.engine.semantic_index_ready());
     assert_eq!(result.engine.full_text_doc_count(), result.node_names.len());
     assert_eq!(
         storage
@@ -2149,8 +2145,12 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
     )
     .expect_err("cancelled semantic persistence must stop before DB upsert");
     assert_eq!(error.code, "cancelled");
-    let error = finalize_staged_semantic_docs(&mut storage, None, None, Some(&cancel_token))
-        .expect_err("cancelled semantic finalization must stop before persistence");
+    let error = finalize_semantic_docs_for_test(
+        &mut storage,
+        Some(&cancel_token),
+        &test_sidecar_runtime_from_env(),
+    )
+    .expect_err("cancelled semantic finalization must stop before persistence");
     assert_eq!(error.code, "cancelled");
 }
 
@@ -2185,7 +2185,7 @@ fn persisted_search_generations_do_not_overwrite_a_racing_reader() {
         .expect("build old search generation");
     let old_path =
         search_index_path_for_publication(&storage_path, Some(&old_publication)).expect("old path");
-    let same_generation_reader = SearchEngine::try_open_existing(&old_path)
+    let same_generation_reader = SearchEngine::open_existing(&old_path)
         .expect("completed builder must retain only a shared generation lock");
     assert_eq!(same_generation_reader.tantivy_doc_count(), 3);
     drop(same_generation_reader);
@@ -2637,14 +2637,6 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
 }
 
 #[test]
-fn primary_source_retention_keeps_short_precise_windows() {
-    assert_eq!(primary_source_retention_threshold(1), 1);
-    assert_eq!(primary_source_retention_threshold(3), 3);
-    assert_eq!(primary_source_retention_threshold(10), 3);
-    assert_eq!(primary_source_retention_threshold(50), 3);
-}
-
-#[test]
 fn inexact_search_results_deduplicate_repeated_display_keys() {
     let mut hits = vec![
         SearchHit {
@@ -2776,18 +2768,81 @@ fn exact_search_results_keep_repeated_display_keys() {
     assert_eq!(hits.len(), 2);
 }
 
+/// F023: the live `limit_per_source` owner must make a smaller result an exact
+/// prefix of the larger one over the same candidate set. The retired test
+/// truncated a local ordering itself, so a limit-aware ordering stage could
+/// reorder freely without failing.
 #[test]
-fn hybrid_search_config_skips_exact_symbol_escalation_for_mixed_nl() {
-    let req = SearchRequest {
-        query: "how ExtensionHostManager starts".to_string(),
-        repo_text: SearchRepoTextMode::Off,
-        limit_per_source: 10,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
+fn live_search_limit_keeps_smaller_limits_a_prefix_of_larger_ones() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let temp = tempdir().expect("create temp dir");
+    let db_path = temp.path().join("codestory.db");
+    let file_path = temp.path().join("src").join("lib.rs");
+
+    {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        let mut nodes = vec![Node {
+            id: CoreNodeId(10),
+            kind: NodeKind::FILE,
+            serialized_name: file_path.to_string_lossy().to_string(),
+            ..Default::default()
+        }];
+        for (index, name) in [
+            "ZqPrefixProbeAlpha",
+            "ZqPrefixProbeBeta",
+            "ZqPrefixProbeGamma",
+            "ZqPrefixProbeDelta",
+        ]
+        .iter()
+        .enumerate()
+        {
+            nodes.push(Node {
+                id: CoreNodeId(20 + index as i64),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("zq::{name}"),
+                qualified_name: Some(format!("zq::{name}")),
+                file_node_id: Some(CoreNodeId(10)),
+                start_line: Some(10 + index as u32),
+                ..Default::default()
+            });
+        }
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+    }
+
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
+        .expect("open project");
+
+    let run = |limit: u32| {
+        controller
+            .search_results(SearchRequest {
+                query: "ZqPrefixProbe".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: limit,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("repo-text off search uses the published core")
+            .indexed_symbol_hits
+            .iter()
+            .map(|hit| hit.node_id.0.clone())
+            .collect::<Vec<_>>()
     };
-    let config = hybrid_search_config_for_request(&req, 10, None, true);
-    assert_eq!(config.max_results, 10);
+
+    let full = run(10);
+    assert!(
+        full.len() >= 3,
+        "the fixture must produce several live hits: {full:?}"
+    );
+    for smaller in 1..full.len() {
+        assert_eq!(
+            run(smaller as u32),
+            full[..smaller],
+            "the live ordering changed with limit_per_source at {smaller}"
+        );
+    }
 }
 
 #[test]
@@ -2987,65 +3042,4 @@ fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
     let state = controller.state.lock();
     assert!(state.search_engine.is_none());
     assert!(state.node_names.is_empty());
-}
-
-#[test]
-fn normalized_hybrid_weights_clamps_and_normalizes_values() {
-    let fallback = HybridSearchConfig::default();
-    let (lexical, semantic, graph) = normalized_hybrid_weights(
-        Some(AgentHybridWeightsDto {
-            lexical: Some(2.0),
-            semantic: Some(-1.0),
-            graph: Some(0.5),
-        }),
-        &fallback,
-    );
-
-    assert!((lexical - 0.666_666_7).abs() < 1e-4);
-    assert!((semantic - 0.0).abs() < 1e-6);
-    assert!((graph - 0.333_333_34).abs() < 1e-4);
-}
-
-#[test]
-fn normalized_hybrid_weights_falls_back_when_invalid_sum() {
-    let fallback = HybridSearchConfig::default();
-    let (lexical, semantic, graph) = normalized_hybrid_weights(
-        Some(AgentHybridWeightsDto {
-            lexical: Some(0.0),
-            semantic: Some(0.0),
-            graph: Some(0.0),
-        }),
-        &fallback,
-    );
-
-    assert!((lexical - fallback.lexical_weight).abs() < 1e-6);
-    assert!((semantic - fallback.semantic_weight).abs() < 1e-6);
-    assert!((graph - fallback.graph_weight).abs() < 1e-6);
-}
-
-#[test]
-fn hybrid_search_defaults_to_accuracy_first_semantic_profile() {
-    let config = HybridSearchConfig::default();
-
-    assert_eq!(config.max_results, 20);
-    assert_eq!(config.lexical_weight, 0.0);
-    assert_eq!(config.semantic_weight, 1.0);
-    assert_eq!(config.graph_weight, 0.0);
-    assert_eq!(config.lexical_limit, 0);
-    assert_eq!(config.semantic_limit, 20);
-}
-
-#[test]
-fn apply_hybrid_limits_overrides_and_caps_values() {
-    let mut config = HybridSearchConfig::default();
-    apply_hybrid_limits(
-        Some(codestory_contracts::api::SearchHybridLimitsDto {
-            lexical: Some(0),
-            semantic: Some(5_000),
-        }),
-        &mut config,
-    );
-
-    assert_eq!(config.lexical_limit, 0);
-    assert_eq!(config.semantic_limit, 1_000);
 }

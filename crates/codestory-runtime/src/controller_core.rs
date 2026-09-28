@@ -72,8 +72,6 @@ impl AppController {
                 observed_core_publication: None,
                 is_indexing: false,
                 index_freshness_cache: None,
-                #[cfg(test)]
-                last_hybrid_instrumentation: None,
             })),
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
