@@ -1542,7 +1542,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_git::{git, git_is_dirty, git_stdout};
+    use crate::test_git::{git, git_is_dirty};
     use tempfile::tempdir;
 
     #[test]
@@ -2154,7 +2154,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let project = git_project();
-        let tree = git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
+        let tree = crate::test_git::git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
         let object_path = project
             .path()
             .join(".git/objects")
