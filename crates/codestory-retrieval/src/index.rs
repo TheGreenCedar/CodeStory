@@ -3997,14 +3997,14 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "test-support"))]
     struct RestoreOwnedRoot {
         root: PathBuf,
         parked: PathBuf,
         restored: bool,
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "test-support"))]
     impl RestoreOwnedRoot {
         fn restore(&mut self) -> std::io::Result<()> {
             if !self.restored {
@@ -4020,7 +4020,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "test-support"))]
     impl Drop for RestoreOwnedRoot {
         fn drop(&mut self) {
             let _ = self.restore();

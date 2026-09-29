@@ -1512,8 +1512,11 @@ mod tests {
     use crate::CandidateHit;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
+    #[cfg(feature = "test-support")]
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
-    use codestory_store::{FileInfo, FileRole};
+    #[cfg(feature = "test-support")]
+    use codestory_store::FileInfo;
+    use codestory_store::FileRole;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -3289,6 +3292,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
     fn live_mtime_millis(path: &Path) -> i64 {
         std::fs::metadata(path)
             .expect("metadata")
