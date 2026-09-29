@@ -1542,14 +1542,12 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::test_git::{git, git_is_dirty};
     use tempfile::tempdir;
 
     #[test]
     fn plain_repository_tracks_identity_cleanliness_and_paths() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let clean = read_repository_metadata(project.path());
         assert_eq!(
             clean.remote_url.as_deref(),
@@ -1567,9 +1565,7 @@ mod tests {
 
     #[test]
     fn linked_worktree_and_detached_head_are_read_without_following_submodules() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let parent = tempdir().expect("worktree parent");
         let worktree = parent.path().join("linked");
         git(
@@ -1596,12 +1592,8 @@ mod tests {
 
     #[test]
     fn linked_worktree_pointer_swap_does_not_redirect_the_validated_gix_open() {
-        let Some(project) = git_project() else {
-            return;
-        };
-        let Some(alternate) = git_project() else {
-            return;
-        };
+        let project = git_project();
+        let alternate = git_project();
         let parent = tempdir().expect("worktree parent");
         let worktree = parent.path().join("linked");
         git(
@@ -1647,12 +1639,8 @@ mod tests {
 
     #[test]
     fn linked_worktree_commondir_rewrite_is_rejected_before_gix_open() {
-        let Some(project) = git_project() else {
-            return;
-        };
-        let Some(alternate) = git_project() else {
-            return;
-        };
+        let project = git_project();
+        let alternate = git_project();
         let parent = tempdir().expect("worktree parent");
         let worktree = parent.path().join("linked");
         git(
@@ -1697,9 +1685,7 @@ mod tests {
     fn local_config_swap_to_external_symlink_fails_at_the_no_follow_open() {
         use std::os::unix::fs::symlink;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let outside = tempdir().expect("outside config directory");
         let outside_config = outside.path().join("config");
         fs::write(
@@ -1752,9 +1738,7 @@ mod tests {
     fn hostile_core_worktree_is_rejected_before_gix_can_probe_the_outside_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let outside = tempdir().expect("outside worktree parent");
         let forbidden = outside.path().join("forbidden");
         fs::create_dir(&forbidden).expect("create forbidden directory");
@@ -1802,12 +1786,8 @@ mod tests {
 
     #[test]
     fn submodule_checkout_resolves_its_gitdir_without_walking_nested_metadata() {
-        let Some(submodule_source) = git_project() else {
-            return;
-        };
-        let Some(parent) = git_project() else {
-            return;
-        };
+        let submodule_source = git_project();
+        let parent = git_project();
         git(
             parent.path(),
             &[
@@ -1840,9 +1820,7 @@ mod tests {
     fn pre_epoch_mtimes_match_git_porcelain_without_panicking() {
         use std::time::{Duration, SystemTime};
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let source = project.path().join("lib.rs");
         let file = fs::OpenOptions::new()
             .write(true)
@@ -1869,9 +1847,7 @@ mod tests {
 
     #[test]
     fn hostile_local_config_never_executes_fsmonitor() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let sentinel = project.path().join("fsmonitor-ran");
         let hook = project.path().join("hostile.sh");
         fs::write(
@@ -1884,25 +1860,42 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
         }
-        git(
-            project.path(),
-            &[
-                "config",
-                "core.fsmonitor",
-                hook.to_str().expect("UTF-8 hook"),
-            ],
+        // Git's fsmonitor hook executes through a shell even on Windows
+        // (Git for Windows' MSYS sh), which mangles backslash spellings — the
+        // config value must use forward slashes for the probe to be viable
+        // natively on both platforms.
+        let hook_config = hook.to_str().expect("UTF-8 hook").replace('\\', "/");
+        git(project.path(), &["config", "core.fsmonitor", &hook_config]);
+
+        // Positive control: `core.fsmonitor` is not a hooksPath hook, so an
+        // isolated `git status` still executes the configured command. If it
+        // does not, the containment assertion below would pass vacuously.
+        let probed = crate::test_git::git_command(project.path(), &["status", "--porcelain"])
+            .output()
+            .expect("run fsmonitor-probing git status");
+        assert!(
+            probed.status.success(),
+            "fsmonitor-probing git status failed: {}",
+            String::from_utf8_lossy(&probed.stderr)
         );
+        assert!(
+            sentinel.exists(),
+            "the configured core.fsmonitor command did not run under git, \
+             so the containment check cannot prove anything"
+        );
+        fs::remove_file(&sentinel).expect("reset sentinel");
 
         let metadata = read_repository_metadata(project.path());
         assert!(metadata.issues.is_empty(), "{:?}", metadata.issues);
-        assert!(!sentinel.exists());
+        assert!(
+            !sentinel.exists(),
+            "repository metadata observation executed the local core.fsmonitor command"
+        );
     }
 
     #[test]
     fn repository_config_include_never_reads_outside_metadata_roots() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let outside = tempdir().expect("outside config directory");
         let outside_config = outside.path().join("hostile-config");
         fs::write(
@@ -1934,9 +1927,7 @@ mod tests {
     fn external_clean_filter_fails_closed_without_executing() {
         use std::os::unix::fs::PermissionsExt;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let sentinel = project.path().join("clean-filter-ran");
         let hook = project.path().join("hostile-clean.sh");
         fs::write(
@@ -1981,12 +1972,8 @@ mod tests {
 
     #[test]
     fn parent_repository_with_submodule_status_fails_closed() {
-        let Some(submodule_source) = git_project() else {
-            return;
-        };
-        let Some(parent) = git_project() else {
-            return;
-        };
+        let submodule_source = git_project();
+        let parent = git_project();
         git(
             parent.path(),
             &[
@@ -2012,9 +1999,7 @@ mod tests {
 
     #[test]
     fn external_alternate_fails_closed_before_object_reads() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let outside = tempdir().expect("outside alternate");
         let alternates = project.path().join(".git/objects/info/alternates");
         fs::write(&alternates, outside.path().as_os_str().as_encoded_bytes())
@@ -2030,9 +2015,7 @@ mod tests {
     fn commondir_symlink_fails_closed_before_reading_its_target() {
         use std::os::unix::fs::symlink;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let outside = tempdir().expect("outside commondir pointer");
         let pointer = outside.path().join("commondir");
         fs::write(&pointer, ".\n").expect("write outside pointer");
@@ -2051,9 +2034,7 @@ mod tests {
 
     #[test]
     fn oversized_commondir_pointer_fails_closed() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(
             project.path().join(".git/commondir"),
             vec![b'a'; (MAX_COMMONDIR_POINTER_BYTES + 1) as usize],
@@ -2075,9 +2056,7 @@ mod tests {
     fn current_head_ref_symlink_fails_closed_before_gix_reads_outside() {
         use std::os::unix::fs::symlink;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let head = fs::read_to_string(project.path().join(".git/HEAD")).expect("read HEAD");
         let reference = head
             .trim()
@@ -2105,9 +2084,7 @@ mod tests {
     fn metadata_mutation_between_validation_and_gix_open_fails_closed() {
         use std::os::unix::fs::symlink;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let head = fs::read_to_string(project.path().join(".git/HEAD")).expect("read HEAD");
         let reference = head
             .trim()
@@ -2144,9 +2121,7 @@ mod tests {
 
     #[test]
     fn ordinary_gitdir_file_churn_during_open_does_not_drop_identity() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let cookie_dir = project.path().join(".git/fsmonitor--daemon");
         AFTER_BOUNDARY_VALIDATION_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
@@ -2176,10 +2151,8 @@ mod tests {
     fn current_head_tree_object_symlink_fails_closed_before_gix_reads_outside() {
         use std::os::unix::fs::symlink;
 
-        let Some(project) = git_project() else {
-            return;
-        };
-        let tree = git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
+        let project = git_project();
+        let tree = crate::test_git::git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
         let object_path = project
             .path()
             .join(".git/objects")
@@ -2229,9 +2202,7 @@ mod tests {
 
     #[test]
     fn changed_path_scopes_distinguish_staged_unstaged_and_untracked() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(project.path().join("lib.rs"), "pub fn staged() {}\n").expect("staged edit");
         git(project.path(), &["add", "lib.rs"]);
         fs::write(project.path().join("lib.rs"), "pub fn unstaged() {}\n").expect("unstaged edit");
@@ -2269,9 +2240,7 @@ mod tests {
 
     #[test]
     fn staged_rename_preserves_the_public_rename_kind() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         git(project.path(), &["mv", "lib.rs", "renamed.rs"]);
 
         let changes = read_repository_changes(project.path(), RepositoryChangeScope::Staged)
@@ -2284,9 +2253,7 @@ mod tests {
 
     #[test]
     fn staged_modified_rename_uses_bounded_similarity_tracking() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(
             project.path().join("lib.rs"),
             "pub fn run() {}\npub fn stop() {}\npub fn pause() {}\npub fn resume() {}\n",
@@ -2311,12 +2278,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_band_rename_detection() {
-        let Some(project) = git_project() else {
-            return;
-        };
-        eprintln!("PROBE threshold = {MAX_REWRITE_BLOB_BYTES}");
-        for size in [990_000usize, 1_010_000usize, 1_100_000usize] {
+    fn rewrite_blob_threshold_boundary_controls_rename_detection() {
+        let project = git_project();
+        // The bound is a declared contract: 1,000,000 bytes, to the byte.
+        assert_eq!(MAX_REWRITE_BLOB_BYTES, 1_000_000);
+        for (size, expect_rename) in [
+            (990_000usize, true),
+            (1_010_000usize, false),
+            (1_100_000usize, false),
+        ] {
             let mut body: String = (0..size / 26)
                 .map(|i| format!("pub fn f{i:012}() {{}}\n"))
                 .collect();
@@ -2335,21 +2305,33 @@ mod tests {
 
             let changes = read_repository_changes(project.path(), RepositoryChangeScope::Staged)
                 .expect("read staged");
-            eprintln!(
-                "PROBE size={} blob={} -> {:?}",
-                body.len(),
-                modified.len(),
-                changes
-                    .iter()
-                    .map(|c| (
-                        String::from_utf8_lossy(&c.path).to_string(),
-                        c.kind,
-                        c.previous_path
-                            .as_ref()
-                            .map(|p| String::from_utf8_lossy(p).to_string())
-                    ))
-                    .collect::<Vec<_>>()
-            );
+            let mut observed: Vec<(RepositoryChangeKind, Vec<u8>, Option<Vec<u8>>)> = changes
+                .iter()
+                .map(|c| (c.kind, c.path.clone(), c.previous_path.clone()))
+                .collect();
+            observed.sort();
+            if expect_rename {
+                assert_eq!(
+                    observed,
+                    vec![(
+                        RepositoryChangeKind::Renamed,
+                        b"renamed.rs".to_vec(),
+                        Some(b"lib.rs".to_vec())
+                    )],
+                    "blob at {size} bytes is under the rewrite threshold and must keep \
+                     its rename lineage"
+                );
+            } else {
+                assert_eq!(
+                    observed,
+                    vec![
+                        (RepositoryChangeKind::Added, b"renamed.rs".to_vec(), None),
+                        (RepositoryChangeKind::Deleted, b"lib.rs".to_vec(), None),
+                    ],
+                    "blob at {size} bytes exceeds the rewrite threshold and must surface \
+                     as an independent delete+add pair"
+                );
+            }
             git(project.path(), &["mv", "renamed.rs", "lib.rs"]);
             fs::write(project.path().join("lib.rs"), "pub fn run() {}\n").expect("reset");
             git(project.path(), &["add", "-A"]);
@@ -2359,9 +2341,7 @@ mod tests {
 
     #[test]
     fn tracked_sources_excluded_by_repo_rules_are_restored_without_flagging_untracked_output() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(project.path().join(".gitignore"), "lib.rs\nscratch.rs\n")
             .expect("write repository ignores");
         fs::write(project.path().join("scratch.rs"), "pub fn generated() {}\n")
@@ -2397,9 +2377,7 @@ mod tests {
 
     #[test]
     fn unavailable_repository_metadata_cannot_yield_a_complete_inventory() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(project.path().join(".gitignore"), "lib.rs\n").expect("write repository ignores");
         git(project.path(), &["add", ".gitignore"]);
         git(project.path(), &["commit", "-m", "ignore tracked source"]);
@@ -2434,9 +2412,7 @@ mod tests {
 
     #[test]
     fn unavailable_head_tree_does_not_poison_a_complete_tracked_inventory() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         fs::write(
             project.path().join(".git/HEAD"),
             "ref: refs/heads/missing\n",
@@ -2457,12 +2433,8 @@ mod tests {
 
     #[test]
     fn unavailable_submodule_status_does_not_poison_a_complete_tracked_inventory() {
-        let Some(submodule_source) = git_project() else {
-            return;
-        };
-        let Some(parent) = git_project() else {
-            return;
-        };
+        let submodule_source = git_project();
+        let parent = git_project();
         git(
             parent.path(),
             &[
@@ -2490,9 +2462,6 @@ mod tests {
 
     #[test]
     fn ancestor_ignore_rules_do_not_hide_the_selected_workspace() {
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
         let parent = tempdir().expect("workspace parent");
         let project = parent.path().join("repo");
         fs::create_dir_all(project.join("src")).expect("create project");
@@ -2529,75 +2498,7 @@ mod tests {
             .collect()
     }
 
-    fn git_project() -> Option<tempfile::TempDir> {
-        if Command::new("git").arg("--version").output().is_err() {
-            return None;
-        }
-        let project = tempdir().expect("project");
-        git(project.path(), &["init"]);
-        git(
-            project.path(),
-            &["config", "user.email", "codestory@example.invalid"],
-        );
-        git(project.path(), &["config", "user.name", "CodeStory Test"]);
-        git(
-            project.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://example.com/team/repo.git",
-            ],
-        );
-        fs::write(project.path().join("lib.rs"), "pub fn run() {}\n").expect("write source");
-        git(project.path(), &["add", "."]);
-        git(project.path(), &["commit", "-m", "init"]);
-        Some(project)
-    }
-
-    fn git(project: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(project: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("UTF-8 git output")
-            .trim()
-            .to_string()
-    }
-
-    fn git_is_dirty(project: &Path) -> bool {
-        let output = Command::new("git")
-            .arg("--no-optional-locks")
-            .arg("-C")
-            .arg(project)
-            .args(["status", "--porcelain"])
-            .output()
-            .expect("run git status");
-        assert!(output.status.success());
-        !output.stdout.is_empty()
+    fn git_project() -> tempfile::TempDir {
+        crate::test_git::git_project("https://example.com/team/repo.git")
     }
 }

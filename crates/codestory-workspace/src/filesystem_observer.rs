@@ -1639,26 +1639,49 @@ mod tests {
 
     #[test]
     fn every_gap_carries_a_distinct_stable_identity() {
+        // The IDs are a persisted contract: each gap must map to its own
+        // literal wire name, not merely to some distinct value.
         let gaps = [
-            FilesystemObserverGap::BackendUnavailable {
-                detail: String::new(),
-            },
-            FilesystemObserverGap::UnsupportedFilesystem {
-                kind: UnsupportedFilesystemKind::NetworkMount,
-                detail: String::new(),
-            },
-            FilesystemObserverGap::EventQueueOverflow {
-                detail: String::new(),
-            },
-            FilesystemObserverGap::BackendFailed {
-                detail: String::new(),
-            },
-            FilesystemObserverGap::ObservationBudgetExhausted { limit: 1 },
-            FilesystemObserverGap::ConcurrentObservation,
+            (
+                FilesystemObserverGap::BackendUnavailable {
+                    detail: String::new(),
+                },
+                "observer_backend_unavailable",
+            ),
+            (
+                FilesystemObserverGap::UnsupportedFilesystem {
+                    kind: UnsupportedFilesystemKind::NetworkMount,
+                    detail: String::new(),
+                },
+                "observer_unsupported_filesystem",
+            ),
+            (
+                FilesystemObserverGap::EventQueueOverflow {
+                    detail: String::new(),
+                },
+                "observer_event_queue_overflow",
+            ),
+            (
+                FilesystemObserverGap::BackendFailed {
+                    detail: String::new(),
+                },
+                "observer_backend_failed",
+            ),
+            (
+                FilesystemObserverGap::ObservationBudgetExhausted { limit: 1 },
+                "observer_budget_exhausted",
+            ),
+            (
+                FilesystemObserverGap::ConcurrentObservation,
+                "observer_concurrent_observation",
+            ),
         ];
+        for (gap, expected_id) in &gaps {
+            assert_eq!(gap.id(), *expected_id);
+        }
         let identities = gaps
             .iter()
-            .map(FilesystemObserverGap::id)
+            .map(|(gap, _)| FilesystemObserverGap::id(gap))
             .collect::<BTreeSet<_>>();
         assert_eq!(identities.len(), gaps.len());
     }
