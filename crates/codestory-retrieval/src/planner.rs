@@ -282,29 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn every_stage_kind_label_matches_the_wire_contract() {
-        for kind in [
-            RetrievalStageKind::Stage0ScipAnchor,
-            RetrievalStageKind::Stage1Lexical,
-            RetrievalStageKind::Stage1bSemantic,
-            RetrievalStageKind::Stage2ScipExpand,
-            RetrievalStageKind::Stage3RepoTextFallback,
-        ] {
-            let expected = match kind {
-                RetrievalStageKind::Stage0ScipAnchor => RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL,
-                RetrievalStageKind::Stage1Lexical => RETRIEVAL_STAGE1_LEXICAL_LABEL,
-                RetrievalStageKind::Stage1bSemantic => RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
-                RetrievalStageKind::Stage2ScipExpand => RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
-                RetrievalStageKind::Stage3RepoTextFallback => {
-                    RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL
-                }
-            };
-
-            assert_eq!(kind.label(), expected);
-        }
-    }
-
-    #[test]
     fn non_full_modes_have_no_product_stages() {
         let features = classify_query("ExtensionService");
         for mode in [

@@ -2869,6 +2869,10 @@ fn query_exact_candidates(
 ///
 /// This intentionally replaces the old per-token `MATCH … AND rowid IN (…)`
 /// loop. FTS-lane survival alone never clears the gate.
+#[cfg(test)]
+static DESCRIPTOR_FTS_BODY_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn populate_descriptor_token_matches_fail_closed(
     connection: &Connection,
     candidates: &mut [LexicalCandidate],
@@ -2920,6 +2924,8 @@ fn populate_descriptor_token_matches_fail_closed(
             "SELECT rowid, lower(content) FROM lexical_fts WHERE rowid IN ({placeholders})"
         );
         let mut statement = connection.prepare_cached(&sql)?;
+        #[cfg(test)]
+        DESCRIPTOR_FTS_BODY_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let rows = statement.query_map(params_from_iter(chunk.iter().copied()), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -5190,9 +5196,10 @@ mod tests {
             || Ok(()),
         )
         .expect("incremental shard");
-        let Some(work) = work else {
-            return;
-        };
+        let work = work.expect(
+            "a readable predecessor must take the incremental path; a silent full \
+             rebuild would bypass every parity assertion below",
+        );
         assert_eq!(work.retained, 1);
         assert_eq!(work.inserted, 2);
         assert_eq!(work.removed, 2);
@@ -6407,7 +6414,7 @@ mod tests {
             "descriptor-path-symbol-admit",
             "input",
         );
-        let started = std::time::Instant::now();
+        DESCRIPTOR_FTS_BODY_READS.store(0, Ordering::SeqCst);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6416,7 +6423,6 @@ mod tests {
             || false,
         )
         .expect("descriptor search");
-        let elapsed = started.elapsed();
         assert!(
             descriptors.iter().any(|hit| {
                 hit.path.contains("alpha_beta_handler")
@@ -6424,9 +6430,11 @@ mod tests {
             }),
             "path/symbol must honestly clear the two-of-three gate for alpha+beta: {descriptors:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "descriptor token coverage must not re-query FTS per token; elapsed={elapsed:?}"
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst),
+            0,
+            "a path/symbol-covered candidate must not pay any FTS body re-read; \
+             per-token coverage re-query is the Keycloak-class cost this gate exists to avoid"
         );
     }
 
@@ -6438,6 +6446,14 @@ mod tests {
             "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
         )
         .expect("write content-only multi-token artifact");
+        // A second content-only candidate keeps the needs-content batch wider
+        // than one row so a per-row body requery is distinguishable from the
+        // single batched read.
+        std::fs::write(
+            project.path().join("NOTICE"),
+            "The control plane runs the scheduled reconcilers.\n",
+        )
+        .expect("write second content-only artifact");
         let data = TempDir::new().expect("data");
         let shard = build(
             project.path(),
@@ -6445,6 +6461,7 @@ mod tests {
             "descriptor-content-batched-proof",
             "input",
         );
+        DESCRIPTOR_FTS_BODY_READS.store(0, Ordering::SeqCst);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6456,6 +6473,13 @@ mod tests {
         assert!(
             descriptors.iter().any(|hit| hit.path == "LICENSE"),
             "honest batched content proof must admit LICENSE without path/symbol tokens: {descriptors:?}"
+        );
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst),
+            1,
+            "content coverage must be proven by one batched FTS body read, not a \
+             per-token or per-row requery; reads={}",
+            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst)
         );
     }
 
@@ -6921,41 +6945,91 @@ mod tests {
     fn sqlite_build_skips_stale_temporary_file_collisions() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
-        let data = TempDir::new().expect("data");
-        let shard = shard_dir_for(data.path(), "collision");
-        std::fs::create_dir_all(&shard).expect("shard");
-        let index = shard.join(LEXICAL_INDEX_FILE);
-        let probe = codestory_workspace::atomic_file::atomic_temp_path(&index, "lexical-index");
-        let counter = probe
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.rsplit('.').nth(1))
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("temp counter");
-        let stale = (counter + 1..=counter + 32)
-            .map(|counter| {
-                index.with_file_name(format!(
-                    ".lexical-index.{}.{}.tmp",
-                    std::process::id(),
-                    counter
-                ))
-            })
-            .collect::<Vec<_>>();
-        for path in &stale {
-            std::fs::write(path, b"stale").expect("stale temp");
-        }
         let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        let temp_counter = |probe: PathBuf| -> u64 {
+            probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit('.').nth(1))
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("temp counter")
+        };
+        // The process-global name counter makes the build's retry name
+        // unpredictable, so plant the next PLANTED names and prove a collision
+        // by exact accounting: a control build yields the nominal pull count,
+        // and a clean planted window must consume exactly nominal + PLANTED
+        // names — every planted name was occupied, so the index temp
+        // allocation retried through a live collision before escaping past the
+        // block. A foreign allocation inside either window breaks the
+        // equality, so the fixture retries rather than passing unproven.
+        const PLANTED: u64 = 64;
+        let mut rounds = 0u32;
+        let (_data, stale) = loop {
+            rounds += 1;
+            assert!(rounds <= 8, "never observed a clean collision window");
+            let data = TempDir::new().expect("data");
+            let control_index =
+                shard_dir_for(data.path(), "collision-control").join(LEXICAL_INDEX_FILE);
+            let control_before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+                &control_index,
+                "lexical-index",
+            ));
+            build_lexical_shard(
+                project.path(),
+                None,
+                data.path(),
+                "collision-control",
+                &fingerprint,
+                "input",
+            )
+            .expect("control build");
+            let nominal = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+                &control_index,
+                "lexical-index",
+            )) - control_before
+                - 1;
 
-        build_lexical_shard(
-            project.path(),
-            None,
-            data.path(),
-            "collision",
-            &fingerprint,
-            "input",
-        )
-        .expect("collision-safe build");
+            let planted_shard = shard_dir_for(data.path(), "collision-planted");
+            std::fs::create_dir_all(&planted_shard).expect("planted shard");
+            let planted_index = planted_shard.join(LEXICAL_INDEX_FILE);
+            let before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+                &planted_index,
+                "lexical-index",
+            ));
+            let stale = (before + 1..=before + PLANTED)
+                .map(|counter| {
+                    planted_index.with_file_name(format!(
+                        ".lexical-index.{}.{}.tmp",
+                        std::process::id(),
+                        counter
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for path in &stale {
+                std::fs::write(path, b"stale").expect("stale temp");
+            }
 
+            build_lexical_shard(
+                project.path(),
+                None,
+                data.path(),
+                "collision-planted",
+                &fingerprint,
+                "input",
+            )
+            .expect("collision-safe build");
+
+            let window_pulls = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+                &planted_index,
+                "lexical-index",
+            )) - before
+                - 1;
+            if window_pulls != nominal + PLANTED {
+                continue;
+            }
+            assert!(planted_index.is_file(), "the index must still publish");
+            break (data, stale);
+        };
         for path in stale {
             assert_eq!(std::fs::read(path).expect("stale preserved"), b"stale");
         }
@@ -7781,7 +7855,17 @@ mod tests {
             deep_validation_micros.sort_unstable();
             sqlite_micros.sort_unstable();
             jsonl_micros.sort_unstable();
-            assert_eq!(sqlite_top, jsonl_top);
+            let expected_top = format!("src/file_{:05}.rs", corpus_documents - 1);
+            assert_eq!(
+                sqlite_top.as_deref(),
+                Some(expected_top.as_str()),
+                "SQLite search must find the known corpus hit for {query}"
+            );
+            assert_eq!(
+                jsonl_top.as_deref(),
+                Some(expected_top.as_str()),
+                "JSONL scan must find the known corpus hit for {query}"
+            );
             reports.push(serde_json::json!({
                 "corpus_documents": documents.len(),
                 "jsonl_bytes": std::fs::metadata(jsonl_path).expect("JSONL metadata").len(),

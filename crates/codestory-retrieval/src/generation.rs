@@ -1,5 +1,3 @@
-#[cfg(test)]
-use codestory_contracts::graph::NodeKind;
 use codestory_store::{RetrievalIndexManifest, Store};
 
 pub const SIDECAR_SCHEMA_VERSION: i32 = 7;
@@ -225,26 +223,6 @@ pub fn manifest_sidecar_generation(manifest: &RetrievalIndexManifest) -> &str {
         .sidecar_generation
         .as_deref()
         .expect("validated sidecar manifest has a generation id")
-}
-
-#[cfg(test)]
-pub(crate) fn sidecar_semantic_node_kind(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::STRUCT
-            | NodeKind::CLASS
-            | NodeKind::INTERFACE
-            | NodeKind::ANNOTATION
-            | NodeKind::UNION
-            | NodeKind::ENUM
-            | NodeKind::TYPEDEF
-            | NodeKind::FUNCTION
-            | NodeKind::METHOD
-            | NodeKind::MACRO
-            | NodeKind::GLOBAL_VARIABLE
-            | NodeKind::CONSTANT
-            | NodeKind::ENUM_CONSTANT
-    )
 }
 
 #[cfg(test)]

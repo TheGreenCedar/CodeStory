@@ -30,18 +30,25 @@ impl EmbeddingServerTransport for WatchdogTransport {
     }
 }
 
+/// A peer whose reads follow a script: `None` stalls with a timeout,
+/// `Some(n)` delivers at most `n` bytes of the frame, and an exhausted script
+/// reads to completion. Timeouts interleaved with partial reads prove the
+/// reader retains its partial frame across `Pending`.
 pub(super) struct PollingStream {
     pub(super) inner: MemoryStream,
-    pub(super) pending_reads: usize,
+    pub(super) plan: std::collections::VecDeque<Option<usize>>,
 }
 
 impl Read for PollingStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.pending_reads != 0 {
-            self.pending_reads -= 1;
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "poll"));
+        match self.plan.pop_front() {
+            Some(None) => Err(io::Error::new(io::ErrorKind::TimedOut, "poll")),
+            Some(Some(limit)) => {
+                let limit = buffer.len().min(limit);
+                self.inner.read(&mut buffer[..limit])
+            }
+            None => self.inner.read(buffer),
         }
-        self.inner.read(buffer)
     }
 }
 

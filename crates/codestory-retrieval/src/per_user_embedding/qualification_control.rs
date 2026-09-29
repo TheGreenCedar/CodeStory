@@ -22,8 +22,8 @@ mod server;
 pub(super) use server::native_path_identity;
 #[cfg(test)]
 pub(super) use server::{
-    CommandAbsence, MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
-    server_qualification_control_from_values,
+    CommandAbsence, MAX_DENIED_COMMAND_TICKS, absent_command, inject_mid_consume_probe,
+    read_server_qualification_command, server_qualification_control_from_values,
 };
 pub(super) use server::{
     ServerQualificationControl, ServerQualificationEvent, ServerQualificationEventClock,

@@ -249,40 +249,56 @@ fn bounded_exchange_reprobes_exit_code_after_liveness_observes_exit() {
 
 #[test]
 fn held_lease_reader_survives_repeated_timeouts_then_decodes() {
-    let frame = encode_test_frame(
-        &request(
-            "lease-snapshot",
-            EmbeddingCompatibility::current(true),
-            EmbeddingOperation::Snapshot,
-        ),
-        &[],
+    let expected = request(
+        "lease-snapshot",
+        EmbeddingCompatibility::current(true),
+        EmbeddingOperation::Snapshot,
     );
-    let (inner, _) = MemoryStream::new(frame, true);
+    let payload = b"held-lease-payload";
+    let (inner, _) = MemoryStream::new(encode_test_frame(&expected, payload), true);
+    // Timeouts before any byte, then timeouts interleaved with partial reads:
+    // a reader that drops its buffered bytes on `Pending` can never decode
+    // this request.
     let mut stream = PollingStream {
         inner,
-        pending_reads: 4,
+        plan: std::collections::VecDeque::from(vec![
+            None,
+            None,
+            Some(3),
+            None,
+            Some(5),
+            None,
+            None,
+            Some(10),
+            None,
+            Some(usize::MAX),
+        ]),
     };
     let mut reader = IncrementalProtocolFrameReader::default();
-    for _ in 0..4 {
-        assert!(matches!(
-            reader
-                .poll::<EmbeddingProtocolRequest>(&mut stream)
-                .expect("bounded poll"),
-            ProtocolFramePoll::Pending
-        ));
-    }
-    assert!(matches!(
-        reader
+    let mut pending_polls = 0;
+    let (decoded, decoded_payload) = loop {
+        match reader
             .poll::<EmbeddingProtocolRequest>(&mut stream)
-            .expect("eventual frame"),
-        ProtocolFramePoll::Ready((
-            EmbeddingProtocolRequest {
-                operation: EmbeddingOperation::Snapshot,
-                ..
-            },
-            _
-        ))
-    ));
+            .expect("bounded poll")
+        {
+            ProtocolFramePoll::Pending => {
+                pending_polls += 1;
+                assert!(pending_polls < 16, "the frame must eventually complete");
+            }
+            ProtocolFramePoll::Ready(frame) => break frame,
+            ProtocolFramePoll::Closed => panic!("the scripted peer never closes"),
+        }
+    };
+
+    // Five scripted timeouts and four partial reads all surface as Pending;
+    // the frame completes on the tenth poll.
+    assert_eq!(pending_polls, 9);
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("decoded request serializes"),
+        serde_json::to_value(&expected).expect("expected request serializes"),
+        "the decoded request must be byte-exact, not merely a Snapshot"
+    );
+    assert_eq!(decoded_payload.as_slice(), payload);
 }
 
 #[test]

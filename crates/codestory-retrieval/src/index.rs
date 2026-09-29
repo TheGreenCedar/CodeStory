@@ -289,50 +289,55 @@ pub(crate) fn record_finalize_phase_timing(phase: &'static str, elapsed: Duratio
 
 fn finish_finalize_phase_timings() -> Vec<FinalizePhaseTiming> {
     FINALIZE_PHASE_TIMINGS.with(|state| {
-        let Some((started, mut accumulated)) = state.borrow_mut().take() else {
+        let Some((started, accumulated)) = state.borrow_mut().take() else {
             return Vec::new();
         };
-        let vector_total = accumulated
-            .iter()
-            .filter(|timing| {
-                matches!(
-                    timing.phase.as_str(),
-                    "embedded vectors" | "incremental embedded vectors"
-                )
-            })
-            .map(|timing| timing.elapsed)
-            .fold(Duration::ZERO, Duration::saturating_add);
-        let vector_subphases = accumulated
-            .iter()
-            .filter(|timing| timing.phase.starts_with("vector "))
-            .map(|timing| timing.elapsed)
-            .fold(Duration::ZERO, Duration::saturating_add);
-        if !vector_total.is_zero() {
-            accumulated.push(AccumulatedPhaseTiming {
-                phase: "vector ipc and orchestration".to_string(),
-                elapsed: vector_total.saturating_sub(vector_subphases),
-            });
-        }
-        let attributed = accumulated
-            .iter()
-            .filter(|timing| !timing.phase.starts_with("vector "))
-            .map(|timing| timing.elapsed)
-            .fold(Duration::ZERO, Duration::saturating_add);
-        let total = started.elapsed();
-        let mut timings = accumulated
-            .into_iter()
-            .map(|timing| FinalizePhaseTiming {
-                phase: timing.phase,
-                elapsed_ms: u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX),
-            })
-            .collect::<Vec<_>>();
-        timings.push(FinalizePhaseTiming {
-            phase: "unattributed".to_string(),
-            elapsed_ms: u64::try_from(total.saturating_sub(attributed).as_millis())
-                .unwrap_or(u64::MAX),
-        });
-        timings
+        assemble_finalize_phase_timings(started.elapsed(), accumulated)
     })
+}
+
+fn assemble_finalize_phase_timings(
+    total: Duration,
+    mut accumulated: Vec<AccumulatedPhaseTiming>,
+) -> Vec<FinalizePhaseTiming> {
+    let vector_total = accumulated
+        .iter()
+        .filter(|timing| {
+            matches!(
+                timing.phase.as_str(),
+                "embedded vectors" | "incremental embedded vectors"
+            )
+        })
+        .map(|timing| timing.elapsed)
+        .fold(Duration::ZERO, Duration::saturating_add);
+    let vector_subphases = accumulated
+        .iter()
+        .filter(|timing| timing.phase.starts_with("vector "))
+        .map(|timing| timing.elapsed)
+        .fold(Duration::ZERO, Duration::saturating_add);
+    if !vector_total.is_zero() {
+        accumulated.push(AccumulatedPhaseTiming {
+            phase: "vector ipc and orchestration".to_string(),
+            elapsed: vector_total.saturating_sub(vector_subphases),
+        });
+    }
+    let attributed = accumulated
+        .iter()
+        .filter(|timing| !timing.phase.starts_with("vector "))
+        .map(|timing| timing.elapsed)
+        .fold(Duration::ZERO, Duration::saturating_add);
+    let mut timings = accumulated
+        .into_iter()
+        .map(|timing| FinalizePhaseTiming {
+            phase: timing.phase,
+            elapsed_ms: u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX),
+        })
+        .collect::<Vec<_>>();
+    timings.push(FinalizePhaseTiming {
+        phase: "unattributed".to_string(),
+        elapsed_ms: u64::try_from(total.saturating_sub(attributed).as_millis()).unwrap_or(u64::MAX),
+    });
+    timings
 }
 
 fn record_embedding_vector_timings(timings: crate::per_user_embedding::EmbeddingVectorTimings) {
@@ -3967,18 +3972,6 @@ fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: 
     hash_part(hasher, &doc.source_provenance);
 }
 
-#[cfg(test)]
-fn semantic_projection_row(row: &codestory_store::SearchSymbolProjectionDetail) -> bool {
-    let Some(kind) = row
-        .node_kind
-        .and_then(|kind| i32::try_from(kind).ok())
-        .and_then(|kind| codestory_contracts::graph::NodeKind::try_from(kind).ok())
-    else {
-        return false;
-    };
-    crate::generation::sidecar_semantic_node_kind(kind)
-}
-
 fn hash_part(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_le_bytes());
     hasher.update(value.as_bytes());
@@ -3998,9 +3991,8 @@ fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
-    use codestory_store::{SearchSymbolProjection, SearchSymbolProjectionDetail};
+    use codestory_store::SearchSymbolProjection;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -4131,30 +4123,45 @@ mod tests {
 
     #[test]
     fn vector_subphases_reconcile_without_double_counting_the_total() {
-        begin_finalize_phase_timings();
-        record_finalize_phase_timing("embedded vectors", Duration::from_millis(100));
-        record_finalize_phase_timing("vector tokenization", Duration::from_millis(10));
-        record_finalize_phase_timing("vector native encode", Duration::from_millis(40));
-        record_finalize_phase_timing("vector normalization", Duration::from_millis(5));
-        record_finalize_phase_timing("vector content cache", Duration::from_millis(5));
-        record_finalize_phase_timing("vector sqlite persistence", Duration::from_millis(20));
-        record_finalize_phase_timing("vector hashing", Duration::from_millis(5));
-        record_finalize_phase_timing("vector final validation", Duration::from_millis(10));
-
-        let timings = finish_finalize_phase_timings();
+        // The subphase sum (95ms) is deliberately smaller than the parent
+        // (100ms) but large enough that subtracting it twice would saturate to
+        // zero — and the top-level clock leaves 60ms of real headroom so a
+        // second subtraction of the nested phases is observable instead of
+        // hiding behind `saturating_sub`.
+        let phase = |name: &str, millis: u64| AccumulatedPhaseTiming {
+            phase: name.to_string(),
+            elapsed: Duration::from_millis(millis),
+        };
+        let timings = assemble_finalize_phase_timings(
+            Duration::from_millis(200),
+            vec![
+                phase("embedded vectors", 100),
+                phase("vector tokenization", 10),
+                phase("vector native encode", 40),
+                phase("vector normalization", 5),
+                phase("vector content cache", 5),
+                phase("vector sqlite persistence", 20),
+                phase("vector hashing", 5),
+                phase("vector final validation", 10),
+                phase("lexical index", 40),
+            ],
+        );
         let remainder = timings
             .iter()
             .find(|timing| timing.phase == "vector ipc and orchestration")
             .expect("vector timing remainder");
 
-        assert_eq!(remainder.elapsed_ms, 5);
+        assert_eq!(
+            remainder.elapsed_ms, 5,
+            "the vector remainder is the parent minus its subphases once"
+        );
         assert_eq!(
             timings
                 .iter()
                 .find(|timing| timing.phase == "unattributed")
                 .expect("top-level remainder")
                 .elapsed_ms,
-            0,
+            60,
             "nested vector subphases must not be subtracted from the top-level clock twice"
         );
     }
@@ -5388,10 +5395,25 @@ mod tests {
             let storage = Store::open(&storage_path).expect("open empty db");
             drop(storage);
         }
-        let error = crate::config::with_test_cache_root(cache_root.path(), || {
-            finalize_index(project.path(), &storage_path)
-        })
-        .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
+        // A TempDir-owned runtime keeps every artifact root under the test so a
+        // default-configuration ambient cache directory cannot satisfy or mask
+        // the refusal.
+        let mut runtime = SidecarRuntimeConfig::for_project_profile(
+            Some(project.path()),
+            crate::SidecarProfile::Local,
+        );
+        runtime.cache_root = cache_root.path().to_path_buf();
+
+        // Publication preservation is the contract being tested: capture the
+        // pointer state before the failing call so a partial or rewritten
+        // pointer is observable instead of implied.
+        let layout = codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+            .expect("core publication layout");
+        let retrieval_pointer_path = layout.retrieval_publication_path();
+        let prior_pointer = fs::read(&retrieval_pointer_path).ok();
+
+        let error = finalize_index_for_runtime(project.path(), &storage_path, &runtime)
+            .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
         let message = format!("{error:#}");
         assert!(
             message.contains("mandatory")
@@ -5399,6 +5421,11 @@ mod tests {
                 || message.contains("without its embedded embedding model")
                 || message.contains("complete core publication"),
             "expected a pre-publication retrieval trust-gate error, got {error:#}"
+        );
+        assert_eq!(
+            fs::read(&retrieval_pointer_path).ok(),
+            prior_pointer,
+            "a refused finalization must not create or rewrite the retrieval publication pointer"
         );
     }
 
@@ -5562,6 +5589,241 @@ mod tests {
                 self.core_pointer_bytes,
                 "retrieval finalization must not republish the core pointer"
             );
+        }
+    }
+
+    /// The candidate-validation seam every fixture-driven publication attempt
+    /// shares: substitute backend validation only, retaining the real
+    /// input/core/source fences, pointer write, and finalizer.
+    #[cfg(feature = "test-support")]
+    fn validate_fixture_candidate(
+        project_id: &str,
+        input: &SidecarInputFingerprint,
+        manifest: &RetrievalIndexManifest,
+        context: &GenerationRetentionContext<'_>,
+        storage: &Store,
+        _storage_path: &Path,
+    ) -> Result<()> {
+        assert_eq!(project_id, manifest.project_id);
+        assert_eq!(
+            manifest.sidecar_input_hash.as_deref(),
+            Some(input.hash.as_str())
+        );
+        assert_eq!(
+            storage.get_complete_index_publication()?,
+            Some(context.pinned_core_publication.clone())
+        );
+        assert!(crate::lexical_index::shard_matches_lexical_input(
+            &context.layout.lexical_data_dir,
+            manifest.sidecar_generation.as_deref().expect("generation"),
+            input.lexical_file_count,
+            &input.lexical_hash,
+            &input.hash,
+        ));
+        Ok(())
+    }
+
+    /// A real on-disk candidate generation for the fixture: manifest,
+    /// fingerprint, and lexical seals captured once, then reusable across
+    /// repeated `persist_finalized_manifest_with_hooks` attempts (rejected
+    /// attempts commit nothing, so the artifacts stay valid).
+    #[cfg(feature = "test-support")]
+    struct FixtureCandidate {
+        manifest: RetrievalIndexManifest,
+        sidecar_input: SidecarInputFingerprint,
+        prepared_lexical: PreparedLexicalInput,
+        embedding_device: crate::embeddings::EmbeddingDeviceReadiness,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl FixtureCandidate {
+        fn build(fixture: &FirstRetrievalPublicationFixture) -> Self {
+            let manifest = crate::test_support::publish_zero_dense_pinned_query_fixture(
+                fixture.project.path(),
+                &fixture.storage_path,
+                &fixture.runtime,
+            )
+            .expect("prepare complete candidate artifacts");
+            let storage = Store::open(&fixture.storage_path).expect("open candidate core");
+            let embedding_device =
+                crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+            let embedding_dim = manifest.embedding_dim.expect("embedding dimension");
+            let producer = crate::embedded_vector::vector_producer_compatibility_identity(
+                &embedding_device,
+                None,
+                u32::try_from(embedding_dim).expect("positive dimension"),
+            )
+            .expect("producer compatibility identity");
+            let sidecar_input = compute_sidecar_input_fingerprint(
+                &storage,
+                fixture.project.path(),
+                &fixture.storage_path,
+                &manifest.project_id,
+                manifest.embedding_backend.as_deref().expect("backend"),
+                embedding_dim,
+                &producer,
+            )
+            .expect("compute exact candidate input");
+            assert_eq!(
+                manifest.sidecar_input_hash.as_deref(),
+                Some(sidecar_input.hash.as_str()),
+                "test validator must not admit a stale candidate"
+            );
+            let prepared_lexical = prepare_lexical_input_for_store(
+                lexical_source_input(fixture.project.path(), &fixture.storage_path)
+                    .expect("scan lexical source"),
+                fixture.project.path(),
+                &storage,
+            )
+            .expect("prepare lexical source seals");
+            drop(storage);
+            Self {
+                manifest,
+                sidecar_input,
+                prepared_lexical,
+                embedding_device,
+            }
+        }
+
+        /// Drive the real publication owner. Cancellation is a production
+        /// input; `after_pointer_write` runs between the staged pointer write
+        /// and the commit fence, which is the only seam where a cancellation
+        /// can observe written-but-uncommitted state.
+        fn attempt(
+            &self,
+            fixture: &FirstRetrievalPublicationFixture,
+            previous_manifest: Option<RetrievalIndexManifest>,
+            cancelled: &AtomicBool,
+            validate_candidate: impl FnOnce(
+                &str,
+                &SidecarInputFingerprint,
+                &RetrievalIndexManifest,
+                &GenerationRetentionContext<'_>,
+                &Store,
+                &Path,
+            ) -> Result<()>,
+            after_pointer_write: impl FnOnce(),
+            after_marker: impl FnOnce(),
+        ) -> Result<FinalizeIndexOutcome> {
+            let residency = crate::embeddings::acquire_product_embedding_residency_for_runtime(
+                &fixture.runtime,
+            )
+            .expect("acquire test residency");
+            let context = GenerationRetentionContext {
+                runtime: &fixture.runtime,
+                layout: &fixture.runtime.layout,
+                workspace_id: "fixture-publication-workspace",
+                previous_manifest: previous_manifest.as_ref(),
+                embedding_device: &self.embedding_device,
+                embedding_residency: residency,
+                pinned_core_publication: fixture.publication.clone(),
+                graph_equivalent_predecessor: None,
+            };
+            crate::config::with_test_cache_root(fixture._cache.path(), || {
+                persist_finalized_manifest_with_hooks(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                    &self.prepared_lexical,
+                    &context,
+                    cancelled,
+                    &self.sidecar_input,
+                    self.manifest.project_id.clone(),
+                    self.manifest.clone(),
+                    Vec::new(),
+                    SidecarStubFlags {
+                        scip_stubbed: false,
+                    },
+                    validate_candidate,
+                    after_pointer_write,
+                    after_marker,
+                )
+            })
+        }
+    }
+
+    /// Commit two distinct real generations through the production owner so the
+    /// seeded pointer pair is (current B, rollback A). The caller mutates the
+    /// project between commits, which is why each build reruns the fixture.
+    #[cfg(feature = "test-support")]
+    fn seed_committed_publication_pair(
+        fixture: &FirstRetrievalPublicationFixture,
+    ) -> (
+        RetrievalIndexManifest,
+        RetrievalIndexManifest,
+        (RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>),
+    ) {
+        let committed_a = FixtureCandidate::build(fixture)
+            .attempt(
+                fixture,
+                None,
+                &AtomicBool::new(false),
+                validate_fixture_candidate,
+                || {},
+                || {},
+            )
+            .expect("first candidate commits through the real owner")
+            .manifest;
+        fs::write(
+            fixture.project.path().join("extra_b.rs"),
+            "pub fn extra_b() {}\n",
+        )
+        .expect("second source file");
+        let candidate_b = FixtureCandidate::build(fixture);
+        // Building the candidate upserts its manifest as current through the
+        // fixture helper; production candidates publish atomically at the
+        // commit fence, so restore the predecessor pointer first.
+        restore_publication_pointer(fixture, committed_a.clone(), None);
+        let committed_b = candidate_b
+            .attempt(
+                fixture,
+                Some(committed_a.clone()),
+                &AtomicBool::new(false),
+                validate_fixture_candidate,
+                || {},
+                || {},
+            )
+            .expect("second candidate commits through the real owner")
+            .manifest;
+        let prior = Store::open(&fixture.storage_path)
+            .expect("independently reopen the pointer store")
+            .get_retrieval_index_publication(&committed_b.project_id)
+            .expect("read seeded publication pair")
+            .expect("seeded pair exists");
+        assert_eq!(
+            prior.0, committed_b,
+            "the seeded current pointer is the second committed manifest"
+        );
+        assert_eq!(
+            prior.1.as_ref().map(|record| &record.manifest),
+            Some(&committed_a),
+            "the seeded rollback pointer chains to the first committed manifest"
+        );
+        (committed_a, committed_b, prior)
+    }
+
+    /// Repoint the authoritative current/rollback pair after a fixture build
+    /// upserted its candidate manifest. `publish_retrieval_index_publication`
+    /// only accepts a rollback equal to the bound current, so a rollback pair
+    /// is restored in two steps: current A alone, then current B with A.
+    #[cfg(feature = "test-support")]
+    fn restore_publication_pointer(
+        fixture: &FirstRetrievalPublicationFixture,
+        current: RetrievalIndexManifest,
+        rollback: Option<RetrievalIndexRollbackRecord>,
+    ) {
+        let mut storage = Store::open(&fixture.storage_path)
+            .expect("reopen pointer store to restore publication");
+        if let Some(rollback) = rollback {
+            storage
+                .publish_retrieval_index_publication(&rollback.manifest, None)
+                .expect("restore rollback manifest as current");
+            storage
+                .publish_retrieval_index_publication(&current, Some(&rollback))
+                .expect("restore current with chained rollback");
+        } else {
+            storage
+                .publish_retrieval_index_publication(&current, None)
+                .expect("restore current publication");
         }
     }
 
@@ -6417,228 +6679,202 @@ mod tests {
         assert_eq!(manifest.semantic_generation, collection);
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
     fn cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
-        let storage_dir = TempDir::new().expect("storage dir");
-        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
-            .expect("open retrieval publication store");
-        let input = |hash: &str| SidecarInputFingerprint {
-            hash: hash.into(),
-            symbol_doc_count: 0,
-            projection_count: 0,
-            dense_projection_count: 0,
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            graph_artifact_hash: format!("graph-{hash}"),
-            dense_reason_counts_json: "{}".into(),
-            lexical_file_count: 0,
-            lexical_hash: format!("lexical-{hash}"),
-            lexical_coverage: Default::default(),
-        };
-        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
-            let mut manifest = retrieval_manifest_for_sidecar(
-                "proj",
-                &sidecar_generation_id("proj", &input.hash),
-                &crate::generation::sidecar_vector_generation("proj", &input.hash),
-                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-                input,
-            );
-            manifest.built_at_epoch_ms = built_at_epoch_ms;
-            manifest
-        };
-        let rollback_input = input("11111111111111111111111111111111");
-        let current_input = input("22222222222222222222222222222222");
-        let candidate_input = input("33333333333333333333333333333333");
-        let rollback_manifest = manifest(&rollback_input, 1);
-        let current_manifest = manifest(&current_input, 2);
-        let candidate_manifest = manifest(&candidate_input, 3);
-        let rollback = RetrievalIndexRollbackRecord {
-            manifest: rollback_manifest,
-            verified_at_epoch_ms: 2,
-        };
-        storage
-            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
-            .expect("seed current and rollback pointers");
-        let prior = storage
-            .get_retrieval_index_publication("proj")
-            .expect("read prior publication");
-        let checks = std::cell::Cell::new(0_u8);
+        let _env = crate::test_support::env_lock();
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let (_, committed_b, prior) = seed_committed_publication_pair(&fixture);
 
-        let error = promote_retrieval_manifest_with_cancel(
-            &mut storage,
-            &candidate_input,
-            &candidate_manifest,
-            |_| Ok(candidate_input.clone()),
-            |_| Ok(()),
-            |_| Ok(()),
-            |_| {
-                Ok(Some(RetrievalIndexRollbackRecord {
-                    manifest: current_manifest.clone(),
-                    verified_at_epoch_ms: 3,
-                }))
-            },
-            || {
-                let next = checks.get() + 1;
-                checks.set(next);
-                if next == 3 {
-                    bail!("simulated cancellation before SQLite commit");
-                }
-                Ok(())
-            },
+        // A distinct third candidate cancelled after the staged pointer write
+        // must be rejected by the production commit fence with the prior
+        // current/rollback pair byte-identical on an independent reopen.
+        fs::write(
+            fixture.project.path().join("extra_c.rs"),
+            "pub fn extra_c() {}\n",
         )
-        .expect_err("cancellation before commit must reject publication");
+        .expect("third source file");
+        let candidate = FixtureCandidate::build(&fixture);
+        restore_publication_pointer(&fixture, prior.0.clone(), prior.1.clone());
+        let cancelled = AtomicBool::new(false);
+        let pointer_writes = std::cell::Cell::new(0_u8);
+        let result = candidate.attempt(
+            &fixture,
+            Some(committed_b),
+            &cancelled,
+            validate_fixture_candidate,
+            || {
+                pointer_writes.set(pointer_writes.get() + 1);
+                cancelled.store(true, Ordering::Release);
+            },
+            || {},
+        );
 
-        assert!(error.to_string().contains("simulated cancellation"));
         assert_eq!(
-            checks.get(),
-            3,
-            "cancellation did not reach the commit fence"
+            pointer_writes.get(),
+            1,
+            "the staged pointer write ran before cancellation fired"
+        );
+        let error = result.expect_err("cancellation before commit must reject publication");
+        assert!(
+            is_retrieval_index_cancelled(&error),
+            "typed cancellation lost: {error:#}"
         );
         assert_eq!(
-            storage
-                .get_retrieval_index_publication("proj")
+            Store::open(&fixture.storage_path)
+                .expect("independently reopen the pointer store")
+                .get_retrieval_index_publication(&candidate.manifest.project_id)
                 .expect("read publication after cancellation"),
-            prior,
+            Some(prior),
             "cancelled transaction changed current or rollback pointers"
         );
+        fixture.assert_core_unchanged();
     }
 
+    /// Cancellation positions map onto the production owner's real fences:
+    /// `Some(1)` raises the flag before the call (candidate-validation fence),
+    /// `Some(2)` raises it inside candidate validation (still before the staged
+    /// pointer write), `Some(3)` raises it between the write and the commit
+    /// fence, and `None` commits healthily.
     #[cfg(feature = "test-support")]
     fn pointer_backed_publication_cancellation_case(cancel_at: Option<u8>) {
         let _env = crate::test_support::env_lock();
         let fixture = FirstRetrievalPublicationFixture::new();
-        let mut storage =
-            Store::open(&fixture.storage_path).expect("open real pointer-backed immutable core");
-        assert_eq!(
-            storage
-                .get_complete_index_publication()
-                .expect("complete core"),
-            Some(fixture.publication.clone())
-        );
-        assert!(fixture.core_pointer_path.is_file());
-        let input = |hash: &str| SidecarInputFingerprint {
-            hash: hash.into(),
-            symbol_doc_count: 0,
-            projection_count: 0,
-            dense_projection_count: 0,
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            graph_artifact_hash: format!("graph-{hash}"),
-            dense_reason_counts_json: "{}".into(),
-            lexical_file_count: 0,
-            lexical_hash: format!("lexical-{hash}"),
-            lexical_coverage: Default::default(),
-        };
-        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
-            let mut manifest = retrieval_manifest_for_sidecar(
-                "proj",
-                &sidecar_generation_id("proj", &input.hash),
-                &crate::generation::sidecar_vector_generation("proj", &input.hash),
-                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-                input,
-            );
-            manifest.built_at_epoch_ms = built_at_epoch_ms;
-            manifest
-        };
-        let rollback_input = input("11111111111111111111111111111111");
-        let current_input = input("22222222222222222222222222222222");
-        let candidate_input = input("33333333333333333333333333333333");
-        let rollback_manifest = manifest(&rollback_input, 1);
-        let current_manifest = manifest(&current_input, 2);
-        let candidate_manifest = manifest(&candidate_input, 3);
-        storage
-            .publish_retrieval_index_publication(&rollback_manifest, None)
-            .expect("bind first external retrieval publication to pinned core");
-        let rollback = RetrievalIndexRollbackRecord {
-            manifest: rollback_manifest,
-            verified_at_epoch_ms: 2,
-        };
-        storage
-            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
-            .expect("seed current and rollback pointers");
-        let prior = storage
-            .get_retrieval_index_publication("proj")
-            .expect("read prior publication");
-        assert!(fixture.retrieval_pointer_path.is_file());
         {
+            let storage = Store::open(&fixture.storage_path)
+                .expect("open real pointer-backed immutable core");
+            assert_eq!(
+                storage
+                    .get_complete_index_publication()
+                    .expect("complete core"),
+                Some(fixture.publication.clone())
+            );
+        }
+        assert!(fixture.core_pointer_path.is_file());
+        let (_, committed_b, prior) = seed_committed_publication_pair(&fixture);
+        assert!(fixture.retrieval_pointer_path.is_file());
+
+        // A hostile transaction that tries to bind a non-current rollback must
+        // still be rejected by the real store API before any cancellation case.
+        fs::write(
+            fixture.project.path().join("extra_c.rs"),
+            "pub fn extra_c() {}\n",
+        )
+        .expect("candidate source file");
+        let candidate = FixtureCandidate::build(&fixture);
+        restore_publication_pointer(&fixture, prior.0.clone(), prior.1.clone());
+        {
+            let mut storage =
+                Store::open(&fixture.storage_path).expect("open pointer store for hostile binding");
             let mut transaction = storage
                 .retrieval_publication_transaction()
                 .expect("stage hostile rollback binding");
-            let wrong_rollback = prior
-                .as_ref()
-                .and_then(|(_, rollback)| rollback.as_ref())
-                .expect("prior rollback fixture");
+            let wrong_rollback = prior.1.as_ref().expect("prior rollback fixture");
             let error = transaction
-                .publish_retrieval_index_publication(&candidate_manifest, Some(wrong_rollback))
+                .publish_retrieval_index_publication(&candidate.manifest, Some(wrong_rollback))
                 .expect_err("a non-current rollback must not substitute the bound predecessor");
             assert!(
                 error.to_string().contains("currently bound publication"),
                 "{error}"
             );
         }
+        let reopened = Store::open(&fixture.storage_path).expect("reopen after hostile binding");
         assert_eq!(
-            storage
-                .get_retrieval_index_publication("proj")
-                .expect("read after wrong binding"),
+            reopened
+                .get_retrieval_index_publication(&candidate.manifest.project_id)
+                .expect("read after wrong binding")
+                .expect("prior pair survives"),
             prior,
             "wrong rollback binding changed the prior pointer pair"
         );
-        let checks = std::cell::Cell::new(0_u8);
+        drop(reopened);
 
-        let result = promote_retrieval_manifest_with_cancel(
-            &mut storage,
-            &candidate_input,
-            &candidate_manifest,
-            |_| Ok(candidate_input.clone()),
-            |_| Ok(()),
-            |_| Ok(()),
-            |_| {
-                Ok(Some(RetrievalIndexRollbackRecord {
-                    manifest: current_manifest.clone(),
-                    verified_at_epoch_ms: 3,
-                }))
+        let cancelled = AtomicBool::new(false);
+        if cancel_at == Some(1) {
+            cancelled.store(true, Ordering::Release);
+        }
+        let validations = std::cell::Cell::new(0_u8);
+        let writes = std::cell::Cell::new(0_u8);
+        let markers = std::cell::Cell::new(0_u8);
+        let result = candidate.attempt(
+            &fixture,
+            Some(committed_b.clone()),
+            &cancelled,
+            |project_id, input, manifest, context, storage, storage_path| {
+                validations.set(validations.get() + 1);
+                if cancel_at == Some(2) {
+                    cancelled.store(true, Ordering::Release);
+                }
+                validate_fixture_candidate(
+                    project_id,
+                    input,
+                    manifest,
+                    context,
+                    storage,
+                    storage_path,
+                )
             },
             || {
-                let next = checks.get() + 1;
-                checks.set(next);
-                if Some(next) == cancel_at {
-                    return Err(RetrievalIndexCancelled {
-                        boundary: "fixture authoritative pointer commit",
-                    }
-                    .into());
+                writes.set(writes.get() + 1);
+                if cancel_at == Some(3) {
+                    cancelled.store(true, Ordering::Release);
                 }
-                Ok(())
             },
+            || markers.set(markers.get() + 1),
         );
         fixture.assert_core_unchanged();
         let observed = Store::open(&fixture.storage_path)
             .expect("independently reopen pointer-backed core")
-            .get_retrieval_index_publication("proj")
-            .expect("read authoritative publication after cancellation fence");
+            .get_retrieval_index_publication(&candidate.manifest.project_id)
+            .expect("read authoritative publication after cancellation fence")
+            .expect("the seeded pair always survives");
         if let Some(cancel_at) = cancel_at {
             let error = result.expect_err("cancellation before commit must reject publication");
-            assert!(is_retrieval_index_cancelled(&error), "{error:#}");
-            assert_eq!(checks.get(), cancel_at, "cancellation callback census");
+            assert!(
+                is_retrieval_index_cancelled(&error)
+                    || format!("{error:#}").contains("lock_wait_cancelled"),
+                "typed cancellation lost: {error:#}"
+            );
             assert_eq!(
                 observed, prior,
                 "cancelled transaction changed current or rollback pointers"
             );
-        } else {
-            result.expect("uncancelled pointer publication must commit");
-            assert_eq!(checks.get(), 3, "all cancellation fences must execute");
+            match cancel_at {
+                1 => assert_eq!(validations.get(), 0, "pre-call cancel skipped validation"),
+                2 => assert_eq!(
+                    writes.get(),
+                    0,
+                    "prewrite cancellation must not reach the staged pointer write"
+                ),
+                3 => assert_eq!(
+                    writes.get(),
+                    1,
+                    "post-write cancellation must observe the staged pointer write"
+                ),
+                _ => unreachable!(),
+            }
             assert_eq!(
-                observed,
-                Some((
-                    candidate_manifest,
-                    Some(RetrievalIndexRollbackRecord {
-                        manifest: current_manifest,
-                        verified_at_epoch_ms: 3,
-                    })
-                ))
+                markers.get(),
+                0,
+                "a cancelled commit never reaches postcommit cleanup"
+            );
+        } else {
+            let outcome = result.expect("uncancelled pointer publication must commit");
+            assert_eq!(validations.get(), 1);
+            assert_eq!(writes.get(), 1, "the staged pointer write hook ran");
+            assert_eq!(markers.get(), 1, "postcommit marker hook ran");
+            assert_eq!(
+                observed.0, outcome.manifest,
+                "the committed pointer is the manifest the owner returned"
+            );
+            assert_eq!(
+                observed.1.map(|record| record.manifest),
+                Some(committed_b),
+                "the committed rollback chains to the prior current manifest"
             );
             let bound = Store::open(&fixture.storage_path)
                 .expect("reopen committed binding")
-                .get_bound_retrieval_index_manifest("proj")
+                .get_bound_retrieval_index_manifest(&candidate.manifest.project_id)
                 .expect("read committed binding")
                 .expect("committed binding exists");
             assert_eq!(bound.core.generation_id, fixture.publication.generation_id);
@@ -6930,24 +7166,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_projection_excludes_low_value_local_symbols() {
-        let row = |kind: NodeKind| SearchSymbolProjectionDetail {
-            node_id: codestory_contracts::graph::NodeId(1),
-            display_name: "symbol".into(),
-            node_kind: Some(kind as i64),
-            file_path: Some("src/lib.rs".into()),
-            start_line: Some(1),
-            end_line: Some(1),
-        };
-
-        assert!(semantic_projection_row(&row(NodeKind::FUNCTION)));
-        assert!(semantic_projection_row(&row(NodeKind::ENUM_CONSTANT)));
-        assert!(!semantic_projection_row(&row(NodeKind::VARIABLE)));
-        assert!(!semantic_projection_row(&row(NodeKind::FIELD)));
-        assert!(!semantic_projection_row(&row(NodeKind::UNKNOWN)));
-    }
-
-    #[test]
     fn sidecar_input_preparation_ignores_empty_and_stale_legacy_symbol_projection() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
@@ -7117,12 +7335,8 @@ mod tests {
 
     #[test]
     fn canonical_sidecar_generation_is_stable_across_clean_roots_with_same_input() {
-        let Some(first_project) = git_project() else {
-            return;
-        };
-        let Some(second_project) = git_project() else {
-            return;
-        };
+        let first_project = git_project();
+        let second_project = git_project();
         let first_storage_dir = TempDir::new().expect("first storage dir");
         let second_storage_dir = TempDir::new().expect("second storage dir");
         let first_storage_path = first_storage_dir.path().join("codestory.db");
@@ -7242,9 +7456,7 @@ mod tests {
 
     #[test]
     fn dirty_canonical_repo_falls_back_to_root_sidecar_project_id() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let clean = sidecar_project_id_for_root(project.path());
         std::fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
         let dirty = sidecar_project_id_for_root(project.path());
@@ -7283,6 +7495,7 @@ mod tests {
         assert_eq!(selected, dirty, "the exact identity must win over recency");
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
     fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
         let _env = crate::test_support::env_lock();
@@ -7293,11 +7506,6 @@ mod tests {
         let storage_path = storage_dir.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
         let runtime = SidecarRuntimeConfig::local();
-        let embedding_contract = SidecarEmbeddingContract {
-            backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-            dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            producer_compatibility_identity: "producer-compatibility-v1",
-        };
         storage
             .insert_nodes_batch(&[Node {
                 id: NodeId(1),
@@ -7431,34 +7639,6 @@ mod tests {
             &first,
         );
         rejected_manifest.built_at_epoch_ms += 1;
-        let lexical_source =
-            lexical_source_input(project.path(), &storage_path).expect("lexical source");
-        let rejected = promote_retrieval_manifest(
-            &mut storage,
-            &first,
-            &rejected_manifest,
-            |snapshot| {
-                compute_sidecar_input_fingerprint_with_lexical_source(
-                    snapshot,
-                    project.path(),
-                    &storage_path,
-                    "proj",
-                    &embedding_contract,
-                    lexical_source,
-                    None,
-                )
-            },
-            |_| Ok(()),
-            |_| Ok(()),
-            |_| Ok(None),
-        );
-        assert!(rejected.is_err());
-        assert_eq!(
-            storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest"),
-            Some(old_manifest.clone())
-        );
 
         let mut new_manifest = retrieval_manifest_for_sidecar(
             "proj",
@@ -7495,6 +7675,29 @@ mod tests {
             retrieval_mode: "full".into(),
             degraded_reason: None,
         };
+        // A manifest bound to the pre-drift input is rejected by the production
+        // evidence predicate before any transaction opens, and the current
+        // manifest row is untouched.
+        let stale = validate_candidate_generation_evidence(
+            "proj",
+            &second,
+            &rejected_manifest,
+            &runtime,
+            &passing,
+        )
+        .expect_err("a manifest bound to the pre-drift input must not promote");
+        assert!(
+            stale.to_string().contains("sidecar generation input"),
+            "{stale:#}"
+        );
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest"),
+            Some(old_manifest.clone()),
+            "a rejected stale candidate must not disturb the current manifest"
+        );
+
         let mut zero_dense_input = second.clone();
         zero_dense_input.hash = "zero-dense-candidate".into();
         zero_dense_input.projection_count = 0;
@@ -7589,29 +7792,79 @@ mod tests {
             &cpu_evidence,
         )
         .expect("explicit CPU policy remains valid");
-        let mut rollback_manifest = old_manifest.clone();
-        let rollback_hash = "verified-rollback-input";
-        rollback_manifest.sidecar_input_hash = Some(rollback_hash.into());
-        rollback_manifest.sidecar_generation = Some(sidecar_generation_id("proj", rollback_hash));
-        rollback_manifest.semantic_generation =
-            crate::generation::sidecar_vector_generation("proj", rollback_hash);
-        rollback_manifest.built_at_epoch_ms -= 1;
-        let state_file = storage_dir.path().join("state/retrieval-sidecars.json");
-        let marker = GenerationRetentionMarker::next(
-            "workspace",
-            storage_dir.path(),
-            old_manifest.clone(),
-            Some(RetrievalIndexRollbackRecord {
-                manifest: rollback_manifest,
-                verified_at_epoch_ms: 123,
-            }),
-            123,
+        // ── Owner path: every transactional and pointer-preservation
+        // assertion below drives persist_finalized_manifest_with_hooks — the
+        // function production finalization calls — with evidence faults and
+        // drift injected at its real seams. A committed (current, rollback)
+        // pair is seeded first so "preserved" means "byte-identical pair", not
+        // merely "no new pointer". ──
+        let fixture = FirstRetrievalPublicationFixture::new();
+        let (_committed_a, committed_b, prior_pair) = seed_committed_publication_pair(&fixture);
+        fs::write(
+            fixture.project.path().join("candidate_c.rs"),
+            "pub fn candidate_c() {}\n",
         )
-        .expect("retention marker");
-        write_retention_marker(&state_file, &marker).expect("write retention marker");
-        let marker_before = read_retention_marker(&state_file, "workspace")
-            .expect("read marker")
-            .expect("marker exists");
+        .expect("candidate source file");
+        let fixture_candidate = FixtureCandidate::build(&fixture);
+        restore_publication_pointer(&fixture, prior_pair.0.clone(), prior_pair.1.clone());
+        let fixture_runtime = &fixture.runtime;
+        let fixture_storage_path = &fixture.storage_path;
+        let fixture_project_id = fixture_candidate.manifest.project_id.clone();
+        let (passing_device, passing_smoke, identity) = if fixture_runtime.embedding.allow_cpu {
+            (cpu_explicit_device(), None, "cpu_explicit")
+        } else {
+            (
+                crate::embeddings::EmbeddingDeviceReadiness {
+                    requested_policy: "accelerator_required",
+                    observed_state: "accelerated",
+                    observation_source: "per_user_server",
+                    detected_provider: Some("test".into()),
+                    detected_gpu: Some("test accelerator".into()),
+                    accelerator_requested: true,
+                    accelerator_request_provider: Some("test".into()),
+                    accelerator_request_device: None,
+                    cpu_allowed: false,
+                    full_retrieval_allowed: true,
+                    degraded_reason: None,
+                },
+                Some(12),
+                "accelerated",
+            )
+        };
+        let passing_candidate = CandidateGenerationEvidence {
+            lexical_matches: true,
+            scip_revision: fixture_candidate.manifest.scip_revision.clone(),
+            scip_graph: true,
+            semantic_points: Some(0),
+            semantic_ready: true,
+            semantic_zero_dense_policy: true,
+            embedding_device: passing_device,
+            embedding_accelerator_smoke_elapsed_ms: passing_smoke,
+            embedding_identity_before: test_embedding_identity(identity),
+            embedding_identity_after: test_embedding_identity(identity),
+            retrieval_mode: "full".into(),
+            degraded_reason: None,
+        };
+        validate_candidate_generation_evidence(
+            &fixture_project_id,
+            &fixture_candidate.sidecar_input,
+            &fixture_candidate.manifest,
+            fixture_runtime,
+            &passing_candidate,
+        )
+        .expect("control evidence must validate before component faults mean anything");
+        let never_cancelled = AtomicBool::new(false);
+        let assert_prior_pair = || {
+            assert_eq!(
+                Store::open(fixture_storage_path)
+                    .expect("reopen pointer store")
+                    .get_retrieval_index_publication(&fixture_project_id)
+                    .expect("read publication pair")
+                    .expect("publication pair exists"),
+                prior_pair,
+                "a rejected candidate changed the committed current/rollback pair"
+            );
+        };
 
         for component in [
             "lexical",
@@ -7620,8 +7873,7 @@ mod tests {
             "embedding_runtime",
             "accelerator_proof",
         ] {
-            let mut failing = passing.clone();
-            let candidate_input = second.clone();
+            let mut failing = passing_candidate.clone();
             match component {
                 "lexical" => failing.lexical_matches = false,
                 "scip" => failing.scip_revision = Some("wrong-revision".into()),
@@ -7629,207 +7881,146 @@ mod tests {
                 "embedding_runtime" => {
                     failing.embedding_identity_after.instance_id = "inprocess:replaced".into();
                 }
-                "accelerator_proof" => failing.embedding_accelerator_smoke_elapsed_ms = None,
+                "accelerator_proof" => {
+                    // CPU candidates must carry no accelerator smoke;
+                    // accelerated candidates must carry a timed one. Either
+                    // direction of the check is a real rejection.
+                    failing.embedding_accelerator_smoke_elapsed_ms =
+                        if fixture_runtime.embedding.allow_cpu {
+                            Some(9)
+                        } else {
+                            None
+                        };
+                }
                 _ => unreachable!(),
             }
-            let rejected = promote_retrieval_manifest(
-                &mut storage,
-                &candidate_input,
-                &new_manifest,
-                |_| Ok(candidate_input.clone()),
-                |_| {
-                    validate_candidate_generation_evidence(
-                        "proj",
-                        &candidate_input,
-                        &new_manifest,
-                        &runtime,
-                        &failing,
-                    )
-                },
-                |_| Ok(()),
-                |_| Ok(None),
-            )
-            .expect_err("component failure must reject promotion");
+            let rejected = fixture_candidate
+                .attempt(
+                    &fixture,
+                    Some(committed_b.clone()),
+                    &never_cancelled,
+                    |project_id, input, manifest, context, storage, storage_path| {
+                        validate_fixture_candidate(
+                            project_id,
+                            input,
+                            manifest,
+                            context,
+                            storage,
+                            storage_path,
+                        )?;
+                        validate_candidate_generation_evidence(
+                            project_id,
+                            input,
+                            manifest,
+                            fixture_runtime,
+                            &failing,
+                        )
+                    },
+                    || {},
+                    || {},
+                )
+                .expect_err("component failure must reject promotion through the real owner");
             assert!(
-                rejected.to_string().contains(component)
-                    || component == "embedding_runtime"
-                        && rejected.to_string().contains("does not match")
+                format!("{rejected:#}").contains(component),
+                "{component} rejection came from the wrong check: {rejected:#}"
             );
-            assert_eq!(
-                storage
-                    .get_retrieval_index_manifest("proj")
-                    .expect("current manifest"),
-                Some(old_manifest.clone()),
-                "{component} failure changed current"
-            );
-            assert_eq!(
-                read_retention_marker(&state_file, "workspace")
-                    .expect("read marker")
-                    .expect("marker exists"),
-                marker_before,
-                "{component} failure changed rollback"
-            );
+            assert_prior_pair();
+            fixture.assert_core_unchanged();
         }
+
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = promote_retrieval_manifest(
-                &mut storage,
-                &second,
-                &new_manifest,
-                |_| Ok(second.clone()),
-                |_| {
-                    validate_candidate_generation_evidence(
-                        "proj",
-                        &second,
-                        &new_manifest,
-                        &runtime,
-                        &passing,
+            let _ = fixture_candidate.attempt(
+                &fixture,
+                Some(committed_b.clone()),
+                &never_cancelled,
+                |project_id, input, manifest, context, storage, storage_path| {
+                    validate_fixture_candidate(
+                        project_id,
+                        input,
+                        manifest,
+                        context,
+                        storage,
+                        storage_path,
                     )?;
-                    panic!("simulated crash before candidate promotion")
+                    panic!("simulated crash inside candidate validation")
                 },
-                |_| Ok(()),
-                |_| Ok(None),
+                || {},
+                || {},
             );
         }));
         assert!(crashed.is_err());
-        assert_eq!(
-            storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest after crash"),
-            Some(old_manifest.clone())
-        );
-        assert_eq!(
-            read_retention_marker(&state_file, "workspace")
-                .expect("read marker")
-                .expect("marker exists"),
-            marker_before
-        );
+        assert_prior_pair();
+        fixture.assert_core_unchanged();
 
-        let source_path = project.path().join("lib.rs");
-        let drifted = promote_retrieval_manifest(
-            &mut storage,
-            &second,
-            &new_manifest,
-            |snapshot| {
-                let lexical_source = lexical_source_input(project.path(), &storage_path)
-                    .expect("fresh lexical source");
-                compute_sidecar_input_fingerprint_with_lexical_source(
-                    snapshot,
-                    project.path(),
-                    &storage_path,
-                    "proj",
-                    &embedding_contract,
-                    lexical_source,
-                    None,
-                )
-            },
-            |_| {
-                validate_candidate_generation_evidence(
-                    "proj",
-                    &second,
-                    &new_manifest,
-                    &runtime,
-                    &passing,
-                )?;
-                std::fs::write(&source_path, "pub fn changed_during_validation() {}\n")?;
-                Ok(())
-            },
-            |_| Ok(()),
-            |_| Ok(None),
-        )
-        .expect_err("source drift during validation must reject publication");
-        assert!(is_sidecar_input_changed(&drifted));
-        assert!(drifted.to_string().contains("input changed"));
-        assert_eq!(
-            storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest after source drift"),
-            Some(old_manifest.clone())
-        );
-        std::fs::write(&source_path, "pub fn do_work() {}\n").expect("restore source");
-
-        let pointer_fault = promote_retrieval_manifest(
-            &mut storage,
-            &second,
-            &new_manifest,
-            |snapshot| {
-                let lexical_source = lexical_source_input(project.path(), &storage_path)
-                    .expect("fresh lexical source");
-                compute_sidecar_input_fingerprint_with_lexical_source(
-                    snapshot,
-                    project.path(),
-                    &storage_path,
-                    "proj",
-                    &embedding_contract,
-                    lexical_source,
-                    None,
-                )
-            },
-            |_| {
-                validate_candidate_generation_evidence(
-                    "proj",
-                    &second,
-                    &new_manifest,
-                    &runtime,
-                    &passing,
-                )
-            },
-            |_| Ok(()),
-            |_| bail!("simulated SQLite rollback pointer failure"),
-        )
-        .expect_err("SQLite rollback pointer failure must reject publication");
+        // Same-count content drift: the file set is unchanged but the bytes no
+        // longer match the seals the candidate was prepared against, so the
+        // owner's publication-fence revalidation must reject it.
+        let drifted_source = fixture.project.path().join("fixture.rs");
+        fs::write(&drifted_source, "pub fn fixture_drifted() {}\n").expect("drift source");
+        let drifted = fixture_candidate
+            .attempt(
+                &fixture,
+                Some(committed_b.clone()),
+                &never_cancelled,
+                validate_fixture_candidate,
+                || {},
+                || {},
+            )
+            .expect_err("source drift after candidate preparation must reject publication");
         assert!(
-            pointer_fault
-                .to_string()
-                .contains("SQLite rollback pointer")
+            format!("{drifted:#}").contains("lexical source identity changed"),
+            "{drifted:#}"
         );
-        assert_eq!(
-            storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest after retention pointer fault"),
-            Some(old_manifest.clone())
-        );
-        assert_eq!(
-            read_retention_marker(&state_file, "workspace")
-                .expect("read marker")
-                .expect("marker exists"),
-            marker_before,
-            "retention pointer failure changed rollback state"
-        );
+        fs::write(
+            &drifted_source,
+            "pub fn first_retrieval_publication_fixture() {}\n",
+        )
+        .expect("restore source");
+        assert_prior_pair();
+        fixture.assert_core_unchanged();
 
+        // Source seals bind filesystem identity, not bytes: the rewrite gave
+        // `fixture.rs` a new inode, so the original candidate can never pass
+        // revalidation again. Rebuild the candidate against the restored bytes
+        // and restore the pointer the build's upsert claimed.
+        let fixture_candidate = FixtureCandidate::build(&fixture);
+        restore_publication_pointer(&fixture, prior_pair.0.clone(), prior_pair.1.clone());
+        let outcome = fixture_candidate
+            .attempt(
+                &fixture,
+                Some(committed_b.clone()),
+                &never_cancelled,
+                validate_fixture_candidate,
+                || {},
+                || {},
+            )
+            .expect("unchanged input promotes through the real owner");
+        let observed = Store::open(fixture_storage_path)
+            .expect("reopen pointer store")
+            .get_retrieval_index_publication(&fixture_project_id)
+            .expect("read committed publication")
+            .expect("committed publication exists");
+        assert_eq!(
+            observed.0, outcome.manifest,
+            "the committed pointer is the manifest the owner returned"
+        );
+        assert_eq!(
+            observed.1.map(|record| record.manifest),
+            Some(committed_b),
+            "the healthy commit chains its rollback to the prior current"
+        );
+        fixture.assert_core_unchanged();
+
+        // The post-commit marker/protection assertions observe the real store
+        // write path's output, so seed the synthetic store with the same
+        // publication call the owner performs.
         let rollback_record = RetrievalIndexRollbackRecord {
             manifest: old_manifest.clone(),
             verified_at_epoch_ms: 456,
         };
-        promote_retrieval_manifest(
-            &mut storage,
-            &second,
-            &new_manifest,
-            |snapshot| {
-                let lexical_source = lexical_source_input(project.path(), &storage_path)
-                    .expect("fresh lexical source");
-                compute_sidecar_input_fingerprint_with_lexical_source(
-                    snapshot,
-                    project.path(),
-                    &storage_path,
-                    "proj",
-                    &embedding_contract,
-                    lexical_source,
-                    None,
-                )
-            },
-            |_| {
-                validate_candidate_generation_evidence(
-                    "proj",
-                    &second,
-                    &new_manifest,
-                    &runtime,
-                    &passing,
-                )
-            },
-            |_| Ok(()),
-            |_| Ok(Some(rollback_record.clone())),
-        )
-        .expect("unchanged input promotes manifest");
+        storage
+            .publish_retrieval_index_publication(&new_manifest, Some(&rollback_record))
+            .expect("commit manifest for post-commit marker assertions");
         assert_eq!(
             storage
                 .get_retrieval_index_publication("proj")
@@ -8026,14 +8217,9 @@ mod tests {
             .expect("semantic doc");
     }
 
-    fn git_project() -> Option<TempDir> {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return None;
-        }
+    /// A git fixture is a hard dev dependency: a missing or failing `git`
+    /// fails the test rather than skipping the identity assertions it owns.
+    fn git_project() -> TempDir {
         let project = TempDir::new().expect("project");
         git(project.path(), &["init"]);
         git(
@@ -8054,16 +8240,35 @@ mod tests {
             .expect("write source");
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "init"]);
-        Some(project)
+        project
     }
 
+    /// Every fixture git runs under child-scoped isolation: no ambient config,
+    /// no hooks, no inherited `GIT_*` state, and a fixture-owned HOME/XDG.
     fn git(project: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let home = project.join(".codestory-test-home");
+        std::fs::create_dir_all(&home).expect("isolated git home");
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
             .arg("-C")
             .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
+            .args(args);
+        for (key, _) in std::env::vars() {
+            if key.starts_with("GIT_") {
+                command.env_remove(&key);
+            }
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+            .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+            .env("USERPROFILE", &home);
+        let output = command.output().expect("run isolated fixture git");
         assert!(
             output.status.success(),
             "git {} failed: {}",

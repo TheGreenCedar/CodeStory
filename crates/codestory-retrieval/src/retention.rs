@@ -2128,7 +2128,13 @@ mod tests {
         let root = tempdir().expect("root");
         let layout = layout(root.path());
         let project = "repo-v1-project";
+        // An authoritative active generation makes the stale bundle genuinely
+        // reclaimable, so malformed-entry suppression is the only reason
+        // deletion is withheld — without an active generation the
+        // missing-active rule alone would suppress the same plan.
+        let active = "aaaaaaaaaaaaaaaa";
         let stale = "cccccccccccccccc";
+        write_bundle(&layout, project, active, [1, 1, 1]);
         write_bundle(&layout, project, stale, [2, 3, 4]);
         std::fs::create_dir_all(
             layout
@@ -2136,14 +2142,19 @@ mod tests {
                 .join(format!("{project}-malformed")),
         )
         .expect("malformed");
+        let protection = RetentionProtectionScan {
+            authoritative_active: vec![manifest(project, active, 1)],
+            ..RetentionProtectionScan::default()
+        };
 
-        let plan = plan_generation_retention(&layout, project, &RetentionProtectionScan::default());
+        let plan = plan_generation_retention(&layout, project, &protection);
         let mut remover = TestRemover::default();
         let report = apply_generation_retention(&plan, &mut remover);
 
         assert!(plan.pruning_suppressed);
-        assert_eq!(plan.building_bytes, 9);
         assert_eq!(plan.reclaimable_bytes, 0);
+        assert_eq!(plan.active_bytes, 3);
+        assert_eq!(plan.blocked.len(), 1);
         assert!(report.pruning_suppressed);
         assert_eq!(report.removed_bytes, 0);
         assert!(remover.removed_paths.is_empty());

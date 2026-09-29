@@ -866,12 +866,28 @@ mod tests {
 
     #[test]
     fn status_reports_unavailable_when_lexical_down() {
-        let layout = SidecarLayout::from_env();
-        let report = probe_sidecar_health(&layout, "testproject", None);
-        assert_eq!(report.lexical.name, "lexical");
-        if report.lexical.status == ComponentStatus::Unavailable {
-            assert_eq!(report.retrieval_mode, "unavailable");
-        }
+        let data = TempDir::new().expect("sidecar data root");
+        let mut layout = SidecarLayout::from_env();
+        layout.lexical_data_dir = data.path().join("lexical");
+        layout.semantic_data_dir = data.path().join("semantic");
+        layout.scip_artifacts_root = data.path().join("scip");
+        // A current-contract manifest with no shard on disk must report the
+        // lexical lane unconditionally unavailable, not merely "not full".
+        let manifest = retrieval_manifest_fixture("testproject", "test-input");
+
+        let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
+
+        assert_eq!(
+            report.lexical.status,
+            ComponentStatus::Unavailable,
+            "missing lexical shard must report unavailable: {:?}",
+            report.lexical
+        );
+        assert!(
+            !report.is_live_ready(),
+            "a lexical-unavailable sidecar cannot be live ready: {:?}",
+            report.retrieval_mode
+        );
     }
 
     #[test]

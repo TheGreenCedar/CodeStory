@@ -129,8 +129,16 @@ def _shared_snapshot_test(
         }
     }
     first_snapshot = server_snapshot(snapshot_payload, manifest, require_resident=True)
+    # The second host observes the same server at a different moment: every
+    # identity field the shared proof pins is equal, while the volatile
+    # observation fields are not -- comparing a clone against itself could
+    # never show the comparator reads either side.
+    second_payload = json.loads(json.dumps(snapshot_payload))
+    second_payload["embedding_server"]["event_sequence"] = 31
+    second_payload["embedding_server"]["scheduler"]["connection_count"] = 5
+    second_payload["embedding_server"]["engine"]["successful_encode_count"] = 9
     second_snapshot = server_snapshot(
-        json.loads(json.dumps(snapshot_payload)),
+        second_payload,
         manifest,
         require_resident=True,
     )
@@ -146,6 +154,23 @@ def _shared_snapshot_test(
         raise ProofFailure("launcher digest was accepted as the runtime process")
     shared = shared_server_identity(first_snapshot, second_snapshot)
     require(shared["model_load_count"] == 1, "shared server identity self-test failed")
+    second_host = json.loads(json.dumps(second_snapshot))
+    second_host["process"]["server_instance_id"] = "server-2"
+    try:
+        shared_server_identity(first_snapshot, second_host)
+    except ProofFailure as error:
+        require(
+            str(error)
+            == "independent plugin hosts observed different"
+            " process.server_instance_id",
+            f"a second host's distinct server identity lost its own"
+            f" attribution: {error}",
+        )
+    else:
+        raise ProofFailure(
+            "independent plugin hosts with different server identities were"
+            " accepted as observing one server"
+        )
     return snapshot_payload, first_snapshot, shared
 
 

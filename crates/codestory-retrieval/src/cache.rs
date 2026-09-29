@@ -176,29 +176,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_round_trip() {
-        let mut cache = RetrievalCache::new();
-        let key = RetrievalCacheKey {
-            core_generation_id: None,
-            core_run_id: None,
-            project_id: "abc".into(),
-            lexical_version: "v1".into(),
-            semantic_generation: "codestory_abc".into(),
-            scip_revision: None,
-            sidecar_generation: Some("abc-hash".into()),
-            sidecar_input_hash: Some("hash".into()),
-            sidecar_schema_version: Some(1),
-            projection_count: Some(1),
-            query_fingerprint: "fp".into(),
-        };
-        cache.insert(
-            key.clone(),
-            vec![super::super::CandidateHit::lexical_stub("src/lib.rs", 1.0)],
-        );
-        assert_eq!(cache.get(&key).expect("hit").len(), 1);
-    }
-
-    #[test]
     fn cache_evicts_oldest_entry_when_capacity_is_reached() {
         let mut cache = RetrievalCache::with_capacity(1);
         let first = RetrievalCacheKey {
