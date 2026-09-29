@@ -9,24 +9,28 @@
 //! SQLite sidecar all break the seal, so a generation damaged after its first
 //! validation re-validates instead of hiding behind the earlier verdict.
 //!
-//! **A seal is only as strong as the metadata the platform reports, and one
-//! shipped platform reports less.** The paragraph above holds in full on Unix,
-//! where `std::fs` exposes a device/inode pair and an inode-change instant.
-//! Windows exposes neither through `std::fs`, so a seal taken there compares
-//! presence, length, the creation and modification instants, and the read-only
-//! bit — nothing that records *that the bytes were rewritten*. A writer that
-//! rewrites an artifact in place without changing its length and then restores
-//! the modification time produces an observation identical to the sealed one,
-//! and the receipt answers for bytes it never read. The same is true of a
-//! replacement whose length, creation, and modification instants all match.
-//! [`SealFidelity`] names which of the two a given observation is, and
-//! [`ArtifactSeal::fidelity`] reports it. This is a stated limit of the
+//! **A seal is only as strong as the metadata the platform reports.** The
+//! paragraph above holds in full on Unix, where `std::fs` exposes a
+//! device/inode pair and an inode-change instant, and on Windows, where the
+//! observation opens the file briefly for a volume-serial/file-index pair and
+//! the NTFS ChangeTime — the instant a same-length in-place rewrite cannot
+//! hide behind a restored modification time. Where the platform reports none
+//! of that — a Windows file whose handle query fails or whose filesystem does
+//! not report a change instant, or any platform without either mechanism — a
+//! seal compares presence, length, the creation and modification instants, and
+//! the read-only bit: nothing that records *that the bytes were rewritten*. A
+//! writer that rewrites an artifact in place without changing its length and
+//! then restores the modification time produces an observation identical to
+//! the sealed one, and the receipt answers for bytes it never read. The same
+//! is true of a replacement whose length, creation, and modification instants
+//! all match. [`SealFidelity`] names which of the two a given observation is,
+//! and [`ArtifactSeal::fidelity`] reports it. This is a stated limit of the
 //! receipt, not an accident of it: on a
-//! [`SealFidelity::TimestampsOnly`] platform a receipt proves the artifact was
-//! not casually touched; it does not prove the bytes are the ones the
+//! [`SealFidelity::TimestampsOnly`] observation a receipt proves the artifact
+//! was not casually touched; it does not prove the bytes are the ones the
 //! validation read. Nothing that must detect deliberate corruption may rest on
 //! a receipt alone there. Concretely, a consumer whose verdict is receipted
-//! carries the limit forward: on a timestamps-only platform an artifact
+//! carries the limit forward: under a timestamps-only observation an artifact
 //! rewritten in place at the same length, with its modification time restored,
 //! keeps answering with the verdict this process already sealed for it. What
 //! bounds that is the receipt's process-local lifetime, not the seal — the next
@@ -112,19 +116,22 @@ pub enum SealFidelity {
     /// A rewrite in place breaks the seal even when the writer keeps the length
     /// and restores the modification time afterwards, and a replacement breaks
     /// it even when the replacement's bytes and timestamps match. Unix reports
-    /// this.
+    /// this through `std::fs`; Windows reports it through a bounded handle
+    /// query for the volume serial number, the file index, and the NTFS
+    /// ChangeTime.
     InodeChangeTracked,
     /// The observation carries only presence, length, the creation and
     /// modification instants, and the read-only bit.
     ///
-    /// Windows is this platform: `std::fs` reports no device/inode pair and no
-    /// inode-change instant there, so nothing in the seal records that an
-    /// artifact's bytes were rewritten. A same-length rewrite in place that
-    /// restores the modification time is indistinguishable from the sealed
-    /// observation, and so is a replacement that matches every field. The
-    /// residual guarantee is real but narrower: a change in presence, length,
-    /// creation instant, modification instant, or the read-only bit still
-    /// breaks the seal.
+    /// This is what remains when the platform reports no native file identity:
+    /// any platform without a device/inode pair and an inode-change instant,
+    /// including a Windows file whose handle query fails or whose filesystem
+    /// cannot report one, so nothing in the seal records that an artifact's
+    /// bytes were rewritten. A same-length rewrite in place that restores the
+    /// modification time is indistinguishable from the sealed observation, and
+    /// so is a replacement that matches every field. The residual guarantee is
+    /// real but narrower: a change in presence, length, creation instant,
+    /// modification instant, or the read-only bit still breaks the seal.
     TimestampsOnly,
 }
 
@@ -144,12 +151,15 @@ enum SealPresence {
         len: u64,
         modified_nanos: i128,
         created_nanos: i128,
-        /// Unix device id, `0` where the platform does not report one.
+        /// Native device identity: the Unix device id or the Windows volume
+        /// serial number; `0` where the platform does not report one.
         device: u64,
-        /// Unix inode number, `0` where the platform does not report one.
+        /// Native file identity: the Unix inode number or the Windows file
+        /// index; `0` where the platform does not report one.
         inode: u64,
-        /// Unix inode-change instant. This is what catches an in-place rewrite
-        /// that restores the modification time afterwards.
+        /// The inode-change instant — Unix ctime, or the NTFS ChangeTime on
+        /// Windows. This is what catches an in-place rewrite that restores the
+        /// modification time afterwards.
         inode_change_nanos: i128,
         readonly: bool,
     },
@@ -163,22 +173,25 @@ impl ArtifactSeal {
     /// device node — is refused rather than sealed.
     pub fn observe(path: &Path) -> Result<Self, ArtifactSealError> {
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() => Ok(Self {
-                path: path.to_path_buf(),
-                presence: SealPresence::Present {
-                    len: metadata.len(),
-                    modified_nanos: metadata
-                        .modified()
-                        .map_or(TIMESTAMP_UNAVAILABLE, system_time_nanos),
-                    created_nanos: metadata
-                        .created()
-                        .map_or(TIMESTAMP_UNAVAILABLE, system_time_nanos),
-                    device: native_device(&metadata),
-                    inode: native_inode(&metadata),
-                    inode_change_nanos: native_inode_change_nanos(&metadata),
-                    readonly: metadata.permissions().readonly(),
-                },
-            }),
+            Ok(metadata) if metadata.is_file() => {
+                let (device, inode, inode_change_nanos) = native_identity(path, &metadata);
+                Ok(Self {
+                    path: path.to_path_buf(),
+                    presence: SealPresence::Present {
+                        len: metadata.len(),
+                        modified_nanos: metadata
+                            .modified()
+                            .map_or(TIMESTAMP_UNAVAILABLE, system_time_nanos),
+                        created_nanos: metadata
+                            .created()
+                            .map_or(TIMESTAMP_UNAVAILABLE, system_time_nanos),
+                        device,
+                        inode,
+                        inode_change_nanos,
+                        readonly: metadata.permissions().readonly(),
+                    },
+                })
+            }
             Ok(_) => Err(ArtifactSealError::NotRegularFile {
                 path: path.to_path_buf(),
             }),
@@ -234,9 +247,10 @@ impl ArtifactSeal {
     /// Whether this pre-link observation still describes the source after an
     /// owned hard-link operation.
     ///
-    /// Creating a hard link changes the inode-change instant on Unix even
-    /// though it cannot change the file bytes. Every other observable field,
-    /// including the native file identity where available, must remain fixed.
+    /// Creating a hard link changes the inode-change instant — Unix ctime and
+    /// NTFS ChangeTime both move on link-count changes — even though it cannot
+    /// change the file bytes. Every other observable field, including the
+    /// native file identity where available, must remain fixed.
     fn same_source_after_hard_link(&self, after: &Self) -> bool {
         if self.path != after.path {
             return false;
@@ -336,12 +350,109 @@ fn content_digests(seals: &[ArtifactSeal]) -> Option<Vec<Option<[u8; 32]>>> {
         .collect()
 }
 
+/// One bounded observation of native file identity: device/inode pair and the
+/// inode-change instant. The handle is opened once so all three values come
+/// from the same query and cannot tear against each other.
+#[cfg(unix)]
+fn native_identity(_path: &Path, metadata: &std::fs::Metadata) -> (u64, u64, i128) {
+    (
+        native_device(metadata),
+        native_inode(metadata),
+        native_inode_change_nanos(metadata),
+    )
+}
+
+/// `std::fs` reports no native file identity on Windows, so the observation
+/// opens the file briefly and asks the handle for the volume serial number,
+/// the file index, and the NTFS ChangeTime. `FILE_FLAG_OPEN_REPARSE_POINT`
+/// keeps the query on the same node `symlink_metadata` accepted, and the
+/// share mode admits every concurrent reader and writer. A path that cannot
+/// be opened or queried this way keeps the fallback observation, so the seal
+/// degrades to [`SealFidelity::TimestampsOnly`] rather than erroring.
+#[cfg(windows)]
+fn native_identity(path: &Path, _metadata: &std::fs::Metadata) -> (u64, u64, i128) {
+    windows_file_identity(path).unwrap_or((0, 0, TIMESTAMP_UNAVAILABLE))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_identity(_path: &Path, metadata: &std::fs::Metadata) -> (u64, u64, i128) {
+    (
+        native_device(metadata),
+        native_inode(metadata),
+        native_inode_change_nanos(metadata),
+    )
+}
+
+/// `device`, file index, and `ChangeTime` for `path`, or `None` when the open
+/// or either handle query fails.
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u64, u64, i128)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let handle = file.as_raw_handle().cast();
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output points to correctly sized, writable storage.
+    if unsafe { GetFileInformationByHandle(handle, information.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    // SAFETY: a successful `GetFileInformationByHandle` initializes all fields.
+    let information = unsafe { information.assume_init() };
+
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output points to correctly sized, writable storage.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return None;
+    }
+    // SAFETY: a successful `GetFileInformationByHandleEx` initializes all
+    // fields.
+    let basic = unsafe { basic.assume_init() };
+    drop(file);
+
+    let device = u64::from(information.dwVolumeSerialNumber);
+    let inode =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    // `ChangeTime` counts 100-ns intervals since 1601-01-01; shift it onto the
+    // Unix-epoch scale `system_time_nanos` uses. A filesystem that reports no
+    // change instant degrades this field alone to the sentinel.
+    const WINDOWS_UNIX_EPOCH_TICKS: i128 = 116_444_736_000_000_000;
+    let inode_change_nanos = if basic.ChangeTime > 0 {
+        (i128::from(basic.ChangeTime) - WINDOWS_UNIX_EPOCH_TICKS) * 100
+    } else {
+        TIMESTAMP_UNAVAILABLE
+    };
+    Some((device, inode, inode_change_nanos))
+}
+
 #[cfg(unix)]
 fn native_device(metadata: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::dev(metadata)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn native_device(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
@@ -351,7 +462,7 @@ fn native_inode(metadata: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::ino(metadata)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn native_inode(_metadata: &std::fs::Metadata) -> u64 {
     0
 }
@@ -362,7 +473,7 @@ fn native_inode_change_nanos(metadata: &std::fs::Metadata) -> i128 {
     i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn native_inode_change_nanos(_metadata: &std::fs::Metadata) -> i128 {
     TIMESTAMP_UNAVAILABLE
 }
@@ -438,11 +549,11 @@ where
     ///
     /// A failed validation removes any receipt for `key` and is never cached.
     ///
-    /// "Still holds" means what [`SealFidelity`] says it means on this
-    /// platform. Where the observation is
-    /// [`SealFidelity::TimestampsOnly`] — Windows — a same-length in-place
-    /// rewrite that restores the modification time still satisfies the seal and
-    /// is answered from the receipt.
+    /// "Still holds" means what [`SealFidelity`] says it means for this
+    /// observation. Where the observation is
+    /// [`SealFidelity::TimestampsOnly`], a same-length in-place rewrite that
+    /// restores the modification time still satisfies the seal and is answered
+    /// from the receipt.
     pub fn validate_sealed<E>(
         &self,
         key: K,
@@ -780,17 +891,18 @@ mod tests {
             .expect("seal the artifact")
             .fidelity();
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_eq!(
             fidelity,
             Some(SealFidelity::InodeChangeTracked),
-            "Unix reports a device/inode pair and an inode-change instant"
+            "Unix reports a device/inode pair and an inode-change instant; \
+             Windows reports the volume serial number, file index, and NTFS ChangeTime"
         );
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert_eq!(
             fidelity,
             Some(SealFidelity::TimestampsOnly),
-            "Windows `std::fs` reports no device/inode pair and no inode-change instant; \
+            "this platform reports no device/inode pair and no inode-change instant; \
              claiming otherwise would let a corrupted generation answer from its receipt"
         );
 
@@ -1092,12 +1204,14 @@ mod tests {
     /// The seal's strength against a deliberate in-place rewrite, stated
     /// exactly as far as the platform can carry it.
     ///
-    /// This test used to assert detection unconditionally. It runs only where
-    /// `codestory-contracts` tests run — Linux and macOS — so the assertion was
-    /// never contradicted, while the same code on Windows answers the rewritten
-    /// artifact from the earlier receipt. Both outcomes are pinned here against
-    /// the fidelity the observation itself reports, so neither platform's
-    /// behaviour can drift and neither can be claimed for the other.
+    /// This test used to assert detection unconditionally, which Windows
+    /// contradicted while its seals were timestamps-only. Windows now reports
+    /// the NTFS ChangeTime through a bounded handle query, so both shipped
+    /// platforms take the tracked branch; the timestamps-only branch still
+    /// pins the residual guarantee for an observation whose identity query
+    /// fails. Both outcomes are pinned against the fidelity the observation
+    /// itself reports, so neither platform's behaviour can drift and neither
+    /// can be claimed for the other.
     #[test]
     fn an_in_place_rewrite_that_restores_the_modification_time_is_detected_only_at_full_fidelity() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -1177,11 +1291,10 @@ mod tests {
     /// it.
     ///
     /// A timestamps-only observation carries no file identity, so whether a
-    /// byte-identical replacement is noticed there depends on whether the new
-    /// file happens to inherit the old creation instant — which on NTFS it
-    /// sometimes does. The contract therefore claims nothing about that case
-    /// on such a platform, and this test claims nothing either; it pins the
-    /// residual guarantee instead.
+    /// byte-identical replacement is noticed depends on whether the new file
+    /// happens to inherit the old creation instant. The contract therefore
+    /// claims nothing about that case under such an observation, and this
+    /// test claims nothing either; it pins the residual guarantee instead.
     #[test]
     fn replacing_the_artifact_with_identical_bytes_is_detected_only_at_full_fidelity() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -1233,6 +1346,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Windows carries the same native identity as Unix: the volume serial
+    /// number, the file index, and the NTFS ChangeTime, read through a bounded
+    /// handle query. A same-length rewrite in place and a timestamp-preserving
+    /// replacement both break the seal.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_seal_tracks_the_inode_change_instant_and_replacement_identity() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let artifact = dir.path().join("shard.sqlite3");
+        let pinned_modified = 1_700_000_000_000_000_000;
+        write(&artifact, "generation-a");
+        set_modified(&artifact, pinned_modified);
+        let sealed = ArtifactSeal::observe(&artifact).expect("seal the artifact");
+        assert_eq!(
+            sealed.fidelity(),
+            Some(SealFidelity::InodeChangeTracked),
+            "an NTFS file reports a volume/index pair and ChangeTime"
+        );
+
+        // Same path, same file index, same length, and the modification time
+        // put back exactly where it was: only ChangeTime records that the
+        // bytes were rewritten.
+        write(&artifact, "generation-X");
+        set_modified(&artifact, pinned_modified);
+        let rewritten = ArtifactSeal::observe(&artifact).expect("re-observe");
+        assert_ne!(
+            rewritten, sealed,
+            "an in-place rewrite at the same length must break the seal"
+        );
+
+        // A copy that preserves the visible timestamps and is then moved over
+        // the artifact is a different file index: the seal must still break.
+        let replacement = dir.path().join("shard.sqlite3.new");
+        std::fs::copy(&artifact, &replacement).expect("copy bytes");
+        set_modified(&replacement, pinned_modified);
+        std::fs::remove_file(&artifact).expect("remove artifact");
+        std::fs::rename(&replacement, &artifact).expect("rename over artifact");
+        assert_ne!(
+            ArtifactSeal::observe(&artifact).expect("observe replacement"),
+            rewritten,
+            "a timestamp-preserving copy/remove/rename replacement must break the seal"
+        );
     }
 
     #[test]

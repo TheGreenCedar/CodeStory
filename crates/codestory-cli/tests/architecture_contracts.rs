@@ -3432,14 +3432,14 @@ fn retrieval_annotations_are_classified_by_typed_kind_not_by_prose() {
 ///
 /// READY-C (#1654) shipped `validation_receipts` documenting that "replacement,
 /// truncation, in-place rewriting ... all break the seal", and two tests
-/// asserting exactly that. Neither statement holds on Windows: `std::fs`
-/// reports no device/inode pair and no inode-change instant there, so a
-/// same-length rewrite that restores the modification time produces an
-/// identical observation and is answered from the receipt. Nothing contradicted
-/// the claim because `codestory-contracts` tests run only on Linux and macOS —
-/// the Windows lanes in `source-proof.yml` build `codestory-workspace` and
-/// `codestory-llama-sys` test targets only. The limit is therefore stated, in
-/// the contract and in the docs, and this is what keeps it stated.
+/// asserting exactly that. Windows contradicted both while `std::fs` reported
+/// no device/inode pair and no inode-change instant there, and nothing pinned
+/// it because `codestory-contracts` tests ran only on Linux and macOS. Windows
+/// now observes the same native identity through a bounded handle query
+/// (volume serial, file index, NTFS ChangeTime); what remains is the fallback
+/// case — a platform or filesystem that reports none of that, including a
+/// Windows file whose query fails — and that weaker case must stay named in
+/// the contract and the docs, which is what this keeps pinned.
 #[test]
 fn the_sealed_receipt_states_its_windows_limit_in_the_contract_and_the_docs() {
     let receipts = read("crates/codestory-contracts/src/validation_receipts.rs");
