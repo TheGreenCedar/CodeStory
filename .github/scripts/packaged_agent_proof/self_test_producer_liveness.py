@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .event_producer_liveness import (
     ChildProcessProducer,
+    EventProducer,
     NativeProcessProducer,
     ObservationalProducer,
     ProducerGroup,
@@ -139,6 +140,31 @@ def _dead_producer_fails_fast_instead_of_timing_out() -> None:
         )
 
 
+class _AppendingProducer(EventProducer):
+    """A producer whose exit probe lands just after its final append.
+
+    Its ``exited()`` is not side-effect free like a real producer's contract
+    requires; it exists to place the awaited record between the wait's poll
+    read and the exit probe, which is the exact race the drain read exists for.
+    """
+
+    def __init__(self, log_path: Path, record: dict) -> None:
+        super().__init__(
+            "the self-test producer",
+            "finishing its last record",
+        )
+        self._log_path = log_path
+        self._record = record
+
+    def exited(self) -> bool:
+        with self._log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._record, sort_keys=True) + "\n")
+        return True
+
+    def termination(self) -> str:
+        return "exited after appending its last record"
+
+
 def _a_record_written_just_before_exit_still_completes() -> None:
     """Exit must not beat a record the producer already appended."""
     with tempfile.TemporaryDirectory(
@@ -172,6 +198,37 @@ def _a_record_written_just_before_exit_still_completes() -> None:
         require(
             event.get("sequence") == 1 and event.get("action") == "snapshot",
             "an exited producer lost a record it had already written",
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="codestory-producer-liveness-self-test-"
+    ) as raw:
+        # The awaited record lands after the poll read but before the exit
+        # probe completes: only the drain read after `exited()` can see it.
+        # This drives wait_for_jsonl_event directly rather than a control so
+        # the scripted producer stays out of the residency audit's producer
+        # allowlist; the control path delegates to the same wait.
+        directory = Path(raw)
+        log_path = directory / "late.events.jsonl"
+        record = {
+            "schema_version": 1,
+            "sequence": 1,
+            "action": "snapshot",
+            "status": "completed",
+        }
+        event = wait_for_jsonl_event(
+            log_path,
+            lambda candidate: (
+                candidate.get("sequence") == 1
+                and candidate.get("action") == "snapshot"
+            ),
+            timeout=_UNREACHED_TIMEOUT_SECS,
+            awaited="the late self-test record",
+            producer=_AppendingProducer(log_path, record),
+        )
+        require(
+            event.get("sequence") == 1 and event.get("action") == "snapshot",
+            "a producer exit lost a record appended before the exit probe",
         )
 
 

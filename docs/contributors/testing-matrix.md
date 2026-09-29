@@ -78,6 +78,35 @@ synthetic fixture in
 adds only real-tree scale and incidental shapes no synthetic fixture
 reproduces.
 
+The `codestory-bench` proof-availability materializer owns one
+external-fixture lane, `proof-availability-frozen-checkouts`. Its only test,
+`frozen_source_receipts_match_the_exact_pinned_checkouts`, is `#[ignore]`d in
+the default gate because it requires the frozen cohort checkouts under
+`target/proof-availability/oracle-workspaces`. Produce them with the
+source-only materialize form documented in
+`docs/testing/proof-availability-v1.md` — it fetches the four pinned upstream
+commits (network access required) and all destinations are no-replace, so pick
+fresh paths for a rerun:
+
+```bash
+cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
+    materialize \
+    --corpus benchmarks/proof-availability/corpus-v1.json \
+    --workspace target/proof-availability/oracle-workspaces \
+    --cache-root target/proof-availability/unused-cache \
+    --out target/proof-availability/source-environment.json \
+    --verify-only
+
+cargo test --locked -p codestory-bench --bin codestory-proof-availability \
+    frozen_source_receipts_match_the_exact_pinned_checkouts -- --ignored --exact
+```
+
+The default suite covers the same receipt-file binding against a synthetic
+fixture in
+`oracle_source_verification_binds_steps_to_the_exact_full_file_bytes`; the
+named lane adds only the exact pinned upstream trees the frozen corpus
+references.
+
 ## Draft source checks
 
 Experiment-validity changes use the core-only exact-search cases in

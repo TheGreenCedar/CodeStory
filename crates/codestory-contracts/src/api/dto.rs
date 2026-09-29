@@ -3331,6 +3331,59 @@ mod packet_tests {
 
         assert_eq!(decoded, evidence);
         assert!(decoded.validation_errors().is_empty());
+
+        // A derive round-trip cannot catch a renamed or respelled field, so the
+        // persisted wire shape is pinned key by key.
+        let value = serde_json::to_value(&evidence).expect("evidence value");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+                "producer": {
+                    "name": "codestory-llama-sys",
+                    "version": "1.2.3",
+                },
+                "model": {
+                    "model_id": "model-v1",
+                    "model_sha256": "a".repeat(64),
+                    "model_size_bytes": 1024,
+                    "tokenizer_sha256": "b".repeat(64),
+                    "config_sha256": "c".repeat(64),
+                },
+                "semantics": {
+                    "dimension": 384,
+                    "query_prefix": "query: ",
+                    "document_prefix": "passage: ",
+                    "pooling": "mean",
+                    "normalization": "l2",
+                    "element_type": "f32",
+                    "vector_schema_version": 2,
+                },
+                "engine": {
+                    "engine": "llama.cpp",
+                    "engine_build_id": "build-v1",
+                    "backend": "metal",
+                    "device_id": "gpu-0",
+                    "device_class": "apple-gpu",
+                    "accelerator_kind": "metal",
+                },
+                "execution": {
+                    "eligibility": "eligible",
+                    "observed_state": "smoke_passed",
+                    "observation_source": "runtime_probe",
+                    "smoke_elapsed_ms": 8,
+                    "observed_at_epoch_ms": 123,
+                },
+                "publication": {
+                    "core_generation_id": "core-1",
+                    "core_run_id": "run-1",
+                    "retrieval_generation": "retrieval-1",
+                    "retrieval_input_hash": "d".repeat(64),
+                    "semantic_generation": "semantic-1",
+                },
+            }),
+            "the persisted producer-evidence wire shape is a durable contract"
+        );
     }
 
     #[test]
@@ -3500,6 +3553,56 @@ mod packet_tests {
                 encoded
             );
         }
+
+        // Pin the literal `kind` tags and field names the derive round-trip
+        // cannot catch. `exact_path`, `free_query`, and `qualified_symbol` are
+        // already pinned on the wire by the CLI stdio tests
+        // (codestory-cli/src/stdio_arguments.rs and stdio_catalog.rs); the
+        // remaining three variants are spelled out here.
+        assert_eq!(
+            serde_json::to_value(PacketProbeDto::SymbolId { id: "42".into() })
+                .expect("serialize symbol_id probe"),
+            serde_json::json!({"kind": "symbol_id", "id": "42"})
+        );
+        assert_eq!(
+            serde_json::to_value(PacketProbeDto::FileSymbol {
+                path: "src/lib.rs".into(),
+                symbol: "AppController".into(),
+            })
+            .expect("serialize file_symbol probe"),
+            serde_json::json!({
+                "kind": "file_symbol",
+                "path": "src/lib.rs",
+                "symbol": "AppController",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PacketProbeDto::Continuation {
+                contract_version: PACKET_PROBE_CONTRACT_VERSION,
+                project_id: "project-v3".into(),
+                core_generation_id: "core-generation".into(),
+                retrieval_generation: Some("retrieval-generation".into()),
+                selector: PacketContinuationSelectorV1 {
+                    stable_identity: "node:42".into(),
+                    path: None,
+                    symbol_id: Some("42".into()),
+                    reason: crate::compilation::PacketStructuralGapReasonV1::DisconnectedSeed,
+                },
+            })
+            .expect("serialize continuation probe"),
+            serde_json::json!({
+                "kind": "continuation",
+                "contract_version": 1,
+                "project_id": "project-v3",
+                "core_generation_id": "core-generation",
+                "retrieval_generation": "retrieval-generation",
+                "selector": {
+                    "stable_identity": "node:42",
+                    "symbol_id": "42",
+                    "reason": "disconnected_seed",
+                },
+            })
+        );
     }
 
     #[test]

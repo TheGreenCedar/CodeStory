@@ -65,5 +65,31 @@ mod tests {
 
         assert_eq!(decoded, pointer);
         assert_ne!(decoded.active, decoded.rollback.expect("rollback"));
+
+        // This pointer is a persisted on-disk contract, so its member spellings
+        // are pinned literally. `active` is additionally covered by the store
+        // tamper test indexing value["active"] (codestory-store
+        // core_generation.rs); `rollback` and `receipt_digest` are pinned here.
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("parse pointer as value");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": CORE_PUBLICATION_POINTER_SCHEMA_VERSION,
+                "active": {
+                    "generation_id": "generation-2",
+                    "run_id": "run-2",
+                    "logical_bytes": 8_192,
+                    "published_at_epoch_ms": 2,
+                },
+                "rollback": {
+                    "generation_id": "generation-1",
+                    "run_id": "run-1",
+                    "logical_bytes": 4_096,
+                    "published_at_epoch_ms": 1,
+                },
+                "receipt_digest": "a".repeat(64),
+            })
+        );
     }
 }

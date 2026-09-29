@@ -359,13 +359,24 @@ test("rejects a same-size source with the wrong digest", async (t) => {
 });
 
 test("offline acquisition fails before any download", async (t) => {
-  const { contract, directory } = await fixture(t);
+  // The fetch shim records every attempt: an offline error raised after a real
+  // fetch would look identical without it.
+  const { contract, directory, env, log, nodeArgs } = await transportFixture(t, "ok");
   const output = resolve(directory, "output.gguf");
 
-  const result = run(["--contract", contract, "--output", output, "--offline"], directory);
+  const result = run(
+    ["--contract", contract, "--output", output, "--offline"],
+    directory,
+    { env, nodeArgs },
+  );
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /offline model preparation requires/u);
+  assert.deepEqual(
+    await fetchCalls(log),
+    [],
+    "offline model preparation attempted a download",
+  );
 });
 
 test("retries a transport failure and succeeds within the attempt budget", async (t) => {
@@ -478,6 +489,38 @@ test("acquisition, build, and Rust evidence consume the checked-in contract", as
   assert.equal(parsed.embedding.pooling, "cls");
   assert.equal(parsed.embedding.normalization, "l2");
   assert.equal(parsed.license.spdx_id, "MIT");
+  // Every source must pin its own revision, and that revision must appear in
+  // the URL it serves from; a source pointing at a mutable ref or another
+  // revision would let the manifest drift from what the fetch retrieves.
+  for (const source of parsed.model.sources) {
+    assert.match(source.revision, /^[0-9a-f]{40}$/u);
+    assert.ok(
+      source.url.includes(`/resolve/${source.revision}/`),
+      `source URL does not pin its declared revision: ${source.url}`,
+    );
+  }
+  // The checked-in contract is the generated embedding identity's source of
+  // truth: the Rust constants that stamp persisted vectors must carry the same
+  // values, or vector identity silently diverges from the staged model.
+  const rustConst = (name) => {
+    const match = embeddingContract.match(
+      new RegExp(`const ${name}: (?:&str|usize|u32) =\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|(\\d+))`, "u"),
+    );
+    assert.ok(match, `embedding_contract.rs no longer defines ${name}`);
+    return match[1] !== undefined ? match[1] : Number(match[2]);
+  };
+  assert.equal(rustConst("RETRIEVAL_EMBEDDING_DIM"), parsed.embedding.dimension);
+  assert.equal(rustConst("CODERANK_QUERY_PREFIX"), parsed.embedding.query_prefix);
+  assert.equal(rustConst("CODERANK_DOCUMENT_PREFIX"), parsed.embedding.document_prefix);
+  assert.equal(rustConst("EMBEDDING_MODEL_ID"), parsed.model.file_name);
+  assert.equal(rustConst("EMBEDDING_MODEL_SHA256"), parsed.model.sha256);
+  assert.equal(rustConst("EMBEDDING_POOLING"), parsed.embedding.pooling);
+  assert.equal(rustConst("EMBEDDING_NORMALIZATION"), parsed.embedding.normalization);
+  assert.equal(rustConst("EMBEDDING_ELEMENT_TYPE"), parsed.embedding.element_type);
+  assert.equal(
+    rustConst("EMBEDDING_VECTOR_SCHEMA_VERSION"),
+    parsed.embedding.vector_schema_version,
+  );
   assert.match(acquisition, /model-contract\.json/u);
   assert.match(build, /model-contract\.json/u);
   assert.doesNotMatch(acquisition, new RegExp(parsed.model.sha256, "u"));
