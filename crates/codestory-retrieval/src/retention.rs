@@ -2584,15 +2584,17 @@ mod tests {
             "next_action must name the holder and forbid deletion: {}",
             peer.next_action()
         );
-        assert!(lock_path.is_file(), "the lock file exists while held");
         // Mutual exclusion binds to the lock inode, not its name: the holder's
-        // flock must still refuse a second writer after our timeout.
+        // flock must still refuse a second writer after our timeout. A waiter
+        // that unlinked the lock file would let this acquire a fresh inode
+        // while the child still holds the old one — two concurrent holders.
         assert!(
             GenerationRetentionLock::try_acquire(&state_file, SCOPE)
                 .expect("try acquire")
                 .is_none(),
             "a live holder must still exclude a second writer after our timeout"
         );
+        assert!(lock_path.is_file(), "the lock file exists while held");
 
         holder
             .kill()
