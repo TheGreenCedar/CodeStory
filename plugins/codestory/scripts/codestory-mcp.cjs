@@ -2691,6 +2691,34 @@ function removeManagedCliTempRoot(tempRoot, identity, options = {}) {
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }
 
+async function renameManagedCliStaging(
+  from,
+  to,
+  {
+    ops = fs,
+    platform = process.platform,
+    delaysMs = [10, 20, 40, 80, 160, 320, 640],
+  } = {},
+) {
+  const retryableCodes = new Set(['EPERM', 'EACCES', 'EBUSY']);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      ops.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (
+        platform !== 'win32' ||
+        !retryableCodes.has(error && error.code) ||
+        attempt >= delaysMs.length
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]));
+      if (ops.existsSync(to)) throw new Error('managed_cli_publish_target_reappeared');
+    }
+  }
+}
+
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
   const { target, asset, buildSource } = managedAssetIdentity(version);
@@ -2806,7 +2834,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       tempRootIdentity = null;
     }
     if (fs.existsSync(versionDir)) throw new Error('managed_cli_publish_target_reappeared');
-    fs.renameSync(stagingDir, versionDir);
+    await renameManagedCliStaging(stagingDir, versionDir);
     stagingDir = null;
     removeManagedCliDownloadCache(root, version);
     managedCliDownloadProgress.stage = null;
@@ -5257,6 +5285,7 @@ if (require.main === module) {
       minimumCompatiblePublicationStampSchemaVersion,
       provisionManagedCli,
       quarantineManagedCliVersion,
+      renameManagedCliStaging,
       releaseManagedCliLock,
       resolveManagedCli,
       runFailOpenMcp,

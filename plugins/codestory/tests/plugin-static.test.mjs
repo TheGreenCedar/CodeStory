@@ -7172,6 +7172,122 @@ test("managed cli resolution fails closed on a running Windows executable", { ti
   }
 });
 
+test("managed cli staging rename retries a transient win32 hold", async () => {
+  let calls = 0;
+  const ops = {
+    renameSync() {
+      calls += 1;
+      if (calls < 3) {
+        const error = new Error("held");
+        error.code = "EPERM";
+        throw error;
+      }
+    },
+    existsSync() {
+      return false;
+    },
+  };
+  await launcherTest.renameManagedCliStaging("from", "to", {
+    ops,
+    platform: "win32",
+    delaysMs: [0, 0, 0, 0, 0, 0, 0],
+  });
+  assert.equal(calls, 3);
+});
+
+test("managed cli staging rename rethrows a persistent win32 hold after the delay budget", async () => {
+  let calls = 0;
+  const ops = {
+    renameSync() {
+      calls += 1;
+      const error = new Error("held");
+      error.code = "EPERM";
+      throw error;
+    },
+    existsSync() {
+      return false;
+    },
+  };
+  const delaysMs = [0, 0, 0];
+  const error = await launcherTest
+    .renameManagedCliStaging("from", "to", { ops, platform: "win32", delaysMs })
+    .then(
+      () => null,
+      (caught) => caught,
+    );
+  assert.equal(error && error.code, "EPERM");
+  assert.equal(calls, 1 + delaysMs.length);
+});
+
+test("managed cli staging rename does not retry a non-transient win32 error", async () => {
+  let calls = 0;
+  const ops = {
+    renameSync() {
+      calls += 1;
+      const error = new Error("missing");
+      error.code = "ENOENT";
+      throw error;
+    },
+    existsSync() {
+      return false;
+    },
+  };
+  const error = await launcherTest
+    .renameManagedCliStaging("from", "to", { ops, platform: "win32", delaysMs: [0, 0, 0] })
+    .then(
+      () => null,
+      (caught) => caught,
+    );
+  assert.equal(error && error.code, "ENOENT");
+  assert.equal(calls, 1);
+});
+
+test("managed cli staging rename does not retry retryable codes off win32", async () => {
+  let calls = 0;
+  const ops = {
+    renameSync() {
+      calls += 1;
+      const error = new Error("held");
+      error.code = "EPERM";
+      throw error;
+    },
+    existsSync() {
+      return false;
+    },
+  };
+  const error = await launcherTest
+    .renameManagedCliStaging("from", "to", { ops, platform: "linux", delaysMs: [0, 0, 0] })
+    .then(
+      () => null,
+      (caught) => caught,
+    );
+  assert.equal(error && error.code, "EPERM");
+  assert.equal(calls, 1);
+});
+
+test("managed cli staging rename refuses a reappeared publish target before a retry", async () => {
+  let calls = 0;
+  const ops = {
+    renameSync() {
+      calls += 1;
+      const error = new Error("held");
+      error.code = "EPERM";
+      throw error;
+    },
+    existsSync() {
+      return true;
+    },
+  };
+  const error = await launcherTest
+    .renameManagedCliStaging("from", "to", { ops, platform: "win32", delaysMs: [0, 0, 0] })
+    .then(
+      () => null,
+      (caught) => caught,
+    );
+  assert.equal(error && error.message, "managed_cli_publish_target_reappeared");
+  assert.equal(calls, 1);
+});
+
 test("startup hook records active project without runtime bootstrap", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-minimal-"));
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
