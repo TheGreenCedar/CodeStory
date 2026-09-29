@@ -2,6 +2,7 @@ use crate::{args::SearchHitOutput, display, runtime};
 use codestory_contracts::api::{ApiError, ApiErrorDetails, CommandFailureEnvelope};
 use std::{
     ffi::{OsStr, OsString},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -42,6 +43,7 @@ pub(in crate::app) fn command_failure_envelope(
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     ))
     .with_context(context)
@@ -104,6 +106,64 @@ pub(in crate::app) fn emit_command_failure(
         return;
     }
     println!("{json}");
+}
+
+/// The evidence lines a failing command owes a human reading the default
+/// output: the same `context.causes` chain and `next_action`/`next_commands`
+/// guidance the JSON envelope already carries.
+pub(in crate::app) fn command_failure_details_markdown(
+    envelope: &CommandFailureEnvelope,
+) -> String {
+    let mut markdown = String::new();
+    let error = &envelope.error;
+    let _ = writeln!(markdown, "code: {}", error.code);
+    if let Some(details) = error.details.as_deref()
+        && let Some(layer) = details.failed_layer.as_deref()
+    {
+        let _ = writeln!(markdown, "failed_layer: {layer}");
+    }
+    if let Some(causes) = envelope
+        .context
+        .as_ref()
+        .and_then(|context| context.get("causes"))
+        .and_then(serde_json::Value::as_array)
+        && !causes.is_empty()
+    {
+        let _ = writeln!(markdown, "causes:");
+        for cause in causes {
+            let cause = cause
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| cause.to_string());
+            let _ = writeln!(markdown, "- {cause}");
+        }
+    }
+    if let Some(details) = error.details.as_deref() {
+        for action in &details.minimum_next {
+            let _ = writeln!(markdown, "next_action: {action}");
+        }
+        if details.next_commands.len() > details.minimum_next.len() {
+            let _ = writeln!(markdown, "next_commands:");
+            for command in details
+                .next_commands
+                .iter()
+                .skip(details.minimum_next.len())
+            {
+                let _ = writeln!(markdown, "- `{command}`");
+            }
+        }
+    }
+    markdown
+}
+
+/// The complete markdown document for a failed command, written to
+/// `--output-file` when the run did not ask for JSON.
+pub(in crate::app) fn render_command_failure_markdown(envelope: &CommandFailureEnvelope) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Command Error");
+    let _ = writeln!(markdown, "message: {}", envelope.error.message);
+    markdown.push_str(&command_failure_details_markdown(envelope));
+    markdown
 }
 
 pub(in crate::app) fn quote_command_path(path: &Path) -> String {

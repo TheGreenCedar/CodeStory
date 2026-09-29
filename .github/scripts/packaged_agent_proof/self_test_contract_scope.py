@@ -256,14 +256,58 @@ def _publication_identity_tests() -> None:
     }
     publication_identity = publication_identity_from_status(publication_status)
     require_sha256(publication_identity, "publication identity self-test")
-    hostile_publication_status = json.loads(json.dumps(publication_status))
-    hostile_publication_status["manifest"]["sidecar_generation"] = "stale-generation"
-    try:
-        publication_identity_from_status(hostile_publication_status)
-    except ProofFailure:
-        pass
-    else:
-        raise ProofFailure("manifest report/contract drift was accepted")
+
+    # Every contract->manifest pairing is bound one field at a time: dropping
+    # any one equality check must turn that field's drift invisible, so each
+    # divergence is an independent negative.
+    for contract_field, manifest_field in (
+        ("project_id", "project_id"),
+        ("generation", "sidecar_generation"),
+        ("input_hash", "sidecar_input_hash"),
+        ("schema_version", "sidecar_schema_version"),
+        ("graph_hash", "graph_artifact_hash"),
+    ):
+        hostile = json.loads(json.dumps(publication_status))
+        original = hostile["manifest"][manifest_field]
+        hostile["manifest"][manifest_field] = (
+            "stale-generation" if isinstance(original, str)
+            else original + 1
+        )
+        try:
+            publication_identity_from_status(hostile)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"manifest report/contract drift in {manifest_field} was accepted"
+            )
+
+    # Each identity-payload field must change the digest when it changes on
+    # both sides; a field dropped from the canonical payload stops binding it.
+    for contract_field, manifest_field, hostile_value in (
+        ("project_id", "project_id", "repo-v2-other-project"),
+        ("generation", "sidecar_generation", "repo-v2-other-generation"),
+        ("input_hash", "sidecar_input_hash", "9" * 64),
+        ("schema_version", "sidecar_schema_version", 7),
+        ("graph_hash", "graph_artifact_hash", "8" * 64),
+        (None, "lexical_version", "sqlite-fts5-v2"),
+        (None, "semantic_generation", "semantic-other"),
+        (None, "scip_revision", "graph-other"),
+    ):
+        consistent = json.loads(json.dumps(publication_status))
+        consistent["manifest"][manifest_field] = hostile_value
+        if contract_field is not None:
+            consistent["manifest_contract"][contract_field] = hostile_value
+        try:
+            shifted = publication_identity_from_status(consistent)
+        except ProofFailure as error:
+            raise ProofFailure(
+                f"a consistent {manifest_field} change was rejected: {error}"
+            ) from error
+        require(
+            shifted != publication_identity,
+            f"the publication identity does not bind {manifest_field}",
+        )
 
 
 def run_contract_scope_self_tests() -> None:

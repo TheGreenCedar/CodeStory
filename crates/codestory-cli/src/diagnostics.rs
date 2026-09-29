@@ -106,6 +106,99 @@ pub(crate) fn record_command_failure(error: &anyhow::Error) {
     let _ = process_diagnostics().write_record(record);
 }
 
+/// A support bundle is the user-facing triage artifact: the command's own
+/// report plus every diagnostics record this process cache root already holds.
+/// The records carry only what was safe at capture time (panic site
+/// file:line:column, payload sizes, event classes), so bundling them adds no
+/// new disclosure and there is no unredacted mode.
+const SUPPORT_BUNDLE_SCHEMA_VERSION: u32 = 1;
+const SUPPORT_BUNDLE_MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(crate) fn write_support_bundle(path: &Path, report: &Value) -> Result<()> {
+    let sink = process_diagnostics();
+    let (diagnostics, diagnostics_truncated) = collect_diagnostic_records(&sink);
+    let bundle = json!({
+        "schema_version": SUPPORT_BUNDLE_SCHEMA_VERSION,
+        "generated_at_unix_ms": unix_timestamp_ms(),
+        "correlation_id": sink.correlation_id.clone(),
+        "report": report,
+        "diagnostics": diagnostics,
+        "diagnostics_truncated": diagnostics_truncated,
+    });
+    let mut encoded = serde_json::to_vec_pretty(&bundle).context("encode support bundle")?;
+    encoded.push(b'\n');
+    refuse_symlink(path)?;
+    let mut file = open_private_truncated_file(path)
+        .with_context(|| format!("write support bundle {}", path.display()))?;
+    file.write_all(&encoded)
+        .with_context(|| format!("write support bundle {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync support bundle {}", path.display()))?;
+    Ok(())
+}
+
+/// Read the records the sink already persisted. Reading must stay
+/// observational: a missing or unreadable log contributes nothing, and the
+/// reader never creates the diagnostics directory or touches the record lock.
+fn collect_diagnostic_records(sink: &DiagnosticSink) -> (Vec<Value>, bool) {
+    let mut records = Vec::new();
+    let mut bytes: u64 = 0;
+    let mut truncated = false;
+    let mut read_file = |path: &Path, records: &mut Vec<Value>| {
+        let Ok(content) = fs::read(path) else {
+            return;
+        };
+        for line in content.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if bytes.saturating_add(line.len() as u64) > SUPPORT_BUNDLE_MAX_DIAGNOSTIC_BYTES {
+                truncated = true;
+                return;
+            }
+            match serde_json::from_slice::<Value>(line) {
+                Ok(record) => {
+                    bytes += line.len() as u64;
+                    records.push(record);
+                }
+                Err(_) => {
+                    records.push(json!({
+                        "event": "unparseable_diagnostic_record",
+                        "bytes": line.len(),
+                    }));
+                }
+            }
+        }
+    };
+    let directory = sink.diagnostics_dir();
+    read_file(&directory.join(LOG_FILE), &mut records);
+    for index in 1..=RETAINED_LOGS {
+        read_file(
+            &rotated_path(&directory.join(LOG_FILE), index),
+            &mut records,
+        );
+    }
+    for namespace in ["emergency-", "fail-stop-"] {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut candidates = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(namespace))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        for candidate in candidates {
+            read_file(&candidate, &mut records);
+        }
+    }
+    (records, truncated)
+}
+
 fn command_failure_record(error: &anyhow::Error) -> Value {
     let chain_count = error.chain().take(MAX_ERROR_CHAIN_COUNT + 1).count();
     json!({
@@ -848,16 +941,29 @@ mod tests {
                 query = "must stay redacted",
                 "packet entry observation"
             );
+            // Hostile guard: an allowlisted field carrying arbitrary private
+            // text must still be redacted — the allowlist admits digest lists
+            // only.
+            tracing::warn!(
+                raf_ranked_identity_digests = "unlabeled private query payload",
+                "hostile digest field"
+            );
         });
 
         let rows = read_jsonl(&sink.log_path())?;
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         let fields = &rows[0]["fields"];
         assert_eq!(fields["raf_ranked_identity_digests"], ranked);
         assert_eq!(fields["raf_admitted_identity_digests"], admitted);
         assert_eq!(fields["raf_final_identity_digests"], final_support);
         assert_eq!(fields["query"], "[redacted]");
         assert_eq!(fields["message"], REDACTED);
+        let hostile = serde_json::to_string(&rows[1])?;
+        assert_eq!(
+            rows[1]["fields"]["raf_ranked_identity_digests"], "[redacted]",
+            "a non-digest payload in an allowlisted field must not survive: {hostile}"
+        );
+        assert!(!hostile.contains("unlabeled private query payload"));
         Ok(())
     }
 
@@ -1070,6 +1176,30 @@ mod tests {
         bounded_locks::release(&lock)?;
 
         let files = evidence_files(&sink.diagnostics_dir(), "emergency-", ".jsonl")?;
+        // Positive controls first: a fallback writer that emitted nothing at
+        // all must not satisfy this test.
+        assert_eq!(
+            files.len(),
+            EMERGENCY_LOG_SLOTS,
+            "every contended write must reach a bounded emergency slot"
+        );
+        let mut survived = Vec::new();
+        for path in &files {
+            let row: Value = serde_json::from_slice(&fs::read(path)?)
+                .expect("each emergency slot holds one JSON record");
+            assert_eq!(row["event"], json!("lock_contention"));
+            assert_eq!(row["correlation_id"], json!("emergency-test"));
+            survived.push(row["index"].as_u64().expect("emergency row index"));
+        }
+        survived.sort_unstable();
+        let expected = ((EMERGENCY_LOG_SLOTS * 2)..(EMERGENCY_LOG_SLOTS * 3))
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            survived, expected,
+            "each slot must retain its newest write, so the surviving rows are \
+             the last EMERGENCY_LOG_SLOTS indexes"
+        );
         assert!(files.len() <= EMERGENCY_LOG_SLOTS);
         assert!(
             evidence_namespace_count(&sink.diagnostics_dir(), "emergency-")?

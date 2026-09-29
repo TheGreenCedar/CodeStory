@@ -548,13 +548,57 @@ mod tests {
 
     #[test]
     fn ranker_does_not_use_repo_name_features() {
+        // The first path component is repository identity, not evidence: the
+        // same candidates must rank identically whether the root happens to
+        // share a query token or not. Every fixture path already repeats the
+        // token, so substring overlap stays saturated at 1.0 under both roots
+        // and only a repo-name feature can move the result.
         let features = classify_query("handler");
-        let mut hit = CandidateHit::lexical_stub("src/handler.rs", 0.8);
-        hit.source = CandidateSource::Lexical;
-        hit.file_role = Some(FileRole::Source);
-        let ranked = rank_candidates(&features, vec![hit]);
-        let rf = ranked[0].rank_features.as_ref().expect("features");
-        assert!(rf.file_role_prior > 0.0);
+        let under_root = |root: &str| {
+            let make = |file: &str, symbol: &str, node: &str, line: u32, score: f32| {
+                let mut hit = CandidateHit::lexical_stub(format!("{root}/handler/{file}"), score);
+                hit.source = CandidateSource::Lexical;
+                hit.file_role = Some(FileRole::Source);
+                hit.symbol_name = Some(symbol.into());
+                hit.node_id = Some(node.into());
+                hit.start_line = Some(line);
+                hit.structural_kind = Some(NodeKind::FUNCTION);
+                hit
+            };
+            rank_candidates(
+                &features,
+                vec![
+                    make("util.rs", "util", "12", 9, 0.4),
+                    make("handler.rs", "handler", "11", 4, 0.8),
+                ],
+            )
+        };
+        let matching = under_root("handler-suite");
+        let renamed = under_root("billing-suite");
+        let suffix = |hit: &CandidateHit| {
+            hit.file_path
+                .split_once('/')
+                .expect("rooted fixture path")
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            matching.iter().map(&suffix).collect::<Vec<_>>(),
+            renamed.iter().map(&suffix).collect::<Vec<_>>(),
+            "renaming the repository root reordered candidates"
+        );
+        for (matching_hit, renamed_hit) in matching.iter().zip(renamed.iter()) {
+            assert_eq!(
+                matching_hit.score, renamed_hit.score,
+                "the repository name moved the fused score for {}",
+                renamed_hit.file_path
+            );
+            assert_eq!(
+                matching_hit.rank_features, renamed_hit.rank_features,
+                "the repository name changed rank features for {}",
+                renamed_hit.file_path
+            );
+        }
     }
 
     #[test]
@@ -860,14 +904,37 @@ mod tests {
             "dense_anchor".into(),
             "same_file_name_affinity".into(),
         ];
-        fused.scip_hop_distance = Some(1);
+        // A nonzero graph-lane score arrived through same-file-name affinity
+        // alone: no typed hop, no graph evidence, no graph provenance label.
+        // It must stay lane-local instead of minting a graph feature.
+        fused.record_lane(CandidateLane::Graph, 0.9, 1, "same_file_name_affinity");
+        let mut laneless = fused.clone();
+        laneless.lane_scores.graph = None;
 
         let ranked = rank_candidates(&features, vec![fused]);
-        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+        let laneless = rank_candidates(&features, vec![laneless]);
+        let candidate = &ranked[0];
+        let rank_features = candidate.rank_features.as_ref().expect("rank features");
 
         assert_eq!(rank_features.lexical, 0.85);
         assert_eq!(rank_features.semantic, 0.0);
-        assert_eq!(rank_features.scip_distance, 0.0);
+        assert_eq!(
+            rank_features.scip_distance, 0.0,
+            "same-file-name affinity must not export a graph feature"
+        );
+        assert_eq!(
+            candidate.score, laneless[0].score,
+            "an untyped graph lane must not reach the fused score"
+        );
+        assert_eq!(
+            candidate
+                .lane_scores
+                .graph
+                .as_ref()
+                .expect("graph lane evidence is retained")
+                .raw_score,
+            0.9
+        );
     }
 
     #[test]
@@ -887,12 +954,16 @@ mod tests {
 
         let dense = ranked
             .iter()
-            .find(|hit| hit.file_path == "docs/notes/glossary.md");
-        assert!(
-            dense.is_none_or(
-                |hit| hit.rank_features.as_ref().expect("rank features").semantic < 0.4
-            ),
-            "a barely related vector must not report a floored dense feature: {ranked:#?}"
+            .find(|hit| hit.file_path == "docs/notes/glossary.md")
+            .expect("the measured weak dense candidate must be retained, not dropped");
+        assert_eq!(
+            dense
+                .rank_features
+                .as_ref()
+                .expect("rank features")
+                .semantic,
+            0.02,
+            "the measured similarity must be reported exactly, with no floor: {ranked:#?}"
         );
         assert_eq!(
             ranked.first().map(|hit| hit.file_path.as_str()),

@@ -65,10 +65,12 @@ rather than republished, and is not recorded as a rollback target.
 Health probes cache the immutable half of lexical deep verification as a sealed
 validation receipt, and inherit its platform limit, stated in
 [the contracts subsystem](contracts.md#sealed-validation-receipts-and-their-platform-limit):
-on Windows a same-length in-place rewrite that restores the modification time
-still satisfies the seal, so within one process the probe keeps answering with
-the lexical verdict it already sealed. Receipts are process-local, so the next
-process re-reads the bytes; nothing persists a stale verdict across a restart.
+wherever the platform reports no native file identity — including a Windows
+file whose identity query fails — a same-length in-place rewrite that restores
+the modification time still satisfies the seal, so within one process the
+probe keeps answering with the lexical verdict it already sealed. Receipts are
+process-local, so the next process re-reads the bytes; nothing persists a
+stale verdict across a restart.
 
 Retrieval finalization holds an embedding residency lease across candidate
 build, validation, and publication. Manifest compatibility uses the stable

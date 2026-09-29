@@ -220,19 +220,16 @@ fn u03_colliding_route_siblings_keep_file_owned_openapi_projections() -> Result<
 }
 
 #[test]
-fn u06_kratos_openapi_and_swagger_project_when_present() -> Result<()> {
-    let pin = std::env::var_os("CODESTORY_U06_KRATOS_PIN").map(PathBuf::from);
-    let Some(pin) = pin.filter(|p| p.is_dir()) else {
-        eprintln!(
-            "skipping U06 pin fixtures; set CODESTORY_U06_KRATOS_PIN to exercise both schemas together"
-        );
-        return Ok(());
-    };
-    let openapi = fs::read(pin.join(".schema/openapi.json"))?;
-    let swagger = fs::read(pin.join("spec/swagger.json"))?;
+fn u06_openapi_and_swagger_dialects_share_a_project() -> Result<()> {
+    // Checked-in stand-ins for the Kratos pin: an OpenAPI 3 schema and a
+    // Swagger 2.0 schema indexed together exercise the mixed-dialect contract
+    // on every run instead of skipping when CODESTORY_U06_KRATOS_PIN is unset.
     let (_dir, storage) = index_files(&[
-        (".schema/openapi.json", openapi.as_slice()),
-        ("spec/swagger.json", swagger.as_slice()),
+        (
+            ".schema/openapi.json",
+            fixture("openapi.spec.global-auth.json"),
+        ),
+        ("spec/swagger.json", fixture("petstore-swagger.json")),
     ])?;
     for relative in [".schema/openapi.json", "spec/swagger.json"] {
         let file = storage

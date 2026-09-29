@@ -10,23 +10,23 @@ use codestory_contracts::api::{
     AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentHybridWeightsDto, ApiError,
-    AppEventPayload, EdgeKind, EmbeddingProfileContractDto, FrameworkRouteCoverageDto,
-    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
-    GroundingFileDigestDto, GroundingOrientationConfidenceDto, GroundingOrientationDto,
-    GroundingOrientationUncertaintyDto, GroundingSnapshotDto, GroundingSymbolDigestDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
-    IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, RouteEndpointKindDto,
-    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
-    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
-    StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
-    WorkspaceMemberIndexDto,
+    ApiErrorDetails, AppEventPayload, EdgeKind, EmbeddingProfileContractDto,
+    FrameworkRouteCoverageDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
+    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingOrientationConfidenceDto,
+    GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto,
+    IndexPublicationDto, IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId,
+    NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
+    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
+    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
+    TrailContextDto, WorkspaceMemberIndexDto,
 };
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -75,6 +75,28 @@ fn index_storage_error(context: &str, error: codestory_store::StorageError) -> A
         } => ApiError::insufficient_cache_space(operation, required_bytes, available_bytes),
         other => ApiError::internal(format!("{context}: {other}")),
     }
+}
+
+/// Recover the typed `peer_writer_active` failure from an anyhow chain: a
+/// writer-scope retention lock timed out behind a live peer, and the owner
+/// record it published beside the lock carries who that peer is.
+pub fn peer_writer_api_error(error: &anyhow::Error) -> Option<ApiError> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<codestory_retrieval::PeerWriterActive>()
+            .map(|peer| {
+                ApiError::with_details(
+                    "peer_writer_active",
+                    peer.to_string(),
+                    ApiErrorDetails {
+                        cause_code: Some("lock_wait_timeout".into()),
+                        failed_layer: Some("retrieval_finalize".into()),
+                        peer_writer: Some(peer.diagnostics()),
+                        ..ApiErrorDetails::cause("peer_writer_active")
+                    },
+                )
+            })
+    })
 }
 
 /// Preserve a sealed component copy's disk refusal through retrieval and CLI
@@ -170,8 +192,6 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
-#[cfg(test)]
-mod source_coverage;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]
 pub mod v3_evidence_qualification_support;
@@ -211,8 +231,8 @@ use index_freshness::{
 };
 #[cfg(test)]
 use index_freshness::{
-    EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, arm_after_index_freshness_fence_test_hook,
-    index_freshness_from_storage, indexable_source_path, not_checked_index_freshness,
+    arm_after_index_freshness_fence_test_hook, index_freshness_from_storage, indexable_source_path,
+    not_checked_index_freshness,
 };
 #[cfg(test)]
 use publication::{
@@ -228,12 +248,10 @@ use route_coverage::compare_optional_confidence_desc;
 use route_coverage::route_endpoint_adjusted_search_score;
 #[cfg(test)]
 use search_publication::{
-    SearchGenerationCompletion, llm_doc_embed_batch_size, load_persisted_search_state,
-    search_generation_completion_path, search_index_generation_root, search_index_storage_path,
+    SearchGenerationCompletion, load_persisted_search_state, search_generation_completion_path,
+    search_index_generation_root, search_index_storage_path,
 };
 use search_publication::{load_canonical_search_symbols, retrieval_state_from_storage_for_runtime};
-#[cfg(test)]
-use search_scoring::HybridSearchInstrumentation;
 pub(crate) use search_scoring::HybridSearchScoredHit;
 use search_state_cache::*;
 pub use semantic_projection::SemanticProjectionRepublishOutcome;
@@ -346,7 +364,7 @@ pub fn retrieval_state_from_manifest_storage_for_test(
             &process_defaults,
             &overrides,
         );
-    let storage = open_storage_for_read(storage_path)?;
+    let storage = open_storage_for_read(project_root, storage_path)?;
     search_publication::retrieval_state_from_storage_for_runtime(&storage, project_root, &runtime)
 }
 #[cfg(test)]
@@ -357,16 +375,13 @@ use semantic_projection::{
     SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV,
     SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_STREAM_PENDING_DOCS_ENV,
     SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, SYMBOL_SEARCH_DOC_PROVENANCE, SemanticDocAliasMode,
-    SemanticDocGraphContext, SemanticDocScope, build_component_report_docs,
-    build_llm_symbol_doc_text, build_search_state, build_semantic_file_text_cache_with_limits,
-    dense_anchor_is_central, dense_anchor_reason_for_node, finalize_staged_semantic_docs,
-    flush_pending_dense_anchor_inputs, llm_indexable_kind, llm_indexable_kind_for_scope,
-    llm_indexable_kinds_for_scope, llm_symbol_doc_hash, semantic_doc_alias_mode_from_env,
-    semantic_doc_alias_mode_from_value, semantic_doc_max_tokens_from_env,
-    semantic_doc_scope_from_env, semantic_doc_scope_from_value, semantic_doc_shape_contract,
-    semantic_doc_text_budget_cost, semantic_stream_sort_window_batches_from_env,
-    sort_pending_dense_anchor_inputs, stream_pending_llm_symbol_docs_from_env,
-    truncate_semantic_doc_text_to_token_budget,
+    SemanticDocGraphContext, SemanticDocScope, SemanticRuntimePolicy, build_search_state,
+    build_semantic_file_text_cache_with_limits, dense_anchor_is_central,
+    dense_anchor_reason_for_node, flush_pending_dense_anchor_inputs, llm_indexable_kind,
+    llm_indexable_kind_for_scope, llm_indexable_kinds_for_scope, llm_symbol_doc_hash,
+    semantic_doc_alias_mode_from_value, semantic_doc_scope_from_value,
+    semantic_doc_shape_contract_for_runtime, semantic_doc_text_budget_cost,
+    sort_pending_dense_anchor_inputs,
 };
 pub(crate) use snippets::{
     BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
@@ -475,11 +490,54 @@ pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRun
         &codestory_retrieval::SidecarRuntimeOverrides::default(),
     )
 }
+
+/// Runtime config whose process-owned defaults carry `cache_root` instead of
+/// the ambient process cache. The caller owns the directory and must keep it
+/// alive until every worker a runtime built from it has quiesced.
+#[cfg(test)]
+pub(crate) fn test_sidecar_runtime_with_cache_root(
+    cache_root: &std::path::Path,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+    );
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        None,
+        codestory_retrieval::SidecarProfile::Local,
+        None,
+        &process_defaults,
+        &codestory_retrieval::SidecarRuntimeOverrides::default(),
+    )
+}
+
+/// Runtime whose process-owned defaults carry `cache_root` instead of the
+/// ambient process cache. The caller owns the directory and must keep it
+/// alive until every activation worker the runtime spawned has quiesced.
+#[cfg(test)]
+pub(crate) fn test_runtime_with_owned_cache_root(cache_root: &std::path::Path) -> Runtime {
+    Runtime::new_with_config(test_sidecar_runtime_with_cache_root(cache_root))
+}
+
+impl Runtime {
+    /// The cache root captured in this runtime's immutable process defaults.
+    /// Tests assert it equals their owned directory so a regression back to
+    /// ambient process defaults is observable without relying on writes.
+    #[cfg(test)]
+    pub(crate) fn test_owned_cache_root(&self) -> &std::path::Path {
+        &self.controller.runtime_config.cache_root
+    }
+}
 #[doc(hidden)]
 pub use agent::packet_batch::{
     PacketEntryObservationPhase, PacketLatencyScopeGuard, enter_packet_latency_scope,
     observe_packet_entry_phase,
 };
+pub use call_path_kernel::PROOF_DOMAIN;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use controller_indexing::set_mid_indexing_test_hook;
+pub use index_incremental::{StaleCachedCore, observe_stale_cached_cores};
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
@@ -493,8 +551,9 @@ pub use services::{
     ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
     ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
-    IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error, search_operation_name, set_activation_fail_stop_hook,
+    HistoricalServedReason, IndexService, OperationFreshness, OperationReadClass, ProjectService,
+    PublicOperation, PublicOperationService, SearchService, TrailService, embedding_api_error,
+    operation_read_class, search_operation_name, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -518,8 +577,6 @@ pub(crate) use support::{
     source_freshness_telemetry_for_operation,
 };
 #[cfg(test)]
-pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};
-#[cfg(test)]
 use symbol_query::compare_search_hits;
 pub use symbol_query::{
     RetrievalFileRole, SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment,
@@ -531,8 +588,6 @@ pub(crate) use symbol_query::{
     compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_term,
     looks_like_standalone_symbol_query, query_mentions_non_primary_source,
 };
-#[cfg(test)]
-pub(crate) use symbol_query::{is_non_primary_source_hit, mixed_natural_language_query};
 
 type Storage = Store;
 type GraphNodeId = codestory_contracts::graph::NodeId;
@@ -680,9 +735,6 @@ struct AppState {
     observed_core_publication: Option<IndexPublicationDto>,
     is_indexing: bool,
     index_freshness_cache: Option<CachedIndexFreshness>,
-    #[cfg(test)]
-    #[allow(dead_code)]
-    last_hybrid_instrumentation: Option<HybridSearchInstrumentation>,
 }
 
 fn publish_search_engine(

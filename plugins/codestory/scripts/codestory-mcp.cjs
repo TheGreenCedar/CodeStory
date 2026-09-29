@@ -87,7 +87,7 @@ const supportedMcpProtocolVersions = Object.freeze([
   '2025-06-18',
   '2025-11-25',
 ]);
-const publicationStampSchemaVersion = 3;
+const publicationStampSchemaVersion = 4;
 const minimumCompatiblePublicationStampSchemaVersion = 3;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
@@ -2063,12 +2063,24 @@ function managedCliVersionProbeFailure(probeOrReason, expectedVersion) {
   return kind === 'version_probe_mismatch' ? kind : null;
 }
 
+// Containment rejections raised while verifying a staged or installed managed
+// CLI are fixed launcher tokens, safe to preserve in the surfaced code so the
+// hint can name the actual cause instead of the generic staging label.
+const managedCliVerificationContainmentReasons = new Set([
+  'manifest_path_unsafe',
+  'manifest_path_escape',
+]);
+
 function managedCliFailureCode(error) {
   const message = String(error?.message || error || 'unknown_failure');
   const code = safeFailureToken(message, 'unknown_failure');
   if (code !== 'managed_cli_staging_verification_failed') return code;
   const probeFailure = managedCliVersionProbeFailure(message.slice(code.length + 1));
-  return probeFailure ? `${code}:${probeFailure}` : code;
+  if (probeFailure) return `${code}:${probeFailure}`;
+  const reason = safeFailureToken(message.slice(code.length + 1), null);
+  return reason && managedCliVerificationContainmentReasons.has(reason)
+    ? `${code}:${reason}`
+    : code;
 }
 
 // The machine-readable failure code is deliberately reduced to a single safe token, which left the
@@ -2119,6 +2131,15 @@ function managedCliDownloadHint(context, code) {
   if (code === 'archive_checksum_mismatch') {
     return 'The runtime archive failed checksum verification and was discarded. ' +
       'Retry the tool to download it again.';
+  }
+  if (code === 'managed_cli_staging_verification_failed:manifest_path_escape' ||
+    code === 'managed_cli_staging_verification_failed:manifest_path_unsafe') {
+    return 'The managed runtime path resolves outside its own version directory, ' +
+      'which the containment check rejects. If you linked the executable out, ' +
+      'replace the link with a hard link or a real copy — a symlink escape is ' +
+      'refused — and never point a host directly into the revision-hashed ' +
+      'plugin cache. To bypass managed provisioning entirely, install ' +
+      'codestory-cli yourself and point CODESTORY_CLI at it.';
   }
   if (!context) return null;
   const resumeNote = context.resumable_bytes > 0
@@ -2352,7 +2373,7 @@ function v3LauncherSession(requested, discoveryContracts) {
     requested: asked || null,
     negotiated,
     discoveryContractSha256,
-    publicationSchemaVersion: 3,
+    publicationSchemaVersion: publicationStampSchemaVersion,
   });
 }
 
@@ -2670,6 +2691,34 @@ function removeManagedCliTempRoot(tempRoot, identity, options = {}) {
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }
 
+async function renameManagedCliStaging(
+  from,
+  to,
+  {
+    ops = fs,
+    platform = process.platform,
+    delaysMs = [10, 20, 40, 80, 160, 320, 640],
+  } = {},
+) {
+  const retryableCodes = new Set(['EPERM', 'EACCES', 'EBUSY']);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      ops.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (
+        platform !== 'win32' ||
+        !retryableCodes.has(error && error.code) ||
+        attempt >= delaysMs.length
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]));
+      if (ops.existsSync(to)) throw new Error('managed_cli_publish_target_reappeared');
+    }
+  }
+}
+
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
   const { target, asset, buildSource } = managedAssetIdentity(version);
@@ -2785,7 +2834,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       tempRootIdentity = null;
     }
     if (fs.existsSync(versionDir)) throw new Error('managed_cli_publish_target_reappeared');
-    fs.renameSync(stagingDir, versionDir);
+    await renameManagedCliStaging(stagingDir, versionDir);
     stagingDir = null;
     removeManagedCliDownloadCache(root, version);
     managedCliDownloadProgress.stage = null;
@@ -5236,6 +5285,7 @@ if (require.main === module) {
       minimumCompatiblePublicationStampSchemaVersion,
       provisionManagedCli,
       quarantineManagedCliVersion,
+      renameManagedCliStaging,
       releaseManagedCliLock,
       resolveManagedCli,
       runFailOpenMcp,

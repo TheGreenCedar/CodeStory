@@ -565,6 +565,41 @@ fn assert_resolved_call_count_to_method_owner_in_file(
     );
 }
 
+/// Ordinary-call census: a negative resolution assertion is vacuous unless the
+/// designated caller really emitted the expected CALL edges toward the callee
+/// (matched on the edge's raw target). Assert this before every negative
+/// helper so a dropped call census cannot let the negative pass silently.
+fn assert_ordinary_call_census(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    callee_name: &str,
+    expected_count: usize,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let count = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, callee_name))
+        })
+        .count();
+
+    assert_eq!(
+        count,
+        expected_count,
+        "Case `{case_name}`: ordinary call census expected {expected_count} CALL edge(s) \
+         `{caller_name}` -> `{callee_name}`; negative assertions are vacuous without them. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
 fn assert_no_resolved_call_to_method_owner_in_file(
     case_name: &str,
     nodes: &[Node],
@@ -971,6 +1006,14 @@ class Widget:
         ("external.py", external_source),
         ("workflow.py", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "python self receiver shadowing import",
+        &nodes,
+        &edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "python self receiver shadowing import",
         &nodes,
@@ -1043,6 +1086,14 @@ def union_typed(repo: Repository | None):
 
     let (nodes, edges) = index_single_file("workflow.py", source)?;
     for caller in ["unannotated", "union_typed"] {
+        assert_ordinary_call_census(
+            "python imprecise receiver",
+            &nodes,
+            &edges,
+            caller,
+            "save",
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "python imprecise receiver",
             &nodes,
@@ -1050,6 +1101,14 @@ def union_typed(repo: Repository | None):
             caller,
             "Repository",
             "save",
+        );
+        assert_ordinary_call_census(
+            "python imprecise receiver",
+            &nodes,
+            &edges,
+            caller,
+            "save",
+            1,
         );
         assert_no_resolved_call_to_method_owner(
             "python imprecise receiver",
@@ -1179,6 +1238,14 @@ class Notifier:
         "notify_event",
         "notifier.py",
     );
+    assert_ordinary_call_census(
+        "python imported annotated receiver",
+        &nodes,
+        &edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "python imported annotated receiver",
         &nodes,
@@ -1187,6 +1254,14 @@ class Notifier:
         "Notifier",
         "notify_event",
         "shadow.py",
+    );
+    assert_ordinary_call_census(
+        "python imported untyped receiver",
+        &nodes,
+        &edges,
+        "untyped",
+        "notify_event",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "python imported untyped receiver",
@@ -1201,6 +1276,14 @@ class Notifier:
         ("shadow.py", shadow_source),
         ("workflow.py", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "python missing imported owner",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python missing imported owner",
         &missing_nodes,
@@ -1214,6 +1297,14 @@ class Notifier:
         ("other/notifier.py", notifier_source),
         ("workflow.py", misplaced_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "python misplaced imported owner",
+        &misplaced_nodes,
+        &misplaced_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python misplaced imported owner",
         &misplaced_nodes,
@@ -1227,6 +1318,14 @@ class Notifier:
         ("other/notifier.py", notifier_source),
         ("workflow.py", unimported_annotation_source),
     ])?;
+    assert_ordinary_call_census(
+        "python unimported annotated owner",
+        &unimported_nodes,
+        &unimported_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python unimported annotated owner",
         &unimported_nodes,
@@ -1241,6 +1340,14 @@ class Notifier:
         ("shadow.py", shadow_source),
         ("workflow.py", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "python duplicate imported owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python duplicate imported owner",
         &duplicate_nodes,
@@ -1262,6 +1369,14 @@ class Notifier:
         "Notifier",
         "notify_event",
         "workflow.py",
+    );
+    assert_ordinary_call_census(
+        "python local shadowed imported owner",
+        &local_shadow_nodes,
+        &local_shadow_edges,
+        "run",
+        "notify_event",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "python local shadowed imported owner",
@@ -1340,6 +1455,7 @@ class Notifier:
     ] {
         let (nodes, edges) =
             index_files(&[("notifier.py", notifier_source), ("workflow.py", &source)])?;
+        assert_ordinary_call_census(name, &nodes, &edges, "run", "notify_event", 1);
         assert_no_resolved_call_to_method_owner(
             name,
             &nodes,
@@ -1356,6 +1472,14 @@ class Notifier:
         ("notifier.py", notifier_source),
         ("workflow.py", &constructor_source),
     ])?;
+    assert_ordinary_call_census(
+        "local annotation authority does not restore guessed constructor binding",
+        &constructor_nodes,
+        &constructor_edges,
+        "construct",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "local annotation authority does not restore guessed constructor binding",
         &constructor_nodes,
@@ -1369,6 +1493,14 @@ class Notifier:
         ("notifier.py", notifier_source),
         ("workflow.py", assignment_shadow_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "python assignment shadowed imported owner",
+        &assignment_shadow_nodes,
+        &assignment_shadow_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "python assignment shadowed imported owner",
         &assignment_shadow_nodes,
@@ -1407,6 +1539,14 @@ class Notifier:
         "notify_event",
         "notifier.py",
     );
+    assert_ordinary_call_census(
+        "python aliased imported owner",
+        &alias_nodes,
+        &alias_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "python aliased imported owner",
         &alias_nodes,
@@ -1431,6 +1571,14 @@ class Notifier:
         "notify_event",
         "notifier.py",
     );
+    assert_ordinary_call_census(
+        "python multiline imported owner",
+        &multiline_nodes,
+        &multiline_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "python multiline imported owner",
         &multiline_nodes,
@@ -1445,6 +1593,14 @@ class Notifier:
         ("notifier.py", ambiguous_notifier_source),
         ("workflow.py", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "python ambiguous imported owner",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "notify_event",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python ambiguous imported owner",
         &ambiguous_nodes,
@@ -1565,6 +1721,14 @@ class Pipeline:
             "run",
             "workflow.py",
         );
+        assert_ordinary_call_census(
+            "python imported property receiver",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "python imported property receiver",
             &nodes,
@@ -1580,6 +1744,14 @@ class Pipeline:
         ("workflow.py", workflow_source),
         ("main.py", missing_source),
     ])?;
+    assert_ordinary_call_census(
+        "python missing imported property owner",
+        &missing_nodes,
+        &missing_edges,
+        "Pipeline.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python missing imported property owner",
         &missing_nodes,
@@ -1594,6 +1766,14 @@ class Pipeline:
         ("shadow.py", shadow_source),
         ("main.py", duplicate_source),
     ])?;
+    assert_ordinary_call_census(
+        "python duplicate imported property owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Pipeline.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python duplicate imported property owner",
         &duplicate_nodes,
@@ -1683,6 +1863,14 @@ class NestedAssignmentPipeline:
         "StaticAssignmentPipeline.run",
         "ClassAssignmentPipeline.run",
     ] {
+        assert_ordinary_call_census(
+            "python uncertain property receiver",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "python uncertain property receiver",
             &nodes,
@@ -1690,6 +1878,14 @@ class NestedAssignmentPipeline:
             caller,
             "Workflow",
             "run",
+        );
+        assert_ordinary_call_census(
+            "python uncertain property receiver",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
         );
         assert_no_resolved_call_to_method_owner(
             "python uncertain property receiver",
@@ -1707,6 +1903,14 @@ class NestedAssignmentPipeline:
         "NestedAssignmentPipeline.run",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "python property receiver ignores nested assignment",
+        &nodes,
+        &edges,
+        "NestedAssignmentPipeline.run",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "python property receiver ignores nested assignment",
@@ -1852,6 +2056,14 @@ class ReassignedSession:
         "ReassignedSession.send",
     ] {
         for owner in ["BaseAdapter", "HTTPAdapter"] {
+            assert_ordinary_call_census(
+                "python imprecise factory return",
+                &nodes,
+                &edges,
+                caller,
+                "send",
+                1,
+            );
             assert_no_resolved_call_to_method_owner(
                 "python imprecise factory return",
                 &nodes,
@@ -1922,6 +2134,14 @@ def run():
             "run",
             "workflow.py",
         );
+        assert_ordinary_call_census(
+            "python imported constructor local receiver",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "python imported constructor local receiver",
             &nodes,
@@ -1937,6 +2157,14 @@ def run():
         ("workflow.py", workflow_source),
         ("main.py", missing_source),
     ])?;
+    assert_ordinary_call_census(
+        "python missing imported constructor owner",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python missing imported constructor owner",
         &missing_nodes,
@@ -1951,6 +2179,14 @@ def run():
         ("shadow.py", shadow_source),
         ("main.py", duplicate_source),
     ])?;
+    assert_ordinary_call_census(
+        "python duplicate imported constructor owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "python duplicate imported constructor owner",
         &duplicate_nodes,
@@ -2223,6 +2459,21 @@ def shadowed_module(method, url):
             "DuplicateEnterSession",
             "AsyncEnterSession",
         ] {
+            // `nested_scope` delegates to a nested `inner` callable that owns
+            // the `session.request` call; census that inner-owned edge.
+            let census_caller = if caller == "nested_scope" {
+                "inner"
+            } else {
+                caller
+            };
+            assert_ordinary_call_census(
+                "python with-item fail-closed guard",
+                &nodes,
+                &edges,
+                census_caller,
+                "request",
+                1,
+            );
             assert_no_resolved_call_to_method_owner_in_file(
                 "python with-item fail-closed guard",
                 &nodes,
@@ -2319,6 +2570,14 @@ def future_local_class_shadow():
         "local_from_import_alias_shadow",
         "future_local_class_shadow",
     ] {
+        assert_ordinary_call_census(
+            "python constructor local visibility guard",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "python constructor local visibility guard",
             &nodes,
@@ -2328,6 +2587,14 @@ def future_local_class_shadow():
             "run",
             "workflow.py",
         );
+        assert_ordinary_call_census(
+            "python constructor local visibility guard",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "python constructor local visibility guard",
             &nodes,
@@ -2336,6 +2603,14 @@ def future_local_class_shadow():
             "Workflow",
             "run",
             "shadow.py",
+        );
+        assert_ordinary_call_census(
+            "python constructor local visibility guard",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
         );
         assert_no_resolved_call_to_method_owner_in_file(
             "python constructor local visibility guard",
@@ -2355,6 +2630,14 @@ def future_local_class_shadow():
         "Workflow",
         "run",
         "main.py",
+    );
+    assert_ordinary_call_census(
+        "python constructor local class shadow",
+        &nodes,
+        &edges,
+        "local_class_shadow",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "python constructor local class shadow",
@@ -2446,6 +2729,18 @@ def outer(repo: Repository):
         "outer",
         "Repository",
         "flush",
+    );
+    // Census anchor: the nested `inner` callable owns the `repo.save()` call.
+    // The negative assertions below deliberately expect no outer-owned `save`
+    // edge; the census therefore proves the *inner-owned* call exists.
+    assert_ordinary_call_census("python nested receiver", &nodes, &edges, "inner", "save", 1);
+    assert_ordinary_call_census(
+        "python nested receiver",
+        &nodes,
+        &edges,
+        "outer",
+        "flush",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "python nested receiver",
@@ -2606,6 +2901,7 @@ type Notifier interface {
         "Notify",
         "project/notifier/notifier.go",
     );
+    assert_ordinary_call_census("go imported receiver", &nodes, &edges, "Run", "Notify", 1);
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported receiver",
         &nodes,
@@ -2615,6 +2911,7 @@ type Notifier interface {
         "Notify",
         "workflow.go",
     );
+    assert_ordinary_call_census("go imported receiver", &nodes, &edges, "Run", "Notify", 1);
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported receiver",
         &nodes,
@@ -2629,6 +2926,14 @@ type Notifier interface {
         ("other/notifier/notifier.go", other_notifier_source),
         ("workflow.go", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "go imported receiver missing package",
+        &missing_import_nodes,
+        &missing_import_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported receiver missing package",
         &missing_import_nodes,
@@ -2650,6 +2955,14 @@ func Run(n Notifier) {
         ("project/notifier/notifier.go", notifier_source),
         ("workflow.go", no_import_workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "go unimported receiver type stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go unimported receiver type stays unresolved",
         &no_import_nodes,
@@ -2859,6 +3172,14 @@ func outerParamStillWorks(workflow Workflow) {
         "Run",
         "workflow.go",
     );
+    assert_ordinary_call_census(
+        "go same-file composite receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "go same-file composite receiver avoids other owner",
         &nodes,
@@ -2866,6 +3187,14 @@ func outerParamStillWorks(workflow Workflow) {
         "orchestrate",
         "OtherWorkflow",
         "Run",
+    );
+    assert_ordinary_call_census(
+        "go factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factoryOnly",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "go factory receiver stays unresolved",
@@ -2875,6 +3204,14 @@ func outerParamStillWorks(workflow Workflow) {
         "Workflow",
         "Run",
     );
+    assert_ordinary_call_census(
+        "go reassigned factory receiver invalidates stale owner",
+        &nodes,
+        &edges,
+        "reassignedFactory",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "go reassigned factory receiver invalidates stale owner",
         &nodes,
@@ -2883,6 +3220,14 @@ func outerParamStillWorks(workflow Workflow) {
         "Workflow",
         "Run",
     );
+    assert_ordinary_call_census(
+        "go redeclared factory receiver invalidates stale owner",
+        &nodes,
+        &edges,
+        "redeclaredFactory",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "go redeclared factory receiver invalidates stale owner",
         &nodes,
@@ -2890,6 +3235,14 @@ func outerParamStillWorks(workflow Workflow) {
         "redeclaredFactory",
         "Workflow",
         "Run",
+    );
+    assert_ordinary_call_census(
+        "go wrapper call containing composite stays unresolved",
+        &nodes,
+        &edges,
+        "wrappedComposite",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "go wrapper call containing composite stays unresolved",
@@ -2905,6 +3258,14 @@ func outerParamStillWorks(workflow Workflow) {
         &edges,
         "directOnly",
         "makeWorkflow",
+    );
+    assert_ordinary_call_census(
+        "go erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "go erased receiver stays unresolved",
@@ -2925,6 +3286,14 @@ func outerParamStillWorks(workflow Workflow) {
             file_suffix: "workflow.go",
             expected_count: 1,
         },
+    );
+    assert_ordinary_call_census(
+        "go local composite shadows typed parameter",
+        &nodes,
+        &edges,
+        "innerShadow",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "go local composite shadows typed parameter",
@@ -2970,6 +3339,14 @@ func orchestrate() {
         ("project/external/workflow.go", imported_owner_source),
         ("app/workflow.go", imported_caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "go unqualified composite receiver does not use imported cross-file owner",
+        &imported_nodes,
+        &imported_edges,
+        "orchestrate",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go unqualified composite receiver does not use imported cross-file owner",
         &imported_nodes,
@@ -3294,6 +3671,14 @@ func orchestrate() {
         "Run",
         "project/external/workflow.go",
     );
+    assert_ordinary_call_census(
+        "go qualified imported composite avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go qualified imported composite avoids other owner",
         &nodes,
@@ -3308,6 +3693,14 @@ func orchestrate() {
         ("project/external/workflow.go", external_source),
         ("app/workflow.go", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "go missing qualified imported composite receiver",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrate",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go missing qualified imported composite receiver",
         &missing_nodes,
@@ -3323,6 +3716,14 @@ func orchestrate() {
         ("project/other/workflow.go", other_source),
         ("app/workflow.go", duplicate_alias_source),
     ])?;
+    assert_ordinary_call_census(
+        "go duplicate qualified imported composite receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go duplicate qualified imported composite receiver",
         &duplicate_nodes,
@@ -3331,6 +3732,14 @@ func orchestrate() {
         "Workflow",
         "Run",
         "project/external/workflow.go",
+    );
+    assert_ordinary_call_census(
+        "go duplicate qualified imported composite receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "go duplicate qualified imported composite receiver",
@@ -3431,6 +3840,14 @@ func (w Workflow) Run() {
         "Notify",
         "project/notifier/notifier.go",
     );
+    assert_ordinary_call_census(
+        "go imported method receiver field avoids local same-name owner",
+        &nodes,
+        &edges,
+        "Run",
+        "Notify",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported method receiver field avoids local same-name owner",
         &nodes,
@@ -3439,6 +3856,14 @@ func (w Workflow) Run() {
         "Notifier",
         "Notify",
         "workflow.go",
+    );
+    assert_ordinary_call_census(
+        "go imported method receiver field avoids other package owner",
+        &nodes,
+        &edges,
+        "Run",
+        "Notify",
+        2,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported method receiver field avoids other package owner",
@@ -3467,6 +3892,14 @@ func (w Workflow) Run() {
         ),
         ("workflow.go", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "go duplicate imported method receiver field owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go duplicate imported method receiver field owner",
         &duplicate_nodes,
@@ -3475,6 +3908,14 @@ func (w Workflow) Run() {
         "Notifier",
         "Notify",
         "project/notifier/notifier.go",
+    );
+    assert_ordinary_call_census(
+        "go duplicate imported method receiver field owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        2,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "go duplicate imported method receiver field owner",
@@ -3490,6 +3931,14 @@ func (w Workflow) Run() {
         ("project/notifier/notifier.go", notifier_source),
         ("workflow.go", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "go imported method receiver field missing package",
+        &missing_nodes,
+        &missing_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go imported method receiver field missing package",
         &missing_nodes,
@@ -3504,6 +3953,14 @@ func (w Workflow) Run() {
         ("project/notifier/notifier.go", notifier_source),
         ("workflow.go", no_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "go qualified field type without import stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "go qualified field type without import stays unresolved",
         &no_import_nodes,
@@ -3742,6 +4199,14 @@ class Entry {
         "run",
         "src/com/acme/workflow/Entry.java",
     );
+    assert_ordinary_call_census(
+        "java var factory local receiver stays unresolved",
+        &nodes,
+        &edges,
+        "varFactory",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "java var factory local receiver stays unresolved",
         &nodes,
@@ -3759,6 +4224,14 @@ class Entry {
         "run",
         "src/com/acme/workflow/Entry.java",
     );
+    assert_ordinary_call_census(
+        "java object-typed wrapper stays unresolved",
+        &nodes,
+        &edges,
+        "objectWrapped",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "java object-typed wrapper stays unresolved",
         &nodes,
@@ -3767,6 +4240,14 @@ class Entry {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "java erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "java erased receiver stays unresolved",
         &nodes,
@@ -3774,6 +4255,14 @@ class Entry {
         "erased",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "java local receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "java local receiver avoids other owner",
@@ -3801,6 +4290,14 @@ class Entry {
             file_suffix: "src/com/acme/workflow/Entry.java",
             expected_count: 1,
         },
+    );
+    assert_ordinary_call_census(
+        "java local declaration shadows typed parameter",
+        &nodes,
+        &edges,
+        "innerShadow",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "java local declaration shadows typed parameter",
@@ -3830,6 +4327,14 @@ class Entry {
         "Workflow",
         "run",
         "src/com/acme/workflow/Entry.java",
+    );
+    assert_ordinary_call_census(
+        "java enhanced-for receiver does not leak",
+        &nodes,
+        &edges,
+        "enhancedForDoesNotLeak",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "java enhanced-for receiver does not leak",
@@ -3944,6 +4449,14 @@ class OtherWorkflow {
         "decorate",
         "src/com/acme/workflow/Workflow.java",
     );
+    assert_ordinary_call_census(
+        "java self receiver avoids same-named owner",
+        &nodes,
+        &edges,
+        "run",
+        "decorate",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "java self receiver avoids same-named owner",
         &nodes,
@@ -3961,6 +4474,14 @@ class OtherWorkflow {
         "save",
         "src/com/acme/workflow/Workflow.java",
     );
+    assert_ordinary_call_census(
+        "java local receiver shadow prevents field fallback",
+        &nodes,
+        &edges,
+        "localShadowsField",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "java local receiver shadow prevents field fallback",
         &nodes,
@@ -3968,6 +4489,14 @@ class OtherWorkflow {
         "localShadowsField",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "java erased field receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erasedField",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "java erased field receiver stays unresolved",
@@ -4000,6 +4529,14 @@ class Entry {
         ("src/com/acme/model/Workflow.java", owner_source),
         ("src/com/acme/app/Entry.java", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "java field receiver does not use unimported cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java field receiver does not use unimported cross-file owner",
         &cross_file_nodes,
@@ -4072,6 +4609,14 @@ class Workflow {
         "notifyEvent",
         "src/com/acme/mail/Notifier.java",
     );
+    assert_ordinary_call_census(
+        "java imported field receiver exact package",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java imported field receiver exact package",
         &nodes,
@@ -4090,6 +4635,14 @@ class Workflow {
             duplicate_import_source,
         ),
     ])?;
+    assert_ordinary_call_census(
+        "java duplicate imported field receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java duplicate imported field receiver local name",
         &duplicate_nodes,
@@ -4098,6 +4651,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "src/com/acme/mail/Notifier.java",
+    );
+    assert_ordinary_call_census(
+        "java duplicate imported field receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "java duplicate imported field receiver local name",
@@ -4205,6 +4766,14 @@ class Workflow {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "java imported receiver exact package",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java imported receiver exact package",
         &nodes,
@@ -4219,6 +4788,14 @@ class Workflow {
         ("src/com/acme/mail/Notifier.java", mail_notifier_source),
         ("src/com/acme/workflow/Workflow.java", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "java missing imported receiver package",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java missing imported receiver package",
         &missing_nodes,
@@ -4237,6 +4814,14 @@ class Workflow {
             duplicate_import_source,
         ),
     ])?;
+    assert_ordinary_call_census(
+        "java duplicate imported receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "java duplicate imported receiver local name",
         &duplicate_nodes,
@@ -4245,6 +4830,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "src/com/acme/mail/Notifier.java",
+    );
+    assert_ordinary_call_census(
+        "java duplicate imported receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "java duplicate imported receiver local name",
@@ -4268,6 +4861,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "src/com/acme/workflow/Workflow.java",
+    );
+    assert_ordinary_call_census(
+        "java local receiver shadows imported type",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "java local receiver shadows imported type",
@@ -4392,6 +4993,14 @@ fun run(notifier: Notifier) {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "kotlin imported receiver exact package",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin imported receiver exact package",
         &nodes,
@@ -4416,6 +5025,14 @@ fun run(notifier: Notifier) {
         "notifyEvent",
         "src/com/acme/mail/Notifier.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin aliased imported receiver exact package",
+        &alias_nodes,
+        &alias_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin aliased imported receiver exact package",
         &alias_nodes,
@@ -4430,6 +5047,14 @@ fun run(notifier: Notifier) {
         ("src/com/acme/mail/Notifier.kt", mail_notifier_source),
         ("src/com/acme/workflow/Workflow.kt", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin missing imported receiver package",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin missing imported receiver package",
         &missing_nodes,
@@ -4445,6 +5070,14 @@ fun run(notifier: Notifier) {
         ("src/com/acme/other/Notifier.kt", other_notifier_source),
         ("src/com/acme/workflow/Workflow.kt", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin duplicate imported receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported receiver local name",
         &duplicate_nodes,
@@ -4453,6 +5086,14 @@ fun run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "src/com/acme/mail/Notifier.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin duplicate imported receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported receiver local name",
@@ -4468,6 +5109,14 @@ fun run(notifier: Notifier) {
         ("src/com/acme/mail/Notifier.kt", mail_notifier_source),
         ("src/com/acme/workflow/Workflow.kt", wildcard_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin wildcard imported receiver stays unresolved",
+        &wildcard_nodes,
+        &wildcard_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin wildcard imported receiver stays unresolved",
         &wildcard_nodes,
@@ -4482,6 +5131,14 @@ fun run(notifier: Notifier) {
         ("src/com/acme/mail/Notifier.kt", mail_notifier_source),
         ("src/com/acme/workflow/Workflow.kt", no_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin unimported receiver type stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin unimported receiver type stays unresolved",
         &no_import_nodes,
@@ -4504,6 +5161,14 @@ fun run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "src/com/acme/workflow/Workflow.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin local receiver shadows imported type",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin local receiver shadows imported type",
@@ -4586,6 +5251,14 @@ fun orderAware() {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "kotlin same-file constructor receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "kotlin same-file constructor receiver avoids other owner",
         &nodes,
@@ -4594,6 +5267,14 @@ fun orderAware() {
         "OtherWorkflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "kotlin factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factoryOnly",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "kotlin factory receiver stays unresolved",
         &nodes,
@@ -4601,6 +5282,14 @@ fun orderAware() {
         "factoryOnly",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "kotlin erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "kotlin erased receiver stays unresolved",
@@ -4781,6 +5470,14 @@ fun orchestrate() {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "kotlin imported constructor receiver avoids other package",
+        &imported_nodes,
+        &imported_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin imported constructor receiver avoids other package",
         &imported_nodes,
@@ -4805,6 +5502,14 @@ fun orchestrate() {
         "run",
         "src/other/Workflow.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin aliased imported constructor receiver avoids other package",
+        &alias_nodes,
+        &alias_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin aliased imported constructor receiver avoids other package",
         &alias_nodes,
@@ -4819,6 +5524,14 @@ fun orchestrate() {
         ("src/other/Workflow.kt", imported_owner_source),
         ("src/app/UseWorkflow.kt", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin missing imported constructor package",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin missing imported constructor package",
         &missing_nodes,
@@ -4834,6 +5547,14 @@ fun orchestrate() {
         ("src/alternate/Workflow.kt", other_imported_owner_source),
         ("src/app/UseWorkflow.kt", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin duplicate imported constructor local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported constructor local name",
         &duplicate_nodes,
@@ -4842,6 +5563,14 @@ fun orchestrate() {
         "Workflow",
         "run",
         "src/other/Workflow.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin duplicate imported constructor local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported constructor local name",
@@ -4857,6 +5586,14 @@ fun orchestrate() {
         ("src/other/Workflow.kt", imported_owner_source),
         ("src/app/UseWorkflow.kt", wildcard_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin wildcard imported constructor receiver stays unresolved",
+        &wildcard_nodes,
+        &wildcard_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin wildcard imported constructor receiver stays unresolved",
         &wildcard_nodes,
@@ -4871,6 +5608,14 @@ fun orchestrate() {
         ("src/other/Workflow.kt", imported_owner_source),
         ("src/app/UseWorkflow.kt", no_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin unimported constructor receiver stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin unimported constructor receiver stays unresolved",
         &no_import_nodes,
@@ -4894,6 +5639,14 @@ fun orchestrate() {
         "run",
         "src/app/UseWorkflow.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin local constructor receiver shadows imported type",
+        &shadow_nodes,
+        &shadow_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin local constructor receiver shadows imported type",
         &shadow_nodes,
@@ -4916,6 +5669,14 @@ fun orchestrate() {
         "RemoteWorkflow",
         "run",
         "src/app/UseWorkflow.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin local constructor receiver shadows imported alias",
+        &alias_shadow_nodes,
+        &alias_shadow_edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin local constructor receiver shadows imported alias",
@@ -5031,6 +5792,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "decorate",
         "src/app/Workflow.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin self receiver avoids same-named owner",
+        &nodes,
+        &edges,
+        "run",
+        "decorate",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "kotlin self receiver avoids same-named owner",
         &nodes,
@@ -5047,6 +5816,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "Repository",
         "save",
         "src/app/Workflow.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin parameter shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "parameterShadowsProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "kotlin parameter shadow prevents property fallback",
@@ -5083,6 +5860,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "save",
         "src/app/Workflow.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin local constructor shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localConstructorShadowsProperty",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "kotlin local constructor shadow prevents property fallback",
         &nodes,
@@ -5090,6 +5875,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "localConstructorShadowsProperty",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "kotlin local factory shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localFactoryShadowsProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "kotlin local factory shadow prevents property fallback",
@@ -5099,6 +5892,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "Notifier",
         "notifyEvent",
     );
+    assert_ordinary_call_census(
+        "kotlin local Any shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localAnyShadowsProperty",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "kotlin local Any shadow prevents property fallback",
         &nodes,
@@ -5106,6 +5907,14 @@ fun makeNotifier(): Notifier = object : Notifier {
         "localAnyShadowsProperty",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "kotlin erased property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erasedProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "kotlin erased property receiver stays unresolved",
@@ -5138,6 +5947,14 @@ class Entry {
         ("src/other/Workflow.kt", owner_source),
         ("src/app/Entry.kt", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin property receiver does not use unimported cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin property receiver does not use unimported cross-file owner",
         &cross_file_nodes,
@@ -5217,6 +6034,14 @@ class Workflow(private val notifier: Notifier) {
         "notifyEvent",
         "src/com/acme/mail/Notifier.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin imported property receiver exact package",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin imported property receiver exact package",
         &nodes,
@@ -5241,6 +6066,14 @@ class Workflow(private val notifier: Notifier) {
         "notifyEvent",
         "src/com/acme/mail/Notifier.kt",
     );
+    assert_ordinary_call_census(
+        "kotlin aliased imported property receiver exact package",
+        &alias_nodes,
+        &alias_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin aliased imported property receiver exact package",
         &alias_nodes,
@@ -5256,6 +6089,14 @@ class Workflow(private val notifier: Notifier) {
         ("src/com/acme/other/Notifier.kt", other_notifier_source),
         ("src/com/acme/workflow/Workflow.kt", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "kotlin duplicate imported property receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported property receiver local name",
         &duplicate_nodes,
@@ -5264,6 +6105,14 @@ class Workflow(private val notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "src/com/acme/mail/Notifier.kt",
+    );
+    assert_ordinary_call_census(
+        "kotlin duplicate imported property receiver local name",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "kotlin duplicate imported property receiver local name",
@@ -5483,6 +6332,14 @@ class Program
         "Decorate",
         "src/Acme/Workflow/Program.cs",
     );
+    assert_ordinary_call_census(
+        "csharp var factory receiver stays fail-closed without return-type evidence",
+        &nodes,
+        &edges,
+        "VarFactory",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp var factory receiver stays fail-closed without return-type evidence",
         &nodes,
@@ -5491,6 +6348,14 @@ class Program
         "Workflow",
         "Run",
         "src/Acme/Workflow/Program.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp dynamic receiver stays fail-closed",
+        &nodes,
+        &edges,
+        "DynamicWrapped",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp dynamic receiver stays fail-closed",
@@ -5501,6 +6366,14 @@ class Program
         "Run",
         "src/Acme/Workflow/Program.cs",
     );
+    assert_ordinary_call_census(
+        "csharp qualified external local receiver does not collapse to same-file short owner",
+        &nodes,
+        &edges,
+        "ExternalQualifiedLocal",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp qualified external local receiver does not collapse to same-file short owner",
         &nodes,
@@ -5509,6 +6382,14 @@ class Program
         "Workflow",
         "Run",
         "src/Acme/Workflow/Program.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp qualified external constructor receiver does not collapse to same-file short owner",
+        &nodes,
+        &edges,
+        "ExternalQualifiedConstructor",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp qualified external constructor receiver does not collapse to same-file short owner",
@@ -5519,6 +6400,14 @@ class Program
         "Run",
         "src/Acme/Workflow/Program.cs",
     );
+    assert_ordinary_call_census(
+        "csharp qualified external static receiver does not collapse to same-file short owner",
+        &nodes,
+        &edges,
+        "ExternalQualifiedStatic",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp qualified external static receiver does not collapse to same-file short owner",
         &nodes,
@@ -5527,6 +6416,14 @@ class Program
         "Workflow",
         "Run",
         "src/Acme/Workflow/Program.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp precise local owner avoids same-name global fallback",
+        &nodes,
+        &edges,
+        "Local",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp precise local owner avoids same-name global fallback",
@@ -5591,6 +6488,14 @@ class Program
 "#;
     let (unique_nodes, unique_edges) =
         index_files(&[("src/Acme/Unique/Program.cs", unique_fallback_source)])?;
+    assert_ordinary_call_census(
+        "csharp uninferred var receiver stays fail-closed with unique global method",
+        &unique_nodes,
+        &unique_edges,
+        "VarFactory",
+        "Run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp uninferred var receiver stays fail-closed with unique global method",
         &unique_nodes,
@@ -5599,6 +6504,14 @@ class Program
         "Workflow",
         "Run",
         "src/Acme/Unique/Program.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp dynamic receiver stays fail-closed with unique global method",
+        &unique_nodes,
+        &unique_edges,
+        "DynamicFactory",
+        "Run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp dynamic receiver stays fail-closed with unique global method",
@@ -5822,6 +6735,14 @@ class Workflow
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "csharp using alias imported receiver exact namespace",
+        &nodes,
+        &edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp using alias imported receiver exact namespace",
         &nodes,
@@ -5849,6 +6770,14 @@ class Workflow
         "Notify",
         "src/Acme/Mail/Notifier.cs",
     );
+    assert_ordinary_call_census(
+        "csharp block namespace using alias imported receiver",
+        &block_alias_nodes,
+        &block_alias_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp block namespace using alias imported receiver",
         &block_alias_nodes,
@@ -5863,6 +6792,14 @@ class Workflow
         ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp missing using alias imported receiver",
+        &missing_nodes,
+        &missing_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp missing using alias imported receiver",
         &missing_nodes,
@@ -5878,6 +6815,14 @@ class Workflow
         ("src/Acme/Other/Notifier.cs", other_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", duplicate_alias_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp duplicate using alias imported receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate using alias imported receiver",
         &duplicate_nodes,
@@ -5886,6 +6831,14 @@ class Workflow
         "Notifier",
         "Notify",
         "src/Acme/Mail/Notifier.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp duplicate using alias imported receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate using alias imported receiver",
@@ -5909,6 +6862,14 @@ class Workflow
         "Mailer",
         "Notify",
         "src/Acme/Workflow/Workflow.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp local receiver shadows using alias",
+        &shadow_nodes,
+        &shadow_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp local receiver shadows using alias",
@@ -5936,6 +6897,14 @@ class Workflow
         "Notify",
         "src/Acme/Workflow/Workflow.cs",
     );
+    assert_ordinary_call_census(
+        "csharp block namespace local receiver shadows using alias",
+        &block_shadow_nodes,
+        &block_shadow_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp block namespace local receiver shadows using alias",
         &block_shadow_nodes,
@@ -5960,6 +6929,14 @@ class Workflow
         "Notify",
         "src/Acme/Mail/Notifier.cs",
     );
+    assert_ordinary_call_census(
+        "csharp plain namespace using avoids other namespace",
+        &plain_nodes,
+        &plain_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp plain namespace using avoids other namespace",
         &plain_nodes,
@@ -5978,6 +6955,14 @@ class Workflow
             duplicate_plain_using_source,
         ),
     ])?;
+    assert_ordinary_call_census(
+        "csharp duplicate plain namespace using stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate plain namespace using stays unresolved",
         &duplicate_plain_nodes,
@@ -5986,6 +6971,14 @@ class Workflow
         "Notifier",
         "Notify",
         "src/Acme/Mail/Notifier.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp duplicate plain namespace using stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate plain namespace using stays unresolved",
@@ -6002,6 +6995,14 @@ class Workflow
         ("src/Acme/Other/Notifier.cs", other_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", system_plain_using_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp system plus plain namespace using stays unresolved",
+        &system_plain_nodes,
+        &system_plain_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp system plus plain namespace using stays unresolved",
         &system_plain_nodes,
@@ -6010,6 +7011,14 @@ class Workflow
         "Notifier",
         "Notify",
         "src/Acme/Mail/Notifier.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp system plus plain namespace using stays unresolved",
+        &system_plain_nodes,
+        &system_plain_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp system plus plain namespace using stays unresolved",
@@ -6034,6 +7043,14 @@ class Workflow
         "Notify",
         "src/Acme/Workflow/Workflow.cs",
     );
+    assert_ordinary_call_census(
+        "csharp local receiver shadows plain namespace using",
+        &local_plain_shadow_nodes,
+        &local_plain_shadow_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp local receiver shadows plain namespace using",
         &local_plain_shadow_nodes,
@@ -6048,6 +7065,14 @@ class Workflow
         ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", static_plain_using_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp plain namespace using does not resolve static receiver",
+        &static_plain_nodes,
+        &static_plain_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp plain namespace using does not resolve static receiver",
         &static_plain_nodes,
@@ -6196,6 +7221,14 @@ class Workflow
         "Notify",
         "src/Acme/Mail/Notifier.cs",
     );
+    assert_ordinary_call_census(
+        "csharp using alias imported field receiver avoids other namespace",
+        &nodes,
+        &edges,
+        "Run",
+        "Notify",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp using alias imported field receiver avoids other namespace",
         &nodes,
@@ -6213,6 +7246,14 @@ class Workflow
         "Other",
         "Notify",
         "src/Acme/Workflow/Workflow.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp parameter name shadows using alias static receiver",
+        &nodes,
+        &edges,
+        "ParameterNameShadowsAlias",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp parameter name shadows using alias static receiver",
@@ -6252,6 +7293,14 @@ class Workflow
         ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp missing using alias imported field receiver",
+        &missing_nodes,
+        &missing_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp missing using alias imported field receiver",
         &missing_nodes,
@@ -6267,6 +7316,14 @@ class Workflow
         ("src/Acme/Other/Notifier.cs", other_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", duplicate_alias_source),
     ])?;
+    assert_ordinary_call_census(
+        "csharp duplicate using alias imported field receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate using alias imported field receiver",
         &duplicate_nodes,
@@ -6275,6 +7332,14 @@ class Workflow
         "Notifier",
         "Notify",
         "src/Acme/Mail/Notifier.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp duplicate using alias imported field receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp duplicate using alias imported field receiver",
@@ -6298,6 +7363,14 @@ class Workflow
         "Mailer",
         "Notify",
         "src/Acme/Workflow/Workflow.cs",
+    );
+    assert_ordinary_call_census(
+        "csharp local receiver shadows using alias field type",
+        &shadow_nodes,
+        &shadow_edges,
+        "Run",
+        "Notify",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp local receiver shadows using alias field type",
@@ -6387,6 +7460,14 @@ end
         "run",
         "src/workflow.rb",
     );
+    assert_ordinary_call_census(
+        "ruby factory receiver stays fail-closed without return-type evidence",
+        &nodes,
+        &edges,
+        "factory_returned",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby factory receiver stays fail-closed without return-type evidence",
         &nodes,
@@ -6395,6 +7476,14 @@ end
         "Workflow",
         "run",
         "src/workflow.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby local owner avoids same-name global fallback",
+        &nodes,
+        &edges,
+        "local_constructor",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby local owner avoids same-name global fallback",
@@ -6429,6 +7518,14 @@ end
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "ruby local operator reassignment stays fail-closed",
+        &nodes,
+        &edges,
+        "operator_reassigned",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby local operator reassignment stays fail-closed",
         &nodes,
@@ -6437,6 +7534,14 @@ end
         "Workflow",
         "run",
         "src/workflow.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby direct receiver constructor requires exact new segment",
+        &nodes,
+        &edges,
+        "non_constructor_segment",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby direct receiver constructor requires exact new segment",
@@ -6464,6 +7569,14 @@ end
         ("src/workflow.rb", owner_source),
         ("src/use_workflow.rb", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby constructor receiver does not use cross-file owner",
+        &cross_nodes,
+        &cross_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby constructor receiver does not use cross-file owner",
         &cross_nodes,
@@ -6572,6 +7685,14 @@ end
             "run",
             "src/workflow.rb",
         );
+        assert_ordinary_call_census(
+            "ruby require_relative constructor receiver",
+            &nodes,
+            &edges,
+            caller,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "ruby require_relative constructor receiver",
             &nodes,
@@ -6587,6 +7708,14 @@ end
         ("src/workflow.rb", workflow_source),
         ("src/use_workflow.rb", missing_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby missing require_relative owner",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby missing require_relative owner",
         &missing_nodes,
@@ -6602,6 +7731,14 @@ end
         ("src/shadow.rb", shadow_source),
         ("src/use_workflow.rb", duplicate_require_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby duplicate require_relative owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby duplicate require_relative owner",
         &duplicate_nodes,
@@ -6616,6 +7753,14 @@ end
         ("src/workflow.rb", wrong_owner_source),
         ("src/use_workflow.rb", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby require_relative owner mismatch stays unresolved",
+        &wrong_owner_nodes,
+        &wrong_owner_edges,
+        "direct_constructor",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby require_relative owner mismatch stays unresolved",
         &wrong_owner_nodes,
@@ -6624,6 +7769,14 @@ end
         "OtherWorkflow",
         "run",
         "src/workflow.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby require_relative owner mismatch stays unresolved",
+        &wrong_owner_nodes,
+        &wrong_owner_edges,
+        "direct_constructor",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby require_relative owner mismatch stays unresolved",
@@ -6639,6 +7792,14 @@ end
         ("src/workflow.rb", workflow_source),
         ("src/use_workflow.rb", assignment_shadow_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby constant assignment shadows require_relative owner",
+        &assignment_shadow_nodes,
+        &assignment_shadow_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby constant assignment shadows require_relative owner",
         &assignment_shadow_nodes,
@@ -6661,6 +7822,14 @@ end
         "Workflow",
         "run",
         "src/use_workflow.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby local class shadows require_relative owner",
+        &local_shadow_nodes,
+        &local_shadow_edges,
+        "run",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby local class shadows require_relative owner",
@@ -6771,6 +7940,14 @@ end
         "run",
         "src/entry.rb",
     );
+    assert_ordinary_call_census(
+        "ruby instance variable operator assignment stays fail-closed",
+        &nodes,
+        &edges,
+        "replace",
+        "run",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby instance variable operator assignment stays fail-closed",
         &nodes,
@@ -6783,6 +7960,14 @@ end
 
     let (class_body_nodes, class_body_edges) =
         index_files(&[("src/class_body.rb", class_body_source)])?;
+    assert_ordinary_call_census(
+        "ruby class-body instance variable does not authorize instance receiver",
+        &class_body_nodes,
+        &class_body_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby class-body instance variable does not authorize instance receiver",
         &class_body_nodes,
@@ -6795,6 +7980,14 @@ end
 
     let (singleton_nodes, singleton_edges) =
         index_files(&[("src/singleton.rb", singleton_source)])?;
+    assert_ordinary_call_census(
+        "ruby singleton instance variable does not authorize instance receiver",
+        &singleton_nodes,
+        &singleton_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby singleton instance variable does not authorize instance receiver",
         &singleton_nodes,
@@ -6812,6 +8005,14 @@ end
         "Workflow",
         "run",
         "src/entry.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby instance variable factory reassignment stays fail-closed",
+        &nodes,
+        &edges,
+        "replace",
+        "run",
+        2,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby instance variable factory reassignment stays fail-closed",
@@ -6843,6 +8044,14 @@ end
         ("src/workflow.rb", owner_source),
         ("src/entry.rb", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "ruby instance variable receiver does not use cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby instance variable receiver does not use cross-file owner",
         &cross_file_nodes,
@@ -6876,6 +8085,14 @@ class MixedEntry
 end
 "#;
     let (mixed_nodes, mixed_edges) = index_files(&[("src/mixed.rb", mixed_source)])?;
+    assert_ordinary_call_census(
+        "ruby mixed instance variable owners stay fail-closed",
+        &mixed_nodes,
+        &mixed_edges,
+        "run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby mixed instance variable owners stay fail-closed",
         &mixed_nodes,
@@ -6884,6 +8101,14 @@ end
         "Workflow",
         "run",
         "src/mixed.rb",
+    );
+    assert_ordinary_call_census(
+        "ruby mixed instance variable owners stay fail-closed",
+        &mixed_nodes,
+        &mixed_edges,
+        "run",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "ruby mixed instance variable owners stay fail-closed",
@@ -7086,6 +8311,14 @@ function explicit_property(): void
         "save",
         "src/App/workflow.php",
     );
+    assert_ordinary_call_census(
+        "php untyped property receiver stays fail-closed",
+        &nodes,
+        &edges,
+        "check",
+        "notify",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php untyped property receiver stays fail-closed",
         &nodes,
@@ -7104,6 +8337,14 @@ function explicit_property(): void
         "notify",
         "src/App/workflow.php",
     );
+    assert_ordinary_call_census(
+        "php factory receiver stays fail-closed without return-type evidence",
+        &nodes,
+        &edges,
+        "factory_returned",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php factory receiver stays fail-closed without return-type evidence",
         &nodes,
@@ -7113,6 +8354,14 @@ function explicit_property(): void
         "run",
         "src/App/workflow.php",
     );
+    assert_ordinary_call_census(
+        "php nullsafe factory receiver stays fail-closed without return-type evidence",
+        &nodes,
+        &edges,
+        "factory_nullsafe_returned",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php nullsafe factory receiver stays fail-closed without return-type evidence",
         &nodes,
@@ -7121,6 +8370,14 @@ function explicit_property(): void
         "Workflow",
         "run",
         "src/App/workflow.php",
+    );
+    assert_ordinary_call_census(
+        "php local owner avoids same-name global fallback",
+        &nodes,
+        &edges,
+        "local_constructor",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php local owner avoids same-name global fallback",
@@ -7183,6 +8440,14 @@ function orchestrate(): void
         ("src/App/workflow.php", owner_source),
         ("src/App/use_workflow.php", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "php constructor receiver does not use cross-file owner",
+        &cross_nodes,
+        &cross_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php constructor receiver does not use cross-file owner",
         &cross_nodes,
@@ -7404,6 +8669,14 @@ function run(Mailer $notifier): void
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "php use alias imported receiver exact namespace",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php use alias imported receiver exact namespace",
         &nodes,
@@ -7427,6 +8700,14 @@ function run(Mailer $notifier): void
         "Notifier",
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
+    );
+    assert_ordinary_call_census(
+        "php bracketed namespace use alias imported receiver",
+        &bracketed_nodes,
+        &bracketed_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php bracketed namespace use alias imported receiver",
@@ -7452,6 +8733,14 @@ function run(Mailer $notifier): void
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
     );
+    assert_ordinary_call_census(
+        "php unbracketed namespace use alias does not leak",
+        &leak_nodes,
+        &leak_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php unbracketed namespace use alias does not leak",
         &leak_nodes,
@@ -7460,6 +8749,14 @@ function run(Mailer $notifier): void
         "Notifier",
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
+    );
+    assert_ordinary_call_census(
+        "php unbracketed namespace use alias does not leak",
+        &leak_nodes,
+        &leak_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php unbracketed namespace use alias does not leak",
@@ -7475,6 +8772,14 @@ function run(Mailer $notifier): void
         ("src/Acme/Mail/Notifier.php", mail_notifier_source),
         ("src/Acme/Workflow/workflow.php", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "php missing use alias imported receiver",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php missing use alias imported receiver",
         &missing_nodes,
@@ -7490,6 +8795,14 @@ function run(Mailer $notifier): void
         ("src/Acme/Other/Notifier.php", other_notifier_source),
         ("src/Acme/Workflow/workflow.php", duplicate_alias_source),
     ])?;
+    assert_ordinary_call_census(
+        "php duplicate use alias imported receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate use alias imported receiver",
         &duplicate_nodes,
@@ -7498,6 +8811,14 @@ function run(Mailer $notifier): void
         "Notifier",
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
+    );
+    assert_ordinary_call_census(
+        "php duplicate use alias imported receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate use alias imported receiver",
@@ -7521,6 +8842,14 @@ function run(Mailer $notifier): void
         "Mailer",
         "notifyEvent",
         "src/Acme/Workflow/workflow.php",
+    );
+    assert_ordinary_call_census(
+        "php local receiver shadows use alias",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php local receiver shadows use alias",
@@ -7546,6 +8875,14 @@ function run(Mailer $notifier): void
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
     );
+    assert_ordinary_call_census(
+        "php plain use avoids other namespace",
+        &plain_nodes,
+        &plain_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php plain use avoids other namespace",
         &plain_nodes,
@@ -7561,6 +8898,14 @@ function run(Mailer $notifier): void
         ("src/Acme/Other/Notifier.php", other_notifier_source),
         ("src/Acme/Workflow/workflow.php", duplicate_plain_use_source),
     ])?;
+    assert_ordinary_call_census(
+        "php duplicate plain use stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate plain use stays unresolved",
         &duplicate_plain_nodes,
@@ -7569,6 +8914,14 @@ function run(Mailer $notifier): void
         "Notifier",
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
+    );
+    assert_ordinary_call_census(
+        "php duplicate plain use stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate plain use stays unresolved",
@@ -7584,6 +8937,14 @@ function run(Mailer $notifier): void
         ("src/Acme/Mail/Notifier.php", mail_notifier_source),
         ("src/Acme/Workflow/workflow.php", const_plain_use_source),
     ])?;
+    assert_ordinary_call_census(
+        "php const plain use is not treated as a type import",
+        &const_plain_nodes,
+        &const_plain_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php const plain use is not treated as a type import",
         &const_plain_nodes,
@@ -7598,6 +8959,14 @@ function run(Mailer $notifier): void
         ("src/Acme/Mail/Notifier.php", mail_notifier_source),
         ("src/Acme/Workflow/workflow.php", grouped_plain_use_source),
     ])?;
+    assert_ordinary_call_census(
+        "php grouped plain use stays unresolved",
+        &grouped_plain_nodes,
+        &grouped_plain_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php grouped plain use stays unresolved",
         &grouped_plain_nodes,
@@ -7622,6 +8991,14 @@ function run(Mailer $notifier): void
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
     );
+    assert_ordinary_call_census(
+        "php uppercase use alias nullsafe receiver avoids other namespace",
+        &uppercase_nodes,
+        &uppercase_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php uppercase use alias nullsafe receiver avoids other namespace",
         &uppercase_nodes,
@@ -7639,6 +9016,14 @@ function run(Mailer $notifier): void
             uppercase_function_import_source,
         ),
     ])?;
+    assert_ordinary_call_census(
+        "php uppercase function use alias is not treated as a type alias",
+        &function_import_nodes,
+        &function_import_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php uppercase function use alias is not treated as a type alias",
         &function_import_nodes,
@@ -7819,14 +9204,24 @@ function nested_shadowing(array $listeners, array $inner): void
         ("src/Acme/App/hostile.php", hostile_source),
     ])?;
 
-    for hostile_caller in [
-        "no_docblock",
-        "unresolvable_type",
-        "union_docblock",
-        "wrong_variable_docblock",
-        "commented_and_quoted",
-        "nested_shadowing",
+    for (hostile_caller, expected_handle_calls) in [
+        ("no_docblock", 1),
+        ("unresolvable_type", 1),
+        ("union_docblock", 1),
+        ("wrong_variable_docblock", 1),
+        // The comment/string hostile parses no call at all; its census is
+        // deliberately zero.
+        ("commented_and_quoted", 0),
+        ("nested_shadowing", 1),
     ] {
+        assert_ordinary_call_census(
+            "php foreach hostile fails closed",
+            &nodes,
+            &edges,
+            hostile_caller,
+            "handle",
+            expected_handle_calls,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "php foreach hostile fails closed",
             &nodes,
@@ -8050,6 +9445,14 @@ class AmbiguousDispatcher
     );
     // AmbiguousDispatcher iterates a string[] property; the Listener docblock
     // on the sibling property must not bind it.
+    assert_ordinary_call_census(
+        "php ambiguous property collection fails closed",
+        &property_nodes,
+        &property_edges,
+        "AmbiguousDispatcher.flush",
+        "handle",
+        1,
+    );
     assert_no_loop_marker_from_caller(
         "php ambiguous property collection fails closed",
         &property_nodes,
@@ -8625,6 +10028,14 @@ function scopedTwo(workflow) {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "javascript factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factory",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "javascript factory receiver stays unresolved",
         &nodes,
@@ -8633,6 +10044,14 @@ function scopedTwo(workflow) {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "javascript parameter receiver stays unresolved",
+        &nodes,
+        &edges,
+        "scopedTwo",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "javascript parameter receiver stays unresolved",
         &nodes,
@@ -8640,6 +10059,14 @@ function scopedTwo(workflow) {
         "scopedTwo",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "javascript constructor receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "javascript constructor receiver avoids same-name owner",
@@ -8786,6 +10213,14 @@ res.sendFile = function sendFile(path) {
         "res.send",
         "res",
         "end",
+    );
+    assert_ordinary_call_census(
+        "javascript imported bare call avoids same-name receiver method",
+        &nodes,
+        &edges,
+        "res.sendFile",
+        "send",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "javascript imported bare call avoids same-name receiver method",
@@ -9122,6 +10557,14 @@ function loneLoopWriteExternal(body) {
 "#;
     let (nodes, edges) = index_single_file("neutral.js", source)?;
     for method in ["direct", "dispatch", "relay", "assigned"] {
+        assert_ordinary_call_census(
+            "exact CommonJS aliases stay external",
+            &nodes,
+            &edges,
+            "externalCalls",
+            method,
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "exact CommonJS aliases stay external",
             &nodes,
@@ -9201,6 +10644,14 @@ function loneLoopWriteExternal(body) {
         ("shadowedLocal", "dispatch"),
         ("shadowedDeclaration", "relay"),
     ] {
+        assert_ordinary_call_census(
+            "shadowed import name avoids unrelated receiver method",
+            &nodes,
+            &edges,
+            caller,
+            method,
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "shadowed import name avoids unrelated receiver method",
             &nodes,
@@ -9462,6 +10913,21 @@ function Widget({ response, body }: { response: Response; body: string }) {
             Some("dispatch"),
             "the member expression target must not inherit the bare import marker"
         );
+        // Both callsites resolve to a `dispatch` target by name; the bare
+        // import call is the only line whose statement starts with `dispatch`.
+        // Pinning the marked edge's line proves the member call never inherits
+        // the marker — swapping marker ownership would still name `dispatch`.
+        let bare_line = source
+            .lines()
+            .position(|line| line.trim_start().starts_with("dispatch("))
+            .map(|index| index as u32 + 1)
+            .expect("the fixture carries a bare dispatch callsite");
+        assert_eq!(
+            marked[0].line,
+            Some(bare_line),
+            "the runtime-import marker must sit on the bare call, not the member call: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
     }
     Ok(())
 }
@@ -9598,6 +11064,14 @@ export class Workflow {
         "run",
         "main.js",
     );
+    assert_ordinary_call_census(
+        "javascript imported constructor receiver avoids local file",
+        &nodes,
+        &edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript imported constructor receiver avoids local file",
         &nodes,
@@ -9663,6 +11137,14 @@ export class Workflow {
         ("main.js", missing_import_source),
         ("workflow.js", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript missing imported constructor receiver stays unresolved",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript missing imported constructor receiver stays unresolved",
         &missing_nodes,
@@ -9678,6 +11160,14 @@ export class Workflow {
         ("workflow.js", workflow_source),
         ("other.js", other_workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript duplicate imported constructor receiver avoids first owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript duplicate imported constructor receiver avoids first owner",
         &duplicate_nodes,
@@ -9686,6 +11176,14 @@ export class Workflow {
         "Workflow",
         "run",
         "workflow.js",
+    );
+    assert_ordinary_call_census(
+        "javascript duplicate imported constructor receiver avoids second owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrateRemote",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript duplicate imported constructor receiver avoids second owner",
@@ -9710,6 +11208,14 @@ export class Workflow {
         "run",
         "main.js",
     );
+    assert_ordinary_call_census(
+        "javascript local class shadow avoids imported constructor owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript local class shadow avoids imported constructor owner",
         &shadow_nodes,
@@ -9724,6 +11230,14 @@ export class Workflow {
         ("main.js", future_binding_source),
         ("workflow.js", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript constructor receiver does not use future binding",
+        &future_nodes,
+        &future_edges,
+        "beforeDeclaration",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript constructor receiver does not use future binding",
         &future_nodes,
@@ -9747,6 +11261,14 @@ export class Workflow {
         "run",
         "main.js",
     );
+    assert_ordinary_call_census(
+        "javascript function local class shadow avoids imported owner",
+        &function_shadow_nodes,
+        &function_shadow_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript function local class shadow avoids imported owner",
         &function_shadow_nodes,
@@ -9761,6 +11283,14 @@ export class Workflow {
         ("main.js", qualified_constructor_source),
         ("workflow.js", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript qualified constructor receiver avoids local same-name owner",
+        &qualified_nodes,
+        &qualified_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript qualified constructor receiver avoids local same-name owner",
         &qualified_nodes,
@@ -9769,6 +11299,14 @@ export class Workflow {
         "Workflow",
         "run",
         "main.js",
+    );
+    assert_ordinary_call_census(
+        "javascript qualified constructor receiver stays unresolved",
+        &qualified_nodes,
+        &qualified_edges,
+        "orchestrateRemote",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript qualified constructor receiver stays unresolved",
@@ -9852,6 +11390,14 @@ class StaticEntry {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "javascript property receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "javascript property receiver avoids same-name owner",
         &nodes,
@@ -9870,6 +11416,14 @@ class StaticEntry {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "javascript private property receiver avoids same-name owner",
+        &private_nodes,
+        &private_edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "javascript private property receiver avoids same-name owner",
         &private_nodes,
@@ -9885,6 +11439,14 @@ class StaticEntry {
         "InitializerEntry.run",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "javascript static private field initializer stays unresolved",
+        &private_nodes,
+        &private_edges,
+        "StaticEntry.run",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "javascript static private field initializer stays unresolved",
@@ -10109,6 +11671,14 @@ export class Workflow {
         ("main.js", missing_source),
         ("workflow.js", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript missing imported property receiver stays unresolved",
+        &missing_nodes,
+        &missing_edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript missing imported property receiver stays unresolved",
         &missing_nodes,
@@ -10124,6 +11694,14 @@ export class Workflow {
         ("workflow.js", workflow_source),
         ("other.js", other_workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript duplicate imported property receiver avoids first owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript duplicate imported property receiver avoids first owner",
         &duplicate_nodes,
@@ -10132,6 +11710,14 @@ export class Workflow {
         "Workflow",
         "run",
         "workflow.js",
+    );
+    assert_ordinary_call_census(
+        "javascript duplicate imported property receiver avoids second owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Entry.run",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript duplicate imported property receiver avoids second owner",
@@ -10156,6 +11742,14 @@ export class Workflow {
         "run",
         "main.js",
     );
+    assert_ordinary_call_census(
+        "javascript local class property shadow avoids imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript local class property shadow avoids imported owner",
         &shadow_nodes,
@@ -10170,6 +11764,14 @@ export class Workflow {
         ("main.js", qualified_source),
         ("workflow.js", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "javascript qualified property constructor stays unresolved",
+        &qualified_nodes,
+        &qualified_edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript qualified property constructor stays unresolved",
         &qualified_nodes,
@@ -10274,6 +11876,14 @@ class QualifiedEntry {
         "StaticEntry.run",
         "QualifiedEntry.run",
     ] {
+        assert_ordinary_call_census(
+            "javascript property receiver stays unresolved",
+            &nodes,
+            &edges,
+            source_name,
+            "run",
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "javascript property receiver stays unresolved",
             &nodes,
@@ -10281,6 +11891,14 @@ class QualifiedEntry {
             source_name,
             "Workflow",
             "run",
+        );
+        assert_ordinary_call_census(
+            "javascript property receiver avoids ambiguous same-name owner",
+            &nodes,
+            &edges,
+            source_name,
+            "run",
+            1,
         );
         assert_no_resolved_call_to_method_owner(
             "javascript property receiver avoids ambiguous same-name owner",
@@ -10316,6 +11934,14 @@ class Entry {
 "#;
 
     let (nodes, edges) = index_single_file("main.js", source)?;
+    assert_ordinary_call_census(
+        "javascript property receiver duplicate method target stays unresolved",
+        &nodes,
+        &edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "javascript property receiver duplicate method target stays unresolved",
         &nodes,
@@ -10349,6 +11975,14 @@ export class Workflow {
 
     let (nodes, edges) =
         index_files(&[("main.js", main_source), ("workflow.js", workflow_source)])?;
+    assert_ordinary_call_census(
+        "javascript unimported property receiver avoids cross-file owner",
+        &nodes,
+        &edges,
+        "Entry.run",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "javascript unimported property receiver avoids cross-file owner",
         &nodes,
@@ -10443,6 +12077,14 @@ function scopedTwo(workflow: any): void {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "typescript factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factory",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "typescript factory receiver stays unresolved",
         &nodes,
@@ -10451,6 +12093,14 @@ function scopedTwo(workflow: any): void {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "typescript any receiver stays unresolved",
+        &nodes,
+        &edges,
+        "scopedTwo",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "typescript any receiver stays unresolved",
         &nodes,
@@ -10458,6 +12108,14 @@ function scopedTwo(workflow: any): void {
         "scopedTwo",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "typescript constructor receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "typescript constructor receiver avoids same-name owner",
@@ -10569,6 +12227,14 @@ class Workflow {
         "Repository",
         "save",
     );
+    assert_ordinary_call_census(
+        "typescript class property receiver avoids same-name method owner",
+        &nodes,
+        &edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "typescript class property receiver avoids same-name method owner",
         &nodes,
@@ -10577,6 +12243,14 @@ class Workflow {
         "OtherRepository",
         "save",
     );
+    assert_ordinary_call_census(
+        "typescript any property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "Workflow.erasedProperty",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "typescript any property receiver stays unresolved",
         &nodes,
@@ -10584,6 +12258,14 @@ class Workflow {
         "Workflow.erasedProperty",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "typescript unknown property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "Workflow.unknownProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "typescript unknown property receiver stays unresolved",
@@ -10785,6 +12467,14 @@ export class Workflow {
         ("main.ts", missing_namespace_source),
         ("workflow.ts", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript missing namespace constructor receiver stays unresolved",
+        &missing_namespace_nodes,
+        &missing_namespace_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript missing namespace constructor receiver stays unresolved",
         &missing_namespace_nodes,
@@ -10800,6 +12490,14 @@ export class Workflow {
         ("workflow.ts", workflow_source),
         ("other.ts", other_workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript duplicate namespace constructor receiver avoids first owner",
+        &duplicate_namespace_nodes,
+        &duplicate_namespace_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate namespace constructor receiver avoids first owner",
         &duplicate_namespace_nodes,
@@ -10808,6 +12506,14 @@ export class Workflow {
         "Workflow",
         "run",
         "workflow.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript duplicate namespace constructor receiver avoids second owner",
+        &duplicate_namespace_nodes,
+        &duplicate_namespace_edges,
+        "orchestrateRemote",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate namespace constructor receiver avoids second owner",
@@ -10823,6 +12529,14 @@ export class Workflow {
         ("main.ts", missing_import_source),
         ("workflow.ts", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript missing imported constructor receiver",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript missing imported constructor receiver",
         &missing_nodes,
@@ -10838,6 +12552,14 @@ export class Workflow {
         ("workflow.ts", workflow_source),
         ("other.ts", other_workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript duplicate imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported constructor receiver",
         &duplicate_nodes,
@@ -10846,6 +12568,14 @@ export class Workflow {
         "Workflow",
         "run",
         "workflow.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript duplicate imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrateRemote",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported constructor receiver",
@@ -10861,6 +12591,14 @@ export class Workflow {
         ("main.ts", local_shadow_source),
         ("workflow.ts", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript local constructor shadow avoids imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript local constructor shadow avoids imported owner",
         &shadow_nodes,
@@ -10875,6 +12613,14 @@ export class Workflow {
         ("main.ts", future_binding_source),
         ("workflow.ts", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript constructor receiver does not use future binding",
+        &future_nodes,
+        &future_edges,
+        "beforeDeclaration",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript constructor receiver does not use future binding",
         &future_nodes,
@@ -10898,6 +12644,14 @@ export class Workflow {
         "run",
         "main.ts",
     );
+    assert_ordinary_call_census(
+        "typescript function local class shadow avoids imported owner",
+        &function_shadow_nodes,
+        &function_shadow_edges,
+        "orchestrateRemote",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript function local class shadow avoids imported owner",
         &function_shadow_nodes,
@@ -10912,6 +12666,14 @@ export class Workflow {
         ("main.ts", block_factory_shadow_source),
         ("workflow.ts", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript block local factory receiver suppresses parameter fallback",
+        &block_shadow_nodes,
+        &block_shadow_edges,
+        "scopedShadow",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript block local factory receiver suppresses parameter fallback",
         &block_shadow_nodes,
@@ -10947,6 +12709,14 @@ export class Repository {
         ("main.ts", main_source),
         ("repository.ts", repository_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript unimported cross-file property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript unimported cross-file property receiver stays unresolved",
         &nodes,
@@ -10989,13 +12759,20 @@ export function Widget(): JSX.Element {
         "WidgetWorkflow",
         "decorate",
     );
-    assert_resolved_call_to_method_owner(
+    // The fixture carries two `workflow.run` callsites — the statement and the
+    // JSX expression. A count assertion is required: an existential check
+    // stays green when the JSX call is dropped.
+    assert_resolved_call_count_to_method_owner_in_file(
         "tsx constructor receiver",
         &nodes,
         &edges,
-        "Widget",
-        "WidgetWorkflow",
-        "run",
+        ResolvedCallCountInFile {
+            caller_name: "Widget",
+            owner_name: "WidgetWorkflow",
+            method_name: "run",
+            file_suffix: "widget.tsx",
+            expected_count: 2,
+        },
     );
 
     Ok(())
@@ -11225,6 +13002,14 @@ export function Widget(): JSX.Element {
         "notifyEvent",
         "notifier.ts",
     );
+    assert_ordinary_call_census(
+        "tsx imported private class property receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "WidgetWorkflow.run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "tsx imported private class property receiver avoids same-name owner",
         &nodes,
@@ -11242,6 +13027,14 @@ export function Widget(): JSX.Element {
         "Repository",
         "save",
         "repository.ts",
+    );
+    assert_ordinary_call_census(
+        "tsx imported class property receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "WidgetWorkflow.run",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "tsx imported class property receiver avoids same-name owner",
@@ -11266,6 +13059,14 @@ export function Widget(): JSX.Element {
         "save",
         "widget.tsx",
     );
+    assert_ordinary_call_census(
+        "tsx local shadowed class property receiver avoids imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "WidgetWorkflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "tsx local shadowed class property receiver avoids imported owner",
         &shadow_nodes,
@@ -11280,6 +13081,14 @@ export function Widget(): JSX.Element {
         ("other/repository.ts", other_repository_source),
         ("widget.tsx", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "tsx missing imported class property receiver",
+        &missing_nodes,
+        &missing_edges,
+        "WidgetWorkflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "tsx missing imported class property receiver",
         &missing_nodes,
@@ -11413,6 +13222,14 @@ func run(notifier: Notifier) {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "swift imported typed receiver",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift imported typed receiver",
         &nodes,
@@ -11436,6 +13253,14 @@ func run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift module-qualified typed receiver",
+        &qualified_nodes,
+        &qualified_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift module-qualified typed receiver",
@@ -11462,6 +13287,14 @@ func run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift module-qualified receiver ignores same-file shadow",
+        &qualified_shadow_nodes,
+        &qualified_shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift module-qualified receiver ignores same-file shadow",
@@ -11492,6 +13325,14 @@ func run(notifier: Notifier) {
         ("Sources/MailKit/Repository.swift", mail_repository_source),
         ("Sources/App/App.swift", scoped_unrelated_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift scoped import does not imply whole-module import",
+        &scoped_unrelated_nodes,
+        &scoped_unrelated_edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift scoped import does not imply whole-module import",
         &scoped_unrelated_nodes,
@@ -11506,6 +13347,14 @@ func run(notifier: Notifier) {
         ("Sources/MailKit/Notifier.swift", mail_notifier_source),
         ("Sources/App/App.swift", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift missing imported receiver module",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift missing imported receiver module",
         &missing_nodes,
@@ -11520,6 +13369,14 @@ func run(notifier: Notifier) {
         ("Sources/MailKit/Notifier.swift", mail_notifier_source),
         ("Sources/App/App.swift", no_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift unimported receiver type stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift unimported receiver type stays unresolved",
         &no_import_nodes,
@@ -11537,6 +13394,14 @@ func run(notifier: Notifier) {
         ),
         ("Packages/App/Sources/App/App.swift", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift imported receiver stays within package root",
+        &cross_package_nodes,
+        &cross_package_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift imported receiver stays within package root",
         &cross_package_nodes,
@@ -11552,6 +13417,14 @@ func run(notifier: Notifier) {
         ("Sources/OtherKit/Notifier.swift", other_notifier_source),
         ("Sources/App/App.swift", ambiguous_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift ambiguous imported receiver module",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported receiver module",
         &ambiguous_nodes,
@@ -11560,6 +13433,14 @@ func run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift ambiguous imported receiver module",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported receiver module",
@@ -11579,6 +13460,14 @@ func run(notifier: Notifier) {
         ),
         ("Sources/App/App.swift", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift duplicate imported receiver module owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift duplicate imported receiver module owner",
         &duplicate_nodes,
@@ -11587,6 +13476,14 @@ func run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift duplicate imported receiver module owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift duplicate imported receiver module owner",
@@ -11610,6 +13507,14 @@ func run(notifier: Notifier) {
         "Notifier",
         "notifyEvent",
         "Sources/App/App.swift",
+    );
+    assert_ordinary_call_census(
+        "swift local receiver shadows imported module",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift local receiver shadows imported module",
@@ -11694,6 +13599,14 @@ func orderAware() {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "swift same-file constructor receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "swift same-file constructor receiver avoids other owner",
         &nodes,
@@ -11702,6 +13615,14 @@ func orderAware() {
         "OtherWorkflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "swift factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factoryOnly",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "swift factory receiver stays unresolved",
         &nodes,
@@ -11709,6 +13630,14 @@ func orderAware() {
         "factoryOnly",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "swift erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "swift erased receiver stays unresolved",
@@ -11778,6 +13707,14 @@ func orchestrate() {
         ("Sources/WorkflowKit/Workflow.swift", imported_owner_source),
         ("Sources/App/App.swift", imported_caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift unimported constructor receiver does not use cross-file owner",
+        &imported_nodes,
+        &imported_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift unimported constructor receiver does not use cross-file owner",
         &imported_nodes,
@@ -11879,6 +13816,14 @@ func orchestrate() {
         "run",
         "Sources/WorkflowKit/Workflow.swift",
     );
+    assert_ordinary_call_census(
+        "swift imported constructor receiver avoids other module",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift imported constructor receiver avoids other module",
         &nodes,
@@ -11902,6 +13847,14 @@ func orchestrate() {
         "Workflow",
         "run",
         "Sources/WorkflowKit/Workflow.swift",
+    );
+    assert_ordinary_call_census(
+        "swift module-qualified constructor receiver avoids same-file shadow",
+        &qualified_nodes,
+        &qualified_edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift module-qualified constructor receiver avoids same-file shadow",
@@ -11932,6 +13885,14 @@ func orchestrate() {
         ("Sources/OtherKit/Workflow.swift", other_workflow_source),
         ("Sources/App/App.swift", ambiguous_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift ambiguous imported constructor receiver",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported constructor receiver",
         &ambiguous_nodes,
@@ -11940,6 +13901,14 @@ func orchestrate() {
         "Workflow",
         "run",
         "Sources/WorkflowKit/Workflow.swift",
+    );
+    assert_ordinary_call_census(
+        "swift ambiguous imported constructor receiver",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported constructor receiver",
@@ -11955,6 +13924,14 @@ func orchestrate() {
         ("Sources/WorkflowKit/Workflow.swift", workflow_source),
         ("Sources/App/App.swift", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift missing imported constructor receiver",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift missing imported constructor receiver",
         &missing_nodes,
@@ -11969,6 +13946,14 @@ func orchestrate() {
         ("Sources/WorkflowKit/Workflow.swift", workflow_source),
         ("Sources/App/App.swift", local_shadow_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift local constructor shadow avoids imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift local constructor shadow avoids imported owner",
         &shadow_nodes,
@@ -12082,6 +14067,14 @@ func makeNotifier() -> Notifier {
         "decorate",
         "Sources/App/Workflow.swift",
     );
+    assert_ordinary_call_census(
+        "swift self receiver avoids same-named owner",
+        &nodes,
+        &edges,
+        "run",
+        "decorate",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "swift self receiver avoids same-named owner",
         &nodes,
@@ -12098,6 +14091,14 @@ func makeNotifier() -> Notifier {
         "Repository",
         "save",
         "Sources/App/Workflow.swift",
+    );
+    assert_ordinary_call_census(
+        "swift parameter shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "parameterShadowsProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "swift parameter shadow prevents property fallback",
@@ -12134,6 +14135,14 @@ func makeNotifier() -> Notifier {
         "save",
         "Sources/App/Workflow.swift",
     );
+    assert_ordinary_call_census(
+        "swift local constructor shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localConstructorShadowsProperty",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "swift local constructor shadow prevents property fallback",
         &nodes,
@@ -12141,6 +14150,14 @@ func makeNotifier() -> Notifier {
         "localConstructorShadowsProperty",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "swift local factory shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localFactoryShadowsProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "swift local factory shadow prevents property fallback",
@@ -12150,6 +14167,14 @@ func makeNotifier() -> Notifier {
         "Notifier",
         "notifyEvent",
     );
+    assert_ordinary_call_census(
+        "swift local Any shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localAnyShadowsProperty",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "swift local Any shadow prevents property fallback",
         &nodes,
@@ -12157,6 +14182,14 @@ func makeNotifier() -> Notifier {
         "localAnyShadowsProperty",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "swift erased property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erasedProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "swift erased property receiver stays unresolved",
@@ -12189,6 +14222,14 @@ class Entry {
         ("Sources/WorkflowKit/Workflow.swift", owner_source),
         ("Sources/App/Entry.swift", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift property receiver does not use unimported cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift property receiver does not use unimported cross-file owner",
         &cross_file_nodes,
@@ -12351,6 +14392,14 @@ class Workflow {
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
     );
+    assert_ordinary_call_census(
+        "swift imported property receiver exact module",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift imported property receiver exact module",
         &nodes,
@@ -12374,6 +14423,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift module-qualified property receiver exact module",
+        &qualified_nodes,
+        &qualified_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift module-qualified property receiver exact module",
@@ -12400,6 +14457,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift module-qualified property receiver ignores same-file shadow",
+        &qualified_shadow_nodes,
+        &qualified_shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift module-qualified property receiver ignores same-file shadow",
@@ -12430,6 +14495,14 @@ class Workflow {
         ("Sources/MailKit/Repository.swift", mail_repository_source),
         ("Sources/App/Workflow.swift", scoped_unrelated_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift scoped property import does not imply whole-module import",
+        &scoped_unrelated_nodes,
+        &scoped_unrelated_edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift scoped property import does not imply whole-module import",
         &scoped_unrelated_nodes,
@@ -12444,6 +14517,14 @@ class Workflow {
         ("Sources/MailKit/Notifier.swift", mail_notifier_source),
         ("Sources/App/Workflow.swift", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift missing imported property receiver module",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift missing imported property receiver module",
         &missing_nodes,
@@ -12459,6 +14540,14 @@ class Workflow {
         ("Sources/OtherKit/Notifier.swift", other_notifier_source),
         ("Sources/App/Workflow.swift", ambiguous_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift ambiguous imported property receiver module",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported property receiver module",
         &ambiguous_nodes,
@@ -12467,6 +14556,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift ambiguous imported property receiver module",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift ambiguous imported property receiver module",
@@ -12486,6 +14583,14 @@ class Workflow {
         ),
         ("Sources/App/Workflow.swift", workflow_source),
     ])?;
+    assert_ordinary_call_census(
+        "swift duplicate imported property receiver module owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift duplicate imported property receiver module owner",
         &duplicate_nodes,
@@ -12494,6 +14599,14 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "Sources/MailKit/Notifier.swift",
+    );
+    assert_ordinary_call_census(
+        "swift duplicate imported property receiver module owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "swift duplicate imported property receiver module owner",
@@ -12614,6 +14727,14 @@ export function run(notifier: mail.Notifier): void {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "typescript imported typed receiver",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript imported typed receiver",
         &nodes,
@@ -12665,6 +14786,14 @@ export function run(notifier: mail.Notifier): void {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "typescript same-line imported typed receiver",
+        &nodes,
+        &edges,
+        "run",
+        "save",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript same-line imported typed receiver",
         &nodes,
@@ -12673,6 +14802,14 @@ export function run(notifier: mail.Notifier): void {
         "Archive",
         "save",
         "repository.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript imported untyped receiver",
+        &nodes,
+        &edges,
+        "untyped",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "typescript imported untyped receiver",
@@ -12687,6 +14824,14 @@ export function run(notifier: mail.Notifier): void {
         ("other/notifier.ts", other_notifier_source),
         ("workflow.ts", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript missing imported owner",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "typescript missing imported owner",
         &missing_nodes,
@@ -12701,6 +14846,14 @@ export function run(notifier: mail.Notifier): void {
         ("other/notifier.ts", other_notifier_source),
         ("workflow.ts", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript duplicate imported owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported owner",
         &duplicate_nodes,
@@ -12709,6 +14862,14 @@ export function run(notifier: mail.Notifier): void {
         "Notifier",
         "notifyEvent",
         "notifier.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript duplicate imported owner",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported owner",
@@ -12732,6 +14893,14 @@ export function run(notifier: mail.Notifier): void {
         "Mailer",
         "notifyEvent",
         "workflow.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript local shadowed imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript local shadowed imported owner",
@@ -12782,6 +14951,14 @@ export function run(notifier: mail.Notifier): void {
             file_suffix: "notifier.ts",
             expected_count: 1,
         },
+    );
+    assert_ordinary_call_census(
+        "typescript namespace imported owner",
+        &namespace_nodes,
+        &namespace_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript namespace imported owner",
@@ -12971,6 +15148,14 @@ class Workflow {
         "save",
         "archive.ts",
     );
+    assert_ordinary_call_census(
+        "typescript imported class property receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "Workflow.run",
+        "save",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript imported class property receiver avoids same-name owner",
         &nodes,
@@ -12985,6 +15170,14 @@ class Workflow {
         ("other/repository.ts", other_repository_source),
         ("workflow.ts", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript missing imported class property receiver",
+        &missing_nodes,
+        &missing_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript missing imported class property receiver",
         &missing_nodes,
@@ -13000,6 +15193,14 @@ class Workflow {
         ("other/repository.ts", other_repository_source),
         ("workflow.ts", duplicate_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript duplicate imported class property receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported class property receiver",
         &duplicate_nodes,
@@ -13008,6 +15209,14 @@ class Workflow {
         "Repository",
         "save",
         "repository.ts",
+    );
+    assert_ordinary_call_census(
+        "typescript duplicate imported class property receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "Workflow.run",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript duplicate imported class property receiver",
@@ -13032,6 +15241,14 @@ class Workflow {
         "save",
         "workflow.ts",
     );
+    assert_ordinary_call_census(
+        "typescript local shadowed class property receiver",
+        &shadow_nodes,
+        &shadow_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript local shadowed class property receiver",
         &shadow_nodes,
@@ -13046,6 +15263,14 @@ class Workflow {
         ("archive.ts", archive_source),
         ("workflow.ts", missing_namespace_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript missing namespace class property receiver",
+        &missing_namespace_nodes,
+        &missing_namespace_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript missing namespace class property receiver",
         &missing_namespace_nodes,
@@ -13060,6 +15285,14 @@ class Workflow {
         ("archive.ts", archive_source),
         ("workflow.ts", local_namespace_shadow_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript local namespace shadowed class property receiver",
+        &local_namespace_shadow_nodes,
+        &local_namespace_shadow_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript local namespace shadowed class property receiver",
         &local_namespace_shadow_nodes,
@@ -13074,6 +15307,14 @@ class Workflow {
         ("archive.ts", archive_source),
         ("workflow.ts", import_namespace_collision_source),
     ])?;
+    assert_ordinary_call_census(
+        "typescript import namespace collision class property receiver",
+        &import_namespace_collision_nodes,
+        &import_namespace_collision_edges,
+        "Workflow.run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "typescript import namespace collision class property receiver",
         &import_namespace_collision_nodes,
@@ -13118,21 +15359,30 @@ void run(mail.Notifier notifier) {
 import './mail/notifier.dart' as shared;
 import './other/notifier.dart' as shared;
 
+void helper() {}
+
 void run(shared.Notifier notifier) {
   notifier.notifyEvent('ready');
+  helper();
 }
 "#;
     let unprefixed_duplicate_source = r#"
 import './mail/notifier.dart';
 import './other/notifier.dart';
 
+void helper() {}
+
 void run(Notifier notifier) {
   notifier.notifyEvent('ready');
+  helper();
 }
 "#;
     let no_import_source = r#"
+void helper() {}
+
 void run(Notifier notifier) {
   notifier.notifyEvent('ready');
+  helper();
 }
 "#;
     let commented_import_source = r#"
@@ -13143,8 +15393,11 @@ const importExample = """
 import './mail/notifier.dart';
 """;
 
+void helper() {}
+
 void run(Notifier notifier) {
   notifier.notifyEvent('ready');
+  helper();
 }
 "#;
 
@@ -13174,6 +15427,14 @@ void run(Notifier notifier) {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "dart prefixed imported receiver",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart prefixed imported receiver",
         &nodes,
@@ -13188,6 +15449,14 @@ void run(Notifier notifier) {
         ("lib/mail/notifier.dart", notifier_source),
         ("lib/workflow.dart", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "dart missing prefixed imported receiver",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart missing prefixed imported receiver",
         &missing_nodes,
@@ -13202,6 +15471,25 @@ void run(Notifier notifier) {
         ("lib/mail/notifier.dart", notifier_source),
         ("lib/workflow.dart", no_import_source),
     ])?;
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart unimported receiver type stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart unimported receiver type stays unresolved",
+        &no_import_nodes,
+        &no_import_edges,
+        "run",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart unimported receiver type stays unresolved",
         &no_import_nodes,
@@ -13216,6 +15504,25 @@ void run(Notifier notifier) {
         ("lib/mail/notifier.dart", notifier_source),
         ("lib/workflow.dart", commented_import_source),
     ])?;
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart comment and string text cannot prove an import",
+        &commented_import_nodes,
+        &commented_import_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart comment and string text cannot prove an import",
+        &commented_import_nodes,
+        &commented_import_edges,
+        "run",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart comment and string text cannot prove an import",
         &commented_import_nodes,
@@ -13231,6 +15538,25 @@ void run(Notifier notifier) {
         ("lib/other/notifier.dart", other_notifier_source),
         ("lib/workflow.dart", duplicate_alias_source),
     ])?;
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed import alias",
+        &duplicate_alias_nodes,
+        &duplicate_alias_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed import alias",
+        &duplicate_alias_nodes,
+        &duplicate_alias_edges,
+        "run",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed import alias",
         &duplicate_alias_nodes,
@@ -13239,6 +15565,25 @@ void run(Notifier notifier) {
         "Notifier",
         "notifyEvent",
         "lib/mail/notifier.dart",
+    );
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed import alias",
+        &duplicate_alias_nodes,
+        &duplicate_alias_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed import alias",
+        &duplicate_alias_nodes,
+        &duplicate_alias_edges,
+        "run",
+        "notifyEvent",
+        0,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed import alias",
@@ -13255,6 +15600,24 @@ void run(Notifier notifier) {
         ("lib/other/notifier.dart", other_notifier_source),
         ("lib/workflow.dart", unprefixed_duplicate_source),
     ])?;
+    // `run`'s `notifyEvent` call emits an edge but stays unresolved on the
+    // ambiguous receiver; the `helper` and `notifyEvent` censuses pin both.
+    assert_ordinary_call_census(
+        "dart unprefixed ambiguous imported receiver",
+        &unprefixed_nodes,
+        &unprefixed_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart unprefixed ambiguous imported receiver",
+        &unprefixed_nodes,
+        &unprefixed_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart unprefixed ambiguous imported receiver",
         &unprefixed_nodes,
@@ -13263,6 +15626,24 @@ void run(Notifier notifier) {
         "Notifier",
         "notifyEvent",
         "lib/mail/notifier.dart",
+    );
+    // `run`'s `notifyEvent` call emits an edge but stays unresolved on the
+    // ambiguous receiver; the `helper` and `notifyEvent` censuses pin both.
+    assert_ordinary_call_census(
+        "dart unprefixed ambiguous imported receiver",
+        &unprefixed_nodes,
+        &unprefixed_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart unprefixed ambiguous imported receiver",
+        &unprefixed_nodes,
+        &unprefixed_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart unprefixed ambiguous imported receiver",
@@ -13316,6 +15697,7 @@ void directOnly() {
 
 void erased(dynamic workflow) {
   workflow.run('ready');
+  makeWorkflow();
 }
 
 void innerShadow(dynamic workflow, bool enabled) {
@@ -13363,6 +15745,14 @@ void orderAware() {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "dart same-file constructor receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart same-file constructor receiver avoids other owner",
         &nodes,
@@ -13371,6 +15761,25 @@ void orderAware() {
         "OtherWorkflow",
         "run",
     );
+    // `factoryOnly`'s `run` call emits no CALL edge while its receiver cannot
+    // be bound; the `makeWorkflow` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factoryOnly",
+        "makeWorkflow",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "factoryOnly",
+        "run",
+        0,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart factory receiver stays unresolved",
         &nodes,
@@ -13378,6 +15787,25 @@ void orderAware() {
         "factoryOnly",
         "Workflow",
         "run",
+    );
+    // `erased`'s `run` call emits no CALL edge while its receiver
+    // cannot be bound; the `makeWorkflow` census proves this caller's calls
+    // were extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "makeWorkflow",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart erased receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erased",
+        "run",
+        0,
     );
     assert_no_resolved_call_to_method_owner(
         "dart erased receiver stays unresolved",
@@ -13439,9 +15867,12 @@ class Workflow {
     let imported_caller_source = r#"
 import './other/workflow.dart';
 
+void helper() {}
+
 void orchestrate() {
   final workflow = Workflow();
   workflow.run('ready');
+  helper();
 }
 "#;
     let shadowed_parameter_source = r#"
@@ -13460,6 +15891,25 @@ void shadowed(other.Workflow workflow, bool enabled) {
         ("lib/other/workflow.dart", imported_owner_source),
         ("lib/use_workflow.dart", imported_caller_source),
     ])?;
+    // `orchestrate`'s `run` call emits no CALL edge while its receiver type
+    // stays ambiguous; the `helper` census proves its calls were extracted,
+    // and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart constructor receiver does not use imported cross-file owner",
+        &imported_nodes,
+        &imported_edges,
+        "orchestrate",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart constructor receiver does not use imported cross-file owner",
+        &imported_nodes,
+        &imported_edges,
+        "orchestrate",
+        "run",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart constructor receiver does not use imported cross-file owner",
         &imported_nodes,
@@ -13474,6 +15924,14 @@ void shadowed(other.Workflow workflow, bool enabled) {
         ("lib/other/workflow.dart", imported_owner_source),
         ("lib/shadowed.dart", shadowed_parameter_source),
     ])?;
+    assert_ordinary_call_census(
+        "dart local constructor shadows imported typed parameter",
+        &shadowed_nodes,
+        &shadowed_edges,
+        "shadowed",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart local constructor shadows imported typed parameter",
         &shadowed_nodes,
@@ -13583,6 +16041,14 @@ Object readNotifier() {
         "decorate",
         "lib/workflow.dart",
     );
+    assert_ordinary_call_census(
+        "dart field receiver avoids other owner",
+        &nodes,
+        &edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart field receiver avoids other owner",
         &nodes,
@@ -13590,6 +16056,14 @@ Object readNotifier() {
         "run",
         "OtherRepository",
         "save",
+    );
+    assert_ordinary_call_census(
+        "dart parameter receiver shadows field receiver",
+        &nodes,
+        &edges,
+        "parameterShadowsField",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "dart parameter receiver shadows field receiver",
@@ -13608,6 +16082,25 @@ Object readNotifier() {
         "save",
         "lib/workflow.dart",
     );
+    // `localFactoryShadowsField`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `makeNotifier` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart local factory shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localFactoryShadowsField",
+        "makeNotifier",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart local factory shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localFactoryShadowsField",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart local factory shadow prevents property fallback",
         &nodes,
@@ -13615,6 +16108,25 @@ Object readNotifier() {
         "localFactoryShadowsField",
         "Notifier",
         "notifyEvent",
+    );
+    // `localDynamicShadowsField`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `makeNotifier` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart local dynamic shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localDynamicShadowsField",
+        "makeNotifier",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart local dynamic shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localDynamicShadowsField",
+        "notifyEvent",
+        0,
     );
     assert_no_resolved_call_to_method_owner(
         "dart local dynamic shadow prevents property fallback",
@@ -13624,6 +16136,25 @@ Object readNotifier() {
         "Notifier",
         "notifyEvent",
     );
+    // `localUnknownShadowsField`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `readNotifier` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart local unknown shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localUnknownShadowsField",
+        "readNotifier",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart local unknown shadow prevents property fallback",
+        &nodes,
+        &edges,
+        "localUnknownShadowsField",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart local unknown shadow prevents property fallback",
         &nodes,
@@ -13631,6 +16162,14 @@ Object readNotifier() {
         "localUnknownShadowsField",
         "Notifier",
         "notifyEvent",
+    );
+    assert_ordinary_call_census(
+        "dart erased property receiver stays unresolved",
+        &nodes,
+        &edges,
+        "erasedProperty",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "dart erased property receiver stays unresolved",
@@ -13647,6 +16186,8 @@ class Workflow {
 }
 "#;
     let caller_source = r#"
+void helper() {}
+
 class Entry {
   final Workflow workflow;
 
@@ -13654,6 +16195,7 @@ class Entry {
 
   void call() {
     workflow.run('ready');
+    helper();
   }
 }
 "#;
@@ -13661,6 +16203,25 @@ class Entry {
         ("lib/workflow.dart", owner_source),
         ("lib/entry.dart", caller_source),
     ])?;
+    // `call`'s `run` call emits no CALL edge while its receiver
+    // cannot be bound; the `helper` census proves this caller's calls
+    // were extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart property receiver does not use unimported cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart property receiver does not use unimported cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "run",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart property receiver does not use unimported cross-file owner",
         &cross_file_nodes,
@@ -13862,6 +16423,14 @@ class Workflow
             expected_count: 2,
         },
     );
+    assert_ordinary_call_census(
+        "php use alias imported property receiver avoids other namespace",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php use alias imported property receiver avoids other namespace",
         &nodes,
@@ -13889,6 +16458,14 @@ class Workflow
             expected_count: 2,
         },
     );
+    assert_ordinary_call_census(
+        "php plain use imported property receiver avoids other namespace",
+        &plain_nodes,
+        &plain_edges,
+        "run",
+        "notifyEvent",
+        2,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php plain use imported property receiver avoids other namespace",
         &plain_nodes,
@@ -13903,6 +16480,14 @@ class Workflow
         ("src/Acme/Mail/Notifier.php", mail_notifier_source),
         ("src/Acme/Workflow/workflow.php", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "php missing use alias imported property receiver",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php missing use alias imported property receiver",
         &missing_nodes,
@@ -13918,6 +16503,14 @@ class Workflow
         ("src/Acme/Other/Notifier.php", other_notifier_source),
         ("src/Acme/Workflow/workflow.php", duplicate_alias_source),
     ])?;
+    assert_ordinary_call_census(
+        "php duplicate use alias imported property receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate use alias imported property receiver",
         &duplicate_nodes,
@@ -13926,6 +16519,14 @@ class Workflow
         "Notifier",
         "notifyEvent",
         "src/Acme/Mail/Notifier.php",
+    );
+    assert_ordinary_call_census(
+        "php duplicate use alias imported property receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php duplicate use alias imported property receiver",
@@ -13949,6 +16550,14 @@ class Workflow
         "Mailer",
         "notifyEvent",
         "src/Acme/Workflow/workflow.php",
+    );
+    assert_ordinary_call_census(
+        "php local receiver shadows use alias property type",
+        &shadow_nodes,
+        &shadow_edges,
+        "run",
+        "notifyEvent",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "php local receiver shadows use alias property type",
@@ -14057,6 +16666,8 @@ class Workflow {
 import './mail/notifier.dart' as shared;
 import './other/notifier.dart' as shared;
 
+void helper() {}
+
 class Workflow {
   final shared.Notifier notifier;
 
@@ -14064,6 +16675,7 @@ class Workflow {
 
   void run() {
     notifier.notifyEvent('ready');
+    helper();
   }
 }
 "#;
@@ -14082,6 +16694,14 @@ class Workflow {
         "notifyEvent",
         "lib/mail/notifier.dart",
     );
+    assert_ordinary_call_census(
+        "dart imported property receiver avoids other import",
+        &nodes,
+        &edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart imported property receiver avoids other import",
         &nodes,
@@ -14096,6 +16716,14 @@ class Workflow {
         ("lib/mail/notifier.dart", notifier_source),
         ("lib/workflow.dart", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "dart missing prefixed property receiver import",
+        &missing_nodes,
+        &missing_edges,
+        "run",
+        "notifyEvent",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart missing prefixed property receiver import",
         &missing_nodes,
@@ -14115,6 +16743,25 @@ class Workflow {
         ),
         ("lib/workflow.dart", duplicate_alias_source),
     ])?;
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed property receiver alias",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed property receiver alias",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed property receiver alias",
         &duplicate_nodes,
@@ -14123,6 +16770,25 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "lib/mail/notifier.dart",
+    );
+    // `run`'s `notifyEvent` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed property receiver alias",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed property receiver alias",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "run",
+        "notifyEvent",
+        0,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed property receiver alias",
@@ -14184,9 +16850,12 @@ void orchestrate() {
 import './mail/workflow.dart' as shared;
 import './other/workflow.dart' as shared;
 
+void helper() {}
+
 void orchestrate() {
   final workflow = shared.Workflow();
   workflow.run('ready');
+  helper();
 }
 "#;
 
@@ -14222,6 +16891,14 @@ void orchestrate() {
         "run",
         "lib/mail/workflow.dart",
     );
+    assert_ordinary_call_census(
+        "dart prefixed imported constructor avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart prefixed imported constructor avoids other owner",
         &nodes,
@@ -14236,6 +16913,14 @@ void orchestrate() {
         ("lib/mail/workflow.dart", workflow_source),
         ("lib/use_workflow.dart", missing_import_source),
     ])?;
+    assert_ordinary_call_census(
+        "dart missing prefixed imported constructor receiver",
+        &missing_nodes,
+        &missing_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart missing prefixed imported constructor receiver",
         &missing_nodes,
@@ -14251,6 +16936,25 @@ void orchestrate() {
         ("lib/other/workflow.dart", other_workflow_source),
         ("lib/use_workflow.dart", duplicate_alias_source),
     ])?;
+    // `orchestrate`'s `run` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "run",
+        0,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed imported constructor receiver",
         &duplicate_nodes,
@@ -14259,6 +16963,25 @@ void orchestrate() {
         "Workflow",
         "run",
         "lib/mail/workflow.dart",
+    );
+    // `orchestrate`'s `run` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart duplicate prefixed imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart duplicate prefixed imported constructor receiver",
+        &duplicate_nodes,
+        &duplicate_edges,
+        "orchestrate",
+        "run",
+        0,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "dart duplicate prefixed imported constructor receiver",
@@ -14708,6 +17431,14 @@ void run(Notifier& notifier) {
         ("two/Notifier.cpp", other_notifier_source),
         ("workflow.cpp", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "cpp cross-file ambiguous receiver",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "cpp cross-file ambiguous receiver",
         &ambiguous_nodes,
@@ -14716,6 +17447,14 @@ void run(Notifier& notifier) {
         "Notifier",
         "save",
         "one/Notifier.cpp",
+    );
+    assert_ordinary_call_census(
+        "cpp cross-file ambiguous receiver",
+        &ambiguous_nodes,
+        &ambiguous_edges,
+        "run",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "cpp cross-file ambiguous receiver",
@@ -14744,6 +17483,14 @@ void run() {
 "#;
     let (temporary_nodes, temporary_edges) =
         index_single_file("temporary.cpp", constructor_temporary_source)?;
+    assert_ordinary_call_census(
+        "cpp constructor temporary receiver",
+        &temporary_nodes,
+        &temporary_edges,
+        "run",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp constructor temporary receiver",
         &temporary_nodes,
@@ -14751,6 +17498,14 @@ void run() {
         "run",
         "Notifier",
         "save",
+    );
+    assert_ordinary_call_census(
+        "cpp constructor temporary receiver",
+        &temporary_nodes,
+        &temporary_edges,
+        "run",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp constructor temporary receiver",
@@ -14976,6 +17731,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "run",
         "workflow.cpp",
     );
+    assert_ordinary_call_census(
+        "cpp auto factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "autoFactory",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp auto factory receiver stays unresolved",
         &nodes,
@@ -14983,6 +17746,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "autoFactory",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "cpp auto factory receiver assigned later stays unresolved",
+        &nodes,
+        &edges,
+        "autoFactoryThenAssigned",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp auto factory receiver assigned later stays unresolved",
@@ -14992,6 +17763,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "cpp auto bare identifier initializer stays unresolved",
+        &nodes,
+        &edges,
+        "autoBareIdentifierInitializer",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp auto bare identifier initializer stays unresolved",
         &nodes,
@@ -14999,6 +17778,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "autoBareIdentifierInitializer",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "cpp auto composed braced initializer stays unresolved",
+        &nodes,
+        &edges,
+        "autoComposedBracedInitializer",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp auto composed braced initializer stays unresolved",
@@ -15008,6 +17795,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "cpp auto chained paren initializer stays unresolved",
+        &nodes,
+        &edges,
+        "autoChainedParenInitializer",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp auto chained paren initializer stays unresolved",
         &nodes,
@@ -15015,6 +17810,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "autoChainedParenInitializer",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "cpp auto qualified constructor receiver stays unresolved",
+        &nodes,
+        &edges,
+        "autoQualifiedConstructor",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp auto qualified constructor receiver stays unresolved",
@@ -15024,6 +17827,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "Workflow",
         "run",
     );
+    assert_ordinary_call_census(
+        "cpp auto smart-pointer factory receiver stays unresolved",
+        &nodes,
+        &edges,
+        "autoFactoryPointer",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp auto smart-pointer factory receiver stays unresolved",
         &nodes,
@@ -15031,6 +17842,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "autoFactoryPointer",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "cpp local receiver avoids other owner",
+        &nodes,
+        &edges,
+        "orchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp local receiver avoids other owner",
@@ -15059,6 +17878,14 @@ void outerParamStillWorks(Workflow& workflow) {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "cpp local auto declaration shadows typed parameter",
+        &nodes,
+        &edges,
+        "innerShadow",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp local auto declaration shadows typed parameter",
         &nodes,
@@ -15079,6 +17906,14 @@ void outerParamStillWorks(Workflow& workflow) {
             expected_count: 1,
         },
     );
+    assert_ordinary_call_census(
+        "cpp multi-declarator local declaration shadows typed parameter",
+        &nodes,
+        &edges,
+        "multiDeclaratorShadow",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp multi-declarator local declaration shadows typed parameter",
         &nodes,
@@ -15086,6 +17921,14 @@ void outerParamStillWorks(Workflow& workflow) {
         "multiDeclaratorShadow",
         "Workflow",
         "run",
+    );
+    assert_ordinary_call_census(
+        "cpp direct auto multi-declarator shadows typed parameter",
+        &nodes,
+        &edges,
+        "directAutoMultiDeclaratorShadow",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp direct auto multi-declarator shadows typed parameter",
@@ -15133,6 +17976,14 @@ void autoOrchestrate() {
         ("lib/workflow.cpp", owner_source),
         ("app/caller.cpp", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "cpp local receiver does not use cross-file owner",
+        &cross_nodes,
+        &cross_edges,
+        "orchestrate",
+        "run",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "cpp local receiver does not use cross-file owner",
         &cross_nodes,
@@ -15141,6 +17992,14 @@ void autoOrchestrate() {
         "Workflow",
         "run",
         "lib/workflow.cpp",
+    );
+    assert_ordinary_call_census(
+        "cpp auto local receiver does not use cross-file owner",
+        &cross_nodes,
+        &cross_edges,
+        "autoOrchestrate",
+        "run",
+        1,
     );
     assert_no_resolved_call_to_method_owner_in_file(
         "cpp auto local receiver does not use cross-file owner",
@@ -15248,6 +18107,14 @@ public:
         "decorate",
         "workflow.cpp",
     );
+    assert_ordinary_call_census(
+        "cpp field receiver avoids other owner",
+        &nodes,
+        &edges,
+        "fieldRun",
+        "save",
+        3,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp field receiver avoids other owner",
         &nodes,
@@ -15256,6 +18123,14 @@ public:
         "OtherRepository",
         "save",
     );
+    assert_ordinary_call_census(
+        "cpp self receiver avoids other owner",
+        &nodes,
+        &edges,
+        "fieldRun",
+        "decorate",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp self receiver avoids other owner",
         &nodes,
@@ -15263,6 +18138,14 @@ public:
         "fieldRun",
         "OtherWorkflow",
         "decorate",
+    );
+    assert_ordinary_call_census(
+        "cpp parameter receiver shadows field receiver",
+        &nodes,
+        &edges,
+        "parameterShadowsField",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp parameter receiver shadows field receiver",
@@ -15281,6 +18164,14 @@ public:
         "save",
         "workflow.cpp",
     );
+    assert_ordinary_call_census(
+        "cpp local receiver shadows field receiver",
+        &nodes,
+        &edges,
+        "localShadowsField",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "cpp local receiver shadows field receiver",
         &nodes,
@@ -15288,6 +18179,14 @@ public:
         "localShadowsField",
         "Repository",
         "save",
+    );
+    assert_ordinary_call_census(
+        "cpp multi-declarator field stays unresolved",
+        &nodes,
+        &edges,
+        "multiDeclaratorField",
+        "save",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "cpp multi-declarator field stays unresolved",
@@ -15322,6 +18221,14 @@ public:
         ("lib/repository.cpp", owner_source),
         ("app/entry.cpp", caller_source),
     ])?;
+    assert_ordinary_call_census(
+        "cpp field receiver does not use cross-file owner",
+        &cross_file_nodes,
+        &cross_file_edges,
+        "call",
+        "save",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "cpp field receiver does not use cross-file owner",
         &cross_file_nodes,
@@ -15593,28 +18500,6 @@ func run(notifier: Any) {
 }
 
 #[test]
-fn test_java_annotation_usage_span_tracks_terminal_identifier() -> anyhow::Result<()> {
-    let source = "@Deprecated\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-
-    let deprecated_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Deprecated"))
-        .ok_or_else(|| anyhow::anyhow!("expected Deprecated annotation usage node"))?;
-
-    assert_eq!(
-        snippet_for_node(source, deprecated_target),
-        Some("Deprecated"),
-        "expected Java annotation usage placeholder to cover only the annotation token"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn test_rust_impl_expr_span_tracks_terminal_identifier() -> anyhow::Result<()> {
     let source = "impl crate::api::Worker<T> {\n    fn run(&self) {}\n}\n";
     let (nodes, _edges) = index_single_file("main.rs", source)?;
@@ -15634,48 +18519,30 @@ fn test_rust_impl_expr_span_tracks_terminal_identifier() -> anyhow::Result<()> {
 
 #[test]
 fn test_java_annotation_usage_placeholder_span_tracks_terminal_identifier() -> anyhow::Result<()> {
-    let source = "@Marker\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    // The Marker/Deprecated/Logged spellings all traverse the same
+    // `marker_annotation` grammar path; the consolidated sweep keeps the
+    // spelling variants while asserting the terminal-identifier span and the
+    // exact line-1 placement the weaker duplicates lacked.
+    for annotation in ["Marker", "Deprecated", "Logged"] {
+        let source = format!("@{annotation}\nclass Example {{}}\n");
+        let (nodes, edges) = index_single_file("Main.java", &source)?;
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
 
-    let marker_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Marker"))
-        .ok_or_else(|| anyhow::anyhow!("expected Marker annotation placeholder node"))?;
+        let annotation_target = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
+            .filter_map(|edge| node_by_id.get(&edge.target).copied())
+            .find(|node| is_matching_name(&node.serialized_name, annotation))
+            .ok_or_else(|| anyhow::anyhow!("expected {annotation} annotation placeholder node"))?;
 
-    assert_eq!(marker_target.start_line, Some(1));
-    assert_eq!(marker_target.end_line, Some(1));
-    assert_eq!(
-        snippet_for_node(source, marker_target),
-        Some("Marker"),
-        "expected Java annotation placeholder to cover only the annotation token"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_java_annotation_usage_placeholder_span_tracks_annotation_token() -> anyhow::Result<()> {
-    let source = "@Logged\nclass Example {}\n";
-    let (nodes, edges) = index_single_file("Main.java", source)?;
-    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-
-    let logged_target = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
-        .filter_map(|edge| node_by_id.get(&edge.target).copied())
-        .find(|node| is_matching_name(&node.serialized_name, "Logged"))
-        .ok_or_else(|| anyhow::anyhow!("expected Logged annotation node"))?;
-
-    assert_eq!(logged_target.start_line, Some(1));
-    assert_eq!(logged_target.end_line, Some(1));
-    assert_eq!(
-        snippet_for_node(source, logged_target),
-        Some("Logged"),
-        "expected Java annotation usage placeholder to cover only the annotation token"
-    );
+        assert_eq!(annotation_target.start_line, Some(1));
+        assert_eq!(annotation_target.end_line, Some(1));
+        assert_eq!(
+            snippet_for_node(&source, annotation_target),
+            Some(annotation),
+            "expected Java annotation placeholder to cover only the annotation token"
+        );
+    }
 
     Ok(())
 }
@@ -15975,6 +18842,14 @@ fn run(factory: &Factory) -> Result<(), ()> {
         ("factory.rs", factory),
         ("caller.rs", caller),
     ])?;
+    assert_ordinary_call_census(
+        "rust cross-file return type remains fail-closed",
+        &nodes,
+        &edges,
+        "run",
+        "execute",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "rust cross-file return type remains fail-closed",
         &nodes,
@@ -16031,6 +18906,14 @@ trait ConstructorWorkflow {
             "Workflow",
             method,
         );
+        assert_ordinary_call_census(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            method,
+            1,
+        );
         assert_no_resolved_call_to_method_owner(
             "rust trait default self call",
             &nodes,
@@ -16040,6 +18923,14 @@ trait ConstructorWorkflow {
             method,
         );
     }
+    assert_ordinary_call_census(
+        "rust trait constructor return remains fail closed",
+        &nodes,
+        &edges,
+        "run_constructor",
+        "inspect",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "rust trait constructor return remains fail closed",
         &nodes,
@@ -16081,6 +18972,14 @@ fn ambiguous<T: Handler + Auditor>(target: &T) {
         "Handler",
         "handle",
     );
+    assert_ordinary_call_census(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "handle",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "rust ambiguous local generic trait bound",
         &nodes,
@@ -16088,6 +18987,14 @@ fn ambiguous<T: Handler + Auditor>(target: &T) {
         "ambiguous",
         "Handler",
         "handle",
+    );
+    assert_ordinary_call_census(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "handle",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "rust ambiguous local generic trait bound",
@@ -16191,6 +19098,14 @@ func shadowed(new func(node) *other) {
         "node",
         "addRoute",
     );
+    assert_ordinary_call_census(
+        "go shadowed new remains fail-closed",
+        &nodes,
+        &edges,
+        "shadowed",
+        "addRoute",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "go shadowed new remains fail-closed",
         &nodes,
@@ -16222,6 +19137,14 @@ func build() {
 "#;
 
     let (nodes, edges) = index_files(&[("router.go", source)])?;
+    assert_ordinary_call_census(
+        "go file-scope new shadow remains fail-closed",
+        &nodes,
+        &edges,
+        "build",
+        "addRoute",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "go file-scope new shadow remains fail-closed",
         &nodes,
@@ -16340,6 +19263,14 @@ class IOClient {
         "BaseRequest",
         "finalize",
     );
+    assert_ordinary_call_census(
+        "dart untyped initializer remains fail-closed",
+        &nodes,
+        &edges,
+        "IOClient.untyped",
+        "finalize",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart untyped initializer remains fail-closed",
         &nodes,
@@ -16355,14 +19286,36 @@ class Worker {
 }
 "#;
     let unimported_entry = r#"
+void helper() {}
+
 void call(Worker worker) {
   worker.run();
+  helper();
 }
 "#;
     let (unimported_nodes, unimported_edges) = index_files(&[
         ("lib/worker.dart", worker),
         ("lib/entry.dart", unimported_entry),
     ])?;
+    // `call`'s `run` call emits no CALL edge while its receiver cannot
+    // be bound; the `helper` census proves this caller's calls were
+    // extracted, and the 0-count pins the contract.
+    assert_ordinary_call_census(
+        "dart unimported typed parameter remains fail-closed",
+        &unimported_nodes,
+        &unimported_edges,
+        "call",
+        "helper",
+        1,
+    );
+    assert_ordinary_call_census(
+        "dart unimported typed parameter remains fail-closed",
+        &unimported_nodes,
+        &unimported_edges,
+        "call",
+        "run",
+        0,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart unimported typed parameter remains fail-closed",
         &unimported_nodes,
@@ -16401,6 +19354,14 @@ class Client {
         ("lib/second_request.dart", second_request),
         ("lib/client.dart", caller),
     ])?;
+    assert_ordinary_call_census(
+        "dart duplicate same-directory owner remains fail-closed",
+        &nodes,
+        &edges,
+        "Client.send",
+        "finish",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "dart duplicate same-directory owner remains fail-closed",
         &nodes,
@@ -17014,6 +19975,14 @@ class PanelOwner
 
     // Vendor shadow: Widget's only declaration is under root `Vendor`.
     assert_no_type_usage_from("csharp vendor shadow", &nodes, &edges, "ShadowOwner");
+    assert_ordinary_call_census(
+        "csharp vendor shadow chained call",
+        &nodes,
+        &edges,
+        "ShadowOwner.Chain",
+        "Render",
+        1,
+    );
     assert_no_resolved_call_to_method_owner_in_file(
         "csharp vendor shadow chained call",
         &nodes,
@@ -17027,6 +19996,14 @@ class PanelOwner
     // Ambiguity: two Panel declarations under root `Acme`.
     assert_no_type_usage_from("csharp same-root ambiguity", &nodes, &edges, "PanelOwner");
     for panel_file in ["src/Acme/A/Panel.cs", "src/Acme/B/Panel.cs"] {
+        assert_ordinary_call_census(
+            "csharp same-root ambiguity chained call",
+            &nodes,
+            &edges,
+            "PanelOwner.Chain",
+            "Draw",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "csharp same-root ambiguity chained call",
             &nodes,
@@ -17450,6 +20427,8 @@ func Convert(k Key) string { return string(k) }
 func Variable(run func() int) int { return run() }
 "#;
     let (nodes, edges) = index_files(&[("methods.go", methods), ("calls.go", conversions)])?;
+    assert_ordinary_call_census("G08-string", &nodes, &edges, "Convert", "string", 1);
+    assert_ordinary_call_census("G08-run", &nodes, &edges, "Variable", "run", 1);
     assert_no_resolved_call_to_method_owner(
         "G08-string",
         &nodes,
@@ -17492,6 +20471,7 @@ func Caller() { Run() }
         ("caller.go", caller),
     ])?;
     assert_resolved_call_to_kind("G09", &nodes, &edges, "Caller", "Run", NodeKind::FUNCTION);
+    assert_ordinary_call_census("G09", &nodes, &edges, "Caller", "Run", 1);
     assert_no_resolved_call_to_method_owner("G09", &nodes, &edges, "Caller", "Handler", "Run");
     Ok(())
 }
@@ -17820,21 +20800,31 @@ func ImplicitDeclaredPackage() { declared.NewWorker().Finish() }
         ),
     ])?;
     assert_unresolved_nonpackage_go_selector_call(&nodes, &edges, "FabricatedImport", "Finish");
-    assert_resolved_call_to_method_owner(
+    // Three same-named `Worker` declarations exist across worker/, other/, and
+    // oddpath/; the target file must be pinned, not just the owner name.
+    assert_resolved_call_count_to_method_owner_in_file(
         "return-import-ast",
         &nodes,
         &edges,
-        "ActualImport",
-        "Worker",
-        "Finish",
+        ResolvedCallCountInFile {
+            caller_name: "ActualImport",
+            owner_name: "Worker",
+            method_name: "Finish",
+            file_suffix: "worker/worker.go",
+            expected_count: 1,
+        },
     );
-    assert_resolved_call_to_method_owner(
+    assert_resolved_call_count_to_method_owner_in_file(
         "return-import-implicit-package-clause",
         &nodes,
         &edges,
-        "ImplicitDeclaredPackage",
-        "Worker",
-        "Finish",
+        ResolvedCallCountInFile {
+            caller_name: "ImplicitDeclaredPackage",
+            owner_name: "Worker",
+            method_name: "Finish",
+            file_suffix: "oddpath/worker.go",
+            expected_count: 1,
+        },
     );
     Ok(())
 }
@@ -18168,6 +21158,14 @@ fn test_go_factory_return_header_and_case_shadows_block_import_inside_scope() ->
         "InsideSwitchHeader",
         "InsideSwitchCase",
     ] {
+        assert_ordinary_call_census(
+            "return-header-shadow-inside",
+            &nodes,
+            &edges,
+            caller,
+            "Finish",
+            1,
+        );
         assert_no_resolved_call_to_method_owner_in_file(
             "return-header-shadow-inside",
             &nodes,
@@ -18457,6 +21455,14 @@ fn test_go_factory_return_module_refresh_clears_unchanged_caller() -> anyhow::Re
     fixture.assert_initial_alpha("return-refresh-module-initial")?;
     fs::write(&fixture.module_path, "module example.com/changed\n")?;
     fixture.refresh(vec![fixture.module_path.clone()], vec![])?;
+    assert_ordinary_call_census(
+        "return-refresh-module-control",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Finish",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "return-refresh-module-control",
         &fixture.storage.get_nodes()?,
@@ -18479,6 +21485,14 @@ fn test_go_factory_return_deletion_refresh_clears_unchanged_caller() -> anyhow::
         .id;
     fs::remove_file(&fixture.factory_path)?;
     fixture.refresh(vec![], vec![factory_id])?;
+    assert_ordinary_call_census(
+        "return-refresh-factory-deletion",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Finish",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "return-refresh-factory-deletion",
         &fixture.storage.get_nodes()?,
@@ -18499,6 +21513,14 @@ fn test_go_factory_return_source_hash_drift_stays_unresolved() -> anyhow::Result
         "package worker\nfunc New() *Bravo { return nil }\n",
     )?;
     fixture.refresh(vec![fixture.caller_path.clone()], vec![])?;
+    assert_ordinary_call_census(
+        "return-refresh-drift-old",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Finish",
+        1,
+    );
     assert_no_resolved_call_to_method_owner(
         "return-refresh-drift-old",
         &fixture.storage.get_nodes()?,
@@ -18506,6 +21528,14 @@ fn test_go_factory_return_source_hash_drift_stays_unresolved() -> anyhow::Result
         "Caller",
         "Alpha",
         "Finish",
+    );
+    assert_ordinary_call_census(
+        "return-refresh-drift-unindexed",
+        &fixture.storage.get_nodes()?,
+        &fixture.storage.get_edges()?,
+        "Caller",
+        "Finish",
+        1,
     );
     assert_no_resolved_call_to_method_owner(
         "return-refresh-drift-unindexed",
@@ -18649,7 +21679,11 @@ func Closure() { chosen := local{}; func() { chosen.Target() }() }
 fn test_go_module_control_change_reindexes_callers_and_clears_old_resolution() -> anyhow::Result<()>
 {
     let dir = tempdir()?;
-    let root = dir.path();
+    // Workspace plans report canonical paths; on macOS `tempdir()` returns the
+    // lexical `/var/...` spelling of the canonical `/private/var/...` inode, so
+    // every `root.join(...)` comparison below must use the canonical path.
+    let canonical_root = dir.path().canonicalize()?;
+    let root = canonical_root.as_path();
     fs::create_dir_all(root.join("selected"))?;
     fs::write(root.join(".gitignore"), "go.mod\n")?;
     fs::write(root.join("go.mod"), "module example.com/project\n")?;
@@ -19056,6 +22090,7 @@ func Convert(k Key) string { return string(k) }
 
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
+    assert_ordinary_call_census("G13-initial", &nodes, &edges, "Convert", "string", 1);
     assert_no_resolved_call_to_method_owner(
         "G13-initial",
         &nodes,
@@ -19074,6 +22109,7 @@ func Convert(k Key) string { return string(k) }
     assert!(!snapshot_loaded.telemetry.support_snapshot_stored);
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
+    assert_ordinary_call_census("G13-snapshot-hit", &nodes, &edges, "Convert", "string", 1);
     assert_no_resolved_call_to_method_owner(
         "G13-snapshot-hit",
         &nodes,
@@ -19104,6 +22140,7 @@ func Convert(k Key) string { return string(k) }
 
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
+    assert_ordinary_call_census("G13-refresh", &nodes, &edges, "Convert", "string", 1);
     assert_no_resolved_call_to_method_owner(
         "G13-refresh",
         &nodes,

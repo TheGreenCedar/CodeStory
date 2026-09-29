@@ -67,10 +67,14 @@ static VECTOR_PUBLICATION_RECEIPTS: SealedReceiptCache<
     VectorPublicationReceiptKey,
     VectorGenerationManifest,
 > = SealedReceiptCache::new(VECTOR_PUBLICATION_RECEIPT_CAPACITY);
+/// The abstention policy the shipped dense lane applies, in the hundredths the
+/// calibration corpus records, so the corpus's selected policy can be bound to
+/// these constants instead of restating an independent pair.
+pub(crate) const DENSE_ABSTENTION_POLICY_HUNDREDTHS: (u8, u8) = (30, 10);
 /// Minimum cosine supported by the source-backed development calibration.
-const DENSE_ABSTENTION_ABSOLUTE_FLOOR: f32 = 0.30;
+const DENSE_ABSTENTION_ABSOLUTE_FLOOR: f32 = DENSE_ABSTENTION_POLICY_HUNDREDTHS.0 as f32 / 100.0;
 /// Maximum distance from the lane's best cosine supported by that calibration.
-const DENSE_ABSTENTION_ADDITIVE_MARGIN: f32 = 0.10;
+const DENSE_ABSTENTION_ADDITIVE_MARGIN: f32 = DENSE_ABSTENTION_POLICY_HUNDREDTHS.1 as f32 / 100.0;
 type ScoredHit = (
     f32,
     String,
@@ -2597,11 +2601,18 @@ fn retain_dense_evidence(scored: &mut Vec<ScoredHit>) {
     let Some(best) = scored.first().map(|hit| hit.0) else {
         return;
     };
-    scored.retain(|hit| {
-        hit.0.is_finite()
-            && hit.0 >= DENSE_ABSTENTION_ABSOLUTE_FLOOR
-            && hit.0 >= best - DENSE_ABSTENTION_ADDITIVE_MARGIN
-    });
+    scored.retain(|hit| dense_abstention_keeps(best, hit.0));
+}
+
+/// The shipped dense-abstention rule for one candidate: finite cosine, at or
+/// above the absolute floor, and within the additive margin of the lane's
+/// best cosine. `semantic_calibration_support` replays recorded raw scores
+/// through this same predicate so the attested corpus policy cannot drift
+/// from the constants here.
+pub(crate) fn dense_abstention_keeps(best: f32, score: f32) -> bool {
+    score.is_finite()
+        && score >= DENSE_ABSTENTION_ABSOLUTE_FLOOR
+        && score >= best - DENSE_ABSTENTION_ADDITIVE_MARGIN
 }
 
 #[cfg(feature = "semantic-calibration-support")]
@@ -3409,16 +3420,29 @@ mod tests {
             attestation
         );
 
-        let connection = Connection::open(index_path(&layout, "codestory_attested"))
-            .expect("open attested database");
+        // The published file is owner-readonly, so an INSERT against it fails
+        // for filesystem reasons regardless of the schema. Probe the singleton
+        // on a writable copy so only the constraint itself can reject the row.
+        let writable_copy = root.path().join("attested-writable.db");
+        std::fs::copy(index_path(&layout, "codestory_attested"), &writable_copy)
+            .expect("copy attested database");
+        let mut permissions = std::fs::metadata(&writable_copy)
+            .expect("copy metadata")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&writable_copy, permissions).expect("make copy writable");
+        let connection = Connection::open(&writable_copy).expect("open writable copy");
+        let error = connection
+            .execute(
+                "INSERT INTO metadata SELECT * FROM metadata WHERE singleton = 1",
+                [],
+            )
+            .expect_err("metadata singleton must reject a second row");
         assert!(
-            connection
-                .execute(
-                    "INSERT INTO metadata SELECT * FROM metadata WHERE singleton = 1",
-                    [],
-                )
-                .is_err(),
-            "metadata singleton must reject a second row"
+            error.to_string().contains("constraint failed"),
+            "the second row must fail on the singleton constraint, not on \
+             ambient filesystem or journal state: {error:#}"
         );
     }
 
@@ -3733,9 +3757,10 @@ mod tests {
             },
         )
         .expect("incremental build");
-        let Some((attestation, work)) = outcome else {
-            return;
-        };
+        let (attestation, work) = outcome.expect(
+            "a readable predecessor must take the incremental path; a silent \
+             fallback would bypass every reconciliation assertion below",
+        );
 
         assert_eq!(work.retained, 1);
         assert_eq!(work.inserted, 1);
@@ -5154,14 +5179,27 @@ mod tests {
                 |visit| {
                     for index in 0..point_count {
                         let mut vector = vec![0.0_f32; DIMENSION];
-                        let first = index % DIMENSION;
-                        let second = (index.wrapping_mul(31) + 7) % DIMENSION;
-                        if first == second {
-                            vector[first] = 1.0;
+                        if index < 20 {
+                            // Twenty exact copies of the query vector keep the
+                            // `hits.len() == 20` assertion reachable: the
+                            // product abstention floor and margin retain only
+                            // near-parallel rows, and the generated pattern
+                            // peaks at 0.8 for every other index. Stored
+                            // vectors must be L2-normalized, so the unit-length
+                            // spelling of the query direction is used.
+                            const QUERY_NORM: f32 = 0.894_427_2;
+                            vector[0] = QUERY_NORM;
+                            vector[7] = 0.5 * QUERY_NORM;
                         } else {
-                            const NORMALIZER: f32 = 0.894_427_2;
-                            vector[first] = NORMALIZER;
-                            vector[second] = 0.5 * NORMALIZER;
+                            let first = index % DIMENSION;
+                            let second = (index.wrapping_mul(31) + 8) % DIMENSION;
+                            if first == second {
+                                vector[first] = 1.0;
+                            } else {
+                                const NORMALIZER: f32 = 0.894_427_2;
+                                vector[first] = NORMALIZER;
+                                vector[second] = 0.5 * NORMALIZER;
+                            }
                         }
                         visit(point(&index.to_string(), vector))?;
                     }
@@ -5188,6 +5226,17 @@ mod tests {
                 )
                 .expect("measure search");
                 assert_eq!(hits.len(), 20);
+                assert!(
+                    hits.iter().all(|hit| {
+                        hit.node_id
+                            .as_deref()
+                            .and_then(|node| node.parse::<usize>().ok())
+                            .map(|node| node < 20)
+                            .unwrap_or(false)
+                    }),
+                    "the twenty planted exact duplicates must fill the result \
+                     window: {hits:#?}"
+                );
                 search_us.push(started.elapsed().as_micros());
             }
             search_us.sort_unstable();

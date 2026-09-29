@@ -51,6 +51,8 @@ use codestory_store::{
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Duration;
 use std::time::Instant;
 
 pub(crate) struct ActivationIndexingEvidence {
@@ -63,6 +65,78 @@ pub(crate) struct ActivationIndexingEvidence {
 struct IndexingCompletion {
     phase_timings: IndexingPhaseTimings,
     repository_tracking_digest: Option<codestory_workspace::RepositoryTrackingDigest>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type MidIndexingTestHook = Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>;
+
+#[cfg(any(test, feature = "test-support"))]
+static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
+    std::sync::RwLock::new(None);
+
+/// Run `hook` while an indexing worker owns the writer lock with
+/// `is_indexing` set, so a test can hold a refresh genuinely in flight while
+/// reads pin the retained publication. The hook sees the storage path so a
+/// shared test binary only parks the run it armed for.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_mid_indexing_test_hook(hook: MidIndexingTestHook) {
+    *MID_INDEXING_TEST_HOOK
+        .write()
+        .expect("mid-indexing test hook lock") = hook;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_mid_indexing_test_hook(storage_path: &Path) {
+    let hook = MID_INDEXING_TEST_HOOK
+        .read()
+        .expect("mid-indexing test hook lock")
+        .clone();
+    if let Some(hook) = hook {
+        hook(storage_path);
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_mid_indexing_test_hook(_storage_path: &Path) {}
+
+/// Extension for the spawned-process writer-hold marker: while
+/// `<storage>.index-writer-hold` exists, a run that already owns the writer
+/// lock parks before doing any work.
+#[cfg(any(test, feature = "test-support"))]
+const INDEX_WRITER_HOLD_EXTENSION: &str = "index-writer-hold";
+
+/// Spawned-process tests park a real refresh mid-flight by creating the
+/// `<storage>.index-writer-hold` marker: the run that already owns the writer
+/// lock waits here — still holding it — until the file disappears. Both the
+/// explicit token and the ambient activation cancellation stop the wait, and
+/// a bounded deadline keeps a forgotten marker from wedging indexing.
+#[cfg(any(test, feature = "test-support"))]
+fn wait_out_index_writer_hold_marker(
+    storage_path: &Path,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), ApiError> {
+    let marker = storage_path.with_extension(INDEX_WRITER_HOLD_EXTENSION);
+    if !marker.exists() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while marker.exists() {
+        if cancel_token.is_some_and(|token| token.is_cancelled())
+            || codestory_contracts::bounded_locks::thread_cancellation()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(ApiError::new(
+                "cancelled",
+                "indexing cancelled while holding the writer lock on a hold marker",
+            ));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 impl AppController {
@@ -148,6 +222,16 @@ impl AppController {
             )));
         }
         let session = CoreReadSession::pin(&storage_path).map_err(|error| {
+            if matches!(
+                error,
+                codestory_store::StorageError::SchemaVersionMismatch { .. }
+            ) {
+                return crate::index_incremental::core_schema_observation_error(
+                    &root,
+                    "Failed to pin complete core publication",
+                    error,
+                );
+            }
             ApiError::new(
                 "project_unavailable",
                 format!("no complete core publication is available: {error}"),
@@ -188,6 +272,7 @@ impl AppController {
 
     pub fn complete_index_publication_at(
         &self,
+        project_root: &Path,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
         if !codestory_store::core_database_exists(storage_path).map_err(|error| {
@@ -201,9 +286,11 @@ impl AppController {
             .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
-                ApiError::internal(format!(
-                    "Failed to observe complete index publication: {error}"
-                ))
+                crate::index_incremental::core_schema_observation_error(
+                    project_root,
+                    "Failed to observe complete index publication",
+                    error,
+                )
             })
     }
 
@@ -224,13 +311,15 @@ impl AppController {
         {
             let storage =
                 Storage::open_freshness_observational(&storage_path).map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to open fenced storage for project summary: {error}"
-                    ))
+                    crate::index_incremental::core_schema_observation_error(
+                        &root,
+                        "Failed to open fenced storage for project summary",
+                        error,
+                    )
                 })?;
             self.project_summary_from_storage(&root, &storage_path, &storage)?
         } else {
-            let storage = open_storage_for_read(&storage_path)?;
+            let storage = open_storage_for_read(&root, &storage_path)?;
             let snapshot = storage.read_snapshot().map_err(|error| {
                 ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
             })?;
@@ -282,9 +371,10 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let mut storage = open_storage_for_read(&storage_path)?;
+        let mut storage = open_storage_for_read(&root, &storage_path)?;
         let loaded = load_persisted_search_state_for_runtime(
             &mut storage,
+            &root,
             &storage_path,
             &self.runtime_config,
         )?;
@@ -421,15 +511,20 @@ impl AppController {
                 ))
             })?;
         if schema_version < CURRENT_SCHEMA_VERSION {
-            return Err(ApiError::new(
-                "core_schema_upgrade_required",
-                format!(
-                    "Core cache schema {schema_version} requires a full index to upgrade to schema {CURRENT_SCHEMA_VERSION}"
+            return Err(
+                crate::index_incremental::core_schema_upgrade_required_error(
+                    &root,
+                    schema_version,
+                    CURRENT_SCHEMA_VERSION,
                 ),
-            ));
+            );
         }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
-            ApiError::internal(format!("Failed to open storage observationally: {error}"))
+            crate::index_incremental::core_schema_observation_error(
+                &root,
+                "Failed to open storage observationally",
+                error,
+            )
         })?;
         let snapshot = storage.read_snapshot().map_err(|error| {
             ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
@@ -561,6 +656,7 @@ impl AppController {
             cancel_token,
             None,
             None,
+            None,
         )
         .map(|completion| completion.phase_timings)
     }
@@ -572,6 +668,7 @@ impl AppController {
         cancel_token: Option<&CancellationToken>,
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        preacquired_writer: Option<IndexWriterGuard>,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -601,13 +698,25 @@ impl AppController {
             s.index_freshness_cache = None;
         }
 
-        let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.state.lock().is_indexing = false;
-                return Err(error);
-            }
+        let _writer_guard = match preacquired_writer {
+            // A peer-waited activation hands in the writer it already holds;
+            // every other caller contends here and keeps the single-failure
+            // `cache_busy` answer.
+            Some(guard) => guard,
+            None => match IndexWriterGuard::try_acquire(&storage_path) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    self.state.lock().is_indexing = false;
+                    return Err(error);
+                }
+            },
         };
+        run_mid_indexing_test_hook(&storage_path);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Err(error) = wait_out_index_writer_hold_marker(&storage_path, cancel_token) {
+            self.state.lock().is_indexing = false;
+            return Err(error);
+        }
 
         // A refresh can install a database that never carried the legacy
         // annotation tables, so annotations move to the sidecar before the run
@@ -819,7 +928,18 @@ impl AppController {
             .storage_path
             .clone()
             .ok_or_else(no_project_error)?;
-        let _writer_guard = IndexWriterGuard::try_acquire(&storage_path)?;
+        // Activation owns this acquisition, so peer contention waits on the
+        // publication boundary rather than failing `cache_busy`: the ambient
+        // activation cancellation reaches the bounded wait, and the
+        // publication revalidation below already re-checks whatever the peer
+        // committed first.
+        let _writer_guard = IndexWriterGuard::acquire_after_peer(
+            &storage_path,
+            codestory_contracts::bounded_locks::LockDeadline::after(
+                codestory_contracts::bounded_locks::PUBLICATION_LOCK_WAIT,
+            ),
+            None,
+        )?;
         if cancel_token.is_cancelled() {
             return Err(indexing_cancelled_error());
         }
@@ -999,12 +1119,16 @@ impl AppController {
     /// core facts that the staged publication already validated. Activation
     /// uses this receipt instead of rebuilding a broad project summary and
     /// revalidating the same derived publications before retrieval can start.
+    /// `writer_guard` is the index-writer lock the activation already holds —
+    /// either acquired uncontended or taken over from a peer after a bounded
+    /// wait — so the publication it plans against cannot change underneath it.
     pub(crate) fn run_indexing_blocking_with_cancel_for_activation(
         &self,
         mode: IndexMode,
         cancel_token: &CancellationToken,
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        writer_guard: IndexWriterGuard,
     ) -> Result<ActivationIndexingEvidence, ApiError> {
         let completion = self.run_indexing_blocking_inner_with_probe(
             mode,
@@ -1012,6 +1136,7 @@ impl AppController {
             Some(cancel_token),
             precomputed_probe,
             failed_refresh_diagnostics,
+            Some(writer_guard),
         )?;
         let storage_path = self.require_storage_path()?;
         let storage = Store::open_read_only(&storage_path).map_err(|error| {
@@ -1296,9 +1421,11 @@ impl AppController {
                 } else {
                     let store =
                         Store::open_freshness_observational(&storage_path).map_err(|error| {
-                            ApiError::internal(format!(
-                                "Failed to inspect dry-run storage without mutation: {error}"
-                            ))
+                            crate::index_incremental::schema_observation_error(
+                                &root,
+                                "Failed to inspect dry-run storage without mutation",
+                                error,
+                            )
                         })?;
                     workspace_refresh_inputs(&store)?
                 }
@@ -1420,7 +1547,7 @@ impl AppController {
     /// exists the live database is read-only and the rows can only be installed
     /// by republishing a new generation. An unpublished cache still takes the
     /// direct write.
-    fn persist_symbol_summaries(
+    pub(crate) fn persist_symbol_summaries(
         &self,
         storage_path: &Path,
         summaries: Vec<SymbolSummaryRecord>,
@@ -1481,7 +1608,7 @@ impl AppController {
     }
 
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
-        self.ensure_consistent_read_state("Files")?;
+        self.ensure_graph_only_read_state("Files")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
         indexed_files_from_storage(&root, &storage, &self.source_index_policy, req)

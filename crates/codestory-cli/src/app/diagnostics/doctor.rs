@@ -3,7 +3,7 @@ use super::super::readiness_commands::doctor_sidecar_status_is_live_ready;
 use super::super::resolution::quote_command_path;
 use super::readiness::{agent_readiness_status, build_readiness_lanes_for_runtime};
 use super::sidecar::{build_summary_readiness, doctor_sidecar_status};
-use crate::args::{DoctorCheckOutput, DoctorOutput, RetrievalStatusOutput};
+use crate::args::{DoctorCheckOutput, DoctorOutput, DoctorStaleCachedCore, RetrievalStatusOutput};
 use crate::display;
 use crate::embedding_config;
 use crate::readiness;
@@ -94,6 +94,39 @@ pub(in crate::app) fn build_doctor_output(
         checks.push(index_freshness_check(freshness));
     }
 
+    // Enumerate sibling project caches under this runtime's own process cache
+    // root. The scan is strictly observational: each cache is opened through
+    // the non-mutating schema reader, never read-write, so reporting a stale
+    // core can never migrate it.
+    let stale_cached_cores = codestory_runtime::observe_stale_cached_cores(
+        runtime.sidecar.process_cache_root(),
+        &runtime.cache_root,
+    )
+    .into_iter()
+    .map(|entry| {
+        let project_root = entry
+            .project_root
+            .map(|root| display::clean_path_string(&root.to_string_lossy()));
+        DoctorStaleCachedCore {
+            cache_dir: display::clean_path_string(&entry.cache_dir.to_string_lossy()),
+            project_root,
+            found_schema: entry.found_schema,
+            required_schema: entry.required_schema,
+            next_action: entry.next_action,
+        }
+    })
+    .collect::<Vec<_>>();
+    if !stale_cached_cores.is_empty() {
+        checks.push(doctor_check(
+            "cached_cores",
+            "warn",
+            format!(
+                "{} other cached project(s) have an incompatible core schema; follow each cache's next_action, or use a matching CodeStory version when its project root is unavailable.",
+                stale_cached_cores.len()
+            ),
+        ));
+    }
+
     // Reported settings are observed through the registry so a secret-marked
     // value can never reach a doctor line, whatever this list grows to hold.
     // The list itself lives in the registry too: naming these identities here
@@ -129,6 +162,7 @@ pub(in crate::app) fn build_doctor_output(
         readiness_lanes,
         checks,
         next_commands,
+        stale_cached_cores,
         environment,
     }
 }
@@ -257,14 +291,19 @@ pub(in crate::app::diagnostics) fn index_freshness_check(
                 freshness.duration_ms
             ),
         ),
-        IndexFreshnessStatusDto::NotChecked => doctor_check(
-            "index_freshness",
-            "info",
-            format!(
-                "Index freshness was not checked: {}.",
-                freshness.reason.as_deref().unwrap_or("no reason reported")
-            ),
-        ),
+        IndexFreshnessStatusDto::NotChecked => {
+            if let Some(warning) = readiness::bounded_inventory_freshness_warning(freshness) {
+                return doctor_check("index_freshness", "warn", warning);
+            }
+            doctor_check(
+                "index_freshness",
+                "info",
+                format!(
+                    "Index freshness was not checked: {}.",
+                    freshness.reason.as_deref().unwrap_or("no reason reported")
+                ),
+            )
+        }
     }
 }
 
@@ -652,5 +691,59 @@ mod rollback_recommendation_tests {
             next_commands,
             vec!["codestory-cli index --project /repo --refresh full".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod freshness_check_tests {
+    use super::*;
+    use codestory_contracts::api::IndexFreshnessNotCheckedCauseDto;
+
+    fn not_checked(cause: IndexFreshnessNotCheckedCauseDto) -> IndexFreshnessDto {
+        IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 30_000,
+            duration_ms: 0,
+            reason: Some(
+                "indexed file inventory exceeds bounded freshness cap (30000 > 25000)".to_string(),
+            ),
+            not_checked_cause: Some(cause),
+            samples: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_bounded_inventory_is_a_warn_not_an_info_line() {
+        // Repositories past the scale envelope are a supported-but-bounded
+        // state the operator should see, not a trivia footnote.
+        let check = index_freshness_check(&not_checked(
+            IndexFreshnessNotCheckedCauseDto::BoundedInventory,
+        ));
+
+        assert_eq!(check.name, "index_freshness");
+        assert_eq!(check.status, "warn");
+        assert!(
+            check.message.contains("30000 > 25000"),
+            "the warning must carry the observed bound, not a bare label: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("remains usable"),
+            "the warning must say the index stays usable: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn an_unavailable_inventory_stays_informational() {
+        let check = index_freshness_check(&not_checked(
+            IndexFreshnessNotCheckedCauseDto::InventoryUnavailable,
+        ));
+
+        assert_eq!(check.status, "info");
     }
 }

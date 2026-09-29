@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::test_sidecar_runtime_from_env;
 use super::{
     ApiError, CancellationToken, EmbeddingProfileContractDto, FileLockKind,
     HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexPublicationRecord, Instant, LockDeadline,
@@ -8,13 +10,6 @@ use super::{
     embedding_runtime_availability_from_config, indexing_cancelled_error, is_indexing_cancelled,
     open_storage_for_read,
 };
-#[cfg(test)]
-use super::{
-    embedding_runtime_availability_from_env, hybrid_retrieval_enabled,
-    test_sidecar_runtime_from_env,
-};
-#[cfg(test)]
-use crate::semantic_projection::current_embedding_contract_from_env;
 use crate::semantic_projection::{
     SEARCH_SYMBOL_STREAM_BATCH_SIZE, SearchStateBuildStats, current_embedding_contract_for_runtime,
     load_persisted_semantic_docs_for_runtime,
@@ -546,18 +541,25 @@ pub(super) struct LoadedSearchState {
 #[cfg(test)]
 pub(super) fn load_persisted_search_state(
     storage: &mut Storage,
+    project_root: &Path,
     storage_path: &Path,
 ) -> Result<LoadedSearchState, ApiError> {
-    load_persisted_search_state_for_runtime(storage, storage_path, &test_sidecar_runtime_from_env())
+    load_persisted_search_state_for_runtime(
+        storage,
+        project_root,
+        storage_path,
+        &test_sidecar_runtime_from_env(),
+    )
 }
 
 pub(super) fn load_persisted_search_state_for_runtime(
     storage: &mut Storage,
+    project_root: &Path,
     storage_path: &Path,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<LoadedSearchState, ApiError> {
     let _catalog_guard = SearchGenerationCatalogGuard::acquire(storage_path)?;
-    *storage = open_storage_for_read(storage_path)?;
+    *storage = open_storage_for_read(project_root, storage_path)?;
     let publication = storage.get_complete_index_publication().map_err(|error| {
         ApiError::internal(format!(
             "Failed to read complete search publication identity: {error}"
@@ -679,39 +681,6 @@ pub(super) fn load_persisted_search_state_for_runtime(
     })
 }
 
-/// Documents per embedding batch, as the setting's owner reads it.
-///
-/// `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` is declared to
-/// `codestory-retrieval/src/config.rs` and read there; publication takes the
-/// clamped value rather than parsing the variable again.
-#[cfg(test)]
-pub(super) fn llm_doc_embed_batch_size() -> usize {
-    codestory_retrieval::retrieval_runtime_config_from_process_env().llm_doc_embed_batch_size
-}
-
-#[cfg(test)]
-pub(super) fn retrieval_state_from_parts(
-    semantic_doc_count: u32,
-    embedding_model: Option<String>,
-    embedding_runtime_available: bool,
-    fallback_message: Option<String>,
-    current_embedding: Option<EmbeddingProfileContractDto>,
-    stored_embedding: Option<StoredSemanticDocsContractDto>,
-    runtime_degraded: bool,
-) -> RetrievalStateDto {
-    retrieval_state_from_parts_with_hybrid(
-        semantic_doc_count,
-        embedding_model,
-        embedding_runtime_available,
-        fallback_message,
-        current_embedding,
-        stored_embedding,
-        runtime_degraded,
-        false,
-        hybrid_retrieval_enabled(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retrieval_state_from_parts_with_hybrid(
     semantic_doc_count: u32,
@@ -780,55 +749,6 @@ pub(super) fn retrieval_state_from_parts_with_hybrid(
         fallback_reason,
         fallback_message,
     }
-}
-
-#[cfg(test)]
-pub(super) fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
-    let probe = embedding_runtime_availability_from_env();
-    let current_embedding = current_embedding_contract_from_env();
-    retrieval_state_from_parts(
-        engine.semantic_doc_count(),
-        engine
-            .embedding_model_id()
-            .map(str::to_string)
-            .or_else(|| {
-                current_embedding
-                    .as_ref()
-                    .map(|contract| contract.cache_key.clone())
-            })
-            .or(probe.model_id),
-        engine.embedding_runtime_configured(),
-        if engine.embedding_runtime_configured() {
-            None
-        } else {
-            probe.fallback_message
-        },
-        current_embedding,
-        None,
-        false,
-    )
-}
-
-#[cfg(test)]
-pub(super) fn retrieval_state_from_engine_with_storage_contract(
-    engine: &SearchEngine,
-    storage_retrieval: &RetrievalStateDto,
-) -> RetrievalStateDto {
-    let mut retrieval = retrieval_state_from_engine(engine);
-    retrieval.stored_embedding = storage_retrieval.stored_embedding.clone();
-    retrieval
-}
-
-#[cfg(test)]
-pub(super) fn retrieval_state_from_storage(
-    storage: &Storage,
-    project_root: &Path,
-) -> Result<RetrievalStateDto, ApiError> {
-    retrieval_state_from_storage_for_runtime(
-        storage,
-        project_root,
-        &test_sidecar_runtime_from_env(),
-    )
 }
 
 /// Derive agent-visible retrieval readiness from the published retrieval manifest.

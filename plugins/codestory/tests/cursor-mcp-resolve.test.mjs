@@ -123,38 +123,9 @@ test("Cursor MCP resolve prefers the local plugin package over cache", async () 
   }
 });
 
-test("requiring a main-guarded launcher does not start it", async () => {
-  const home = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-home-"));
-  const cachePlugin = join(
-    home,
-    ".cursor",
-    "plugins",
-    "cache",
-    "thegreencedar-codestory",
-    "codestory",
-    "deadbeef",
-  );
-  const sentinel = join(home, "sentinel.txt");
-  try {
-    const launcher = await writePluginPackage(cachePlugin, "must-not-start");
-    const result = spawnSync(
-      process.execPath,
-      ["-e", `require(${JSON.stringify(launcher)})`],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          CODESTORY_CURSOR_MCP_SENTINEL: sentinel,
-        },
-      },
-    );
-    assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(readFile(sentinel, "utf8"), { code: "ENOENT" });
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
+// The removed "requiring a main-guarded launcher does not start it" row
+// exercised Node's require.main semantics on a synthetic fixture rather than
+// any resolver code; the inline-entry spawn test below covers the real entry.
 test("Cursor mcp.cursor.json inline entry starts the cached launcher from a foreign cwd", async () => {
   const home = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-home-"));
   const project = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-project-"));

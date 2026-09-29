@@ -753,6 +753,23 @@ mod tests {
             compact_rehydrate_remaining_space_required(ONE_MIB),
             ONE_MIB + COMPACT_SAFETY_FLOOR_BYTES
         );
+        // Above the floor the ten-percent margin must dominate: a constant-floor
+        // implementation would pass the assertions above while underreserving
+        // real large compactions.
+        let working = 4 * 1024 * ONE_MIB;
+        assert_eq!(
+            compact_rehydrate_space_required(0, working),
+            working + working / 10
+        );
+        assert!(
+            working / 10 > COMPACT_SAFETY_FLOOR_BYTES,
+            "fixture must sit above the floor regime"
+        );
+        // Saturating boundary: inputs near u64::MAX must not wrap.
+        assert_eq!(
+            compact_rehydrate_space_required(u64::MAX, u64::MAX),
+            u64::MAX
+        );
     }
 
     #[test]

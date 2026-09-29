@@ -324,11 +324,6 @@ pub fn embed_documents_for_runtime(
     ProductEmbeddingClient::new(runtime).embed_documents(texts)
 }
 
-#[cfg(test)]
-pub fn embed_query(text: &str) -> Result<Vec<f32>> {
-    embed_query_for_runtime(&SidecarRuntimeConfig::local(), text)
-}
-
 /// Initializes the engine on an activating product path and validates the
 /// exact model, build, device, policy, and timed startup smoke evidence.
 pub fn ensure_product_embedding_backend() -> Result<()> {

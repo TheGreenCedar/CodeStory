@@ -1226,7 +1226,11 @@ mod tests {
                 root, cache_path, source, &config, None, false, true,
             )
             .expect("cache key");
-            let route_language = FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name);
+            // Independently enumerated oracle: extensions whose languages carry
+            // route-declaration rules. Reading FRAMEWORK_ROUTE_LANGUAGE_NAMES
+            // here would be circular — dropping a language from the shared list
+            // would change the production mix and this oracle together.
+            let route_language = !matches!(extension, "c" | "cpp" | "sh");
 
             assert_eq!(current != previous, route_language, "{extension}");
         }

@@ -1162,9 +1162,10 @@ pub(super) mod tests {
 
     #[test]
     fn hard_budget_minimizer_cannot_destroy_the_v3_request_identity() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         fs::write(project.path().join("lib.rs"), "pub fn retained() {}\n").expect("source");
-        let controller = crate::AppController::new();
+        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
                 project.path().to_path_buf(),

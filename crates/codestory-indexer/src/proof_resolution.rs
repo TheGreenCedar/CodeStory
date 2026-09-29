@@ -20702,7 +20702,12 @@ mod ruby_php_complexity_tests {
             .expect("Ruby grammar");
         let tree = parser.parse(&source, None).expect("Ruby declarations");
         reset_ruby_php_resolution_work();
-        let _ = RubyResolutionIndex::build(&tree, &source, NodeId(1), &nodes);
+        let index = RubyResolutionIndex::build(&tree, &source, NodeId(1), &nodes);
+        assert_eq!(
+            index.declarations.len(),
+            declarations,
+            "every declared function must reach the index, or the work bound is vacuous"
+        );
         ruby_php_resolution_work()
     }
 
@@ -20776,12 +20781,46 @@ mod ruby_php_complexity_tests {
             .collect::<Vec<_>>();
         reset_ruby_php_resolution_work();
         let index = JavaKotlinProjectionIndex::prepare(&records, &[]);
+        let ruby_candidates: usize = index.ruby_functions.values().map(Vec::len).sum();
+        assert_eq!(
+            ruby_candidates,
+            files * declarations,
+            "every ruby declaration must reach the projection domain"
+        );
+        let php_candidates: usize = index
+            .php_domains
+            .values()
+            .flat_map(|domain| domain.declarations.values().map(Vec::len))
+            .sum();
+        assert_eq!(
+            php_candidates,
+            files * declarations,
+            "every php declaration must reach the projection domain"
+        );
         for record in &records {
             for declaration in &record.file.top_level_declarations {
                 if record.file.language == "ruby" {
-                    let _ = index.ruby_function(&declaration.name, declaration.declaration);
+                    let resolution =
+                        index.ruby_function(&declaration.name, declaration.declaration);
+                    assert_eq!(
+                        resolution.is_some(),
+                        !duplicate,
+                        "a unique ruby declaration must resolve; a duplicated one must not"
+                    );
                 } else {
-                    let _ = index.resolve_php(&record.file.php_namespace, None, &declaration.name);
+                    let resolution =
+                        index.resolve_php(&record.file.php_namespace, None, &declaration.name);
+                    if duplicate {
+                        assert!(
+                            matches!(resolution, JavaKotlinImportResolution::Ambiguous),
+                            "duplicated php declarations must resolve ambiguously"
+                        );
+                    } else {
+                        assert!(
+                            matches!(resolution, JavaKotlinImportResolution::Exact { .. }),
+                            "each unique php declaration must resolve exactly"
+                        );
+                    }
                 }
             }
         }
@@ -20794,6 +20833,10 @@ mod ruby_php_complexity_tests {
             ("ruby", ruby_receiver_work(128), ruby_receiver_work(256)),
             ("php", php_receiver_work(128), php_receiver_work(256)),
         ] {
+            assert!(
+                small > 0,
+                "{language} work was not counted; a disabled counter makes the bound vacuous"
+            );
             assert!(
                 large <= small.saturating_mul(2).saturating_add(32),
                 "{language} work grew superlinearly: 1x={small}, 2x={large}"
@@ -20844,7 +20887,11 @@ mod rust_complexity_tests {
             .expect("Rust grammar must load");
         let tree = parser.parse(source, None).expect("source must parse");
         reset_rust_resolution_work();
-        let _ = RustResolutionIndex::build(&tree, source, NodeId(1), &[]);
+        let index = RustResolutionIndex::build(&tree, source, NodeId(1), &[]);
+        assert!(
+            !index.calls.is_empty(),
+            "the measured source must produce call specs, or the work bound is vacuous"
+        );
         rust_resolution_work()
     }
 
@@ -21012,16 +21059,37 @@ mod rust_complexity_tests {
         let index = RustProjectionIndex::prepare(&records).expect("projection index");
         for item in 0..count {
             let module = vec![format!("module_{item}")];
-            let _ = index.module(&records[0], &module);
-            let _ = index.declarations(&records[0], &module, &format!("function_{item}"));
-            let _ = index.types(&records[0], &module, &format!("Owner{item}"));
-            let _ = index.methods(
-                &records[0],
-                &module,
-                &format!("Owner{item}"),
-                &format!("method_{item}"),
+            assert!(
+                index.module(&records[0], &module).is_some(),
+                "module_{item} must be indexed, or the projection bound is vacuous"
             );
-            let _ = index.node_file(NodeId(50_000 + item as i64));
+            assert!(
+                !index
+                    .declarations(&records[0], &module, &format!("function_{item}"))
+                    .is_empty(),
+                "function_{item} must be indexed"
+            );
+            assert!(
+                !index
+                    .types(&records[0], &module, &format!("Owner{item}"))
+                    .is_empty(),
+                "Owner{item} must be indexed"
+            );
+            assert!(
+                !index
+                    .methods(
+                        &records[0],
+                        &module,
+                        &format!("Owner{item}"),
+                        &format!("method_{item}"),
+                    )
+                    .is_empty(),
+                "Owner{item}::method_{item} must be indexed"
+            );
+            assert!(
+                index.node_file(NodeId(50_000 + item as i64)).is_some(),
+                "import node 50_000+{item} must be indexed"
+            );
         }
         rust_resolution_work()
     }
@@ -21118,7 +21186,7 @@ mod c_cpp_complexity_tests {
     use super::*;
     use tree_sitter::Parser;
 
-    fn measured_work(source: &str) -> usize {
+    fn measured_work(source: &str, expected_calls: usize) -> usize {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -21159,8 +21227,17 @@ mod c_cpp_complexity_tests {
             file_id,
             &nodes,
         );
+        assert!(
+            index.calls.len() >= expected_calls,
+            "each receiver call must produce a spec, or the work bound is vacuous"
+        );
         for call in &index.calls {
-            let _ = index.resolve_syntax_claim(call.callee, call.form, &call.raw_target);
+            let (caller, binding) =
+                index.resolve_syntax_claim(call.callee, call.form, &call.raw_target);
+            assert!(
+                caller.is_some() && !matches!(binding, CachedResolutionBinding::Unsupported),
+                "each receiver call must bind its caller, or the lookup did no work"
+            );
         }
         c_cpp_resolution_work()
     }
@@ -21183,8 +21260,8 @@ mod c_cpp_complexity_tests {
 
     #[test]
     fn c_cpp_parser_index_work_is_linear_for_doubled_receivers_and_nested_owners() {
-        let small = measured_work(&source(64));
-        let large = measured_work(&source(128));
+        let small = measured_work(&source(64), 64);
+        let large = measured_work(&source(128), 128);
         assert!(
             small >= 64 * 8,
             "C++ parser work was not fully counted: {small}"
@@ -21332,7 +21409,7 @@ mod java_kotlin_complexity_tests {
         Ok(())
     }
 
-    fn measured_work(language: &str, source: &str) -> usize {
+    fn measured_work(language: &str, source: &str, expected_calls: usize) -> usize {
         let mut parser = Parser::new();
         let (grammar, path) = match language {
             "java" => (tree_sitter_java::LANGUAGE.into(), Path::new("Exact.java")),
@@ -21380,8 +21457,23 @@ mod java_kotlin_complexity_tests {
         reset_java_kotlin_resolution_work();
         let index =
             JavaKotlinResolutionIndex::build(&tree, source, path, language, file_id, &nodes);
+        assert!(
+            index.calls.len() >= expected_calls,
+            "{language}: each receiver call must produce a spec, or the work bound is vacuous"
+        );
         for call in &index.calls {
-            let _ = index.resolve_syntax_claim(source, call.callee, call.form, &call.raw_target);
+            let (caller, binding) =
+                index.resolve_syntax_claim(source, call.callee, call.form, &call.raw_target);
+            // Dart callables are nominal here: their caller node is not in the
+            // fixture's callable set, so a legitimately collected dart call may
+            // return `(None, Unsupported)`. The spec census above is its
+            // non-vacuity proof; the other languages must bind every call.
+            if language != "dart" {
+                assert!(
+                    caller.is_some() && !matches!(binding, CachedResolutionBinding::Unsupported),
+                    "{language}: each receiver call must bind its caller, or the lookup did no work"
+                );
+            }
         }
         java_kotlin_resolution_work()
     }
@@ -21575,6 +21667,12 @@ mod java_kotlin_complexity_tests {
                 .last()
                 .is_some_and(|snapshot| snapshot.proof_store_transaction_completed)
         );
+        assert!(
+            progress
+                .last()
+                .is_some_and(|snapshot| snapshot.facts_persisted > 0),
+            "the measured pipeline must persist call facts, or the work bound is vacuous"
+        );
         store
             .validate_proof_resolution_publication(&publication)
             .expect("replay proof resolution");
@@ -21625,8 +21723,8 @@ mod java_kotlin_complexity_tests {
     #[test]
     fn java_kotlin_parser_index_work_is_linear_for_doubled_calls_and_nested_owners() {
         for language in ["java", "kotlin"] {
-            let small = measured_work(language, &source(language, 64));
-            let large = measured_work(language, &source(language, 128));
+            let small = measured_work(language, &source(language, 64), 64);
+            let large = measured_work(language, &source(language, 128), 128);
             assert!(
                 small >= 64 * 8,
                 "{language} parser work was not fully counted: {small}"
@@ -21641,8 +21739,8 @@ mod java_kotlin_complexity_tests {
     #[test]
     fn csharp_swift_dart_parser_index_work_is_linear_for_doubled_receivers_and_callers() {
         for language in ["csharp", "swift", "dart"] {
-            let small = measured_work(language, &csd_source(language, 64));
-            let large = measured_work(language, &csd_source(language, 128));
+            let small = measured_work(language, &csd_source(language, 64), 64);
+            let large = measured_work(language, &csd_source(language, 128), 128);
             assert!(
                 small >= 64 * 8,
                 "{language} parser work was not fully counted: {small}"
@@ -21768,7 +21866,11 @@ mod go_complexity_tests {
             .expect("Go grammar must load");
         let tree = parser.parse(source, None).expect("source must parse");
         reset_go_resolution_work();
-        let _ = GoResolutionIndex::build(&tree, source, NodeId(1), &[]);
+        let index = GoResolutionIndex::build(&tree, source, NodeId(1), &[]);
+        assert!(
+            !index.calls.is_empty(),
+            "the measured Go source must produce call specs, or the work bound is vacuous"
+        );
         go_resolution_work()
     }
 
@@ -21821,7 +21923,11 @@ mod go_complexity_tests {
         reset_go_resolution_work();
         let index = GoProjectionIndex::prepare(&records).expect("Go package projection");
         for _ in 0..lookup_count {
-            let _ = index.resolve_function(&records[0], "proof", "Target");
+            let resolution = index.resolve_function(&records[0], "proof", "Target");
+            assert!(
+                matches!(resolution, GoFunctionResolution::Ambiguous),
+                "every package file declares Target, so the lookup must report                  ambiguity — Missing or Incomplete would mean the domain was empty"
+            );
         }
         go_resolution_work()
     }
@@ -21974,7 +22080,11 @@ mod python_complexity_tests {
             .expect("Python grammar must load");
         let tree = parser.parse(&source, None).expect("source must parse");
         reset_python_resolution_work();
-        let _ = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        let index = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        assert!(
+            !index.calls.is_empty(),
+            "the measured Python source must produce call specs, or the work bound is vacuous"
+        );
         python_resolution_work()
     }
 
@@ -21999,7 +22109,11 @@ mod python_complexity_tests {
         let tree = parser.parse(&source, None).expect("source must parse");
         assert!(!tree.root_node().has_error(), "nested pattern must parse");
         reset_python_resolution_work();
-        let _ = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        let index = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        assert!(
+            !index.calls.is_empty(),
+            "the nested-match source must produce call specs, or the work bound is vacuous"
+        );
         python_resolution_work()
     }
 
@@ -22039,10 +22153,16 @@ mod python_complexity_tests {
                 resolution.target,
                 RelativeImportResolution::Unique(_)
             ));
-            let _ = index.declarations(FileId(2), "target");
+            assert!(
+                !index.declarations(FileId(2), "target").is_empty(),
+                "module_1.py's target must reach the projection, or the lookup bound is vacuous"
+            );
             let owners = index.classes(FileId(2), "Worker");
             assert_eq!(owners.len(), 1);
-            let _ = index.methods(FileId(2), owners[0], "run");
+            assert!(
+                !index.methods(FileId(2), owners[0], "run").is_empty(),
+                "Worker::run must reach the projection"
+            );
         }
         python_resolution_work()
     }

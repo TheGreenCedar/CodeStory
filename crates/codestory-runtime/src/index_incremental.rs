@@ -4,7 +4,8 @@ use crate::index_commit::{
 };
 use crate::index_coverage::validate_source_policy_exclusions;
 use crate::index_timings::{
-    IndexingRunSummary, core_indexing_phase_timings, incremental_plan_probe_timings,
+    IndexingRunSummary, core_indexing_phase_timings, core_retention_outcome,
+    incremental_plan_probe_timings,
 };
 use crate::search_publication::{
     discard_unpublished_search_generation, materialize_equivalent_search_generation,
@@ -29,7 +30,8 @@ use crate::{
 use crate::{publication::run_incremental_staged_store_hook, test_sidecar_runtime_from_env};
 use codestory_contracts::api::{
     ApiError, ApiErrorDetails, AppEventPayload, FileCoverageDiagnosticDto,
-    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto, IncrementalScheduledPathActionDto,
+    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto,
+    IncrementalProbeUnavailableStageDto, IncrementalScheduledPathActionDto,
     IncrementalScheduledPathDto, IncrementalScheduledPathReasonDto, IndexingPhaseTimings,
 };
 use codestory_contracts::events::{Event, EventBus};
@@ -151,10 +153,7 @@ pub(super) fn full_refresh_required_error(
     reason: impl AsRef<str>,
 ) -> ApiError {
     let project = root.to_string_lossy().to_string();
-    let next_command = format!(
-        "codestory-cli index --project {} --refresh full",
-        quote_refresh_command_argument(&project)
-    );
+    let next_command = full_refresh_command(root);
     ApiError::with_details(
         FULL_REFRESH_REQUIRED_ERROR_CODE,
         format!(
@@ -173,6 +172,7 @@ pub(super) fn full_refresh_required_error(
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     )
 }
@@ -185,6 +185,215 @@ fn quote_refresh_command_argument(value: &str) -> String {
 #[cfg(not(windows))]
 fn quote_refresh_command_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The exact refresh command a stale-schema surface must name.
+pub(super) fn full_refresh_command(root: &Path) -> String {
+    format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_refresh_command_argument(&root.to_string_lossy())
+    )
+}
+
+/// The typed stale-schema failure for observational surfaces. `status`,
+/// `doctor`, and `resources/read` report this instead of `internal`, carrying
+/// the rebuild command an operator or host can act on.
+pub(super) fn core_schema_upgrade_required_error(
+    root: &Path,
+    found: u32,
+    required: u32,
+) -> ApiError {
+    core_schema_recovery_error(
+        root,
+        "core_schema_upgrade_required",
+        format!("Core cache schema {found} requires a full index to upgrade to schema {required}"),
+    )
+}
+
+/// The typed refusal when the cached core was written by a newer binary than
+/// the one reading it. Migrations are forward-only, so the recovery is the
+/// derived-cache quarantine sequence, not a bare refresh. The message keeps
+/// the "unsupported database schema version" wording the CLI's downgrade
+/// guidance matches on.
+pub(super) fn core_schema_too_new_error(root: &Path, found: u32, required: u32) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let quoted = quote_refresh_command_argument(&project);
+    let reset_dry_run =
+        format!("codestory-cli cache reset --project {quoted} --derived-only --dry-run");
+    let reset_confirm =
+        format!("codestory-cli cache reset --project {quoted} --derived-only --confirm");
+    let rebuild = full_refresh_command(root);
+    let doctor = format!("codestory-cli doctor --project {quoted} --format markdown");
+    ApiError::with_details(
+        "core_schema_too_new",
+        format!(
+            "Unsupported database schema version {found} (max supported: {required}); the cache was written by a newer CodeStory"
+        ),
+        ApiErrorDetails {
+            cause_code: Some("core_schema_too_new".to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![
+                reset_dry_run.clone(),
+                reset_confirm.clone(),
+                rebuild.clone(),
+            ],
+            minimum_next: vec![
+                reset_dry_run.clone(),
+                reset_confirm.clone(),
+                rebuild.clone(),
+            ],
+            full_repair: vec![reset_dry_run, reset_confirm, rebuild, doctor],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            disk_space: None,
+            coverage_gaps: Vec::new(),
+            peer_writer: None,
+        },
+    )
+}
+
+fn core_schema_recovery_error(root: &Path, code: &str, message: String) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let next_command = full_refresh_command(root);
+    ApiError::with_details(
+        code,
+        message,
+        ApiErrorDetails {
+            cause_code: Some(code.to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![next_command.clone()],
+            minimum_next: vec![next_command.clone()],
+            full_repair: vec![next_command],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            disk_space: None,
+            coverage_gaps: Vec::new(),
+            peer_writer: None,
+        },
+    )
+}
+
+/// Map a store open refusal on an observational read into the compatibility
+/// contract: a typed schema mismatch is stale, fenced, or forward-incompatible
+/// state a full refresh rebuilds, never an internal failure.
+pub(super) fn core_schema_observation_error(
+    root: &Path,
+    context: &str,
+    error: codestory_store::StorageError,
+) -> ApiError {
+    match error {
+        codestory_store::StorageError::SchemaVersionMismatch { found, .. }
+            if found == codestory_store::INCOMPLETE_INCREMENTAL_SCHEMA_VERSION =>
+        {
+            full_refresh_required_error(
+                root,
+                "incomplete_incremental_run",
+                format!("incomplete_incremental_run:schema={found}"),
+            )
+        }
+        codestory_store::StorageError::SchemaVersionMismatch {
+            found, required, ..
+        } if found > required => core_schema_too_new_error(root, found, required),
+        codestory_store::StorageError::SchemaVersionMismatch {
+            found, required, ..
+        } => core_schema_upgrade_required_error(root, found, required),
+        other => ApiError::internal(format!("{context}: {other}")),
+    }
+}
+
+/// A project cache under the process cache root whose durable core schema is
+/// not the one this binary serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleCachedCore {
+    /// The per-project cache directory (`<cache_root>/<workspace-id>`).
+    pub cache_dir: PathBuf,
+    /// The project root recovered from the cache's indexed source paths, when
+    /// the core is readable enough to derive one.
+    pub project_root: Option<PathBuf>,
+    /// The durable schema version observed in the core.
+    pub found_schema: u32,
+    /// The schema version this binary serves.
+    pub required_schema: u32,
+    /// First recovery step for this schema, when its project root is known.
+    pub next_action: Option<String>,
+}
+
+/// Enumerate cached projects whose core schema is not current. This is an
+/// observational read of the cache root: caches are opened through the
+/// non-mutating schema reader only, so nothing is migrated, recovered, or
+/// opened read-write. Caches that cannot be observed (mid-promotion, owned by
+/// another product, missing an image) are skipped rather than reported.
+/// `exclude_cache_dir` removes the caller's own project cache, which
+/// observational commands already report directly.
+pub fn observe_stale_cached_cores(
+    process_cache_root: &Path,
+    exclude_cache_dir: &Path,
+) -> Vec<StaleCachedCore> {
+    let mut stale = Vec::new();
+    let excluded = std::fs::canonicalize(exclude_cache_dir)
+        .unwrap_or_else(|_| exclude_cache_dir.to_path_buf());
+    let Ok(entries) = std::fs::read_dir(process_cache_root) else {
+        return stale;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone()) == excluded {
+            continue;
+        }
+        let storage_path = dir.join(codestory_store::CORE_DATABASE_FILE);
+        if !dir.join(codestory_store::CORE_DIRECTORY).is_dir() && !storage_path.is_file() {
+            continue;
+        }
+        let Ok(found_schema) = Store::database_schema_version_observational(&storage_path) else {
+            continue;
+        };
+        if found_schema == CURRENT_SCHEMA_VERSION {
+            continue;
+        }
+        let project_root = Store::database_indexed_source_root_observational(&storage_path)
+            .ok()
+            .flatten();
+        let next_action = project_root.as_ref().and_then(|root| {
+            core_schema_observation_error(
+                root,
+                "Observe cached core schema",
+                codestory_store::StorageError::SchemaVersionMismatch {
+                    surface: "cached core",
+                    found: found_schema,
+                    required: CURRENT_SCHEMA_VERSION,
+                },
+            )
+            .details
+            .and_then(|details| details.next_commands.into_iter().next())
+        });
+        stale.push(StaleCachedCore {
+            cache_dir: dir,
+            project_root,
+            found_schema,
+            required_schema: CURRENT_SCHEMA_VERSION,
+            next_action,
+        });
+    }
+    stale.sort_by(|a, b| a.cache_dir.cmp(&b.cache_dir));
+    stale
+}
+
+/// Map a store open refusal into the compatibility contract: a typed schema
+/// mismatch is stale, fenced, or forward-incompatible state, never an internal
+/// failure.
+pub(super) fn schema_observation_error(
+    root: &Path,
+    context: &str,
+    error: codestory_store::StorageError,
+) -> ApiError {
+    core_schema_observation_error(root, context, error)
 }
 
 pub(super) fn ensure_incremental_refresh_compatible(
@@ -226,9 +435,11 @@ pub(super) fn ensure_incremental_refresh_compatible(
         return Err(full_refresh_required_error(root, reason_code, reason));
     }
     let storage = Store::open_freshness_observational(storage_path).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to inspect incremental refresh compatibility: {error}"
-        ))
+        schema_observation_error(
+            root,
+            "Failed to inspect incremental refresh compatibility",
+            error,
+        )
     })?;
     if storage.has_incomplete_incremental_run().map_err(|error| {
         ApiError::internal(format!(
@@ -278,9 +489,14 @@ pub(super) const INCREMENTAL_PUBLICATION_DATABASE_COPIES: u32 = 0;
 /// authority.
 pub(super) struct IncrementalPlanProbe {
     pub(super) outcome: IncrementalPlanProbeOutcomeDto,
+    /// The stage that failed before the plan could be computed. `None` unless
+    /// `outcome` is `ProbeUnavailable`.
+    pub(super) unavailable_stage: Option<IncrementalProbeUnavailableStageDto>,
     pub(super) probe_ms: u32,
-    pub(super) files_to_index: u32,
-    pub(super) files_to_remove: u32,
+    /// `None` until the refresh plan stage actually computed a count; a probe
+    /// that failed earlier never measured anything.
+    pub(super) files_to_index: Option<u32>,
+    pub(super) files_to_remove: Option<u32>,
     pub(super) live_database_file_bytes: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) publication: Option<IndexPublicationRecord>,
@@ -367,26 +583,36 @@ fn evaluate_incremental_plan_probe(
     source_index_policy: &SourceIndexPolicy,
     probe: &mut IncrementalPlanProbe,
 ) -> IncrementalPlanProbeOutcomeDto {
+    macro_rules! probe_unavailable {
+        ($stage:ident) => {{
+            probe.unavailable_stage = Some(IncrementalProbeUnavailableStageDto::$stage);
+            return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        }};
+    }
     let Ok(storage) = Store::open_freshness_observational(storage_path) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(OpenCore);
     };
     let Ok(Some(publication)) = storage.get_complete_index_publication() else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Publication);
     };
     probe.publication = Some(publication.clone());
     let Ok(workspace) = runtime_workspace_manifest(root, storage_path) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(WorkspaceManifest);
     };
     let Ok(refresh_inputs) = workspace_refresh_inputs(&storage) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(RefreshInputs);
     };
     let Ok(policy_refresh) =
         workspace.build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
     else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Policy);
     };
-    probe.files_to_index = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_index.len());
-    probe.files_to_remove = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_remove.len());
+    probe.files_to_index = Some(clamp_usize_to_u32(
+        policy_refresh.refresh.plan.files_to_index.len(),
+    ));
+    probe.files_to_remove = Some(clamp_usize_to_u32(
+        policy_refresh.refresh.plan.files_to_remove.len(),
+    ));
     probe.repository_tracking_digest = policy_refresh.repository_tracking_digest.clone();
     if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         return IncrementalPlanProbeOutcomeDto::InventoryIncomplete;
@@ -396,7 +622,7 @@ fn evaluate_incremental_plan_probe(
         incremental_scheduled_paths(root, &refresh_inputs, &policy_refresh.refresh.plan);
     probe.execution_plan = Some(policy_refresh.refresh.plan.clone());
     probe.policy_exclusions = Some(policy_refresh.policy_exclusions.clone());
-    if probe.files_to_index != 0 || probe.files_to_remove != 0 {
+    if probe.files_to_index != Some(0) || probe.files_to_remove != Some(0) {
         return IncrementalPlanProbeOutcomeDto::PlanNotEmpty;
     }
     // A blocking stored coverage gap is adjudicated by
@@ -404,7 +630,7 @@ fn evaluate_incremental_plan_probe(
     // does not clear it, so short-circuiting here would keep serving a core the
     // staged pipeline refuses.
     let Ok(stored_coverage) = stored_file_coverage_diagnostics(root, &storage) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Coverage);
     };
     if stored_coverage
         .iter()
@@ -422,7 +648,7 @@ fn evaluate_incremental_plan_probe(
         return IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale;
     }
     let Ok(stored_exclusions) = storage.get_source_policy_exclusions() else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Exclusions);
     };
     if !source_policy_exclusions_unchanged(&stored_exclusions, &policy_refresh.policy_exclusions) {
         return IncrementalPlanProbeOutcomeDto::PolicyExclusionsChanged;
@@ -430,7 +656,7 @@ fn evaluate_incremental_plan_probe(
     match storage.get_dense_anchor_publication_manifest() {
         Ok(Some(_)) => {}
         Ok(None) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
-        Err(_) => return IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        Err(_) => probe_unavailable!(DenseAnchor),
     }
     // Use the same strict validation the readiness probe
     // (`complete_core_requires_publication_repair`) applies. Accepting a weaker
@@ -453,14 +679,14 @@ fn evaluate_incremental_plan_probe(
     ) {
         Ok(false) => {}
         Ok(true) => return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
-        Err(_) => return IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        Err(_) => probe_unavailable!(DocContract),
     }
     let Ok(search_path) = search_index_path_for_publication(storage_path, Some(&publication))
     else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(SearchIndexLocation);
     };
     let Ok(generation_id) = Uuid::parse_str(&publication.generation_id) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(GenerationId);
     };
     if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none() {
         return IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
@@ -468,7 +694,7 @@ fn evaluate_incremental_plan_probe(
     // An empty plan is not a freshness receipt until every admitted source has
     // a generic seal. Selected source aliases deliberately cannot produce one.
     if probe.source_seals.is_none() {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(SourceSeals);
     }
     IncrementalPlanProbeOutcomeDto::ShortCircuited
 }
@@ -486,9 +712,10 @@ pub(super) fn probe_incremental_plan(
         .unwrap_or_default();
     let mut probe = IncrementalPlanProbe {
         outcome: IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        unavailable_stage: None,
         probe_ms: 0,
-        files_to_index: 0,
-        files_to_remove: 0,
+        files_to_index: None,
+        files_to_remove: None,
         live_database_file_bytes,
         publication: None,
         execution_plan: None,
@@ -1448,7 +1675,7 @@ fn run_incremental_indexing_common(
     let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
-    crate::activation_retrieval::apply_core_gc_after_publication(
+    let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
         runtime,
         storage_path,
         cancel_token,
@@ -1470,6 +1697,7 @@ fn run_incremental_indexing_common(
         staged_semantic_stats.semantic_context_index_ms,
     );
     phase_timings.incremental_plan_probe = Some(incremental_plan_probe_timings(&probe));
+    phase_timings.core_retention = core_retention.as_ref().map(core_retention_outcome);
     phase_timings.incremental_coverage_validation_ms = Some(derived_timings.coverage_validation_ms);
     phase_timings.incremental_proof_projection_ms = Some(derived_timings.proof_projection_ms);
     phase_timings.incremental_semantic_scope_ms = Some(derived_timings.semantic_scope_ms);

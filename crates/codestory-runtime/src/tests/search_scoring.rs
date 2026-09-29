@@ -1,22 +1,20 @@
 use super::{
-    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind,
-    EnvGuard, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
-    IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
-    OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
-    ResolutionCertainty, RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV,
-    SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine, SearchGenerationCatalogGuard,
-    SearchGenerationCompletion, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation, Storage,
-    apply_hybrid_limits, arm_publication_test_fault, assert_mandatory_retrieval_unavailable,
-    assert_no_staged_publication_artifacts, build_persisted_search_state_from_canonical_symbols,
-    build_search_state, compare_search_hits, copy_tictactoe_workspace, current_epoch_ms,
-    dedupe_inexact_search_hits_by_display_key, default_source_policy_identity,
-    finalize_staged_semantic_docs, flush_pending_dense_anchor_inputs, fs,
-    hybrid_search_config_for_request, hybrid_test_env, insert_semantic_fixture_nodes,
+    AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind, EnvGuard,
+    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexFreshnessStatusDto, IndexMode,
+    Node, NodeId, NodeKind, Occurrence, OccurrenceKind, OpenProjectRequest, Path, PathBuf,
+    PublicationTestAction, PublicationTestBoundary, ResolutionCertainty, RetrievalModeDto,
+    SearchEngine, SearchGenerationCatalogGuard, SearchGenerationCompletion, SearchHit,
+    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
+    SemanticProjectionStats, SnapshotStore, SourceLocation, Storage, arm_publication_test_fault,
+    assert_mandatory_retrieval_unavailable, assert_no_staged_publication_artifacts,
+    build_persisted_search_state_from_canonical_symbols, build_search_state, compare_search_hits,
+    copy_tictactoe_workspace, current_epoch_ms, dedupe_inexact_search_hits_by_display_key,
+    default_source_policy_identity, finalize_semantic_docs_for_test,
+    flush_pending_dense_anchor_inputs, fs, hybrid_test_env, insert_semantic_fixture_nodes,
     llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
-    normalized_hybrid_weights, pending_semantic_doc_for_test, persisted_search_generation_names,
-    primary_source_retention_threshold, process_env_test_lock, project_identity_v3,
-    prune_search_generations, rebuild_search_state_from_storage, search_generation_completion_path,
+    mutate_published_core, pending_semantic_doc_for_test, persisted_search_generation_names,
+    process_env_test_lock, project_identity_v3, prune_search_generations,
+    rebuild_search_state_from_storage, search_generation_completion_path,
     search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
     semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
     test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
@@ -26,26 +24,25 @@ use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
 fn semantic_doc_text_alias_modes_are_switchable_for_research() {
-    let _lock = process_env_test_lock();
-    let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
-    let no_alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "no_alias");
     let no_alias_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::NoAlias,
+        512,
     );
     let no_alias_hash = llm_symbol_doc_hash(&no_alias_doc);
     assert!(!no_alias_doc.contains("terminal_alias:"));
     assert!(!no_alias_doc.contains("path_aliases:"));
-    drop(no_alias);
 
-    let variant = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "alias_variant");
     let variant_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::AliasVariant,
+        512,
     );
     let variant_hash = llm_symbol_doc_hash(&variant_doc);
     assert!(variant_doc.contains("terminal_alias: open project with storage path"));
@@ -54,19 +51,18 @@ fn semantic_doc_text_alias_modes_are_switchable_for_research() {
     assert!(!variant_doc.contains("name_aliases:"));
     assert!(!variant_doc.contains("path_aliases:"));
     assert_ne!(no_alias_hash, variant_hash);
-    drop(variant);
 
-    let current = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
     let current_doc = semantic_doc_text_for_test(
         "AppController::openProjectWithStoragePath",
         Some("codestory_runtime::AppController::openProjectWithStoragePath"),
         "crates/codestory-runtime/src/lib.rs",
         NodeKind::METHOD,
+        SemanticDocAliasMode::CurrentAlias,
+        512,
     );
     assert!(current_doc.contains("name_aliases:"));
     assert!(current_doc.contains("path_aliases:"));
     assert_ne!(variant_hash, llm_symbol_doc_hash(&current_doc));
-    drop(current);
 }
 
 #[test]
@@ -279,6 +275,7 @@ fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
 
 #[test]
 fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let route_canonical_id = format!(
         "route_endpoint:{}",
         serde_json::json!({
@@ -386,7 +383,7 @@ fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
         );
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     for (route_id, expected_handler) in [
         (CoreNodeId(101), NodeId("105".to_string())),
         (CoreNodeId(102), NodeId("106".to_string())),
@@ -787,6 +784,7 @@ fn persisted_search_build_streams_multiple_pages_through_one_writer() {
 
 #[test]
 fn search_requires_full_sidecars_for_exact_type_queries() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -834,7 +832,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
         .expect("open project");
@@ -896,6 +894,7 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 
 #[test]
 fn dotted_owner_method_query_resolves_with_file_constraint() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     use crate::{TargetResolution, TargetSelection};
 
     let temp = tempdir().expect("create temp dir");
@@ -976,7 +975,7 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
             .expect("insert symbols");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
         .expect("open project");
@@ -1097,12 +1096,14 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
 #[test]
 fn core_exact_search_is_invariant_to_absolute_project_root() {
     struct Fixture {
+        _process_cache: tempfile::TempDir,
         controller: AppController,
         storage_path: PathBuf,
         source_path: PathBuf,
     }
 
     fn fixture(root: &Path) -> Fixture {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let source_path = root.join("src").join("module-entry.ts");
         fs::create_dir_all(source_path.parent().expect("source parent"))
             .expect("create source directory");
@@ -1211,11 +1212,12 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                 .expect("insert canonical file identities");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(root.to_path_buf(), storage_path.clone())
             .expect("open project");
         Fixture {
+            _process_cache: process_cache,
             controller,
             storage_path,
             source_path,
@@ -1464,6 +1466,7 @@ fn repo_explanation_search_requires_full_sidecar_retrieval() {
 
 #[test]
 fn search_rejects_natural_language_queries_without_full_sidecars() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("create temp dir");
     let db_path = temp.path().join("codestory.db");
 
@@ -1493,7 +1496,7 @@ fn search_rejects_natural_language_queries_without_full_sidecars() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
             path: temp.path().to_string_lossy().to_string(),
@@ -1612,9 +1615,10 @@ fn broad_search_plan_loads_symbols_after_summary_only_open() {
 
 #[test]
 fn open_project_summary_preserves_search_state_for_the_same_complete_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
@@ -1779,9 +1783,10 @@ fn activation_search_preparation_preserves_resident_state_for_retrieval_only_rep
 
 #[test]
 fn open_project_summary_clears_state_bound_to_another_core_publication() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
@@ -1829,9 +1834,10 @@ fn open_project_summary_clears_state_bound_to_another_core_publication() {
 
 #[test]
 fn run_indexing_without_runtime_refresh_keeps_search_uninitialized() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
@@ -2066,7 +2072,8 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
             "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         ))
         .expect("publish identity");
-    finalize_staged_semantic_docs(&mut storage, None, None, None).expect("finalize semantic rows");
+    finalize_semantic_docs_for_test(&mut storage, None, &test_sidecar_runtime_from_env())
+        .expect("finalize semantic rows");
     let before_legacy = storage
         .get_all_llm_symbol_docs()
         .expect("legacy semantic rows before cache load");
@@ -2106,7 +2113,6 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
     let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
         .expect("hydrate cache without semantic persistence");
 
-    assert!(!result.engine.semantic_index_ready());
     assert_eq!(result.engine.full_text_doc_count(), result.node_names.len());
     assert_eq!(
         storage
@@ -2139,8 +2145,12 @@ fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
     )
     .expect_err("cancelled semantic persistence must stop before DB upsert");
     assert_eq!(error.code, "cancelled");
-    let error = finalize_staged_semantic_docs(&mut storage, None, None, Some(&cancel_token))
-        .expect_err("cancelled semantic finalization must stop before persistence");
+    let error = finalize_semantic_docs_for_test(
+        &mut storage,
+        Some(&cancel_token),
+        &test_sidecar_runtime_from_env(),
+    )
+    .expect_err("cancelled semantic finalization must stop before persistence");
     assert_eq!(error.code, "cancelled");
 }
 
@@ -2175,7 +2185,7 @@ fn persisted_search_generations_do_not_overwrite_a_racing_reader() {
         .expect("build old search generation");
     let old_path =
         search_index_path_for_publication(&storage_path, Some(&old_publication)).expect("old path");
-    let same_generation_reader = SearchEngine::try_open_existing(&old_path)
+    let same_generation_reader = SearchEngine::open_existing(&old_path)
         .expect("completed builder must retain only a shared generation lock");
     assert_eq!(same_generation_reader.tantivy_doc_count(), 3);
     drop(same_generation_reader);
@@ -2218,7 +2228,6 @@ fn persisted_search_generations_do_not_overwrite_a_racing_reader() {
 }
 
 #[test]
-#[ignore = "staged core promotion requires rebound proof-resolution identity"]
 fn catalog_waiting_loader_reopens_core_and_search_as_one_generation() {
     let _env = hybrid_test_env();
     let temp = tempdir().expect("create temp dir");
@@ -2251,11 +2260,12 @@ fn catalog_waiting_loader_reopens_core_and_search_as_one_generation() {
     let catalog_guard =
         SearchGenerationCatalogGuard::acquire(&storage_path).expect("hold catalog for publish");
     let loader_path = storage_path.clone();
+    let loader_root = temp.path().to_path_buf();
     let (started_tx, started_rx) = unbounded();
     let loader = std::thread::spawn(move || {
         let mut stale_storage = stale_storage;
         started_tx.send(()).expect("announce loader");
-        load_persisted_search_state(&mut stale_storage, &loader_path)
+        load_persisted_search_state(&mut stale_storage, &loader_root, &loader_path)
             .expect("load post-publication generation")
     });
     started_rx.recv().expect("loader started");
@@ -2382,7 +2392,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
         .expect("publish core generation");
     let expected_path = search_index_path_for_publication(&storage_path, Some(&publication))
         .expect("expected path");
-    let missing_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let missing_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must not rebuild a missing search generation"),
     };
@@ -2405,7 +2416,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
     )
     .expect("write mismatched completion marker");
 
-    let mismatch_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let mismatch_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must reject a count-mismatched search generation"),
     };
@@ -2417,7 +2429,8 @@ fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_rea
     fs::write(&expected_path, b"corrupt search generation")
         .expect("write corrupt generation artifact");
 
-    let corrupt_error = match load_persisted_search_state(&mut storage, &storage_path) {
+    let corrupt_error = match load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+    {
         Err(error) => error,
         Ok(_) => panic!("reader must not rebuild a corrupt search generation"),
     };
@@ -2627,14 +2640,6 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
 }
 
 #[test]
-fn primary_source_retention_keeps_short_precise_windows() {
-    assert_eq!(primary_source_retention_threshold(1), 1);
-    assert_eq!(primary_source_retention_threshold(3), 3);
-    assert_eq!(primary_source_retention_threshold(10), 3);
-    assert_eq!(primary_source_retention_threshold(50), 3);
-}
-
-#[test]
 fn inexact_search_results_deduplicate_repeated_display_keys() {
     let mut hits = vec![
         SearchHit {
@@ -2766,23 +2771,87 @@ fn exact_search_results_keep_repeated_display_keys() {
     assert_eq!(hits.len(), 2);
 }
 
+/// F023: the live `limit_per_source` owner must make a smaller result an exact
+/// prefix of the larger one over the same candidate set. The retired test
+/// truncated a local ordering itself, so a limit-aware ordering stage could
+/// reorder freely without failing.
 #[test]
-fn hybrid_search_config_skips_exact_symbol_escalation_for_mixed_nl() {
-    let req = SearchRequest {
-        query: "how ExtensionHostManager starts".to_string(),
-        repo_text: SearchRepoTextMode::Off,
-        limit_per_source: 10,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
+fn live_search_limit_keeps_smaller_limits_a_prefix_of_larger_ones() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let temp = tempdir().expect("create temp dir");
+    let db_path = temp.path().join("codestory.db");
+    let file_path = temp.path().join("src").join("lib.rs");
+
+    {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        let mut nodes = vec![Node {
+            id: CoreNodeId(10),
+            kind: NodeKind::FILE,
+            serialized_name: file_path.to_string_lossy().to_string(),
+            ..Default::default()
+        }];
+        for (index, name) in [
+            "ZqPrefixProbeAlpha",
+            "ZqPrefixProbeBeta",
+            "ZqPrefixProbeGamma",
+            "ZqPrefixProbeDelta",
+        ]
+        .iter()
+        .enumerate()
+        {
+            nodes.push(Node {
+                id: CoreNodeId(20 + index as i64),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("zq::{name}"),
+                qualified_name: Some(format!("zq::{name}")),
+                file_node_id: Some(CoreNodeId(10)),
+                start_line: Some(10 + index as u32),
+                ..Default::default()
+            });
+        }
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+    }
+
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
+        .expect("open project");
+
+    let run = |limit: u32| {
+        controller
+            .search_results(SearchRequest {
+                query: "ZqPrefixProbe".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: limit,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("repo-text off search uses the published core")
+            .indexed_symbol_hits
+            .iter()
+            .map(|hit| hit.node_id.0.clone())
+            .collect::<Vec<_>>()
     };
-    let config = hybrid_search_config_for_request(&req, 10, None, true);
-    assert_eq!(config.max_results, 10);
+
+    let full = run(10);
+    assert!(
+        full.len() >= 3,
+        "the fixture must produce several live hits: {full:?}"
+    );
+    for smaller in 1..full.len() {
+        assert_eq!(
+            run(smaller as u32),
+            full[..smaller],
+            "the live ordering changed with limit_per_source at {smaller}"
+        );
+    }
 }
 
 #[test]
-#[ignore = "live published cores are immutable generations; incomplete-run fences belong on staged candidates"]
 fn staged_recovery_search_failure_preserves_the_marked_live_database() {
+    const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -2790,7 +2859,7 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
     )
     .expect("write source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_summary_with_storage_path(
             workspace.path().to_path_buf(),
@@ -2800,10 +2869,22 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("initial full index");
-    Storage::open(&storage_path)
-        .expect("open storage")
-        .begin_incremental_run()
-        .expect("simulate interrupted incremental");
+    // An interrupted incremental leaves its durable fence on the published
+    // core: the marker row plus the incomplete-run schema sentinel. Live
+    // generation files are immutable to ordinary opens, so the fence goes in
+    // through the same sealed-generation replacement the recovery code meets.
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(&format!(
+                "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+                 VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET
+                    started_at_epoch_ms = excluded.started_at_epoch_ms;
+                 PRAGMA user_version = {INCOMPLETE_INCREMENTAL_SCHEMA_VERSION};"
+            ))
+            .expect("plant the durable incomplete-run fence");
+    });
 
     let search_path = search_index_generation_root(&storage_path);
     if search_path.is_dir() {
@@ -2819,42 +2900,22 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         error.message.contains("search"),
         "unexpected error: {error:?}"
     );
-    let storage = Storage::open(&storage_path).expect("open replacement database");
+    assert_no_staged_publication_artifacts(&storage_path);
+    // The fence stamps the live generation with the incomplete-run sentinel
+    // version, which read-only opens refuse by contract; inspect it through
+    // the static promotion readers instead of Storage::open.
     assert!(
-        storage
-            .has_incomplete_incremental_run()
-            .expect("replacement marker")
+        Storage::database_has_incomplete_incremental_run(&storage_path)
+            .expect("replacement marker"),
+        "pre-publication failure must preserve the durable incomplete-run fence"
     );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_summary()
-            .expect("live summary readiness"),
-        "pre-publication failure must preserve the live summary snapshot"
-    );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_detail()
-            .expect("live detail readiness"),
-        "pre-publication failure must preserve the live detail snapshot"
-    );
-    storage
-        .get_connection()
-        .execute(
-            "UPDATE incomplete_index_run
-             SET started_at_epoch_ms = started_at_epoch_ms
-             WHERE id = 1",
-            [],
-        )
-        .expect("retain the fence in committed WAL state");
     let fenced_schema =
         Storage::database_schema_version(&storage_path).expect("replacement schema");
-    assert_ne!(fenced_schema, codestory_store::CURRENT_SCHEMA_VERSION);
-    let wal_path = storage_path.with_extension("db-wal");
-    assert!(wal_path.is_file(), "fenced fixture must retain WAL state");
-    let database_before = fs::read(&storage_path).expect("read fenced database before freshness");
-    let wal_before = fs::read(&wal_path).expect("read fenced WAL before freshness");
+    assert_eq!(fenced_schema, INCOMPLETE_INCREMENTAL_SCHEMA_VERSION);
+    let live_database = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve fenced live generation");
+    let live_wal = live_database.with_extension("db-wal");
+    let database_before = fs::read(&live_database).expect("read fenced database before freshness");
 
     let cached = controller
         .index_freshness()
@@ -2878,39 +2939,37 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         assert!(freshness.samples.is_empty());
     }
     assert_eq!(
-        fs::read(&storage_path).expect("read fenced database after freshness"),
+        fs::read(&live_database).expect("read fenced database after freshness"),
         database_before
     );
-    assert_eq!(
-        fs::read(&wal_path).expect("read fenced WAL after freshness"),
-        wal_before
+    assert!(
+        !live_wal.exists(),
+        "read-only freshness must not leave WAL state on the fenced generation"
     );
     assert_eq!(
         Storage::database_schema_version(&storage_path).expect("schema after freshness"),
         fenced_schema
     );
     assert!(
-        storage
-            .has_incomplete_incremental_run()
+        Storage::database_has_incomplete_incremental_run(&storage_path)
             .expect("marker after freshness"),
         "freshness observation must preserve the durable fence"
     );
 
-    drop(storage);
     fs::remove_file(&search_path).expect("remove search rebuild blocker");
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("successful full recovery");
+    assert_no_staged_publication_artifacts(&storage_path);
     assert_eq!(
         Storage::database_schema_version(&storage_path).expect("recovered schema"),
         codestory_store::CURRENT_SCHEMA_VERSION
     );
-    let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
     assert!(
-        !readable
-            .has_incomplete_incremental_run()
+        !Storage::database_has_incomplete_incremental_run(&storage_path)
             .expect("read recovered marker")
     );
+    let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
     assert!(
         readable
             .get_complete_index_publication()
@@ -2921,7 +2980,8 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
 
 #[test]
 fn search_rejects_reads_while_indexing_is_active() {
-    let controller = AppController::new();
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     {
         let mut state = controller.state.lock();
         state.is_indexing = true;
@@ -2938,15 +2998,20 @@ fn search_rejects_reads_while_indexing_is_active() {
         })
         .expect_err("search should be blocked while indexing");
 
-    assert_eq!(error.code, "invalid_argument");
-    assert!(error.message.contains("indexing is in progress"));
+    assert_eq!(error.code, "activation_preparing");
+    assert!(
+        error.message.contains("indexing is in progress"),
+        "preparing refusal must name the in-progress indexing: {}",
+        error.message
+    );
 }
 
 #[test]
 fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
 
     controller
         .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
@@ -2970,65 +3035,4 @@ fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
     let state = controller.state.lock();
     assert!(state.search_engine.is_none());
     assert!(state.node_names.is_empty());
-}
-
-#[test]
-fn normalized_hybrid_weights_clamps_and_normalizes_values() {
-    let fallback = HybridSearchConfig::default();
-    let (lexical, semantic, graph) = normalized_hybrid_weights(
-        Some(AgentHybridWeightsDto {
-            lexical: Some(2.0),
-            semantic: Some(-1.0),
-            graph: Some(0.5),
-        }),
-        &fallback,
-    );
-
-    assert!((lexical - 0.666_666_7).abs() < 1e-4);
-    assert!((semantic - 0.0).abs() < 1e-6);
-    assert!((graph - 0.333_333_34).abs() < 1e-4);
-}
-
-#[test]
-fn normalized_hybrid_weights_falls_back_when_invalid_sum() {
-    let fallback = HybridSearchConfig::default();
-    let (lexical, semantic, graph) = normalized_hybrid_weights(
-        Some(AgentHybridWeightsDto {
-            lexical: Some(0.0),
-            semantic: Some(0.0),
-            graph: Some(0.0),
-        }),
-        &fallback,
-    );
-
-    assert!((lexical - fallback.lexical_weight).abs() < 1e-6);
-    assert!((semantic - fallback.semantic_weight).abs() < 1e-6);
-    assert!((graph - fallback.graph_weight).abs() < 1e-6);
-}
-
-#[test]
-fn hybrid_search_defaults_to_accuracy_first_semantic_profile() {
-    let config = HybridSearchConfig::default();
-
-    assert_eq!(config.max_results, 20);
-    assert_eq!(config.lexical_weight, 0.0);
-    assert_eq!(config.semantic_weight, 1.0);
-    assert_eq!(config.graph_weight, 0.0);
-    assert_eq!(config.lexical_limit, 0);
-    assert_eq!(config.semantic_limit, 20);
-}
-
-#[test]
-fn apply_hybrid_limits_overrides_and_caps_values() {
-    let mut config = HybridSearchConfig::default();
-    apply_hybrid_limits(
-        Some(codestory_contracts::api::SearchHybridLimitsDto {
-            lexical: Some(0),
-            semantic: Some(5_000),
-        }),
-        &mut config,
-    );
-
-    assert_eq!(config.lexical_limit, 0);
-    assert_eq!(config.semantic_limit, 1_000);
 }

@@ -453,9 +453,21 @@ mod tests {
             .find(name)
             .expect("name on line")
             .saturating_add(1) as u32;
+        // The declaration node's span starts at the `function` keyword (e.g.
+        // `export function main` starts at col 8, not at `main`'s col 17).
+        // Derive it from the fixture independently: `col <= name_start` would
+        // accept column 1 and never catch a shifted span.
+        let declaration_start = line_text
+            .find("function")
+            .expect("declaration keyword on line")
+            .saturating_add(1) as u32;
         assert!(
-            col <= name_start,
-            "column for {name} should not be past identifier start (col {col}, name starts {name_start})"
+            declaration_start < name_start,
+            "fixture line must declare `{name}` via `function` ({line_text:?})"
+        );
+        assert_eq!(
+            col, declaration_start,
+            "column for {name} must be the declaration start {declaration_start},              not col {col} (identifier starts at {name_start})"
         );
     }
 
@@ -501,6 +513,7 @@ export function greet(name: string) {
         )?;
 
         assert_symbol_on_original_source_line(source, &result, "greet");
+
         Ok(())
     }
 
@@ -530,6 +543,7 @@ export function greet(name: string) {
         )?;
 
         assert_symbol_on_original_source_line(source, &result, "bump");
+
         Ok(())
     }
 
@@ -561,6 +575,7 @@ const site = 'codestory'
         )?;
 
         assert_symbol_on_original_source_line(source, &result, "buildTitle");
+
         assert!(result.files[0].complete);
         Ok(())
     }

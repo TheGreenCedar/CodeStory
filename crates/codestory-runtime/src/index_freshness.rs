@@ -19,8 +19,6 @@ const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
 const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
-#[cfg(test)]
-pub(super) const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
 #[cfg(test)]
 thread_local! {
@@ -1080,7 +1078,7 @@ fn storage_path_fingerprint(path: &Path) -> String {
     format!("len:{}:mtime_ms:{modified_ms}", metadata.len())
 }
 
-pub(super) fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
+pub(super) fn open_storage_for_read(root: &Path, path: &Path) -> Result<Storage, ApiError> {
     let requires_initialization = !path.exists()
         || Storage::database_schema_version(path)
             .map(|version| version != CURRENT_SCHEMA_VERSION)
@@ -1092,10 +1090,19 @@ pub(super) fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
     } else {
         Storage::open_read_only(path)
     };
-    storage.map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+    storage.map_err(|error| {
+        crate::index_incremental::core_schema_observation_error(
+            root,
+            "Failed to open storage",
+            error,
+        )
+    })
 }
 
-pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
+pub(super) fn open_existing_storage_for_read(
+    root: &Path,
+    path: &Path,
+) -> Result<Storage, ApiError> {
     let resolved = match codestory_store::resolve_core_database_path(path) {
         Ok(resolved) => resolved,
         Err(_) if path.is_file() => path.to_path_buf(),
@@ -1113,16 +1120,25 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
         ApiError::internal(format!("Failed to inspect storage schema: {error}"))
     })?;
     if schema != CURRENT_SCHEMA_VERSION {
-        return Err(ApiError::new(
-            "project_unavailable",
-            format!(
-                "project storage schema {schema} is not readable by runtime schema {CURRENT_SCHEMA_VERSION}"
-            ),
+        return Err(crate::index_incremental::core_schema_observation_error(
+            root,
+            "Failed to inspect storage schema",
+            codestory_store::StorageError::SchemaVersionMismatch {
+                surface: "Project storage",
+                required: CURRENT_SCHEMA_VERSION,
+                found: schema,
+            },
         ));
     }
     Storage::open_read_only(path)
         .or_else(|_| Storage::open_read_only(&resolved))
-        .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+        .map_err(|error| {
+            crate::index_incremental::core_schema_observation_error(
+                root,
+                "Failed to open storage",
+                error,
+            )
+        })
 }
 
 #[cfg(test)]

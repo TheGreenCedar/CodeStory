@@ -106,11 +106,11 @@ test("only observed non-full preflight is blocked", () => {
 
   const mismatch = proof();
   mismatch.report.next_commands = ["hidden-legacy-follow-up"];
-  let failure;
-  try {
-    verifyDrillPacketParity(mismatch);
-  } catch (error) {
-    failure = error;
-  }
+  // A swallowed undefined here would still classify as "failed"; require the
+  // parity rejection first so the classification is asserted on a real throw.
+  const failure = assert.throws(
+    () => verifyDrillPacketParity(mismatch),
+    /hidden follow-up commands/u,
+  );
   assert.equal(evidenceStatusForError(failure), "failed");
 });

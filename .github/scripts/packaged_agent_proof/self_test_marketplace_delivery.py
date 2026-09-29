@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -60,12 +61,46 @@ def _run_directory_contract_ordering_self_test() -> None:
         )
 
 
+# A self-test git child must not see the developer's git configuration, hooks, or
+# credential helpers: ambient config (init.defaultBranch, commit hooks, signing
+# rules, GIT_* variables) changes what init/commit/rev-parse do on a machine.
+# Isolate the child: every GIT_* variable is scrubbed, global/system config and
+# hooks point at the null device, and HOME/XDG resolve under an owned directory.
+_GIT_CHILD_HOME: Path | None = None
+
+
 def _git(repository: Path, *arguments: str) -> str:
+    global _GIT_CHILD_HOME
+    if _GIT_CHILD_HOME is None:
+        _GIT_CHILD_HOME = Path(tempfile.mkdtemp(prefix="codestory-git-home-"))
+    null_device = "NUL" if os.name == "nt" else "/dev/null"
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": null_device,
+            "GIT_CONFIG_SYSTEM": null_device,
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(_GIT_CHILD_HOME),
+            "USERPROFILE": str(_GIT_CHILD_HOME),
+            "XDG_CONFIG_HOME": str(_GIT_CHILD_HOME / "xdg-config"),
+        }
+    )
     completed = subprocess.run(
-        ["git", "-C", str(repository), *arguments],
+        [
+            "git",
+            "-c",
+            f"core.hooksPath={null_device}",
+            "-C",
+            str(repository),
+            *arguments,
+        ],
         text=True,
         capture_output=True,
         timeout=60,
+        env=environment,
     )
     require(
         completed.returncode == 0,
@@ -605,9 +640,27 @@ def _run_shared_identity_self_tests() -> None:
     which is precisely the failure this whole path was repaired for, and it would surface only
     after the tag was already pushed.
     """
-    source = (
-        REPOSITORY_ROOT / ".github" / "scripts" / "marketplace-delivery-identity.mjs"
-    ).read_text(encoding="utf-8")
+    # Import the module and read its live exports. A source-text match can be
+    # satisfied by a comment or an unused declaration; only the imported binding
+    # is what a producer child process actually resolves.
+    module = REPOSITORY_ROOT / ".github" / "scripts" / "marketplace-delivery-identity.mjs"
+    program = (
+        f"import({json.dumps(module.resolve().as_uri())})"
+        ".then((exports) => console.log(JSON.stringify(exports)));"
+    )
+    node = shutil.which("node")
+    require(node is not None, "node is required for the delivery identity self-test")
+    completed = subprocess.run(
+        [node, "--input-type=module", "--eval", program],
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    require(
+        completed.returncode == 0,
+        f"marketplace delivery identity module did not evaluate: {completed.stderr.strip()}",
+    )
+    exports = json.loads(completed.stdout)
     for name, value in (
         ("LIVE_INSTALLATION_SOURCE", LIVE_INSTALLATION_SOURCE),
         ("DEFERRED_INSTALLATION_SOURCE", DEFERRED_INSTALLATION_SOURCE),
@@ -619,7 +672,7 @@ def _run_shared_identity_self_tests() -> None:
         ("FIXTURE_MARKER_PURPOSE", _MARKER_PURPOSE),
     ):
         require(
-            f'export const {name} = "{value}";' in source,
+            exports.get(name) == value,
             f"marketplace delivery identity {name} differs between the producer and the verifier",
         )
 

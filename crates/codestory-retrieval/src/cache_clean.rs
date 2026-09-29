@@ -849,6 +849,9 @@ mod tests {
     use crate::config::{SidecarLayout, with_test_cache_root};
     use crate::retention::{GenerationRetentionMarker, write_retention_marker};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_contracts::owned_artifacts::{
+        EMBEDDED_MODEL_CACHE_DIR, EMBEDDED_MODEL_DIGEST_DIR,
+    };
     use codestory_store::RetrievalIndexManifest;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -997,6 +1000,16 @@ mod tests {
             .collect()
     }
 
+    /// The plan labels model digests with the platform's native separator, so
+    /// build the expectation with `Path::join` rather than a `/` literal.
+    fn digest_relative(digest: &str) -> String {
+        Path::new(EMBEDDED_MODEL_CACHE_DIR)
+            .join(EMBEDDED_MODEL_DIGEST_DIR)
+            .join(digest)
+            .display()
+            .to_string()
+    }
+
     struct Fixture {
         cache: TempDir,
         _worktrees: TempDir,
@@ -1072,7 +1085,7 @@ mod tests {
             plan_cache_clean().expect("cache clean plan")
         });
 
-        let superseded = format!("embedded-models/sha256/{OTHER_DIGEST}");
+        let superseded = digest_relative(OTHER_DIGEST);
         assert_eq!(
             candidate_kinds(&plan),
             vec![
@@ -1092,13 +1105,7 @@ mod tests {
             Some(CacheCleanRefusal::UnregisteredWorkspace)
         );
         assert_eq!(
-            retained_reason(
-                &plan,
-                &format!(
-                    "embedded-models/sha256/{}",
-                    codestory_llama_sys::MODEL_SHA256
-                )
-            ),
+            retained_reason(&plan, &digest_relative(codestory_llama_sys::MODEL_SHA256)),
             Some(CacheCleanRefusal::CurrentModelDigest)
         );
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
@@ -1123,10 +1130,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (fixture.dead_workspace.as_str(), true),
-                (
-                    format!("embedded-models/sha256/{OTHER_DIGEST}").as_str(),
-                    true
-                ),
+                (digest_relative(OTHER_DIGEST).as_str(), true),
             ]
         );
         assert!(!cache_root.join(&fixture.dead_workspace).exists());
@@ -1180,7 +1184,7 @@ mod tests {
                 .iter()
                 .map(|removal| removal.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+            vec![digest_relative(OTHER_DIGEST).as_str()]
         );
     }
 
@@ -1235,7 +1239,7 @@ mod tests {
                 .iter()
                 .map(|removal| removal.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+            vec![digest_relative(OTHER_DIGEST).as_str()]
         );
     }
 
@@ -1267,7 +1271,7 @@ mod tests {
                 .iter()
                 .map(|removal| removal.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+            vec![digest_relative(OTHER_DIGEST).as_str()]
         );
     }
 
@@ -1321,10 +1325,7 @@ mod tests {
             "a model tree a peer is materializing must not be reclaimed"
         );
         assert_eq!(
-            retained_reason(
-                &report.plan,
-                &format!("embedded-models/sha256/{OTHER_DIGEST}")
-            ),
+            retained_reason(&report.plan, &digest_relative(OTHER_DIGEST)),
             Some(CacheCleanRefusal::ModelTreeInUse)
         );
         assert_eq!(
@@ -1358,7 +1359,7 @@ mod tests {
         assert_eq!(
             candidate_kinds(&plan),
             vec![(
-                format!("embedded-models/sha256/{OTHER_DIGEST}"),
+                digest_relative(OTHER_DIGEST),
                 CacheCleanKind::SupersededModelDigest
             )]
         );
@@ -1442,7 +1443,7 @@ mod tests {
 
         assert!(candidate_kinds(&plan).is_empty(), "{:?}", plan.candidates);
         assert_eq!(
-            retained_reason(&plan, "embedded-models/sha256/scratch"),
+            retained_reason(&plan, &digest_relative("scratch")),
             Some(CacheCleanRefusal::UnrecognizedEntry)
         );
     }

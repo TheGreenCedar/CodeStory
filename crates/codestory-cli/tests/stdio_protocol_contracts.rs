@@ -198,7 +198,7 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&json!(3))
+            Some(&json!(4))
         );
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
@@ -616,7 +616,25 @@ fn public_v3_cli_keeps_experimental_verification_out_of_default_help() {
         .args(["--help"])
         .output()
         .expect("run top-level help");
+    assert!(
+        output.status.success(),
+        "top-level help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let top_level = String::from_utf8(output.stdout).expect("UTF-8 top-level help");
+    // The command must be listed as a subcommand row, not merely mentioned in
+    // prose: the help preamble already names `search`/`packet` in its lane
+    // examples, so a bare `contains` cannot tell a hidden command from an
+    // advertised one.
+    for command in ["packet", "search"] {
+        assert!(
+            top_level.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed == command || trimmed.starts_with(&format!("{command} "))
+            }),
+            "top-level help must list the `{command}` subcommand row: {top_level}"
+        );
+    }
     assert!(!top_level.contains("prove-call-path"), "{top_level}");
     assert!(
         !top_level.contains("verify-indexed-direct-calls"),
@@ -1181,12 +1199,6 @@ fn tool_result_code(response: &Value) -> Option<String> {
     if response.pointer("/result/structuredContent/kind") == Some(&json!("preparing")) {
         return Some("codestory_preparing".to_string());
     }
-    if let Some(code) = response
-        .pointer("/result/structuredContent/code")
-        .and_then(Value::as_str)
-    {
-        return Some(code.to_string());
-    }
     response
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
@@ -1317,9 +1329,32 @@ fn assert_search_repaired_before_terminal_activation(
         "a terminal activation failure must name its cause: {error}"
     );
     assert_eq!(error["retry_tool"], Value::Null);
+    // The terminal branch must prove the repair left a completed generation,
+    // not merely a directory: an empty or partial replacement would satisfy
+    // `is_dir` alone.
+    let completed = fs::read_dir(search_generations)
+        .expect("search repair must leave a generations directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let marker_path = entry.path().join(".codestory-complete.json");
+            let marker: Value = serde_json::from_slice(&fs::read(&marker_path).ok()?).ok()?;
+            Some((entry.file_name().to_string_lossy().into_owned(), marker))
+        })
+        .find(|(name, marker)| {
+            marker["schema_version"] == json!(1)
+                && marker["generation_id"].as_str() == Some(name.as_str())
+                && marker["symbol_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                && marker["tantivy_doc_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        });
     assert!(
-        search_generations.is_dir(),
-        "search repair must complete before the terminal package limitation is reported"
+        completed.is_some(),
+        "search repair must complete a generation with a matching marker \
+         before the terminal package limitation is reported"
     );
     let ground_id = format!("{id}-local-ground");
     let ground = send_json(
@@ -1936,7 +1971,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(3)),
+        Some(&json!(4)),
         "the session-start stamp publishes the evidence-only v3 response schema: {agreed}"
     );
     assert_eq!(
@@ -2039,7 +2074,7 @@ fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
     let result = assert_success_envelope(&response, json!("ground-stamp"));
     assert_eq!(
         result.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(3)),
+        Some(&json!(4)),
         "a served payload must name the schema its vocabulary belongs to: {response}"
     );
     assert_eq!(
@@ -2213,6 +2248,124 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     );
     assert_eq!(refreshed["readiness"][0]["status"], json!("ready"));
     assert_allowed_surface(&refreshed, "ground", true, "local_navigation", "ready");
+}
+
+/// A 0.17.6-era cache carries schema 35 under this binary's schema 36. The
+/// observational status surface must return the typed upgrade refusal with the
+/// managed refresh command — never `internal` — and the activation-owned
+/// `ground` call must rebuild instead of failing.
+#[test]
+fn stdio_status_reports_stale_core_schema_and_ground_rebuilds() {
+    let fixture = indexed_fixture();
+    let database = test_support::set_active_core_schema_version(fixture.cache_dir.path(), 35);
+    let stale_bytes = fs::read(&database).expect("read downgraded generation");
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-stale-schema");
+
+    let status = send_json(
+        &mut server,
+        stdio_status_request("status-stale", fixture.workspace.path()),
+    );
+    let status_text = status
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or_else(|| status["result"].clone());
+    let code = status_text["code"].as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        code, "core_schema_upgrade_required",
+        "status on a stale core must be typed, not internal: {status}"
+    );
+    let command = status_text["next_commands"]
+        .as_array()
+        .or_else(|| {
+            status_text
+                .pointer("/details/next_commands")
+                .and_then(Value::as_array)
+        })
+        .and_then(|commands| {
+            commands
+                .iter()
+                .find(|command| {
+                    command
+                        .as_str()
+                        .is_some_and(|text| text.contains("index --project"))
+                })
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("status must name the managed refresh: {status}"));
+    assert!(
+        command
+            .as_str()
+            .is_some_and(|text| text.contains("--refresh full")),
+        "refresh command must be a full refresh: {command}"
+    );
+    assert_eq!(
+        fs::read(&database).expect("reread stale generation"),
+        stale_bytes,
+        "an observational status read must not mutate the stale generation"
+    );
+
+    let resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-resource-stale",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let resource_error = assert_error_envelope(&resource, json!("status-resource-stale"));
+    assert_eq!(
+        resource_error["data"]["code"],
+        json!("core_schema_upgrade_required"),
+        "resources/read status must surface the typed schema refusal: {resource}"
+    );
+    assert!(
+        resource_error["data"]["details"]["next_commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| {
+                command.as_str().is_some_and(|text| {
+                    text.contains("index --project") && text.contains("--refresh full")
+                })
+            })),
+        "resources/read must carry the managed refresh command: {resource_error}"
+    );
+
+    // The activation-owned call treats the stale core as cold: it rebuilds into
+    // a new generation and converges (or reports exact retry state), never an
+    // internal failure.
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stale",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    match tool_result_code(&ground).as_deref() {
+        Some("codestory_preparing") => {
+            assert_tool_preparing(&ground, json!("ground-stale"));
+        }
+        Some(code) => panic!("ground on a stale core must rebuild, not fail: {code}"),
+        None => {
+            let grounding = assert_tool_success(&ground, json!("ground-stale"));
+            assert!(
+                grounding["stats"]["file_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "rebuilt ground call should return a repository map: {ground}"
+            );
+        }
+    }
+    if database.exists() {
+        assert_eq!(
+            fs::read(&database).expect("reread old generation"),
+            stale_bytes,
+            "rebuild must leave the previous generation image intact"
+        );
+    }
 }
 
 #[test]
@@ -2560,7 +2713,43 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
         );
     }
 
-    let first_symbol = assert_tool_success(
+    // Query-resolution is retrieval-class; ground is graph-only and lists
+    // first_only with its stable id for the id-based symbol call below.
+    let first_ground = assert_tool_success(
+        &send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "multi-first-ground",
+                "method": "tools/call",
+                "params": {
+                    "name": "ground",
+                    "arguments": {"project": first.path(), "budget": "strict"}
+                }
+            }),
+        ),
+        json!("multi-first-ground"),
+    )
+    .clone();
+    let first_node_id = first_ground["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            first_ground["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("first_only"))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("first project should expose first_only: {first_ground:#}"));
+    assert_tool_success(
         &send_json(
             &mut server,
             json!({
@@ -2569,18 +2758,12 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
                 "method": "tools/call",
                 "params": {
                     "name": "symbol",
-                    "arguments": {"project": first.path(), "query": "first_only"}
+                    "arguments": {"project": first.path(), "id": first_node_id}
                 }
             }),
         ),
         json!("multi-first-symbol"),
-    )
-    .clone();
-    let first_node_id = first_symbol
-        .pointer("/node/id")
-        .or_else(|| first_symbol.pointer("/resolution/resolved/node_id"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("first project should resolve first_only: {first_symbol}"));
+    );
     let wrong_project_uri = format!(
         "codestory://symbol/{}?project={}",
         strict_resource_component(first_node_id),
@@ -2649,6 +2832,9 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         })
         .collect::<Vec<_>>();
     let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    // A peer holding the writer lock is a wait, not a failure: each project's
+    // activation parks at the peer-writer stage and the short latency budget
+    // returns a resumable preparing envelope naming that operation.
     let packet_request = |id: &str, project: &Path| {
         json!({
             "jsonrpc": "2.0",
@@ -2658,7 +2844,8 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
                 "name": "packet",
                 "arguments": {
                     "project": project,
-                    "question": "How does AppController open a project?"
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 1000
                 }
             }
         })
@@ -2668,17 +2855,16 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let unavailable = assert_tool_error(&response, json!(id));
+        let preparing = assert_tool_preparing(&response, json!(id));
         assert_eq!(
-            unavailable["code"],
-            json!("codestory_unavailable"),
-            "the original call must report the writer-lock failure: {unavailable}"
+            preparing["operation"]["stage"],
+            json!("waiting_for_peer_writer"),
+            "the call must be parked on the peer's writer lock: {preparing}"
         );
-        assert_eq!(unavailable["cause_code"], json!("cache_busy"));
-        assert_eq!(unavailable["state"], json!("unavailable"));
-        assert_eq!(unavailable["operation"]["state"], json!("retryable"));
+        assert!(preparing["resume_operation_id"].is_string());
+        assert!(preparing["resume_operation_attempt"].is_u64());
         operation_ids.push(
-            unavailable["operation"]["operation_id"]
+            preparing["operation"]["operation_id"]
                 .as_str()
                 .expect("project activation operation id")
                 .to_string(),
@@ -4075,11 +4261,130 @@ fn snippet_tool_exact_id_navigates_structural_evidence_but_query_stays_typed() {
         }),
     );
     let error = assert_tool_error(&query_response, json!("snippet-structural-query"));
+    // A query snippet is a retrieval-class read: where managed retrieval is
+    // unavailable the refusal is the typed availability envelope; where it is
+    // available the resolver still reports a typed no-match. Either way the
+    // wire carries a typed refusal, never an untyped error or stale bytes.
     assert!(
-        error["message"]
+        error["code"].as_str() == Some("codestory_unavailable")
+            || error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No symbol matched query")),
+        "stdio query snippet should retain typed refusal: {error:#}"
+    );
+}
+
+/// A symbol-identified snippet read must never serve bytes that fail the
+/// indexed content hash. Mutating the bound file after indexing makes the
+/// observational `codestory://snippet/` resource answer with the typed
+/// `source_stale` code, while the `snippet` tool waits for the managed
+/// refresh and then reports the stale id as `not_found`.
+#[test]
+fn snippet_id_reads_return_source_stale_when_indexed_bytes_change() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stale-snippet",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "balanced"}}
+        }),
+    );
+    let grounding = assert_tool_success(&ground_response, json!("ground-stale-snippet"));
+    let node_id = grounding["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            grounding["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("tiny-stdio-contract-fixture @ "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("grounding should expose the Cargo package: {grounding:#}"))
+        .to_string();
+
+    let manifest_path = fixture.workspace.path().join("Cargo.toml");
+    let manifest_original = fs::read_to_string(&manifest_path).expect("read manifest");
+    let manifest_mutated =
+        manifest_original.replace("tiny-stdio-contract-fixture", "tiny-stdio-contract-staledx");
+    assert_eq!(manifest_original.len(), manifest_mutated.len());
+    let modified = fs::metadata(&manifest_path)
+        .expect("manifest metadata")
+        .modified()
+        .expect("manifest mtime");
+    fs::write(&manifest_path, manifest_mutated).expect("mutate indexed manifest");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&manifest_path)
+        .expect("open manifest")
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .expect("restore manifest mtime");
+
+    // The snippet resource is an observational read: it pins the publication
+    // that activation already produced instead of refreshing first, so the
+    // drifted bytes reach the hash check and surface the typed stale code.
+    let resource_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-stale-resource",
+            "method": "resources/read",
+            "params": {
+                "uri": format!("codestory://snippet/{node_id}"),
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let resource_error = assert_error_envelope(&resource_response, json!("snippet-stale-resource"));
+    assert!(
+        resource_error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("No symbol matched query")),
-        "stdio query snippet should retain typed graph filtering: {error:#}"
+            .is_some_and(|message| message.contains("source_stale")),
+        "the snippet resource must surface the typed stale-source code: {resource_error:#}"
+    );
+    assert!(
+        !resource_error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("staledx")),
+        "the stale-source error must not carry bytes the index never saw: {resource_error:#}"
+    );
+
+    let tool_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-stale-tool",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": node_id}}
+        }),
+    );
+    // The snippet tool is a source-backed read: managed activation detects
+    // the drift, waits for the refresh, and republishes. The pinned id from
+    // the previous generation then no longer resolves, so the exact refusal
+    // is `not_found` -- and the wire still never carries the mutated bytes
+    // under the old identity.
+    let tool_error = assert_tool_error(&tool_response, json!("snippet-stale-tool"));
+    assert_eq!(
+        tool_error["code"].as_str(),
+        Some("not_found"),
+        "snippet tool waits for the refresh, so the stale id resolves to nothing: {tool_error:#}"
+    );
+    assert!(
+        !serde_json::to_string(&tool_error)
+            .expect("serialize tool error")
+            .contains("staledx"),
+        "the refusal must not carry bytes the index never saw: {tool_error:#}"
     );
 }
 
@@ -4918,12 +5223,15 @@ fn transcript_reads_project_resource() {
     assert_eq!(content["mimeType"], "application/json");
     let text = content["text"].as_str().expect("project resource text");
     let project: Value = serde_json::from_str(text).expect("project resource json text");
+    let root = project
+        .get("project_root")
+        .or_else(|| project.get("root"))
+        .and_then(Value::as_str)
+        .expect("project resource should include a project root field");
     assert!(
-        project
-            .get("project_root")
-            .or_else(|| project.get("root"))
-            .is_some(),
-        "project resource should include a project root field: {project}"
+        codestory_workspace::same_workspace_path(Path::new(root), fixture.workspace.path()),
+        "project resource must describe this fixture's canonical root, not an \
+         unrelated project: {project}"
     );
 }
 
@@ -5994,13 +6302,48 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
             .expect("ground serving generation");
     assert!(served_generation >= generation);
 
+    // A query-resolved symbol call is retrieval-class; the root-symbol
+    // resource is graph-only and hands back the stable id instead.
+    let pre_symbols_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-root-symbols-lookup",
+            "method": "resources/read",
+            "params": {
+                "uri": "codestory://symbols/root",
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let pre_symbols = json_resource_content(
+        assert_success_envelope(
+            &pre_symbols_response,
+            json!("concurrent-root-symbols-lookup"),
+        ),
+        "codestory://symbols/root",
+    );
+    let app_controller_id = pre_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|symbol| {
+            symbol["display_name"] == json!("AppController")
+                || symbol["label"] == json!("AppController")
+                || symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("AppController "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("root symbols should expose AppController: {pre_symbols}"))
+        .to_string();
     let symbol_response = send_json(
         &mut ground_client,
         json!({
             "jsonrpc": "2.0",
             "id": "concurrent-symbol",
             "method": "tools/call",
-            "params": {"name": "symbol", "arguments": {"query": "AppController"}}
+            "params": {"name": "symbol", "arguments": {"id": app_controller_id}}
         }),
     );
     let symbol = assert_tool_success(&symbol_response, json!("concurrent-symbol"));
@@ -6058,12 +6401,19 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
-    let old_generation = json_resource_content(
+    let warmup_content = json_resource_content(
         assert_success_envelope(&warmup_status, json!("warmup-generation")),
         "codestory://status",
-    )["index_publication"]["generation"]
+    );
+    let old_generation = warmup_content["index_publication"]["generation"]
         .as_u64()
         .expect("old complete generation");
+    let writer_lock_path = PathBuf::from(
+        warmup_content["storage_path"]
+            .as_str()
+            .expect("status storage_path"),
+    )
+    .with_extension("index-writer.lock");
     let mut writer_client = spawn_stdio_server(&fixture);
     initialize_stdio_server(&mut writer_client, "writer-initialize");
     thread::sleep(Duration::from_millis(25));
@@ -6092,40 +6442,65 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         (writer_client, response)
     });
 
-    let lock_path = fixture.cache_dir.path().join("local-refresh.lock");
-    let lock_deadline = Instant::now() + Duration::from_secs(10);
-    while !lock_path.exists() {
-        if writer.is_finished() {
-            break;
+    // Owner-scoped barrier: probe the real index-writer lock the refresh run
+    // holds end to end. A failed try-lock proves the writer is inside the
+    // publication boundary; a reader request answered in that window proves
+    // reads were admitted while the writer still held it. Releasing a
+    // successful probe immediately is safe because the production acquire
+    // retries within its spawn-ghost budget.
+    let writer_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&writer_lock_path)
+        .expect("open index-writer lock");
+    let mut admitted_during_writer_hold = false;
+    let lock_deadline = Instant::now() + Duration::from_secs(120);
+    while !admitted_during_writer_hold {
+        if writer_lock_file
+            .try_lock_exclusive()
+            .expect("probe index-writer lock")
+        {
+            writer_lock_file.unlock().expect("release probed lock");
+            assert!(
+                !writer.is_finished(),
+                "writer finished without ever holding the index-writer lock"
+            );
+        } else {
+            let concurrent_ground = send_json(
+                &mut reader_client,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "reader-ground-during-lock",
+                    "method": "resources/read",
+                    "params": {
+                        "uri": "codestory://grounding",
+                        "project": fixture.workspace.path()
+                    }
+                }),
+            );
+            let concurrent_ground = json_resource_content(
+                assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
+                "codestory://grounding",
+            );
+            assert!(
+                concurrent_ground["stats"]["file_count"]
+                    .as_u64()
+                    .is_some_and(|count| count == 5 || count == 101),
+                "concurrent resource read observed neither complete file set: {concurrent_ground}"
+            );
+            admitted_during_writer_hold = true;
         }
         assert!(
             Instant::now() < lock_deadline,
-            "writer did not acquire the local refresh lock"
+            "writer never held the index-writer lock while a reader ran"
         );
         thread::sleep(Duration::from_millis(10));
     }
-
-    let concurrent_ground = send_json(
-        &mut reader_client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "reader-ground-during-lock",
-            "method": "resources/read",
-            "params": {
-                "uri": "codestory://grounding",
-                "project": fixture.workspace.path()
-            }
-        }),
-    );
-    let concurrent_ground = json_resource_content(
-        assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
-        "codestory://grounding",
-    );
     assert!(
-        concurrent_ground["stats"]["file_count"]
-            .as_u64()
-            .is_some_and(|count| count == 5 || count == 101),
-        "concurrent resource read observed neither complete file set: {concurrent_ground}"
+        admitted_during_writer_hold,
+        "no reader request was admitted while the writer held the publication boundary"
     );
 
     // Workspace-wide default-concurrency runs can heavily contend with the
@@ -6205,6 +6580,846 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
 
     let (_writer_client, writer_status) = writer.join().expect("join writer status client");
     assert_tool_success(&writer_status, json!("writer-start-refresh"));
+}
+
+// Shared-cache two-process fixtures below pin the cross-process peer-writer
+// contract: while one process holds the index-writer lock mid-refresh, a
+// second process's activation waits on the publication boundary instead of
+// failing `cache_busy`, then adopts whatever the peer published.
+
+/// `<storage>.index-writer.hold` marker companion to the lock path: the file
+/// holds a refresh parked mid-flight while it exists (see
+/// `wait_out_index_writer_hold_marker`).
+fn stdio_writer_paths(storage_path: &str) -> (PathBuf, PathBuf) {
+    let storage = PathBuf::from(storage_path);
+    (
+        storage.with_extension("index-writer.lock"),
+        storage.with_extension("index-writer-hold"),
+    )
+}
+
+/// Spawn `index --refresh incremental` as a child process. With the
+/// writer-hold marker armed it parks mid-refresh still holding the
+/// index-writer lock, so tests control exactly when the peer publishes.
+fn spawn_peer_index_refresh(fixture: &StdioFixture) -> Child {
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("incremental")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(fixture.workspace.path())
+        .arg("--cache-dir")
+        .arg(fixture.cache_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    allow_explicit_cpu_embeddings(&mut command);
+    command.spawn().expect("spawn peer index refresh")
+}
+
+/// Wait until some other process holds the index-writer lock: a failed probe
+/// proves ownership sits elsewhere.
+fn wait_for_peer_held_writer(writer_lock_path: &Path, context: &str) {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(writer_lock_path)
+        .expect("open index-writer lock");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if !file.try_lock_exclusive().expect("probe index-writer lock") {
+            return;
+        }
+        file.unlock().expect("release probed lock");
+        assert!(Instant::now() < deadline, "{context}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Write `request` without consuming a response: interleaved
+/// `notifications/progress` frames are read separately by the caller.
+fn write_stdio_request(server: &mut StdioServer, request: &Value) {
+    writeln!(server.stdin, "{request}").expect("write request line");
+    server.stdin.flush().expect("flush request line");
+}
+
+/// Send `request` on a background thread and stream every frame — progress
+/// notifications included — through the channel. The frame matching the
+/// request `id` is the response and ends the stream.
+fn stream_stdio_request(
+    mut server: StdioServer,
+    request: Value,
+) -> (
+    std::sync::mpsc::Receiver<Value>,
+    thread::JoinHandle<StdioServer>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = request.get("id").cloned();
+    let handle = thread::spawn(move || {
+        write_stdio_request(&mut server, &request);
+        loop {
+            let frame = read_json(&mut server);
+            let is_response = frame.get("id") == id.as_ref();
+            let _ = tx.send(frame);
+            if is_response {
+                break;
+            }
+        }
+        server
+    });
+    (rx, handle)
+}
+
+/// Drain `rx` until the response frame for `id` arrives, returning it along
+/// with every notification frame observed before it.
+fn wait_for_streamed_response(
+    rx: &std::sync::mpsc::Receiver<Value>,
+    id: &str,
+    deadline: Duration,
+) -> (Value, Vec<Value>) {
+    let started = Instant::now();
+    let mut notifications = Vec::new();
+    loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        assert!(
+            !remaining.is_zero(),
+            "response for {id} did not arrive within {deadline:?}"
+        );
+        match rx.recv_timeout(remaining) {
+            Ok(frame) if frame.get("id") == Some(&json!(id)) => {
+                return (frame, notifications);
+            }
+            Ok(frame) => notifications.push(frame),
+            Err(_) => panic!("response for {id} did not arrive within {deadline:?}"),
+        }
+    }
+}
+
+/// A request armed with a progress token must surface the peer-wait stage
+/// message while the activation is parked on the peer's writer lock.
+fn wait_for_peer_wait_progress(rx: &std::sync::mpsc::Receiver<Value>, id: &str) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let frame = rx
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|_| panic!("no frames observed for {id} while waiting for the peer"));
+        if frame.get("id") == Some(&json!(id)) {
+            panic!("request {id} answered before reaching the peer-writer wait: {frame}");
+        }
+        let is_wait_stage = frame.get("method") == Some(&json!("notifications/progress"))
+            && frame.pointer("/params/message").and_then(Value::as_str)
+                == Some("CodeStory is waiting for another session to finish indexing");
+        seen.push(frame);
+        if is_wait_stage {
+            return seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "request {id} never reported the peer-writer wait stage: {seen:?}"
+        );
+    }
+}
+
+/// Collect the fixture's storage path, current generation, and one stable
+/// symbol id from a warm reader process before any drift.
+fn warmup_reader_state(fixture: &StdioFixture) -> (StdioServer, String, u64, String) {
+    let mut reader = spawn_stdio_server(fixture);
+    let warmup_status = send_json(
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-warmup-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&warmup_status, json!("peer-warmup-status")),
+        "codestory://status",
+    );
+    let storage_path = status["storage_path"]
+        .as_str()
+        .expect("status storage_path")
+        .to_string();
+    let old_generation = status["index_publication"]["generation"]
+        .as_u64()
+        .expect("warm complete generation");
+    let symbols_response = send_json(
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-warmup-symbols",
+            "method": "resources/read",
+            "params": {
+                "uri": "codestory://symbols/root",
+                "project": fixture.workspace.path()
+            }
+        }),
+    );
+    let root_symbols = json_resource_content(
+        assert_success_envelope(&symbols_response, json!("peer-warmup-symbols")),
+        "codestory://symbols/root",
+    );
+    let symbol_id = root_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|symbol| {
+            symbol["display_name"] == json!("AppController")
+                || symbol["label"] == json!("AppController")
+                || symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("AppController "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("root symbols should expose AppController: {root_symbols}"))
+        .to_string();
+    (reader, storage_path, old_generation, symbol_id)
+}
+
+/// The current complete generation as a fresh observational status read sees
+/// it, so the test counts publications from shared storage.
+fn observed_generation(reader: &mut StdioServer, fixture: &StdioFixture, id: &str) -> u64 {
+    let response = send_json(
+        reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&response, json!(id)),
+        "codestory://status",
+    );
+    status["index_publication"]["generation"]
+        .as_u64()
+        .expect("observed complete generation")
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_wait_adopts_the_peer_publication() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_adopted.rs"),
+        "pub fn peer_adopted() -> usize { 7 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let snippet_server = spawn_stdio_server(&fixture);
+    let packet_server = spawn_stdio_server(&fixture);
+    let (snippet_rx, snippet_thread) = stream_stdio_request(
+        snippet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-wait-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-snippet-progress"}
+            }
+        }),
+    );
+    let (packet_rx, packet_thread) = stream_stdio_request(
+        packet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-wait-packet",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 60000
+                },
+                "_meta": {"progressToken": "peer-packet-progress"}
+            }
+        }),
+    );
+
+    // Both calls must be parked inside the peer-writer wait — progress
+    // reporting proves the stage — with no response on the wire while the
+    // peer still holds the writer.
+    wait_for_peer_wait_progress(&snippet_rx, "peer-wait-snippet");
+    wait_for_peer_wait_progress(&packet_rx, "peer-wait-packet");
+    thread::sleep(Duration::from_millis(500));
+    for (rx, id) in [
+        (&snippet_rx, "peer-wait-snippet"),
+        (&packet_rx, "peer-wait-packet"),
+    ] {
+        while let Ok(frame) = rx.try_recv() {
+            assert_ne!(
+                frame.get("id"),
+                Some(&json!(id)),
+                "request {id} answered while the peer still held the writer: {frame}"
+            );
+        }
+    }
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "peer refresh failed
+stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&peer_output.stdout),
+        String::from_utf8_lossy(&peer_output.stderr)
+    );
+
+    let (snippet_response, _) =
+        wait_for_streamed_response(&snippet_rx, "peer-wait-snippet", Duration::from_secs(120));
+    let (packet_response, _) =
+        wait_for_streamed_response(&packet_rx, "peer-wait-packet", Duration::from_secs(120));
+    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    let _packet_server = packet_thread.join().expect("join packet request");
+
+    // Exactly one new complete generation exists — the peer's — and both
+    // waiters answer from it rather than publishing again.
+    let published = observed_generation(&mut reader, &fixture, "peer-adopted-generation");
+    assert_eq!(
+        published,
+        old_generation + 1,
+        "exactly one publication must occur: the peer's"
+    );
+    assert_tool_success(&snippet_response, json!("peer-wait-snippet"));
+    let snippet_result = assert_success_envelope(&snippet_response, json!("peer-wait-snippet"));
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published),
+        "the waiting snippet must answer from the peer's publication"
+    );
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("fresh")
+    );
+    let packet_result = assert_success_envelope(&packet_response, json!("peer-wait-packet"));
+    if packet_result.get("isError").and_then(Value::as_bool) == Some(true) {
+        // This build carries no embedded embedding model, so a full
+        // activation can wait on the peer, adopt its publication, and still
+        // terminate at dense preparation. The wire answer must be that typed
+        // limitation — never a lock-contention refusal — and the observed
+        // operation proves the peer's publication was already in place.
+        let error = assert_tool_error(&packet_response, json!("peer-wait-packet"));
+        assert_eq!(
+            error["cause_code"],
+            json!("native_model_not_embedded"),
+            "the waited packet must not fail on writer contention: {error}"
+        );
+        assert_eq!(
+            error["operation"]["retained_core_publication"]["generation"],
+            json!(published),
+            "the packet activation must have adopted the peer's publication"
+        );
+    } else {
+        assert_tool_success(&packet_response, json!("peer-wait-packet"));
+        assert_eq!(
+            packet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+            json!(published)
+        );
+        assert_eq!(
+            packet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+            json!("fresh")
+        );
+    }
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_wait_returns_resumable_preparing() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, _symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_resume.rs"),
+        "pub fn peer_resume() -> usize { 8 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    // A bounded packet latency budget expires while the peer still holds the
+    // writer: the caller gets a resumable preparing envelope plus progress.
+    // The budget must span the first activation slice plus one progress tick
+    // so the join-wait loop reports the parked stage before returning.
+    // send_json reads only one line, so progress frames are drained until the
+    // matching response id arrives.
+    let mut packet_server = spawn_stdio_server(&fixture);
+    write_stdio_request(
+        &mut packet_server,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-deadline-packet",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "How does AppController open a project?",
+                    "latency_budget_ms": 10000
+                },
+                "_meta": {"progressToken": "peer-deadline-progress"}
+            }
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut notifications = Vec::new();
+    let preparing_response = loop {
+        let frame = read_json(&mut packet_server);
+        assert!(
+            Instant::now() < deadline,
+            "the packet call never returned its preparing envelope"
+        );
+        if frame.get("id") == Some(&json!("peer-deadline-packet")) {
+            break frame;
+        }
+        notifications.push(frame);
+    };
+    let preparing = assert_success_envelope(&preparing_response, json!("peer-deadline-packet"));
+    let structured = preparing["structuredContent"].clone();
+    assert_eq!(
+        structured["kind"],
+        json!("preparing"),
+        "the expired call must return the resumable preparing envelope: {preparing_response}"
+    );
+    assert_eq!(structured["state"], json!("preparing"));
+    assert_eq!(structured["deadline_exceeded"], json!(true));
+    assert!(
+        structured["resume_operation_id"].is_string()
+            && structured["resume_operation_attempt"].is_u64(),
+        "the preparing envelope must carry callable resume identity: {structured}"
+    );
+    assert!(
+        notifications.iter().any(|frame| {
+            frame.get("method") == Some(&json!("notifications/progress"))
+                && frame.pointer("/params/progressToken") == Some(&json!("peer-deadline-progress"))
+        }),
+        "a progress-token request must emit progress while waiting on the peer: {notifications:?}"
+    );
+    // The timed-out request left its activation running in the background;
+    // it is still parked on the peer's writer lock.
+    assert_eq!(
+        structured["operation"]["stage"],
+        json!("waiting_for_peer_writer"),
+        "the preparing envelope must describe the peer-writer wait: {structured}"
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "peer refresh failed
+stderr:
+{}",
+        String::from_utf8_lossy(&peer_output.stderr)
+    );
+    let published = observed_generation(&mut reader, &fixture, "peer-resume-generation");
+    assert_eq!(published, old_generation + 1);
+
+    // Resume on the same connection with the envelope's exact minimum_next
+    // arguments: the still-running shared activation adopts the peer's
+    // publication, finishes, and the resumed call answers from it. The
+    // replayed latency budget is short, so another preparing envelope is a
+    // legal intermediate answer.
+    let resume_arguments = structured["minimum_next"]["arguments"].clone();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut resume_attempt = 0usize;
+    loop {
+        resume_attempt += 1;
+        let resume_response = send_json(
+            &mut packet_server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("peer-deadline-resume-{resume_attempt}"),
+                "method": "tools/call",
+                "params": {"name": "packet", "arguments": resume_arguments}
+            }),
+        );
+        let resume_result = assert_success_envelope(
+            &resume_response,
+            json!(format!("peer-deadline-resume-{resume_attempt}")),
+        );
+        if resume_result["structuredContent"]["kind"] == json!("preparing") {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed call never converged after the peer published"
+            );
+            continue;
+        }
+        if resume_result.get("isError").and_then(Value::as_bool) == Some(true) {
+            // A build without the embedded embedding model waits, adopts the
+            // peer's core, then ends at dense preparation. The wire answer is
+            // that typed limitation — never a contention error or an unknown
+            // operation.
+            let error = assert_tool_error(
+                &resume_response,
+                json!(format!("peer-deadline-resume-{resume_attempt}")),
+            );
+            let cause = error["cause_code"]
+                .as_str()
+                .or_else(|| error["details"]["cause_code"].as_str());
+            assert_eq!(
+                cause,
+                Some("native_model_not_embedded"),
+                "the resumed call must not fail on writer contention: {error}"
+            );
+            break;
+        }
+        assert_tool_success(&resume_response, json!("peer-deadline-resume"));
+        assert_eq!(
+            resume_result["_meta"]["codestory_publication"]["publication"]["generation"],
+            json!(published),
+            "the resumed call must answer from the peer's publication: {resume_response}"
+        );
+        assert_eq!(
+            resume_result["_meta"]["codestory_publication"]["freshness"]["state"],
+            json!("fresh")
+        );
+        break;
+    }
+}
+
+#[test]
+fn two_stdio_processes_cancelling_a_peer_waiter_leaves_everything_running() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_cancel.rs"),
+        "pub fn peer_cancel() -> usize { 9 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    // Park the waiter's snippet on the peer's writer lock; the progress
+    // frames prove which stage the request reached.
+    let mut waiter = spawn_stdio_server(&fixture);
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-cancel-progress"}
+            }
+        }),
+    );
+    let progress_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = read_json(&mut waiter);
+        assert_ne!(
+            frame.get("id"),
+            Some(&json!("peer-cancel-snippet")),
+            "the waiting request must not answer before cancellation: {frame}"
+        );
+        if frame.pointer("/params/message").and_then(Value::as_str)
+            == Some("CodeStory is waiting for another session to finish indexing")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < progress_deadline,
+            "the waiter never reached the peer-writer stage"
+        );
+    }
+
+    // Cancelling the request frees the worker promptly without touching the
+    // shared activation it joined.
+    let cancel_sent = Instant::now();
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "peer-cancel-snippet"}
+        }),
+    );
+    write_stdio_request(
+        &mut waiter,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let status_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_cancelled_response = false;
+    let status_response = loop {
+        let frame = read_json(&mut waiter);
+        assert!(
+            Instant::now() < status_deadline,
+            "the cancelled request never released the connection"
+        );
+        if frame.get("id") == Some(&json!("peer-cancel-snippet")) {
+            saw_cancelled_response = true;
+        }
+        if frame.get("id") == Some(&json!("peer-cancel-status")) {
+            break frame;
+        }
+    };
+    assert!(
+        !saw_cancelled_response,
+        "a client-cancelled request id is owed no response"
+    );
+    assert!(
+        cancel_sent.elapsed() < Duration::from_secs(30),
+        "the cancelled request must release the worker promptly"
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&status_response, json!("peer-cancel-status")),
+        "codestory://status",
+    );
+    let assert_still_waiting = |status: &Value| {
+        let operation = &status["current_operation"];
+        assert_eq!(
+            operation["stage"],
+            json!("waiting_for_peer_writer"),
+            "cancelling the request must not cancel the shared activation: {status}"
+        );
+        assert!(
+            matches!(
+                operation["state"].as_str(),
+                Some("preparing" | "updating" | "working_locally")
+            ),
+            "the shared activation must still be running for other callers: {status}"
+        );
+    };
+    assert_still_waiting(&status);
+
+    // The cancelled waiter must not have killed the shared activation: after
+    // a settle window it is still parked on the peer's writer lock.
+    std::thread::sleep(Duration::from_secs(2));
+    let settled_status_response = send_json(
+        &mut waiter,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-status-settled",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
+        }),
+    );
+    let settled_status = json_resource_content(
+        assert_success_envelope(
+            &settled_status_response,
+            json!("peer-cancel-status-settled"),
+        ),
+        "codestory://status",
+    );
+    assert_still_waiting(&settled_status);
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(
+        peer_output.status.success(),
+        "the peer refresh must publish normally despite the cancelled waiter"
+    );
+    let published = observed_generation(&mut reader, &fixture, "peer-cancel-generation");
+    assert_eq!(published, old_generation + 1);
+
+    let retry_response = send_json(
+        &mut waiter,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-cancel-retry",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": symbol_id}}
+        }),
+    );
+    let retried = assert_tool_success(&retry_response, json!("peer-cancel-retry"));
+    let retry_result = assert_success_envelope(&retry_response, json!("peer-cancel-retry"));
+    assert_eq!(
+        retry_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published),
+        "a later call must answer from the peer publication: {retried:?}"
+    );
+}
+
+#[test]
+fn two_stdio_processes_peer_writer_death_lets_the_waiter_publish() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_dead.rs"),
+        "pub fn peer_dead() -> usize { 10 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let mut peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let snippet_server = spawn_stdio_server(&fixture);
+    let (snippet_rx, snippet_thread) = stream_stdio_request(
+        snippet_server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-death-snippet",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": symbol_id},
+                "_meta": {"progressToken": "peer-death-progress"}
+            }
+        }),
+    );
+    wait_for_peer_wait_progress(&snippet_rx, "peer-death-snippet");
+
+    // Kill the owner without publishing: the OS releases the writer lock and
+    // the parked waiter takes over — where the still-armed marker parks it
+    // again, mid-refresh, holding the lock this time.
+    peer.kill().expect("kill the peer writer");
+    let _ = peer.wait().expect("reap the peer writer");
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the waiter never took over the index-writer lock after the peer died",
+    );
+
+    // The previous publication stays readable while the waiter owns the
+    // writer: a graph-only read is answered from it and labelled historical.
+    let mut graph_only = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut graph_only,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-death-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("peer-death-ground"));
+    assert!(ground["stats"]["file_count"].as_u64().is_some());
+    let ground_result = assert_success_envelope(&ground_response, json!("peer-death-ground"));
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(old_generation),
+        "the retained publication must stay readable while the waiter writes"
+    );
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("historical")
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked waiter");
+    let (snippet_response, _) =
+        wait_for_streamed_response(&snippet_rx, "peer-death-snippet", Duration::from_secs(120));
+    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    assert_tool_success(&snippet_response, json!("peer-death-snippet"));
+    let snippet_result = assert_success_envelope(&snippet_response, json!("peer-death-snippet"));
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["freshness"]["state"],
+        json!("fresh")
+    );
+
+    // The dead peer published nothing; the waiter's own refresh is the only
+    // new complete generation.
+    let published = observed_generation(&mut reader, &fixture, "peer-death-generation");
+    assert_eq!(
+        published,
+        old_generation + 1,
+        "the waiter performs exactly one refresh after the peer dies"
+    );
+    assert_eq!(
+        snippet_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(published)
+    );
+}
+
+#[test]
+fn two_stdio_processes_graph_only_read_during_peer_refresh_is_historical() {
+    let fixture = indexed_fixture();
+    let (mut reader, storage_path, old_generation, _symbol_id) = warmup_reader_state(&fixture);
+    let (writer_lock_path, hold_marker_path) = stdio_writer_paths(&storage_path);
+
+    fs::write(
+        fixture.workspace.path().join("src/peer_historical.rs"),
+        "pub fn peer_historical() -> usize { 11 }
+",
+    )
+    .expect("drift the workspace");
+    fs::write(&hold_marker_path, "hold").expect("arm writer-hold marker");
+    let peer = spawn_peer_index_refresh(&fixture);
+    wait_for_peer_held_writer(
+        &writer_lock_path,
+        "the peer refresh never held the index-writer lock",
+    );
+
+    let mut graph_only = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut graph_only,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "peer-historical-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("peer-historical-ground"));
+    assert!(ground["stats"]["file_count"].as_u64().is_some());
+    let ground_result = assert_success_envelope(&ground_response, json!("peer-historical-ground"));
+    let publication_meta = &ground_result["_meta"]["codestory_publication"];
+    assert_eq!(
+        publication_meta["freshness"]["state"],
+        json!("historical"),
+        "the graph-only read must be labelled historical while a peer writes"
+    );
+    assert_eq!(
+        publication_meta["freshness"]["reason"],
+        json!("peer_writer"),
+        "the peer-writer wait stage must identify the retained answer: {publication_meta}"
+    );
+    assert_eq!(
+        publication_meta["publication"]["generation"],
+        json!(old_generation),
+        "the historical answer must come from the retained publication"
+    );
+
+    fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
+    let peer_output = peer.wait_with_output().expect("wait for peer refresh exit");
+    assert!(peer_output.status.success());
+    assert_eq!(
+        observed_generation(&mut reader, &fixture, "peer-historical-generation"),
+        old_generation + 1
+    );
 }
 
 #[test]
@@ -6347,28 +7562,29 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         "ground should serve refreshed graph stats after mutation; before={node_count_before}, after={node_count_after}, snapshot={ground_after}"
     );
 
-    let symbol_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "tool-refresh-symbol",
-            "method": "tools/call",
-            "params": {
-                "name": "symbol",
-                "arguments": {"query": "stdio_tool_added_after_mutation"}
-            }
-        }),
-    );
-    let symbol = assert_tool_success(&symbol_response, json!("tool-refresh-symbol"));
-    let node_id = symbol
-        .pointer("/node/id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            symbol
-                .pointer("/resolution/resolved/node_id")
-                .and_then(Value::as_str)
+    // Query-resolution is retrieval-class and unavailable without broad
+    // retrieval; the refreshed ground response already lists the new symbol
+    // with its stable id, which is the graph-only way to select it.
+    let node_id = ground_after["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            ground_after["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("stdio_tool_added_after_mutation"))
         })
-        .unwrap_or_else(|| panic!("symbol should resolve the post-mutation function: {symbol}"))
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| {
+            panic!("refreshed ground should expose the post-mutation function: {ground_after:#}")
+        })
         .to_string();
 
     for (tool, id) in [
@@ -6468,10 +7684,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     );
     assert!(
         matches!(
-            search_error.pointer("/code").and_then(Value::as_str),
+            tool_result_code(&search_response).as_deref(),
             Some("codestory_preparing" | "codestory_unavailable")
         ),
-        "broad search should use the normal readiness response after local graph refresh: {search_response}"
+        "broad search should use the normal readiness response after local graph refresh: {search_error}"
     );
 }
 
@@ -7363,29 +8579,40 @@ fn mcp_graph_caller_scope_hides_stored_test_call_until_explicitly_included() {
     let mut server = spawn_stdio_server(&fixture);
     initialize_stdio_server(&mut server, "init-scope");
 
-    let test_entry = call_graph_tool(
+    // Query-resolution is retrieval-class; ground is graph-only and lists the
+    // fixture functions with their stable ids.
+    let grounding = call_graph_tool(
         &mut server,
-        "symbol-test-entry",
-        "symbol",
+        "scope-ground",
+        "ground",
         json!({
             "project": fixture.workspace.path(),
-            "query": "test_entry"
+            "budget": "strict"
         }),
     );
-    let test_id = test_entry["node"]["id"]
-        .as_str()
-        .expect("test_entry id")
-        .to_string();
-    let leaf = call_graph_tool(
-        &mut server,
-        "symbol-leaf",
-        "symbol",
-        json!({
-            "project": fixture.workspace.path(),
-            "query": "leaf"
-        }),
-    );
-    let leaf_id = leaf["node"]["id"].as_str().expect("leaf id").to_string();
+    let scope_symbol_id = |name: &str| {
+        grounding["root_symbols"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                grounding["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+            )
+            .find(|symbol| {
+                symbol["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with(name))
+            })
+            .and_then(|symbol| symbol["id"].as_str())
+            .unwrap_or_else(|| panic!("ground should expose {name}: {grounding:#}"))
+            .to_string()
+    };
+    let test_id = scope_symbol_id("test_entry");
+    let leaf_id = scope_symbol_id("leaf");
 
     for (name, extra) in [
         (

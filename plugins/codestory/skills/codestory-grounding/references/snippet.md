@@ -28,6 +28,13 @@ The MCP `snippet` tool exposes `scope=line_context|function_body` and
 `scope`. Pass only one member of each alias pair; unknown or conflicting fields
 fail instead of being ignored.
 
+A snippet resolved by stable symbol id is a source-backed read: while a refresh
+is running it waits for the fresh complete index inside the call's deadline
+instead of returning pre-refresh bytes, and returns `preparing` when the
+deadline expires first. The `codestory://snippet/{id}` resource stays
+observational — it never activates or waits, and reports `source_stale` when
+the indexed bytes no longer match the file.
+
 ```
 # Snippet
 resolved: `AppController::new` -> [abc123] new [FUNCTION] `src/lib.rs`:100

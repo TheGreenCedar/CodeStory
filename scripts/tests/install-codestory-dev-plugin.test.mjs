@@ -89,7 +89,7 @@ process.stdout.write(JSON.stringify(response));
   await chmod(script, 0o755);
 }
 
-async function fixture() {
+async function fixture({ pluginVersion = version } = {}) {
   const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "codestory-dev-install-"));
   const checkout = path.join(root, "repo");
   const plugin = path.join(checkout, "plugins", "codestory");
@@ -109,6 +109,15 @@ async function fixture() {
   const codex = path.join(root, "codex-fixture");
   await mkdir(path.dirname(plugin), { recursive: true });
   await cp(sourcePlugin, plugin, { recursive: true });
+  if (pluginVersion !== version) {
+    // The repository currently ships plugin version == CLI pin, which makes a
+    // plugin/cli version swap unobservable. Diverge the copied manifest before
+    // the fixture commit so the two identities are separable.
+    const manifestPath = path.join(plugin, ".codex-plugin", "plugin.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.version = pluginVersion;
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  }
   git(checkout, "init", "-q");
   git(checkout, "config", "user.email", "fixture@example.invalid");
   git(checkout, "config", "user.name", "Fixture");
@@ -125,7 +134,7 @@ async function fixture() {
     codex,
     env: {
       FAKE_CACHE_ROOT: cacheRoot,
-      FAKE_PLUGIN_VERSION: version,
+      FAKE_PLUGIN_VERSION: pluginVersion,
       FAKE_STAGE_ROOT: stagingRoot,
     },
     marketplacePlugin,
@@ -238,21 +247,30 @@ test("CodeStoryDev installer stages and refreshes an exact receipt while preserv
 test("CodeStoryDev installer keeps the plugin version independent from its pinned CLI version", {
   skip: process.platform === "win32" ? "fixture uses a POSIX executable" : false,
 }, async () => {
-  const value = await fixture();
+  const divergentPluginVersion = "9.8.7";
+  assert.notEqual(divergentPluginVersion, cliVersion);
+  const value = await fixture({ pluginVersion: divergentPluginVersion });
   try {
     await writeFakeCli(value.cli, cliVersion);
 
     const installed = install(value);
 
-    assert.equal(installed.plugin_version, version);
+    assert.equal(installed.plugin_version, divergentPluginVersion);
     assert.equal(installed.cli.version, cliVersion);
-    assert.equal(
-      contract.validateDevCliReceipt(installed.installed_plugin_root, {
-        expectedCliVersion: cliVersion,
-        expectedPluginVersion: version,
-      }).state,
-      "verified",
-    );
+    const receipt = contract.validateDevCliReceipt(installed.installed_plugin_root, {
+      expectedCliVersion: cliVersion,
+      expectedPluginVersion: divergentPluginVersion,
+    });
+    assert.equal(receipt.state, "verified");
+    // A plugin/cli version swap must fail closed: the divergent pin exercised
+    // the production contract with each identity in the other's slot.
+    for (const swap of [
+      { expectedCliVersion: divergentPluginVersion, expectedPluginVersion: divergentPluginVersion },
+      { expectedCliVersion: cliVersion, expectedPluginVersion: cliVersion },
+    ]) {
+      const swapped = contract.validateDevCliReceipt(installed.installed_plugin_root, swap);
+      assert.equal(swapped.state, "invalid", JSON.stringify(swap));
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

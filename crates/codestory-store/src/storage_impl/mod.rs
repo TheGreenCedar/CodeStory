@@ -26,7 +26,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,8 +42,9 @@ mod schema;
 mod trail;
 
 pub use core_retention::{
-    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, LegacyRetirementReport,
-    apply_core_retention, apply_legacy_retirement, observe_legacy_retirement,
+    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, CoreRetentionSuppression,
+    LegacyRetirementReport, apply_core_retention, apply_legacy_retirement,
+    observe_legacy_retirement,
 };
 pub(crate) use core_retention::{
     CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,
@@ -85,10 +86,14 @@ pub(crate) struct SealedCoreCandidateReceipt {
 const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
 const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
-const SCHEMA_VERSION: u32 = ATTACHED_COMMENT_SCHEMA_VERSION;
+const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
+const SCHEMA_VERSION: u32 = PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
-const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
+/// The `user_version` sentinel stamped while an incremental index run is
+/// incomplete. Read surfaces must distinguish the fence from a real
+/// forward-incompatible schema even though it sorts above `SCHEMA_VERSION`.
+pub const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
 /// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
@@ -1226,79 +1231,10 @@ fn require_recorded_proof_resolution_identity(
     Ok(())
 }
 
-/// Byte extent of the SQLite database header in retained legacy-promotion
-/// tests.
-#[cfg(test)]
-const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
-
-/// Header slots SQLite rewrites as bookkeeping when it commits or completes a
-/// `sqlite3_backup`, and which therefore carry no database content: the file
-/// change counter (24..28), the schema cookie (40..44), and the version-valid-for
-/// counter (92..96). Every other byte of the file, header included, participates.
-#[cfg(test)]
-const SQLITE_VOLATILE_HEADER_SLOTS: [(usize, usize); 3] = [(24, 28), (40, 44), (92, 96)];
-
 /// Rollback-journal sidecars that can hold database content outside the main
 /// file. `-shm` is excluded on purpose: it is a rebuildable wal-index, never
 /// content.
 const SQLITE_CONTENT_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-journal"];
-
-/// Whole-database byte identity for one promotion artifact.
-///
-/// This is content evidence, not a handle: two databases with the same image
-/// hold the same pages, so a validation that passed on one is a validation of
-/// the other. It is deliberately opaque so no caller can manufacture one.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PromotionDatabaseImage([u8; 32]);
-
-/// Digest the whole database file, masking only the header slots SQLite itself
-/// rewrites.
-///
-/// `None` means the image is not provable — a hot `-wal` or `-journal` sidecar
-/// puts content outside the main file, and a file shorter than the header is not
-/// a database. An unprovable image never admits reuse; it forces full
-/// revalidation.
-#[cfg(test)]
-fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage>, StorageError> {
-    for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
-        let sidecar = sqlite_sidecar_path(path, suffix);
-        match fs::metadata(&sidecar) {
-            Ok(metadata) if metadata.len() > 0 => return Ok(None),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(promotion_path_error("inspect", &sidecar, error)),
-        }
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(promotion_path_error("open", path, error)),
-    };
-    let mut reader = BufReader::new(file);
-    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(promotion_path_error("read", path, error)),
-    }
-    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
-        header[start..end].fill(0);
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(header);
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| promotion_path_error("read", path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(Some(PromotionDatabaseImage(hasher.finalize().into())))
-}
 
 fn require_standalone_core_candidate(path: &Path) -> Result<(), StorageError> {
     for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
@@ -1386,58 +1322,6 @@ impl PromotedValidation {
             Self::Revalidated => "revalidated",
         }
     }
-}
-
-/// Fence the restored live database before the promotion may commit.
-///
-/// The publication identity is always read back from the promoted file. The
-/// deep source-policy and structural-text validations are reused from the staged
-/// candidate only when the restored file's whole-database image equals the image
-/// sealed to that candidate's validation — which proves the two files hold the
-/// same pages, so re-deriving the same verdict from them is redundant work. A
-/// missing image on either side, or any difference at all, revalidates in full.
-#[cfg(test)]
-fn validate_promoted_live_database(
-    live_path: &Path,
-    staged_path: &Path,
-    candidate: &IndexPublicationRecord,
-    candidate_source_policy: &Option<SourcePolicyExclusionRollbackIdentity>,
-    candidate_structural_text: &Option<StructuralTextUnitRollbackIdentity>,
-    candidate_proof_resolution: &Option<ProofResolutionRollbackIdentity>,
-    candidate_image: Option<PromotionDatabaseImage>,
-) -> Result<PromotedValidation, StorageError> {
-    let published =
-        require_complete_promotion_database_identity(live_path, "Promoted live database")?;
-    if &published != candidate {
-        return Err(promotion_error(format!(
-            "Promoted live database identity does not match staged candidate {}",
-            staged_path.display()
-        )));
-    }
-    if let Some(candidate_image) = candidate_image
-        && promotion_database_image(live_path)? == Some(candidate_image)
-    {
-        return Ok(PromotedValidation::ReusedCandidateReceipt);
-    }
-    require_candidate_source_policy_identity(
-        live_path,
-        &published,
-        candidate_source_policy,
-        "Promoted live database",
-    )?;
-    require_candidate_structural_text_identity(
-        live_path,
-        &published,
-        candidate_structural_text,
-        "Promoted live database",
-    )?;
-    require_recorded_proof_resolution_identity(
-        live_path,
-        &published,
-        candidate_proof_resolution,
-        "Promoted live database",
-    )?;
-    Ok(PromotedValidation::Revalidated)
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
@@ -2353,6 +2237,58 @@ fn grounding_node_rank_sql(alias: &str) -> String {
     )
 }
 
+/// The root-symbol window query the snapshot path executes. Plan assertions
+/// must explain this owner SQL, not a test-local copy.
+fn grounding_root_symbol_candidates_window_query() -> &'static str {
+    "SELECT
+        node_id,
+        kind,
+        serialized_name,
+        qualified_name,
+        canonical_id,
+        file_node_id,
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+        display_name,
+        file_path
+     FROM grounding_node_snapshot
+     WHERE is_root = 1
+     ORDER BY
+        node_rank,
+        sort_start_line,
+        display_name,
+        node_id
+     LIMIT ?1 OFFSET ?2"
+}
+
+/// The per-file root-symbol query the snapshot path executes, parameterized by
+/// the number of file placeholders.
+fn grounding_root_symbols_for_files_query(file_count: usize) -> String {
+    let placeholders = numbered_placeholders(2, file_count);
+    format!(
+        "SELECT
+            node_id,
+            kind,
+            serialized_name,
+            qualified_name,
+            canonical_id,
+            file_node_id,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            display_name,
+            file_path
+         FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
+         WHERE file_symbol_rank <= ?1
+           AND is_root = 1
+           AND file_node_id IN ({placeholders})
+         ORDER BY file_node_id, file_symbol_rank, node_id"
+    )
+}
+
 fn grounding_node_snapshot_insert_sql() -> String {
     let rank_sql = grounding_node_rank_sql("n");
     let display_name = grounding_display_name_expr("n");
@@ -2671,10 +2607,34 @@ pub enum StorageError {
     },
     #[error("Resolution support snapshot exceeds the current SQLite value limit")]
     ResolutionSupportSnapshotTooBig,
+    /// A read-only or observational open refused a publication whose durable
+    /// `user_version` is not the schema this binary serves. `found`/`required`
+    /// keep the refusal typed so callers can route stale cores into managed
+    /// preparation instead of reporting a string match.
+    #[error("{surface} requires schema version {required}, found {found}")]
+    SchemaVersionMismatch {
+        surface: &'static str,
+        required: u32,
+        found: u32,
+    },
     #[error("Invalid enum value: {0}")]
     EnumConversion(#[from] EnumConversionError),
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// The typed refusal for a `PRAGMA user_version` that is not `SCHEMA_VERSION`.
+/// `found`/`required` keep the refusal typed so callers can route a stale core
+/// into managed preparation instead of matching on message text. A publication
+/// written by a newer binary reaches the same variant — a full refresh rebuilds
+/// either direction — while mutable writer opens keep their long-standing
+/// "unsupported" contract for the forward-incompatible case.
+fn schema_version_mismatch_error(surface: &'static str, version: u32) -> StorageError {
+    StorageError::SchemaVersionMismatch {
+        surface,
+        required: SCHEMA_VERSION,
+        found: version,
+    }
 }
 
 /// One reusable parser artifact to persist in the index artifact cache.
@@ -5175,9 +5135,7 @@ impl Storage {
                     "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
                 )));
             }
-            return Err(StorageError::Other(format!(
-                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error("Read-only storage", version));
         }
         Ok(Self {
             conn,
@@ -5234,9 +5192,10 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Immutable core generation requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error(
+                "Immutable core generation",
+                version,
+            ));
         }
         Ok(Self {
             conn,
@@ -5281,6 +5240,53 @@ impl Storage {
     pub fn database_schema_version_observational(path: &Path) -> Result<u32, StorageError> {
         let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
         storage.schema_version()
+    }
+
+    /// The deepest directory containing every indexed source path, observed
+    /// without mutating or migrating the database. `None` when the core has no
+    /// file rows, the `file` table predates the path column, or no common
+    /// directory prefix exists. Diagnostics use it to name the project a stale
+    /// cache belongs to.
+    pub fn database_indexed_source_root_observational(
+        path: &Path,
+    ) -> Result<Option<PathBuf>, StorageError> {
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
+        let has_file_table: Option<i64> = storage
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if has_file_table.is_none() {
+            return Ok(None);
+        }
+        let bounds = storage
+            .conn
+            .query_row("SELECT MIN(path), MAX(path) FROM file", [], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        let Some((Some(low), Some(high))) = bounds else {
+            return Ok(None);
+        };
+        let common_len = low
+            .chars()
+            .zip(high.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum::<usize>();
+        let prefix = &low[..common_len];
+        let cut = prefix.rfind(['/', '\\']).unwrap_or(0);
+        let root = &prefix[..cut];
+        if root.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PathBuf::from(root)))
     }
 
     fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
@@ -5373,9 +5379,10 @@ impl Storage {
         let version = version.max(0) as u32;
         match policy {
             NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
-                )));
+                return Err(schema_version_mismatch_error(
+                    "Observational storage",
+                    version,
+                ));
             }
             NonmutatingOpenPolicy::FreshnessFence
                 if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
@@ -5388,14 +5395,13 @@ impl Storage {
             NonmutatingOpenPolicy::FreshnessFence
                 if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => {}
             NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
-                )));
+                return Err(schema_version_mismatch_error(
+                    "Freshness observation",
+                    version,
+                ));
             }
             NonmutatingOpenPolicy::ProofValidation if version != SCHEMA_VERSION => {
-                return Err(StorageError::Other(format!(
-                    "Proof validation requires schema version {SCHEMA_VERSION}, found {version}"
-                )));
+                return Err(schema_version_mismatch_error("Proof validation", version));
             }
             NonmutatingOpenPolicy::SchemaVersion => {}
             _ => {}
@@ -5687,9 +5693,10 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Artifact-cache reader requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+            return Err(schema_version_mismatch_error(
+                "Artifact-cache reader",
+                version,
+            ));
         }
         Ok(Some(IndexArtifactCacheReader { conn }))
     }
@@ -7452,7 +7459,8 @@ impl Storage {
     }
 
     pub fn discard_staged_snapshot(staged_path: &Path) -> Result<(), StorageError> {
-        cleanup_sqlite_sidecars(staged_path)
+        cleanup_sqlite_sidecars(staged_path)?;
+        crate::core_generation::remove_empty_staging_directory(staged_path)
     }
 
     fn init(&self, _mode: StorageOpenMode) -> Result<(), StorageError> {
@@ -13237,27 +13245,7 @@ impl Storage {
         }
 
         if self.has_ready_grounding_summary_snapshots()? {
-            let placeholders = numbered_placeholders(2, file_ids.len());
-            let query = format!(
-                "SELECT
-                    node_id,
-                    kind,
-                    serialized_name,
-                    qualified_name,
-                    canonical_id,
-                    file_node_id,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                    display_name,
-                    file_path
-                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
-                 WHERE file_symbol_rank <= ?1
-                   AND is_root = 1
-                   AND file_node_id IN ({placeholders})
-                 ORDER BY file_node_id, file_symbol_rank, node_id"
-            );
+            let query = grounding_root_symbols_for_files_query(file_ids.len());
             let mut params = Vec::with_capacity(file_ids.len() + 1);
             params.push(Value::Integer(
                 per_file_candidate_limit.min(i64::MAX as usize) as i64,
@@ -13364,29 +13352,9 @@ impl Storage {
         }
 
         if self.has_ready_grounding_summary_snapshots()? {
-            let mut stmt = self.conn.prepare(
-                "SELECT
-                    node_id,
-                    kind,
-                    serialized_name,
-                    qualified_name,
-                    canonical_id,
-                    file_node_id,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                    display_name,
-                    file_path
-                 FROM grounding_node_snapshot
-                 WHERE is_root = 1
-                 ORDER BY
-                    node_rank,
-                    sort_start_line,
-                    display_name,
-                    node_id
-                 LIMIT ?1 OFFSET ?2",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare(grounding_root_symbol_candidates_window_query())?;
             let mut rows = stmt.query(params![
                 limit.min(i64::MAX as usize) as i64,
                 offset.min(i64::MAX as usize) as i64
@@ -15083,16 +15051,14 @@ mod grounding_snapshot_fast_path_tests {
             .collect::<Vec<_>>();
         assert_eq!(snapshot, fallback);
 
+        // Explain the exact SQL the owners execute: a copied literal cannot
+        // detect the owner switching to an unbounded scan.
         let base_plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT node_id
-                 FROM grounding_node_snapshot
-                 WHERE is_root = 1
-                 ORDER BY node_rank, sort_start_line, display_name, node_id
-                 LIMIT ?1 OFFSET ?2",
-            )?
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                grounding_root_symbol_candidates_window_query()
+            ))?
             .query_map(params![16_i64, 0_i64], |row| row.get::<_, String>(3))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         assert!(
@@ -15110,16 +15076,10 @@ mod grounding_snapshot_fast_path_tests {
 
         let file_plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT node_id
-                 FROM grounding_node_snapshot
-                      INDEXED BY idx_grounding_node_snapshot_file_rank
-                 WHERE file_symbol_rank <= ?1
-                   AND is_root = 1
-                   AND file_node_id IN (?2)
-                 ORDER BY file_node_id, file_symbol_rank, node_id",
-            )?
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                grounding_root_symbols_for_files_query(1)
+            ))?
             .query_map(params![16_i64, 10_i64], |row| row.get::<_, String>(3))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         assert!(

@@ -266,7 +266,7 @@ fn refutation_schema() -> Value {
     })
 }
 
-fn gap_schema() -> Value {
+fn gap_variants() -> Vec<Value> {
     let selector_gap = |kind| {
         closed_object_schema(vec![
             ("kind", enum_schema(&[kind])),
@@ -285,23 +285,26 @@ fn gap_schema() -> Value {
             ),
         ])
     };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema(vec![("kind", enum_schema(&["unclassified_source_text"]))]),
-            closed_object_schema(vec![
-                ("kind", enum_schema(&["unresolved_material_clause"])),
-                ("clause_id", string_schema()),
-                ("reason", enum_schema(&[
+    vec![
+        closed_object_schema(vec![("kind", enum_schema(&["unclassified_source_text"]))]),
+        closed_object_schema(vec![
+            ("kind", enum_schema(&["unresolved_material_clause"])),
+            ("clause_id", string_schema()),
+            (
+                "reason",
+                enum_schema(&[
                     "missing_selector_resolution",
                     "ambiguous_selector_resolution",
                     "unsupported_interpretation",
-                ])),
-            ]),
-            closed_object_schema(vec![
-                ("kind", enum_schema(&["material_token_misclassified"])),
-                ("clause_id", string_schema()),
-                ("guard_families", json!({
+                ]),
+            ),
+        ]),
+        closed_object_schema(vec![
+            ("kind", enum_schema(&["material_token_misclassified"])),
+            ("clause_id", string_schema()),
+            (
+                "guard_families",
+                json!({
                     "type":"array",
                     "items":enum_schema(&[
                         "quoted_or_backticked_identifier",
@@ -316,26 +319,42 @@ fn gap_schema() -> Value {
                     "minItems":1,
                     "maxItems":8,
                     "uniqueItems":true,
-                })),
-            ]),
-            selector_gap("selector_missing"),
-            selector_gap("selector_ambiguous"),
-            selector_gap("non_callable_selector"),
-            step_gap("direct_call_missing"),
-            step_gap("recursive_call_not_representable"),
-            step_gap("source_window_too_large"),
-            step_gap("invalid_utf8"),
-            step_gap("source_line_out_of_range"),
-            step_gap("edge_containment_unproven"),
-            step_gap("missing_direct_call_receipt"),
-            step_gap("receipt_or_edge_already_used"),
-            step_gap("projection_exclusion_conflicts_with_required_receipt"),
-            closed_object_schema(vec![("kind", enum_schema(&["kernel_search_budget_exceeded"]))])
-        ]
+                }),
+            ),
+        ]),
+        selector_gap("selector_missing"),
+        selector_gap("selector_ambiguous"),
+        selector_gap("non_callable_selector"),
+        step_gap("direct_call_missing"),
+        step_gap("recursive_call_not_representable"),
+        step_gap("source_window_too_large"),
+        step_gap("invalid_utf8"),
+        step_gap("source_line_out_of_range"),
+        step_gap("edge_containment_unproven"),
+        step_gap("missing_direct_call_receipt"),
+        step_gap("receipt_or_edge_already_used"),
+        step_gap("projection_exclusion_conflicts_with_required_receipt"),
+        closed_object_schema(vec![(
+            "kind",
+            enum_schema(&["kernel_search_budget_exceeded"]),
+        )]),
+    ]
+}
+
+fn gap_schema() -> Value {
+    json!({
+        "type":"object",
+        "oneOf":gap_variants()
     })
 }
 
+fn output_budget_exceeded_gap_schema() -> Value {
+    closed_object_schema(vec![("kind", enum_schema(&["output_budget_exceeded"]))])
+}
+
 fn budget_disposition_schema() -> Value {
+    let mut gap_kinds = gap_variants();
+    gap_kinds.push(output_budget_exceeded_gap_schema());
     closed_object_schema(vec![
         ("kind", enum_schema(&["unknown"])),
         ("contract_digest", sha256_schema()),
@@ -343,9 +362,10 @@ fn budget_disposition_schema() -> Value {
             "gaps",
             json!({
                 "type":"array",
-                "items":closed_object_schema(vec![("kind", enum_schema(&["output_budget_exceeded"]))]),
+                "items":{"oneOf":gap_kinds},
                 "minItems":1,
-                "maxItems":1
+                "maxItems":257,
+                "uniqueItems":true
             }),
         ),
     ])

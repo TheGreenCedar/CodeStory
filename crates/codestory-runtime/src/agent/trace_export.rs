@@ -622,6 +622,10 @@ pub(crate) fn packet_retrieval_trace_summary(
 pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Option<String> {
     let trace_path =
         std::env::var(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV).ok()?;
+    write_packet_step_trace(&trace_path, answer)
+}
+
+fn write_packet_step_trace(trace_path: &str, answer: &AgentAnswerDto) -> Option<String> {
     let trace = packet_step_trace_json(answer);
     let payload = match serde_json::to_string_pretty(&trace) {
         Ok(payload) => payload,
@@ -632,7 +636,7 @@ pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Optio
             ));
         }
     };
-    match std::fs::write(&trace_path, payload) {
+    match std::fs::write(trace_path, payload) {
         Ok(()) => None,
         Err(error) => Some(format!(
             "packet_step_trace_out error=write path={} message={error}",
@@ -1111,20 +1115,13 @@ mod tests {
 
     #[test]
     fn env_step_trace_write_error_is_reported() {
-        let _lock = crate::process_env_test_lock();
-        let missing_parent = std::env::temp_dir().join(format!(
-            "codestory-missing-trace-parent-{}",
-            std::process::id()
-        ));
-        let trace_path = missing_parent.join("trace.json");
-        // SAFETY: this test holds the process env lock and restores the variable below.
-        unsafe {
-            std::env::set_var("CODESTORY_PACKET_STEP_TRACE_OUT", &trace_path);
-        }
+        let trace_dir = tempfile::tempdir().expect("trace directory");
+        let trace_path = trace_dir.path().join("missing-parent").join("trace.json");
 
         let answer = sample_answer(Vec::new());
-        let diagnostic = write_packet_step_trace_from_env(&answer)
-            .expect("missing parent should produce a write diagnostic");
+        let diagnostic =
+            write_packet_step_trace(trace_path.to_str().expect("utf8 trace path"), &answer)
+                .expect("missing parent should produce a write diagnostic");
         assert!(
             diagnostic.starts_with("packet_step_trace_out error=write "),
             "diagnostic should report the write error: {diagnostic}"
@@ -1133,11 +1130,6 @@ mod tests {
             diagnostic.contains(trace_path.to_string_lossy().as_ref()),
             "diagnostic should include the configured trace path: {diagnostic}"
         );
-
-        // SAFETY: this test holds the process env lock.
-        unsafe {
-            std::env::remove_var("CODESTORY_PACKET_STEP_TRACE_OUT");
-        }
     }
 
     #[test]
@@ -1146,7 +1138,7 @@ mod tests {
             AgentRetrievalStepDto {
                 kind: AgentRetrievalStepKindDto::Search,
                 status: AgentRetrievalStepStatusDto::Skipped,
-                duration_ms: 0,
+                duration_ms: 500,
                 input: Vec::new(),
                 output: Vec::new(),
                 message: Some("budget exhausted".to_string()),

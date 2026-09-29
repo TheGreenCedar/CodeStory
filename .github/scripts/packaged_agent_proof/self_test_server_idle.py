@@ -985,6 +985,15 @@ def _guarded_calls(function: ast.AST) -> list[tuple[int, str, ast.Call, bool]]:
                 marks.append(
                     (node.lineno, node.col_offset, "control", node, conditional)
                 )
+        if isinstance(node, ast.BoolOp):
+            # `and`/`or` short-circuit: every operand after the first runs
+            # only on the paths where the earlier ones did not already decide
+            # the result. `False and ensure_resident_qualification_server(...)`
+            # never establishes anything.
+            visit(node.values[0], conditional=conditional)
+            for operand in node.values[1:]:
+                visit(operand, conditional=True)
+            return
         branching = _CONDITIONAL_FIELDS.get(type(node), frozenset())
         for field, value in ast.iter_fields(node):
             children = value if isinstance(value, list) else [value]
@@ -1019,13 +1028,24 @@ def _establishes_its_own_residency(call: ast.Call) -> bool:
     The argument has to name something that establishes residency. Merely being
     present and non-``None`` would let a callable that does no embedding work --
     ``lambda: None`` is the honest example -- satisfy the one guard standing
-    between this harness and the deadlock it just removed.
+    between this harness and the deadlock it just removed. And an establishing
+    name that only occurs in the argument without being executed -- a
+    ``lambda: (ensure_resident_qualification_server, None)[1]`` -- establishes
+    nothing either, so the name has to be in call position or be the callable
+    passed by reference.
     """
     establish = _keyword(call, "establish")
     if establish is None:
         return False
+    # Handing the establisher itself to the sender by reference qualifies on
+    # its own: the sender invokes it for each attempt.
+    if isinstance(establish, ast.Name):
+        return establish.id in _RESIDENCY_ESTABLISHING
+    if isinstance(establish, ast.Attribute):
+        return establish.attr in _RESIDENCY_ESTABLISHING
     return any(
-        isinstance(node, ast.Name) and node.id in _RESIDENCY_ESTABLISHING
+        isinstance(node, ast.Call)
+        and _call_name(node) in _RESIDENCY_ESTABLISHING
         for node in ast.walk(establish)
     )
 
@@ -1040,12 +1060,15 @@ def _pins_a_live_producer(call: ast.Call) -> bool:
     as a control holding none. Naming the two producers that do pin a process
     keeps the next non-pinning producer out by default, instead of admitting it
     until someone remembers to exclude it here.
+
+    The pinning producer has to be constructed, not merely named: a class
+    object passed as data pins no process, so only a call counts.
     """
     producer = _keyword(call, "producer")
     if producer is None:
         return False
     return any(
-        isinstance(node, ast.Name) and node.id in _PINNING_PRODUCERS
+        isinstance(node, ast.Call) and _call_name(node) in _PINNING_PRODUCERS
         for node in ast.walk(producer)
     )
 
@@ -1058,7 +1081,10 @@ def _varies_with_its_attempt(call: ast.Call) -> bool:
     evidence identically therefore cannot both run: the replacement dies on its
     own output before it starts, and the run reports that instead of the server
     it lost. So the attempt number has to reach the evidence, not just the
-    signature.
+    signature: it has to land in the ``label`` argument of the establishing
+    call, because that label names the worker's request and output files. An
+    attempt spent anywhere else -- a log line, an unused computation -- leaves
+    the label constant and the collision in place.
 
     Only an inline lambda is decided here, which is the shape the production
     call site uses; a named callable is a self-test stand-in that asserts the
@@ -1070,10 +1096,21 @@ def _varies_with_its_attempt(call: ast.Call) -> bool:
     parameters = [argument.arg for argument in establish.args.args]
     if len(parameters) != 1:
         return False
-    return any(
-        isinstance(node, ast.Name) and node.id == parameters[0]
-        for node in ast.walk(establish.body)
-    )
+    attempt = parameters[0]
+    for node in ast.walk(establish.body):
+        if not isinstance(node, ast.Call):
+            continue
+        if _call_name(node) not in _RESIDENCY_ESTABLISHING:
+            continue
+        label = _keyword(node, "label")
+        if label is None:
+            continue
+        if any(
+            isinstance(leaf, ast.Name) and leaf.id == attempt
+            for leaf in ast.walk(label)
+        ):
+            return True
+    return False
 
 
 def _every_control_is_issued_to_a_server_proven_resident() -> None:

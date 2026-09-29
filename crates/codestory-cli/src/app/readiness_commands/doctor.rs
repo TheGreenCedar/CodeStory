@@ -12,15 +12,16 @@ use crate::args::{
 use crate::display::quote_command_path;
 use crate::output::{emit, render_doctor_markdown, render_ready_markdown};
 use crate::runtime::{RuntimeContext, api_error_in_chain};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codestory_contracts::api::{
-    ProjectSummary, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
+    ApiErrorDetails, ProjectSummary, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
 };
 
 struct ObservedCore {
     summary: ProjectSummary,
     status: Option<DiagnosticCoreStatus>,
     reason: Option<String>,
+    recovery: Option<Box<ApiErrorDetails>>,
 }
 
 fn observe_core(runtime: &RuntimeContext) -> Result<ObservedCore> {
@@ -29,23 +30,33 @@ fn observe_core(runtime: &RuntimeContext) -> Result<ObservedCore> {
             summary,
             status: None,
             reason: None,
+            recovery: None,
         }),
         Ok(None) => Ok(ObservedCore {
             summary: unavailable_summary(runtime),
             status: Some(DiagnosticCoreStatus::Unavailable),
             reason: Some("No core cache database is available for this project.".to_string()),
+            recovery: None,
         }),
         Err(error) => {
             let Some(api_error) = api_error_in_chain(&error) else {
                 return Err(error);
             };
-            if api_error.code != "core_schema_upgrade_required" {
+            if !matches!(
+                api_error.code.as_str(),
+                "core_schema_upgrade_required" | "core_schema_too_new"
+            ) {
                 return Err(error);
             }
             Ok(ObservedCore {
                 summary: unavailable_summary(runtime),
-                status: Some(DiagnosticCoreStatus::UpgradeRequired),
+                status: Some(if api_error.code == "core_schema_too_new" {
+                    DiagnosticCoreStatus::NewerSchema
+                } else {
+                    DiagnosticCoreStatus::UpgradeRequired
+                }),
                 reason: Some(api_error.message.clone()),
+                recovery: api_error.details.clone(),
             })
         }
     }
@@ -72,6 +83,7 @@ fn mark_unavailable_verdicts(
     runtime: &RuntimeContext,
     verdicts: &mut [ReadinessVerdictDto],
     reason: &str,
+    recovery: Option<&ApiErrorDetails>,
 ) {
     let project = quote_command_path(&runtime.project_root);
     let index_command = format!("codestory-cli index --project {project} --refresh full");
@@ -79,8 +91,13 @@ fn mark_unavailable_verdicts(
     for verdict in verdicts {
         verdict.status = ReadinessStatusDto::RepairIndex;
         verdict.summary = reason.to_string();
-        verdict.minimum_next = vec![index_command.clone()];
-        verdict.full_repair = vec![index_command.clone(), doctor_command.clone()];
+        if let Some(recovery) = recovery {
+            verdict.minimum_next = recovery.minimum_next.clone();
+            verdict.full_repair = recovery.full_repair.clone();
+        } else {
+            verdict.minimum_next = vec![index_command.clone()];
+            verdict.full_repair = vec![index_command.clone(), doctor_command.clone()];
+        }
     }
 }
 
@@ -89,9 +106,10 @@ fn mark_unavailable_doctor(
     output: &mut DoctorOutput,
     status: DiagnosticCoreStatus,
     reason: &str,
+    recovery: Option<&ApiErrorDetails>,
 ) {
     output.core_status = Some(status);
-    mark_unavailable_verdicts(runtime, &mut output.readiness, reason);
+    mark_unavailable_verdicts(runtime, &mut output.readiness, reason, recovery);
     output.readiness_lanes =
         build_readiness_lanes_for_runtime(runtime, &output.readiness, None, None);
     output.next_commands = crate::readiness::compatibility_next_commands(&output.readiness);
@@ -106,11 +124,23 @@ fn mark_unavailable_doctor(
 pub(in crate::app) fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "doctor")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    preflight_output_file(cmd.support_bundle.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let observed = observe_core(&runtime)?;
     let mut output = build_doctor_output(&runtime, &observed.summary);
     if let (Some(status), Some(reason)) = (observed.status, observed.reason.as_deref()) {
-        mark_unavailable_doctor(&runtime, &mut output, status, reason);
+        mark_unavailable_doctor(
+            &runtime,
+            &mut output,
+            status,
+            reason,
+            observed.recovery.as_deref(),
+        );
+    }
+    if let Some(path) = cmd.support_bundle.as_deref() {
+        let report =
+            serde_json::to_value(&output).context("serialize doctor report for support bundle")?;
+        crate::diagnostics::write_support_bundle(path, &report)?;
     }
     let markdown = render_doctor_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
@@ -127,12 +157,18 @@ pub(in crate::app) fn run_ready(cmd: ReadyCommand) -> Result<()> {
 fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let agent_run_id = cmd.run_id.as_deref();
-    let (summary, local_refresh, core_status, core_reason) = if cmd.wait_fresh {
+    let (summary, local_refresh, core_status, core_reason, core_recovery) = if cmd.wait_fresh {
         let (summary, local_refresh) = wait_for_local_freshness(&cmd.project, &runtime)?;
-        (summary, local_refresh, None, None)
+        (summary, local_refresh, None, None, None)
     } else {
         let observed = observe_core(&runtime)?;
-        (observed.summary, None, observed.status, observed.reason)
+        (
+            observed.summary,
+            None,
+            observed.status,
+            observed.reason,
+            observed.recovery,
+        )
     };
     let readiness_sidecar = if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
         agent_readiness_status(&runtime, agent_run_id)
@@ -151,7 +187,7 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         &readiness_sidecar,
     );
     if let Some(reason) = core_reason.as_deref() {
-        mark_unavailable_verdicts(&runtime, &mut verdicts, reason);
+        mark_unavailable_verdicts(&runtime, &mut verdicts, reason, core_recovery.as_deref());
     }
     let readiness_lanes = build_readiness_lanes_for_runtime(
         &runtime,

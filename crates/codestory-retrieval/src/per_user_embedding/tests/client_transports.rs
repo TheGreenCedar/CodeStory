@@ -4,7 +4,9 @@ use super::super::{
     EmbeddingSpawnAttempt, EmbeddingTransportFailure,
 };
 use super::identities::{test_executable, test_transport_identity};
-use super::transport_fixtures::{ScriptOutcome, ScriptStream, StallingHelloStream, TestClock};
+use super::transport_fixtures::{
+    BlockingScriptState, ScriptOutcome, ScriptStream, StallingHelloStream, TestClock,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,6 +80,7 @@ pub(super) struct ControlledCancelTestTransport {
     pub(super) connect_count: AtomicUsize,
     pub(super) request_started: Arc<AtomicBool>,
     pub(super) server_cancelled: Arc<AtomicBool>,
+    pub(super) blocking_state: Arc<Mutex<BlockingScriptState>>,
     pub(super) compatibility: EmbeddingCompatibility,
 }
 
@@ -88,6 +91,7 @@ impl ControlledCancelTestTransport {
             connect_count: AtomicUsize::new(0),
             request_started: Arc::new(AtomicBool::new(false)),
             server_cancelled: Arc::new(AtomicBool::new(false)),
+            blocking_state: Arc::new(Mutex::new(BlockingScriptState::default())),
             compatibility: EmbeddingCompatibility::current(true),
         })
     }
@@ -106,6 +110,7 @@ impl EmbeddingClientTransport for ControlledCancelTestTransport {
                 ScriptOutcome::Blocking {
                     request_started: Arc::clone(&self.request_started),
                     cancelled: Arc::clone(&self.server_cancelled),
+                    state: Arc::clone(&self.blocking_state),
                 },
                 self.compatibility.clone(),
             ),

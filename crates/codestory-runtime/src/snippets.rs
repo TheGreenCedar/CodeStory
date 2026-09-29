@@ -100,6 +100,7 @@ pub(crate) fn bounded_direct_markdown_snippet(
     )
 }
 
+#[cfg(test)]
 pub(super) fn bounded_markdown_snippet_from_path(
     path: &Path,
     focus_line: u32,
@@ -241,7 +242,50 @@ pub(super) fn bounded_markdown_snippet_range_from_path(
     truncation_suffix: &str,
 ) -> io::Result<BoundedSnippet> {
     let file = std::fs::File::open(path)?;
-    let mut reader = io::BufReader::new(file);
+    let reader = io::BufReader::new(file);
+    bounded_markdown_snippet_range_from_reader(
+        reader,
+        focus_line,
+        start_line,
+        end_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+/// Render an explicit line range from an already verified UTF-8 buffer.
+/// Callers that carry a symbol identity must pass verified content instead of
+/// reopening the path: a second read could serve bytes the index never saw.
+pub(crate) fn bounded_markdown_snippet_range_from_text(
+    text: &str,
+    focus_line: u32,
+    start_line: u32,
+    end_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
+    bounded_markdown_snippet_range_from_reader(
+        io::Cursor::new(text.as_bytes()),
+        focus_line,
+        start_line,
+        end_line,
+        context,
+        max_bytes,
+        truncation_suffix,
+    )
+}
+
+fn bounded_markdown_snippet_range_from_reader(
+    mut reader: impl BufRead,
+    focus_line: u32,
+    start_line: u32,
+    end_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
     let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP) as u32;
     let focus = focus_line.max(1);
     let start = start_line.saturating_sub(context).max(1);

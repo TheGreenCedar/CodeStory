@@ -57,7 +57,19 @@ test("the fixture catalog carries the fields the resolver requires", () => {
     const [plugin] = catalog.plugins;
     assert.deepEqual(Object.keys(plugin).sort(), PLUGIN_KEYS);
     assert.equal(plugin.name, "codestory");
+    assert.deepEqual(plugin.policy, {
+      installation: "AVAILABLE",
+      authentication: "ON_INSTALL",
+    });
+    assert.equal(plugin.category, "Developer Tools");
     assert.deepEqual(Object.keys(plugin.source).sort(), SOURCE_KEYS);
+    // Key sets alone do not pin a delivery: a wrong source kind or repository
+    // URL resolves a different (or no) plugin while passing every key check.
+    assert.equal(plugin.source.source, "git-subdir");
+    assert.equal(
+      plugin.source.url,
+      "https://github.com/TheGreenCedar/CodeStory.git",
+    );
     assert.equal(plugin.source.sha, commit);
     assert.equal(plugin.source.path, "plugins/codestory");
   } finally {
@@ -96,8 +108,29 @@ test("the fixture identifies itself and the commit it pins", () => {
     assert.equal(marker.schema_version, 1);
     assert.equal(marker.purpose, "codestory-candidate-pinned-marketplace-fixture");
     assert.equal(marker.pinned_commit, commit);
+    // The consumer requires the marker's version to be the pinned commit's own
+    // plugin version; compare it, do not only require the key to exist.
+    const pinnedManifest = JSON.parse(
+      execFileSync(
+        "git",
+        [
+          "-C",
+          repositoryRoot,
+          "show",
+          `${commit}:plugins/codestory/.codex-plugin/plugin.json`,
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+    assert.equal(marker.plugin_version, pinnedManifest.version);
     // The marker must be committed, or a clean-tree check would pass over a fixture that had
-    // been re-marked after the fact.
+    // been re-marked after the fact. ls-files --error-unmatch proves the marker is in the
+    // committed tree -- a gitignored marker leaves status clean while never being delivered.
+    execFileSync(
+      "git",
+      ["-C", out, "ls-files", "--error-unmatch", ".codestory-marketplace-fixture.json"],
+      { encoding: "utf8" },
+    );
     assert.equal(
       execFileSync("git", ["-C", out, "status", "--porcelain"], { encoding: "utf8" }).trim(),
       "",

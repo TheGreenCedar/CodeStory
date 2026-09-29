@@ -31,7 +31,12 @@ where
 }
 
 pub(super) fn test_server_state() -> Arc<PerUserEmbeddingServerState> {
-    let clock = TestClock::new();
+    test_server_state_with_clock(TestClock::new())
+}
+
+pub(super) fn test_server_state_with_clock(
+    clock: Arc<dyn super::super::AwakeMonotonicClock>,
+) -> Arc<PerUserEmbeddingServerState> {
     Arc::new(PerUserEmbeddingServerState {
         clock,
         engine_cache_root: PathBuf::from("test-cache"),

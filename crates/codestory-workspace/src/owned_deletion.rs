@@ -242,6 +242,45 @@ impl OwnedDeletionRoot {
         }
     }
 
+    /// Remove one authenticated directory after the opened child is verified empty.
+    ///
+    /// Unlike [`Self::remove_empty_directory`], this completes the removal on
+    /// Unix too: the emptiness check binds to the pinned child handle while
+    /// the final `rmdir` stays name-based, so this is not a final-leaf
+    /// identity guarantee — a directory that gained entries between the check
+    /// and the syscall fails `rmdir` rather than being removed. The removal
+    /// is never recursive: unknown children return `Ok(false)` and survive.
+    /// Missing or replaced directories also return `Ok(false)`. Callers must
+    /// hold the publication/acquisition fences excluding cooperating writers
+    /// through the final Unix name-based syscall, just as for file removal.
+    pub fn remove_owned_empty_directory(
+        &self,
+        relative: &Path,
+        authenticated: &File,
+    ) -> io::Result<bool> {
+        let parts = relative_owned_parts(relative)?;
+        let (leaf, ancestors) = parts
+            .split_last()
+            .expect("relative_owned_parts rejects an empty path");
+        let mut parent = self.root.try_clone()?;
+        for ancestor in ancestors {
+            parent = open_child_dir(&parent, ancestor)?;
+        }
+        let target = match open_child_dir(&parent, leaf) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            // A non-directory leaf is unknown content and is never removed.
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if crate::workspace_file_identity(&target)?
+            != crate::workspace_file_identity(authenticated)?
+        {
+            return Ok(false);
+        }
+        remove_open_owned_empty_directory(&parent, leaf, target)
+    }
+
     /// Remove one owned directory only when it is empty.
     ///
     /// Unlike [`Self::remove`], this never removes children. Callers that
@@ -301,7 +340,10 @@ fn open_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
     let child = options.open_dir_at(parent, Path::new(name))?;
     let metadata = child.metadata()?;
     if !metadata.is_dir() {
-        return Err(io::Error::other("owned deletion target is not a directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "owned deletion target is not a directory",
+        ));
     }
     reject_windows_reparse(&metadata)?;
     Ok(child)
@@ -367,6 +409,22 @@ fn remove_open_directory(_: &File, _: &OsStr, target: File) -> io::Result<()> {
     use fs_at::os::windows::FileExt as _;
 
     target.delete_by_handle().map_err(|(_, error)| error)
+}
+
+fn remove_open_owned_empty_directory(
+    parent: &File,
+    leaf: &OsStr,
+    target: File,
+) -> io::Result<bool> {
+    let mut directory = target.try_clone()?;
+    for entry in fs_at::read_dir(&mut directory)? {
+        let entry = entry?;
+        if entry.name() != OsStr::new(".") && entry.name() != OsStr::new("..") {
+            return Ok(false);
+        }
+    }
+    remove_open_directory(parent, leaf, target)?;
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -438,6 +496,79 @@ mod tests {
         assert_eq!(
             fs::read(owned.join("scope/unknown")).expect("unknown child survives"),
             b"keep"
+        );
+    }
+
+    #[test]
+    fn owned_empty_directory_removal_refuses_a_replacement_after_authentication() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("generation");
+        let moved = temp.path().join("authenticated-generation");
+        fs::create_dir(&path).unwrap();
+        let root = OwnedDeletionRoot::open(temp.path()).unwrap();
+        let authenticated = root.open_child_directory("generation".as_ref()).unwrap();
+        assert!(authenticated.matches_path(&path).unwrap());
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            !root
+                .remove_owned_empty_directory("generation".as_ref(), &authenticated.root)
+                .unwrap()
+        );
+        assert!(path.is_dir(), "an empty foreign replacement must survive");
+        assert!(
+            moved.is_dir(),
+            "the pinned authenticated directory must survive"
+        );
+    }
+
+    /// The retired-generation remover is strictly non-recursive: an unknown
+    /// child refuses the removal and survives, and only a verified-empty
+    /// directory is unlinked.
+    #[test]
+    fn owned_empty_directory_removal_never_recurses_into_unknown_entries() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        fs::create_dir_all(owned.join("occupied")).expect("create occupied dir");
+        fs::write(owned.join("occupied/unknown"), b"keep").expect("write unknown child");
+        fs::create_dir_all(owned.join("vacant")).expect("create empty dir");
+        fs::write(owned.join("file"), b"leaf").expect("write file leaf");
+        let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+        let occupied = deletion.open_child_directory("occupied".as_ref()).unwrap();
+        let vacant = deletion.open_child_directory("vacant".as_ref()).unwrap();
+
+        assert!(
+            !deletion
+                .remove_owned_empty_directory("occupied".as_ref(), &occupied.root)
+                .expect("occupied removal must report refusal, not error"),
+            "a non-empty directory refuses removal"
+        );
+        assert_eq!(
+            fs::read(owned.join("occupied/unknown")).expect("unknown child survives"),
+            b"keep"
+        );
+        assert!(owned.join("occupied").is_dir());
+
+        assert!(
+            !deletion
+                .remove_owned_empty_directory("file".as_ref(), &vacant.root)
+                .expect("a file leaf is unknown content"),
+            "a non-directory leaf is never removed"
+        );
+        assert!(owned.join("file").is_file());
+
+        assert!(
+            deletion
+                .remove_owned_empty_directory("vacant".as_ref(), &vacant.root)
+                .expect("empty removal")
+        );
+        assert!(!owned.join("vacant").exists());
+
+        assert!(
+            !deletion
+                .remove_owned_empty_directory("missing".as_ref(), &vacant.root)
+                .expect("missing removal"),
+            "an absent directory reports false"
         );
     }
 

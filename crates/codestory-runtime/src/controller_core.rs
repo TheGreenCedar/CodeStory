@@ -17,7 +17,8 @@ use crate::{
     SourceObserverState, Storage, clear_search_engine, publish_search_engine,
 };
 use codestory_contracts::api::{
-    ApiError, AppEventPayload, IndexFreshnessDto, ProjectSummary, RetrievalStateDto,
+    ApiError, ApiErrorDetails, AppEventPayload, IndexFreshnessDto, ProjectSummary,
+    RetrievalStateDto,
 };
 use codestory_store::{IndexPublicationRecord, Store};
 use codestory_workspace::SourceIndexPolicy;
@@ -44,6 +45,14 @@ impl AppController {
         ))
     }
 
+    /// Controller whose process-owned defaults carry `cache_root` instead of
+    /// the ambient process cache. The caller owns the directory and must keep
+    /// it alive until every worker the controller spawned has quiesced.
+    #[cfg(test)]
+    pub(crate) fn new_with_owned_cache_root(cache_root: &Path) -> Self {
+        Self::new_with_config(crate::test_sidecar_runtime_with_cache_root(cache_root))
+    }
+
     pub(crate) fn new_with_process_config(config: RuntimeProcessConfig) -> Self {
         Self::new_with_source_index_policy(config.sidecar.into_inner(), config.source_index_policy)
     }
@@ -63,8 +72,6 @@ impl AppController {
                 observed_core_publication: None,
                 is_indexing: false,
                 index_freshness_cache: None,
-                #[cfg(test)]
-                last_hybrid_instrumentation: None,
             })),
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
@@ -162,7 +169,8 @@ impl AppController {
             return Ok(ReadStorage::Pinned(storage));
         }
         let storage_path = self.require_storage_path()?;
-        open_existing_storage_for_read(&storage_path).map(ReadStorage::Owned)
+        let root = self.require_project_root()?;
+        open_existing_storage_for_read(&root, &storage_path).map(ReadStorage::Owned)
     }
 
     pub(crate) fn open_storage_for_freshness(&self) -> Result<ReadStorage, ApiError> {
@@ -176,12 +184,15 @@ impl AppController {
             return Ok(ReadStorage::Pinned(storage));
         }
         let storage_path = self.require_storage_path()?;
+        let root = self.require_project_root()?;
         Storage::open_freshness_observational(&storage_path)
             .map(ReadStorage::Owned)
             .map_err(|error| {
-                ApiError::internal(format!(
-                    "Failed to open storage for freshness observation: {error}"
-                ))
+                crate::index_incremental::core_schema_observation_error(
+                    &root,
+                    "Failed to open storage for freshness observation",
+                    error,
+                )
             })
     }
 
@@ -215,7 +226,8 @@ impl AppController {
             return build(&publication);
         }
         let storage_path = self.require_storage_path()?;
-        let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
+        let root = self.require_project_root()?;
+        let storage = Rc::new(open_existing_storage_for_read(&root, &storage_path)?);
         self.prepare_armed_proof_publication_validation()?;
         let installed_storage = Rc::clone(&storage);
         let snapshot = storage.read_snapshot().map_err(|error| {
@@ -454,13 +466,48 @@ impl AppController {
         self.canonical_symbol_names.lock().clear();
     }
 
+    /// Guard for reads that consult controller state indexing mutates.
+    /// Source-backed and pinned observers reach this only when indexing starts
+    /// mid-operation, so the refusal is typed as preparation, not a bad
+    /// argument; adapters already wait before dispatching.
     pub(crate) fn ensure_consistent_read_state(&self, operation: &str) -> Result<(), ApiError> {
         if self.state.lock().is_indexing {
-            return Err(ApiError::invalid_argument(format!(
-                "{operation} is unavailable while indexing is in progress. Retry after indexing completes."
-            )));
+            return Err(ApiError::with_details(
+                "activation_preparing",
+                format!(
+                    "{operation} is unavailable while indexing is in progress. Retry after indexing completes."
+                ),
+                ApiErrorDetails::cause("indexing_in_progress"),
+            ));
         }
         Ok(())
+    }
+
+    /// Guard for pure graph reads (`ground`, `files`). They only read the
+    /// published generation's storage, which is immutable and stays readable
+    /// while a refresh stages its replacement, so a pinned complete
+    /// publication may serve them even while `is_indexing` is set. Without a
+    /// pin or a durable complete publication the call is typed preparation.
+    pub(crate) fn ensure_graph_only_read_state(&self, operation: &str) -> Result<(), ApiError> {
+        if !self.state.lock().is_indexing || self.active_core_publication().is_some() {
+            return Ok(());
+        }
+        let storage_path = self.require_storage_path()?;
+        if Store::database_complete_index_publication(&storage_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read complete index publication: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(ApiError::with_details(
+            "activation_preparing",
+            format!("{operation} is unavailable until the first index publication completes."),
+            ApiErrorDetails::cause("indexing_in_progress"),
+        ))
     }
 
     pub(crate) fn ensure_search_state(&self) -> Result<(), ApiError> {
@@ -495,11 +542,13 @@ impl AppController {
             }
         }
 
+        let root = self.require_project_root()?;
         let mut attempts = 0;
         let loaded = loop {
-            let mut storage = open_storage_for_read(&storage_path)?;
+            let mut storage = open_storage_for_read(&root, &storage_path)?;
             match load_persisted_search_state_for_runtime(
                 &mut storage,
+                &root,
                 &storage_path,
                 &self.runtime_config,
             ) {

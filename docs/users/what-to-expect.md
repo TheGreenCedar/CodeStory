@@ -43,6 +43,12 @@ what each claim does *not* mean:
   navigation is a freshness problem, not a prompt problem.
 - **Very large or unusual layouts** (generated trees, vendored giants) may index
   partially; the agent should cite gaps instead of guessing.
+- **Supported scale envelope** — the freshness scan that keeps incremental
+  refresh honest is bounded at 25,000 indexed files. Beyond that bound the
+  index itself stays complete and usable, but `index` reports a warning and
+  `doctor` reports the inventory check at `warn` because drift past the bound
+  is not observed. Narrow the indexed scope (exclude generated or vendored
+  trees) to get full freshness checking back.
 
 The released executable contains its model and embedding backend. There is no
 separate model download or service startup. A verified content-addressed model

@@ -1,6 +1,5 @@
 use crate::snippets::{
-    BoundedSnippet, BoundedSnippetRangeOptions, bounded_markdown_snippet_from_path,
-    bounded_markdown_snippet_range_from_path,
+    BoundedSnippet, BoundedSnippetRangeOptions, bounded_markdown_snippet_range_from_path,
 };
 use crate::support::clamp_i64_to_u32;
 use crate::{AppController, path_resolution};
@@ -9,22 +8,48 @@ use codestory_contracts::api::{
 };
 use std::path::PathBuf;
 
+/// Source bytes for a symbol-identified node, verified against the pinned
+/// core publication. `content` is the single buffer every renderer must use:
+/// the path was checked for project containment, read once, and hashed against
+/// the indexed SHA-256, so no caller may reopen `path` afterwards.
+pub(crate) struct VerifiedNodeSource {
+    pub(crate) file_id: i64,
+    pub(crate) start_line: u32,
+    pub(crate) end_line: Option<u32>,
+    pub(crate) path: PathBuf,
+    pub(crate) content: String,
+    pub(crate) content_sha256: String,
+    /// Publication the verified bytes were bound to. `None` only for an
+    /// unpinned caller whose storage declares no complete publication (a state
+    /// unreachable through the public operation wrappers, which pin one).
+    pub(crate) generation_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) project_id: String,
+}
+
 impl AppController {
-    pub(crate) fn focused_source_context(
+    /// Resolve a public node identity to source bytes that provably match the
+    /// indexed content hash under the currently pinned core publication.
+    /// Returns `source_stale` when the file exists but no longer matches the
+    /// indexed bytes, and `source_unavailable` for every other failure.
+    pub(crate) fn verified_node_source(
         &self,
         node: &codestory_contracts::api::NodeDetailsDto,
-        maximum_bytes: usize,
-        truncation_suffix: &str,
-    ) -> Result<crate::FocusedSourceContext, ApiError> {
+    ) -> Result<VerifiedNodeSource, ApiError> {
         let unavailable = || {
             ApiError::new(
                 "source_unavailable",
                 "Focused source could not be bound to the pinned file.",
             )
         };
-        let publication = self.active_core_publication().ok_or_else(unavailable)?;
         let project_root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
+        // Public operations pin one complete publication for their whole read;
+        // an unpinned caller binds to the complete publication the same
+        // storage handle declares, which is the pin's own record under a pin.
+        let publication = self
+            .active_core_publication()
+            .or_else(|| storage.get_complete_index_publication().ok().flatten());
         let id = node.id.0.parse::<i64>().map_err(|_| unavailable())?;
         let stored_node = storage
             .get_node(codestory_contracts::graph::NodeId(id))
@@ -44,8 +69,55 @@ impl AppController {
         if node.start_line != Some(line) {
             return Err(unavailable());
         }
-        let source = crate::search_evidence::verified_file(&storage, Some(&project_root), &file)
-            .ok_or_else(unavailable)?;
+        let source = crate::search_evidence::verified_file_checked(
+            &storage,
+            Some(&project_root),
+            &file,
+        )
+        .map_err(|error| match error {
+            crate::search_evidence::VerifiedFileError::Stale => ApiError::new(
+                "source_stale",
+                format!(
+                    "Indexed source for {} changed on disk after publication; refresh the index before reading symbol source.",
+                    file.path.display()
+                ),
+            ),
+            crate::search_evidence::VerifiedFileError::Unavailable => unavailable(),
+        })?;
+        Ok(VerifiedNodeSource {
+            file_id,
+            start_line: line,
+            end_line: stored_node.end_line,
+            path: source.path,
+            content: source.content,
+            content_sha256: source.content_sha256,
+            generation_id: publication
+                .as_ref()
+                .map(|publication| publication.generation_id.clone()),
+            run_id: publication
+                .as_ref()
+                .map(|publication| publication.run_id.clone()),
+            project_id: codestory_workspace::project_identity_v3(&project_root).project_id,
+        })
+    }
+
+    pub(crate) fn focused_source_context(
+        &self,
+        node: &codestory_contracts::api::NodeDetailsDto,
+        maximum_bytes: usize,
+        truncation_suffix: &str,
+    ) -> Result<crate::FocusedSourceContext, ApiError> {
+        let unavailable = || {
+            ApiError::new(
+                "source_unavailable",
+                "Focused source could not be bound to the pinned file.",
+            )
+        };
+        let source = self.verified_node_source(node)?;
+        if source.generation_id.is_none() || source.run_id.is_none() {
+            return Err(unavailable());
+        }
+        let line = source.start_line;
         let window =
             crate::snippets::bounded_source_window(&source.content, line, 6, maximum_bytes)
                 .ok_or_else(unavailable)?;
@@ -65,12 +137,12 @@ impl AppController {
             truncated: rendered.truncated,
             evidence: codestory_contracts::api::FocusedSourceEvidenceDto {
                 node_id: node.id.clone(),
-                file_id,
+                file_id: source.file_id,
                 path,
-                project_id: codestory_workspace::project_identity_v3(&project_root).project_id,
-                core_generation_id: publication.generation_id,
-                core_run_id: publication.run_id,
-                content_sha256: source.content_sha256,
+                project_id: source.project_id.clone(),
+                core_generation_id: source.generation_id.clone().unwrap_or_default(),
+                core_run_id: source.run_id.clone().unwrap_or_default(),
+                content_sha256: source.content_sha256.clone(),
                 start_line: window.start_line,
                 end_line: window.end_line,
                 excerpt: window.text,
@@ -171,29 +243,6 @@ impl AppController {
             path: candidate.to_string_lossy().to_string(),
             text,
         })
-    }
-
-    pub(crate) fn bounded_file_snippet(
-        &self,
-        path: &str,
-        line: u32,
-        context_lines: usize,
-        max_bytes: usize,
-        truncation_suffix: &str,
-    ) -> Result<(String, BoundedSnippet), ApiError> {
-        let candidate = self.resolve_project_file_path(path, false)?;
-        let snippet = bounded_markdown_snippet_from_path(
-            &candidate,
-            line,
-            context_lines,
-            max_bytes,
-            truncation_suffix,
-        )
-        .map_err(|e| {
-            ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))
-        })?;
-
-        Ok((candidate.to_string_lossy().to_string(), snippet))
     }
 
     pub(crate) fn bounded_file_snippet_range(

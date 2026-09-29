@@ -984,7 +984,59 @@ fn graph_read_authorizations_for_projection(fact_count: u32) -> usize {
 fn schema_33_migration_creates_no_synthetic_proof_publication() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("codestory.db");
-    let store = Store::open(&path).expect("store");
+    {
+        // Carry the database across the real schema-33 boundary: a schema-32
+        // store kept denormalized fact columns and no shared provenance table.
+        let store = Store::open(&path).expect("store");
+        drop(store);
+        let legacy = rusqlite::Connection::open(&path).expect("open legacy conversion");
+        legacy
+            .execute_batch(
+                "CREATE TABLE proof_resolution_fact_legacy AS
+                 SELECT f.fact_id, f.edge_id, f.raw_edge_target_id,
+                        f.raw_callsite_identity, f.file_id, p.source_sha256,
+                        f.start_byte, f.end_byte_exclusive, f.line, f.column,
+                        f.callee_form, f.raw_target, f.caller_node_id,
+                        f.target_node_id, f.status, f.reason, f.evidence_json,
+                        p.dependency_json, f.lookup_domain_complete, f.producer,
+                        f.fact_schema_version, f.algorithm, f.language_adapter,
+                        f.language_adapter_version, p.parser_fingerprint,
+                        f.evidence_digest
+                 FROM proof_resolution_fact AS f
+                 JOIN proof_resolution_provenance AS p
+                   ON p.provenance_id = f.provenance_id AND p.file_id = f.file_id;
+                 DROP TABLE proof_resolution_fact;
+                 ALTER TABLE proof_resolution_fact_legacy RENAME TO proof_resolution_fact;
+                 DROP TABLE proof_resolution_provenance;
+                 PRAGMA user_version = 32;",
+            )
+            .expect("construct an empty legacy schema-32 proof layout");
+        let columns: Vec<String> = legacy
+            .prepare("PRAGMA table_info(proof_resolution_fact)")
+            .expect("inspect legacy fact columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("list legacy fact columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read legacy fact columns");
+        assert!(
+            !columns.iter().any(|column| column == "provenance_id"),
+            "the schema-32 layout must lack the shared provenance column"
+        );
+        assert_eq!(
+            legacy
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'proof_resolution_provenance')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("check provenance table"),
+            0,
+            "the schema-32 layout must lack the provenance table"
+        );
+        drop(legacy);
+    }
+
+    let store = Store::open(&path).expect("migrate the schema-32 layout");
 
     let stored_version: u32 = store
         .get_connection()
@@ -1156,7 +1208,13 @@ fn shared_file_provenance_round_trips_with_fewer_pages_than_denormalized_facts()
              CREATE INDEX idx_proof_resolution_file
                ON proof_resolution_fact(file_id);
              CREATE INDEX idx_proof_resolution_caller_target
-               ON proof_resolution_fact(caller_node_id, target_node_id, status);",
+               ON proof_resolution_fact(caller_node_id, target_node_id, status);
+             CREATE INDEX idx_proof_resolution_target
+               ON proof_resolution_fact(target_node_id);
+             CREATE INDEX idx_proof_resolution_raw_target
+               ON proof_resolution_fact(raw_edge_target_id);
+             CREATE INDEX idx_proof_resolution_edge
+               ON proof_resolution_fact(edge_id);",
         )
         .expect("create exact legacy proof schema");
     {
@@ -1419,9 +1477,40 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
     seed_exact_graph(&mut store);
     let publication = publication();
     let expected_fact = exact_fact(EdgeId(7));
-    let receipt = store
+    store
         .replace_proof_resolution_projection(&publication, &projection(vec![expected_fact.clone()]))
         .unwrap();
+
+    // Control: a distinct generation/run is a legal replacement and reaches
+    // the write path; without the trigger it must succeed. The second fact
+    // binds its own edge so the canonical-callsite check passes.
+    store
+        .insert_edge(&Edge {
+            id: EdgeId(8),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:2:4".to_owned()),
+            ..Default::default()
+        })
+        .expect("second callsite edge");
+    let second_publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".to_owned(),
+        run_id: "run-2".to_owned(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 456,
+    };
+    // The projection must cover both edges' callsites to validate.
+    let second_fact = repeated_exact_fact(1);
+    let second_facts = vec![expected_fact.clone(), second_fact.clone()];
+    let second_receipt = store
+        .replace_proof_resolution_projection(&second_publication, &projection(second_facts.clone()))
+        .expect("a distinct publication replaces the projection");
+
     store
         .get_connection()
         .execute_batch(
@@ -1431,20 +1520,33 @@ fn failed_shared_provenance_write_preserves_the_previous_complete_projection() {
         )
         .unwrap();
 
-    store
-        .replace_proof_resolution_projection(&publication, &projection(vec![expected_fact.clone()]))
+    // A third distinct generation reaches the injected INSERT failure; the
+    // error must carry the trigger's message so a same-identity rejection
+    // cannot masquerade as the injected fault.
+    let third_publication = IndexPublicationRecord {
+        generation: 3,
+        generation_id: "generation-3".to_owned(),
+        run_id: "run-3".to_owned(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 789,
+    };
+    let error = store
+        .replace_proof_resolution_projection(&third_publication, &projection(second_facts.clone()))
         .expect_err("the injected shared provenance write must fail");
-
-    assert_eq!(
-        store.get_proof_resolution_facts().unwrap(),
-        vec![expected_fact]
+    assert!(
+        error
+            .to_string()
+            .contains("forced provenance write failure"),
+        "the reached failure must be the injected trigger, got: {error}"
     );
+
+    assert_eq!(store.get_proof_resolution_facts().unwrap(), second_facts);
     assert_eq!(
         store.get_proof_resolution_publication().unwrap(),
-        Some(receipt)
+        Some(second_receipt)
     );
     store
-        .validate_proof_resolution_publication(&publication)
+        .validate_proof_resolution_publication(&second_publication)
         .expect("the previous complete projection survives rollback");
 }
 

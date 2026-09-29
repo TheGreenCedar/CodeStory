@@ -1,7 +1,7 @@
 use super::{
     Path, SearchHit, SearchIntentFilter, apply_search_intent_filters, extract_symbol_search_terms,
-    indexed_file_matches_language_filter, language_filter_matches_path,
-    mixed_natural_language_query, parse_search_intent_query, should_expand_symbol_query,
+    indexed_file_matches_language_filter, language_filter_matches_path, parse_search_intent_query,
+    should_expand_symbol_query,
 };
 
 #[test]
@@ -74,6 +74,32 @@ fn search_intent_filters_hits_by_kind_path_name_and_language() {
             "listUsers",
             codestory_contracts::api::NodeKind::FUNCTION,
             "src/routes.rs",
+        ),
+        // Each of these violates exactly one filter, so disabling any single
+        // filter check must let exactly one extra hit through.
+        hit(
+            "kind-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::STRUCT,
+            "src/routes.ts",
+        ),
+        hit(
+            "name-only",
+            "getUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "src/routes.ts",
+        ),
+        hit(
+            "path-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "lib/users.ts",
+        ),
+        hit(
+            "language-only",
+            "listUsers",
+            codestory_contracts::api::NodeKind::FUNCTION,
+            "src/routes.ts.md",
         ),
     ];
 
@@ -161,13 +187,4 @@ fn should_expand_symbol_query_for_sentence_prompts() {
         "How does the language parsing work in this repo?",
         5
     ));
-}
-
-#[test]
-fn mixed_natural_language_query_detects_embedded_symbol_prompts() {
-    assert!(mixed_natural_language_query(
-        "how ExtensionHostManager starts"
-    ));
-    assert!(!mixed_natural_language_query("Workbench"));
-    assert!(!mixed_natural_language_query("Subcommand::Exec"));
 }

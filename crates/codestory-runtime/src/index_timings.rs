@@ -3,9 +3,9 @@ use crate::semantic_projection::{SearchStateBuildResult, SemanticProjectionStats
 use crate::{clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32};
 use codestory_contracts::api::{
     ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
-    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalPlanProbeTimings,
-    IndexingPhaseTimings, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
-    PromotedValidationDto,
+    CoreRetentionOutcomeDto, DatabaseSnapshotCopyTimings, FullRefreshWallTimings,
+    IncrementalPlanProbeTimings, IndexingPhaseTimings, ProjectionPersistenceFamilyTimings,
+    ProjectionPersistenceTimings, PromotedValidationDto,
 };
 use codestory_indexer::{ArtifactCacheFamilyStats, ArtifactCachePolicy, IncrementalIndexingStats};
 #[cfg(test)]
@@ -39,6 +39,7 @@ pub(super) fn incremental_plan_probe_timings(
     };
     IncrementalPlanProbeTimings {
         outcome: probe.outcome,
+        probe_unavailable_stage: probe.unavailable_stage,
         probe_ms: probe.probe_ms,
         files_to_index: probe.files_to_index,
         files_to_remove: probe.files_to_remove,
@@ -48,6 +49,19 @@ pub(super) fn incremental_plan_probe_timings(
             .live_database_file_bytes
             .saturating_mul(u64::from(skipped_database_copies)),
         skipped_search_state_rebuild: short_circuited,
+    }
+}
+
+/// Project the post-publication retention pass for the index result. `reason`
+/// is the stable suppression cause (`fenced_by_active_retrieval_publication`,
+/// `cancelled`, `store_precondition`) whenever the pass never ran.
+pub(super) fn core_retention_outcome(
+    report: &codestory_store::CoreRetentionReport,
+) -> CoreRetentionOutcomeDto {
+    CoreRetentionOutcomeDto {
+        reclaimed_images: clamp_usize_to_u32(report.reclaimed_images),
+        pruning_suppressed: report.pruning_suppressed,
+        reason: report.reason.map(|reason| reason.as_str().to_owned()),
     }
 }
 

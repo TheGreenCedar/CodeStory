@@ -836,6 +836,130 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
     }
 
+    fn staged_proof_index_names(staged: &StagedSnapshot) -> Vec<String> {
+        let mut statement = staged
+            .store
+            .get_connection()
+            .prepare("PRAGMA index_list('proof_resolution_fact')")
+            .expect("list proof fact indexes");
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read index names")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect index names")
+    }
+
+    /// An incremental stage cloned from a publication that predates the
+    /// proof-FK indexes must gain them at open — before any graph cleanup —
+    /// and must never write to the sealed source generation.
+    #[test]
+    fn clone_live_stage_from_index_less_generation_gains_proof_fk_indexes() {
+        let temp = fresh_temp_root("proof-fk-stage");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut staged = SnapshotStore::open_staged(&live_path).expect("open stage");
+            staged
+                .store_mut()
+                .insert_files_batch(&[crate::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("removed.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 4,
+                    file_role: crate::FileRole::Source,
+                }])
+                .expect("seed removed file");
+            staged
+                .store_mut()
+                .insert_nodes_batch(&[
+                    codestory_contracts::graph::Node {
+                        id: codestory_contracts::graph::NodeId(1),
+                        kind: codestory_contracts::graph::NodeKind::FILE,
+                        serialized_name: "removed.rs".to_string(),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: codestory_contracts::graph::NodeId(2),
+                        kind: codestory_contracts::graph::NodeKind::FUNCTION,
+                        serialized_name: "removed_fn".to_string(),
+                        file_node_id: Some(codestory_contracts::graph::NodeId(1)),
+                        ..Default::default()
+                    },
+                ])
+                .expect("seed removed nodes");
+            let publication = crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "index-less-generation".to_string(),
+                run_id: "index-less-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            staged
+                .store_mut()
+                .put_index_publication(&publication)
+                .expect("identify publication");
+            publish_empty_source_policy(staged.store_mut(), &publication);
+            staged.publish(&live_path).expect("publish generation");
+        }
+
+        // Downgrade the sealed generation to schema 35, before the proof-FK
+        // indexes existed, then seal it again.
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let generation_path = layout
+            .resolve_active_database()
+            .expect("resolve active generation")
+            .expect("active generation path");
+        crate::make_file_owner_writable(&generation_path).expect("unseal generation for downgrade");
+        {
+            let connection =
+                rusqlite::Connection::open(&generation_path).expect("open sealed generation");
+            connection
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_proof_resolution_target;
+                     DROP INDEX IF EXISTS idx_proof_resolution_raw_target;
+                     DROP INDEX IF EXISTS idx_proof_resolution_edge;
+                     PRAGMA user_version = 35;",
+                )
+                .expect("downgrade sealed generation");
+        }
+        crate::core_generation::make_file_immutable(&generation_path)
+            .expect("reseal downgraded generation");
+        let pre_clone_bytes = fs::read(&generation_path).expect("source bytes before clone");
+
+        let mut staged =
+            SnapshotStore::clone_live_to_staged(&live_path).expect("clone index-less generation");
+
+        // The three proof-FK indexes exist on the mutable stage before the
+        // first graph deletion.
+        let index_names = staged_proof_index_names(&staged);
+        for index in [
+            "idx_proof_resolution_target",
+            "idx_proof_resolution_raw_target",
+            "idx_proof_resolution_edge",
+        ] {
+            assert!(
+                index_names.iter().any(|name| name == index),
+                "stage is missing {index}: {index_names:?}"
+            );
+        }
+
+        let summary = staged
+            .store_mut()
+            .delete_file_projection(1)
+            .expect("delete file projection on stage");
+        assert_eq!(summary.removed_file_row_count, 1);
+        assert_eq!(summary.removed_node_count, 2);
+
+        assert_eq!(
+            fs::read(&generation_path).expect("source bytes after clone"),
+            pre_clone_bytes,
+            "staging wrote to the sealed source generation"
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
     /// Renaming the sealed stage into its generation preserves the exact
     /// candidate bytes; publication moves only the small pointer.
     #[test]
@@ -1465,28 +1589,71 @@ mod tests {
         let temp = fresh_temp_root("clone-live-cow-disabled");
         let live_path = temp.join("live.sqlite");
         {
-            let mut live = Store::open(&live_path).expect("open live");
-            live.insert_files_batch(&[crate::FileInfo {
-                id: 1,
-                path: PathBuf::from("old.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 1,
-                file_role: crate::FileRole::Source,
-            }])
-            .expect("seed live file");
+            // Publish a real generation so clone_live enters the sealed-copy
+            // path where with_core_clone_disabled actually gates the strategy.
+            let mut stage = SnapshotStore::open_staged(&live_path).expect("open source stage");
+            let publication = crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "generation-1".into(),
+                run_id: "run-1".into(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            stage
+                .store_mut()
+                .insert_files_batch(&[crate::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("old.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                }])
+                .expect("seed live file");
+            stage
+                .store_mut()
+                .put_index_publication(&publication)
+                .expect("source publication");
+            publish_empty_source_policy(stage.store_mut(), &publication);
+            stage
+                .publish(&live_path)
+                .expect("publish source generation");
         }
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path).expect("layout");
+        let source = layout
+            .resolve_active_database()
+            .expect("resolve source")
+            .expect("published source exists");
+        let source_bytes = fs::read(&source).expect("read source image");
 
         let mut staged = crate::with_core_clone_disabled(|| {
             SnapshotStore::clone_live_to_staged(&live_path)
                 .expect("unsupported native clone uses the production copy path")
         });
         assert_ne!(staged.path(), live_path);
+        let copy = staged
+            .snapshot_copy
+            .as_ref()
+            .expect("sealed copy produced stats");
+        assert_eq!(
+            copy.stage_strategy, "copied",
+            "disabled native clone must take the sealed-copy path"
+        );
+        assert!(
+            copy.fallback_reason.is_some(),
+            "the copy must record why the native clone was not used"
+        );
+        assert_eq!(copy.copied_bytes, source_bytes.len() as u64);
         assert_eq!(
             staged.store_mut().get_files().expect("staged files")[0].path,
             PathBuf::from("old.rs")
+        );
+        assert_eq!(
+            fs::read(&source).expect("read source after copy"),
+            source_bytes,
+            "the copy must not mutate the sealed source image"
         );
         staged.discard().expect("discard copied stage");
 

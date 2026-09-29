@@ -82,6 +82,7 @@ fn packet_cli_json_budget_measures_publication_metadata_and_newline() {
         retrieval_publication: None,
         operation_id: "public-packet-budget".to_string(),
         attempt: 1,
+        freshness: codestory_runtime::OperationFreshness::Fresh,
     };
     enforce_packet_cli_json_output_budget(
         Path::new("/workspace/project"),
@@ -198,6 +199,7 @@ fn packet_cli_sixteen_row_identity_envelope_stays_complete() {
         }),
         operation_id: "public-operation-123456789".to_owned(),
         attempt: 2,
+        freshness: codestory_runtime::OperationFreshness::Fresh,
     };
 
     let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(

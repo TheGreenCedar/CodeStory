@@ -181,21 +181,73 @@ pub enum IncrementalPlanProbeOutcomeDto {
     ProbeUnavailable,
 }
 
+/// The stage where an incremental plan probe failed before it could compute
+/// the refresh plan.
+///
+/// `ProbeUnavailable` reports always carry the stage so a `null` plan count is
+/// attributed to the step that never produced it instead of reading as a
+/// measured zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum IncrementalProbeUnavailableStageDto {
+    /// The published core could not be opened for freshness observation.
+    OpenCore,
+    /// No complete index publication could be read from the core.
+    Publication,
+    /// The workspace manifest could not be built.
+    WorkspaceManifest,
+    /// Stored refresh inputs could not be read.
+    RefreshInputs,
+    /// The refresh plan could not be built against the source policy.
+    Policy,
+    /// Stored file-coverage diagnostics could not be read.
+    Coverage,
+    /// Stored source-policy exclusions could not be read.
+    Exclusions,
+    /// The dense-anchor publication manifest could not be read.
+    DenseAnchor,
+    /// The symbol-document contract check could not be evaluated.
+    DocContract,
+    /// The search index path for the publication could not be resolved.
+    SearchIndexLocation,
+    /// The publication generation id was not a usable identity.
+    GenerationId,
+    /// Admitted sources could not all be sealed.
+    SourceSeals,
+}
+
 /// Work an incremental refresh avoided by proving its plan was empty.
 ///
 /// `live_database_file_bytes` is the on-disk size of the published core
 /// database file (not its SQLite logical image, and not including WAL). The
 /// skipped-copy counters are zero on every run that proceeded.
+/// `files_to_index`/`files_to_remove` are `null` when the probe never reached
+/// the stage that computes them; a measured empty plan reports `0`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct IncrementalPlanProbeTimings {
     pub outcome: IncrementalPlanProbeOutcomeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_unavailable_stage: Option<IncrementalProbeUnavailableStageDto>,
     pub probe_ms: u32,
-    pub files_to_index: u32,
-    pub files_to_remove: u32,
+    pub files_to_index: Option<u32>,
+    pub files_to_remove: Option<u32>,
     pub live_database_file_bytes: u64,
     pub skipped_database_copies: u32,
     pub skipped_database_copy_bytes: u64,
     pub skipped_search_state_rebuild: bool,
+}
+
+/// What the post-publication core-retention pass of one run observed.
+///
+/// `pruning_suppressed` marks a pass that was fenced off or stopped before it
+/// could prune; `reason` names the stable cause (for example
+/// `fenced_by_active_retrieval_publication`) when suppression was external.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct CoreRetentionOutcomeDto {
+    pub reclaimed_images: u32,
+    pub pruning_suppressed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -405,6 +457,8 @@ pub struct IndexingPhaseTimings {
     pub core_promotion: Option<CorePromotionTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_plan_probe: Option<IncrementalPlanProbeTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_retention: Option<CoreRetentionOutcomeDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_coverage_validation_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +686,7 @@ mod tests {
             staged_snapshot_copy: None,
             core_promotion: None,
             incremental_plan_probe: None,
+            core_retention: None,
             incremental_coverage_validation_ms: None,
             incremental_proof_projection_ms: None,
             incremental_semantic_scope_ms: None,
@@ -1049,9 +1104,10 @@ mod tests {
     fn test_indexing_phase_timings_round_trips_incremental_plan_probe() {
         let probe = IncrementalPlanProbeTimings {
             outcome: IncrementalPlanProbeOutcomeDto::ShortCircuited,
+            probe_unavailable_stage: None,
             probe_ms: 7,
-            files_to_index: 0,
-            files_to_remove: 0,
+            files_to_index: Some(0),
+            files_to_remove: Some(0),
             live_database_file_bytes: 4_096,
             skipped_database_copies: 3,
             skipped_database_copy_bytes: 12_288,

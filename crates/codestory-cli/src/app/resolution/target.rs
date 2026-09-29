@@ -101,6 +101,7 @@ pub(in crate::app) fn ambiguous_command_failure(
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     ))
     .with_context(serde_json::json!({

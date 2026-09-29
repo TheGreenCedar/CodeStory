@@ -13,7 +13,8 @@ mod filesystem;
 pub(in crate::per_user_embedding) use command_io::poll_server_qualification_command;
 #[cfg(test)]
 pub(in crate::per_user_embedding) use command_io::{
-    MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
+    MAX_DENIED_COMMAND_TICKS, absent_command, inject_mid_consume_probe,
+    read_server_qualification_command,
 };
 pub(in crate::per_user_embedding) use configuration::server_qualification_control_from_env;
 #[cfg(test)]

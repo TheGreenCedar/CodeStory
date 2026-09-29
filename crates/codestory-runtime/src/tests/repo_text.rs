@@ -121,6 +121,7 @@ fn search_plan_repo_text_exact_terminal_identifier_promotes_member_symbol() {
 
 #[test]
 fn search_results_ignores_repo_text_hits_without_full_sidecars() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("temp dir");
     let storage_path = temp.path().join("cache").join("codestory.db");
     std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
@@ -166,7 +167,7 @@ fn search_results_ignores_repo_text_hits_without_full_sidecars() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
         .expect("open project");
@@ -186,6 +187,7 @@ fn search_results_ignores_repo_text_hits_without_full_sidecars() {
 
 #[test]
 fn repo_text_auto_fallback_is_not_product_search_without_full_sidecars() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let temp = tempdir().expect("temp dir");
     let storage_path = temp.path().join("cache").join("codestory.db");
     std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
@@ -245,7 +247,7 @@ fn repo_text_auto_fallback_is_not_product_search_without_full_sidecars() {
             .expect("insert nodes");
     }
 
-    let controller = AppController::new();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
         .expect("open project");

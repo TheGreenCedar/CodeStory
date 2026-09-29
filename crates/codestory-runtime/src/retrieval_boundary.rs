@@ -157,6 +157,13 @@ impl RuntimeRetrievalConfig {
         &self.0.layout.state_file
     }
 
+    /// The process-level cache root captured when this runtime configuration
+    /// was built. Diagnostics may enumerate project caches beneath it, but must
+    /// never treat a later environment read as authoritative.
+    pub fn process_cache_root(&self) -> &Path {
+        &self.0.cache_root
+    }
+
     pub(crate) fn as_inner(&self) -> &codestory_retrieval::SidecarRuntimeConfig {
         &self.0
     }
