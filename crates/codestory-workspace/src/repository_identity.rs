@@ -1538,11 +1538,41 @@ mod tests {
         assert_eq!(first.artifact_scope_id, second.artifact_scope_id);
     }
 
+    /// Test-owned FNV-1a-64 used to check the production hash contract
+    /// independently of the production implementation.
+    fn reference_fnv1a_64(bytes: &[u8]) -> String {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
     #[test]
     fn workspace_id_matches_existing_canonical_root_fnv_contract() {
+        // Published FNV-1a-64 vectors pin the reference implementation itself.
+        assert_eq!(reference_fnv1a_64(b""), "cbf29ce484222325");
+        assert_eq!(reference_fnv1a_64(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(reference_fnv1a_64(b"foobar"), "85944171f73967e8");
+
         let project = tempdir().expect("project");
         let canonical = fs::canonicalize(project.path()).expect("canonical project root");
-        let expected = fnv1a_path_hex(&canonical);
+        #[cfg(unix)]
+        let path_bytes: Vec<u8> = {
+            use std::os::unix::ffi::OsStrExt;
+            canonical.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(windows)]
+        let path_bytes: Vec<u8> = {
+            use std::os::windows::ffi::OsStrExt;
+            canonical
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        let expected = reference_fnv1a_64(&path_bytes);
 
         assert_eq!(workspace_id_v3_for_root(project.path()), expected);
         assert_eq!(project_identity_v3(project.path()).workspace_id, expected);
