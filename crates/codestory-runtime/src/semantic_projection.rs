@@ -302,15 +302,14 @@ pub(super) fn summarize_symbol_doc(
 
     let body = serde_json::to_string(&request)
         .map_err(|e| ApiError::internal(format!("Failed to build summary request: {e}")))?;
-    let mut request = ureq::post(endpoint)
-        .timeout(config.timeout)
-        .set("Content-Type", "application/json");
-    if let Some(api_key) = config.api_key.as_deref() {
-        request = request.set("Authorization", &format!("Bearer {}", api_key.trim()));
-    }
-    let response_body = codestory_retrieval::outbound_http::read_text(request.send_string(&body))
-        .map_err(summary_endpoint_http_error)?
-        .body;
+    let response_body = codestory_retrieval::outbound_http::post_json_text(
+        endpoint,
+        config.timeout,
+        config.api_key.as_deref(),
+        &body,
+    )
+    .map_err(summary_endpoint_http_error)?
+    .body;
     let response: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| ApiError::internal(format!("Summary endpoint returned invalid JSON: {e}")))?;
     let summary = response

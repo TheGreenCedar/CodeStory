@@ -1,8 +1,9 @@
 //! Development-only evidence capture and deterministic semantic-abstention selection.
 
 use crate::embedded_vector::{
-    VectorEvidenceContract, VectorGenerationManifest, open_read_only,
-    search_database_for_semantic_calibration, validate_database,
+    DENSE_ABSTENTION_POLICY_HUNDREDTHS, VectorEvidenceContract, VectorGenerationManifest,
+    dense_abstention_keeps, open_read_only, search_database_for_semantic_calibration,
+    validate_database,
 };
 use anyhow::{Context, Result, bail};
 pub use codestory_contracts::config_registry::SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR_ENV as QUERY_VECTOR_CAPTURE_DIR_ENV;
@@ -699,10 +700,32 @@ fn checked_artifact_path(directory: &Path, file_name: &str) -> Result<std::path:
     Ok(directory.join(path))
 }
 
+/// The abstention policy the shipped dense lane applies, expressed as the
+/// corpus's hundredths. `embedded_vector::retain_dense_evidence` is built on
+/// the same constants, so the attested selection binds the product rule
+/// rather than restating an independent pair of literals.
+pub fn product_abstention_policy() -> CalibrationPolicy {
+    CalibrationPolicy {
+        absolute_floor_hundredths: DENSE_ABSTENTION_POLICY_HUNDREDTHS.0,
+        additive_margin_hundredths: DENSE_ABSTENTION_POLICY_HUNDREDTHS.1,
+    }
+}
+
+/// Recompute the corpus metrics with each query's recorded raw scores filtered
+/// by the shipped abstention predicate itself, so the attested selection is
+/// checked against admitted product results, not a parallel rule.
+pub fn evaluate_corpus_under_product_policy(
+    corpus: &SemanticCalibrationCorpus,
+) -> Result<CalibrationMetrics> {
+    validate_corpus_shape(corpus)?;
+    evaluate(corpus, RetentionRule::Product)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RetentionRule {
     RelativeBaseline,
     AbsoluteAdditive(CalibrationPolicy),
+    Product,
 }
 
 fn evaluate(corpus: &SemanticCalibrationCorpus, rule: RetentionRule) -> Result<CalibrationMetrics> {
@@ -757,6 +780,7 @@ fn retains(rule: RetentionRule, best: f32, score: f32) -> bool {
                 && score >= policy.absolute_floor()
                 && best - score <= policy.additive_margin()
         }
+        RetentionRule::Product => dense_abstention_keeps(best, score),
     }
 }
 

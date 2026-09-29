@@ -2859,6 +2859,39 @@ mod tests {
         assert!(owner.accounted_payload_bytes().expect("payload") <= row_weight * 4);
         assert_eq!(owner.retained_batch_count().expect("row count"), 4);
         assert!(owner.database_bytes().expect("database bytes") <= database_limit);
+
+        // The bound must be a property SQLite itself enforces, not an
+        // accounting convention the writer promises to honor: read back the
+        // applied page budget on the owner's own connection (SQLite scopes
+        // max_page_count per connection) and prove the live file fits inside.
+        let page_size = owner
+            .connection
+            .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+            .expect("page size");
+        let applied_max_page_count = owner
+            .connection
+            .pragma_query_value(None, "max_page_count", |row| row.get::<_, i64>(0))
+            .expect("applied max page count");
+        let page_budget = u64::try_from(applied_max_page_count)
+            .expect("applied page count is negative")
+            .checked_mul(u64::try_from(page_size).expect("page size is negative"))
+            .expect("applied page budget overflow");
+        assert!(
+            applied_max_page_count > 0 && page_budget <= database_limit,
+            "max_page_count must apply a real cap at or below the database \
+             limit, got {applied_max_page_count} pages of {page_size}B"
+        );
+        assert!(
+            u64::try_from(
+                owner
+                    .connection
+                    .pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))
+                    .expect("page count")
+            )
+            .expect("page count is negative")
+                <= u64::try_from(applied_max_page_count).expect("applied page count"),
+            "the live page count must fit inside the applied bound"
+        );
     }
 
     #[test]
@@ -3237,7 +3270,30 @@ mod tests {
             })
         });
         let [left, right] = handles.map(|handle| handle.join().expect("join publisher"));
-        assert_eq!(left, right);
+        assert_eq!(
+            left, right,
+            "concurrent publishers must share the canonical row"
+        );
+        // Both publishers must observe one of the real submitted payloads — a
+        // shared empty or fabricated row must not satisfy equality.
+        assert!(
+            left == vec![vec![1.0, 0.0]] || left == vec![vec![0.0, 1.0]],
+            "the canonical row must be one of the submitted vectors: {left:?}"
+        );
+        // Read the persisted row back through a fresh handle so the assertion
+        // inspects the stored canonical record, not only in-flight returns.
+        let mut reader =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("reopen cache");
+        let rows = [("same", "same-doc", "same text")];
+        let stored = reader
+            .load_batch(&inputs(&rows))
+            .expect("load canonical row")
+            .expect("stored canonical row exists");
+        assert_eq!(
+            stored, left,
+            "the persisted canonical row must equal what both publishers observed"
+        );
     }
 
     #[cfg(unix)]

@@ -42,6 +42,23 @@ pub fn read_text(
     read_response(response, |response| response.into_string())
 }
 
+/// POST a JSON document with the product summary-request headers and return
+/// the decoded text response.
+pub fn post_json_text(
+    endpoint: &str,
+    timeout: std::time::Duration,
+    api_key: Option<&str>,
+    body: &str,
+) -> Result<HttpResponse<String>, OutboundHttpError> {
+    let mut request = ureq::post(endpoint)
+        .timeout(timeout)
+        .set("Content-Type", "application/json");
+    if let Some(api_key) = api_key {
+        request = request.set("Authorization", &format!("Bearer {}", api_key.trim()));
+    }
+    read_text(request.send_string(body))
+}
+
 pub fn read_bytes(
     response: Result<ureq::Response, ureq::Error>,
 ) -> Result<HttpResponse<Vec<u8>>, OutboundHttpError> {
@@ -176,12 +193,11 @@ mod tests {
     #[test]
     fn post_json_text_sends_json_content_type_and_custom_headers() {
         let (url, request) = one_shot_server("200 OK", "accepted");
-        let response = read_text(
-            ureq::post(&format!("{url}/summary"))
-                .timeout(Duration::from_secs(5))
-                .set("Content-Type", "application/json")
-                .set("Authorization", "Bearer test-token")
-                .send_string(r#"{"hello":"world"}"#),
+        let response = post_json_text(
+            &format!("{url}/summary"),
+            Duration::from_secs(5),
+            Some(" test-token "),
+            r#"{"hello":"world"}"#,
         )
         .expect("post succeeds");
 
@@ -193,6 +209,23 @@ mod tests {
         assert!(lowercase.contains("content-type: application/json"));
         assert!(lowercase.contains("authorization: bearer test-token"));
         assert!(request.ends_with(r#"{"hello":"world"}"#));
+
+        let (url, request) = one_shot_server("200 OK", "accepted");
+        post_json_text(
+            &format!("{url}/summary"),
+            Duration::from_secs(5),
+            None,
+            "{}",
+        )
+        .expect("anonymous post succeeds");
+        assert!(
+            !request
+                .join()
+                .expect("request thread")
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "no credential must be sent without a configured api key"
+        );
     }
 
     #[test]

@@ -315,9 +315,15 @@ def _server_crash_scenario_tests() -> None:
         "scenario assertion self-test did not derive exact raw claims",
     )
     hostile_scenario = json.loads(json.dumps(scenario_observations))
-    hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1]["outcome"] = (
-        "server_loss"
-    )
+    hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1][
+        "outcome"
+    ] = "server_loss"
+    # Keep the failed replay structurally valid so the rejection proves the
+    # semantic contract -- the replacement attempt did not complete -- rather
+    # than failing at loss_code shape validation first.
+    hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1][
+        "loss_code"
+    ] = "embedding_server_connection_lost"
     try:
         derive_scenario_assertions(
             "server_crash",
@@ -327,8 +333,13 @@ def _server_crash_scenario_tests() -> None:
             same_account={},
             materialization={},
         )
-    except ProofFailure:
-        pass
+    except ProofFailure as error:
+        require(
+            "do not bind the old loss and exact replacement completion"
+            in str(error),
+            f"a replay that itself lost its server was rejected for its shape"
+            f" instead of its semantics: {error}",
+        )
     else:
         raise ProofFailure("named scenario transitions with false values were accepted")
     misclassified_scenario = json.loads(json.dumps(scenario_observations))

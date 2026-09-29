@@ -226,6 +226,41 @@ fn a_command_removed_mid_consume_never_kills_the_poll_loop() {
     );
 }
 
+/// The stress race above can land before the first stat or after the consume
+/// finished and still pass, so it never proves a removal was tolerated
+/// mid-consume. This case places it deterministically: a one-shot probe
+/// inside the consume removes the command after it has been opened and
+/// identity-bound, before the final revalidation. A consume that tolerates
+/// removal only at its entry checks still fails here, and the counter proves
+/// the boundary was actually reached.
+#[test]
+fn a_command_removed_after_open_reads_as_absent() {
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    write_private_command(&command_path, b"{\"schema_version\":1}");
+
+    let injected = Arc::new(AtomicUsize::new(0));
+    let probe_count = Arc::clone(&injected);
+    super::super::inject_mid_consume_probe(move || {
+        probe_count.fetch_add(1, Ordering::AcqRel);
+        fs::remove_file(&command_path).expect("mid-consume removal");
+    });
+
+    let outcome = read_server_qualification_command(&control)
+        .expect("a removal after the open is a vanished command, not a failure");
+    assert!(
+        outcome.is_none(),
+        "the taken-back command must read as no command this tick"
+    );
+    assert_eq!(
+        injected.load(Ordering::Acquire),
+        1,
+        "the probe never reached the post-open boundary"
+    );
+}
+
 /// The vanish tolerance must not become "ignore every filesystem error".
 ///
 /// A command that is present but unreadable is a real control-plane failure:

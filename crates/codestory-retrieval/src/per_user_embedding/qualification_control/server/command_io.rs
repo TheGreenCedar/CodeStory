@@ -139,6 +139,22 @@ pub(in crate::per_user_embedding) fn read_server_qualification_command(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot probe fired inside `consume_server_qualification_command`
+    /// after the command is opened and identity-bound, before its final
+    /// revalidation. Thread-local so parallel tests cannot see each other's
+    /// probe.
+    static MID_CONSUME_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the one-shot mid-consume probe on this thread.
+#[cfg(test)]
+pub(in crate::per_user_embedding) fn inject_mid_consume_probe(probe: impl FnOnce() + 'static) {
+    MID_CONSUME_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+}
+
 /// One consume attempt, reporting either the command or why there was none.
 fn consume_server_qualification_command(
     control: &ServerQualificationControl,
@@ -184,6 +200,12 @@ fn consume_server_qualification_command(
     if native_file_identity(&file)? != identity {
         bail!("embedding_qualification_command_replaced");
     }
+    #[cfg(test)]
+    MID_CONSUME_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow_mut().take() {
+            probe();
+        }
+    });
     control.directory.revalidate()?;
     let mut bytes = Vec::with_capacity(opened.len() as usize);
     file.take(SERVER_QUALIFICATION_MAX_COMMAND_BYTES + 1)

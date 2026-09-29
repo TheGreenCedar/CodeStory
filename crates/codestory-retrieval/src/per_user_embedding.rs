@@ -81,8 +81,8 @@ use qualification_control::native_path_identity;
 #[cfg(test)]
 use qualification_control::{
     CommandAbsence, MAX_DENIED_COMMAND_TICKS, ServerQualificationEvent,
-    ServerQualificationEventClock, absent_command, read_server_qualification_command,
-    server_qualification_control_from_values,
+    ServerQualificationEventClock, absent_command, inject_mid_consume_probe,
+    read_server_qualification_command, server_qualification_control_from_values,
 };
 #[cfg(test)]
 use scheduler::{ActiveServerRequest, spawn_server_watchdog};

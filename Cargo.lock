@@ -714,7 +714,6 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tracing",
- "ureq",
  "uuid",
 ]
 

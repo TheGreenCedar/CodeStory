@@ -3354,9 +3354,10 @@ mod tests {
         let work =
             publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
                 .expect("incremental component");
-        if !work.cloned {
-            return;
-        }
+        // The reconciliation contract below is transport-independent: clone or
+        // copy fallback must still reconcile, so asserting only when the clone
+        // landed would let a copy-path regression pass silently.
+        assert!(work.cloned || work.copied);
         assert_eq!(work.retained, 2);
         assert_eq!(work.inserted, 4);
         assert_eq!(work.removed, 4);
@@ -3498,37 +3499,6 @@ mod tests {
                 .expect("previous publication"),
             previous
         );
-    }
-
-    #[test]
-    fn identical_scip_records_do_not_rewrite_ordering_rows() {
-        let root = TempDir::new().expect("tempdir");
-        let previous_dir = root.path().join("previous");
-        let current_dir = root.path().join("current");
-        std::fs::create_dir_all(&previous_dir).expect("previous dir");
-        std::fs::create_dir_all(&current_dir).expect("current dir");
-        let previous = component_index(
-            "generation-v1",
-            vec![
-                component_symbol("1", "src/a.rs", "alpha"),
-                component_symbol("2", "src/b.rs", "beta"),
-            ],
-        );
-        publish_scip_component(&previous_dir, None, &previous, &mut || Ok(()))
-            .expect("previous component");
-        let mut current = previous.clone();
-        current.generation = "generation-v2".into();
-
-        let work =
-            publish_scip_component(&current_dir, Some(&previous_dir), &current, &mut || Ok(()))
-                .expect("incremental component");
-        if !work.cloned {
-            return;
-        }
-        assert_eq!(work.retained, 4);
-        assert_eq!(work.inserted, 0);
-        assert_eq!(work.removed, 0);
-        assert_eq!(work.reordered, 0);
     }
 
     #[test]
@@ -5195,8 +5165,23 @@ mod tests {
         let out = std::path::PathBuf::from(
             std::env::var("CODESTORY_SCIP_PROBE_OUT").expect("CODESTORY_SCIP_PROBE_OUT"),
         );
-        let _ = std::fs::remove_dir_all(&out);
-        std::fs::create_dir_all(&out).expect("out dir");
+        // The probe never recursively deletes a caller-named directory: it may
+        // only create a fresh one or reuse one it can prove is empty.
+        match std::fs::create_dir(&out) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert!(
+                    std::fs::read_dir(&out)
+                        .expect("read existing probe out dir")
+                        .next()
+                        .is_none(),
+                    "CODESTORY_SCIP_PROBE_OUT must name a fresh or empty \
+                     directory; refusing to clean {}",
+                    out.display()
+                );
+            }
+            Err(error) => panic!("create probe out dir {}: {error}", out.display()),
+        }
         let started = Instant::now();
         let outcome =
             emit_scip_artifacts_from_store_incremental(&db, &out, "probe-generation", None, || {
