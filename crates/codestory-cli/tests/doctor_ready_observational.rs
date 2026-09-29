@@ -245,9 +245,8 @@ fn assert_unavailable_verdict(command: &str, json: &Value, reason: &str) {
     }
 }
 
-/// Seed a real publication, then downgrade the active generation's durable
-/// schema to 35 — the shape a 0.17.6 cache takes under this binary's schema 36.
-fn prepare_stale_schema35_generation(project: &Path, cache: &Path) -> PathBuf {
+/// Seed a real publication before constructing an incompatible generation.
+fn prepare_current_generation(project: &Path, cache: &Path) -> PathBuf {
     fs::create_dir(project).expect("project");
     fs::write(
         project.join("lib.rs"),
@@ -261,47 +260,111 @@ fn prepare_stale_schema35_generation(project: &Path, cache: &Path) -> PathBuf {
     ))
     .expect("seed index json");
     assert!(seed["summary"]["stats"]["node_count"].as_u64().unwrap_or(0) > 0);
-    test_support::set_active_core_schema_version(cache, 35)
+    active_generation_database(cache)
+}
+
+fn active_generation_database(cache: &Path) -> PathBuf {
+    let pointer: Value = serde_json::from_slice(
+        &fs::read(cache.join("core/publication.json")).expect("committed core pointer"),
+    )
+    .expect("core pointer json");
+    cache
+        .join("core/generations")
+        .join(
+            pointer["active"]["generation_id"]
+                .as_str()
+                .expect("generation id"),
+        )
+        .join("codestory.db")
 }
 
 #[test]
-fn doctor_preserves_a_stale_schema35_generation() {
-    assert_stale_schema35_generation_is_observational("doctor");
+fn doctor_preserves_incompatible_generations_and_reports_recovery() {
+    for newer in [false, true] {
+        assert_incompatible_generation_is_observational("doctor", newer);
+    }
 }
 
 #[test]
-fn ready_preserves_a_stale_schema35_generation() {
-    assert_stale_schema35_generation_is_observational("ready");
+fn ready_preserves_incompatible_generations_and_reports_recovery() {
+    for newer in [false, true] {
+        assert_incompatible_generation_is_observational("ready", newer);
+    }
 }
 
-fn assert_stale_schema35_generation_is_observational(command: &str) {
+fn assert_incompatible_generation_is_observational(command: &str, newer: bool) {
     let fixture = tempdir().expect("fixture");
     let project = fixture.path().join("project");
     let cache = fixture.path().join("cache");
-    let database = prepare_stale_schema35_generation(&project, &cache);
+    let current = schema_version(&prepare_current_generation(&project, &cache));
+    let schema = if newer { current + 1 } else { current - 1 };
+    let database = test_support::set_active_core_schema_version(&cache, schema);
     // A plain read-only SQLite open of a WAL database can materialize -shm/-wal
     // in a writable directory, so probe the durable version before the baseline
     // snapshot rather than letting the probe pollute the comparison.
-    assert_eq!(schema_version(&database), 35);
+    assert_eq!(schema_version(&database), schema);
     let before = snapshot_tree(&cache);
 
     let output = run_cli(&project, &cache, &[command, "--format", "json"]);
     let json: Value = serde_json::from_str(&output).expect("diagnostic json");
     assert_eq!(
         schema_version(&database),
-        35,
-        "{command} migrated the stale generation"
+        schema,
+        "{command} migrated the incompatible generation"
     );
     assert_eq!(
         snapshot_tree(&cache),
         before,
         "{command} changed stale cache files or sidecars"
     );
-    assert_eq!(
-        json["core_status"], "upgrade_required",
-        "{command}: {output}"
-    );
-    assert_unavailable_verdict(command, &json, "schema 35");
+    if !newer {
+        assert_eq!(
+            json["core_status"], "upgrade_required",
+            "{command}: {output}"
+        );
+        assert_unavailable_verdict(command, &json, &format!("schema {schema}"));
+    } else {
+        assert_eq!(json["core_status"], "newer_schema", "{command}: {output}");
+        let verdicts = if command == "doctor" {
+            &json["readiness"]
+        } else {
+            &json["verdicts"]
+        };
+        for verdict in verdicts.as_array().unwrap() {
+            assert_eq!(verdict["status"], "repair_index");
+            let minimum = verdict["minimum_next"].as_array().unwrap();
+            assert!(
+                minimum[0].as_str().unwrap().contains("cache reset")
+                    && minimum[0].as_str().unwrap().contains("--derived-only")
+                    && minimum[0].as_str().unwrap().contains("--dry-run"),
+                "{verdict}"
+            );
+            assert!(
+                minimum[1].as_str().unwrap().contains("--confirm"),
+                "{verdict}"
+            );
+            assert!(
+                minimum[2].as_str().unwrap().contains("--refresh full"),
+                "{verdict}"
+            );
+            let full = verdict["full_repair"].as_array().unwrap();
+            assert_eq!(
+                &full[..minimum.len()],
+                minimum.as_slice(),
+                "full recovery must retain the ordered reset and rebuild steps"
+            );
+            assert!(full.last().unwrap().as_str().unwrap().contains("doctor"));
+        }
+        if command == "doctor" {
+            assert!(
+                json["next_commands"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("cache reset"),
+                "{json}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -349,40 +412,55 @@ fn doctor_lists_other_cached_projects_with_stale_core_schema() {
         "derived sibling cache missing: {}",
         cache_b.display()
     );
-    let database_b = test_support::set_active_core_schema_version(&cache_b, 35);
-    let process_before = snapshot_tree(&process_root);
+    let current = schema_version(&active_generation_database(&cache_b));
+    for schema in [current - 1, current + 1] {
+        let database_b = test_support::set_active_core_schema_version(&cache_b, schema);
+        let process_before = snapshot_tree(&process_root);
 
-    let output = run_cli(&project_a, &cache_a, &["doctor", "--format", "json"]);
-    let json: Value = serde_json::from_str(&output).expect("doctor json");
-    let stale = json["stale_cached_cores"]
-        .as_array()
-        .expect("stale_cached_cores array");
-    let entry = stale
-        .iter()
-        .find(|entry| entry["found_schema"].as_u64() == Some(35))
-        .unwrap_or_else(|| panic!("doctor must report the stale sibling cache: {output}"));
-    let required = entry["required_schema"].as_u64().expect("required schema");
-    assert!(
-        required > 35,
-        "required schema must be the current core schema: {entry}"
-    );
-    if let Some(root) = entry["project_root"].as_str() {
-        let action = entry["next_action"].as_str().expect("next action");
+        let output = run_cli(&project_a, &cache_a, &["doctor", "--format", "json"]);
+        let json: Value = serde_json::from_str(&output).expect("doctor json");
+        let stale = json["stale_cached_cores"]
+            .as_array()
+            .expect("stale_cached_cores array");
+        let entry = stale
+            .iter()
+            .find(|entry| entry["found_schema"].as_u64() == Some(schema as u64))
+            .unwrap_or_else(|| panic!("doctor must report the stale sibling cache: {output}"));
+        let required = entry["required_schema"].as_u64().expect("required schema");
         assert!(
-            action.contains("index --project") && action.contains("--refresh full"),
-            "stale sibling must name the managed refresh: {action}"
+            required == current as u64,
+            "required schema must be the current core schema: {entry}"
         );
-        assert!(
-            action.contains(root),
-            "next action must target the sibling's project root: {action}"
+        {
+            let root = entry["project_root"]
+                .as_str()
+                .expect("attributed sibling project root");
+            let action = entry["next_action"].as_str().expect("next action");
+            if schema > current {
+                assert!(
+                    action.contains("cache reset")
+                        && action.contains("--derived-only")
+                        && action.contains("--dry-run"),
+                    "newer sibling must name derived-cache recovery: {action}"
+                );
+            } else {
+                assert!(
+                    action.contains("index --project") && action.contains("--refresh full"),
+                    "older sibling must name full refresh: {action}"
+                );
+            }
+            assert!(
+                action.contains(root),
+                "next action must target the sibling's project root: {action}"
+            );
+        }
+        assert_eq!(
+            snapshot_tree(&process_root),
+            process_before,
+            "the cross-project scan must not create, migrate, or recover cache state"
         );
+        assert_eq!(schema_version(&database_b), schema);
     }
-    assert_eq!(
-        snapshot_tree(&process_root),
-        process_before,
-        "the cross-project scan must not create, migrate, or recover cache state"
-    );
-    assert_eq!(schema_version(&database_b), 35);
 }
 
 fn prepare_complete_schema31(project: &Path, cache: &Path) {
@@ -757,9 +835,10 @@ fn doctor_support_bundle_writes_the_redacted_diagnostics_records() {
 
     let raw = fs::read_to_string(&bundle).expect("bundle file");
     let document: Value = serde_json::from_str(&raw).expect("bundle json");
+    let canonical_project = project.canonicalize().expect("canonical project root");
     assert_eq!(
         document["report"]["project"].as_str(),
-        Some(project.to_str().expect("project path")),
+        Some(canonical_project.to_str().expect("project path")),
         "bundle must carry the doctor report: {document}"
     );
     let records = document["diagnostics"]

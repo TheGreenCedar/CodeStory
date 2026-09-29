@@ -290,6 +290,7 @@ fn diagnostic_core_status_label(status: crate::args::DiagnosticCoreStatus) -> &'
     match status {
         crate::args::DiagnosticCoreStatus::Unavailable => "unavailable",
         crate::args::DiagnosticCoreStatus::UpgradeRequired => "upgrade_required",
+        crate::args::DiagnosticCoreStatus::NewerSchema => "newer_schema",
     }
 }
 

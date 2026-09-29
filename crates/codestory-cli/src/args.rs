@@ -1690,6 +1690,7 @@ pub(crate) struct IndexOutput<'a> {
 pub(crate) enum DiagnosticCoreStatus {
     Unavailable,
     UpgradeRequired,
+    NewerSchema,
 }
 
 #[derive(Debug, Serialize)]

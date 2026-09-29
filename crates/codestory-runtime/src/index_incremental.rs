@@ -238,8 +238,12 @@ pub(super) fn core_schema_too_new_error(root: &Path, found: u32, required: u32) 
                 reset_confirm.clone(),
                 rebuild.clone(),
             ],
-            minimum_next: vec![reset_dry_run, reset_confirm, rebuild],
-            full_repair: vec![doctor],
+            minimum_next: vec![
+                reset_dry_run.clone(),
+                reset_confirm.clone(),
+                rebuild.clone(),
+            ],
+            full_repair: vec![reset_dry_run, reset_confirm, rebuild, doctor],
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
@@ -314,6 +318,8 @@ pub struct StaleCachedCore {
     pub found_schema: u32,
     /// The schema version this binary serves.
     pub required_schema: u32,
+    /// First recovery step for this schema, when its project root is known.
+    pub next_action: Option<String>,
 }
 
 /// Enumerate cached projects whose core schema is not current. This is an
@@ -354,11 +360,25 @@ pub fn observe_stale_cached_cores(
         let project_root = Store::database_indexed_source_root_observational(&storage_path)
             .ok()
             .flatten();
+        let next_action = project_root.as_ref().and_then(|root| {
+            core_schema_observation_error(
+                root,
+                "Observe cached core schema",
+                codestory_store::StorageError::SchemaVersionMismatch {
+                    surface: "cached core",
+                    found: found_schema,
+                    required: CURRENT_SCHEMA_VERSION,
+                },
+            )
+            .details
+            .and_then(|details| details.next_commands.into_iter().next())
+        });
         stale.push(StaleCachedCore {
             cache_dir: dir,
             project_root,
             found_schema,
             required_schema: CURRENT_SCHEMA_VERSION,
+            next_action,
         });
     }
     stale.sort_by(|a, b| a.cache_dir.cmp(&b.cache_dir));

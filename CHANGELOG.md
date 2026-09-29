@@ -19,7 +19,7 @@ CodeStory keeps source reads tied to the indexed bytes, waits for refreshes acro
 - Files with trailing whitespace in their extensions no longer abort indexing.
 - Obsolete index images are reclaimed after publication finishes, including work deferred while another session was publishing. Cleanup preserves foreign entries and verifies the retired directory's identity before removing it.
 - A write-lock timeout identifies the holding process and provides guidance to wait for or stop it. A failed freshness probe names the failed stage instead of reporting a misleading zero file count.
-- Markdown errors include their cause chain and recovery commands. `doctor --support-bundle <file>` writes a local redacted diagnostic bundle, and `doctor` lists other cached projects requiring a schema upgrade.
+- Markdown errors include their cause chain and recovery commands. `doctor --support-bundle <file>` writes a local redacted diagnostic bundle, and `doctor` lists other cached projects with incompatible schemas and their recovery commands.
 - Indexing warns when a repository exceeds the 25,000-file freshness-scan bound; `doctor` reports the same limitation as a warning.
 
 ### Windows and MCP hosts

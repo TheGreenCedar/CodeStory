@@ -107,18 +107,12 @@ pub(in crate::app) fn build_doctor_output(
         let project_root = entry
             .project_root
             .map(|root| display::clean_path_string(&root.to_string_lossy()));
-        let next_action = project_root.as_ref().map(|root| {
-            format!(
-                "codestory-cli index --project {} --refresh full",
-                display::quote_command_path(std::path::Path::new(root))
-            )
-        });
         DoctorStaleCachedCore {
             cache_dir: display::clean_path_string(&entry.cache_dir.to_string_lossy()),
             project_root,
             found_schema: entry.found_schema,
             required_schema: entry.required_schema,
-            next_action,
+            next_action: entry.next_action,
         }
     })
     .collect::<Vec<_>>();
@@ -127,7 +121,7 @@ pub(in crate::app) fn build_doctor_output(
             "cached_cores",
             "warn",
             format!(
-                "{} other cached project(s) have an incompatible core schema; re-index each with `codestory-cli index --project <root> --refresh full`.",
+                "{} other cached project(s) have an incompatible core schema; follow each cache's next_action, or use a matching CodeStory version when its project root is unavailable.",
                 stale_cached_cores.len()
             ),
         ));
