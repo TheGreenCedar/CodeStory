@@ -6941,6 +6941,13 @@ mod tests {
         assert!(search_lexical_index(&shard, "input", "handler", 4).is_err());
     }
 
+    /// The temporary-name allocation must skip names already occupied by
+    /// stale temporary files, never truncate them. Plant an occupied block
+    /// directly ahead of the process-global counter: the build's create-new
+    /// allocation collides through the whole block and lands past it, and
+    /// every planted file must survive with its exact bytes. Other tests may
+    /// consume counter values concurrently; only the occupied *names* matter,
+    /// so the proof holds under any interleaving.
     #[test]
     fn sqlite_build_skips_stale_temporary_file_collisions() {
         let project = TempDir::new().expect("project");
@@ -6954,85 +6961,58 @@ mod tests {
                 .and_then(|value| value.parse::<u64>().ok())
                 .expect("temp counter")
         };
-        // The process-global name counter makes the build's retry name
-        // unpredictable, so plant the next PLANTED names and prove a collision
-        // by exact accounting: a control build yields the nominal pull count,
-        // and a clean planted window must consume exactly nominal + PLANTED
-        // names — every planted name was occupied, so the index temp
-        // allocation retried through a live collision before escaping past the
-        // block. A foreign allocation inside either window breaks the
-        // equality, so the fixture retries rather than passing unproven.
-        const PLANTED: u64 = 64;
-        let mut rounds = 0u32;
-        let (_data, stale) = loop {
-            rounds += 1;
-            assert!(rounds <= 8, "never observed a clean collision window");
-            let data = TempDir::new().expect("data");
-            let control_index =
-                shard_dir_for(data.path(), "collision-control").join(LEXICAL_INDEX_FILE);
-            let control_before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
-                &control_index,
-                "lexical-index",
-            ));
-            build_lexical_shard(
-                project.path(),
-                None,
-                data.path(),
-                "collision-control",
-                &fingerprint,
-                "input",
-            )
-            .expect("control build");
-            let nominal = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
-                &control_index,
-                "lexical-index",
-            )) - control_before
-                - 1;
-
-            let planted_shard = shard_dir_for(data.path(), "collision-planted");
-            std::fs::create_dir_all(&planted_shard).expect("planted shard");
-            let planted_index = planted_shard.join(LEXICAL_INDEX_FILE);
-            let before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
-                &planted_index,
-                "lexical-index",
-            ));
-            let stale = (before + 1..=before + PLANTED)
-                .map(|counter| {
-                    planted_index.with_file_name(format!(
-                        ".lexical-index.{}.{}.tmp",
-                        std::process::id(),
-                        counter
-                    ))
-                })
-                .collect::<Vec<_>>();
-            for path in &stale {
-                std::fs::write(path, b"stale").expect("stale temp");
-            }
-
-            build_lexical_shard(
-                project.path(),
-                None,
-                data.path(),
-                "collision-planted",
-                &fingerprint,
-                "input",
-            )
-            .expect("collision-safe build");
-
-            let window_pulls = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
-                &planted_index,
-                "lexical-index",
-            )) - before
-                - 1;
-            if window_pulls != nominal + PLANTED {
-                continue;
-            }
-            assert!(planted_index.is_file(), "the index must still publish");
-            break (data, stale);
-        };
-        for path in stale {
-            assert_eq!(std::fs::read(path).expect("stale preserved"), b"stale");
+        const PLANTED: u64 = 4096;
+        let data = TempDir::new().expect("data");
+        let planted_shard = shard_dir_for(data.path(), "collision-planted");
+        std::fs::create_dir_all(&planted_shard).expect("planted shard");
+        let planted_index = planted_shard.join(LEXICAL_INDEX_FILE);
+        let before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+            &planted_index,
+            "lexical-index",
+        ));
+        let stale = (before + 1..=before + PLANTED)
+            .map(|counter| {
+                planted_index.with_file_name(format!(
+                    ".lexical-index.{}.{}.tmp",
+                    std::process::id(),
+                    counter
+                ))
+            })
+            .collect::<Vec<_>>();
+        for path in &stale {
+            std::fs::write(path, b"stale").expect("stale temp");
         }
+
+        build_lexical_shard(
+            project.path(),
+            None,
+            data.path(),
+            "collision-planted",
+            &fingerprint,
+            "input",
+        )
+        .expect("collision-safe build");
+        assert!(
+            !search_lexical_index(&planted_shard, "input", "handler", 4)
+                .expect("search the built index")
+                .is_empty(),
+            "the published index must answer the same query shape the build produced"
+        );
+        for path in &stale {
+            assert_eq!(
+                std::fs::read(path).expect("stale preserved"),
+                b"stale",
+                "the build must skip, not overwrite, an occupied temporary name"
+            );
+        }
+        let after = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+            &planted_index,
+            "lexical-index",
+        ));
+        assert!(
+            after > before + PLANTED,
+            "the name counter must advance past the occupied block ({after} > {before} + {PLANTED})"
+        );
     }
 
     #[test]
