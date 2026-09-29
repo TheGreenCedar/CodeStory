@@ -529,6 +529,8 @@ impl RepositoryReader {
         let opened_work_dir = repository
             .workdir()
             .context("bare repositories are not project workspaces")?;
+        let opened_work_dir =
+            canonical_existing(opened_work_dir).context("canonicalize gix repository workdir")?;
         if opened_work_dir != roots.root {
             bail!(
                 "repository worktree changed during open: expected {}, found {}",
