@@ -66,9 +66,11 @@ struct IndexingCompletion {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-static MID_INDEXING_TEST_HOOK: std::sync::RwLock<
-    Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
-> = std::sync::RwLock::new(None);
+type MidIndexingTestHook = Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>;
+
+#[cfg(any(test, feature = "test-support"))]
+static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
+    std::sync::RwLock::new(None);
 
 /// Run `hook` while an indexing worker owns the writer lock with
 /// `is_indexing` set, so a test can hold a refresh genuinely in flight while
@@ -76,7 +78,7 @@ static MID_INDEXING_TEST_HOOK: std::sync::RwLock<
 /// shared test binary only parks the run it armed for.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_mid_indexing_test_hook(hook: Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>) {
+pub fn set_mid_indexing_test_hook(hook: MidIndexingTestHook) {
     *MID_INDEXING_TEST_HOOK
         .write()
         .expect("mid-indexing test hook lock") = hook;

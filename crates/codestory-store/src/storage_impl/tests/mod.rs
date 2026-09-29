@@ -11576,6 +11576,7 @@ const PROOF_FK_SURVIVOR_EDGE: i64 = 90_001;
 const PROOF_FK_SURVIVOR_PROVENANCE: i64 = 81;
 const PROOF_FK_REMOVED_PROVENANCE: i64 = 71;
 
+#[allow(clippy::too_many_arguments)]
 fn insert_proof_fact(
     storage: &Storage,
     ordinal: i64,

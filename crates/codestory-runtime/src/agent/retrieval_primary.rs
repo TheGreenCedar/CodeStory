@@ -4217,9 +4217,9 @@ mod tests {
         std::fs::create_dir_all(source.parent().expect("src parent")).expect("mkdir src");
         std::fs::write(&source, "fn lib() {}\n").expect("write source");
         let real = CandidateHit::lexical_stub("src/lib.rs", 0.9);
-        assert!(!codestory_retrieval::phantom_sidecar_candidates_only(&[
-            real.clone()
-        ]));
+        assert!(!codestory_retrieval::phantom_sidecar_candidates_only(
+            std::slice::from_ref(&real)
+        ));
 
         let storage = Store::new_in_memory().expect("storage");
         assert_eq!(

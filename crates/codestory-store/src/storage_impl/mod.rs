@@ -5281,7 +5281,7 @@ impl Storage {
             .map(|(a, _)| a.len_utf8())
             .sum::<usize>();
         let prefix = &low[..common_len];
-        let cut = prefix.rfind(|c| c == '/' || c == '\\').unwrap_or(0);
+        let cut = prefix.rfind(['/', '\\']).unwrap_or(0);
         let root = &prefix[..cut];
         if root.is_empty() {
             return Ok(None);

@@ -918,9 +918,15 @@ fn public_exact_verifier_compiles_without_qualification_support() {
             "the inert launcher discovery session lost Rust's {revision} revision"
         );
     }
+    // LIVE-L2 bumped the publication stamp to schema 4 (the launcher exposes
+    // it as `publicationSchemaVersion`; minimum-compatible stays 3).
     assert!(
-        launcher.contains("publicationSchemaVersion: 3"),
+        launcher.contains("publicationStampSchemaVersion = 4"),
         "the inert launcher discovery session must preserve the Rust discovery schema"
+    );
+    assert!(
+        launcher.contains("minimumCompatiblePublicationStampSchemaVersion = 3"),
+        "the inert launcher must keep schema-3 producers readable"
     );
 }
 
@@ -959,7 +965,8 @@ process.stdout.write(JSON.stringify(
         session["discoveryContractSha256"], contracts["2025-06-18"],
         "the launcher must retain Rust's discovery digest without substituting one"
     );
-    assert_eq!(session["publicationSchemaVersion"], 3);
+    // LIVE-L2 bumped the publication stamp to schema 4.
+    assert_eq!(session["publicationSchemaVersion"], 4);
 }
 
 #[test]
@@ -2020,8 +2027,12 @@ fn production_source_never_spawns_git() {
         {
             continue;
         }
+        // `test_git.rs` compiles only under `#[cfg(test)]` (the `mod` gate
+        // lives in the workspace lib.rs) — it is the isolated fixture git
+        // builder, never product code.
         if path.starts_with(&benchmark_root)
             || path == repo_root().join("crates/codestory-runtime/src/test_support.rs")
+            || path == repo_root().join("crates/codestory-workspace/src/test_git.rs")
         {
             continue;
         }
@@ -2063,6 +2074,9 @@ fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
         "crates/codestory-bench/src/bin/codestory_proof_availability/multilingual_contract.rs"
             .to_owned(),
         "crates/codestory-runtime/src/test_support.rs".to_owned(),
+        // `#[cfg(test)]`-gated isolated fixture git builder (the `mod` gate is
+        // in codestory-workspace's lib.rs, invisible to this file scanner).
+        "crates/codestory-workspace/src/test_git.rs".to_owned(),
     ]);
 
     assert_eq!(
