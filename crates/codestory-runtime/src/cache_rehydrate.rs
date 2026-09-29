@@ -618,11 +618,19 @@ fn publish_rehydrated_database(
                 ),
                 &codestory_retrieval::SidecarRuntimeOverrides::default(),
             );
-        let _core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
+        if let Some(report) = crate::activation_retrieval::apply_core_gc_after_publication(
             &retrieval_runtime,
             logical_target,
             None,
-        );
+        ) && report.pruning_suppressed
+        {
+            // Rehydrate has no index-result JSON; keep the suppression
+            // observable in diagnostics rather than discarding it silently.
+            tracing::debug!(
+                reason = report.reason.map(|reason| reason.as_str()),
+                "core retention after rehydrate suppressed"
+            );
+        }
         Ok(PublishedRehydrate {
             invalidated_retrieval_manifests,
             rebase_stats,
