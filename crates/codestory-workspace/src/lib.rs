@@ -3165,6 +3165,16 @@ mod tests {
         Ok(())
     }
 
+    /// Windows grants SetFileTime only on handles opened for write, so the
+    /// fixture must open with `.write(true)` rather than `File::open`.
+    fn set_mtime(path: &Path, modified: std::time::SystemTime) -> Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(modified)?;
+        Ok(())
+    }
+
     fn test_source_group(
         language: Language,
         source_path: PathBuf,
@@ -4469,13 +4479,13 @@ mod tests {
         let mut same_length_drift = fs::read(&files[3])?;
         same_length_drift[3] ^= 1;
         fs::write(&files[3], same_length_drift)?;
-        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+        set_mtime(&files[3], same_mtime)?;
 
         let changed_mtime = fs::metadata(&files[7])?
             .modified()?
             .checked_add(std::time::Duration::from_secs(2))
             .expect("fixture timestamp can advance");
-        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        set_mtime(&files[7], changed_mtime)?;
         fs::remove_file(&files[11])?;
         inputs.stored_files[15].retry_required = true;
 
@@ -4551,12 +4561,12 @@ mod tests {
         let mut same_length_drift = fs::read(&files[3])?;
         same_length_drift[3] ^= 1;
         fs::write(&files[3], same_length_drift)?;
-        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+        set_mtime(&files[3], same_mtime)?;
         let changed_mtime = fs::metadata(&files[7])?
             .modified()?
             .checked_add(std::time::Duration::from_secs(2))
             .expect("fixture timestamp can advance");
-        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        set_mtime(&files[7], changed_mtime)?;
         fs::remove_file(&files[11])?;
         let new_file = root.join("file_21.rs");
         fs::write(&new_file, "fn file_21() {}\n")?;
@@ -4679,7 +4689,7 @@ mod tests {
         assert!(clean.files_to_index.is_empty());
 
         fs::write(&file, "fn main() { let drifted = 1; }\n")?;
-        fs::File::open(&file)?.set_modified(original_mtime)?;
+        set_mtime(&file, original_mtime)?;
         assert_eq!(
             fs::metadata(&file)?.modified()?,
             original_mtime,
@@ -4719,7 +4729,7 @@ mod tests {
         // Same length, same mtime, different bytes: exactly the coarse-mtime /
         // mtime-preserving-tool case the content hash exists to catch.
         fs::write(&file, "fn maim() {}\n")?;
-        fs::File::open(&file)?.set_modified(original_mtime)?;
+        set_mtime(&file, original_mtime)?;
         let observed = fs::metadata(&file)?;
         assert_eq!(
             observed.len(),
@@ -4776,7 +4786,7 @@ mod tests {
         );
 
         fs::write(&file, "fn maim() {}\n")?;
-        fs::File::open(&file)?.set_modified(original_mtime)?;
+        set_mtime(&file, original_mtime)?;
         let retried = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
         assert_eq!(retried.files_to_index, vec![file]);
         assert_eq!(
