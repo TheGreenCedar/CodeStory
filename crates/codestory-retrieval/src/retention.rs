@@ -1310,6 +1310,11 @@ pub(crate) fn classify_retention_entry(path: &Path) -> RetentionDirEntry {
     if name.starts_with('.') {
         return RetentionDirEntry::Ignorable;
     }
+    // `<lock>.owner.json` is peer-holder diagnostics, never protection
+    // evidence: it must not parse as a marker nor count as unrecognized.
+    if name.ends_with(".owner.json") {
+        return RetentionDirEntry::Ignorable;
+    }
     match path.extension().and_then(|value| value.to_str()) {
         Some(RETENTION_MARKER_EXTENSION) => RetentionDirEntry::Marker,
         Some(RETENTION_LOCK_EXTENSION) => RetentionDirEntry::Ignorable,
