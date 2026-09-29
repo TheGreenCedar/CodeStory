@@ -184,7 +184,13 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       USERPROFILE: personalHome,
       npm_config_cache: npmCache,
     };
-    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    // Resolve npm.cmd to an absolute path: commandPlan quotes the command
+    // name, and a quoted bare name leaves cmd's %0 unexpanded, so npm.cmd
+    // would compute %~dp0 (its install prefix) from the cwd.
+    const npm = process.platform === "win32"
+      ? spawnSync("where.exe", ["npm.cmd"], { encoding: "utf8" }).stdout.trim()
+        .split(/\r?\n/u)[0]
+      : "npm";
     run(npm, [
       "install",
       "--prefix",
