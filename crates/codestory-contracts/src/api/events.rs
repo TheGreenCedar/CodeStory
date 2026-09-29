@@ -209,7 +209,7 @@ pub enum IncrementalProbeUnavailableStageDto {
     /// The symbol-document contract check could not be evaluated.
     DocContract,
     /// The search index path for the publication could not be resolved.
-    SearchPath,
+    SearchIndexLocation,
     /// The publication generation id was not a usable identity.
     GenerationId,
     /// Admitted sources could not all be sealed.

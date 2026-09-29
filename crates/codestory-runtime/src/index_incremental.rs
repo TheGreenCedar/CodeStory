@@ -663,7 +663,7 @@ fn evaluate_incremental_plan_probe(
     }
     let Ok(search_path) = search_index_path_for_publication(storage_path, Some(&publication))
     else {
-        probe_unavailable!(SearchPath);
+        probe_unavailable!(SearchIndexLocation);
     };
     let Ok(generation_id) = Uuid::parse_str(&publication.generation_id) else {
         probe_unavailable!(GenerationId);
