@@ -1860,14 +1860,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
         }
-        git(
-            project.path(),
-            &[
-                "config",
-                "core.fsmonitor",
-                hook.to_str().expect("UTF-8 hook"),
-            ],
-        );
+        // Git's fsmonitor hook executes through a shell even on Windows
+        // (Git for Windows' MSYS sh), which mangles backslash spellings — the
+        // config value must use forward slashes for the probe to be viable
+        // natively on both platforms.
+        let hook_config = hook.to_str().expect("UTF-8 hook").replace('\\', "/");
+        git(project.path(), &["config", "core.fsmonitor", &hook_config]);
 
         // Positive control: `core.fsmonitor` is not a hooksPath hook, so an
         // isolated `git status` still executes the configured command. If it
