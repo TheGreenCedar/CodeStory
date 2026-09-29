@@ -4,7 +4,8 @@ use crate::index_commit::{
 };
 use crate::index_coverage::validate_source_policy_exclusions;
 use crate::index_timings::{
-    IndexingRunSummary, core_indexing_phase_timings, incremental_plan_probe_timings,
+    IndexingRunSummary, core_indexing_phase_timings, core_retention_outcome,
+    incremental_plan_probe_timings,
 };
 use crate::search_publication::{
     discard_unpublished_search_generation, materialize_equivalent_search_generation,
@@ -29,7 +30,8 @@ use crate::{
 use crate::{publication::run_incremental_staged_store_hook, test_sidecar_runtime_from_env};
 use codestory_contracts::api::{
     ApiError, ApiErrorDetails, AppEventPayload, FileCoverageDiagnosticDto,
-    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto, IncrementalScheduledPathActionDto,
+    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto,
+    IncrementalProbeUnavailableStageDto, IncrementalScheduledPathActionDto,
     IncrementalScheduledPathDto, IncrementalScheduledPathReasonDto, IndexingPhaseTimings,
 };
 use codestory_contracts::events::{Event, EventBus};
@@ -170,6 +172,7 @@ pub(super) fn full_refresh_required_error(
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     )
 }
@@ -242,6 +245,7 @@ pub(super) fn core_schema_too_new_error(root: &Path, found: u32, required: u32) 
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     )
 }
@@ -264,6 +268,7 @@ fn core_schema_recovery_error(root: &Path, code: &str, message: String) -> ApiEr
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     )
 }
@@ -464,9 +469,14 @@ pub(super) const INCREMENTAL_PUBLICATION_DATABASE_COPIES: u32 = 0;
 /// authority.
 pub(super) struct IncrementalPlanProbe {
     pub(super) outcome: IncrementalPlanProbeOutcomeDto,
+    /// The stage that failed before the plan could be computed. `None` unless
+    /// `outcome` is `ProbeUnavailable`.
+    pub(super) unavailable_stage: Option<IncrementalProbeUnavailableStageDto>,
     pub(super) probe_ms: u32,
-    pub(super) files_to_index: u32,
-    pub(super) files_to_remove: u32,
+    /// `None` until the refresh plan stage actually computed a count; a probe
+    /// that failed earlier never measured anything.
+    pub(super) files_to_index: Option<u32>,
+    pub(super) files_to_remove: Option<u32>,
     pub(super) live_database_file_bytes: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) publication: Option<IndexPublicationRecord>,
@@ -553,26 +563,36 @@ fn evaluate_incremental_plan_probe(
     source_index_policy: &SourceIndexPolicy,
     probe: &mut IncrementalPlanProbe,
 ) -> IncrementalPlanProbeOutcomeDto {
+    macro_rules! probe_unavailable {
+        ($stage:ident) => {{
+            probe.unavailable_stage = Some(IncrementalProbeUnavailableStageDto::$stage);
+            return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        }};
+    }
     let Ok(storage) = Store::open_freshness_observational(storage_path) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(OpenCore);
     };
     let Ok(Some(publication)) = storage.get_complete_index_publication() else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Publication);
     };
     probe.publication = Some(publication.clone());
     let Ok(workspace) = runtime_workspace_manifest(root, storage_path) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(WorkspaceManifest);
     };
     let Ok(refresh_inputs) = workspace_refresh_inputs(&storage) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(RefreshInputs);
     };
     let Ok(policy_refresh) =
         workspace.build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
     else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Policy);
     };
-    probe.files_to_index = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_index.len());
-    probe.files_to_remove = clamp_usize_to_u32(policy_refresh.refresh.plan.files_to_remove.len());
+    probe.files_to_index = Some(clamp_usize_to_u32(
+        policy_refresh.refresh.plan.files_to_index.len(),
+    ));
+    probe.files_to_remove = Some(clamp_usize_to_u32(
+        policy_refresh.refresh.plan.files_to_remove.len(),
+    ));
     probe.repository_tracking_digest = policy_refresh.repository_tracking_digest.clone();
     if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         return IncrementalPlanProbeOutcomeDto::InventoryIncomplete;
@@ -582,7 +602,7 @@ fn evaluate_incremental_plan_probe(
         incremental_scheduled_paths(root, &refresh_inputs, &policy_refresh.refresh.plan);
     probe.execution_plan = Some(policy_refresh.refresh.plan.clone());
     probe.policy_exclusions = Some(policy_refresh.policy_exclusions.clone());
-    if probe.files_to_index != 0 || probe.files_to_remove != 0 {
+    if probe.files_to_index != Some(0) || probe.files_to_remove != Some(0) {
         return IncrementalPlanProbeOutcomeDto::PlanNotEmpty;
     }
     // A blocking stored coverage gap is adjudicated by
@@ -590,7 +610,7 @@ fn evaluate_incremental_plan_probe(
     // does not clear it, so short-circuiting here would keep serving a core the
     // staged pipeline refuses.
     let Ok(stored_coverage) = stored_file_coverage_diagnostics(root, &storage) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Coverage);
     };
     if stored_coverage
         .iter()
@@ -608,7 +628,7 @@ fn evaluate_incremental_plan_probe(
         return IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale;
     }
     let Ok(stored_exclusions) = storage.get_source_policy_exclusions() else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(Exclusions);
     };
     if !source_policy_exclusions_unchanged(&stored_exclusions, &policy_refresh.policy_exclusions) {
         return IncrementalPlanProbeOutcomeDto::PolicyExclusionsChanged;
@@ -616,7 +636,7 @@ fn evaluate_incremental_plan_probe(
     match storage.get_dense_anchor_publication_manifest() {
         Ok(Some(_)) => {}
         Ok(None) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
-        Err(_) => return IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        Err(_) => probe_unavailable!(DenseAnchor),
     }
     // Use the same strict validation the readiness probe
     // (`complete_core_requires_publication_repair`) applies. Accepting a weaker
@@ -639,14 +659,14 @@ fn evaluate_incremental_plan_probe(
     ) {
         Ok(false) => {}
         Ok(true) => return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
-        Err(_) => return IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        Err(_) => probe_unavailable!(DocContract),
     }
     let Ok(search_path) = search_index_path_for_publication(storage_path, Some(&publication))
     else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(SearchPath);
     };
     let Ok(generation_id) = Uuid::parse_str(&publication.generation_id) else {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(GenerationId);
     };
     if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none() {
         return IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
@@ -654,7 +674,7 @@ fn evaluate_incremental_plan_probe(
     // An empty plan is not a freshness receipt until every admitted source has
     // a generic seal. Selected source aliases deliberately cannot produce one.
     if probe.source_seals.is_none() {
-        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+        probe_unavailable!(SourceSeals);
     }
     IncrementalPlanProbeOutcomeDto::ShortCircuited
 }
@@ -672,9 +692,10 @@ pub(super) fn probe_incremental_plan(
         .unwrap_or_default();
     let mut probe = IncrementalPlanProbe {
         outcome: IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        unavailable_stage: None,
         probe_ms: 0,
-        files_to_index: 0,
-        files_to_remove: 0,
+        files_to_index: None,
+        files_to_remove: None,
         live_database_file_bytes,
         publication: None,
         execution_plan: None,
@@ -1634,7 +1655,7 @@ fn run_incremental_indexing_common(
     let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
-    crate::activation_retrieval::apply_core_gc_after_publication(
+    let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
         runtime,
         storage_path,
         cancel_token,
@@ -1656,6 +1677,7 @@ fn run_incremental_indexing_common(
         staged_semantic_stats.semantic_context_index_ms,
     );
     phase_timings.incremental_plan_probe = Some(incremental_plan_probe_timings(&probe));
+    phase_timings.core_retention = core_retention.as_ref().map(core_retention_outcome);
     phase_timings.incremental_coverage_validation_ms = Some(derived_timings.coverage_validation_ms);
     phase_timings.incremental_proof_projection_ms = Some(derived_timings.proof_projection_ms);
     phase_timings.incremental_semantic_scope_ms = Some(derived_timings.semantic_scope_ms);

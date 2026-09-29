@@ -11,6 +11,8 @@
 - During a refresh, source-backed reads wait for the fresh index while graph-only answers may come from the retained publication; results served that way are labelled `historical` under `_meta.codestory_publication.freshness`.
 - When another CodeStory session is already refreshing the same project, a second session now waits for it to finish and adopts its publication instead of failing with a busy error.
 - Incremental index updates no longer stall when removing a file's stale graph rows alongside many stored resolution facts.
+- Old index images are now reclaimed promptly after a refresh finishes even while another session was mid-publication, and retired generation directories are removed rather than left empty. An index run whose freshness probe could not open the core now names the failed stage instead of reporting a misleading zero file count.
+- When an index update times out behind another session's write lock, the failure is typed `peer_writer_active` and names the holding process (pid, operation, how long it has held the lock, and whether it is still alive) with guidance to wait for or stop it — never to delete the lock file.
 
 ## 0.17.6
 

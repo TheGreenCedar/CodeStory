@@ -618,7 +618,7 @@ fn publish_rehydrated_database(
                 ),
                 &codestory_retrieval::SidecarRuntimeOverrides::default(),
             );
-        crate::activation_retrieval::apply_core_gc_after_publication(
+        let _core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
             &retrieval_runtime,
             logical_target,
             None,

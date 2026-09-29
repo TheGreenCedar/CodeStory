@@ -242,6 +242,34 @@ impl OwnedDeletionRoot {
         }
     }
 
+    /// Remove one owned directory after the opened child is verified empty.
+    ///
+    /// Unlike [`Self::remove_empty_directory`], this completes the removal on
+    /// Unix too: the emptiness check binds to the pinned child handle while
+    /// the final `rmdir` stays name-based, so this is not a final-leaf
+    /// identity guarantee — a directory that gained entries between the check
+    /// and the syscall fails `rmdir` rather than being removed. The removal
+    /// is never recursive: unknown children return `Ok(false)` and survive.
+    /// Missing directories also return `Ok(false)`.
+    pub fn remove_owned_empty_directory(&self, relative: &Path) -> io::Result<bool> {
+        let parts = relative_owned_parts(relative)?;
+        let (leaf, ancestors) = parts
+            .split_last()
+            .expect("relative_owned_parts rejects an empty path");
+        let mut parent = self.root.try_clone()?;
+        for ancestor in ancestors {
+            parent = open_child_dir(&parent, ancestor)?;
+        }
+        let target = match open_child_dir(&parent, leaf) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            // A non-directory leaf is unknown content and is never removed.
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        remove_open_owned_empty_directory(&parent, leaf, target)
+    }
+
     /// Remove one owned directory only when it is empty.
     ///
     /// Unlike [`Self::remove`], this never removes children. Callers that
@@ -367,6 +395,22 @@ fn remove_open_directory(_: &File, _: &OsStr, target: File) -> io::Result<()> {
     use fs_at::os::windows::FileExt as _;
 
     target.delete_by_handle().map_err(|(_, error)| error)
+}
+
+fn remove_open_owned_empty_directory(
+    parent: &File,
+    leaf: &OsStr,
+    target: File,
+) -> io::Result<bool> {
+    let mut directory = target.try_clone()?;
+    for entry in fs_at::read_dir(&mut directory)? {
+        let entry = entry?;
+        if entry.name() != OsStr::new(".") && entry.name() != OsStr::new("..") {
+            return Ok(false);
+        }
+    }
+    remove_open_directory(parent, leaf, target)?;
+    Ok(true)
 }
 
 #[cfg(unix)]

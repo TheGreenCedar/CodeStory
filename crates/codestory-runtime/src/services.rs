@@ -2015,8 +2015,8 @@ impl ActivationService {
             let search_repair_only = has_complete_core
                 && precomputed_core_probe.as_ref().is_some_and(|probe| {
                     probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
-                        && probe.files_to_index == 0
-                        && probe.files_to_remove == 0
+                        && probe.files_to_index == Some(0)
+                        && probe.files_to_remove == Some(0)
                         && probe.publication.as_ref().is_some_and(|publication| {
                             let publication =
                                 crate::index_commit::index_publication_dto(publication.clone());
@@ -2219,8 +2219,20 @@ impl ActivationService {
                 &storage_path,
                 &self.controller.runtime_config,
                 operation.cancelled.as_ref(),
-            )
-            .map_err(map_activation_error)?;
+            );
+            // The finalize shared fence is released when the call above
+            // returns, on success or failure. Core GC taken under that fence
+            // is suppressed, so publications committed while a peer finalized
+            // keep one unpinned image each; this best-effort pass reclaims
+            // them without another index operation.
+            if let Err(error) = crate::activation_retrieval::apply_core_gc_for_runtime(
+                &self.controller.runtime_config,
+                &storage_path,
+                &|| operation.cancelled.load(Ordering::Relaxed),
+            ) {
+                tracing::warn!("Core retention after retrieval finalize deferred: {error}");
+            }
+            let outcome = outcome.map_err(map_activation_error)?;
             tracing::debug!(
                 target: "codestory::activation",
                 phase_timings = ?outcome.phase_timings,
@@ -2601,6 +2613,9 @@ fn map_activation_error(error: anyhow::Error) -> ApiError {
     if let Some(refusal) = crate::insufficient_space_api_error(&error) {
         return refusal;
     }
+    if let Some(refusal) = crate::peer_writer_api_error(&error) {
+        return refusal;
+    }
     if let Some(error) = embedding_api_error(&error) {
         return classify_activation_api_error(error);
     }
@@ -2637,9 +2652,11 @@ fn classify_activation_api_error(mut error: ApiError) -> ApiError {
             error.code = "activation_retryable".into();
             error
         }
-        "cancelled" | "activation_preparing" | "activation_retryable" | "insufficient_space" => {
-            error
-        }
+        "cancelled"
+        | "activation_preparing"
+        | "activation_retryable"
+        | "insufficient_space"
+        | "peer_writer_active" => error,
         "source_unreadable"
         | "source_malformed"
         | "source_binary"
@@ -8700,6 +8717,45 @@ pub(crate) mod activation_tests {
         assert_eq!(
             (space.required_bytes, space.available_bytes),
             (68_000_000, 0)
+        );
+    }
+
+    #[test]
+    fn peer_writer_timeout_survives_activation_mapping_with_holder_diagnostics() {
+        let source = anyhow::Error::new(codestory_retrieval::PeerWriterActive {
+            scope_id: "writer-project-one".into(),
+            lock_path: PathBuf::from("/cache/retention/writer-project-one.lock"),
+            waited_ms: 250,
+            holder: Some(codestory_retrieval::PeerWriterHolder {
+                pid: 4242,
+                operation: "writer-project-one".into(),
+                project_id: Some("project-one".into()),
+                since_epoch_ms: 1_700_000_000_000,
+                alive: true,
+            }),
+        })
+        .context("retrieval index finalize");
+
+        let mapped = map_activation_error(source);
+
+        assert_eq!(mapped.code, "peer_writer_active");
+        let details = mapped.details.as_deref().expect("error details");
+        assert_eq!(details.cause_code.as_deref(), Some("lock_wait_timeout"));
+        let peer = details.peer_writer.as_ref().expect("peer diagnostics");
+        match &peer.holder {
+            codestory_contracts::api::PeerWriterHolderDto::Recorded(record) => {
+                assert_eq!(record.pid, 4242);
+                assert!(record.alive);
+                assert_eq!(record.operation, "writer-project-one");
+                assert_eq!(record.project_id.as_deref(), Some("project-one"));
+            }
+            other => panic!("the holder record must be reported: {other:?}"),
+        }
+        assert!(
+            peer.next_action.contains("4242")
+                && peer.next_action.contains("Never delete the lock file"),
+            "next_action must name the holder and forbid lock deletion: {}",
+            peer.next_action
         );
     }
 

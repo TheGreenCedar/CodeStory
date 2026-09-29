@@ -42,8 +42,9 @@ mod schema;
 mod trail;
 
 pub use core_retention::{
-    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, LegacyRetirementReport,
-    apply_core_retention, apply_legacy_retirement, observe_legacy_retirement,
+    CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport, CoreRetentionSuppression,
+    LegacyRetirementReport, apply_core_retention, apply_legacy_retirement,
+    observe_legacy_retirement,
 };
 pub(crate) use core_retention::{
     CoreGenerationLease, pin_active_core, pin_exact_core, provision_generation_locks,

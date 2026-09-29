@@ -5,7 +5,7 @@ use crate::index_commit::{
 use crate::index_incremental::spawn_progress_forwarder;
 use crate::index_timings::{
     FullRefreshWallDurations, IndexingRunSummary, apply_full_refresh_pipeline_timings,
-    core_indexing_phase_timings,
+    core_indexing_phase_timings, core_retention_outcome,
 };
 #[cfg(test)]
 use crate::publication::{run_full_refresh_staged_store_hook, run_source_policy_after_plan_hook};
@@ -1024,7 +1024,7 @@ pub(super) fn index_full_for_runtime(
         },
         cancel_token,
     )?;
-    crate::activation_retrieval::apply_core_gc_after_publication(
+    let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
         runtime,
         storage_path,
         cancel_token,
@@ -1039,6 +1039,7 @@ pub(super) fn index_full_for_runtime(
         publish_duration,
         prepared_snapshots.semantic_stats.semantic_context_index_ms,
     );
+    phase_timings.core_retention = core_retention.as_ref().map(core_retention_outcome);
     apply_full_refresh_pipeline_timings(&mut phase_timings, &index_stats, full_refresh_wall);
     Ok(IndexingRunSummary {
         phase_timings,

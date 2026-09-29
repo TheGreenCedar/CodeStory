@@ -370,8 +370,9 @@ pub use query_features::{
 pub use ranker::{RANKING_POLICY_VERSION, rank_candidates};
 pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
-    GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, RETENTION_MARKER_SCHEMA_V1,
-    RETENTION_MARKER_SCHEMA_V2, global_generation_gc_state_file,
+    GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, PeerWriterActive,
+    PeerWriterHolder, RETENTION_MARKER_SCHEMA_V1, RETENTION_MARKER_SCHEMA_V2,
+    global_generation_gc_state_file,
 };
 pub use rollback::{
     RetainedRollbackObservation, RollbackActivationError, RollbackActivationOutcome,

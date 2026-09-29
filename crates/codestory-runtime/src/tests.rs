@@ -10508,8 +10508,8 @@ fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding
         IncrementalPlanProbeOutcomeDto::ShortCircuited,
         "an unchanged workspace must resolve to the short-circuit outcome: {probe:?}"
     );
-    assert_eq!(probe.files_to_index, 0);
-    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.files_to_index, Some(0));
+    assert_eq!(probe.files_to_remove, Some(0));
     assert_eq!(probe.skipped_database_copies, 0);
     assert!(probe.skipped_search_state_rebuild);
     assert!(
@@ -10574,8 +10574,8 @@ fn incremental_refresh_does_not_short_circuit_an_unsealed_source_alias_inventory
         IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
         "a generic artifact seal cannot authorize an alias inventory short-circuit: {probe:?}"
     );
-    assert_eq!(probe.files_to_index, 0);
-    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.files_to_index, Some(0));
+    assert_eq!(probe.files_to_remove, Some(0));
     assert!(!probe.skipped_search_state_rebuild);
     assert!(
         timings.publish_ms.is_some(),
@@ -10649,6 +10649,57 @@ fn incremental_staged_refresh_falls_back_from_an_unsealable_source_alias() {
 }
 
 #[test]
+fn incremental_plan_probe_reports_open_core_stage_and_null_counts_for_a_stale_schema35_core() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // The same durable downgrade the CLI schema-35 fixture performs: the
+    // published generation's `user_version` reads as the older release, so
+    // the observational open refuses before any probe stage can run.
+    mutate_published_core(&fixture.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch("PRAGMA user_version = 35;")
+            .expect("downgrade published core to schema 35");
+    });
+
+    let probe = probe_incremental_plan(
+        fixture._workspace.path(),
+        &fixture.storage_path,
+        &SourceIndexPolicy::default(),
+    );
+
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+        "a schema-35 core must refuse observational open, not read as an empty plan"
+    );
+    assert_eq!(
+        probe.unavailable_stage,
+        Some(codestory_contracts::api::IncrementalProbeUnavailableStageDto::OpenCore),
+        "the probe must attribute the refusal to the stage that failed"
+    );
+    assert_eq!(
+        probe.files_to_index, None,
+        "counts were never computed and must not read as a measured zero"
+    );
+    assert_eq!(
+        probe.files_to_remove, None,
+        "counts were never computed and must not read as a measured zero"
+    );
+    assert!(
+        !probe.short_circuited(),
+        "an unopened core can never short-circuit a refresh"
+    );
+
+    // The event projection must keep the stage and the null counts on the
+    // wire so observers can tell "never computed" from "measured empty".
+    let dto = crate::index_timings::incremental_plan_probe_timings(&probe);
+    let value = serde_json::to_value(&dto).expect("serialize probe timings");
+    assert_eq!(value["probe_unavailable_stage"], "open_core");
+    assert_eq!(value["files_to_index"], serde_json::Value::Null);
+    assert_eq!(value["files_to_remove"], serde_json::Value::Null);
+}
+
+#[test]
 fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
     let fixture = publish_empty_plan_short_circuit_baseline();
     fs::write(&fixture.source_path, "pub fn steady_state() -> i32 { 2 }\n").expect("change source");
@@ -10667,7 +10718,7 @@ fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
         IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
         "a changed workspace must not be reported as short-circuited: {probe:?}"
     );
-    assert_eq!(probe.files_to_index, 1);
+    assert_eq!(probe.files_to_index, Some(1));
     assert_eq!(probe.skipped_database_copies, 0);
     assert_eq!(probe.skipped_database_copy_bytes, 0);
     assert!(!probe.skipped_search_state_rebuild);
@@ -10841,8 +10892,8 @@ fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
         IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
         "an empty plan must not short-circuit while the exclusion manifest is bound to a superseded policy: {probe:?}"
     );
-    assert_eq!(probe.files_to_index, 0);
-    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.files_to_index, Some(0));
+    assert_eq!(probe.files_to_remove, Some(0));
     assert_eq!(probe.skipped_database_copies, 0);
     assert!(timings.publish_ms.is_some());
     assert_eq!(

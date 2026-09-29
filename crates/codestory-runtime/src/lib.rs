@@ -10,23 +10,23 @@ use codestory_contracts::api::{
     AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentHybridWeightsDto, ApiError,
-    AppEventPayload, EdgeKind, EmbeddingProfileContractDto, FrameworkRouteCoverageDto,
-    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
-    GroundingFileDigestDto, GroundingOrientationConfidenceDto, GroundingOrientationDto,
-    GroundingOrientationUncertaintyDto, GroundingSnapshotDto, GroundingSymbolDigestDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
-    IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, RouteEndpointKindDto,
-    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
-    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
-    StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
-    WorkspaceMemberIndexDto,
+    ApiErrorDetails, AppEventPayload, EdgeKind, EmbeddingProfileContractDto,
+    FrameworkRouteCoverageDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
+    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingOrientationConfidenceDto,
+    GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto,
+    IndexPublicationDto, IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId,
+    NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
+    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
+    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
+    TrailContextDto, WorkspaceMemberIndexDto,
 };
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -75,6 +75,28 @@ fn index_storage_error(context: &str, error: codestory_store::StorageError) -> A
         } => ApiError::insufficient_cache_space(operation, required_bytes, available_bytes),
         other => ApiError::internal(format!("{context}: {other}")),
     }
+}
+
+/// Recover the typed `peer_writer_active` failure from an anyhow chain: a
+/// writer-scope retention lock timed out behind a live peer, and the owner
+/// record it published beside the lock carries who that peer is.
+pub fn peer_writer_api_error(error: &anyhow::Error) -> Option<ApiError> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<codestory_retrieval::PeerWriterActive>()
+            .map(|peer| {
+                ApiError::with_details(
+                    "peer_writer_active",
+                    peer.to_string(),
+                    ApiErrorDetails {
+                        cause_code: Some("lock_wait_timeout".into()),
+                        failed_layer: Some("retrieval_finalize".into()),
+                        peer_writer: Some(peer.diagnostics()),
+                        ..ApiErrorDetails::cause("peer_writer_active")
+                    },
+                )
+            })
+    })
 }
 
 /// Preserve a sealed component copy's disk refusal through retrieval and CLI
