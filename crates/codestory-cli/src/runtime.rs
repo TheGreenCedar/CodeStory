@@ -1468,6 +1468,19 @@ mod tests {
             }
             Self { values }
         }
+
+        /// Set `name` to `value` for the guard's lifetime, restoring the prior
+        /// value (or absence) on drop. Callers must hold the config env test
+        /// lock so no concurrent capture observes the forced value.
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = env::var_os(name);
+            unsafe {
+                env::set_var(name, value);
+            }
+            Self {
+                values: vec![(name, prior)],
+            }
+        }
     }
 
     impl Drop for EnvSnapshot {
@@ -1863,9 +1876,7 @@ mod tests {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
-        unsafe {
-            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
-        }
+        let _embed_env = EnvSnapshot::set("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
         let cache = temp.path().join("cache");
@@ -1927,9 +1938,7 @@ mod tests {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
-        unsafe {
-            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
-        }
+        let _embed_env = EnvSnapshot::set("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
         let cache = temp.path().join("cache");
@@ -2034,9 +2043,7 @@ mod tests {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
-        unsafe {
-            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
-        }
+        let _embed_env = EnvSnapshot::set("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
         let cache = temp.path().join("cache");

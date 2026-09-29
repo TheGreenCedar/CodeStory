@@ -1105,6 +1105,19 @@ mod tests {
                 output_bytes: None,
                 attested_bytes: None,
             },
+            // Single-cause rejection: an allowlisted component carrying an
+            // unallowlisted mode must be refused on the mode alone.
+            FinalizeComponentWork {
+                component: "vectors".into(),
+                mode: "/private/mode".into(),
+                retained: None,
+                inserted: None,
+                removed: None,
+                reordered: None,
+                predecessor_bytes: None,
+                output_bytes: None,
+                attested_bytes: None,
+            },
         ];
 
         let safe_phases = safe_retrieval_phase_timings(&phases);

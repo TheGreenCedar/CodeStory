@@ -1479,9 +1479,10 @@ fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
         .expect("run symbol help");
     assert_success(&help, "symbol --help failed");
     let help_text = String::from_utf8_lossy(&help.stdout);
-    if !help_text.contains("--choose") {
-        return;
-    }
+    assert!(
+        help_text.contains("--choose"),
+        "symbol --help must advertise --choose for the numbered-alternative flow: {help_text}"
+    );
 
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

@@ -8669,6 +8669,31 @@ mod tests {
             &valid.uri,
         ));
 
+        // Same-binding controls on a populated session: a live capability
+        // reads in its owning session and is refused in a foreign one. `valid`
+        // was already evicted by the churn above, so register a live grant.
+        let live = session
+            .diagnostics_v3
+            .lock()
+            .unwrap()
+            .register_at(
+                diagnostic_binding(Uuid::new_v4().to_string()),
+                br#"{"live":true}"#.to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let own = diagnostic_resource_read(&mut session, "own-live", &live.uri);
+        assert_eq!(
+            own.pointer("/result/contents/0/text"),
+            Some(&json!("{\"live\":true}")),
+            "the owning session must read its live capability: {own}"
+        );
+        unavailable(&diagnostic_resource_read(
+            &mut other_session,
+            "foreign-live",
+            &live.uri,
+        ));
+
         let malformed = diagnostic_resource_read(
             &mut session,
             "malformed",
@@ -9605,8 +9630,19 @@ mod tests {
             }),
         };
 
-        queued.admit(stdio_cancellation_line(r#""request-1""#), Some(&active));
+        // A wrong-target cancellation on a fresh active request must not set
+        // its flags: prove isolation before the own-target cancel runs.
         queued.admit(stdio_cancellation_line("\"other\""), Some(&active));
+        assert!(
+            !cancelled.load(Ordering::Acquire),
+            "a cancellation for another request must not flag this one"
+        );
+        assert!(
+            !client_cancelled.load(Ordering::Acquire),
+            "a cancellation for another request must not flag this one"
+        );
+
+        queued.admit(stdio_cancellation_line(r#""request-1""#), Some(&active));
 
         assert!(
             cancelled.load(Ordering::Acquire),
@@ -10297,12 +10333,24 @@ mod tests {
     #[tokio::test]
     async fn stdio_serve_loop_answers_the_running_request_when_termination_arrives() {
         static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static OBSERVED_TERMINATION: AtomicBool = AtomicBool::new(false);
         fn handler(
             _: &mut StdioServerSession,
             line: &str,
-            _: &Arc<AtomicBool>,
+            cancelled: &Arc<AtomicBool>,
         ) -> Option<serde_json::Value> {
             ENTERED.store(true, Ordering::Release);
+            // Hold the request until termination actually signals it, so the
+            // running-request overlap this test claims is real. RELEASE is the
+            // cleanup escape if the serve loop abandons the worker instead.
+            while !RELEASE.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) {
+                    OBSERVED_TERMINATION.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Some(stdio_jsonrpc_success(
                 stdio_message_id(line).unwrap_or_default(),
                 json!({"served": true}),
@@ -10332,7 +10380,15 @@ mod tests {
         .await
         .expect("termination drains the running request");
 
+        // Free the worker before asserting so a failure cannot strand it.
+        let observed_termination = OBSERVED_TERMINATION.load(Ordering::Acquire);
+        RELEASE.store(true, Ordering::Release);
+
         assert_eq!(outcome, StdioServeOutcome::Terminated);
+        assert!(
+            observed_termination,
+            "the request must still be running when termination signals it"
+        );
 
         let responses = stdio_written_responses(&output);
         assert_eq!(responses.len(), 1, "{responses:?}");
