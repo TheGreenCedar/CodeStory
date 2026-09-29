@@ -31,20 +31,24 @@ reusable only while the artifact's native identity matches the observation the
 receipt was sealed to. A failing validation is never cached and removes any
 receipt the key already held.
 
-The seal is only as strong as the metadata the platform reports, and Windows
-reports less than Unix does. On Unix a seal carries the device/inode pair and
-the inode-change instant, so an in-place rewrite breaks it even when the writer
-restores the modification time, and a replacement breaks it even when the new
-bytes and timestamps match. `std::fs` exposes neither field on Windows, so a
-seal there compares presence, length, the creation and modification instants,
-and the read-only bit. **On Windows a same-length in-place rewrite that restores
-the modification time satisfies the seal, and the receipt answers for bytes it
-never read.** A receipt proves the artifact was not casually touched on that
-platform; it does not prove the bytes are the ones the validation read, and
-nothing that must detect deliberate corruption may rest on a receipt alone
-there. `SealFidelity` names which of the two an observation is, and
-`ArtifactSeal::fidelity` reports it, so callers and tests read the limit off the
-observation instead of assuming the stronger case.
+The seal is only as strong as the metadata the platform reports. On Unix a
+seal carries the device/inode pair and the inode-change instant; on Windows
+the observation opens the file briefly and carries the volume serial number,
+the file index, and the NTFS ChangeTime. On both platforms an in-place rewrite
+breaks the seal even when the writer restores the modification time, and a
+replacement breaks it even when the new bytes and timestamps match. Where the
+platform reports none of that — a Windows file whose handle query fails or
+whose filesystem cannot report a change instant, or any other platform — the
+seal compares presence, length, the creation and modification instants, and
+the read-only bit only. **Under such an observation a same-length in-place
+rewrite that restores the modification time satisfies the seal, and the
+receipt answers for bytes it never read.** A receipt proves the artifact was
+not casually touched there; it does not prove the bytes are the ones the
+validation read, and nothing that must detect deliberate corruption may rest
+on a receipt alone under that weaker observation. `SealFidelity` names which
+of the two an observation is, and `ArtifactSeal::fidelity` reports it, so
+callers and tests read the limit off the observation instead of assuming the
+stronger case.
 
 ## Extension rules
 
