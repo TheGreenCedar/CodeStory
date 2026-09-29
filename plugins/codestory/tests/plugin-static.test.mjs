@@ -4076,7 +4076,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     })}\n`);
     const status = JSON.parse((await responseFor("status")).result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
-    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(realRepoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.readiness[0].setup.probe_status, 17);
     assert.match(
@@ -4870,7 +4870,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
-    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(realRepoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.degraded_reason, "managed_cli_unavailable");
     assert.equal(status.project_selection, undefined);
@@ -5796,7 +5796,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       params: { uri: statusUri },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
-    assert.equal(status.project_root, repoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(repoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(statusResponse.result.contents[0].uri, statusUri);
     assert.ok(
@@ -7936,7 +7936,35 @@ test("release asset downloader refuses a partial swapped for a symlink after it 
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   let planted = false;
+  const plant = () => {
+    if (planted) return;
+    planted = true;
+    fs.symlinkSync(outside, partialPath, "file");
+  };
   try {
+    if (process.platform === "win32") {
+      // O_NOFOLLOW is 0 on Windows: the open follows the planted link into the
+      // outside file, so the refusal arrives at publish — the post-rename
+      // identity check — not at the partial-open gate. Nothing may land at the
+      // destination.
+      await assert.rejects(
+        launcherTest.downloadFile(
+          `http://127.0.0.1:${server.address().port}/runtime`,
+          destination,
+          {
+            attempts: 3,
+            retryDelayMs: () => 1,
+            timeoutMs: 5000,
+            partialPath,
+            onProgress: plant,
+          },
+        ),
+        /published_identity/u,
+      );
+      assert.equal(planted, true);
+      assert.equal(fs.existsSync(destination), false);
+      return;
+    }
     await launcherTest.downloadFile(
       `http://127.0.0.1:${server.address().port}/runtime`,
       destination,
@@ -7947,11 +7975,7 @@ test("release asset downloader refuses a partial swapped for a symlink after it 
         partialPath,
         // The first progress callback fires after the partial has been sized and before the transfer
         // opens it: exactly the window a planted link would exploit.
-        onProgress() {
-          if (planted) return;
-          planted = true;
-          fs.symlinkSync(outside, partialPath, "file");
-        },
+        onProgress: plant,
       },
     );
     assert.equal(planted, true);
