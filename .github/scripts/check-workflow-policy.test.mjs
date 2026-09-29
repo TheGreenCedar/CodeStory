@@ -6045,7 +6045,7 @@ await import("node:worker_threads");
 `, {}, /must not create subprocesses, workers, or clusters/u],
     ["matrix calls the lint twice", `${source}
 runRetrievalGeneralizationLint({});
-`, {}, /through one in-process lint invocation/u],
+`, {}, /through in-process lint invocations/u],
     ["matrix aliases the lint for a second invocation", source.replace(
       "    const result = runRetrievalGeneralizationLint({",
       [
@@ -6053,7 +6053,7 @@ runRetrievalGeneralizationLint({});
         "    invokeAgain({});",
         "    const result = runRetrievalGeneralizationLint({",
       ].join("\n"),
-    ), {}, /through one in-process lint invocation/u],
+    ), {}, /through in-process lint invocations/u],
     ["global file lock returns", `${source}
 fs.openSync(path.join(os.tmpdir(), "retrieval-generalization.lock"), "wx");
 `, {}, /must not restore a global or cross-process fixture lock/u],
@@ -6069,15 +6069,15 @@ fs.openSync(path.join(os.tmpdir(), "retrieval-generalization.lock"), "wx");
     ["second global temporary root returns", `${source}
 const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shared-suite-"));
 fs.mkdirSync(path.join(sharedRoot, "sentinel"));
-`, {}, /under one temporary tree outside the checkout/u],
+`, {}, /declared temporary trees outside the checkout/u],
     ["second sibling temporary root returns", `${source}
 const sharedRoot = fs.mkdtempSync(path.join(path.dirname(fixtureRoot), "shared-suite-"));
 fs.mkdirSync(path.join(sharedRoot, "sentinel"));
-`, {}, /under one temporary tree outside the checkout/u],
+`, {}, /declared temporary trees outside the checkout/u],
     ["fixtures move into the checkout", source.replace(
       'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
       'fs.mkdtempSync(path.join(repositoryRoot, "codestory-generalization-"))',
-    ), {}, /under one temporary tree outside the checkout/u],
+    ), {}, /declared temporary trees outside the checkout/u],
     ["checkout read-only comparison is removed", source.replace(
       "const checkoutBefore = treeDigest(repositoryRoot);",
       "const checkoutBefore = null;",
@@ -6110,7 +6110,7 @@ fs.mkdirSync(path.join(sharedRoot, "sentinel"));
     ["fixture cleanup is removed", source.replace(
       "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
       "",
-    ), {}, /remove its isolated fixture tree/u],
+    ), {}, /remove its isolated fixture trees/u],
   ];
 
   for (const [name, candidate, options, expectedReason] of mutations) {

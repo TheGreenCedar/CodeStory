@@ -11601,6 +11601,57 @@ mod tests {
         );
     }
 
+    struct EnvVarRestore(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvVarRestore {
+        fn capture(name: &'static str) -> Self {
+            Self(name, std::env::var_os(name))
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_project_stdio_ignores_mutable_active_workspace_state() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _multi = EnvVarRestore::capture("CODESTORY_PLUGIN_MULTI_PROJECT");
+        let _state = EnvVarRestore::capture("CODESTORY_PLUGIN_ACTIVE_STATE_PATH");
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        let active = tempfile::tempdir().expect("active workspace");
+        let state_file = tempfile::NamedTempFile::new().expect("active state");
+        std::fs::write(
+            state_file.path(),
+            serde_json::json!({ "cwd": active.path() }).to_string(),
+        )
+        .expect("write active state");
+        unsafe {
+            std::env::set_var("CODESTORY_PLUGIN_ACTIVE_STATE_PATH", state_file.path());
+            std::env::set_var("CODESTORY_PLUGIN_MULTI_PROJECT", "1");
+        }
+
+        // Multi-project mode selects its project per request and must not even
+        // read the ambient active-workspace pointer.
+        assert!(stdio_workspace_mismatch(&runtime).is_none());
+
+        // Without the flag the same ambient state is a real mismatch — the
+        // ignored-state branch above is the discriminating bit, not the file.
+        unsafe {
+            std::env::remove_var("CODESTORY_PLUGIN_MULTI_PROJECT");
+        }
+        let mismatch = stdio_workspace_mismatch(&runtime).expect("mismatch without multi-project");
+        assert_eq!(mismatch.served_root, runtime.project_root);
+        assert_eq!(mismatch.active_root, active.path().to_path_buf());
+    }
+
     #[test]
     fn stdio_recommended_next_calls_labels_restart_boundary_as_host_action() {
         let restart =

@@ -315,20 +315,6 @@ function banFiredFor(result, relativePath, planted) {
   );
 }
 
-function rankerFilenameLiteral(line) {
-  for (const match of line.matchAll(/(["'`])([^"'`]+)\1/gu)) {
-    const token = match[2];
-    if (
-      /^[A-Za-z0-9]/u.test(token)
-      && token.includes(".")
-      && /^[a-z0-9._-]+$/u.test(token)
-    ) {
-      return token;
-    }
-  }
-  return null;
-}
-
 function workflowTriggerPaths(workflow, triggerName) {
   const lines = workflow.split(/\r?\n/u);
   const start = lines.findIndex((line) => line.trimEnd() === `  ${triggerName}:`);
@@ -804,27 +790,31 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
   for (const [relativePath, contents] of rejectedNonRust) {
     write(nonRustRoot, `rejected/${relativePath}`, contents);
   }
+  // Entries are [scenario directory, relative path, contents]. Two
+  // check-workflow-policy.mjs rows exercise different allowed-use entries of
+  // the same allowlisted file; each needs its own scan root or the second
+  // fixture would silently overwrite the first.
   const allowedNonRust = [
-    ["prose.md", "The benchmark harness reads `benchmarks/tasks/eval-probes.json`; production code must not.\n"],
-    ["quoted-shell.sh", "value='scripts/fetch-\\\nholdout-repos.mjs'\n"],
-    ["unrelated-list.yml", "- scripts/fetch-\\\n- holdout-repos.mjs\n"],
-    ["template-comment.mjs", "const value = `${({ clean: true }).clean /* scripts/fetch-holdout-repos.mjs */}`;\n"],
-    ["quoted-shell-comment.sh", "value='clean\\' # scripts/fetch-holdout-repos.mjs\n"],
-    ["quoted-powershell-comment.ps1", "$value = 'clean`' # scripts/fetch-holdout-repos.mjs\n"],
-    ["quoted-yaml-comment.yml", "value: 'clean\\' # scripts/fetch-holdout-repos.mjs\n"],
-    ["folded-workflow.yml", "run: >-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n"],
-    ["comment-only.yml", "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n"],
-    ["plain-apostrophe.yml", "message: don't load it # scripts/fetch-holdout-repos.mjs\n"],
-    ["punctuated-apostrophe.yml", "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n"],
-    ["doubled-single-quote.yml", "value: 'scripts/fetch-''holdout-repos.mjs'\n"],
-    [".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n"],
-    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst exactQualificationReferences = [\n  \"retrieval-engine-smoke.yml\",\n  \"node scripts/codestory-agent-ab-benchmark.mjs\",\n];\n"],
-    [".github/scripts/check-workflow-policy.mjs", "export const frozenCandidateQualityWorkflowRef = \"./.github/workflows/frozen-candidate-quality.yml\";\n"],
-    [".github/workflows/packaged-platform-pr.yml", "uses: ./.github/workflows/frozen-candidate-quality.yml\n"],
-    [".github/workflows/macos-metal-proof.yml", "run: |\n  node scripts/codestory-agent-ab-benchmark.mjs \\\n    --packet-runtime \\\n    --packet-runtime-mode cold-cli \\\n    --task-suite holdout-retrieval \\\n    --materialize-repos \\\n    --repeats 3 \\\n    --publishable \\\n    --max-source-reads-after-packet 0 \\\n    --codestory-cli \"$packaged_cli\" \\\n    --timeout-ms 180000 \\\n    --out-dir \"$quality_root/packet\"\n"],
+    ["allowed", "prose.md", "The benchmark harness reads `benchmarks/tasks/eval-probes.json`; production code must not.\n"],
+    ["allowed", "quoted-shell.sh", "value='scripts/fetch-\\\nholdout-repos.mjs'\n"],
+    ["allowed", "unrelated-list.yml", "- scripts/fetch-\\\n- holdout-repos.mjs\n"],
+    ["allowed", "template-comment.mjs", "const value = `${({ clean: true }).clean /* scripts/fetch-holdout-repos.mjs */}`;\n"],
+    ["allowed", "quoted-shell-comment.sh", "value='clean\\' # scripts/fetch-holdout-repos.mjs\n"],
+    ["allowed", "quoted-powershell-comment.ps1", "$value = 'clean`' # scripts/fetch-holdout-repos.mjs\n"],
+    ["allowed", "quoted-yaml-comment.yml", "value: 'clean\\' # scripts/fetch-holdout-repos.mjs\n"],
+    ["allowed", "folded-workflow.yml", "run: >-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n"],
+    ["allowed", "comment-only.yml", "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n"],
+    ["allowed", "plain-apostrophe.yml", "message: don't load it # scripts/fetch-holdout-repos.mjs\n"],
+    ["allowed", "punctuated-apostrophe.yml", "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n"],
+    ["allowed", "doubled-single-quote.yml", "value: 'scripts/fetch-''holdout-repos.mjs'\n"],
+    ["allowed", ".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n"],
+    ["allowed-exact", ".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst exactQualificationReferences = [\n  \"retrieval-engine-smoke.yml\",\n  \"node scripts/codestory-agent-ab-benchmark.mjs\",\n];\n"],
+    ["allowed-frozen", ".github/scripts/check-workflow-policy.mjs", "export const frozenCandidateQualityWorkflowRef = \"./.github/workflows/frozen-candidate-quality.yml\";\n"],
+    ["allowed", ".github/workflows/packaged-platform-pr.yml", "uses: ./.github/workflows/frozen-candidate-quality.yml\n"],
+    ["allowed", ".github/workflows/macos-metal-proof.yml", "run: |\n  node scripts/codestory-agent-ab-benchmark.mjs \\\n    --packet-runtime \\\n    --packet-runtime-mode cold-cli \\\n    --task-suite holdout-retrieval \\\n    --materialize-repos \\\n    --repeats 3 \\\n    --publishable \\\n    --max-source-reads-after-packet 0 \\\n    --codestory-cli \"$packaged_cli\" \\\n    --timeout-ms 180000 \\\n    --out-dir \"$quality_root/packet\"\n"],
   ];
-  for (const [relativePath, contents] of allowedNonRust) {
-    write(nonRustRoot, `allowed/${relativePath}`, contents);
+  for (const [scenario, relativePath, contents] of allowedNonRust) {
+    write(nonRustRoot, `${scenario}/${relativePath}`, contents);
   }
   write(nonRustRoot, "rejected/neutral.rs", "pub fn neutral() {}\n");
   write(nonRustRoot, "allowed/neutral.rs", "pub fn neutral() {}\n");
@@ -850,6 +840,8 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
       defaultNonRustScanRoots: [
         path.join(nonRustRoot, "rejected"),
         path.join(nonRustRoot, "allowed"),
+        path.join(nonRustRoot, "allowed-exact"),
+        path.join(nonRustRoot, "allowed-frozen"),
       ],
       validatePendingSurfaceInventory: false,
     });
@@ -1096,10 +1088,10 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
       ),
       `the exact hostile policy split was masked by another finding: ${JSON.stringify(policyFindings)}`,
     );
-    for (const [relativePath] of allowedNonRust) {
+    for (const [scenario, relativePath] of allowedNonRust) {
       assert.ok(
-        !findingFor(result, `allowed/${relativePath}`),
-        `allowed non-Rust fixture ${relativePath} received a finding`,
+        !findingFor(result, `${scenario}/${relativePath}`),
+        `allowed non-Rust fixture ${scenario}/${relativePath} received a finding`,
       );
     }
 
@@ -1182,21 +1174,73 @@ const ALL_REPOS = { ...PUBLIC_REPOS };
   );
 });
 
-test("ranker production has no repository filename literals", () => {
-  const rankerPath = path.join(
+function rankerLintRun(scanRoot) {
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !name.startsWith("CODESTORY_RETRIEVAL_GENERALIZATION_"),
+    ),
+  );
+  return runRetrievalGeneralizationLint({
     repositoryRoot,
-    "crates/codestory-retrieval/src/ranker.rs",
+    environment,
+    defaultScanRoots: [scanRoot],
+    defaultNonRustScanRoots: [],
+    validatePendingSurfaceInventory: false,
+  });
+}
+
+test("ranker production has no repository filename literals", () => {
+  // Drive the production scanner itself rather than a local
+  // split-on-`#[cfg(test)]` + regex copy: the real seam masks cfg(test) items
+  // structurally and matches filename literals case-insensitively.
+  const result = rankerLintRun(
+    path.join(repositoryRoot, "crates", "codestory-retrieval", "src"),
   );
-  const source = fs.readFileSync(rankerPath, "utf8");
-  const production = source.split("#[cfg(test)]", 1)[0];
-  const finding = production.split(/\r?\n/u)
-    .map((line, index) => ({ line: index + 1, token: rankerFilenameLiteral(line) }))
-    .find(({ token }) => token != null);
-  assert.equal(
-    finding,
-    undefined,
-    `ranker production contains a repository filename literal: ${JSON.stringify(finding)}`,
+  const rankerFindings = result.findings.filter((finding) =>
+    finding.file?.replaceAll("\\", "/").endsWith("ranker.rs")
   );
+  assert.deepEqual(
+    rankerFindings,
+    [],
+    `ranker production contains repository filename literals: ${JSON.stringify(rankerFindings)}`,
+  );
+});
+
+test("the ranker filename scanner sees through fake attributes and case", () => {
+  const rankerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ranker-literal-"));
+  try {
+    fs.writeFileSync(
+      path.join(rankerRoot, "ranker.rs"),
+      [
+        "// a #[cfg(test)] mention in a comment must not mask what follows",
+        'fn production() { let _name = "eval-probes.json"; }',
+        'fn uppercase() { let _name = "RELEASE-MANIFEST.JSON"; }',
+        "#[cfg(test)]",
+        'mod tests { fn fixture() { let _masked = "drill-report.json"; } }',
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const result = rankerLintRun(rankerRoot);
+    assert.equal(result.exitCode, 1, "the hostile ranker fixture was not flagged");
+    assert.match(
+      result.stderr,
+      /eval-probes\.json/u,
+      "commented attribute mention masked live production",
+    );
+    assert.match(
+      result.stderr,
+      /RELEASE-MANIFEST\.JSON/u,
+      "uppercase filename literal slipped the case-insensitive pattern",
+    );
+    assert.doesNotMatch(
+      result.stderr,
+      /drill-report\.json/u,
+      "cfg(test) module body was not masked",
+    );
+  } finally {
+    fs.rmSync(rankerRoot, { recursive: true, force: true });
+  }
 });
 
 // The pending inventory is checked as data, not against the checkout: the lint
