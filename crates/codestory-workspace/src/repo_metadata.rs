@@ -2282,10 +2282,12 @@ mod tests {
     #[test]
     fn rewrite_blob_threshold_boundary_controls_rename_detection() {
         let project = git_project();
+        // The bound is a declared contract: 1,000,000 bytes, to the byte.
+        assert_eq!(MAX_REWRITE_BLOB_BYTES, 1_000_000);
         for (size, expect_rename) in [
-            (MAX_REWRITE_BLOB_BYTES as usize - 10_000, true),
-            (MAX_REWRITE_BLOB_BYTES as usize + 10_000, false),
-            (MAX_REWRITE_BLOB_BYTES as usize + 100_000, false),
+            (990_000usize, true),
+            (1_010_000usize, false),
+            (1_100_000usize, false),
         ] {
             let mut body: String = (0..size / 26)
                 .map(|i| format!("pub fn f{i:012}() {{}}\n"))
