@@ -1843,9 +1843,10 @@ mod tests {
         // the configured command. Without that, a git version that ignores
         // `core.fsmonitor` would make the containment assertion below pass
         // vacuously.
-        let unconstrained = crate::test_git::git_command(project.path(), &["status", "--porcelain"])
-            .output()
-            .expect("run fsmonitor-probing git status");
+        let unconstrained =
+            crate::test_git::git_command(project.path(), &["status", "--porcelain"])
+                .output()
+                .expect("run fsmonitor-probing git status");
         assert!(unconstrained.status.success());
         assert!(
             marker.exists(),
