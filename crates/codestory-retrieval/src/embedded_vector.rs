@@ -5184,9 +5184,12 @@ mod tests {
                             // `hits.len() == 20` assertion reachable: the
                             // product abstention floor and margin retain only
                             // near-parallel rows, and the generated pattern
-                            // peaks at 0.8 for every other index.
-                            vector[0] = 1.0;
-                            vector[7] = 0.5;
+                            // peaks at 0.8 for every other index. Stored
+                            // vectors must be L2-normalized, so the unit-length
+                            // spelling of the query direction is used.
+                            const QUERY_NORM: f32 = 0.894_427_2;
+                            vector[0] = QUERY_NORM;
+                            vector[7] = 0.5 * QUERY_NORM;
                         } else {
                             let first = index % DIMENSION;
                             let second = (index.wrapping_mul(31) + 8) % DIMENSION;
