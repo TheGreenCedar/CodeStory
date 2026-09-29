@@ -269,8 +269,14 @@ def _never_exit_fails_by_identity_without_replacement() -> None:
 def _candidate_exit_fails_before_the_predecessor_probe() -> None:
     predecessor = _ScriptedPredecessor([False])
     candidate = _ScriptedCandidate(exit_on_probe=1)
+    invocations: list[tuple[float, int | None]] = []
     try:
-        _drive_replacement(predecessor, candidate, allowance_secs=1.0)
+        _drive_replacement(
+            predecessor,
+            candidate,
+            allowance_secs=1.0,
+            invocations=invocations,
+        )
     except ProofFailure as error:
         message = str(error)
         require(
@@ -285,6 +291,11 @@ def _candidate_exit_fails_before_the_predecessor_probe() -> None:
     require(
         predecessor.probes == 0,
         "the crash fence probed the predecessor before noticing candidate exit",
+    )
+    require(
+        not invocations,
+        "a dead paused candidate still ran the replacement worker:"
+        f" {invocations}",
     )
 
 

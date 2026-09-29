@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,40 @@ def _temporary_boundary_ordering_test() -> None:
         proof < cleanup < returned,
         "runtime proof no longer fences the exact native server before"
         " returning to the temporary-directory boundary",
+    )
+    # Order alone is not enough: a ``return`` between the two calls, or a
+    # conditional guarding the wait, would preserve the substring order above
+    # while bypassing the fence.
+    lines = body.splitlines()
+    proof_line = next(
+        i
+        for i, line in enumerate(lines)
+        if "runtime = prove_runtime(" in line or "prove_single_project_runtime(" in line
+    )
+    cleanup_line = next(
+        i
+        for i, line in enumerate(lines)
+        if "cleanup = wait_for_final_temporary_package_server(" in line
+    )
+    require(
+        not any(
+            re.search(r"\breturn\b", line)
+            for line in lines[proof_line + 1 : cleanup_line]
+        ),
+        "run_runtime_proof can return between proving the runtime and fencing"
+        " the exact native server",
+    )
+    cleanup_indent = len(lines[cleanup_line]) - len(lines[cleanup_line].lstrip())
+    enclosing_header = next(
+        line.strip()
+        for line in reversed(lines[:cleanup_line])
+        if (len(line) - len(line.lstrip())) < cleanup_indent
+        and line.rstrip().endswith(":")
+    )
+    require(
+        enclosing_header == "try:",
+        "the crash-fence wait is guarded by something other than its own"
+        f" error capture: {enclosing_header}",
     )
 
 

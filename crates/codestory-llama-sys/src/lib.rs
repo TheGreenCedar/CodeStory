@@ -1861,7 +1861,7 @@ fn embed_inputs(
         admission.progress(priority.request_class());
         offset = end;
         if priority == RequestPriority::Bulk && offset < tokenized.len() {
-            if let Some(query) = take_query_between_bulk_batches(query_queue) {
+            run_bulk_query_boundary(query_queue, request_context, |query| {
                 handle_request(
                     query,
                     RequestPriority::Query,
@@ -1872,8 +1872,7 @@ fn embed_inputs(
                     config,
                     admission,
                 );
-            }
-            ensure_embedding_request_live(request_context)?;
+            })?;
         }
     }
     request_context.record_completed_tokens(completed_tokens);
@@ -1884,6 +1883,20 @@ fn embed_inputs(
             native_encode_ns,
         },
     ))
+}
+
+/// Between bulk batches a queued query gets one interleaved slot, then the
+/// bulk request's liveness is rechecked before work continues. Cancellation
+/// must stop bulk work here, not only at the batch loop top.
+fn run_bulk_query_boundary(
+    query_queue: &CancellableRequestQueue,
+    request_context: &EmbeddingRequestContext,
+    serve_query: impl FnOnce(EmbeddingRequest),
+) -> Result<(), EngineError> {
+    if let Some(query) = take_query_between_bulk_batches(query_queue) {
+        serve_query(query);
+    }
+    ensure_embedding_request_live(request_context)
 }
 
 fn ensure_embedding_request_live(
@@ -2582,13 +2595,44 @@ mod tests {
 
     #[test]
     fn cancelled_bulk_does_not_continue_after_query_boundary() {
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query_queue = CancellableRequestQueue::new(1, admission);
+        let mut served = Vec::new();
+
+        // With nothing queued, the boundary still rechecks liveness: removing
+        // the post-boundary check would let this cancelled bulk continue.
         let bulk = EmbeddingRequestContext::new("bulk", "scope", 0);
         assert!(bulk.cancel());
+        let outcome = run_bulk_query_boundary(&query_queue, &bulk, |query| {
+            served.push(query.context.request_id().to_string());
+        });
+        assert!(matches!(outcome, Err(EngineError::Cancelled)));
+        assert!(served.is_empty());
 
-        assert!(matches!(
-            ensure_embedding_request_live(&bulk),
-            Err(EngineError::Cancelled)
-        ));
+        // A queued query is served at the boundary, then a cancelled bulk stops
+        // instead of continuing to its next batch.
+        let (_, request, _) = queued_request("query-1");
+        assert!(query_queue.try_push(request).is_ok());
+        let live_bulk = EmbeddingRequestContext::new("live-bulk", "scope", 0);
+        let outcome = run_bulk_query_boundary(&query_queue, &live_bulk, |query| {
+            served.push(query.context.request_id().to_string());
+        });
+        assert!(outcome.is_ok());
+        assert_eq!(served, ["query-1"]);
+
+        let (_, request, _) = queued_request("query-2");
+        assert!(query_queue.try_push(request).is_ok());
+        let cancelled_bulk = EmbeddingRequestContext::new("cancelled-bulk", "scope", 0);
+        assert!(cancelled_bulk.cancel());
+        let outcome = run_bulk_query_boundary(&query_queue, &cancelled_bulk, |query| {
+            served.push(query.context.request_id().to_string());
+        });
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "cancellation must stop bulk work at the query boundary"
+        );
+        assert_eq!(served, ["query-1", "query-2"]);
+        assert_eq!(query_queue.depth(), 0);
     }
 
     #[test]

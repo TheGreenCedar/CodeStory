@@ -2276,8 +2276,15 @@ mod tests {
         );
     }
 
+    /// Named lane `proof-availability-frozen-checkouts`
+    /// (docs/contributors/testing-matrix.md): the pinned cohort trees are
+    /// external checkouts fetched by the source-only `materialize
+    /// --verify-only` form, so the test is `#[ignore]`d out of the default
+    /// gate. The default suite covers the same receipt-file binding through
+    /// the synthetic fixture in
+    /// `oracle_source_verification_binds_steps_to_the_exact_full_file_bytes`.
     #[test]
-    #[ignore = "requires the source-only frozen CodeStory checkout"]
+    #[ignore = "proof-availability-frozen-checkouts lane: requires fetched oracle-workspaces checkouts"]
     fn frozen_source_receipts_match_the_exact_pinned_checkouts() {
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2380,17 +2387,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn destination_overlap_detects_platform_root_aliases() {
-        let root = tempfile::tempdir().unwrap();
-        let spelled_root = root.path().to_path_buf();
-        let canonical_root = spelled_root.canonicalize().unwrap();
-        if spelled_root == canonical_root {
-            return;
-        }
+        // The overlap contract must hold whenever a destination is reachable
+        // through a whitelisted platform root alias (a top-level symlink such
+        // as macOS /var -> private/var or merged-usr /bin -> usr/bin).
+        // Discover one dynamically instead of relying on the tempdir spelling:
+        // on hosts whose tempdir is already canonical the implicit pair never
+        // exists and the assertions below would pass vacuously.
+        let (alias_root, canonical_root) = fs::read_dir("/")
+            .expect("root directory listing")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+            })
+            .find_map(|alias| {
+                alias
+                    .canonicalize()
+                    .ok()
+                    .filter(|canonical| *canonical != alias)
+                    .map(|canonical| (alias, canonical))
+            })
+            .expect("a platform root alias must exist on every supported unix host");
 
-        let workspace = spelled_root.join("workspace");
-        let out = spelled_root.join("source-environment.json");
+        // No directory is created through the alias: observe_destination only
+        // walks metadata, so a unique missing leaf keeps the ancestor chain at
+        // exactly the symlink being exercised.
+        let nonce = format!("codestory-alias-probe-{}", std::process::id());
+        let workspace = alias_root.join(&nonce).join("workspace");
+        let out = alias_root.join(&nonce).join("source-environment.json");
         let arguments = MaterializeArgs {
-            corpus: spelled_root.join("unused-corpus.json"),
+            corpus: alias_root.join(&nonce).join("unused-corpus.json"),
             workspace: workspace.clone(),
             cache_root: canonical_root,
             out: out.clone(),

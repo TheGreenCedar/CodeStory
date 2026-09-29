@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -269,11 +269,24 @@ test("a malformed selector invocation fails loudly instead of inventing a record
     [["select", "--input", log, "--out", out], /missing --build-elapsed-ms/u],
     [["select", "--input", log, "--out", out, "--build-elapsed-ms", "-1"], /must be a non-negative integer/u],
     [["select", "--input", log, "--out", out, "--build-elapsed-ms", "later"], /must be a non-negative integer/u],
+    // Permissive parses that Number.parseInt would silently truncate must still
+    // fail rather than invent a truncated duration.
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", "1.5"], /must be a non-negative integer/u],
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", "12abc"], /must be a non-negative integer/u],
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", "0x10"], /must be a non-negative integer/u],
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", "1e3"], /must be a non-negative integer/u],
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", "+42"], /must be a non-negative integer/u],
+    [["select", "--input", log, "--out", out, "--build-elapsed-ms", " 42"], /must be a non-negative integer/u],
     [["select", "--input", log, "--out", out, "--build-elapsed-ms", "1", "--input", log], /--input may be supplied only once/u],
   ];
   for (const [args, expected] of invocations) {
     const result = runSelector(args);
     assert.equal(result.status, 1, `expected ${JSON.stringify(args)} to fail`);
     assert.match(result.stderr, expected);
+    assert.equal(
+      existsSync(out),
+      false,
+      `a rejected invocation left a receipt behind: ${JSON.stringify(args)}`,
+    );
   }
 });

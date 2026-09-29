@@ -47,6 +47,12 @@ function fail(message) {
 }
 
 function requireNonNegativeInteger(value, label) {
+  // A CLI field must be exactly a decimal integer: parseInt silently truncates
+  // "12abc", "1.5", and "0x10", which would let a malformed duration invent a
+  // receipt record.
+  if (typeof value !== "number" && !/^[0-9]+$/u.test(String(value))) {
+    fail(`${label} must be a non-negative integer`);
+  }
   const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
     fail(`${label} must be a non-negative integer`);

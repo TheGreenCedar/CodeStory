@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from . import process_identity
 
-from .foundation import ProofFailure
+from .foundation import ProofFailure, require
 from .process_identity import (
     live_process_executable_sha256,
     process_start_identity,
@@ -32,6 +32,20 @@ def run_process_identity_self_tests() -> None:
     pid = os.getpid()
     start_id = process_start_identity(pid)
     live_digest = live_process_executable_sha256(pid, start_id, target_os)
+    # The live digest must equal an independent read of the on-disk executable;
+    # using the same implementation for both sides would accept any hash bug.
+    import hashlib
+    from pathlib import Path
+
+    executable_digests = {
+        hashlib.sha256(Path(candidate).read_bytes()).hexdigest()
+        for candidate in {sys.executable, getattr(sys, "_base_executable", None)}
+        if candidate and Path(candidate).is_file()
+    }
+    require(
+        executable_digests and live_digest in executable_digests,
+        "live executable hashing disagreed with an independent file read",
+    )
     verified_live_executable(
         pid=pid,
         process_start_id=start_id,
@@ -190,6 +204,23 @@ def _macos_terminal_lifecycle_test() -> None:
             )
             assert waiter.exited()
             waiter.close()
+            # A waiter pinned to a different start identity must not accept the
+            # same terminal record as exit evidence: without the identity check
+            # in the terminal-record path, this classifies the zombie as gone.
+            wrong_identity = identity[:-1] + ("0" if identity[-1] != "0" else "1")
+            wrong_waiter = process_identity.ExactProcessExitWaiter(
+                child.pid, wrong_identity, "macos", allow_already_exited=True,
+            )
+            try:
+                wrong_waiter.exited()
+            except ProofFailure:
+                pass
+            else:
+                raise ProofFailure(
+                    "a terminal record carrying a different start identity was"
+                    " admitted as exit evidence"
+                )
+            wrong_waiter.close()
         assert child.wait(timeout=5) == 0
         assert process_identity.macos_terminal_process_observation(child.pid) is None
     finally:

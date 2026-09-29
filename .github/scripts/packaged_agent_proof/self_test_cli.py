@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
 
@@ -46,6 +47,26 @@ def run_cli_self_tests() -> None:
             enforce_calibration_freeze_lineage=False,
             calibration_producer_run_id=None,
             calibration_producer_artifact=None,
+        )
+        relative_args = argparse.Namespace(
+            qualification_evidence=None,
+            qualification_driver=None,
+            publication_fault_evidence=None,
+            calibration_bundle=None,
+            constant_calibration_output_dir=None,
+            installed_plugin_attestation=Path("candidate-attestation.json"),
+            installed_plugin_data=None,
+        )
+        previous_cwd = os.getcwd()
+        os.chdir(root)
+        try:
+            _resolve_optional_paths(relative_args)
+        finally:
+            os.chdir(previous_cwd)
+        require(
+            relative_args.installed_plugin_attestation == attestation.resolve()
+            and relative_args.installed_plugin_attestation.is_absolute(),
+            "an optional CLI path kept its ambient working-directory dependence",
         )
         _resolve_optional_paths(args)
         require(
@@ -155,3 +176,41 @@ def run_cli_self_tests() -> None:
             pass
         else:
             raise ProofFailure("constant calibration accepted CPU execution")
+        calibration_args.engine_policy = "accelerated"
+        calibration_args.expected_backend = "metal"
+
+        for field, hostile_value in (
+            ("proof_tier", "installed_runtime"),
+            ("version_only", True),
+            ("constant_calibration_output_dir", None),
+            ("qualification_driver", None),
+            ("offline", False),
+            ("project", root / "project"),
+            ("additional_project", [root / "other"]),
+            ("additional_query", ["q"]),
+            ("qualification_evidence", attestation),
+            ("publication_fault_evidence", attestation),
+            ("calibration_bundle", attestation),
+        ):
+            hostile = argparse.Namespace(**vars(calibration_args))
+            setattr(hostile, field, hostile_value)
+            try:
+                _validate_calibration_mode(hostile)
+            except ProofFailure:
+                pass
+            else:
+                raise ProofFailure(
+                    f"constant calibration accepted {field}={hostile_value!r}"
+                )
+
+        # The retained runs and the proof output must not nest.
+        nested = argparse.Namespace(**vars(calibration_args))
+        nested.constant_calibration_output_dir = root / "proof" / "constant-runs"
+        try:
+            _validate_calibration_mode(nested)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "constant calibration accepted runs nested inside proof output"
+            )

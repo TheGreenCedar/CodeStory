@@ -399,6 +399,22 @@ mod tests {
 
         assert_eq!(decoded, envelope);
         assert_eq!(decoded.schema_version, COMMAND_FAILURE_SCHEMA_VERSION);
+
+        // The shared CLI error envelope is a wire contract; pin the literal
+        // spellings a derive round-trip cannot catch.
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("parse envelope as value");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": COMMAND_FAILURE_SCHEMA_VERSION,
+                "error": {
+                    "code": "invalid_argument",
+                    "message": "bad input",
+                },
+                "context": {"argument": "--format"},
+            })
+        );
     }
 
     #[test]
