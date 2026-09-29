@@ -215,7 +215,6 @@ pub(crate) fn make_file_owner_writable(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path) -> Result<()> {
-    make_file_immutable(temp_path)?;
     let previous = match std::fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -235,6 +234,12 @@ pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).context("inspect immutable component destination"),
     };
+
+    // Windows ReplaceFileW rejects a read-only replacement, so a staged file
+    // that will replace an existing destination stays owner-writable there.
+    if !(cfg!(windows) && previous.is_some()) {
+        make_file_immutable(temp_path)?;
+    }
 
     #[cfg(test)]
     let publication = if PUBLICATION_DISABLED.get() {
