@@ -346,9 +346,8 @@ fn pinned_copy_source_attach_converts_both_image_and_legacy_paths() {
         Some(b"published-artifact".to_vec())
     );
     drop(target);
-    assert_eq!(
-        sibling(&sealed_source, "-wal").exists() || sibling(&sealed_source, "-shm").exists(),
-        false,
+    assert!(
+        !(sibling(&sealed_source, "-wal").exists() || sibling(&sealed_source, "-shm").exists()),
         "attaching a sealed generation must not materialize lock siblings"
     );
 }

@@ -972,47 +972,49 @@ mod tests {
     #[test]
     fn core_gc_removes_the_retired_generation_directory_and_keeps_unknown_entries() {
         let cache = tempdir().expect("isolated cache");
-        let project = tempdir().expect("project");
-        let storage_path = cache.path().join("codestory.db");
-        publish_owned_core_generations(project.path(), &storage_path, 3);
-        let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
-        let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
-            Some(project.path()),
-            codestory_retrieval::SidecarProfile::Local,
-        );
-        let retired_dir = layout
-            .generation_directory("owned-core-1")
-            .expect("gen-1 dir");
-        let report =
-            apply_core_gc_for_runtime(&runtime, &storage_path, &|| false).expect("retention pass");
-        assert_eq!(report.reclaimed_images, 1);
-        assert!(
-            !retired_dir.exists(),
-            "reclaiming a generation removes its directory, not only the image"
-        );
+        codestory_retrieval::with_test_cache_root(cache.path(), || {
+            let project = tempdir().expect("project");
+            let storage_path = cache.path().join("codestory.db");
+            publish_owned_core_generations(project.path(), &storage_path, 3);
+            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+            let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Local,
+            );
+            let retired_dir = layout
+                .generation_directory("owned-core-1")
+                .expect("gen-1 dir");
+            let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
+                .expect("retention pass");
+            assert_eq!(report.reclaimed_images, 1);
+            assert!(
+                !retired_dir.exists(),
+                "reclaiming a generation removes its directory, not only the image"
+            );
 
-        // An unknown sibling entry must keep the whole generation — the
-        // removal is never recursive — and be counted as an unknown entry.
-        let survivor_dir = layout
-            .generation_directory("owned-core-2")
-            .expect("gen-2 dir");
-        fs::write(survivor_dir.join("keep.txt"), b"foreign").expect("unknown entry");
-        publish_owned_core_generation(project.path(), &storage_path, 4);
-        let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
-            .expect("pass over foreign entry");
-        assert_eq!(
-            report.unknown_entries, 1,
-            "the foreign entry is reported, not deleted"
-        );
-        assert_eq!(report.reclaimed_images, 0);
-        assert_eq!(
-            fs::read(survivor_dir.join("keep.txt")).expect("read foreign entry"),
-            b"foreign"
-        );
-        assert!(
-            survivor_dir.join(CORE_DATABASE_FILE).is_file(),
-            "the image survives beside its unknown neighbour"
-        );
+            // An unknown sibling entry must keep the whole generation — the
+            // removal is never recursive — and be counted as an unknown entry.
+            let survivor_dir = layout
+                .generation_directory("owned-core-2")
+                .expect("gen-2 dir");
+            fs::write(survivor_dir.join("keep.txt"), b"foreign").expect("unknown entry");
+            publish_owned_core_generation(project.path(), &storage_path, 4);
+            let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
+                .expect("pass over foreign entry");
+            assert_eq!(
+                report.unknown_entries, 1,
+                "the foreign entry is reported, not deleted"
+            );
+            assert_eq!(report.reclaimed_images, 0);
+            assert_eq!(
+                fs::read(survivor_dir.join("keep.txt")).expect("read foreign entry"),
+                b"foreign"
+            );
+            assert!(
+                survivor_dir.join(CORE_DATABASE_FILE).is_file(),
+                "the image survives beside its unknown neighbour"
+            );
+        });
     }
 
     #[test]

@@ -636,7 +636,7 @@ fn write_packet_step_trace(trace_path: &str, answer: &AgentAnswerDto) -> Option<
             ));
         }
     };
-    match std::fs::write(&trace_path, payload) {
+    match std::fs::write(trace_path, payload) {
         Ok(()) => None,
         Err(error) => Some(format!(
             "packet_step_trace_out error=write path={} message={error}",

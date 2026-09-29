@@ -501,11 +501,10 @@ mod tests {
         fs::write(owned.join("file"), b"leaf").expect("write file leaf");
         let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
 
-        assert_eq!(
-            deletion
+        assert!(
+            !deletion
                 .remove_owned_empty_directory("occupied".as_ref())
                 .expect("occupied removal must report refusal, not error"),
-            false,
             "a non-empty directory refuses removal"
         );
         assert_eq!(
@@ -514,28 +513,25 @@ mod tests {
         );
         assert!(owned.join("occupied").is_dir());
 
-        assert_eq!(
-            deletion
+        assert!(
+            !deletion
                 .remove_owned_empty_directory("file".as_ref())
                 .expect("a file leaf is unknown content"),
-            false,
             "a non-directory leaf is never removed"
         );
         assert!(owned.join("file").is_file());
 
-        assert_eq!(
+        assert!(
             deletion
                 .remove_owned_empty_directory("vacant".as_ref())
-                .expect("empty removal"),
-            true
+                .expect("empty removal")
         );
         assert!(!owned.join("vacant").exists());
 
-        assert_eq!(
-            deletion
+        assert!(
+            !deletion
                 .remove_owned_empty_directory("missing".as_ref())
                 .expect("missing removal"),
-            false,
             "an absent directory reports false"
         );
     }

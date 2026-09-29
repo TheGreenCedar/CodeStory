@@ -6582,10 +6582,10 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     assert_tool_success(&writer_status, json!("writer-start-refresh"));
 }
 
-/// Shared-cache two-process fixtures below pin the cross-process peer-writer
-/// contract: while one process holds the index-writer lock mid-refresh, a
-/// second process's activation waits on the publication boundary instead of
-/// failing `cache_busy`, then adopts whatever the peer published.
+// Shared-cache two-process fixtures below pin the cross-process peer-writer
+// contract: while one process holds the index-writer lock mid-refresh, a
+// second process's activation waits on the publication boundary instead of
+// failing `cache_busy`, then adopts whatever the peer published.
 
 /// `<storage>.index-writer.hold` marker companion to the lock path: the file
 /// holds a refresh parked mid-flight while it exists (see

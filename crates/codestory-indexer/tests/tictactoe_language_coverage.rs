@@ -735,10 +735,6 @@ fn has_node(nodes: &[Node], kind: NodeKind, name: &str) -> bool {
     })
 }
 
-fn has_edge_kind(edges: &[Edge], kind: EdgeKind) -> bool {
-    edges.iter().any(|edge| edge.kind == kind)
-}
-
 fn has_edge_target_name(edges: &[Edge], nodes: &[Node], kind: EdgeKind, target_name: &str) -> bool {
     edges.iter().filter(|edge| edge.kind == kind).any(|edge| {
         nodes
