@@ -2128,7 +2128,7 @@ test("production hook code neither duplicates Git config nor spawns Git", async 
     // not just one literal form.
     assert.doesNotMatch(
       source,
-      /(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\s*\(\s*['"`][^'"`\n]*(?:^|[\\/])git(?:\.(?:exe|bat|cmd|ps1))?['"`]/u,
+      /(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\s*\(\s*['"`](?:[^'"`\n]*[\\/])?git(?:\.(?:exe|bat|cmd|ps1))?['"`]/u,
     );
   }
   const rustSource = await readFile(
