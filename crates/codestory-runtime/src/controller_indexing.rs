@@ -51,7 +51,9 @@ use codestory_store::{
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) struct ActivationIndexingEvidence {
     pub(crate) phase_timings: IndexingPhaseTimings,
