@@ -43,6 +43,8 @@ pub use source_freshness::{
 mod repo_metadata;
 mod repository_hooks;
 mod repository_identity;
+#[cfg(test)]
+mod test_git;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
     RepositoryMetadataIssue, RepositoryTrackingDigest, observe_repository_tracking_digest,
@@ -3158,10 +3160,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn run_git(root: &Path, args: &[&str]) -> Result<()> {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .status()?;
+        let status = crate::test_git::git_command(root, args).status()?;
         assert!(status.success(), "git {args:?} failed with {status}");
         Ok(())
     }
@@ -5244,16 +5243,38 @@ mod tests {
             workspace_path_identity(&dotted)?
         );
 
+        // The caller-owned exclusion seam, not just the primitive: a missing
+        // path registered by the caller must exclude that same missing path
+        // observed through another spelling under platform lexical rules.
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_files([missing.clone()]);
+        let exclusions =
+            observe_discovery_exclusions(&manifest).expect("observe caller-owned exclusions");
+        assert!(exclusions.file_is_excluded(&missing)?);
+        assert!(exclusions.file_is_excluded(&dotted)?);
+
         #[cfg(windows)]
-        assert_eq!(
-            workspace_path_identity(&missing)?,
-            workspace_path_identity(&root.join("CACHE").join("CODESTORY.DB-WAL"))?
-        );
+        {
+            assert_eq!(
+                workspace_path_identity(&missing)?,
+                workspace_path_identity(&root.join("CACHE").join("CODESTORY.DB-WAL"))?
+            );
+            assert!(
+                exclusions.file_is_excluded(&root.join("CACHE").join("CODESTORY.DB-WAL"))?,
+                "Windows lexical identity is case-insensitive"
+            );
+        }
         #[cfg(unix)]
-        assert_ne!(
-            workspace_path_identity(&missing)?,
-            workspace_path_identity(&root.join("cache").join("CODESTORY.DB-WAL"))?
-        );
+        {
+            assert_ne!(
+                workspace_path_identity(&missing)?,
+                workspace_path_identity(&root.join("cache").join("CODESTORY.DB-WAL"))?
+            );
+            assert!(
+                !exclusions.file_is_excluded(&root.join("cache").join("CODESTORY.DB-WAL"))?,
+                "Unix lexical identity stays case-sensitive"
+            );
+        }
         Ok(())
     }
 
@@ -6117,11 +6138,7 @@ mod tests {
     #[test]
     fn broken_and_device_symlinks_do_not_demote_inventory_to_partial() -> Result<()> {
         use std::os::unix::fs::symlink;
-        use std::process::Command;
 
-        if Command::new("git").arg("--version").output().is_err() {
-            return Ok(());
-        }
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("internal/third_party/dep/fs/testdata/symlinks"))?;
@@ -6147,8 +6164,7 @@ mod tests {
             ["add", "-A"][..].as_ref(),
             ["commit", "-m", "init"][..].as_ref(),
         ] {
-            let status = Command::new("git").args(args).current_dir(&root).status()?;
-            assert!(status.success(), "git {args:?}");
+            crate::test_git::git(&root, args);
         }
 
         let manifest = WorkspaceManifest::open(root.clone())?;
@@ -6185,16 +6201,23 @@ mod tests {
         Ok(())
     }
 
+    /// Named lane `helm-u08-fixture` (docs/contributors/testing-matrix.md):
+    /// the real Helm tree is an external fixture, so the test is `#[ignore]`d
+    /// out of the default gate and fails loudly without its pin. The default
+    /// suite covers the same discovery shape with the checked-in synthetic
+    /// fixture in `broken_and_device_symlinks_do_not_demote_inventory_to_partial`.
     #[cfg(unix)]
     #[test]
+    #[ignore = "helm-u08-fixture lane: requires CODESTORY_U08_HELM_PIN naming a Helm checkout"]
     fn pinned_helm_u08_tree_inventory_is_complete_when_present() -> Result<()> {
-        let Ok(pin) = std::env::var("CODESTORY_U08_HELM_PIN") else {
-            return Ok(());
-        };
+        let pin = std::env::var("CODESTORY_U08_HELM_PIN")
+            .expect("helm-u08-fixture lane requires CODESTORY_U08_HELM_PIN");
         let root = PathBuf::from(pin);
-        if !root.join(".git").exists() {
-            return Ok(());
-        }
+        assert!(
+            root.join(".git").exists(),
+            "CODESTORY_U08_HELM_PIN must name a Helm git checkout: {}",
+            root.display()
+        );
         let manifest = WorkspaceManifest::open(root)?;
         let inventory = manifest.source_inventory()?;
         eprintln!(
@@ -6298,6 +6321,17 @@ mod tests {
             ),
             1_234
         );
+        // The name promises saturation: a timestamp past i64::MAX milliseconds
+        // must clamp to the persisted bound instead of wrapping negative. One
+        // second past the limit stays representable on Unix (i64-second
+        // timespec) and Windows (FILETIME reaches further); where a narrower
+        // SystemTime cannot express it, checked_add exposes that limit
+        // instead of panicking.
+        let beyond_i64_millis =
+            std::time::Duration::from_millis(i64::MAX as u64) + std::time::Duration::from_secs(1);
+        if let Some(extreme) = std::time::UNIX_EPOCH.checked_add(beyond_i64_millis) {
+            assert_eq!(clamp_system_time_to_epoch_millis(extreme), i64::MAX);
+        }
     }
 }
 

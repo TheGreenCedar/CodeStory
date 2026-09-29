@@ -2122,14 +2122,71 @@ test("production hook code neither duplicates Git config nor spawns Git", async 
     readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8"),
   ]);
   for (const source of javascriptSources) {
-    assert.doesNotMatch(source, /hooksPath|gitDirForProject|spawnSync\(['"]git['"]/u);
+    assert.doesNotMatch(source, /hooksPath|gitDirForProject/u);
+    // Any spawn-family call whose program literal names a git executable —
+    // covers spawn/spawnSync/exec/execFile and absolute or shelled spellings,
+    // not just one literal form.
+    assert.doesNotMatch(
+      source,
+      /(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\s*\(\s*['"`][^'"`\n]*(?:^|[\\/])git(?:\.(?:exe|bat|cmd|ps1))?['"`]/u,
+    );
   }
   const rustSource = await readFile(
     join(repoRoot, "crates", "codestory-workspace", "src", "repository_hooks.rs"),
     "utf8",
   );
   const productionRust = rustSource.split("#[cfg(test)]\nmod tests")[0];
-  assert.equal(productionRust.includes(`Command::new("git"`), false);
+  assert.equal(productionRust.includes("Command::new"), false);
+  assert.equal(productionRust.includes("process::Command"), false);
+
+  // Behavioral proof (POSIX): drive the hook's delegation with a PATH that
+  // resolves `git` only to a recording shim. Any Git spawn under any spelling
+  // writes the invocation log. Windows cannot shim git.exe without a native
+  // binary, so the widened source scans above carry that platform.
+  if (process.platform === "win32") return;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-git-spawn-probe-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-git-spawn-proj-"));
+  const script = join(pluginRoot, "hooks", "codestory-dirty-hook.cjs");
+  const shimBin = join(dataDir, "shim-bin");
+  const gitLog = join(dataDir, "git-invocations.log");
+  const fakeCli = join(dataDir, "fake-cli");
+  try {
+    await mkdir(shimBin);
+    await writeFile(
+      join(shimBin, "git"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" >> "${gitLog}"\nexit 0\n`,
+      "utf8",
+    );
+    await chmod(join(shimBin, "git"), 0o755);
+    await writeFile(
+      fakeCli,
+      `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({schema_version:1,status:'installed',hooks:[]}));\n`,
+      "utf8",
+    );
+    await chmod(fakeCli, 0o755);
+
+    for (const action of ["install", "status", "mark"]) {
+      const args = [script, action, "--project", projectRoot, "--plugin-data", dataDir];
+      if (action === "mark") args.push("--source", "spawn-probe");
+      const result = spawnSync(process.execPath, args, {
+        encoding: "utf8",
+        env: {
+          PATH: shimBin,
+          CODESTORY_CLI: fakeCli,
+          CODESTORY_PLUGIN_CLI_PATH: fakeCli,
+        },
+      });
+      assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    }
+    assert.equal(
+      fs.existsSync(gitLog),
+      false,
+      `hook delegation spawned git: ${await readFile(gitLog, "utf8").catch(() => "")}`,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test("mcp launcher prefers a checksummed explicit package without PATH", async () => {

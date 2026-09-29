@@ -199,8 +199,16 @@ pub fn publish_new_private_file_atomic(
 
 /// Reserve a collision-free temporary file beside `path` using create-new semantics.
 pub fn create_unique_temp_file(path: &Path, stem: &str) -> Result<(PathBuf, File)> {
+    create_unique_temp_file_with(path, stem, atomic_temp_path)
+}
+
+fn create_unique_temp_file_with(
+    path: &Path,
+    stem: &str,
+    mut next_name: impl FnMut(&Path, &str) -> PathBuf,
+) -> Result<(PathBuf, File)> {
     loop {
-        let temp_path = atomic_temp_path(path, stem);
+        let temp_path = next_name(path, stem);
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -517,14 +525,26 @@ mod tests {
     fn unique_temp_creation_skips_stale_collision() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
-        let next = TEMP_COUNTER.load(Ordering::Relaxed);
-        let stale = path.with_file_name(format!(".state.{}.{}.tmp", std::process::id(), next));
+        // A deterministic first-candidate collision: the shared TEMP_COUNTER
+        // makes the generator's next name unpredictable to other threads, so
+        // the name stream is pinned. The retry is proven, not assumed — the
+        // created file must be the second candidate, and the stale bytes must
+        // survive the skipped create_new attempt.
+        let stale = path.with_file_name(format!(".state.{}.{}.tmp", std::process::id(), "stale"));
+        let successor =
+            path.with_file_name(format!(".state.{}.{}.tmp", std::process::id(), "successor"));
         fs::write(&stale, b"stale").expect("stale collision");
 
-        let (created, file) = create_unique_temp_file(&path, "state").expect("unique temp");
+        let mut candidates = [stale.clone(), successor.clone()].into_iter();
+        let (created, file) =
+            create_unique_temp_file_with(&path, "state", move |_, _| candidates.next().unwrap())
+                .expect("unique temp");
         drop(file);
 
-        assert_ne!(created, stale);
+        assert_eq!(
+            created, successor,
+            "the collision candidate must be skipped"
+        );
         assert_eq!(fs::read(stale).expect("stale preserved"), b"stale");
         assert!(created.is_file());
     }

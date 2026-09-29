@@ -58,6 +58,26 @@ cargo test --locked -p codestory-workspace
 cargo test --locked -p codestory-agent
 ```
 
+The workspace crate additionally owns one external-fixture lane,
+`helm-u08-fixture`. Its only test,
+`pinned_helm_u08_tree_inventory_is_complete_when_present`, is `#[ignore]`d in
+the default gate because it requires a real Helm checkout; run it explicitly:
+
+```bash
+CODESTORY_U08_HELM_PIN=/path/to/helm \
+    cargo test --locked -p codestory-workspace \
+    --lib tests::pinned_helm_u08_tree_inventory_is_complete_when_present -- --ignored --exact
+```
+
+The pinned tree must be a git checkout (`.git` present). Running the lane
+without the pin, or against a tree that is not a checkout, fails the test
+loudly. The default suite covers the same discovery shape — device-node and
+dangling-symlink fixtures in a Helm-U08-shaped repository — through the
+synthetic fixture in
+`broken_and_device_symlinks_do_not_demote_inventory_to_partial`; the named lane
+adds only real-tree scale and incidental shapes no synthetic fixture
+reproduces.
+
 ## Draft source checks
 
 Experiment-validity changes use the core-only exact-search cases in

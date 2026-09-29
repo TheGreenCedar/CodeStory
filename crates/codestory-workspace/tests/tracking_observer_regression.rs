@@ -10,7 +10,10 @@ use std::{
 };
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let home = root.join(".codestory-test-home");
+    fs::create_dir_all(&home).expect("isolated git home");
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -20,9 +23,22 @@ fn git(root: &Path, args: &[&str]) -> String {
             "user.email=test@example.invalid",
         ])
         .args(args)
-        .current_dir(root)
+        .current_dir(root);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("GIT_") {
+            command.env_remove(&key);
+        }
+    }
+    let output = command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
         .output()
-        .expect("run fixture git");
+        .expect("run isolated fixture git");
     assert!(
         output.status.success(),
         "git {args:?}: {}",
