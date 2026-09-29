@@ -3886,6 +3886,9 @@ mod tests {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("pkg"))?;
+        // The inventory spells module controls under the canonical workspace
+        // root; compare against the same spelling (\\?\ on Windows).
+        let root = root.canonicalize()?;
         fs::write(root.join(".gitignore"), "go.mod\n")?;
         let module = root.join("go.mod");
         let caller = root.join("caller.go");
