@@ -498,14 +498,16 @@ export function retrievalGeneralizationSuitePolicyViolations(
   const expectedFilesystemMemberCounts = {
     existsSync: 1,
     mkdirSync: 7,
-    mkdtempSync: 1,
+    // The hostile matrix owns one tree; the ranker counterexample owns a
+    // second. Both are mkdtempSync under os.tmpdir(), removed on exit.
+    mkdtempSync: 2,
     // Two of these read the shipped pending inventory and the registry document it points at,
     // so the claim-profile ratchet is checked against the tree that ships, not a synthetic one.
-    readFileSync: 6,
+    readFileSync: 5,
     readdirSync: 4,
     readlinkSync: 1,
-    rmSync: 1,
-    writeFileSync: 1,
+    rmSync: 2,
+    writeFileSync: 2,
   };
   const filesystemMemberCounts = new Map();
   for (const name of filesystemMemberReferences) {
@@ -515,8 +517,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
     );
   }
   const fixtureFilesystemShapeIsExact =
-    fsReferenceCount === 24
-    && filesystemMemberReferences.length === 22
+    fsReferenceCount === 26
+    && filesystemMemberReferences.length === 24
     && Object.entries(expectedFilesystemMemberCounts).every(
       ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
     )
@@ -550,7 +552,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
     && writeFirstArguments.length === writeReferenceCount
     && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
   const fixturePathReferenceShapeIsExact =
-    repositoryRootReferenceCount === 14
+    repositoryRootReferenceCount === 15
     && fixtureRootReferenceCount === 10
     && productionRepositoryRootReferenceCount === 5;
   const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
@@ -605,8 +607,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
   );
   add(
     violations,
-    invocationCount === 1 && lintReferenceCount === 2,
-    `${retrievalGeneralizationSuiteFile} must execute the hostile fixture matrix through one in-process lint invocation`,
+    invocationCount === 2 && lintReferenceCount === 3,
+    `${retrievalGeneralizationSuiteFile} must execute the hostile matrix and the ranker probes through in-process lint invocations only`,
   );
   add(
     violations,
@@ -635,8 +637,11 @@ export function retrievalGeneralizationSuitePolicyViolations(
     source.includes(
       'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
     )
-      && temporaryRootCount === 1
-      && temporaryTreeCount === 1
+      && source.includes(
+        'fs.mkdtempSync(path.join(os.tmpdir(), "ranker-literal-"))',
+      )
+      && temporaryRootCount === 2
+      && temporaryTreeCount === 2
       && source.includes(
         'assert.ok(\n    path.relative(repositoryRoot, fixtureRoot).startsWith(".."),',
       )
@@ -644,7 +649,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
       && source.includes("const extraRustRoot = path.join(fixtureRoot,")
       && source.includes("const nonRustRoot = path.join(fixtureRoot,")
       && source.includes("const taskRoot = path.join(fixtureRoot,"),
-    `${retrievalGeneralizationSuiteFile} must keep every mutable hostile fixture under one temporary tree outside the checkout`,
+    `${retrievalGeneralizationSuiteFile} must keep every mutable hostile fixture under its declared temporary trees outside the checkout`,
   );
   add(
     violations,
@@ -667,8 +672,9 @@ export function retrievalGeneralizationSuitePolicyViolations(
   );
   add(
     violations,
-    source.includes("fs.rmSync(fixtureRoot, { recursive: true, force: true });"),
-    `${retrievalGeneralizationSuiteFile} must remove its isolated fixture tree after the matrix`,
+    source.includes("fs.rmSync(fixtureRoot, { recursive: true, force: true });")
+      && source.includes("fs.rmSync(rankerRoot, { recursive: true, force: true });"),
+    `${retrievalGeneralizationSuiteFile} must remove its isolated fixture trees after the matrix`,
   );
   return violations;
 }

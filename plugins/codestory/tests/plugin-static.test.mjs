@@ -404,7 +404,7 @@ test("fail-open relay bounds hostile frames and survives null input and a missin
     JSON.stringify({ jsonrpc: "2.0", id: "after-oversized", method: "initialize" }),
     "",
   ].join("\n"));
-  const [exitCode] = await once(child, "close");
+  const [exitCode] = await awaitChildClose(child);
   assert.equal(exitCode, 0, stderr);
   const responses = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(responses.find((response) => response.error?.code === -32600)?.id, null);
@@ -475,7 +475,7 @@ test("fail-open relay applies revision-native JSON-RPC batch rules", async () =>
       JSON.stringify(batch),
       "",
     ].join("\n"));
-    const [exitCode] = await once(child, "close");
+    const [exitCode] = await awaitChildClose(child);
     assert.equal(exitCode, 0, stderr);
     const frames = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
     assert.equal(frames[0].result.protocolVersion, revision);
@@ -568,7 +568,7 @@ test("handoff waits for child validation and retires answered legacy batch IDs",
   }
 });
 
-test("handoff fails pending calls when child initialize ends or rejects", () => {
+test("handoff fails pending calls when child initialize ends or rejects", async () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const status = {
     plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
@@ -576,40 +576,112 @@ test("handoff fails pending calls when child initialize ends or rejects", () => 
     managed_retrieval: { state: "ready", automatic: true },
   };
   for (const failure of ["eof", "error", "malformed", "premature-result", "nonzero", "silent"]) {
-    const childScript = [
-      "let input='';process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
-      "if(frame.method==='tools/call')process.stderr.write('TOOL_DISPATCHED\\n');",
-      "if(frame.method!=='initialize')continue;",
-      failure === "eof" ? "process.exit(0);" : "",
-      failure === "nonzero" ? "process.exit(17);" : "",
-      failure === "error" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,error:{code:-32600,message:'rejected'}})+'\\n');" : "",
-      failure === "malformed" ? "process.stdout.write('not-json\\n');" : "",
-      failure === "premature-result" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'pending',result:{leaked:true}})+'\\n');" : "",
-      "}});",
-    ].join("");
-    const hostScript = [
-      `const spawn=require('node:child_process').spawn;const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
-      `run(${JSON.stringify(status)},{shouldHandoff:()=>true,startRuntime:()=>spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['pipe','pipe','pipe']}),handoffInitializeTimeoutMs:200,onRuntimeFailure:()=>{}});`,
-    ].join("");
-    const input = [
-      { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: "2025-03-26" } },
-      { jsonrpc: "2.0", method: "notifications/initialized" },
-      { jsonrpc: "2.0", id: "pending", method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } },
-    ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
-    const result = spawnSync(process.execPath, ["-e", hostScript], { input, encoding: "utf8", timeout: 5000 });
-    assert.equal(result.status, 0, `${failure}: ${result.stderr}`);
-    assert.doesNotMatch(result.stderr, /TOOL_DISPATCHED/u, failure);
-    const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
-    assert.equal(frames.filter((frame) => frame.id === "init").length, 1, failure);
-    const pending = frames.filter((frame) => frame.id === "pending");
-    assert.equal(pending.length, 1, failure);
-    assert.equal(pending[0].error.code, -32000, failure);
-    if (failure === "premature-result") {
-      assert.match(pending[0].error.message, /error_code=initialize_response_invalid/u);
+    const dir = await mkdtemp(join(tmpdir(), `codestory-handoff-${failure}-`));
+    const tracePath = join(dir, "dispatch-trace.log");
+    try {
+      const childScript = [
+        "require('node:fs').appendFileSync(process.env.TEST_DISPATCH_TRACE,'CHILD_STARTED\\n');",
+        "let input='';process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
+        "if(frame.method==='tools/call')require('node:fs').appendFileSync(process.env.TEST_DISPATCH_TRACE,'TOOL_DISPATCHED\\n');",
+        "if(frame.method!=='initialize')continue;",
+        failure === "eof" ? "process.exit(0);" : "",
+        failure === "nonzero" ? "process.exit(17);" : "",
+        failure === "error" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,error:{code:-32600,message:'rejected'}})+'\\n');" : "",
+        failure === "malformed" ? "process.stdout.write('not-json\\n');" : "",
+        failure === "premature-result" ? "process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'pending',result:{leaked:true}})+'\\n');" : "",
+        "}});",
+      ].join("");
+      const hostScript = [
+        `const spawn=require('node:child_process').spawn;const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+        `run(${JSON.stringify(status)},{shouldHandoff:()=>true,startRuntime:()=>spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['pipe','pipe','pipe']}),handoffInitializeTimeoutMs:200,onRuntimeFailure:()=>{}});`,
+      ].join("");
+      const input = [
+        { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: "2025-03-26" } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: "pending", method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } },
+      ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+      const result = spawnSync(process.execPath, ["-e", hostScript], {
+        input,
+        encoding: "utf8",
+        timeout: 5000,
+        env: { ...process.env, TEST_DISPATCH_TRACE: tracePath },
+      });
+      assert.equal(result.status, 0, `${failure}: ${result.stderr}`);
+      // The owned trace file proves both that the child ran and that the
+      // pending call never reached it — a dead child cannot hide behind a
+      // drained stderr stream.
+      const trace = await readFile(tracePath, "utf8");
+      assert.ok(trace.includes("CHILD_STARTED"), `${failure}: trace channel missing`);
+      assert.doesNotMatch(trace, /TOOL_DISPATCHED/u, failure);
+      const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+      assert.equal(frames.filter((frame) => frame.id === "init").length, 1, failure);
+      const pending = frames.filter((frame) => frame.id === "pending");
+      assert.equal(pending.length, 1, failure);
+      assert.equal(pending[0].error.code, -32000, failure);
+      if (failure === "premature-result") {
+        assert.match(pending[0].error.message, /error_code=initialize_response_invalid/u);
+      }
+      if (failure === "silent") {
+        assert.match(pending[0].error.message, /error_code=initialize_timeout/u);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
-    if (failure === "silent") {
-      assert.match(pending[0].error.message, /error_code=initialize_timeout/u);
+  }
+
+  // Positive control: a child that answers initialize must observe the
+  // tools/call frame — proves the trace channel records a real dispatch.
+  {
+    const dir = await mkdtemp(join(tmpdir(), "codestory-handoff-dispatched-"));
+    const tracePath = join(dir, "dispatch-trace.log");
+    try {
+      const revision = "2025-03-26";
+      const validInitialize = {
+        jsonrpc: "2.0",
+        id: null,
+        result: {
+          protocolVersion: revision,
+          capabilities: {},
+          serverInfo: { name: "fixture", version: "1" },
+          _meta: {
+            codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
+            codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 3 },
+          },
+        },
+      };
+      const childScript = [
+        "let input='';process.stdin.setEncoding('utf8');",
+        `const valid=${JSON.stringify(validInitialize)};`,
+        "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
+        "if(frame.method==='tools/call'){require('node:fs').appendFileSync(process.env.TEST_DISPATCH_TRACE,'TOOL_DISPATCHED\\n');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{dispatched:true}})+'\\n');}",
+        "if(frame.method==='initialize')process.stdout.write(JSON.stringify({...valid,id:frame.id})+'\\n');",
+        "}});",
+      ].join("");
+      const hostScript = [
+        `const spawn=require('node:child_process').spawn;const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+        `run(${JSON.stringify(status)},{shouldHandoff:()=>true,startRuntime:()=>spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['pipe','pipe','pipe']}),handoffInitializeTimeoutMs:200,onRuntimeFailure:()=>{}});`,
+      ].join("");
+      const input = [
+        { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: "2025-03-26" } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: "pending", method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } },
+      ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+      const result = spawnSync(process.execPath, ["-e", hostScript], {
+        input,
+        encoding: "utf8",
+        timeout: 5000,
+        env: { ...process.env, TEST_DISPATCH_TRACE: tracePath },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const trace = await readFile(tracePath, "utf8");
+      assert.ok(trace.includes("TOOL_DISPATCHED"), "dispatch never reached the child");
+      const pending = result.stdout.split(/\r?\n/u).filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .find((frame) => frame.id === "pending");
+      assert.equal(pending?.result?.dispatched, true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   }
 });
@@ -872,6 +944,16 @@ test("fail-open schema interpreter covers const anyOf and allOf", () => {
     allOf: [{ not: { properties: { value: { const: "forbidden" } }, required: ["value"] } }],
   };
   assert.deepEqual(validate(schema, { kind: "tagged", value: 1 }, "/arguments"), []);
+  assert.deepEqual(validate(schema, { kind: "tagged", value: "x" }, "/arguments"), []);
+  // Values failing every anyOf variant must produce unsatisfied_any_of — an
+  // integer-only acceptance would let the anyOf branch be deleted unnoticed.
+  for (const invalid of [0, ""]) {
+    const anyOfViolations = validate(schema, { kind: "tagged", value: invalid }, "/arguments");
+    assert.ok(
+      anyOfViolations.some(({ code, pointer }) => code === "unsatisfied_any_of" && pointer === "/arguments/value"),
+      `expected unsatisfied_any_of for ${JSON.stringify(invalid)}`,
+    );
+  }
   const violations = validate(schema, { kind: "wrong", value: "forbidden" }, "/arguments");
   assert.ok(violations.some(({ code, pointer }) => code === "invalid_const_value" && pointer === "/arguments/kind"));
   assert.ok(violations.some(({ code, pointer }) => code === "forbidden_combination" && pointer === "/arguments"));
@@ -923,6 +1005,51 @@ test("fail-open schema validation covers every generated input keyword", () => {
   const validated = new Set(launcherTest.failOpenValidatedSchemaKeywords);
   assert.deepEqual(
     [...found].filter((keyword) => !validated.has(keyword)).sort(),
+    [],
+  );
+
+  // The inventory above is an allowlist comparison: a keyword whose
+  // interpreter branch was deleted would stay listed. These rows give every
+  // enforcing keyword a discriminating valid/invalid pair instead.
+  const validate = launcherTest.validatePublishedSchemaValue;
+  const keywordCases = [
+    ["additionalProperties", { type: "object", properties: { a: { type: "integer" } }, additionalProperties: false }, { a: 1 }, { a: 1, b: 2 }, "unknown_property"],
+    ["allOf", { allOf: [{ minimum: 1 }, { maximum: 3 }] }, 2, 9, "above_maximum"],
+    ["anyOf", { anyOf: [{ type: "string" }, { type: "integer" }] }, "x", true, "unsatisfied_any_of"],
+    ["const", { const: "k" }, "k", "x", "invalid_const_value"],
+    ["enum", { enum: ["a", "b"] }, "a", "c", "invalid_enum_value"],
+    ["items", { type: "array", items: { type: "integer" } }, [1], ["x"], "invalid_type"],
+    ["maxItems", { type: "array", maxItems: 1 }, [1], [1, 2], "above_max_items"],
+    ["maxLength", { type: "string", maxLength: 2 }, "ab", "abc", "above_max_length"],
+    ["maximum", { type: "integer", maximum: 2 }, 2, 3, "above_maximum"],
+    ["minItems", { type: "array", minItems: 1 }, [1], [], "below_min_items"],
+    ["minLength", { type: "string", minLength: 2 }, "ab", "a", "below_min_length"],
+    ["minimum", { type: "integer", minimum: 2 }, 2, 1, "below_minimum"],
+    ["not", { not: { const: 0 } }, 1, 0, "forbidden_combination"],
+    ["oneOf", { oneOf: [{ const: "a" }, { const: "b" }] }, "a", "c", "invalid_selector"],
+    ["properties", { type: "object", properties: { a: { type: "integer" } } }, { a: 1 }, { a: "x" }, "invalid_type"],
+    ["required", { type: "object", required: ["a"] }, { a: 1 }, {}, "missing_required"],
+    ["type", { type: "string" }, "x", 1, "invalid_type"],
+  ];
+  const covered = new Set();
+  for (const [keyword, schema, valid, invalid, code] of keywordCases) {
+    assert.ok(validated.has(keyword), `${keyword} is not a published validated keyword`);
+    covered.add(keyword);
+    assert.deepEqual(validate(schema, valid), [], `${keyword}: valid value rejected`);
+    const violations = validate(schema, invalid);
+    assert.ok(
+      violations.some((violation) => violation.code === code),
+      `${keyword}: expected ${code}, got ${JSON.stringify(violations)}`,
+    );
+  }
+  // Annotations (`default`, `description`) are declared but must stay inert.
+  for (const keyword of ["default", "description"]) {
+    assert.ok(validated.has(keyword), `${keyword} dropped from the validated allowlist`);
+    covered.add(keyword);
+    assert.deepEqual(validate({ [keyword]: "x", type: "integer" }, 1), [], `${keyword} must not constrain`);
+  }
+  assert.deepEqual(
+    [...validated].filter((keyword) => !covered.has(keyword)).sort(),
     [],
   );
 });
@@ -1016,7 +1143,7 @@ test("fail-open handoff converts child stdin failure into a bounded request erro
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: "stdin", method: "tools/list" })}\n`);
-  const [exitCode] = await once(child, "close");
+  const [exitCode] = await awaitChildClose(child);
   assert.equal(exitCode, 0, stderr);
   const response = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line))
     .find((candidate) => candidate.id === "stdin");
@@ -1091,7 +1218,7 @@ test("launcher records an uncaught exception and terminates instead of continuin
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const [exitCode, signal] = await once(child, "close");
+  const [exitCode, signal] = await awaitChildClose(child);
   assert.equal(exitCode, 1);
   assert.equal(signal, null);
   const diagnostic = JSON.parse(stderr.trim());
@@ -1302,7 +1429,7 @@ function fakeProbeChild(response, options = {}) {
 async function writeReleaseFixture(releaseDir, version, writeCli = writeFakeCli) {
   const { archiveBase, archiveName } = releaseAssetForPlatform(version);
   const stageDir = join(releaseDir, archiveBase);
-  const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
+  const cliName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
   const cliPath = join(stageDir, cliName);
   const archivePath = join(releaseDir, archiveName);
   await mkdir(stageDir, { recursive: true });
@@ -1358,6 +1485,59 @@ async function waitForPath(pathname, timeoutMs = 10000) {
   assert.fail(`timed out waiting for ${pathname}`);
 }
 
+// A bare `once(child, "close")` hangs the suite on a lifecycle regression;
+// bound the wait and reap the owned child on timeout.
+async function awaitChildClose(child, timeoutMs = 5000) {
+  let timer;
+  try {
+    return await Promise.race([
+      once(child, "close"),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`owned child did not close within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+        timer.unref();
+      }),
+    ]);
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Windows fixture CLIs must be real executables: production requireDirectCli
+// rejects .cmd/.bat paths and spawns with shell:false. The committed shim
+// (tests/fixtures/codestory-cli-shim.exe, source codestory-cli-shim.c) is a
+// PE forwarder that reads this test-appended trailer and execs
+// `node <script.cjs> <original args>`, so the fixture sees the same argv
+// layout the POSIX `node fake.cjs "$@"` wrapper produces.
+let windowsCliShimBytes = null;
+
+async function writeWindowsCliShim(cliPath, source, { evalArgs = false } = {}) {
+  if (!windowsCliShimBytes) {
+    windowsCliShimBytes = await readFile(
+      join(pluginRoot, "tests", "fixtures", "codestory-cli-shim.exe"),
+    );
+    assert.equal(windowsCliShimBytes.subarray(0, 2).toString("latin1"), "MZ");
+  }
+  // evalArgs scripts were written for `node -e`, where argv[1] is the first
+  // argument; executed as a file, argv[1] is the script path, so drop it.
+  const script = evalArgs ? `process.argv.splice(1,1);\n${source}` : source;
+  const scriptBytes = Buffer.from(script, "utf8");
+  const nodeBytes = Buffer.from(process.execPath, "utf8");
+  const trailer = Buffer.alloc(16);
+  trailer.writeUInt32LE(scriptBytes.length, 0);
+  trailer.writeUInt32LE(nodeBytes.length, 4);
+  trailer.write("CSFCSHIM", 8, "ascii");
+  await writeFile(
+    cliPath,
+    Buffer.concat([windowsCliShimBytes, scriptBytes, nodeBytes, trailer]),
+  );
+}
+
 async function writeFakeCli(cliPath) {
   const script = [
     "const fs=require('fs');const args=process.argv.slice(1);",
@@ -1366,11 +1546,7 @@ async function writeFakeCli(cliPath) {
     "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
   ].join("");
   if (process.platform === "win32") {
-    await writeFile(
-      cliPath,
-      `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`,
-      "utf8",
-    );
+    await writeWindowsCliShim(cliPath, script, { evalArgs: true });
     return;
   }
   await writeFile(
@@ -1385,14 +1561,14 @@ async function writeLifecycleCli(cliPath) {
   const script = [
     "const fs=require('fs');",
     "const args=process.argv.slice(1);",
-    "if(args[0]==='--version'){const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
+    "if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
     `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'4'),minimum_compatible_schema_version:3}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
   ].join("");
   if (process.platform === "win32") {
-    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
+    await writeWindowsCliShim(cliPath, script, { evalArgs: true });
     return;
   }
   await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
@@ -1401,7 +1577,10 @@ async function writeLifecycleCli(cliPath) {
 
 async function writeVersionOnlyCli(cliPath) {
   if (process.platform === "win32") {
-    await writeFile(cliPath, "@echo off\r\necho codestory-cli %TEST_CODESTORY_VERSION%\r\n", "utf8");
+    await writeWindowsCliShim(
+      cliPath,
+      "console.log('codestory-cli ' + (process.env.TEST_CODESTORY_VERSION || ''))",
+    );
     return;
   }
   await writeFile(cliPath, "#!/bin/sh\necho codestory-cli \"$TEST_CODESTORY_VERSION\"\n", "utf8");
@@ -1925,11 +2104,204 @@ test("source setup adapters prepare and pass the canonical embedded model", asyn
     readFile(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"), "utf8"),
   ]);
 
-  for (const source of [powershell, posix]) {
-    assert.match(source, /prepare-embedded-model\.mjs/u);
-    assert.match(source, /CODESTORY_EMBED_MODEL_SOURCE/u);
-    assert.match(source, /build[" ]*,?[" ]*--release/u);
-    assert.match(source, /--locked/u);
+  // Token greps over raw source cannot tell a live binding from a comment.
+  // Drop comment-only lines first, then pin the wiring shape: the prepared
+  // model path must be captured into a variable and passed as the
+  // CODESTORY_EMBED_MODEL_SOURCE environment binding on the build invocation.
+  const stripCommentLines = (source) =>
+    source
+      .split(/\r?\n/u)
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+
+  const posixCode = stripCommentLines(posix);
+  assert.match(
+    posixCode,
+    /model_source="\$\(cd "\$source_dir" && node scripts\/prepare-embedded-model\.mjs\)"/u,
+  );
+  assert.match(
+    posixCode,
+    /CODESTORY_EMBED_MODEL_SOURCE="\$model_source" \\\r?\n\s*cargo build --release --locked -p codestory-cli --manifest-path "\$source_dir\/Cargo\.toml"/u,
+  );
+
+  const powershellCode = stripCommentLines(powershell);
+  assert.match(
+    powershellCode,
+    /\$modelSource = & node "scripts\\prepare-embedded-model\.mjs"/u,
+  );
+  assert.match(powershellCode, /\$env:CODESTORY_EMBED_MODEL_SOURCE = \$modelSource/u);
+  assert.match(
+    powershellCode,
+    /Invoke-Checked cargo @\("build",\s*"--release",\s*"--locked",\s*"-p",\s*"codestory-cli"/u,
+  );
+});
+
+test("POSIX source setup adapter prepares and passes the canonical embedded model", {
+  skip: process.platform === "win32" ? "exercises setup.sh; setup.ps1 is pinned statically above" : false,
+}, async () => {
+  // The real setup.sh runs end to end against owned inputs: a file:// fixture
+  // repository carrying the REAL prepare-embedded-model.mjs, a `node` wrapper
+  // that injects a fixture model contract (so no network), and a `cargo` shim
+  // that records the build invocation's environment and fabricates the binary.
+  // If the adapter prepared a model but failed to pass it to the build -- or
+  // passed a different file than it prepared -- this fails.
+  const root = await mkdtemp(join(tmpdir(), "codestory-setup-adapter-"));
+  try {
+    const modelBytes = Buffer.from("codestory fixture embedded model\n");
+    const modelSha = createHash("sha256").update(modelBytes).digest("hex");
+    const contractDigest = (domain, value) => {
+      const hash = createHash("sha256");
+      for (const text of [domain, value]) {
+        const bytes = Buffer.from(text);
+        const length = Buffer.alloc(8);
+        length.writeBigUInt64LE(BigInt(bytes.length));
+        hash.update(length);
+        hash.update(bytes);
+      }
+      return hash.digest("hex");
+    };
+    const modelPath = join(root, "fixture-model.gguf");
+    await writeFile(modelPath, modelBytes);
+    const revision = "f".repeat(40);
+    const contractPath = join(root, "fixture-model-contract.json");
+    await writeFile(contractPath, `${JSON.stringify({
+      schema_version: 1,
+      model: {
+        file_name: "fixture-model.gguf",
+        size_bytes: modelBytes.length,
+        sha256: modelSha,
+        sources: [{
+          url: `https://example.invalid/models/resolve/${revision}/fixture-model.gguf`,
+          revision,
+        }],
+      },
+      embedding: {
+        dimension: 4,
+        query_prefix: "query: ",
+        document_prefix: "",
+        pooling: "cls",
+        normalization: "l2",
+        element_type: "f32_le",
+        vector_schema_version: 2,
+      },
+      tokenizer_config: {
+        container: "gguf",
+        tokenizer_sha256: contractDigest("tokenizer", modelSha),
+        config_sha256: contractDigest("config", `${modelSha}:4:cls:l2`),
+      },
+      producer: { name: "fixture", version: "1" },
+      license: { spdx_id: "MIT", source_url: "https://example.invalid/license" },
+    }, null, 2)}\n`);
+
+    // The fixture repository the adapter clones: the real preparer script, a
+    // placeholder manifest the cargo shim answers for, nothing else.
+    const fixtureRepo = join(root, "source-repo");
+    await mkdir(join(fixtureRepo, "scripts"), { recursive: true });
+    await copyFile(
+      join(repoRoot, "scripts", "prepare-embedded-model.mjs"),
+      join(fixtureRepo, "scripts", "prepare-embedded-model.mjs"),
+    );
+    await writeFile(join(fixtureRepo, "Cargo.toml"), "[workspace]\n");
+    const gitEnv = {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+      ),
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+    };
+    const git = (...args) => {
+      const result = spawnSync(
+        "git",
+        ["-c", "core.hooksPath=/dev/null", "-C", fixtureRepo, ...args],
+        { encoding: "utf8", env: gitEnv },
+      );
+      assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    git("init", "--quiet", "--initial-branch", "main");
+    git("add", "--all");
+    git(
+      "-c", "user.email=fixture@codestory.invalid",
+      "-c", "user.name=fixture",
+      "commit", "--quiet", "--message", "fixture source",
+    );
+
+    // PATH shims: `node` forwards to the real runtime, injecting the fixture
+    // contract and model source only for prepare-embedded-model.mjs; `cargo`
+    // records the binding and fabricates the release binary the script copies.
+    const shimBin = join(root, "shim-bin");
+    await mkdir(shimBin);
+    const cargoEnvMarker = join(root, "cargo-env.txt");
+    const cargoArgvMarker = join(root, "cargo-argv.txt");
+    const nodeShim = join(shimBin, "node");
+    await writeFile(nodeShim, [
+      "#!/bin/sh",
+      'case "$1" in',
+      "  *prepare-embedded-model.mjs)",
+      '    exec "$REAL_NODE" "$@" --contract "$FIXTURE_MODEL_CONTRACT" --source "$FIXTURE_MODEL"',
+      "    ;;",
+      "esac",
+      'exec "$REAL_NODE" "$@"',
+      "",
+    ].join("\n"));
+    const cargoShim = join(shimBin, "cargo");
+    await writeFile(cargoShim, [
+      "#!/bin/sh",
+      'printf \'%s\' "$CODESTORY_EMBED_MODEL_SOURCE" > "$CARGO_ENV_MARKER"',
+      'printf \'%s\\n\' "$@" > "$CARGO_ARGV_MARKER"',
+      'src=""',
+      'for arg in "$@"; do',
+      '  case "$arg" in */Cargo.toml) src="${arg%/Cargo.toml}" ;; esac',
+      "done",
+      '[ -n "$src" ] || exit 3',
+      'mkdir -p "$src/target/release"',
+      'printf \'#!/bin/sh\\nexit 0\\n\' > "$src/target/release/codestory-cli"',
+      "",
+    ].join("\n"));
+    await chmod(nodeShim, 0o755);
+    await chmod(cargoShim, 0o755);
+
+    const codestoryHome = join(root, "codestory-home");
+    const result = spawnSync("bash", [
+      join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"),
+    ], {
+      encoding: "utf8",
+      timeout: 60000,
+      env: {
+        ...gitEnv,
+        PATH: `${shimBin}:${process.env.PATH}`,
+        REAL_NODE: process.execPath,
+        FIXTURE_MODEL_CONTRACT: contractPath,
+        FIXTURE_MODEL: modelPath,
+        CARGO_ENV_MARKER: cargoEnvMarker,
+        CARGO_ARGV_MARKER: cargoArgvMarker,
+        CODESTORY_HOME: codestoryHome,
+        CODESTORY_REPO_URL: `file://${fixtureRepo}`,
+      },
+    });
+    assert.equal(result.status, 0, `setup.sh failed:\n${result.stderr}\n${result.stdout}`);
+
+    const builtSource = join(codestoryHome, "src");
+    const stagedModel = join(
+      builtSource, "target", "build-assets", "sha256", modelSha, "fixture-model.gguf",
+    );
+    const passedToBuild = fs.readFileSync(cargoEnvMarker, "utf8");
+    // The binding passed to the build is the canonical staged path (compare by
+    // realpath: macOS tmpdir aliases /var to /private/var), and the file at
+    // that path is exactly the fixture model the preparer verified.
+    assert.ok(passedToBuild.endsWith(join("sha256", modelSha, "fixture-model.gguf")));
+    assert.equal(fs.realpathSync(passedToBuild), fs.realpathSync(stagedModel));
+    assert.deepEqual(fs.readFileSync(passedToBuild), modelBytes);
+    const argv = fs.readFileSync(cargoArgvMarker, "utf8").split("\n");
+    assert.deepEqual(
+      argv.slice(0, 6),
+      ["build", "--release", "--locked", "-p", "codestory-cli", "--manifest-path"],
+    );
+    assert.match(result.stdout, /CODESTORY_CLI=/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -2197,7 +2569,7 @@ test("mcp launcher prefers a checksummed explicit package without PATH", async (
   const cliDir = join(dataDir, "codestory-cli", version);
   const cliPath = join(
     cliDir,
-    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
   );
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const privateReleaseBaseUrl = "https://private-packages.invalid";
@@ -2212,7 +2584,7 @@ test("mcp launcher prefers a checksummed explicit package without PATH", async (
       join(cliDir, "manifest.json"),
       JSON.stringify(explicitPackageManifest(
         version,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
         sha256,
       )),
       "utf8",
@@ -2981,7 +3353,7 @@ test("managed cli initializing reclaim preserves a new ABA owner", async () => {
 
 test("managed cli staging rejects a version-only binary without MCP initialize", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-stdio-probe-"));
-  const cliPath = join(dataDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const cliPath = join(dataDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
   try {
     await writeVersionOnlyCli(cliPath);
     await assert.rejects(launcherTest.probeManagedCliStdio(cliPath, 1000), /stdio_initialize_/u);
@@ -3456,6 +3828,31 @@ test("managed cli retention inventories versions when the active probe fails", a
     assert.equal(report.removed.length, 0);
     await access(old.versionDir);
     await access(active.versionDir);
+
+    // Apply mode: a failed probe must still stop deletion entirely. The probe
+    // reports the correct version, so the status guard — not the version
+    // mismatch guard — is the load-bearing check.
+    const applyReport = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      { status: 1, error: null, version: "0.14.1", stdout: "", stderr: "broken" },
+      {
+        dataDir,
+        dryRun: false,
+        probeVersion: () => ({ status: 0, error: null, version: "0.14.1", stdout: "", stderr: "" }),
+      },
+    );
+    assert.equal(applyReport.dry_run, false);
+    assert.equal(applyReport.removed.length, 0);
+    assert.ok(
+      applyReport.warnings.includes("managed_cli_retention_active_unverified:version_probe_failed"),
+      JSON.stringify(applyReport.warnings),
+    );
+    assert.deepEqual(
+      applyReport.reclaimable.map((entry) => entry.version).sort(),
+      ["0.14.0", "0.14.1"],
+    );
+    await access(old.versionDir);
+    await access(active.versionDir);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -3497,7 +3894,7 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -3534,7 +3931,7 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -3679,7 +4076,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     })}\n`);
     const status = JSON.parse((await responseFor("status")).result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
-    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(realRepoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.readiness[0].setup.probe_status, 17);
     assert.match(
@@ -3719,7 +4116,7 @@ test("mcp launcher does not route from another thread's global active project st
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -3756,7 +4153,7 @@ test("mcp launcher does not route from another thread's global active project st
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -3801,7 +4198,7 @@ test("mcp launcher ignores thread-scoped and global project state", async () => 
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -3850,7 +4247,7 @@ test("mcp launcher ignores thread-scoped and global project state", async () => 
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -3897,7 +4294,7 @@ test("mcp launcher ignores fresh global active project state when current thread
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -3934,7 +4331,7 @@ test("mcp launcher ignores fresh global active project state when current thread
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -3980,7 +4377,7 @@ test("mcp launcher ignores unscoped global active project state", async () => {
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -4016,7 +4413,7 @@ test("mcp launcher ignores unscoped global active project state", async () => {
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -4060,7 +4457,7 @@ test("mcp launcher uses fresh active project state from before launcher start", 
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -4096,7 +4493,7 @@ test("mcp launcher uses fresh active project state from before launcher start", 
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -4136,7 +4533,7 @@ test("mcp launcher ignores stale active project state from plugin root", async (
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -4167,7 +4564,7 @@ test("mcp launcher ignores stale active project state from plugin root", async (
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -4209,7 +4606,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
   const cliScript = join(dataDir, "recording-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+    process.platform === "win32" ? "recording-codestory-cli.exe" : "recording-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -4262,7 +4659,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -4357,9 +4754,9 @@ test("mcp launcher infers Codex managed data from installed cache without plugin
   const dataDir = join(codexRoot, "plugins", "data", "codestory-TheGreenCedar");
   const outFile = join(dataDir, "env.json");
   const cliDir = join(dataDir, "codestory-cli", version);
-  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
   const pathDir = await mkdtemp(join(tmpdir(), "codestory-stale-path-"));
-  const staleCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const staleCli = join(pathDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
   const launcher = join(installRoot, "scripts", "codestory-mcp.cjs");
   const privateReleaseBaseUrl = "https://private-packages.invalid";
 
@@ -4397,17 +4794,15 @@ test("mcp launcher infers Codex managed data from installed cache without plugin
       .digest("hex");
     const manifest = explicitPackageManifest(
       version,
-      process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+      process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
       sha256,
     );
     await writeFile(join(cliDir, "manifest.json"), JSON.stringify(manifest), "utf8");
-    await writeFile(
-      staleCli,
-      process.platform === "win32"
-        ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
-        : "#!/bin/sh\necho codestory-cli 0.0.1\n",
-      "utf8",
-    );
+    if (process.platform === "win32") {
+      await writeWindowsCliShim(staleCli, "console.log('codestory-cli 0.0.1')");
+    } else {
+      await writeFile(staleCli, "#!/bin/sh\necho codestory-cli 0.0.1\n", "utf8");
+    }
     await chmod(staleCli, 0o755);
 
     const result = spawnSync(process.execPath, [launcher], {
@@ -4475,7 +4870,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
-    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(realRepoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.degraded_reason, "managed_cli_unavailable");
     assert.equal(status.project_selection, undefined);
@@ -4627,6 +5022,21 @@ test("mcp launcher owns initialize before handing off to the native runtime", as
   };
 
   try {
+    // Positive reachability: the override CLI must be callable, so the absent
+    // serve marker below means "the runtime never launched", not "the fixture
+    // could not run" (a rejected executable would pass unwitnessed).
+    const control = spawn(cliPath, ["serve"], {
+      env: { ...process.env, TEST_OUT: marker },
+      stdio: "ignore",
+    });
+    try {
+      await waitForPath(marker, 5000);
+    } finally {
+      control.kill("SIGKILL");
+      await once(control, "close");
+    }
+    await rm(marker);
+
     const result = spawnSync(process.execPath, [launcher], {
       cwd: dataDir,
       env: {
@@ -4781,7 +5191,7 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
   const cliScript = join(dataDir, "fake-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "fake-codestory-cli.cmd" : "fake-codestory-cli",
+    process.platform === "win32" ? "fake-codestory-cli.exe" : "fake-codestory-cli",
   );
   const logFile = join(dataDir, "calls.jsonl");
   const marker = join(dataDir, "serve-called.txt");
@@ -4838,7 +5248,7 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -4910,7 +5320,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
   const cliScript = join(dataDir, "skewed-codestory-cli.cjs");
   const cliPath = join(
     dataDir,
-    process.platform === "win32" ? "skewed-codestory-cli.cmd" : "skewed-codestory-cli",
+    process.platform === "win32" ? "skewed-codestory-cli.exe" : "skewed-codestory-cli",
   );
   const servedFile = join(dataDir, "runtime-served.txt");
   let child;
@@ -4953,7 +5363,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
       "utf8",
     );
     if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+      await writeWindowsCliShim(cliPath, await readFile(cliScript, "utf8"));
     } else {
       await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
       await chmod(cliPath, 0o755);
@@ -5114,7 +5524,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
   const cliDir = join(dataDir, "codestory-cli", cliVersion);
   const cliPath = join(
     cliDir,
-    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
   );
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = JSON.stringify({
@@ -5128,7 +5538,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
   try {
     await mkdir(cliDir, { recursive: true });
     if (process.platform === "win32") {
-      await writeFile(cliPath, "@echo off\r\nexit /b 7\r\n", "utf8");
+      await writeWindowsCliShim(cliPath, "process.exit(7)");
     } else {
       await writeFile(cliPath, "#!/bin/sh\nexit 7\n", "utf8");
       await chmod(cliPath, 0o755);
@@ -5140,7 +5550,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       join(cliDir, "manifest.json"),
       JSON.stringify(explicitPackageManifest(
         cliVersion,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
         sha256,
       )),
       "utf8",
@@ -5149,6 +5559,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
+        CODESTORY_CLI: "",
         PLUGIN_DATA: dataDir,
         CODESTORY_PLUGIN_RELEASE_DIR: join(dataDir, "missing-release"),
         PATH: "",
@@ -5209,7 +5620,7 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const { archiveBase, archiveName } = releaseAssetForPlatform(cliVersion);
   const stageDir = join(releaseDir, archiveBase);
-  const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
+  const cliName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
   const cliPath = join(stageDir, cliName);
   const archivePath = join(releaseDir, archiveName);
 
@@ -5220,7 +5631,10 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
     const priorCli = join(priorDir, "bin", cliName);
     await mkdir(dirname(priorCli), { recursive: true });
     if (process.platform === "win32") {
-      await writeFile(priorCli, `@echo off\r\nif "%1"=="--version" (echo codestory-cli ${priorVersion}& exit /b 0)\r\nexit /b 90\r\n`, "utf8");
+      await writeWindowsCliShim(
+        priorCli,
+        `if (process.argv[2] === '--version') { console.log('codestory-cli ${priorVersion}'); process.exit(0); } process.exit(90);`,
+      );
     } else {
       await writeFile(priorCli, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codestory-cli ${priorVersion}'; exit 0; fi\nexit 90\n`, "utf8");
       await chmod(priorCli, 0o755);
@@ -5337,6 +5751,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
         PLUGIN_DATA: dataDir,
         TEST_CODESTORY_VERSION: cliVersion,
         CODESTORY_TEST_PROBE_DELAY_MS: "1500",
+        CODESTORY_TEST_PROBE_LOG: join(dataDir, "probes.log"),
         TEST_OUT: outFile,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -5381,7 +5796,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       params: { uri: statusUri },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
-    assert.equal(status.project_root, repoRoot);
+    assert.equal(status.project_root, launcherTest.cleanPublicProjectPath(repoRoot));
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(statusResponse.result.contents[0].uri, statusUri);
     assert.ok(
@@ -5475,15 +5890,25 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       assert.equal(typeof progress.received_bytes, "number");
     }
     releaseAssets();
+    // The `.provisioning-*` directory is created before fetch/extract/probe, so it
+    // cannot witness the probe stage. The fixture appends a marker to the probe
+    // log at `--version` entry, ahead of the 1500 ms delay — that write is the
+    // stage-entry proof the responsive-window assertion below relies on.
     const managedRoot = join(dataDir, "codestory-cli");
+    const probeLogPath = join(dataDir, "probes.log");
     const probeDeadline = Date.now() + 5000;
+    let probeEntered = false;
     while (Date.now() < probeDeadline) {
-      const entries = await readdir(managedRoot).catch(() => []);
-      if (entries.some((entry) => entry.startsWith(`.provisioning-${cliVersion}-`))) break;
+      const log = await readFile(probeLogPath, "utf8").catch(() => "");
+      if (log.includes("probe")) {
+        probeEntered = true;
+        break;
+      }
       await delay(10);
     }
     assert.ok(
-      (await readdir(managedRoot)).some((entry) => entry.startsWith(`.provisioning-${cliVersion}-`)),
+      probeEntered &&
+        (await readdir(managedRoot)).some((entry) => entry.startsWith(`.provisioning-${cliVersion}-`)),
       "provisioning should reach its deliberately slow synchronous version probe",
     );
     const responsiveStartedAt = Date.now();
@@ -5796,6 +6221,14 @@ test("managed cli publication is single-flight and atomically visible across two
     const second = spawnLauncher(launcher, { ...common, TEST_OUT: outB });
     const versionDir = join(dataDir, "codestory-cli", version);
     let finished = false;
+    let verifiedGenerations = 0;
+    const verifyPublishedOnce = async () => {
+      const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+      const executable = join(versionDir, ...manifest.path.split("/"));
+      const actual = createHash("sha256").update(await readFile(executable)).digest("hex");
+      assert.equal(actual, manifest.sha256);
+      verifiedGenerations += 1;
+    };
     const visibility = (async () => {
       while (!finished) {
         try {
@@ -5807,16 +6240,19 @@ test("managed cli publication is single-flight and atomically visible across two
           }
           throw error;
         }
-        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
-        const executable = join(versionDir, ...manifest.path.split("/"));
-        const actual = createHash("sha256").update(await readFile(executable)).digest("hex");
-        assert.equal(actual, manifest.sha256);
+        await verifyPublishedOnce();
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
     })();
     const results = await Promise.all([first.completed, second.completed]);
     finished = true;
     await visibility;
+    // The polling loop may exit without observing a published generation;
+    // force one read now that both writers finished so atomic visibility is
+    // asserted, not just permitted.
+    await access(versionDir);
+    await verifyPublishedOnce();
+    assert.ok(verifiedGenerations > 0, "no published generation was observed");
     for (const result of results) assert.equal(result.status, 0, result.stderr);
     for (const file of [outA, outB]) {
       await access(file).catch(() => assert.fail(JSON.stringify(results)));
@@ -5851,7 +6287,9 @@ test("managed cli publication reclaims crashes after lock and before publication
       [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
     ]);
     let holdResponses = true;
+    const requests = [];
     server = createServer((request, response) => {
+      requests.push(request.url);
       const body = assets.get(request.url);
       if (!body) return response.writeHead(404).end();
       const send = () => response.writeHead(200).end(body);
@@ -5866,31 +6304,54 @@ test("managed cli publication reclaims crashes after lock and before publication
       try {
         const failedOut = join(dataDir, "failed.json");
         const recoveredOut = join(dataDir, "recovered.json");
+        const probeLog = join(dataDir, "probes.log");
         holdResponses = crashPoint === "after-lock";
+        requests.length = 0;
         const crashed = spawnLauncher(launcher, {
           CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          CODESTORY_TEST_PROBE_LOG: probeLog,
           PLUGIN_DATA: dataDir,
           TEST_CODESTORY_VERSION: version,
           TEST_OUT: failedOut,
           CODESTORY_TEST_PROBE_DELAY_MS: crashPoint === "before-publication" ? "5000" : "0",
         });
         if (crashPoint === "after-lock") {
+          // Owner record proves the retention lock is held; the request log
+          // additionally witnesses that the asset fetch stage was entered
+          // while the lock was held — the crash lands inside the fetch window.
           await waitForPath(join(dataDir, "codestory-cli", ".retention-lock", "owner.json"));
-        } else {
-          const root = join(dataDir, "codestory-cli");
-          const deadline = Date.now() + 15000;
-          while (Date.now() < deadline) {
-            const children = await readdir(root).catch(() => []);
-            if (children.some((name) => name.startsWith(`.provisioning-${version}-`))) break;
+          const fetchDeadline = Date.now() + 10000;
+          while (Date.now() < fetchDeadline && requests.length === 0) {
             await new Promise((resolve) => setTimeout(resolve, 10));
           }
-          assert.equal((await readdir(root)).some((name) => name.startsWith(`.provisioning-${version}-`)), true);
+          assert.ok(requests.length > 0, "crash should land after the asset fetch begins");
+        } else {
+          // The `.provisioning-*` directory is created before fetch/extract/
+          // probe, so it cannot witness the crash phase. The fixture appends
+          // a probe log entry at `--version` entry — ahead of the 5000 ms
+          // delay — so the marker proves the staged probe was entered.
+          const root = join(dataDir, "codestory-cli");
+          const deadline = Date.now() + 15000;
+          let probeEntered = false;
+          while (Date.now() < deadline) {
+            if ((await readFile(probeLog, "utf8").catch(() => "")).includes("probe")) {
+              probeEntered = true;
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.equal(probeEntered, true, "crash should land inside the staged probe window");
+          assert.equal(
+            (await readdir(root)).some((name) => name.startsWith(`.provisioning-${version}-`)),
+            true,
+          );
         }
         crashed.child.kill("SIGKILL");
         await crashed.completed;
         holdResponses = false;
         const recovered = spawnLauncher(launcher, {
           CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          CODESTORY_TEST_PROBE_LOG: probeLog,
           PLUGIN_DATA: dataDir,
           TEST_CODESTORY_VERSION: version,
           TEST_OUT: recoveredOut,
@@ -6377,7 +6838,7 @@ test("managed cli quarantines corrupt installs, retains two, and fails closed on
         const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
         const executable = join(versionDir, ...manifest.path.split("/"));
         if (process.platform === "win32") {
-          await writeFile(executable, "@echo off\r\necho codestory-cli 0.0.0\r\n", "utf8");
+          await writeWindowsCliShim(executable, "console.log('codestory-cli 0.0.0')");
         } else {
           await writeFile(executable, "#!/bin/sh\necho codestory-cli 0.0.0\n", "utf8");
           await chmod(executable, 0o755);
@@ -6716,10 +7177,41 @@ test("startup hook records active project without runtime bootstrap", async () =
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
 
   try {
+    // A nonexistent CODESTORY_CLI cannot distinguish "hook never invoked the
+    // CLI" from "invocation failed to spawn". Install a callable sentinel that
+    // records every invocation, prove it reachable with a direct call, then
+    // require the hook run to leave no record.
+    const sentinelCli = join(
+      dataDir,
+      process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
+    );
+    const sentinelMarker = join(dataDir, "cli-invocations.txt");
+    const sentinelScript =
+      "require('node:fs').appendFileSync(process.env.CODESTORY_TEST_HOOK_SENTINEL,'invoked\\n');" +
+      "console.log('codestory-cli sentinel')";
+    if (process.platform === "win32") {
+      await writeWindowsCliShim(sentinelCli, sentinelScript);
+    } else {
+      await writeFile(
+        sentinelCli,
+        `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(sentinelScript)} -- "$@"\n`,
+        "utf8",
+      );
+      await chmod(sentinelCli, 0o755);
+    }
+    const control = spawnSync(sentinelCli, ["--version"], {
+      env: { ...process.env, CODESTORY_TEST_HOOK_SENTINEL: sentinelMarker },
+      encoding: "utf8",
+    });
+    assert.equal(control.status, 0, control.stderr);
+    assert.equal(await readFile(sentinelMarker, "utf8"), "invoked\n");
+    await rm(sentinelMarker);
+
     const result = spawnSync(process.execPath, [hookPath], {
       env: {
         ...process.env,
-        CODESTORY_CLI: join(dataDir, "missing-codestory-cli"),
+        CODESTORY_CLI: sentinelCli,
+        CODESTORY_TEST_HOOK_SENTINEL: sentinelMarker,
         CODEX_THREAD_ID: "hook-thread-id",
         COPILOT_PLUGIN_DATA: "",
         PLUGIN_DATA: dataDir,
@@ -6733,6 +7225,11 @@ test("startup hook records active project without runtime bootstrap", async () =
     });
 
     assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      fs.existsSync(sentinelMarker),
+      false,
+      "startup hook must not invoke the CLI",
+    );
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
@@ -6858,6 +7355,18 @@ test("release asset downloader bounds announced and streamed bytes without parti
         /download_size_limit_exceeded/u,
       );
       assert.equal(fs.existsSync(destination), false);
+      // The test name promises no partial files: neither the default
+      // `<destination>.part` nor any stray partial may survive the rejection.
+      assert.equal(
+        fs.existsSync(`${destination}.part`),
+        false,
+        `${name} left a partial file behind`,
+      );
+      assert.deepEqual(
+        (await readdir(dataDir)).filter((entry) => entry.endsWith(".part")),
+        [],
+        `${name} left a stray partial in the download directory`,
+      );
     }
   } finally {
     await rm(dataDir, { recursive: true, force: true });
@@ -6918,10 +7427,12 @@ test("release asset downloader keeps a resumable partial across separate runs", 
   const partialPath = join(dataDir, "cache", "runtime.bin.part");
   await mkdir(join(dataDir, "cache"), { recursive: true });
   const body = Buffer.from("the-managed-runtime-archive-payload");
+  const served = [];
   let cutFirstTransfer = true;
   const server = createServer((request, response) => {
     const range = /^bytes=(\d+)-$/u.exec(request.headers.range || "");
     const start = range ? Number(range[1]) : 0;
+    served.push(start);
     if (cutFirstTransfer) {
       cutFirstTransfer = false;
       response.writeHead(200, { "content-length": String(body.length) });
@@ -6952,6 +7463,9 @@ test("release asset downloader keeps a resumable partial across separate runs", 
     await launcherTest.downloadFile(url, destination, { attempts: 1, timeoutMs: 5000, partialPath });
     assert.deepEqual(await readFile(destination), body);
     assert.equal(fs.existsSync(partialPath), false);
+    // The second run must have asked to continue from the 12 bytes on disk; a
+    // Range-less restart from zero would produce the same final body unwitnessed.
+    assert.deepEqual(served, [0, 12], "second run must resume at the recorded offset");
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(dataDir, { recursive: true, force: true });
@@ -7422,7 +7936,35 @@ test("release asset downloader refuses a partial swapped for a symlink after it 
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   let planted = false;
+  const plant = () => {
+    if (planted) return;
+    planted = true;
+    fs.symlinkSync(outside, partialPath, "file");
+  };
   try {
+    if (process.platform === "win32") {
+      // O_NOFOLLOW is 0 on Windows: the open follows the planted link into the
+      // outside file, so the refusal arrives at publish — the post-rename
+      // identity check — not at the partial-open gate. Nothing may land at the
+      // destination.
+      await assert.rejects(
+        launcherTest.downloadFile(
+          `http://127.0.0.1:${server.address().port}/runtime`,
+          destination,
+          {
+            attempts: 3,
+            retryDelayMs: () => 1,
+            timeoutMs: 5000,
+            partialPath,
+            onProgress: plant,
+          },
+        ),
+        /published_identity/u,
+      );
+      assert.equal(planted, true);
+      assert.equal(fs.existsSync(destination), false);
+      return;
+    }
     await launcherTest.downloadFile(
       `http://127.0.0.1:${server.address().port}/runtime`,
       destination,
@@ -7433,11 +7975,7 @@ test("release asset downloader refuses a partial swapped for a symlink after it 
         partialPath,
         // The first progress callback fires after the partial has been sized and before the transfer
         // opens it: exactly the window a planted link would exploit.
-        onProgress() {
-          if (planted) return;
-          planted = true;
-          fs.symlinkSync(outside, partialPath, "file");
-        },
+        onProgress: plant,
       },
     );
     assert.equal(planted, true);
@@ -7686,6 +8224,10 @@ test("release asset downloader survives a transfer slower than the stall window"
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-slow-"));
   const destination = join(dataDir, "slow.bin");
   const chunks = 8;
+  const stallTimeoutMs = 400;
+  // 8 chunks at 90 ms keeps every inter-chunk gap under the stall window but
+  // stretches the transfer to ~720 ms — beyond one full stall window. A fixed
+  // stall timer that never reset would cut the transfer before it completes.
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-length": String(chunks) });
     let sent = 0;
@@ -7696,19 +8238,22 @@ test("release asset downloader survives a transfer slower than the stall window"
         clearInterval(interval);
         response.end();
       }
-    }, 25);
+    }, 90);
     response.on("close", () => clearInterval(interval));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
-    // Every chunk arrives well after a 40ms budget would have expired, but each one resets the
-    // stall window, so a steady trickle now completes instead of being cut off.
+    const started = Date.now();
     await launcherTest.downloadFile(
       `http://127.0.0.1:${server.address().port}/slow`,
       destination,
-      { attempts: 1, stallTimeoutMs: 400, timeoutMs: 5000 },
+      { attempts: 1, stallTimeoutMs, timeoutMs: 5000 },
     );
     assert.equal((await readFile(destination, "utf8")).length, chunks);
+    assert.ok(
+      Date.now() - started >= stallTimeoutMs,
+      "transfer must outlive one stall window to prove progress resets it",
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(dataDir, { recursive: true, force: true });
@@ -8023,11 +8568,11 @@ async function writeNodeCli(binDir, source) {
   const scriptPath = join(binDir, "fake-codestory-cli.cjs");
   const cliPath = join(
     binDir,
-    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
   );
   await writeFile(scriptPath, source, "utf8");
   if (process.platform === "win32") {
-    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`, "utf8");
+    await writeWindowsCliShim(cliPath, source);
     return cliPath;
   }
   await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
@@ -8091,6 +8636,17 @@ test("hook heartbeat stays quiet and does not bridge hidden MCP", async () => {
 
   try {
     const cliPath = await writeNodeCli(binDir, "require(\"fs\").writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(\" \"));");
+    // Positive reachability: the sentinel is callable, so the absent marker
+    // after the heartbeat means "the hook never invoked it", not "invocation
+    // failed to spawn".
+    const control = spawnSync(cliPath, ["heartbeat-control"], {
+      env: { ...process.env, TEST_MARKER: marker },
+      encoding: "utf8",
+    });
+    assert.equal(control.status, 0, control.stderr);
+    assert.match(await readFile(marker, "utf8"), /heartbeat-control/u);
+    await rm(marker);
+
     const output = runCodexHook({
       hook_event_name: "GoalLoopHeartbeat",
       cwd: repoRoot,

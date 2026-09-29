@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -89,12 +90,21 @@ test("Windows executes a command shim whose path and arguments contain spaces", 
   }
 });
 
-function run(executable, args, options = {}) {
-  const result = spawnSync(executable, args, {
+// Spawning through a shell breaks on spaced executable paths (node.exe under
+// "C:\Program Files\nodejs" dies as 'C:\Program' is not recognized). Route
+// every child through the production planner: real executables spawn
+// directly, only .cmd/.bat shims go through comspec.
+function spawnPlan(executable, args, options = {}) {
+  const { command, commandArgs, spawnOptions = {} } = commandPlan(executable, args);
+  return spawnSync(command, commandArgs, {
     ...options,
+    ...spawnOptions,
     encoding: "utf8",
-    shell: process.platform === "win32",
   });
+}
+
+function run(executable, args, options = {}) {
+  const result = spawnPlan(executable, args, options);
   assert.equal(
     result.status,
     0,
@@ -153,11 +163,8 @@ function proofArgs({
   ];
 }
 
-function assertFailedProof(args, message) {
-  const result = spawnSync(process.execPath, args, {
-    encoding: "utf8",
-    shell: process.platform === "win32",
-  });
+function assertFailedProof(args, message, options = {}) {
+  const result = spawnPlan(process.execPath, args, options);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, message);
 }
@@ -165,8 +172,25 @@ function assertFailedProof(args, message) {
 test("pinned Codex installs a local marketplace fixture into the attested cache", () => {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-marketplace-proof-"));
   try {
+    // Every child of this test runs against owned state: an npm cache and a
+    // HOME under the fixture root. Inheriting ambient npm config/cache or the
+    // developer's HOME makes the outcome depend on machine state.
     const packageRoot = path.join(root, "codex-package");
-    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    const npmCache = path.join(root, "npm-cache");
+    const personalHome = path.join(root, "personal-home");
+    const childEnv = {
+      ...process.env,
+      HOME: personalHome,
+      USERPROFILE: personalHome,
+      npm_config_cache: npmCache,
+    };
+    // Resolve npm.cmd to an absolute path: commandPlan quotes the command
+    // name, and a quoted bare name leaves cmd's %0 unexpanded, so npm.cmd
+    // would compute %~dp0 (its install prefix) from the cwd.
+    const npm = process.platform === "win32"
+      ? spawnSync("where.exe", ["npm.cmd"], { encoding: "utf8" }).stdout.trim()
+        .split(/\r?\n/u)[0]
+      : "npm";
     run(npm, [
       "install",
       "--prefix",
@@ -174,7 +198,11 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       "--no-audit",
       "--no-fund",
       `@openai/codex@${codexVersion}`,
-    ]);
+    ], { env: childEnv });
+    assert.ok(
+      readdirSync(npmCache).length > 0,
+      "npm install did not use the fixture-owned cache",
+    );
 
     const marketplaceRoot = path.join(root, "marketplace");
     const pluginSourceRoot = path.join(root, "plugin-source");
@@ -209,7 +237,6 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     const marketplaceRevision = commitFixture(marketplaceRoot, "fixture", {
       init: true,
     });
-    const personalHome = path.join(root, "personal-home");
     mkdirSync(path.join(personalHome, ".agents", "plugins"), { recursive: true });
     writeFileSync(
       path.join(personalHome, ".agents", "plugins", "marketplace.json"),
@@ -245,12 +272,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       marketplaceRevision,
       expectedVersion: pluginManifest.version,
       sourceRepository: pluginSourceRoot,
-    }), {
-      env: {
-        ...process.env,
-        HOME: personalHome,
-      },
-    });
+    }), { env: childEnv });
 
     const attestation = JSON.parse(readFileSync(attestationPath));
     const expectedPluginRoot = path.join(
@@ -320,9 +342,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       "--installation-source",
       "codex_marketplace_restored_fixture",
     );
-    run(process.execPath, restoredArgs, {
-      env: { ...process.env, HOME: personalHome },
-    });
+    run(process.execPath, restoredArgs, { env: childEnv });
     const restoredAttestation = JSON.parse(
       readFileSync(path.join(restoredRoot, "attestation.json")),
     );
@@ -349,6 +369,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         sourceRepository: pluginSourceRoot,
       }),
       /installed plugin bytes do not match the checked-out CodeStory package/u,
+      { env: childEnv },
     );
     commitFixture(pluginSourceRoot, "change release tree");
     assertFailedProof(
@@ -361,6 +382,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         sourceRepository: pluginSourceRoot,
       }),
       /pinned marketplace plugin source does not match the release source tree/u,
+      { env: childEnv },
     );
 
     const catalogPath = path.join(
@@ -386,6 +408,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         sourceRepository: pluginSourceRoot,
       }),
       /marketplace plugin source is not pinned to one immutable commit/u,
+      { env: childEnv },
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
