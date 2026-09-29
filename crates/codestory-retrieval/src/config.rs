@@ -770,7 +770,10 @@ fn test_cache_root_override() -> Option<PathBuf> {
     if explicit.is_some() {
         return explicit;
     }
-    #[cfg(feature = "test-support")]
+    // The opt-in flag gates only downstream test-support consumers: the
+    // crate's own cfg(test) unit tests must always take the automatic
+    // per-thread root, or they fall through to the ambient user cache.
+    #[cfg(all(feature = "test-support", not(test)))]
     if !AUTOMATIC_TEST_CACHE_ROOT_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
