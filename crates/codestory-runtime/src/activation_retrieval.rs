@@ -290,14 +290,11 @@ fn remove_owned_core_image(
             "Retired core lease changed after image removal".into(),
         ));
     }
-    // Drop the pinned generation handle before the final rmdir; the pinned
-    // generations root re-binds the leaf by name. The removal is
-    // non-recursive: a directory that still holds an unknown entry is not
-    // empty, so `rmdir`/delete-by-handle refuses it and the report marks the
-    // removal refused instead of deleting foreign content.
-    drop(generation);
+    // Re-bind the leaf against the original authenticated directory handle,
+    // still held through removal. The store holds promotion/acquisition fences
+    // across this callback; the final Unix rmdir remains name-based.
     if !root
-        .remove_owned_empty_directory(relative)
+        .remove_owned_empty_directory(relative, validated_directory)
         .map_err(|error| core_deletion_error("remove empty core directory", error))?
     {
         return Ok(false);

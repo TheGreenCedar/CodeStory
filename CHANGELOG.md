@@ -2,21 +2,39 @@
 
 ## Unreleased
 
-- Indexing a file whose extension carries trailing whitespace no longer panics; the file is indexed under its real extension.
-- Markdown failure output now shows the same cause chain and recovery command that JSON output already carried, and `codestory-cli doctor --support-bundle <file>` writes a local redacted bundle (panic site, payload sizes, command-failure causes) for support reports.
-- A project index built by an older CodeStory release is reported as a schema upgrade requirement with an explicit recovery command — `codestory-cli index --project <root> --refresh full` — and the next product call rebuilds it into a fresh generation without touching the old one. `doctor` also lists other cached projects whose cores need the same upgrade.
-- Repositories past the 25,000-file freshness-scan bound now surface a warning in `index` output and a `warn` check in `doctor`, instead of silently reporting the inventory as merely unchecked.
-- The user guide documents connecting arbitrary MCP hosts, including the `CODESTORY_CLI` override, and the managed-CLI containment failure now explains how to fix it.
-- Snippet and source reads for an indexed symbol now verify file bytes against the indexed content hash and refuse stale or missing source with a typed error instead of returning mismatched text.
-- During a refresh, source-backed reads wait for the fresh index while graph-only answers may come from the retained publication; results served that way are labelled `historical` under `_meta.codestory_publication.freshness`.
-- When another CodeStory session is already refreshing the same project, a second session now waits for it to finish and adopts its publication instead of failing with a busy error.
-- Incremental index updates no longer stall when removing a file's stale graph rows alongside many stored resolution facts.
-- Old index images are now reclaimed promptly after a refresh finishes even while another session was mid-publication, and retired generation directories are removed rather than left empty. An index run whose freshness probe could not open the core now names the failed stage instead of reporting a misleading zero file count.
-- When an index update times out behind another session's write lock, the failure is typed `peer_writer_active` and names the holding process (pid, operation, how long it has held the lock, and whether it is still alive) with guidance to wait for or stop it — never to delete the lock file.
-- On Windows, projects opened from a linked Git worktree are now read as that repository instead of failing repository metadata reads, so worktrees share their project identity as they do on macOS and Linux.
-- On Windows, repairing or republishing an existing search index component no longer fails with "Access is denied", including when the component was shared with an earlier index generation.
-- On Windows, a search index file that is rewritten in place or replaced is now detected and re-validated, as on macOS and Linux, instead of being trusted because its size and timestamps still match.
-- On Windows, plugin setup briefly retries publishing the managed CLI folder when another program, such as a virus scanner, still holds it.
+## 0.17.7
+
+CodeStory keeps source reads tied to the indexed bytes, waits for refreshes across sessions, and makes indexing failures easier to diagnose and recover from.
+
+### Read from a coherent index
+
+- Snippets and source-backed context, search and packet results verify source against the indexed content hash. Changed or missing files receive a typed refusal instead of returning unrelated current text.
+- During a refresh, source-backed reads wait for a fresh complete index within the call deadline. Graph navigation may use the retained publication, with its freshness labelled `historical` in the response. Waiting across preparation stages shares one deadline.
+- A second session waits for a project already being refreshed and adopts the completed publication. Cancelling the waiting call leaves the writer running.
+- Call-path verification reports when its search budget is exhausted, so an incomplete investigation cannot look complete.
+
+### Index and recover with clearer diagnostics
+
+- Incremental deletion uses indexed proof-fact lookups, avoiding stalls caused by scanning the surviving graph.
+- Files with trailing whitespace in their extensions no longer abort indexing.
+- Obsolete index images are reclaimed after publication finishes, including work deferred while another session was publishing. Cleanup preserves foreign entries and verifies the retired directory's identity before removing it.
+- A write-lock timeout identifies the holding process and provides guidance to wait for or stop it. A failed freshness probe names the failed stage instead of reporting a misleading zero file count.
+- Markdown errors include their cause chain and recovery commands. `doctor --support-bundle <file>` writes a local redacted diagnostic bundle, and `doctor` lists other cached projects requiring a schema upgrade.
+- Indexing warns when a repository exceeds the 25,000-file freshness-scan bound; `doctor` reports the same limitation as a warning.
+
+### Windows and MCP hosts
+
+- Linked Git worktrees open with the repository identity shared by their sibling worktrees.
+- Search-index repair and republishing can replace read-only components, including files shared with earlier generations. Failed publication restores their immutable permissions.
+- Rewritten or replaced search-index files are revalidated even when their size and timestamps match the previous file.
+- Plugin setup briefly retries a managed CLI folder publication blocked by another program.
+- The user guide covers other MCP hosts, the `CODESTORY_CLI` override and recovery from a managed-CLI containment failure.
+
+### Upgrading
+
+The core cache moves to schema 36. Existing 0.17.6 indexes are rebuilt into a new generation on the next product call, with a one-time indexing cost; status and diagnostic reads remain observational. An older cache supplies the explicit recovery command `codestory-cli index --project <root> --refresh full`. A cache written by a newer binary is refused with guidance to reset derived state and rebuild.
+
+Publication stamps move to schema 4 to add freshness metadata and remain compatible with schema 3 clients. Install matching CLI and plugin versions and restart the MCP host.
 
 ## 0.17.6
 

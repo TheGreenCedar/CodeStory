@@ -2859,6 +2859,11 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DESCRIPTOR_FTS_BODY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Prove descriptor token coverage without fail-open FTS-lane credit.
 ///
 /// 1. Path and symbol names are matched in memory.
@@ -2869,10 +2874,6 @@ fn query_exact_candidates(
 ///
 /// This intentionally replaces the old per-token `MATCH … AND rowid IN (…)`
 /// loop. FTS-lane survival alone never clears the gate.
-#[cfg(test)]
-static DESCRIPTOR_FTS_BODY_READS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 fn populate_descriptor_token_matches_fail_closed(
     connection: &Connection,
     candidates: &mut [LexicalCandidate],
@@ -2925,7 +2926,7 @@ fn populate_descriptor_token_matches_fail_closed(
         );
         let mut statement = connection.prepare_cached(&sql)?;
         #[cfg(test)]
-        DESCRIPTOR_FTS_BODY_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DESCRIPTOR_FTS_BODY_READS.set(DESCRIPTOR_FTS_BODY_READS.get() + 1);
         let rows = statement.query_map(params_from_iter(chunk.iter().copied()), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -6399,6 +6400,19 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_body_read_accounting_does_not_cross_threads() {
+        DESCRIPTOR_FTS_BODY_READS.set(0);
+        std::thread::spawn(descriptor_content_multi_token_admits_via_batched_body_proof)
+            .join()
+            .expect("independent descriptor query");
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.get(),
+            0,
+            "another request's body reads must not contaminate this thread"
+        );
+    }
+
+    #[test]
     fn descriptor_path_symbol_multi_token_admits_without_fts_requery() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
@@ -6414,7 +6428,7 @@ mod tests {
             "descriptor-path-symbol-admit",
             "input",
         );
-        DESCRIPTOR_FTS_BODY_READS.store(0, Ordering::SeqCst);
+        DESCRIPTOR_FTS_BODY_READS.set(0);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6431,7 +6445,7 @@ mod tests {
             "path/symbol must honestly clear the two-of-three gate for alpha+beta: {descriptors:?}"
         );
         assert_eq!(
-            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst),
+            DESCRIPTOR_FTS_BODY_READS.get(),
             0,
             "a path/symbol-covered candidate must not pay any FTS body re-read; \
              per-token coverage re-query is the Keycloak-class cost this gate exists to avoid"
@@ -6461,7 +6475,7 @@ mod tests {
             "descriptor-content-batched-proof",
             "input",
         );
-        DESCRIPTOR_FTS_BODY_READS.store(0, Ordering::SeqCst);
+        DESCRIPTOR_FTS_BODY_READS.set(0);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6475,11 +6489,11 @@ mod tests {
             "honest batched content proof must admit LICENSE without path/symbol tokens: {descriptors:?}"
         );
         assert_eq!(
-            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst),
+            DESCRIPTOR_FTS_BODY_READS.get(),
             1,
             "content coverage must be proven by one batched FTS body read, not a \
              per-token or per-row requery; reads={}",
-            DESCRIPTOR_FTS_BODY_READS.load(Ordering::SeqCst)
+            DESCRIPTOR_FTS_BODY_READS.get()
         );
     }
 

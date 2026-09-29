@@ -101,6 +101,7 @@ fn run_mid_indexing_test_hook(_storage_path: &Path) {}
 /// Extension for the spawned-process writer-hold marker: while
 /// `<storage>.index-writer-hold` exists, a run that already owns the writer
 /// lock parks before doing any work.
+#[cfg(any(test, feature = "test-support"))]
 const INDEX_WRITER_HOLD_EXTENSION: &str = "index-writer-hold";
 
 /// Spawned-process tests park a real refresh mid-flight by creating the
@@ -108,6 +109,7 @@ const INDEX_WRITER_HOLD_EXTENSION: &str = "index-writer-hold";
 /// lock waits here — still holding it — until the file disappears. Both the
 /// explicit token and the ambient activation cancellation stop the wait, and
 /// a bounded deadline keeps a forgotten marker from wedging indexing.
+#[cfg(any(test, feature = "test-support"))]
 fn wait_out_index_writer_hold_marker(
     storage_path: &Path,
     cancel_token: Option<&CancellationToken>,
@@ -218,12 +220,14 @@ impl AppController {
             )));
         }
         let session = CoreReadSession::pin(&storage_path).map_err(|error| {
-            if let codestory_store::StorageError::SchemaVersionMismatch {
-                found, required, ..
-            } = error
-            {
-                return crate::index_incremental::core_schema_upgrade_required_error(
-                    &root, found, required,
+            if matches!(
+                error,
+                codestory_store::StorageError::SchemaVersionMismatch { .. }
+            ) {
+                return crate::index_incremental::core_schema_observation_error(
+                    &root,
+                    "Failed to pin complete core publication",
+                    error,
                 );
             }
             ApiError::new(
@@ -280,21 +284,11 @@ impl AppController {
             .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
-                if let codestory_store::StorageError::SchemaVersionMismatch {
-                    found,
-                    required,
-                    ..
-                } = error
-                {
-                    return crate::index_incremental::core_schema_upgrade_required_error(
-                        project_root,
-                        found,
-                        required,
-                    );
-                }
-                ApiError::internal(format!(
-                    "Failed to observe complete index publication: {error}"
-                ))
+                crate::index_incremental::core_schema_observation_error(
+                    project_root,
+                    "Failed to observe complete index publication",
+                    error,
+                )
             })
     }
 
@@ -524,15 +518,11 @@ impl AppController {
             );
         }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
-            if let codestory_store::StorageError::SchemaVersionMismatch {
-                found, required, ..
-            } = error
-            {
-                return crate::index_incremental::core_schema_upgrade_required_error(
-                    &root, found, required,
-                );
-            }
-            ApiError::internal(format!("Failed to open storage observationally: {error}"))
+            crate::index_incremental::core_schema_observation_error(
+                &root,
+                "Failed to open storage observationally",
+                error,
+            )
         })?;
         let snapshot = storage.read_snapshot().map_err(|error| {
             ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
@@ -720,6 +710,7 @@ impl AppController {
             },
         };
         run_mid_indexing_test_hook(&storage_path);
+        #[cfg(any(test, feature = "test-support"))]
         if let Err(error) = wait_out_index_writer_hold_marker(&storage_path, cancel_token) {
             self.state.lock().is_indexing = false;
             return Err(error);

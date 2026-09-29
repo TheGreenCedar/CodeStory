@@ -1124,16 +1124,17 @@ impl ActivationService {
         }
         let freshness = match Store::open_freshness_observational(storage_path) {
             Ok(storage) => storage,
-            Err(codestory_store::StorageError::SchemaVersionMismatch {
-                found, required, ..
-            }) => {
-                return CompleteCoreAdmission::StaleSchema(
-                    crate::index_incremental::core_schema_upgrade_required_error(
-                        project_root,
-                        found,
-                        required,
-                    ),
+            Err(error @ codestory_store::StorageError::SchemaVersionMismatch { .. }) => {
+                let error = crate::index_incremental::core_schema_observation_error(
+                    project_root,
+                    "Failed to inspect storage admission state",
+                    error,
                 );
+                return if error.code == "core_schema_too_new" {
+                    CompleteCoreAdmission::Corrupt(error)
+                } else {
+                    CompleteCoreAdmission::StaleSchema(error)
+                };
             }
             Err(error) => {
                 return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
@@ -1264,6 +1265,9 @@ impl ActivationService {
                 "request cancelled before project activation",
             ));
         }
+        let deadline = Instant::now()
+            .checked_add(foreground_budget)
+            .unwrap_or_else(Instant::now);
         let target = self.target_for_request(project_root, storage_path);
         let (operation_id, activation_cancelled) = loop {
             let ready_candidate = {
@@ -1292,7 +1296,7 @@ impl ActivationService {
                             state,
                             &target,
                             request_cancelled.as_ref(),
-                            foreground_budget,
+                            deadline.saturating_duration_since(Instant::now()),
                         )?;
                         continue;
                     }
@@ -1311,7 +1315,7 @@ impl ActivationService {
                         &operation_id,
                         true,
                         request_cancelled.as_ref(),
-                        foreground_budget,
+                        deadline.saturating_duration_since(Instant::now()),
                         goal,
                     );
                 }
@@ -1371,7 +1375,7 @@ impl ActivationService {
                             state,
                             &target,
                             request_cancelled.as_ref(),
-                            foreground_budget,
+                            deadline.saturating_duration_since(Instant::now()),
                         )?;
                         continue;
                     }
@@ -1390,7 +1394,7 @@ impl ActivationService {
                         &operation_id,
                         true,
                         request_cancelled.as_ref(),
-                        foreground_budget,
+                        deadline.saturating_duration_since(Instant::now()),
                         goal,
                     );
                 }
@@ -1457,7 +1461,7 @@ impl ActivationService {
                         state,
                         &target,
                         request_cancelled.as_ref(),
-                        foreground_budget,
+                        deadline.saturating_duration_since(Instant::now()),
                     )?;
                     continue;
                 }
@@ -1476,7 +1480,7 @@ impl ActivationService {
                     &operation_id,
                     true,
                     request_cancelled.as_ref(),
-                    foreground_budget,
+                    deadline.saturating_duration_since(Instant::now()),
                     goal,
                 );
             }
@@ -1564,7 +1568,7 @@ impl ActivationService {
             &operation_id,
             false,
             request_cancelled.as_ref(),
-            foreground_budget,
+            deadline.saturating_duration_since(Instant::now()),
             goal,
         )
     }
@@ -7100,6 +7104,51 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn full_activation_keeps_one_budget_across_a_narrower_run() {
+        let process_cache = tempfile::tempdir().expect("owned cache");
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let target = service.target_for_request(project.path(), &storage_path);
+        {
+            let mut state = service.coordinator.state.lock().unwrap();
+            service.begin_activation_locked(&mut state, &target, None, ActivationGoal::CoreOnly);
+        }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let completing = service.clone();
+        let transition = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut state = completing.coordinator.state.lock().unwrap();
+            state.running = false;
+            completing.coordinator.changed.notify_all();
+        });
+        let start = Instant::now();
+        let result = service.activate_project_with_foreground_budget_and_goal(
+            project.path(),
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(500),
+            ActivationGoal::Full,
+        );
+        let elapsed = start.elapsed();
+        transition.join().expect("finish narrower run");
+        service.set_worker_start_gate_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        service.cancel_and_wait();
+        assert_eq!(
+            result.expect_err("full worker remains parked").code,
+            "activation_preparing"
+        );
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "one 500ms budget was renewed: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn a_full_request_waits_for_an_in_flight_core_only_run_then_pursues_full() {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
@@ -8026,14 +8075,16 @@ pub(crate) mod activation_tests {
         mutate_active_generation_sql(&storage_path, "DELETE FROM dense_anchor_publication;");
 
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
-        runtime
+        let error = runtime
             .activation_service()
-            .activate_project(
+            .activate_project_with_foreground_budget(
                 project.path(),
                 &storage_path,
                 Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(30),
             )
             .expect_err("the unit-test runtime has no managed embedding server");
+        assert_eq!(error.code, "project_unavailable", "{error:?}");
 
         let current = Store::database_index_publication(&storage_path)
             .expect("read repaired publication")
@@ -8354,6 +8405,79 @@ pub(crate) mod activation_tests {
             .expect_err("a source-backed read must never serve the retained core");
         assert_eq!(source.code, "project_unavailable");
         assert!(!entered_source_response);
+    }
+
+    #[test]
+    fn newer_core_schema_refuses_observation_and_automatic_rebuild() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        fs::write(project.path().join("fixture.rs"), "pub fn fixture() {}\n").unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "PRAGMA user_version = {};",
+                codestory_store::CURRENT_SCHEMA_VERSION + 1
+            ),
+        );
+        let database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+        let before = fs::read(&database).unwrap();
+        let results = [
+            runtime
+                .project_service()
+                .complete_index_publication_at(project.path(), &storage_path)
+                .map(|_| ()),
+            runtime
+                .project_service()
+                .inspect_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .map(|_| ()),
+            runtime
+                .activation_service()
+                .bind_existing_complete_core_for_observation(
+                    project.path(),
+                    &storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            runtime
+                .activation_service()
+                .ensure_complete_core_for_observation(
+                    project.path(),
+                    &storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                ),
+        ];
+        for result in results {
+            let error = result.expect_err("newer schema requires explicit recovery");
+            assert_eq!(error.code, "core_schema_too_new", "{error:?}");
+            assert!(
+                error
+                    .details
+                    .as_ref()
+                    .unwrap()
+                    .next_commands
+                    .iter()
+                    .any(|command| command.contains("cache reset")
+                        && command.contains("--derived-only")),
+                "{error:?}"
+            );
+        }
+        assert_eq!(fs::read(database).unwrap(), before);
+        assert!(runtime.activation_service().snapshot().is_none());
     }
 
     /// A core published by the previous release (schema 35 under the current
