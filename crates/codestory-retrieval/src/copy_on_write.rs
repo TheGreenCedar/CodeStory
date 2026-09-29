@@ -236,8 +236,11 @@ pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path
     };
 
     // Windows ReplaceFileW rejects a read-only replacement, so a staged file
-    // that will replace an existing destination stays owner-writable there.
-    if !(cfg!(windows) && previous.is_some()) {
+    // that will replace an existing destination must be owner-writable there;
+    // a file linked from an immutable predecessor arrives read-only already.
+    if cfg!(windows) && previous.is_some() {
+        make_file_owner_writable(temp_path)?;
+    } else {
         make_file_immutable(temp_path)?;
     }
 
