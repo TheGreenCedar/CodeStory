@@ -867,6 +867,58 @@ mod trail_story_tests {
     }
 
     #[test]
+    fn trail_story_test_scope_follows_the_caller_scope() {
+        let focus = focus_details();
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![
+                node("focus", "handle_request", "C:/repo/src/request.rs"),
+                node(
+                    "test-helper",
+                    "test_request_flow",
+                    "C:/repo/tests/request_flow.rs",
+                ),
+            ],
+            edges: Vec::new(),
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let production = build_trail_story(None, &focus, &trail, &request(true));
+        assert!(
+            production.test_scope.iter().any(|item| item
+                == "tests and benches excluded by production-only caller scope; request IncludeTestsAndBenches to include them"),
+            "production-scope story should name the exclusion contract: {production:#?}"
+        );
+        assert!(
+            production
+                .test_scope
+                .iter()
+                .any(|item| item.contains("test_request_flow")),
+            "production-scope story should still name test-like nodes present in the trail: {production:#?}"
+        );
+
+        let mut include_request = request(true);
+        include_request.caller_scope = TrailCallerScope::IncludeTestsAndBenches;
+        let included = build_trail_story(None, &focus, &trail, &include_request);
+        assert!(
+            included
+                .test_scope
+                .iter()
+                .all(|item| !item.contains("tests and benches excluded")),
+            "include-tests story must not emit the exclusion line: {included:#?}"
+        );
+        assert!(
+            included
+                .test_scope
+                .iter()
+                .any(|item| item.contains("tests and benches included")),
+            "include-tests story should name the inclusion: {included:#?}"
+        );
+    }
+
+    #[test]
     fn trail_story_flags_structural_only_and_missing_paths() {
         let focus = NodeDetailsDto {
             id: NodeId("focus".to_string()),
