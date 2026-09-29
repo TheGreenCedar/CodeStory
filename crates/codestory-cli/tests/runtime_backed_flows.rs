@@ -251,6 +251,31 @@ fn index_auto_dry_run_reports_missing_core_without_writing() {
     assert_eq!(snapshot_file_bytes(workspace.path()), source_before);
 }
 
+/// The published core lives under the immutable generation layout; resolve the
+/// active generation's database through the publication pointer rather than a
+/// guessed path.
+fn published_core_storage(cache_dir: &Path) -> PathBuf {
+    let publication: Value = serde_json::from_slice(
+        &fs::read(cache_dir.join("core").join("publication.json"))
+            .expect("read core publication pointer"),
+    )
+    .expect("parse core publication pointer");
+    let generation = publication["active"]["generation_id"]
+        .as_str()
+        .expect("active generation id");
+    let storage = cache_dir
+        .join("core")
+        .join("generations")
+        .join(generation)
+        .join("codestory.db");
+    assert!(
+        storage.is_file(),
+        "active generation database must exist: {}",
+        storage.display()
+    );
+    storage
+}
+
 fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> PathBuf {
     fs::create_dir_all(cache_dir).expect("create explicit cache");
     let index = run_cli_with_cache(
@@ -264,7 +289,11 @@ fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> P
         String::from_utf8_lossy(&index.stderr),
         String::from_utf8_lossy(&index.stdout)
     );
-    let storage_path = cache_dir.join("codestory.db");
+    let storage_path = published_core_storage(cache_dir);
+    // The published generation is sealed read-only; this fixture deliberately
+    // rewrites the pinned core into a schema-29 shape inside the isolated test
+    // cache, so unseal the file (and any WAL siblings) first.
+    set_db_writable(&storage_path, true);
     let connection = rusqlite::Connection::open(&storage_path).expect("open indexed fixture");
     let structural_counts = connection
         .query_row(
@@ -317,7 +346,22 @@ fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> P
         )
         .expect("downgrade projection fixture");
     drop(connection);
+    set_db_writable(&storage_path, false);
     storage_path
+}
+
+fn set_db_writable(path: &Path, writable: bool) {
+    for candidate in [
+        path.to_path_buf(),
+        path.with_extension("db-wal"),
+        path.with_extension("db-shm"),
+    ] {
+        if let Ok(metadata) = fs::metadata(&candidate) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(!writable);
+            fs::set_permissions(&candidate, permissions).expect("adjust fixture permissions");
+        }
+    }
 }
 
 fn remove_workspace_source(workspace: &Path) {
@@ -472,17 +516,20 @@ fn raised_source_file_cap_preserves_lexical_recall() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn read_commands_support_explicit_auto_refresh_after_indexing() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
 
+    // Plain `search` fails closed without a full agent sidecar; the core-only
+    // surface is `--repo-text off` (see `search_json_fails_closed_without_full_sidecars`).
     let search = run_cli(
         workspace.path(),
         &[
             "search",
             "--query",
             "TicTacToe",
+            "--repo-text",
+            "off",
             "--refresh",
             "auto",
             "--format",
@@ -496,9 +543,9 @@ fn read_commands_support_explicit_auto_refresh_after_indexing() {
     );
 
     let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
-    assert_publication_metadata(&json, "search", true);
+    assert_publication_metadata(&json, "search", false);
     assert!(
-        json["indexed_symbol_hits"]
+        json["evidence"]
             .as_array()
             .is_some_and(|hits| !hits.is_empty()),
         "auto-refresh search should still return indexed symbol hits"
@@ -506,7 +553,6 @@ fn read_commands_support_explicit_auto_refresh_after_indexing() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn symbol_query_file_filter_resolves_expected_fixture() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
@@ -541,7 +587,6 @@ fn symbol_query_file_filter_resolves_expected_fixture() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn query_command_runs_search_filter_limit_pipeline() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
@@ -576,7 +621,6 @@ fn query_command_runs_search_filter_limit_pipeline() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn query_symbol_prefers_same_exact_target_as_symbol_command() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
@@ -621,7 +665,6 @@ fn query_symbol_prefers_same_exact_target_as_symbol_command() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn trail_command_default_width_matches_query_dsl_trail() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
@@ -666,7 +709,6 @@ fn trail_command_default_width_matches_query_dsl_trail() {
 }
 
 #[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI publication metadata"]
 fn graph_cli_json_surfaces_share_publication_metadata() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
@@ -724,7 +766,6 @@ fn graph_cli_json_surfaces_share_publication_metadata() {
 }
 
 #[test]
-#[ignore = "builds full retrieval fixtures; run explicitly when touching broad CLI publication metadata"]
 fn broad_cli_json_surfaces_share_core_and_retrieval_publications() {
     let workspace = broad_metadata_workspace();
     index_workspace(workspace.path());
@@ -800,7 +841,6 @@ fn broad_cli_json_surfaces_share_core_and_retrieval_publications() {
 }
 
 #[test]
-#[ignore = "builds a schema-29 indexed fixture and executes the projection-only CLI writer"]
 fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
     let workspace = copy_tictactoe_workspace();
     let cache = tempdir().expect("explicit cache");
@@ -826,12 +866,19 @@ fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
             .as_u64()
             .is_some_and(|count| count > 0)
     );
-    let connection = rusqlite::Connection::open(&storage_path).expect("open republished core");
+    // The republish publishes a new immutable generation migrated to the
+    // current schema; the schema-29 fixture stays sealed.
+    let republished = published_core_storage(cache.path());
+    assert_ne!(
+        republished, storage_path,
+        "republish must publish a distinct generation"
+    );
+    let connection = rusqlite::Connection::open(&republished).expect("open republished core");
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("read migrated schema"),
-        30
+        36
     );
     assert_eq!(
         connection
@@ -847,14 +894,18 @@ fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
 }
 
 #[test]
-#[ignore = "builds a schema-29 indexed fixture and verifies CLI writer-lock ordering"]
 fn republish_projections_cli_acquires_writer_lock_before_schema_migration() {
     let workspace = copy_tictactoe_workspace();
     let cache = tempdir().expect("explicit cache");
     let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
     remove_workspace_source(workspace.path());
     let bytes_before = fs::read(&storage_path).expect("read schema-29 bytes");
-    let lock_path = storage_path.with_extension("index-writer.lock");
+    // The writer lock is taken on the logical storage path
+    // (`<cache>/codestory.db`), which resolves to the active generation.
+    let lock_path = cache
+        .path()
+        .join("codestory.db")
+        .with_extension("index-writer.lock");
     let writer_lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -903,11 +954,11 @@ fn republish_projections_cli_acquires_writer_lock_before_schema_migration() {
 }
 
 #[test]
-#[ignore = "builds a schema-29 indexed fixture and verifies retained policy cap drift fails closed"]
 fn republish_projections_cli_rejects_legacy_policy_cap_drift_without_mutation() {
     let workspace = copy_tictactoe_workspace();
     let cache = tempdir().expect("explicit cache");
     let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
+    set_db_writable(&storage_path, true);
     let connection = rusqlite::Connection::open(&storage_path).expect("open retained fixture");
     connection
         .execute(
@@ -919,6 +970,7 @@ fn republish_projections_cli_rejects_legacy_policy_cap_drift_without_mutation() 
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint retained fixture");
     drop(connection);
+    set_db_writable(&storage_path, false);
     remove_workspace_source(workspace.path());
     let bytes_before = fs::read(&storage_path).expect("read retained bytes");
 

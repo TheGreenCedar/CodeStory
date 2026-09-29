@@ -78,6 +78,22 @@ synthetic fixture in
 adds only real-tree scale and incidental shapes no synthetic fixture
 reproduces.
 
+The CLI crate owns one live-sidecar lane, `cli-live-sidecar-contracts`. The
+four `#[ignore]`d contracts in `tests/search_json_output.rs` exercise live
+full-sidecar behavior: `retrieval index --profile agent` must spawn the
+managed per-user embedding runtime, so the lane requires a prepared embedded
+model and an admissible embedding device:
+
+```bash
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
+CODESTORY_TEST_EMBED_ALLOW_CPU=1 \
+    cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture
+```
+
+The `--ignored` selection also runs `search_quality_eval`, whose owner lane is
+the search-quality runbook in `docs/testing/search-quality-eval.md`; pass an
+exact test name after `--` to select a single row.
+
 ## Draft source checks
 
 Experiment-validity changes use the core-only exact-search cases in

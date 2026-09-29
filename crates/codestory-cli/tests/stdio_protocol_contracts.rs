@@ -616,7 +616,25 @@ fn public_v3_cli_keeps_experimental_verification_out_of_default_help() {
         .args(["--help"])
         .output()
         .expect("run top-level help");
+    assert!(
+        output.status.success(),
+        "top-level help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let top_level = String::from_utf8(output.stdout).expect("UTF-8 top-level help");
+    // The command must be listed as a subcommand row, not merely mentioned in
+    // prose: the help preamble already names `search`/`packet` in its lane
+    // examples, so a bare `contains` cannot tell a hidden command from an
+    // advertised one.
+    for command in ["packet", "search"] {
+        assert!(
+            top_level.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed == command || trimmed.starts_with(&format!("{command} "))
+            }),
+            "top-level help must list the `{command}` subcommand row: {top_level}"
+        );
+    }
     assert!(!top_level.contains("prove-call-path"), "{top_level}");
     assert!(
         !top_level.contains("verify-indexed-direct-calls"),
@@ -1311,9 +1329,32 @@ fn assert_search_repaired_before_terminal_activation(
         "a terminal activation failure must name its cause: {error}"
     );
     assert_eq!(error["retry_tool"], Value::Null);
+    // The terminal branch must prove the repair left a completed generation,
+    // not merely a directory: an empty or partial replacement would satisfy
+    // `is_dir` alone.
+    let completed = fs::read_dir(search_generations)
+        .expect("search repair must leave a generations directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let marker_path = entry.path().join(".codestory-complete.json");
+            let marker: Value = serde_json::from_slice(&fs::read(&marker_path).ok()?).ok()?;
+            Some((entry.file_name().to_string_lossy().into_owned(), marker))
+        })
+        .find(|(name, marker)| {
+            marker["schema_version"] == json!(1)
+                && marker["generation_id"].as_str() == Some(name.as_str())
+                && marker["symbol_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                && marker["tantivy_doc_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        });
     assert!(
-        search_generations.is_dir(),
-        "search repair must complete before the terminal package limitation is reported"
+        completed.is_some(),
+        "search repair must complete a generation with a matching marker \
+         before the terminal package limitation is reported"
     );
     let ground_id = format!("{id}-local-ground");
     let ground = send_json(
@@ -5182,12 +5223,15 @@ fn transcript_reads_project_resource() {
     assert_eq!(content["mimeType"], "application/json");
     let text = content["text"].as_str().expect("project resource text");
     let project: Value = serde_json::from_str(text).expect("project resource json text");
+    let root = project
+        .get("project_root")
+        .or_else(|| project.get("root"))
+        .and_then(Value::as_str)
+        .expect("project resource should include a project root field");
     assert!(
-        project
-            .get("project_root")
-            .or_else(|| project.get("root"))
-            .is_some(),
-        "project resource should include a project root field: {project}"
+        codestory_workspace::same_workspace_path(Path::new(root), fixture.workspace.path()),
+        "project resource must describe this fixture's canonical root, not an \
+         unrelated project: {project}"
     );
 }
 

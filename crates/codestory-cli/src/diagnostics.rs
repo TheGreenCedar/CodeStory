@@ -941,16 +941,29 @@ mod tests {
                 query = "must stay redacted",
                 "packet entry observation"
             );
+            // Hostile guard: an allowlisted field carrying arbitrary private
+            // text must still be redacted — the allowlist admits digest lists
+            // only.
+            tracing::warn!(
+                raf_ranked_identity_digests = "unlabeled private query payload",
+                "hostile digest field"
+            );
         });
 
         let rows = read_jsonl(&sink.log_path())?;
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         let fields = &rows[0]["fields"];
         assert_eq!(fields["raf_ranked_identity_digests"], ranked);
         assert_eq!(fields["raf_admitted_identity_digests"], admitted);
         assert_eq!(fields["raf_final_identity_digests"], final_support);
         assert_eq!(fields["query"], "[redacted]");
         assert_eq!(fields["message"], REDACTED);
+        let hostile = serde_json::to_string(&rows[1])?;
+        assert_eq!(
+            rows[1]["fields"]["raf_ranked_identity_digests"], "[redacted]",
+            "a non-digest payload in an allowlisted field must not survive: {hostile}"
+        );
+        assert!(!hostile.contains("unlabeled private query payload"));
         Ok(())
     }
 
@@ -1163,6 +1176,30 @@ mod tests {
         bounded_locks::release(&lock)?;
 
         let files = evidence_files(&sink.diagnostics_dir(), "emergency-", ".jsonl")?;
+        // Positive controls first: a fallback writer that emitted nothing at
+        // all must not satisfy this test.
+        assert_eq!(
+            files.len(),
+            EMERGENCY_LOG_SLOTS,
+            "every contended write must reach a bounded emergency slot"
+        );
+        let mut survived = Vec::new();
+        for path in &files {
+            let row: Value = serde_json::from_slice(&fs::read(path)?)
+                .expect("each emergency slot holds one JSON record");
+            assert_eq!(row["event"], json!("lock_contention"));
+            assert_eq!(row["correlation_id"], json!("emergency-test"));
+            survived.push(row["index"].as_u64().expect("emergency row index"));
+        }
+        survived.sort_unstable();
+        let expected = ((EMERGENCY_LOG_SLOTS * 2)..(EMERGENCY_LOG_SLOTS * 3))
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            survived, expected,
+            "each slot must retain its newest write, so the surviving rows are \
+             the last EMERGENCY_LOG_SLOTS indexes"
+        );
         assert!(files.len() <= EMERGENCY_LOG_SLOTS);
         assert!(
             evidence_namespace_count(&sink.diagnostics_dir(), "emergency-")?

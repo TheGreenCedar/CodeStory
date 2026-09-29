@@ -513,7 +513,7 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 }
 
 #[test]
-#[ignore = "live full-retrieval contract; requires the managed embedding runtime"]
+#[ignore = "cli-live-sidecar lane; requires the managed embedding runtime (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
 fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
@@ -689,7 +689,7 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
 }
 
 #[test]
-#[ignore = "live full-sidecar contract; requires finalized sidecar ranking evidence"]
+#[ignore = "cli-live-sidecar lane; requires finalized sidecar ranking evidence (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
 fn exact_symbol_queries_preserve_fast_path_and_top_rank() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
@@ -750,7 +750,7 @@ fn exact_symbol_queries_preserve_fast_path_and_top_rank() {
 }
 
 #[test]
-#[ignore = "live full-sidecar contract; requires finalized symbol/route fixture evidence"]
+#[ignore = "cli-live-sidecar lane; requires finalized symbol/route fixture evidence (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
 fn symbol_json_exposes_typed_route_endpoint_metadata() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
@@ -856,7 +856,7 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
 }
 
 #[test]
-#[ignore = "live full-sidecar contract; requires finalized sidecar field-filtered search evidence"]
+#[ignore = "cli-live-sidecar lane; requires finalized sidecar field-filtered search evidence (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
 fn field_qualified_search_filters_kind_path_name_and_language() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());

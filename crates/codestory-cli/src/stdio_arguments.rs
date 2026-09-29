@@ -599,6 +599,44 @@ mod tests {
         }
     }
 
+    /// Collect every keyword a published schema uses. `value` is already in
+    /// schema position, so each member key is a keyword regardless of whether
+    /// the object carries a recognized keyword; heuristic detection is only a
+    /// fallback for literal-valued members (a `const`/`default` payload, for
+    /// instance, can itself be a JSON object).
+    fn collect_schema_keywords(schema: &Value, found: &mut std::collections::BTreeSet<String>) {
+        let Value::Object(members) = schema else {
+            return;
+        };
+        for (key, value) in members {
+            found.insert(key.clone());
+            match key.as_str() {
+                "properties" => {
+                    if let Some(properties) = value.as_object() {
+                        for property in properties.values() {
+                            collect_schema_keywords(property, found);
+                        }
+                    }
+                }
+                "items" | "additionalProperties" | "not" => {
+                    collect_schema_keywords(value, found);
+                }
+                "oneOf" | "anyOf" | "allOf" => {
+                    if let Some(variants) = value.as_array() {
+                        for variant in variants {
+                            collect_schema_keywords(variant, found);
+                        }
+                    }
+                }
+                _ => collect_keywords(value, found),
+            }
+        }
+    }
+
+    /// Heuristic schema detection for values that are not already in schema
+    /// position. A schema-shaped literal keeps coverage it had before; a
+    /// keyword-only-unsupported object that reaches this path stays uncollected
+    /// because nothing positions it as a schema.
     fn collect_keywords(schema: &Value, found: &mut std::collections::BTreeSet<String>) {
         match schema {
             Value::Object(members) => {
@@ -612,18 +650,11 @@ mod tests {
                     || members.contains_key("items")
                     || members.contains_key("enum")
                     || members.contains_key("const");
-                for (key, value) in members {
-                    if is_schema {
-                        found.insert(key.clone());
-                    }
-                    if is_schema && key == "properties" {
-                        if let Some(properties) = value.as_object() {
-                            for property in properties.values() {
-                                collect_keywords(property, found);
-                            }
-                        }
-                        continue;
-                    }
+                if is_schema {
+                    collect_schema_keywords(schema, found);
+                    return;
+                }
+                for value in members.values() {
                     collect_keywords(value, found);
                 }
             }
@@ -796,6 +827,15 @@ mod tests {
             codes_from_output(&schema, json!({"kind":"wrong","value":"forbidden"})),
             vec!["invalid_const_value", "forbidden_combination"]
         );
+        // Each of these satisfies no `anyOf` variant; a validator that dropped
+        // union enforcement would admit all three.
+        for value in [json!(false), json!(""), json!(0)] {
+            let codes = codes_from_output(&schema, json!({"kind":"tagged","value":value}));
+            assert!(
+                codes.contains(&"unsatisfied_any_of"),
+                "{value} satisfies no anyOf branch: {codes:?}"
+            );
+        }
     }
 
     #[test]

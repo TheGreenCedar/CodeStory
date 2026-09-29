@@ -515,6 +515,42 @@ mod tests {
             other_session.read_at(&newest.unwrap().uri, now),
             Err(DiagnosticsReadErrorV3::CapabilityUnavailable)
         );
+
+        // The identical binding registered under two distinct session secrets
+        // must mint distinct capabilities: each own URI reads, each foreign
+        // URI refuses. Omitting the session secret from the capability token
+        // would collapse these URIs and fail here.
+        let shared = binding(Uuid::new_v4().to_string(), 77_000);
+        let mut session_a = DiagnosticsRegistryV3::new_with_secret([10; 32]);
+        let mut session_b = DiagnosticsRegistryV3::new_with_secret([11; 32]);
+        let grant_a = session_a
+            .register_at(shared.clone(), vec![7], now)
+            .expect("first session registers the shared binding");
+        let grant_b = session_b
+            .register_at(shared, vec![7], now)
+            .expect("second session registers the shared binding");
+        assert_ne!(
+            grant_a.uri, grant_b.uri,
+            "distinct session secrets must bind distinct capability URIs"
+        );
+        assert_eq!(
+            &*session_a.read_at(&grant_a.uri, now).expect("own URI"),
+            &[7]
+        );
+        assert_eq!(
+            &*session_b.read_at(&grant_b.uri, now).expect("own URI"),
+            &[7]
+        );
+        assert_eq!(
+            session_b.read_at(&grant_a.uri, now),
+            Err(DiagnosticsReadErrorV3::CapabilityUnavailable),
+            "the same binding under a foreign secret must not read"
+        );
+        assert_eq!(
+            session_a.read_at(&grant_b.uri, now),
+            Err(DiagnosticsReadErrorV3::CapabilityUnavailable),
+            "the same binding under a foreign secret must not read"
+        );
     }
 
     #[test]

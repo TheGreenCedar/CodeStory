@@ -2995,9 +2995,29 @@ mod tests {
             observed_size: Some(2),
             byte_cap: Some(1),
         }];
+        answer.freshness = Some(codestory_contracts::api::IndexFreshnessDto {
+            status: codestory_contracts::api::IndexFreshnessStatusDto::Stale,
+            changed_file_count: 2,
+            new_file_count: 1,
+            removed_file_count: 0,
+            checked_file_count: 7,
+            indexed_file_count: 4,
+            duration_ms: 3,
+            reason: None,
+            not_checked_cause: None,
+            samples: Vec::new(),
+        });
 
         let packet = crate::output::context_packet_json(&answer);
         let emitted = packet.as_object().expect("packet object");
+        // The optional fields must actually reach the wire: an empty fixture
+        // proves nothing about whether an emitted key is declared.
+        for field in ["freshness", "source_coverage"] {
+            assert!(
+                emitted.contains_key(field),
+                "populated {field} must reach the packet wire so its schema declaration is audited: {emitted:?}"
+            );
+        }
         let undeclared = emitted
             .keys()
             .filter(|key| !declared.contains(&key.as_str()))
