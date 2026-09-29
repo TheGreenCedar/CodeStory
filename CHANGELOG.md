@@ -14,7 +14,8 @@
 - Old index images are now reclaimed promptly after a refresh finishes even while another session was mid-publication, and retired generation directories are removed rather than left empty. An index run whose freshness probe could not open the core now names the failed stage instead of reporting a misleading zero file count.
 - When an index update times out behind another session's write lock, the failure is typed `peer_writer_active` and names the holding process (pid, operation, how long it has held the lock, and whether it is still alive) with guidance to wait for or stop it — never to delete the lock file.
 - On Windows, projects opened from a linked Git worktree are now read as that repository instead of failing repository metadata reads, so worktrees share their project identity as they do on macOS and Linux.
-- On Windows, repairing or republishing an existing search index component no longer fails with "Access is denied".
+- On Windows, repairing or republishing an existing search index component no longer fails with "Access is denied", including when the component was shared with an earlier index generation.
+- On Windows, a search index file that is rewritten in place or replaced is now detected and re-validated, as on macOS and Linux, instead of being trusted because its size and timestamps still match.
 - On Windows, plugin setup briefly retries publishing the managed CLI folder when another program, such as a virus scanner, still holds it.
 
 ## 0.17.6
