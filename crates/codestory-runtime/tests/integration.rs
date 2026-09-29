@@ -337,7 +337,7 @@ fn incremental_publication_immutable_generation_measurement() -> anyhow::Result<
             + u128::from(promotion.pointer_publication_ms);
 
         println!(
-            "incremental round {round}: files_to_index={} files_to_remove={} outcome={:?}",
+            "incremental round {round}: files_to_index={:?} files_to_remove={:?} outcome={:?}",
             probe.files_to_index, probe.files_to_remove, probe.outcome
         );
         println!(

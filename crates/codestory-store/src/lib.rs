@@ -58,7 +58,7 @@ pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
     BoundedRawCallEdges, BoundedRawIncidentEdges, BuildNodeLookup, CORE_LEASE_FILE,
     CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, CorePromotionStats, CoreResetExclusion,
-    CoreRetentionReport, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    CoreRetentionReport, CoreRetentionSuppression, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorContentIdentity,
     DenseAnchorInput, DenseAnchorInputReuseMetadata, DenseAnchorInputStats,
     DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, DenseReasonCounts,

@@ -144,6 +144,24 @@ Three environment variables override the defaults if you need them:
 | `CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS` | 3600000 | Ceiling on the whole download, across attempts |
 | `CODESTORY_PLUGIN_DOWNLOAD_ATTEMPTS` | 20 | How many resuming attempts before giving up |
 
+## A peer process is publishing
+
+A `peer_writer_active` failure means another CodeStory process is writing or
+finalizing the index for this repository right now. It is never a stale file:
+the operating system releases the lock the moment the holder exits, so a lock
+that still blocks belongs to a live process.
+
+The error tells you who: `holder.pid`, what it was doing (`holder.operation`),
+when it acquired the lock (`holder.since`), and whether it is still
+running (`holder.alive`). Wait for that process to finish, or stop it if it is
+no longer needed, then retry the same tool. If `holder.alive` is `false`, the
+record is only a leftover — retry already succeeds.
+
+Never delete `*.lock` or `*.owner.json` files under the cache's `retention/`
+directory. Removing a lock file while its holder is alive breaks mutual
+exclusion: the old process keeps writing to the old lock while a new process
+locks a replacement, and two writers can publish concurrently.
+
 ## Update and runtime drift
 
 `runtime_update.state=available` is advisory while the current CLI remains

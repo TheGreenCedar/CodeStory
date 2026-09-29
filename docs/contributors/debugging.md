@@ -248,6 +248,32 @@ hermetic or offline build, use `--source <path> --offline`. The acquisition
 script and Cargo independently verify the same checked-in size and digest, and
 an invalid explicit source fails closed.
 
+## If A Writer Lock Times Out
+
+A `peer_writer_active` failure means a live process held the per-project
+writer lock (`writer-<project_id>` under the cache's `retention/` directory)
+for the whole wait budget. It is never a stale file: flock releases on process
+exit, so a lock that still blocks has a live holder.
+
+The typed error carries a `peer_writer` detail with `holder { pid, operation,
+since, alive }` (or `holder: unknown`) and a `next_action`. Every exclusive
+writer or retention acquisition also publishes `<lock>.owner.json` beside the
+lock file — pid, process start identity, executable name, scope, and
+acquisition time — removed best-effort when the holder drops the lock. The
+`alive` flag re-probes the recorded pid against its process start identity, so
+a dead holder's leftover record reads `alive: false` even if the pid was
+reused.
+
+The owner record is diagnostics only. Nothing reads it to acquire, skip, or
+reap a lock, and no recovery path deletes the lock file. Deleting a held lock
+file is how mutual exclusion actually breaks: the old holder keeps its flock
+on the unlinked inode while a new process creates and locks a fresh one, so
+two writers run concurrently.
+
+Recovery: wait for the recorded pid or stop that process, then retry. If
+`alive` is false the record is only a leftover and the next acquisition
+already proceeds; never remove `*.lock` or `*.owner.json` by hand.
+
 ## Cache Reset Cookbook
 
 Use this when you need to wipe state instead of debugging a clearly broken cache:

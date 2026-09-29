@@ -415,10 +415,13 @@ fn retrieval_index_should_retry_full_refresh(
 }
 
 fn map_retrieval_finalize_error(error: anyhow::Error) -> anyhow::Error {
-    match codestory_runtime::insufficient_space_api_error(&error) {
-        Some(refusal) => map_api_error(refusal),
-        None => error,
+    if let Some(refusal) = codestory_runtime::insufficient_space_api_error(&error) {
+        return map_api_error(refusal);
     }
+    if let Some(refusal) = codestory_runtime::peer_writer_api_error(&error) {
+        return map_api_error(refusal);
+    }
+    error
 }
 
 fn error_chain_contains(error: &anyhow::Error, needle: &str) -> bool {

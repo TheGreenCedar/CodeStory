@@ -78,11 +78,13 @@ pub use dto::{
 pub use errors::{
     ApiError, ApiErrorDetails, COMMAND_FAILURE_SCHEMA_VERSION, CommandFailureEnvelope,
     DiskSpacePressureDto, EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
+    PeerWriterDiagnosticsDto, PeerWriterHolderDto, PeerWriterHolderRecordDto,
 };
 pub use events::{
     AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
-    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalCoreWallTimings,
-    IncrementalPlanProbeOutcomeDto, IncrementalPlanProbeTimings, IncrementalScheduledPathActionDto,
+    CoreRetentionOutcomeDto, DatabaseSnapshotCopyTimings, FullRefreshWallTimings,
+    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto, IncrementalPlanProbeTimings,
+    IncrementalProbeUnavailableStageDto, IncrementalScheduledPathActionDto,
     IncrementalScheduledPathDto, IncrementalScheduledPathReasonDto, IndexingPhaseTimings,
     ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings, PromotedValidationDto,
 };

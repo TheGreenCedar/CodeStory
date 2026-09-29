@@ -6,7 +6,10 @@ use std::{fs, io};
 use codestory_retrieval::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock, global_generation_gc_state_file,
 };
-use codestory_store::{CORE_DATABASE_FILE, CORE_LEASE_FILE, CoreResetExclusion, StorageError};
+use codestory_store::{
+    CORE_DATABASE_FILE, CORE_LEASE_FILE, CoreResetExclusion, CoreRetentionReport,
+    CoreRetentionSuppression, StorageError,
+};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 
 use crate::{
@@ -140,12 +143,23 @@ impl ActivationService {
         config: &RuntimeRetrievalConfig,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<FinalizeIndexOutcome> {
-        codestory_retrieval::finalize_index_for_runtime_with_cancel(
+        let outcome = codestory_retrieval::finalize_index_for_runtime_with_cancel(
             project_root,
             storage_path,
             config.as_inner(),
             cancelled,
-        )
+        );
+        // The finalize shared fence is released when the call above returns,
+        // on success or failure. A core-GC pass taken under that fence is
+        // suppressed, so publications committed while a peer finalized keep
+        // one unpinned image each; this best-effort pass reclaims them
+        // without another index operation.
+        if let Err(error) = apply_core_gc_for_runtime(config.as_inner(), storage_path, &|| {
+            cancelled.load(std::sync::atomic::Ordering::Relaxed)
+        }) {
+            tracing::warn!("Core retention after retrieval finalize deferred: {error}");
+        }
+        outcome
     }
 }
 
@@ -153,30 +167,39 @@ pub(crate) fn apply_core_gc_after_publication(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     storage_path: &Path,
     cancel_token: Option<&codestory_indexer::CancellationToken>,
-) {
-    if let Err(error) = apply_core_gc_for_runtime(runtime, storage_path, &|| {
+) -> Option<CoreRetentionReport> {
+    match apply_core_gc_for_runtime(runtime, storage_path, &|| {
         cancel_token.is_some_and(codestory_indexer::CancellationToken::is_cancelled)
     }) {
-        // The core is already published. A retention failure cannot turn the
-        // successful commit into an apparent failed write or invite a retry.
-        tracing::warn!("Core retention after publication deferred: {error}");
+        Ok(report) => Some(report),
+        Err(error) => {
+            // The core is already published. A retention failure cannot turn
+            // the successful commit into an apparent failed write or invite a
+            // retry.
+            tracing::warn!("Core retention after publication deferred: {error}");
+            None
+        }
     }
 }
 
-fn apply_core_gc_for_runtime(
+pub(crate) fn apply_core_gc_for_runtime(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     storage_path: &Path,
     cancelled: &dyn Fn() -> bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CoreRetentionReport> {
     if cancelled() {
-        return Ok(());
+        return Ok(CoreRetentionReport::suppressed(
+            CoreRetentionSuppression::Cancelled,
+        ));
     }
     let Some(_global) = GenerationRetentionLock::try_acquire(
         &global_generation_gc_state_file(runtime),
         GLOBAL_GENERATION_GC_LOCK_SCOPE,
     )?
     else {
-        return Ok(());
+        return Ok(CoreRetentionReport::suppressed(
+            CoreRetentionSuppression::FencedByActiveRetrievalPublication,
+        ));
     };
     let legacy = codestory_store::apply_legacy_retirement(
         storage_path,
@@ -188,10 +211,10 @@ fn apply_core_gc_for_runtime(
     }
     let core =
         codestory_store::apply_core_retention(storage_path, cancelled, remove_owned_core_image)?;
-    for error in core.errors {
+    for error in &core.errors {
         tracing::warn!("Core retention deferred candidate: {error}");
     }
-    Ok(())
+    Ok(core)
 }
 
 fn remove_owned_legacy_file(
@@ -267,11 +290,18 @@ fn remove_owned_core_image(
             "Retired core lease changed after image removal".into(),
         ));
     }
-    // Windows deletes the authenticated directory by this handle. Unix
-    // deliberately retains it: final rmdir cannot bind to the pinned handle.
-    generation
-        .remove_pinned_empty_directory()
-        .map_err(|error| core_deletion_error("remove empty core directory", error))?;
+    // Drop the pinned generation handle before the final rmdir; the pinned
+    // generations root re-binds the leaf by name. The removal is
+    // non-recursive: a directory that still holds an unknown entry is not
+    // empty, so `rmdir`/delete-by-handle refuses it and the report marks the
+    // removal refused instead of deleting foreign content.
+    drop(generation);
+    if !root
+        .remove_owned_empty_directory(relative)
+        .map_err(|error| core_deletion_error("remove empty core directory", error))?
+    {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -676,9 +706,14 @@ mod tests {
                 Some(project.path()),
                 codestory_retrieval::SidecarProfile::Local,
             );
-            apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
+            let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
                 .expect("unknown neighbor pass");
+            assert_eq!(
+                report.unknown_entries, 1,
+                "the foreign file must be counted, never recursed into"
+            );
             assert!(old.is_file());
+            assert!(old.parent().unwrap().is_dir());
             assert_eq!(fs::read(&neighbor).unwrap(), b"keep");
             fs::remove_file(&neighbor).expect("remove test neighbor");
             let pointer_path = layout.publication_path();
@@ -824,28 +859,160 @@ mod tests {
     }
 
     #[test]
-    fn core_gc_defers_behind_a_live_retrieval_global_reader_then_retries() {
+    fn fenced_publications_report_suppression_and_post_finalize_pass_reclaims() {
         let cache = tempdir().expect("isolated cache");
         codestory_retrieval::with_test_cache_root(cache.path(), || {
             let project = tempdir().expect("project");
             let storage_path = cache.path().join("codestory.db");
-            publish_owned_core_generations(project.path(), &storage_path, 3);
-            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
-            let old = layout.generation_database_path("owned-core-1").unwrap();
             let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
                 Some(project.path()),
                 codestory_retrieval::SidecarProfile::Local,
             );
+            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
             let state = global_generation_gc_state_file(&runtime);
             let reader =
                 GenerationRetentionLock::acquire_shared(&state, GLOBAL_GENERATION_GC_LOCK_SCOPE)
-                    .expect("retrieval reader");
-            apply_core_gc_for_runtime(&runtime, &storage_path, &|| false).expect("deferred pass");
-            assert!(old.is_file());
+                    .expect("live retrieval finalize fence");
+
+            // Every publication committed while a peer holds the shared fence
+            // must report its suppressed pass and keep the predecessor image.
+            for generation in 1..=3u64 {
+                publish_owned_core_generation(project.path(), &storage_path, generation);
+                let report = apply_core_gc_after_publication(&runtime, &storage_path, None)
+                    .expect("a suppressed pass still reports");
+                assert!(report.pruning_suppressed);
+                assert_eq!(
+                    report.reason,
+                    Some(CoreRetentionSuppression::FencedByActiveRetrievalPublication),
+                    "suppression under a live finalize fence must be named, not silent"
+                );
+                assert_eq!(report.reclaimed_images, 0);
+            }
+            let leaked = layout
+                .generation_database_path("owned-core-1")
+                .expect("gen-1 image");
+            assert!(leaked.is_file(), "the fenced pass cannot reclaim");
+
             drop(reader);
-            apply_core_gc_for_runtime(&runtime, &storage_path, &|| false).expect("retry pass");
-            assert!(!old.is_file());
+
+            // The post-finalize pass at the retrieval finalize call sites
+            // reclaims the accumulated image without another index operation
+            // and removes the retired generation directory, not just its files.
+            let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
+                .expect("post-finalize pass");
+            assert!(!report.pruning_suppressed);
+            assert_eq!(report.reason, None);
+            assert_eq!(report.reclaimed_images, 1);
+            assert!(
+                !layout
+                    .generation_directory("owned-core-1")
+                    .expect("gen-1 dir")
+                    .exists(),
+                "the retired generation directory must be removed, not only its files"
+            );
+            for kept in ["owned-core-2", "owned-core-3"] {
+                assert!(
+                    layout.generation_database_path(kept).unwrap().is_file(),
+                    "{kept} is active or rollback and must survive"
+                );
+            }
         });
+    }
+
+    #[test]
+    fn retrieval_finalize_call_site_runs_the_deferred_core_gc_pass() {
+        let cache = tempdir().expect("isolated cache");
+        codestory_retrieval::with_test_cache_root(cache.path(), || {
+            let project = tempdir().expect("project");
+            let storage_path = cache.path().join("codestory.db");
+            let raw = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Local,
+            );
+            let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+            let state = global_generation_gc_state_file(&raw);
+            let reader =
+                GenerationRetentionLock::acquire_shared(&state, GLOBAL_GENERATION_GC_LOCK_SCOPE)
+                    .expect("live retrieval finalize fence");
+            publish_owned_core_generations(project.path(), &storage_path, 3);
+            assert!(
+                apply_core_gc_after_publication(&raw, &storage_path, None)
+                    .expect("suppressed report")
+                    .pruning_suppressed
+            );
+            let leaked_dir = layout
+                .generation_directory("owned-core-1")
+                .expect("gen-1 dir");
+            assert!(leaked_dir.is_dir(), "the fenced pass leaves the directory");
+            drop(reader);
+
+            let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
+                raw.clone(),
+                SourceIndexPolicy::default(),
+            ));
+            let facade = runtime.activation_service();
+            let selected: RuntimeRetrievalConfig = raw.clone().into();
+            // The finalizer itself stops at a mandatory fence in this
+            // environment; the post-finalize pass still runs once its shared
+            // fence is released, reclaiming the deferred image without another
+            // index operation.
+            let _ = facade.finalize_retrieval_index_with_cancel(
+                project.path(),
+                &storage_path,
+                &selected,
+                &AtomicBool::new(false),
+            );
+            assert!(
+                !leaked_dir.exists(),
+                "the post-finalize pass must reclaim the accumulated image and directory"
+            );
+        });
+    }
+
+    #[test]
+    fn core_gc_removes_the_retired_generation_directory_and_keeps_unknown_entries() {
+        let cache = tempdir().expect("isolated cache");
+        let project = tempdir().expect("project");
+        let storage_path = cache.path().join("codestory.db");
+        publish_owned_core_generations(project.path(), &storage_path, 3);
+        let layout = CorePublicationLayout::from_storage_path(&storage_path).expect("layout");
+        let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Local,
+        );
+        let retired_dir = layout
+            .generation_directory("owned-core-1")
+            .expect("gen-1 dir");
+        let report =
+            apply_core_gc_for_runtime(&runtime, &storage_path, &|| false).expect("retention pass");
+        assert_eq!(report.reclaimed_images, 1);
+        assert!(
+            !retired_dir.exists(),
+            "reclaiming a generation removes its directory, not only the image"
+        );
+
+        // An unknown sibling entry must keep the whole generation — the
+        // removal is never recursive — and be counted as an unknown entry.
+        let survivor_dir = layout
+            .generation_directory("owned-core-2")
+            .expect("gen-2 dir");
+        fs::write(survivor_dir.join("keep.txt"), b"foreign").expect("unknown entry");
+        publish_owned_core_generation(project.path(), &storage_path, 4);
+        let report = apply_core_gc_for_runtime(&runtime, &storage_path, &|| false)
+            .expect("pass over foreign entry");
+        assert_eq!(
+            report.unknown_entries, 1,
+            "the foreign entry is reported, not deleted"
+        );
+        assert_eq!(report.reclaimed_images, 0);
+        assert_eq!(
+            fs::read(survivor_dir.join("keep.txt")).expect("read foreign entry"),
+            b"foreign"
+        );
+        assert!(
+            survivor_dir.join(CORE_DATABASE_FILE).is_file(),
+            "the image survives beside its unknown neighbour"
+        );
     }
 
     #[test]

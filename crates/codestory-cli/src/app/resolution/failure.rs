@@ -43,6 +43,7 @@ pub(in crate::app) fn command_failure_envelope(
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         },
     ))
     .with_context(context)

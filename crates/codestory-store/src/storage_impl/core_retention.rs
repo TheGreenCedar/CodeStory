@@ -741,6 +741,31 @@ pub(crate) fn pin_exact_core(path: &Path) -> Result<Option<CoreGenerationLease>,
     acquire_generation_read_lease(path)
 }
 
+/// The stable reason a pass was suppressed before it could prune. The reason
+/// is part of the report a caller surfaces, so suppression is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreRetentionSuppression {
+    /// Another process holds the shared retrieval-publication fence for the
+    /// whole of its finalize, so this pass never ran.
+    FencedByActiveRetrievalPublication,
+    /// The caller's cancellation was raised before or during enumeration.
+    Cancelled,
+    /// A store-side precondition (promotion, acquisition lock, or publication
+    /// pointer) suppressed the pass.
+    StorePrecondition,
+}
+
+impl CoreRetentionSuppression {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FencedByActiveRetrievalPublication => "fenced_by_active_retrieval_publication",
+            Self::Cancelled => "cancelled",
+            Self::StorePrecondition => "store_precondition",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CoreRetentionReport {
     pub reclaimed_images: usize,
@@ -750,7 +775,20 @@ pub struct CoreRetentionReport {
     pub unprovisioned_generations: usize,
     pub unknown_entries: usize,
     pub pruning_suppressed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CoreRetentionSuppression>,
     pub errors: Vec<String>,
+}
+
+impl CoreRetentionReport {
+    /// A pass that never ran because `reason` fenced or cancelled it.
+    pub fn suppressed(reason: CoreRetentionSuppression) -> Self {
+        Self {
+            pruning_suppressed: true,
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// Apply a pass with at most `MAX_RECLAIMS_PER_PASS` removals while the caller
@@ -774,11 +812,13 @@ pub fn apply_core_retention(
     let layout = CorePublicationLayout::from_storage_path(logical_path)?;
     let Some(_promotion) = PromotionLock::try_acquire(logical_path)? else {
         report.pruning_suppressed = true;
+        report.reason = Some(CoreRetentionSuppression::StorePrecondition);
         report.errors.push("core promotion is active".into());
         return Ok(report);
     };
     let Some(_acquisition) = acquire_acquisition(&layout, FileLockKind::Exclusive, true)? else {
         report.pruning_suppressed = true;
+        report.reason = Some(CoreRetentionSuppression::StorePrecondition);
         report
             .errors
             .push("core acquisition lock is absent or contended".into());
@@ -786,6 +826,7 @@ pub fn apply_core_retention(
     };
     let Some(pointer) = layout.read_pointer()? else {
         report.pruning_suppressed = true;
+        report.reason = Some(CoreRetentionSuppression::StorePrecondition);
         report
             .errors
             .push("core publication pointer is absent".into());
@@ -809,6 +850,7 @@ pub fn apply_core_retention(
     for entry in entries {
         if cancelled() {
             report.pruning_suppressed = true;
+            report.reason = Some(CoreRetentionSuppression::Cancelled);
             report
                 .errors
                 .push("core retention enumeration was cancelled".into());
@@ -838,6 +880,7 @@ pub fn apply_core_retention(
     }
     if cancelled() {
         report.pruning_suppressed = true;
+        report.reason = Some(CoreRetentionSuppression::Cancelled);
         report
             .errors
             .push("core retention enumeration was cancelled".into());
