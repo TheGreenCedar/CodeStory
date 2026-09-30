@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Packet continuation offers up to eight distinct follow-up actions, so multiple gaps for the same target no longer crowd out another choice.
+- Search can consider its full candidate window when you request more results; the packet's 16-candidate budget no longer cuts ordinary search short.
 
 ## 0.17.7
 
