@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Repository-text search reports when scan limits or skipped oversized files leave source uninspected, so missing matches do not appear exhaustive.
 - Packet continuation offers up to eight distinct follow-up actions, so multiple gaps for the same target no longer crowd out another choice.
 - Search can consider its full candidate window when you request more results; the packet's 16-candidate budget no longer cuts ordinary search short.
 - Packet continuations skip source reads that cannot fit the excerpt limit, while preserving file locations for navigation.
