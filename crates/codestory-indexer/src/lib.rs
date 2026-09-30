@@ -22,6 +22,7 @@ use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
+use finl_unicode::categories::CharacterCategories;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -12818,7 +12819,7 @@ fn go_symbol_access(name: &str) -> AccessKind {
     if terminal
         .chars()
         .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
+        .is_some_and(|ch| ch.is_letter_uppercase())
     {
         AccessKind::Public
     } else {
@@ -16383,6 +16384,10 @@ fn index_file_with_resolution_inputs(
                         AccessKind::Default
                     },
                 )
+            } else if language_config.language_name == "go" && kind == NodeKind::METHOD {
+                // Go exports a method by its own initial, independently of its
+                // receiver's name and any modifier-like text in nearby source.
+                Some(go_symbol_access(&name_str))
             } else {
                 access_kind.or_else(|| {
                     if language_config.language_name == "java"
