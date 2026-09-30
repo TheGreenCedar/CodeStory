@@ -793,9 +793,11 @@ fn classify_packet_disposition(
         request.parent_packet_id.is_some() || !request.option_ids.is_empty()
     });
     if !already_drilled {
+        let mut seen_options = BTreeSet::new();
         let options = continuation
             .iter()
             .filter_map(drill_option_from_selector)
+            .filter(|option| seen_options.insert(option.id.clone()))
             .take(PACKET_DRILL_MAX_OPTIONS)
             .collect::<Vec<_>>();
         if !options.is_empty() {
@@ -923,6 +925,181 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{Edge as CoreEdge, EdgeId as CoreEdgeId};
     use codestory_store::FileRole;
+
+    #[test]
+    fn continuation_budget_counts_distinct_actions_in_compiler_order() {
+        use codestory_contracts::api::PacketDispositionKindDto;
+        use serde_json::json;
+
+        let trace = json!({"request_id":"continuation-request", "resolved_profile":"investigate",
+            "policy_mode":"latency_first", "total_latency_ms":0, "sla_missed":false,
+            "semantic_fallback_count":0, "semantic_fallbacks":[], "semantic_stage_timeout_zero_hits":0,
+            "semantic_abstained_count":0, "annotations":[], "steps":[], "packet_sidecar_diagnostics":[]});
+        let packet: AgentPacketDto = serde_json::from_value(json!({
+            "packet_id":"continuation-request", "question":"repository investigation",
+            "plan":{"queries":[],"trace":[]},
+            "answer":{"answer_id":"continuation-answer", "prompt":"repository investigation",
+                "summary":"fixture", "sections":[], "citations":[], "subgraph_ids":[],
+                "retrieval_version":"fixture", "graphs":[], "retrieval_trace":trace,
+                "freshness":{"status":"fresh", "changed_file_count":0, "new_file_count":0,
+                    "removed_file_count":0, "checked_file_count":0, "indexed_file_count":0,
+                    "duration_ms":0}},
+            "support":[], "disposition":{"kind":"not_established"},
+            "budget":{"requested":"standard", "limits":{"max_anchors":16,"max_files":16,
+                "max_snippets":16,"max_trail_edges":16,"max_output_bytes":65536},
+                "used":{"anchors":0,"files":0,"snippets":0,"trail_edges":0,"output_bytes":0},
+                "truncated":false,"next_deeper_command":null},
+            "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,
+                "search_steps":0,"trail_steps":0}
+        }))
+        .expect("fresh internal packet envelope");
+
+        // A typed selector can admit ambiguous candidates whose source could
+        // not be hydrated. The compiler preserves both structural reasons;
+        // runtime maps them to the same executable symbol-read action.
+        let candidate_ids = [9, 2, 10, 8, 3, 7, 4, 6, 5];
+        for duplicate_reasons in [false, true] {
+            let hydrated_ids = candidate_ids.iter().skip(usize::from(duplicate_reasons));
+            let input = PacketCompilationInputV1 {
+                contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+                publication: PacketCompilationPublicationV1 {
+                    project_id: "project".into(),
+                    core_generation_id: "core".into(),
+                    retrieval_generation: Some("retrieval".into()),
+                },
+                admissions: hydrated_ids
+                    .clone()
+                    .enumerate()
+                    .map(|(ordinal, id)| PacketAdmissionReceiptV1 {
+                        packet_ordinal: ordinal as u32,
+                        stable_identity: format!("node:{id}"),
+                        score_version:
+                            codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1
+                                .into(),
+                        reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                        origin: PacketAdmissionOriginV1::ExactTypedSelector,
+                    })
+                    .collect(),
+                sources: hydrated_ids
+                    .map(|id| PacketHydratedSourceRangeV1 {
+                        stable_identity: format!("node:{id}"),
+                        path: format!("src/symbol_{id}.rs"),
+                        symbol: Some("shared_symbol".into()),
+                        start_line: 1,
+                        end_line: 1,
+                        source: "fn shared_symbol() {}".into(),
+                        parser_completeness: PacketParserCompletenessV1::Complete,
+                    })
+                    .collect(),
+                relations: Vec::new(),
+                admission_gaps: if duplicate_reasons {
+                    vec![PacketAdmissionGapV1 {
+                        kind: PacketAdmissionGapKindV1::SourceUnavailable,
+                        stable_identity: Some("node:9".into()),
+                        exact_selector_ordinal: Some(0),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ambiguities: vec![PacketIdentityAmbiguityV1 {
+                    selector: "shared_symbol".into(),
+                    candidate_identities: candidate_ids
+                        .iter()
+                        .map(|id| format!("node:{id}"))
+                        .collect(),
+                }],
+            };
+            let compiled = compile_repository_evidence(&input);
+            assert_eq!(
+                compiled.continuation.len(),
+                if duplicate_reasons { 10 } else { 9 }
+            );
+            let mut packet = packet.clone();
+            packet.support = compiled.support.clone();
+            let disposition = classify_packet_disposition(
+                &packet,
+                None,
+                &compiled.continuation,
+                "core".into(),
+                Some("retrieval".into()),
+            );
+            let drill = disposition
+                .drill
+                .expect("first packet offers one continuation");
+            assert_eq!(drill.options.len(), PACKET_DRILL_MAX_OPTIONS);
+            assert_eq!(
+                drill
+                    .options
+                    .iter()
+                    .map(|option| option.symbol_id.clone())
+                    .collect::<Vec<_>>(),
+                candidate_ids[..8]
+                    .iter()
+                    .map(|id| Some(id.to_string()))
+                    .collect::<Vec<_>>(),
+                "duplicate reasons must not displace the eighth distinct action",
+            );
+            assert_eq!(
+                drill
+                    .options
+                    .iter()
+                    .map(|option| &option.id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                8
+            );
+            assert_eq!(
+                drill.options[0].structural_reason,
+                Some(if duplicate_reasons {
+                    PacketStructuralGapReasonV1::SourceUnavailable
+                } else {
+                    PacketStructuralGapReasonV1::AmbiguousSelector
+                })
+            );
+            assert_eq!(
+                drill.gap_ids,
+                drill
+                    .options
+                    .iter()
+                    .map(|option| option.gap_id.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(drill.core_generation_id, "core");
+            assert_eq!(drill.retrieval_generation.as_deref(), Some("retrieval"));
+            assert_eq!(drill.remaining_rounds, 1);
+
+            for request_json in [
+                json!({"question":"repository investigation", "parent_packet_id":packet.packet_id}),
+                json!({"question":"repository investigation", "option_ids":[drill.options[0].id]}),
+                json!({"question":"repository investigation", "core_generation_id":"other-core"}),
+                json!({"question":"repository investigation", "retrieval_generation":"other-retrieval"}),
+            ] {
+                let request: AgentPacketRequestDto = serde_json::from_value(request_json).unwrap();
+                let terminal = classify_packet_disposition(
+                    &packet,
+                    Some(&request),
+                    &compiled.continuation,
+                    "core".into(),
+                    Some("retrieval".into()),
+                );
+                assert!(terminal.drill.is_none());
+                if request.parent_packet_id.is_some() || !request.option_ids.is_empty() {
+                    assert_eq!(
+                        terminal.reason.as_deref(),
+                        Some("the bounded continuation left a structural gap")
+                    );
+                }
+                assert_eq!(
+                    terminal.kind,
+                    if request.parent_packet_id.is_some() || !request.option_ids.is_empty() {
+                        PacketDispositionKindDto::NotEstablished
+                    } else {
+                        PacketDispositionKindDto::Unavailable
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn frozen_public_packet_keeps_only_admitted_sources_and_induced_relations() {

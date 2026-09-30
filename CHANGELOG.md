@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Packet continuation offers up to eight distinct follow-up actions, so multiple gaps for the same target no longer crowd out another choice.
+
 ## 0.17.7
 
 CodeStory keeps source reads tied to the indexed bytes, waits for refreshes across sessions, and makes indexing failures easier to diagnose and recover from.
