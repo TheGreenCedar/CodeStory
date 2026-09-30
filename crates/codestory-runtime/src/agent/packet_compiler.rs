@@ -1725,11 +1725,9 @@ mod tests {
                 && unit.snippet.is_none()
                 && unit.summary.starts_with("Navigation only:")
         }));
-        assert_eq!(product.continuation.len(), 2);
         assert!(
-            product.continuation.iter().all(|option| {
-                option.reason == PacketStructuralGapReasonV1::SourceBudgetExceeded
-            })
+            product.continuation.is_empty(),
+            "the same pinned oversized file cannot fit a retry at the same row limit"
         );
 
         std::fs::write(&path, source.replace("line 1", "xxxx 1")).expect("drift");

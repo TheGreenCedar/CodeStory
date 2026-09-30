@@ -6,10 +6,11 @@
 
 use codestory_contracts::api::{SupportUnitDto, SupportUnitKindDto};
 use codestory_contracts::compilation::{
-    INTERIM_MAX_ADMITTED_CANDIDATES, PACKET_COMPILATION_CONTRACT_VERSION_V1,
-    PUBLIC_PACKET_SERIALIZED_MAX_BYTES, PacketAdmissionGapKindV1, PacketAdmissionOriginV1,
-    PacketCompilationInputV1, PacketContinuationSelectorV1, PacketDirectedRelationV1,
-    PacketHydratedSourceRangeV1, PacketRelationCertaintyV1, PacketStructuralGapReasonV1,
+    INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_SOURCE_ROW_UPPER_BOUND,
+    PACKET_COMPILATION_CONTRACT_VERSION_V1, PUBLIC_PACKET_SERIALIZED_MAX_BYTES,
+    PacketAdmissionGapKindV1, PacketAdmissionOriginV1, PacketCompilationInputV1,
+    PacketContinuationSelectorV1, PacketDirectedRelationV1, PacketHydratedSourceRangeV1,
+    PacketRelationCertaintyV1, PacketStructuralGapReasonV1,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -452,6 +453,21 @@ fn continuation_selectors(
             continue;
         };
         identities_with_explicit_gaps.insert(stable_identity.clone());
+        // A pinned identity that failed hydration at the maximum row limit
+        // cannot gain source by retrying the same identity at that limit.
+        // Preserve its navigation without offering an identical source read.
+        if gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+            && input.admissions.iter().any(|admission| {
+                admission.stable_identity == stable_identity
+                    && admission.reserved_source_bytes as usize >= INTERIM_SOURCE_ROW_UPPER_BOUND
+            })
+            && !input
+                .sources
+                .iter()
+                .any(|source| source.stable_identity == stable_identity)
+        {
+            continue;
+        }
         let reason = match gap.kind {
             PacketAdmissionGapKindV1::CandidateCountExceeded => {
                 PacketStructuralGapReasonV1::CandidateCountExceeded
@@ -643,6 +659,98 @@ mod tests {
         assert_eq!(location.path.as_deref(), Some("src/large.rs"));
         assert!(location.summary.starts_with("Navigation only:"));
         assert!(location.snippet.is_none());
+    }
+
+    #[test]
+    fn source_row_limit_retries_preserve_recoverable_budget_and_source_cases() {
+        use codestory_contracts::compilation::PacketAdmissionGapV1;
+
+        let cases = [
+            (
+                "exhausted row",
+                512,
+                true,
+                false,
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                false,
+            ),
+            (
+                "over-reserved row",
+                1024,
+                true,
+                false,
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                false,
+            ),
+            (
+                "smaller reservation",
+                511,
+                true,
+                false,
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                true,
+            ),
+            (
+                "unadmitted loss",
+                512,
+                false,
+                false,
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                true,
+            ),
+            (
+                "hydrated allocation loss",
+                512,
+                true,
+                true,
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                true,
+            ),
+            (
+                "candidate count loss",
+                512,
+                true,
+                false,
+                PacketAdmissionGapKindV1::CandidateCountExceeded,
+                true,
+            ),
+            (
+                "unavailable source",
+                512,
+                true,
+                false,
+                PacketAdmissionGapKindV1::SourceUnavailable,
+                true,
+            ),
+        ];
+        for (case, reservation, admitted, hydrated, kind, retry) in cases {
+            let mut input = input();
+            input
+                .admissions
+                .retain(|admission| admitted && admission.stable_identity == "node:exact");
+            for admission in &mut input.admissions {
+                admission.reserved_source_bytes = reservation;
+            }
+            input
+                .sources
+                .retain(|source| hydrated && source.stable_identity == "node:exact");
+            input.admission_gaps = vec![PacketAdmissionGapV1 {
+                kind,
+                stable_identity: Some("node:exact".into()),
+                exact_selector_ordinal: Some(0),
+            }];
+            let product = compile_repository_evidence(&input);
+            assert_eq!(!product.continuation.is_empty(), retry, "{case}");
+            if admitted && !hydrated {
+                assert_eq!(product.support.len(), 1, "{case}");
+                assert_eq!(
+                    product.support[0].kind,
+                    SupportUnitKindDto::SymbolLocation,
+                    "{case}"
+                );
+                assert!(product.support[0].snippet.is_none(), "{case}");
+            }
+        }
     }
 
     #[test]
