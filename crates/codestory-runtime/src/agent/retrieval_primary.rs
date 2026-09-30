@@ -2984,8 +2984,11 @@ fn resolve_sidecar_candidates_in_storage(
                 .then_with(|| left_candidate.file_path.cmp(&right_candidate.file_path))
         });
     }
-    let max_results =
-        max_results.min(codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES);
+    let max_results = if identity_scope.is_some() {
+        max_results.min(codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES)
+    } else {
+        max_results
+    };
     let mut admitted: Vec<(CoreNodeId, &CandidateHit)> = Vec::new();
 
     while admitted.len() < max_results && !pending.is_empty() {
@@ -4384,6 +4387,122 @@ mod tests {
         assert_eq!(
             hit.resolution_status,
             Some(crate::agent::packet_evidence::PacketEvidenceResolution::SourceRangeOnly)
+        );
+    }
+
+    #[test]
+    fn ordinary_search_resolution_is_not_limited_by_packet_admission() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_store::{FileInfo, FileRole};
+
+        let project = tempfile::tempdir().expect("isolated source project");
+        let path = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            (2..=21)
+                .map(|id| format!("fn source_{id}() {{}}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: path.clone(),
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 20,
+                file_role: FileRole::Source,
+            })
+            .unwrap();
+        let mut nodes = vec![codestory_contracts::graph::Node {
+            id: CoreNodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string_lossy().into_owned(),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(1),
+            ..Default::default()
+        }];
+        let candidates = (2..=21)
+            .map(|id| {
+                let name = format!("source_{id}");
+                nodes.push(codestory_contracts::graph::Node {
+                    id: CoreNodeId(id),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: name.clone(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some((id - 1) as u32),
+                    ..Default::default()
+                });
+                let mut candidate = CandidateHit::with_source(
+                    "src/lib.rs",
+                    Some(name),
+                    1.0 - id as f32 / 100.0,
+                    CandidateSource::Lexical,
+                );
+                candidate.node_id = Some(id.to_string());
+                candidate.source_bytes_upper_bound = Some(64);
+                candidate
+            })
+            .collect::<Vec<_>>();
+        storage.insert_nodes_batch(&nodes).unwrap();
+
+        assert!(crate::agent::packet_candidate::active_packet_proof_session().is_none());
+        for requested in [1, 16, 20] {
+            let ordinary = resolve_sidecar_candidates_in_storage(
+                &storage,
+                &HashMap::new(),
+                project.path(),
+                &candidates,
+                requested,
+            )
+            .expect("ordinary sidecar resolution");
+            assert_eq!(
+                ordinary.resolved_hits.len(),
+                requested,
+                "ordinary resolution must honor its own result window"
+            );
+            assert_eq!(
+                ordinary
+                    .resolved_hits
+                    .iter()
+                    .map(|hit| hit.node_id.0.clone())
+                    .collect::<Vec<_>>(),
+                (2..2 + requested)
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(ordinary.unresolved_candidate_count, 0);
+        }
+
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let packet = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            project.path(),
+            &candidates,
+            20,
+        )
+        .expect("bounded packet resolution");
+        assert_eq!(
+            packet.resolved_hits.len(),
+            codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES
+        );
+        assert_eq!(
+            session.receipts().len(),
+            codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES
+        );
+        assert_eq!(
+            packet
+                .resolved_hits
+                .iter()
+                .map(|hit| hit.node_id.0.clone())
+                .collect::<Vec<_>>(),
+            (2..18).map(|id| id.to_string()).collect::<Vec<_>>()
         );
     }
 
